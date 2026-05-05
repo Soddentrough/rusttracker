@@ -12,7 +12,6 @@ assets = [
     { source = "rusttracker.desktop", dest = "/usr/share/applications/rusttracker.desktop", mode = "644" },
     { source = "icon.png", dest = "/usr/share/icons/hicolor/256x256/apps/rusttracker.png", mode = "644" }
 ]
-requires = ["libopenmpt", "alsa-lib"]
 
 [dependencies]
 anyhow = "1.0.101"
