@@ -28,6 +28,7 @@ pub struct VulkanEngine<'a> {
     uniform_bind_group: wgpu::BindGroup,
     pub egui_renderer: egui_wgpu::Renderer,
     pub heatmap_texture: Option<egui::TextureHandle>,
+    pub fire_buffer: Vec<u8>,
 }
 
 impl<'a> VulkanEngine<'a> {
@@ -174,6 +175,7 @@ impl<'a> VulkanEngine<'a> {
             uniform_bind_group,
             egui_renderer,
             heatmap_texture: None,
+            fire_buffer: vec![0; 80 * 20],
         }
     }
 
@@ -401,42 +403,65 @@ impl<'a> VulkanEngine<'a> {
                             let played_rect = egui::Rect::from_min_size(rect.min, egui::vec2(played_width, rect.height()));
                             painter.rect_filled(played_rect, 2.0, egui::Color32::from_rgb(45, 20, 15)); // Deep charred red/brown
                             
-                            // Fire indicator (Particle System)
+                            // Fire indicator (Demoscene Fire Array)
                             if progress > 0.0 && progress < 1.0 {
                                 let fire_x = rect.min.x + played_width;
-                                let time = state.current_seconds as f32;
+                                let fire_w = 40;
+                                let fire_h = 16;
+                                let pixel_size = 2.0;
+                                let t = state.current_seconds * 1000.0;
                                 
-                                // Stateless particle system
-                                for i in 0..40 {
-                                    // Pseudo-random hash for this particle index
-                                    let seed = i as f32;
-                                    let h1 = ((seed * 12.9898 + 78.233).sin() * 43758.5453).fract().abs();
-                                    let h2 = ((seed * 39.346 + 11.135).sin() * 43758.5453).fract().abs();
-                                    let h3 = ((seed * 73.156 + 52.235).sin() * 43758.5453).fract().abs();
-                                    
-                                    // Particle properties
-                                    let speed = 1.0 + h1 * 1.5;
-                                    let local_time = (time * speed + h2 * 100.0).fract(); // loops 0.0 to 1.0
-                                    
-                                    // Physics
-                                    let base_x = fire_x - 1.0;
-                                    let x_drift = (h3 - 0.5) * 12.0 + (local_time * 10.0 + h1 * 10.0).sin() * 3.0;
-                                    let y_rise = local_time * 24.0;
-                                    let x = base_x + x_drift;
-                                    let y = rect.max.y - 2.0 - y_rise;
-                                    
-                                    // Size and color fade over lifetime
-                                    let size = (1.0 - local_time) * (1.5 + h1 * 2.5);
-                                    let r = 255;
-                                    let g = (255.0 * (1.0 - local_time.powf(0.5))) as u8;
-                                    let b = (100.0 * (1.0 - local_time * 2.0).max(0.0)) as u8;
-                                    let a = (255.0 * (1.0 - local_time)) as u8;
-                                    
-                                    painter.circle_filled(
-                                        egui::pos2(x, y),
-                                        size,
-                                        egui::Color32::from_rgba_unmultiplied(r, g, b, a)
-                                    );
+                                // Randomize bottom row
+                                for x in 0..fire_w {
+                                    let seed = (x as f64 * 31.415 + t as f64).sin() * 43758.5453;
+                                    let r = (seed.fract().abs() * 255.0) as u8;
+                                    self.fire_buffer[(fire_h - 1) * fire_w + x] = if r > 100 { 255 } else { r };
+                                }
+                                
+                                // Propagate up
+                                for y in 0..(fire_h - 1) {
+                                    for x in 0..fire_w {
+                                        let src_idx = (y + 1) * fire_w + x;
+                                        let mut sum = self.fire_buffer[src_idx] as u32 * 2; // Weight directly below
+                                        
+                                        if x > 0 { sum += self.fire_buffer[src_idx - 1] as u32; }
+                                        if x < fire_w - 1 { sum += self.fire_buffer[src_idx + 1] as u32; }
+                                        sum += self.fire_buffer[(y + 2).min(fire_h - 1) * fire_w + x] as u32;
+                                        
+                                        let avg = sum / 5;
+                                        let seed2 = (y as f64 * 12.34 + x as f64 * 45.67 + t as f64).sin() * 43758.5453;
+                                        let cool = (seed2.fract().abs() * 4.0) as u32; // Random cooling 0-3
+                                        
+                                        self.fire_buffer[y * fire_w + x] = avg.saturating_sub(cool) as u8;
+                                    }
+                                }
+
+                                let start_x = fire_x - (fire_w as f32 * pixel_size) / 2.0;
+                                let start_y = rect.max.y - 1.0 - (fire_h as f32 * pixel_size);
+                                
+                                for y in 0..fire_h {
+                                    for x in 0..fire_w {
+                                        let temp = self.fire_buffer[y * fire_w + x];
+                                        if temp > 15 {
+                                            // Map temperature to classic fire gradient
+                                            let r = temp;
+                                            let g = (temp as f32 * 0.7).clamp(0.0, 255.0) as u8;
+                                            let b = (temp.saturating_sub(160) as f32 * 2.0).clamp(0.0, 255.0) as u8;
+                                            let a = temp.min(220);
+                                            
+                                            let px_x = start_x + x as f32 * pixel_size;
+                                            let px_y = start_y + y as f32 * pixel_size;
+                                            
+                                            painter.rect_filled(
+                                                egui::Rect::from_min_size(
+                                                    egui::pos2(px_x, px_y),
+                                                    egui::vec2(pixel_size, pixel_size)
+                                                ),
+                                                0.0,
+                                                egui::Color32::from_rgba_premultiplied(r, g, b, a)
+                                            );
+                                        }
+                                    }
                                 }
                             }
                             
