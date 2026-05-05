@@ -15,7 +15,7 @@ jobs:
         shell: msys2 {0}
         
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v4
     
     - name: Set up MSYS2
       uses: msys2/setup-msys2@v2
@@ -52,7 +52,7 @@ jobs:
         "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
         
     - name: Upload Artifact
-      uses: actions/upload-artifact@v7
+      uses: actions/upload-artifact@v4
       with:
         name: RustTracker-Windows
         path: setup/RustTracker-Setup.exe
