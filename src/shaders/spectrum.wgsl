@@ -226,9 +226,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let wave_y = raw_wave * 0.4 + 0.5; // Map to 0.1 - 0.9 range
             let dist = abs(final_uv.y - wave_y);
             
-            // Age factor: oldest is 1/60, newest is 1.0
-            let age_linear = f32(i + 1u) / 60.0;
-            let age = pow(age_linear, 3.0); 
+            // True exponential decay (e^-kx) like a real CRT phosphor
+            // i=59 is the newest frame (frames_old = 0)
+            let frames_old = 59.0 - f32(i);
+            // k=0.1 means it decays to ~5% brightness over 30 frames (0.5 seconds)
+            let age = exp(-frames_old * 0.1); 
             
             // Anti-aliased line thickness
             let thickness = 0.003;
@@ -238,10 +240,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let bloom = 0.001 / (dist * dist + 0.001) * 0.3;
             
             let frame_intensity = (line_intensity + bloom) * age;
-            wave_intensity = max(wave_intensity, frame_intensity);
+            
+            // Real phosphors are additive light emitters
+            wave_intensity = wave_intensity + frame_intensity;
         }
         
-        final_color = final_color + amber * wave_intensity;
+        // Reinhard-like tonemapping to prevent the additive light from blowing out to pure white
+        // while still preserving the natural additive glow physics of a CRT screen.
+        let mapped_intensity = wave_intensity / (1.0 + wave_intensity * 0.5);
+        
+        final_color = final_color + amber * mapped_intensity;
         
         // Shadow mask: High frequency RGB dot pattern
         let mask_x = fract(in.uv.x * 600.0);
