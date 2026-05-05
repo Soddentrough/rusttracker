@@ -3,6 +3,16 @@ name = "rusttracker"
 version = "0.2.0"
 edition = "2024"
 default-run = "rusttracker"
+description = "High-Performance Vulkan Tracker Module Visualizer"
+license = "MIT"
+
+[package.metadata.generate-rpm]
+assets = [
+    { source = "target/release/rusttracker", dest = "/usr/bin/rusttracker", mode = "755" },
+    { source = "rusttracker.desktop", dest = "/usr/share/applications/rusttracker.desktop", mode = "644" },
+    { source = "icon.png", dest = "/usr/share/icons/hicolor/256x256/apps/rusttracker.png", mode = "644" }
+]
+requires = ["libopenmpt", "alsa-lib"]
 
 [dependencies]
 anyhow = "1.0.101"
@@ -22,3 +32,6 @@ egui = "0.31.0"
 egui-wgpu = "0.31.0"
 egui-winit = "0.31.0"
 rfd = "0.17.2"
+
+[build-dependencies]
+winres = "0.1.12"

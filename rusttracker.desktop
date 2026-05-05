@@ -1,0 +1,10 @@
+[Desktop Entry]
+Name=RustTracker
+GenericName=Module Visualizer
+Comment=High-Performance Vulkan Tracker Module Visualizer
+Exec=rusttracker %F
+Icon=rusttracker
+Terminal=false
+Type=Application
+Categories=AudioVideo;Audio;
+MimeType=audio/x-mod;audio/x-s3m;audio/x-xm;audio/x-it;

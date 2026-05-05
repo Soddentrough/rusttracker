@@ -1,0 +1,36 @@
+name: Linux RPM Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:40
+      
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Build Dependencies
+      run: |
+        dnf update -y
+        dnf install -y rust cargo gcc pkg-config libopenmpt-devel alsa-lib-devel
+        
+    - name: Install cargo-generate-rpm
+      run: cargo install cargo-generate-rpm
+          
+    - name: Build Release Binary
+      run: cargo build --release
+        
+    - name: Generate RPM
+      run: cargo generate-rpm
+        
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: RustTracker-Fedora-RPM
+        path: target/generate-rpm/*.rpm
