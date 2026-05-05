@@ -463,7 +463,13 @@ impl<'a> VulkanEngine<'a> {
                                 
                                 for y in 0..fire_h {
                                     for x in 0..fire_w {
-                                        let temp = self.fire_buffer[y * fire_w + x];
+                                        let mut temp = self.fire_buffer[y * fire_w + x];
+                                        
+                                        // Soft fade at the top to prevent hard edges and blend into smoke
+                                        if y < 4 {
+                                            temp = (temp as f32 * (y as f32 / 4.0)).max(0.0) as u8;
+                                        }
+                                        
                                         let (r, g, b, a) = if temp > 230 {
                                             (255, 255, 255, 255) // White hot
                                         } else if temp > 150 {
