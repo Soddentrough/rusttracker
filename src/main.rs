@@ -29,7 +29,7 @@ use crate::engine::{VulkanEngine, EngineAction};
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    file: Option<String>,
+    file: Vec<String>,
 
     #[arg(long, default_value_t = false)]
     tui: bool,
@@ -70,14 +70,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     let title = if args.mic {
         "Microphone Input".to_string()
     } else {
-        args.file.clone().unwrap_or_default()
+        args.file.first().cloned().unwrap_or_default()
     };
     
     let app_state = Arc::new(Mutex::new(AppState::new(title)));
     
+    {
+        let mut state = app_state.lock().unwrap();
+        state.playlist = args.file.clone();
+        state.playlist_index = 0;
+    }
+    
     let mut initial_stream = None;
-    if args.mic || args.file.is_some() {
-        let file_path = args.file.clone().unwrap_or_default();
+    if args.mic || !args.file.is_empty() {
+        let file_path = args.file.first().cloned().unwrap_or_default();
         initial_stream = audio::start_audio_thread(&file_path, args.mic, Arc::clone(&app_state)).ok();
     }
 
@@ -214,6 +220,15 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                 WindowEvent::RedrawRequested => {
                     let load_path = {
                         let mut state = app_state.lock().unwrap();
+                        
+                        if state.track_ended {
+                            state.track_ended = false;
+                            state.playlist_index += 1;
+                            if state.playlist_index < state.playlist.len() {
+                                state.load_request = Some(state.playlist[state.playlist_index].clone());
+                            }
+                        }
+                        
                         state.load_request.take()
                     };
                     
@@ -311,13 +326,17 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                     if action == EngineAction::OpenFile {
                         let app_state_clone = Arc::clone(&app_state);
                         std::thread::spawn(move || {
-                            if let Some(path) = rfd::FileDialog::new()
+                            if let Some(paths) = rfd::FileDialog::new()
                                 .add_filter("Tracker Modules", &["mod", "s3m", "xm", "it", "stm", "669", "mtm", "med", "okt", "psm"])
                                 .add_filter("All Files", &["*"])
-                                .pick_file() {
-                                let mut state = app_state_clone.lock().unwrap();
-                                state.load_request = Some(path.display().to_string());
-                                state.file_loaded = true;
+                                .pick_files() {
+                                if !paths.is_empty() {
+                                    let mut state = app_state_clone.lock().unwrap();
+                                    state.playlist = paths.into_iter().map(|p| p.display().to_string()).collect();
+                                    state.playlist_index = 0;
+                                    state.load_request = Some(state.playlist[0].clone());
+                                    state.file_loaded = true;
+                                }
                             }
                         });
                     }

@@ -355,8 +355,9 @@ fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
 
     // Fallback to OpenMPT Tracker module
     let mut module_cursor = Cursor::new(data);
-    let module = Module::create(&mut module_cursor, Logger::None, &[])
+    let mut module = Module::create(&mut module_cursor, Logger::None, &[])
         .map_err(|_| anyhow::anyhow!("Failed to create module"))?;
+    module.set_repeat_count(0);
         
     Ok(Box::new(OpenMptSource { module: SafeModule(module) }))
 }
@@ -528,6 +529,12 @@ where
 
             std::mem::forget(fake_left);
             std::mem::forget(fake_right);
+            
+            if frames_read == 0 {
+                if let Ok(mut state) = shared_state.try_lock() {
+                    state.track_ended = true;
+                }
+            }
 
             for (i, frame) in data.chunks_mut(channels).enumerate() {
                 if i < frames_read {

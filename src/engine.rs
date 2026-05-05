@@ -599,6 +599,9 @@ impl<'a> VulkanEngine<'a> {
                             // Column 2: Track Info
                             columns[2].heading("Track Info");
                             columns[2].separator();
+                            if state.playlist.len() > 1 {
+                                columns[2].horizontal(|ui| { ui.label("Playlist"); ui.label(format!("{} / {}", state.playlist_index + 1, state.playlist.len())); });
+                            }
                             columns[2].horizontal(|ui| { ui.label("Title"); ui.label(&state.song_title); });
                             columns[2].horizontal(|ui| { ui.label("Artist"); ui.label(&state.artist); });
                             columns[2].horizontal(|ui| { ui.label("Type"); ui.label(&state.module_type); });

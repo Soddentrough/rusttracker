@@ -32,6 +32,9 @@ pub struct AppState {
     pub file_loaded: bool,
     pub show_stats: bool,
     pub current_fps: f32,
+    pub playlist: Vec<String>,
+    pub playlist_index: usize,
+    pub track_ended: bool,
 }
 
 impl AppState {
@@ -72,6 +75,9 @@ impl AppState {
             load_request: None,
             show_stats: false,
             current_fps: 0.0,
+            playlist: Vec::new(),
+            playlist_index: 0,
+            track_ended: false,
         }
     }
 }
