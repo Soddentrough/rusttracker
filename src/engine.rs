@@ -222,7 +222,8 @@ impl<'a> VulkanEngine<'a> {
         egui_ctx: &egui::Context,
         egui_state: &mut egui_winit::State,
         state: &AppState,
-    ) -> Result<EngineAction, wgpu::SurfaceError> {
+    ) -> Result<(EngineAction, f32, f32), wgpu::SurfaceError> {
+        let ui_start = std::time::Instant::now();
         let output = self.surface.get_current_texture()?;
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
@@ -248,6 +249,14 @@ impl<'a> VulkanEngine<'a> {
                         ui.label(
                             egui::RichText::new(format!("Frame Time: {:.2} ms", 1000.0 / state.current_fps.max(1.0)))
                                 .color(egui::Color32::LIGHT_GREEN)
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("UI: {:.2} ms | Render: {:.2} ms", state.stats.ui_us / 1000.0, state.stats.render_us / 1000.0))
+                                .color(egui::Color32::GRAY)
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("FFT: {:.2} ms | Decode: {:.2} ms", state.stats.fft_us / 1000.0, state.stats.decode_us / 1000.0))
+                                .color(egui::Color32::GRAY)
                         );
                     });
             }
@@ -747,6 +756,9 @@ impl<'a> VulkanEngine<'a> {
             size_in_pixels: [self.config.width, self.config.height],
             pixels_per_point: window.scale_factor() as f32,
         };
+        
+        let ui_elapsed = ui_start.elapsed().as_micros() as f32;
+        let render_start = std::time::Instant::now();
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("Render Encoder"),
@@ -821,7 +833,9 @@ impl<'a> VulkanEngine<'a> {
         for id in &full_output.textures_delta.free {
             self.egui_renderer.free_texture(id);
         }
+        
+        let render_elapsed = render_start.elapsed().as_micros() as f32;
 
-        Ok(engine_action)
+        Ok((engine_action, ui_elapsed, render_elapsed))
     }
 }

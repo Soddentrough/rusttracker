@@ -1,5 +1,13 @@
 use std::collections::VecDeque;
 
+#[derive(Clone, Default, Debug)]
+pub struct PerformanceStats {
+    pub decode_us: f32,
+    pub fft_us: f32,
+    pub ui_us: f32,
+    pub render_us: f32,
+}
+
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub song_title: String,
@@ -34,6 +42,7 @@ pub struct AppState {
     pub load_request: Option<String>,
     pub file_loaded: bool,
     pub show_stats: bool,
+    pub stats: PerformanceStats,
     pub current_fps: f32,
     pub playlist: Vec<String>,
     pub playlist_index: usize,
@@ -86,6 +95,7 @@ impl AppState {
             tracker_patterns_by_order: Vec::new(),
             load_request: None,
             show_stats: false,
+            stats: PerformanceStats::default(),
             current_fps: 0.0,
             playlist: Vec::new(),
             playlist_index: 0,

@@ -5,6 +5,7 @@ use spectrum_analyzer::{samples_fft_to_spectrum, windows::hann_window, Frequency
 use std::fs::File;
 use std::io::{Cursor, Read};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 use symphonia::core::audio::SampleBuffer;
 use symphonia::core::codecs::{Decoder, DecoderOptions};
 use symphonia::core::formats::{FormatOptions, FormatReader};
@@ -40,6 +41,7 @@ fn spawn_dsp_thread(
             for i in 0..4096 {
                 windowed_buffer[i] = *msg.audio_data.get(i).unwrap_or(&0.0);
             }
+            let fft_start = Instant::now();
             let hann = hann_window(&windowed_buffer);
             if let Ok(spectrum) = samples_fft_to_spectrum(
                 &hann,
@@ -58,9 +60,13 @@ fn spawn_dsp_thread(
                     }
                 }
             }
+            let fft_elapsed = fft_start.elapsed().as_micros() as f32;
 
             // Sync to UI state
             if let Ok(mut state) = shared_state.try_lock() {
+                // Decay/smooth the execution stats for readability
+                state.stats.fft_us = state.stats.fft_us * 0.9 + fft_elapsed * 0.1;
+                
                 state.raw_channel_vus.clear();
                 for vu in msg.channel_vus {
                     state.raw_channel_vus.push(vu);
@@ -542,11 +548,13 @@ where
             let mut fake_left = unsafe { Vec::from_raw_parts(left_buffer.as_mut_ptr(), frames_to_render, frames_to_render) };
             let mut fake_right = unsafe { Vec::from_raw_parts(right_buffer.as_mut_ptr(), frames_to_render, frames_to_render) };
 
+            let decode_start = Instant::now();
             let frames_read = audio_source.read_float_stereo(
                 sample_rate,
                 &mut fake_left,
                 &mut fake_right,
             );
+            let decode_elapsed = decode_start.elapsed().as_micros() as f32;
 
             std::mem::forget(fake_left);
             std::mem::forget(fake_right);
@@ -609,6 +617,7 @@ where
 
             // Zero-allocation UI state sync via lock-free try_lock
             if let Ok(mut state) = shared_state.try_lock() {
+                state.stats.decode_us = state.stats.decode_us * 0.9 + decode_elapsed * 0.1;
                 if let Some(pos) = state.seek_request.take() {
                     audio_source.set_position_seconds(pos);
                 }
