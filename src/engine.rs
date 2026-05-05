@@ -362,7 +362,6 @@ impl<'a> VulkanEngine<'a> {
                                 
                                 // Draw Tracker Text Overlay
                                 if state.tracker_patterns_by_order.len() > 0 && state.current_tracker_order >= 0 && (state.current_tracker_order as usize) < state.tracker_patterns_by_order.len() {
-                                    let current_pattern = &state.tracker_patterns_by_order[state.current_tracker_order as usize];
                                     let current_row = state.current_tracker_row as i32;
                                     
                                     let row_height = 14.0;
