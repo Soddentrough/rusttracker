@@ -1,5 +1,7 @@
 # RustTracker 🎵
 
+![RustTracker UI](assets/screenshot.png)
+
 A high-performance, real-time audio visualizer and tracker module player built in Rust. 
 
 RustTracker leverages a **3-Thread DSP Architecture** to ensure zero-latency audio playback while simultaneously computing Fast Fourier Transforms (FFT) and rendering beautiful, fluid visualizations at 60FPS.
