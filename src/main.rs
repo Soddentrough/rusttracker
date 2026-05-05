@@ -23,8 +23,7 @@ use crate::engine::VulkanEngine;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    #[arg(default_value = "ive_got_the_power.mod")]
-    file: String,
+    file: Option<String>,
 
     #[arg(long, default_value_t = false)]
     tui: bool,
@@ -62,13 +61,19 @@ impl Drop for Tui {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = Args::parse();
-    let app_state = Arc::new(Mutex::new(AppState::new(if args.mic { "Microphone Input".to_string() } else { args.file.clone() })));
+    let title = if args.mic {
+        "Microphone Input".to_string()
+    } else {
+        args.file.clone().unwrap_or_default()
+    };
     
-    let _stream = audio::start_audio_thread(&args.file, args.mic, Arc::clone(&app_state))
-        .map_err(|e| {
-            eprintln!("Audio init failed: {}", e);
-            e
-        })?;
+    let app_state = Arc::new(Mutex::new(AppState::new(title)));
+    
+    let mut initial_stream = None;
+    if args.mic || args.file.is_some() {
+        let file_path = args.file.clone().unwrap_or_default();
+        initial_stream = audio::start_audio_thread(&file_path, args.mic, Arc::clone(&app_state)).ok();
+    }
 
     if args.tui {
         let original_hook = std::panic::take_hook();
@@ -83,13 +88,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             eprintln!("App error: {:?}", err);
         }
     } else {
-        pollster::block_on(run_gui(app_state));
+        pollster::block_on(run_gui(app_state, initial_stream));
     }
 
     Ok(())
 }
 
-async fn run_gui(app_state: Arc<Mutex<AppState>>) {
+#[allow(unused_variables, unused_assignments)]
+async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal::Stream>) {
     let event_loop = EventLoop::new().unwrap();
     
     #[allow(deprecated)]
@@ -158,6 +164,15 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>) {
                     engine.resize(*physical_size);
                 }
                 WindowEvent::RedrawRequested => {
+                    let load_path = {
+                        let mut state = app_state.lock().unwrap();
+                        state.load_request.take()
+                    };
+                    
+                    if let Some(path) = load_path {
+                        active_stream = audio::start_audio_thread(&path, false, Arc::clone(&app_state)).ok();
+                    }
+
                     let now = Instant::now();
                     let dt = now.duration_since(last_update).as_secs_f32();
                     last_update = now;
@@ -217,8 +232,8 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>) {
                         engine.update(&state);
                     }
 
-                    let state_copy = app_state.lock().unwrap().clone();
-                    match engine.render(&window, &egui_ctx, &mut egui_state, &state_copy) {
+                    let mut state = app_state.lock().unwrap();
+                    match engine.render(&window, &egui_ctx, &mut egui_state, &mut state) {
                         Ok(_) => {}
                         Err(wgpu::SurfaceError::Lost) => engine.resize(engine.size),
                         Err(wgpu::SurfaceError::OutOfMemory) => elwt.exit(),

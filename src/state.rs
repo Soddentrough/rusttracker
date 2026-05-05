@@ -28,6 +28,8 @@ pub struct AppState {
     pub current_tracker_row: i32,
     pub tracker_row_history: VecDeque<(i32, i32)>,
     pub tracker_patterns_by_order: Vec<Vec<String>>,
+    pub load_request: Option<String>,
+    pub file_loaded: bool,
 }
 
 impl AppState {
@@ -38,6 +40,7 @@ impl AppState {
         }
 
         Self {
+            file_loaded: !title.is_empty(),
             song_title: title,
             artist: "Unknown".to_string(),
             module_type: "Unknown".to_string(),
@@ -64,6 +67,7 @@ impl AppState {
             current_tracker_row: 0,
             tracker_row_history: VecDeque::with_capacity(128),
             tracker_patterns_by_order: Vec::new(),
+            load_request: None,
         }
     }
 }

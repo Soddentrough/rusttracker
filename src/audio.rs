@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use cpal::traits::{DeviceTrait, HostTrait};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use openmpt::module::{Logger, Module};
 use spectrum_analyzer::{samples_fft_to_spectrum, windows::hann_window, FrequencyLimit};
 use std::fs::File;
@@ -462,6 +462,8 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
         cpal::SampleFormat::U16 => run::<u16>(&device, &config, audio_source, shared_state, tx, config.sample_rate, max_frequency),
         _ => return Err(anyhow::anyhow!("Unsupported sample format")),
     }?;
+
+    stream.play().context("Failed to play stream")?;
 
     Ok(stream)
 }

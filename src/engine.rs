@@ -205,7 +205,7 @@ impl<'a> VulkanEngine<'a> {
         window: &winit::window::Window,
         egui_ctx: &egui::Context,
         egui_state: &mut egui_winit::State,
-        state: &AppState,
+        state: &mut AppState,
     ) -> Result<(), wgpu::SurfaceError> {
         let output = self.surface.get_current_texture()?;
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -214,6 +214,32 @@ impl<'a> VulkanEngine<'a> {
         let raw_input = egui_state.take_egui_input(window);
         let mut central_rect = egui::Rect::NOTHING;
         let full_output = egui_ctx.run(raw_input, |ctx| {
+            if !state.file_loaded {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    ui.vertical_centered(|ui| {
+                        ui.add_space(ctx.screen_rect().height() / 3.0);
+                        ui.heading(egui::RichText::new("RustTracker").size(48.0));
+                        ui.add_space(20.0);
+                        if ui.button(egui::RichText::new("OPEN FILE").size(24.0)).clicked() {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Tracker Modules", &["mod", "s3m", "xm", "it", "stm", "669", "mtm", "med", "okt", "psm"])
+                                .add_filter("All Files", &["*"])
+                                .pick_file() {
+                                state.load_request = Some(path.display().to_string());
+                                state.file_loaded = true;
+                            }
+                        }
+                        ui.add_space(40.0);
+                        ui.label(egui::RichText::new("Keyboard Shortcuts").strong().size(18.0));
+                        ui.label("Tab / F : Toggle HUD");
+                        ui.label("Q / Esc : Quit");
+                        ui.label("Space : Play / Pause");
+                        ui.label("Arrows : Seek");
+                    });
+                });
+                return;
+            }
+
             if state.show_hud {
                 egui::TopBottomPanel::top("top_panel")
                     .resizable(false)
