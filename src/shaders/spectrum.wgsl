@@ -102,9 +102,8 @@ fn get_fire_heat(x: f32) -> f32 {
     else { return spec_vec.w; }
 }
 
-fn get_waveform(hist_idx: u32, x: f32) -> f32 {
-    let freq_idx = u32(x * 512.0);
-    let clamped_idx = clamp(freq_idx, 0u, 511u);
+fn get_waveform_raw(hist_idx: u32, idx: u32) -> f32 {
+    let clamped_idx = clamp(idx, 0u, 511u);
     let vec_idx = clamped_idx / 4u;
     let component_idx = clamped_idx % 4u;
     
@@ -113,6 +112,18 @@ fn get_waveform(hist_idx: u32, x: f32) -> f32 {
     else if component_idx == 1u { return spec_vec.y; }
     else if component_idx == 2u { return spec_vec.z; }
     else { return spec_vec.w; }
+}
+
+fn get_waveform_interpolated(hist_idx: u32, x: f32) -> f32 {
+    let float_idx = x * 511.0;
+    let idx0 = u32(float_idx);
+    let idx1 = min(idx0 + 1u, 511u);
+    let fract_part = fract(float_idx);
+    
+    let val0 = get_waveform_raw(hist_idx, idx0);
+    let val1 = get_waveform_raw(hist_idx, idx1);
+    
+    return mix(val0, val1, fract_part);
 }
 
 @fragment
@@ -206,15 +217,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         var final_color = vec3<f32>(0.0);
         let amber = vec3<f32>(1.0, 0.65, 0.1);
         
+        var wave_intensity = 0.0;
+        
         // Accumulate 60 history frames for ghosting
         // waveform_history[0] is oldest, waveform_history[59] is newest
         for (var i = 0u; i < 60u; i = i + 1u) {
-            let raw_wave = get_waveform(i, final_uv.x); // -1.0 to 1.0
+            let raw_wave = get_waveform_interpolated(i, final_uv.x); // -1.0 to 1.0
             let wave_y = raw_wave * 0.4 + 0.5; // Map to 0.1 - 0.9 range
             let dist = abs(final_uv.y - wave_y);
             
             // Age factor: oldest is 1/60, newest is 1.0
-            // We use an exponential decay so the newest frame is brightest, and it fades quickly
             let age_linear = f32(i + 1u) / 60.0;
             let age = pow(age_linear, 3.0); 
             
@@ -226,8 +238,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let bloom = 0.001 / (dist * dist + 0.001) * 0.3;
             
             let frame_intensity = (line_intensity + bloom) * age;
-            final_color = final_color + amber * frame_intensity;
+            wave_intensity = max(wave_intensity, frame_intensity);
         }
+        
+        final_color = final_color + amber * wave_intensity;
         
         // Shadow mask: High frequency RGB dot pattern
         let mask_x = fract(in.uv.x * 600.0);

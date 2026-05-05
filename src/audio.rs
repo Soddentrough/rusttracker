@@ -75,12 +75,19 @@ fn spawn_dsp_thread(
                 state.raw_spectrum_data.copy_from_slice(&binned_data);
                 
                 // --- Waveform extraction (Zero-Crossing Edge Trigger) ---
-                // Scan the 4096 buffer for a zero-crossing (negative to positive) to stabilize the wave
+                // Scan the first half of the buffer for the steepest positive zero-crossing.
+                // This acts as a heuristic to lock onto the fundamental frequency (bass/kick)
+                // rather than triggering randomly on high-frequency noise ripples.
                 let mut start_idx = 0;
-                for i in 0..(msg.audio_data.len() - 512) {
-                    if msg.audio_data[i] < 0.0 && msg.audio_data[i + 1] >= 0.0 {
-                        start_idx = i;
-                        break;
+                let mut best_slope = 0.0;
+                let search_limit = msg.audio_data.len().saturating_sub(512);
+                for i in 0..search_limit {
+                    if msg.audio_data[i] <= 0.0 && msg.audio_data[i + 1] > 0.0 {
+                        let slope = msg.audio_data[i + 1] - msg.audio_data[i];
+                        if slope > best_slope {
+                            best_slope = slope;
+                            start_idx = i;
+                        }
                     }
                 }
                 
