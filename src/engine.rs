@@ -401,28 +401,42 @@ impl<'a> VulkanEngine<'a> {
                             let played_rect = egui::Rect::from_min_size(rect.min, egui::vec2(played_width, rect.height()));
                             painter.rect_filled(played_rect, 2.0, egui::Color32::from_rgb(45, 20, 15)); // Deep charred red/brown
                             
-                            // Fire indicator (Current position)
+                            // Fire indicator (Particle System)
                             if progress > 0.0 && progress < 1.0 {
                                 let fire_x = rect.min.x + played_width;
                                 let time = state.current_seconds as f32;
                                 
-                                // Draw multiple flickering fire layers
-                                for i in 0..3 {
-                                    let phase = i as f32 * 1.5;
-                                    let flicker_w = ((time * 12.0 + phase).sin() * 0.5 + 0.5) * 4.0;
-                                    let flicker_h = ((time * 18.0 + phase * 2.0).cos() * 0.5 + 0.5) * 8.0;
+                                // Stateless particle system
+                                for i in 0..40 {
+                                    // Pseudo-random hash for this particle index
+                                    let seed = i as f32;
+                                    let h1 = ((seed * 12.9898 + 78.233).sin() * 43758.5453).fract().abs();
+                                    let h2 = ((seed * 39.346 + 11.135).sin() * 43758.5453).fract().abs();
+                                    let h3 = ((seed * 73.156 + 52.235).sin() * 43758.5453).fract().abs();
                                     
-                                    let f_rect = egui::Rect::from_min_max(
-                                        egui::pos2(fire_x - 2.0 - flicker_w, rect.min.y - flicker_h),
-                                        egui::pos2(fire_x + 2.0, rect.max.y)
+                                    // Particle properties
+                                    let speed = 1.0 + h1 * 1.5;
+                                    let local_time = (time * speed + h2 * 100.0).fract(); // loops 0.0 to 1.0
+                                    
+                                    // Physics
+                                    let base_x = fire_x - 1.0;
+                                    let x_drift = (h3 - 0.5) * 12.0 + (local_time * 10.0 + h1 * 10.0).sin() * 3.0;
+                                    let y_rise = local_time * 24.0;
+                                    let x = base_x + x_drift;
+                                    let y = rect.max.y - 2.0 - y_rise;
+                                    
+                                    // Size and color fade over lifetime
+                                    let size = (1.0 - local_time) * (1.5 + h1 * 2.5);
+                                    let r = 255;
+                                    let g = (255.0 * (1.0 - local_time.powf(0.5))) as u8;
+                                    let b = (100.0 * (1.0 - local_time * 2.0).max(0.0)) as u8;
+                                    let a = (255.0 * (1.0 - local_time)) as u8;
+                                    
+                                    painter.circle_filled(
+                                        egui::pos2(x, y),
+                                        size,
+                                        egui::Color32::from_rgba_unmultiplied(r, g, b, a)
                                     );
-                                    
-                                    let color = match i {
-                                        0 => egui::Color32::from_rgba_unmultiplied(255, 50, 0, 100),   // Red glow
-                                        1 => egui::Color32::from_rgba_unmultiplied(255, 120, 0, 180),  // Orange mid
-                                        _ => egui::Color32::from_rgba_unmultiplied(255, 255, 100, 255), // White/Yellow hot core
-                                    };
-                                    painter.rect_filled(f_rect, 2.0, color);
                                 }
                             }
                             
