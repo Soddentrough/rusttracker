@@ -66,10 +66,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         return vec4<f32>(0.02, 0.02, 0.03, 1.0); // Gap color
     }
     
-    // Create vertical segmented LEDs
-    let num_leds = 40.0;
+    // Calculate aspect ratio dynamically using screen-space derivatives!
+    // dpdx(uv.x) = 1.0 / window_width
+    // dpdy(uv.y) = 1.0 / window_height
+    // This allows us to make perfectly square cells that adapt to any window size.
+    let aspect = dpdx(in.uv.x) / dpdy(in.uv.y);
+    let num_leds = 512.0 * aspect;
+    
     let led_y = fract((1.0 - in.uv.y) * num_leds);
-    if led_y < 0.1 || led_y > 0.9 {
+    if led_y < 0.15 || led_y > 0.85 {
         return vec4<f32>(0.02, 0.02, 0.03, 1.0); // LED gap
     }
     
