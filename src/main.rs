@@ -373,17 +373,26 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                     }
                     
                     // Fallback for Wayland/Mesa broken FIFO vsync:
-                    // If the elapsed time is suspiciously low (e.g. 500+ FPS), 
-                    // force a manual sleep to the monitor's refresh rate.
-                    let target_fps = window.current_monitor()
-                        .and_then(|m| m.refresh_rate_millihertz())
-                        .map(|mhz| mhz as f32 / 1000.0)
-                        .unwrap_or(60.0);
-                        
-                    let target_frame_time = Duration::from_secs_f32(1.0 / target_fps);
-                    let elapsed = now.elapsed();
-                    if elapsed < target_frame_time {
-                        std::thread::sleep(target_frame_time - elapsed);
+                    // Only manually throttle if hardware VSYNC completely failed (e.g. running > 200 FPS).
+                    // Unconditional std::thread::sleep overshoots by ~1ms, causing 120Hz monitors to drop to ~116 FPS.
+                    if raw_dt < 0.005 {
+                        let target_fps = window.current_monitor()
+                            .and_then(|m| m.refresh_rate_millihertz())
+                            .map(|mhz| mhz as f32 / 1000.0)
+                            .unwrap_or(60.0);
+                            
+                        let target_frame_time = Duration::from_secs_f32(1.0 / target_fps);
+                        let elapsed = now.elapsed();
+                        if elapsed < target_frame_time {
+                            // Sleep up to the last millisecond, then spin-lock for exact precision
+                            let sleep_time = target_frame_time.saturating_sub(elapsed);
+                            if sleep_time > Duration::from_millis(1) {
+                                std::thread::sleep(sleep_time - Duration::from_millis(1));
+                            }
+                            while now.elapsed() < target_frame_time {
+                                std::hint::spin_loop();
+                            }
+                        }
                     }
                     
                     window.request_redraw();

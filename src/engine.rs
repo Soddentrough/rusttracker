@@ -89,8 +89,8 @@ impl<'a> VulkanEngine<'a> {
             .find(|f| f.is_srgb())
             .unwrap_or(surface_caps.formats[0]);
 
-        // Lock to VSYNC strictly
-        let present_mode = wgpu::PresentMode::Fifo;
+        // Let WGPU pick the best VSYNC method (Fifo, Mailbox, or FifoRelaxed)
+        let present_mode = wgpu::PresentMode::AutoVsync;
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
