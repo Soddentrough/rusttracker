@@ -1,3 +1,5 @@
+#![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
+
 use std::{error::Error, io, sync::{Arc, Mutex}, time::{Duration, Instant}};
 use clap::Parser;
 use crossterm::{
@@ -124,9 +126,16 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                         if let PhysicalKey::Code(keycode) = kb_event.physical_key {
                             match keycode {
                                 WinitKeyCode::Escape | WinitKeyCode::KeyQ => elwt.exit(),
-                                WinitKeyCode::Tab | WinitKeyCode::KeyF => {
+                                WinitKeyCode::Tab => {
                                     let mut state = app_state.lock().unwrap();
                                     state.show_hud = !state.show_hud;
+                                },
+                                WinitKeyCode::KeyF => {
+                                    if window.fullscreen().is_some() {
+                                        window.set_fullscreen(None);
+                                    } else {
+                                        window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+                                    }
                                 },
                                 WinitKeyCode::KeyO => {
                                     let app_state_clone = Arc::clone(&app_state);

@@ -230,42 +230,75 @@ impl<'a> VulkanEngine<'a> {
                     .inner_margin(40.0);
                     
                 egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
-                    ui.vertical_centered(|ui| {
-                        ui.add_space(ctx.screen_rect().height() / 3.0 - 50.0);
-                        
-                        ui.label(
-                            egui::RichText::new("RustTracker")
-                                .size(72.0)
-                                .color(egui::Color32::from_rgb(100, 200, 255))
-                                .strong()
-                        );
-                        ui.add_space(10.0);
-                        ui.label(egui::RichText::new("A High-Performance Vulkan Module Visualizer").size(18.0).color(egui::Color32::GRAY));
-                        
-                        ui.add_space(40.0);
-                        
-                        let btn = egui::Button::new(
-                            egui::RichText::new("  OPEN TRACKER MODULE  ")
-                                .size(24.0)
-                                .color(egui::Color32::WHITE)
-                                .strong()
-                        )
-                        .fill(egui::Color32::from_rgb(0, 120, 215))
-                        .corner_radius(8.0);
-                        
-                        if ui.add_sized([350.0, 60.0], btn).clicked() {
-                            engine_action = EngineAction::OpenFile;
+                    let avail_height = ui.available_height();
+                    let content_height = 450.0;
+                    let space = (avail_height - content_height) / 2.0;
+                    if space > 0.0 {
+                        ui.add_space(space);
+                    }
+                    
+                    ui.allocate_ui_with_layout(
+                        ui.available_size(),
+                        egui::Layout::top_down(egui::Align::Center),
+                        |ui| {
+                            ui.label(
+                                egui::RichText::new("RustTracker")
+                                    .size(72.0)
+                                    .color(egui::Color32::from_rgb(100, 200, 255))
+                                    .strong()
+                            );
+                            ui.add_space(10.0);
+                            ui.label(egui::RichText::new("A High-Performance Vulkan Module Visualizer").size(18.0).color(egui::Color32::GRAY));
+                            
+                            ui.add_space(40.0);
+                            
+                            let btn = egui::Button::new(
+                                egui::RichText::new("  OPEN TRACKER MODULE  ")
+                                    .size(24.0)
+                                    .color(egui::Color32::WHITE)
+                                    .strong()
+                            )
+                            .fill(egui::Color32::from_rgb(0, 120, 215))
+                            .corner_radius(8.0);
+                            
+                            if ui.add_sized([350.0, 60.0], btn).clicked() {
+                                engine_action = EngineAction::OpenFile;
+                            }
+                            
+                            ui.add_space(60.0);
+                            ui.label(egui::RichText::new("Keyboard Shortcuts").color(egui::Color32::LIGHT_GRAY).strong().size(18.0));
+                            ui.add_space(15.0);
+                            
+                            egui::Grid::new("shortcuts_grid")
+                                .num_columns(2)
+                                .spacing([30.0, 8.0])
+                                .show(ui, |ui| {
+                                    ui.label(egui::RichText::new("O").color(egui::Color32::WHITE).strong());
+                                    ui.label(egui::RichText::new("Open File").color(egui::Color32::GRAY));
+                                    ui.end_row();
+                                    
+                                    ui.label(egui::RichText::new("Tab").color(egui::Color32::WHITE).strong());
+                                    ui.label(egui::RichText::new("Toggle HUD").color(egui::Color32::GRAY));
+                                    ui.end_row();
+                                    
+                                    ui.label(egui::RichText::new("F").color(egui::Color32::WHITE).strong());
+                                    ui.label(egui::RichText::new("Toggle Fullscreen").color(egui::Color32::GRAY));
+                                    ui.end_row();
+                                    
+                                    ui.label(egui::RichText::new("Space").color(egui::Color32::WHITE).strong());
+                                    ui.label(egui::RichText::new("Play / Pause").color(egui::Color32::GRAY));
+                                    ui.end_row();
+
+                                    ui.label(egui::RichText::new("Arrows").color(egui::Color32::WHITE).strong());
+                                    ui.label(egui::RichText::new("Seek Timeline").color(egui::Color32::GRAY));
+                                    ui.end_row();
+                                    
+                                    ui.label(egui::RichText::new("Q / Esc").color(egui::Color32::WHITE).strong());
+                                    ui.label(egui::RichText::new("Quit").color(egui::Color32::GRAY));
+                                    ui.end_row();
+                                });
                         }
-                        
-                        ui.add_space(60.0);
-                        ui.label(egui::RichText::new("Keyboard Shortcuts").color(egui::Color32::LIGHT_GRAY).strong().size(18.0));
-                        ui.add_space(10.0);
-                        ui.label(egui::RichText::new("O : Open File").color(egui::Color32::GRAY));
-                        ui.label(egui::RichText::new("Tab / F : Toggle HUD").color(egui::Color32::GRAY));
-                        ui.label(egui::RichText::new("Q / Esc : Quit").color(egui::Color32::GRAY));
-                        ui.label(egui::RichText::new("Space : Play / Pause").color(egui::Color32::GRAY));
-                        ui.label(egui::RichText::new("Arrows : Seek").color(egui::Color32::GRAY));
-                    });
+                    );
                 });
                 return;
             }
