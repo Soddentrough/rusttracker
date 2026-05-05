@@ -172,13 +172,17 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                                 WinitKeyCode::KeyO => {
                                     let app_state_clone = Arc::clone(&app_state);
                                     std::thread::spawn(move || {
-                                        if let Some(path) = rfd::FileDialog::new()
+                                        if let Some(paths) = rfd::FileDialog::new()
                                             .add_filter("Tracker Modules", &["mod", "s3m", "xm", "it", "stm", "669", "mtm", "med", "okt", "psm"])
                                             .add_filter("All Files", &["*"])
-                                            .pick_file() {
-                                            let mut state = app_state_clone.lock().unwrap();
-                                            state.load_request = Some(path.display().to_string());
-                                            state.file_loaded = true;
+                                            .pick_files() {
+                                            if !paths.is_empty() {
+                                                let mut state = app_state_clone.lock().unwrap();
+                                                state.playlist = paths.into_iter().map(|p| p.display().to_string()).collect();
+                                                state.playlist_index = 0;
+                                                state.load_request = Some(state.playlist[0].clone());
+                                                state.file_loaded = true;
+                                            }
                                         }
                                     });
                                 },
@@ -199,6 +203,14 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                                     state.seek_request = Some(target);
                                     state.spectrum_history.clear();
                                     for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 512]); }
+                                },
+                                WinitKeyCode::ArrowUp => {
+                                    let mut state = app_state.lock().unwrap();
+                                    state.visualizer_mode = (state.visualizer_mode + 1) % 3;
+                                },
+                                WinitKeyCode::ArrowDown => {
+                                    let mut state = app_state.lock().unwrap();
+                                    state.visualizer_mode = if state.visualizer_mode == 0 { 2 } else { state.visualizer_mode - 1 };
                                 },
                                 _ => {}
                             }

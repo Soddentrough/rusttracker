@@ -35,6 +35,7 @@ pub struct AppState {
     pub playlist: Vec<String>,
     pub playlist_index: usize,
     pub track_ended: bool,
+    pub visualizer_mode: u32,
 }
 
 impl AppState {
@@ -78,6 +79,7 @@ impl AppState {
             playlist: Vec::new(),
             playlist_index: 0,
             track_ended: false,
+            visualizer_mode: 0,
         }
     }
 }

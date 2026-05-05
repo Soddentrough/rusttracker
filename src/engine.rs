@@ -14,7 +14,9 @@ pub struct AudioUniforms {
     pub spectrum: [f32; 512],
     pub channels: [f32; 32],
     pub num_channels: u32,
-    pub _padding: [f32; 3],
+    pub mode: u32,
+    pub time: f32,
+    pub _padding: u32,
 }
 
 pub struct VulkanEngine<'a> {
@@ -193,7 +195,9 @@ impl<'a> VulkanEngine<'a> {
             spectrum: [0.0; 512],
             channels: [0.0; 32],
             num_channels: state.num_channels as u32,
-            _padding: [0.0; 3],
+            mode: state.visualizer_mode,
+            time: state.current_seconds as f32,
+            _padding: 0,
         };
 
         uniforms.spectrum.copy_from_slice(&state.spectrum_data);
