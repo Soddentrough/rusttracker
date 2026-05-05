@@ -539,6 +539,13 @@ impl<'a> VulkanEngine<'a> {
                             if state.num_samples > 0 { columns[2].horizontal(|ui| { ui.label("Samples"); ui.label(format!("{}", state.num_samples)); }); }
                             columns[2].horizontal(|ui| { ui.label("Channels"); ui.label(format!("{}", state.num_channels)); });
                             columns[2].horizontal(|ui| { ui.label("Length"); ui.label(format!("{:.1}s", state.duration_seconds)); });
+                            columns[2].add_space(8.0);
+                            let progress = if state.duration_seconds > 0.0 {
+                                (state.current_seconds / state.duration_seconds) as f32
+                            } else {
+                                0.0
+                            }.clamp(0.0, 1.0);
+                            columns[2].add(egui::ProgressBar::new(progress).text(format!("{:.1}s / {:.1}s", state.current_seconds, state.duration_seconds)));
                         });
                     });
             }
