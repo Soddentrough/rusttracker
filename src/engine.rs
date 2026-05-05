@@ -66,14 +66,8 @@ impl<'a> VulkanEngine<'a> {
             .find(|f| f.is_srgb())
             .unwrap_or(surface_caps.formats[0]);
 
-        // Use Mailbox or Immediate for 240Hz un-capped rendering if available
-        let present_mode = if surface_caps.present_modes.contains(&wgpu::PresentMode::Mailbox) {
-            wgpu::PresentMode::Mailbox
-        } else if surface_caps.present_modes.contains(&wgpu::PresentMode::Immediate) {
-            wgpu::PresentMode::Immediate
-        } else {
-            wgpu::PresentMode::Fifo
-        };
+        // Lock to VSYNC strictly
+        let present_mode = wgpu::PresentMode::Fifo;
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
