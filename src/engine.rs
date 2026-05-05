@@ -27,6 +27,7 @@ pub struct VulkanEngine<'a> {
     uniform_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
     pub egui_renderer: egui_wgpu::Renderer,
+    pub heatmap_texture: Option<egui::TextureHandle>,
 }
 
 impl<'a> VulkanEngine<'a> {
@@ -178,6 +179,7 @@ impl<'a> VulkanEngine<'a> {
             uniform_buffer,
             uniform_bind_group,
             egui_renderer,
+            heatmap_texture: None,
         }
     }
 
@@ -392,51 +394,59 @@ impl<'a> VulkanEngine<'a> {
                                 let chunks = 64; // Downsample 512 bands to 64 for visual clarity & performance
                                 let chunk_size = raw_bands / chunks;
                                 
-                                let cell_h = hm_rect.height() / history_len as f32; // Fill entire height
                                 let cell_w = hm_rect.width() / chunks as f32; // Horizontal frequency scale
                                 
                                 let center_y = hm_rect.top() + hm_rect.height() / 2.0;
                                 
-                                // Draw faint background grid
-                                painter.rect_filled(hm_rect, 0.0, egui::Color32::from_rgb(20, 20, 22));
-                                for c in 0..=chunks {
-                                    let x = hm_rect.left() + c as f32 * cell_w;
-                                    painter.line_segment([egui::pos2(x, hm_rect.top()), egui::pos2(x, hm_rect.bottom())], (1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 5)));
-                                }
+                                let mut image = egui::ColorImage::new([chunks, history_len], egui::Color32::from_rgb(20, 20, 22));
                                 
-                                // Draw vertical heatmap
                                 for (time_idx, bands) in state.spectrum_history.iter().enumerate() {
                                     // time_idx 119 (newest) at bottom. time_idx 0 (oldest) at top.
-                                    let y = hm_rect.bottom() - (history_len - 1 - time_idx) as f32 * cell_h;
+                                    let y = history_len - 1 - time_idx;
                                     
-                                    for c in 0..chunks {
+                                    for x in 0..chunks {
                                         let mut max_val = 0.0;
                                         for k in 0..chunk_size {
-                                            let idx = c * chunk_size + k;
+                                            let idx = x * chunk_size + k;
                                             if idx < bands.len() && bands[idx] > max_val {
                                                 max_val = bands[idx];
                                             }
                                         }
                                         
                                         if max_val > 5.0 {
-                                            let x = hm_rect.left() + c as f32 * cell_w;
                                             let color = if max_val > 60.0 {
-                                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 128)
+                                                egui::Color32::from_rgb(180, 180, 180)
                                             } else if max_val > 30.0 {
-                                                egui::Color32::from_rgba_unmultiplied(255, 140, 0, 128)
+                                                egui::Color32::from_rgb(255, 140, 0)
                                             } else {
-                                                egui::Color32::from_rgba_unmultiplied(180, 20, 20, 128)
+                                                egui::Color32::from_rgb(180, 20, 20)
                                             };
-                                            painter.rect_filled(
-                                                egui::Rect::from_min_max(
-                                                    egui::pos2(x, y),
-                                                    egui::pos2(x + cell_w + 1.0, y + cell_h + 1.0)
-                                                ),
-                                                0.0,
-                                                color
-                                            );
+                                            image[(x, y)] = color;
                                         }
                                     }
+                                }
+                                
+                                if self.heatmap_texture.is_none() {
+                                    self.heatmap_texture = Some(ctx.load_texture(
+                                        "heatmap",
+                                        image,
+                                        egui::TextureOptions::NEAREST
+                                    ));
+                                } else {
+                                    self.heatmap_texture.as_mut().unwrap().set(image, egui::TextureOptions::NEAREST);
+                                }
+                                
+                                painter.image(
+                                    self.heatmap_texture.as_ref().unwrap().id(),
+                                    hm_rect,
+                                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                    egui::Color32::WHITE
+                                );
+                                
+                                // Draw faint background grid over the texture
+                                for c in 0..=chunks {
+                                    let x = hm_rect.left() + c as f32 * cell_w;
+                                    painter.line_segment([egui::pos2(x, hm_rect.top()), egui::pos2(x, hm_rect.bottom())], (1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 5)));
                                 }
                                 
                                 // Draw Tracker Text Overlay
