@@ -30,6 +30,8 @@ pub struct AppState {
     pub tracker_patterns_by_order: Vec<Vec<String>>,
     pub load_request: Option<String>,
     pub file_loaded: bool,
+    pub show_stats: bool,
+    pub current_fps: f32,
 }
 
 impl AppState {
@@ -68,6 +70,8 @@ impl AppState {
             tracker_row_history: VecDeque::with_capacity(128),
             tracker_patterns_by_order: Vec::new(),
             load_request: None,
+            show_stats: false,
+            current_fps: 0.0,
         }
     }
 }

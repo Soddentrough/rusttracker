@@ -137,6 +137,10 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                                         window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
                                     }
                                 },
+                                WinitKeyCode::KeyS => {
+                                    let mut state = app_state.lock().unwrap();
+                                    state.show_stats = !state.show_stats;
+                                },
                                 WinitKeyCode::KeyO => {
                                     let app_state_clone = Arc::clone(&app_state);
                                     std::thread::spawn(move || {
@@ -196,12 +200,15 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                     }
 
                     let now = Instant::now();
-                    let dt = now.duration_since(last_update).as_secs_f32().min(0.1);
+                    let raw_dt = now.duration_since(last_update).as_secs_f32();
+                    let dt = raw_dt.min(0.1);
                     last_update = now;
                     let time_scale = dt * 60.0; // Decay logic built for 60fps
+                    let fps = if raw_dt > 0.0 { 1.0 / raw_dt } else { 0.0 };
 
                     {
                         let mut state = app_state.lock().unwrap();
+                        state.current_fps = state.current_fps * 0.9 + fps * 0.1;
                         
                         if !state.file_loaded {
                             let t = now.elapsed().as_secs_f32();

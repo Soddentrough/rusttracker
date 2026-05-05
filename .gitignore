@@ -1,1 +1,13 @@
 /target
+
+# Tracker Modules
+*.mod
+*.s3m
+*.xm
+*.it
+*.stm
+*.669
+*.mtm
+*.med
+*.okt
+*.psm

@@ -222,6 +222,22 @@ impl<'a> VulkanEngine<'a> {
         let mut engine_action = EngineAction::None;
         
         let full_output = egui_ctx.run(raw_input, |ctx| {
+            if state.show_stats {
+                egui::Window::new("Stats")
+                    .anchor(egui::Align2::RIGHT_TOP, [-10.0, 10.0])
+                    .title_bar(false)
+                    .resizable(false)
+                    .collapsible(false)
+                    .frame(egui::Frame::window(&ctx.style()).fill(egui::Color32::from_black_alpha(200)))
+                    .show(ctx, |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("FPS: {:.1}", state.current_fps))
+                                .color(egui::Color32::GREEN)
+                                .strong()
+                        );
+                    });
+            }
+
             if !state.file_loaded {
                 central_rect = ctx.screen_rect();
                 
