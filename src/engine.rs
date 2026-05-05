@@ -212,9 +212,11 @@ impl<'a> VulkanEngine<'a> {
 
         // Process egui UI
         let raw_input = egui_state.take_egui_input(window);
-        let mut central_rect = egui::Rect::NOTHING;
+        let mut central_rect = egui::Rect::from_min_max(Default::default(), egui::pos2(self.config.width as f32, self.config.height as f32));
+        
         let full_output = egui_ctx.run(raw_input, |ctx| {
             if !state.file_loaded {
+                central_rect = ctx.screen_rect();
                 egui::CentralPanel::default().show(ctx, |ui| {
                     ui.vertical_centered(|ui| {
                         ui.add_space(ctx.screen_rect().height() / 3.0);
