@@ -2,6 +2,12 @@ use std::sync::Arc;
 use winit::window::Window;
 use crate::state::AppState;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum EngineAction {
+    None,
+    OpenFile,
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct AudioUniforms {
@@ -206,37 +212,58 @@ impl<'a> VulkanEngine<'a> {
         egui_ctx: &egui::Context,
         egui_state: &mut egui_winit::State,
         state: &mut AppState,
-    ) -> Result<(), wgpu::SurfaceError> {
+    ) -> Result<EngineAction, wgpu::SurfaceError> {
         let output = self.surface.get_current_texture()?;
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         // Process egui UI
         let raw_input = egui_state.take_egui_input(window);
         let mut central_rect = egui::Rect::from_min_max(Default::default(), egui::pos2(self.config.width as f32, self.config.height as f32));
+        let mut engine_action = EngineAction::None;
         
         let full_output = egui_ctx.run(raw_input, |ctx| {
             if !state.file_loaded {
                 central_rect = ctx.screen_rect();
-                egui::CentralPanel::default().show(ctx, |ui| {
+                
+                let frame = egui::Frame::NONE
+                    .fill(egui::Color32::from_rgba_unmultiplied(10, 10, 15, 200)) // dark tint to pop text over the visualizer
+                    .inner_margin(40.0);
+                    
+                egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
                     ui.vertical_centered(|ui| {
-                        ui.add_space(ctx.screen_rect().height() / 3.0);
-                        ui.heading(egui::RichText::new("RustTracker").size(48.0));
-                        ui.add_space(20.0);
-                        if ui.button(egui::RichText::new("OPEN FILE").size(24.0)).clicked() {
-                            if let Some(path) = rfd::FileDialog::new()
-                                .add_filter("Tracker Modules", &["mod", "s3m", "xm", "it", "stm", "669", "mtm", "med", "okt", "psm"])
-                                .add_filter("All Files", &["*"])
-                                .pick_file() {
-                                state.load_request = Some(path.display().to_string());
-                                state.file_loaded = true;
-                            }
-                        }
+                        ui.add_space(ctx.screen_rect().height() / 3.0 - 50.0);
+                        
+                        ui.label(
+                            egui::RichText::new("RustTracker")
+                                .size(72.0)
+                                .color(egui::Color32::from_rgb(100, 200, 255))
+                                .strong()
+                        );
+                        ui.add_space(10.0);
+                        ui.label(egui::RichText::new("A High-Performance Vulkan Module Visualizer").size(18.0).color(egui::Color32::GRAY));
+                        
                         ui.add_space(40.0);
-                        ui.label(egui::RichText::new("Keyboard Shortcuts").strong().size(18.0));
-                        ui.label("Tab / F : Toggle HUD");
-                        ui.label("Q / Esc : Quit");
-                        ui.label("Space : Play / Pause");
-                        ui.label("Arrows : Seek");
+                        
+                        let btn = egui::Button::new(
+                            egui::RichText::new("  OPEN TRACKER MODULE  ")
+                                .size(24.0)
+                                .color(egui::Color32::WHITE)
+                                .strong()
+                        )
+                        .fill(egui::Color32::from_rgb(0, 120, 215))
+                        .corner_radius(8.0);
+                        
+                        if ui.add_sized([350.0, 60.0], btn).clicked() {
+                            engine_action = EngineAction::OpenFile;
+                        }
+                        
+                        ui.add_space(60.0);
+                        ui.label(egui::RichText::new("Keyboard Shortcuts").color(egui::Color32::LIGHT_GRAY).strong().size(18.0));
+                        ui.add_space(10.0);
+                        ui.label(egui::RichText::new("Tab / F : Toggle HUD").color(egui::Color32::GRAY));
+                        ui.label(egui::RichText::new("Q / Esc : Quit").color(egui::Color32::GRAY));
+                        ui.label(egui::RichText::new("Space : Play / Pause").color(egui::Color32::GRAY));
+                        ui.label(egui::RichText::new("Arrows : Seek").color(egui::Color32::GRAY));
                     });
                 });
                 return;
@@ -579,6 +606,6 @@ impl<'a> VulkanEngine<'a> {
             self.egui_renderer.free_texture(id);
         }
 
-        Ok(())
+        Ok(engine_action)
     }
 }

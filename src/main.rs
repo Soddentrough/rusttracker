@@ -18,7 +18,7 @@ mod ui;
 mod engine;
 
 use crate::state::AppState;
-use crate::engine::VulkanEngine;
+use crate::engine::{VulkanEngine, EngineAction};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
@@ -174,13 +174,26 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                     }
 
                     let now = Instant::now();
-                    let dt = now.duration_since(last_update).as_secs_f32();
+                    let dt = now.duration_since(last_update).as_secs_f32().min(0.1);
                     last_update = now;
                     let time_scale = dt * 60.0; // Decay logic built for 60fps
 
                     {
                         let mut state = app_state.lock().unwrap();
                         
+                        if !state.file_loaded {
+                            let t = now.elapsed().as_secs_f32();
+                            for i in 0..512 {
+                                let pct = i as f32 / 512.0;
+                                let wave1 = (t * 2.0 + pct * 10.0).sin();
+                                let wave2 = (t * 1.5 - pct * 15.0).cos();
+                                let wave3 = (t * 0.5 + pct * 5.0).sin();
+                                let combined = (wave1 + wave2 + wave3) / 3.0; // -1 to 1
+                                let val = (combined * 0.5 + 0.5).powf(2.0) * 0.5; // 0 to 0.5, biased low
+                                state.raw_spectrum_data[i] = val;
+                            }
+                        }
+
                         if state.channel_vus.len() != state.raw_channel_vus.len() {
                             state.channel_vus = vec![0.0; state.raw_channel_vus.len()];
                         }
@@ -232,13 +245,31 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                         engine.update(&state);
                     }
 
-                    let mut state = app_state.lock().unwrap();
-                    match engine.render(&window, &egui_ctx, &mut egui_state, &mut state) {
-                        Ok(_) => {}
-                        Err(wgpu::SurfaceError::Lost) => engine.resize(engine.size),
-                        Err(wgpu::SurfaceError::OutOfMemory) => elwt.exit(),
-                        Err(e) => eprintln!("{:?}", e),
+                    let mut action = EngineAction::None;
+                    {
+                        let mut state = app_state.lock().unwrap();
+                        match engine.render(&window, &egui_ctx, &mut egui_state, &mut state) {
+                            Ok(res) => action = res,
+                            Err(wgpu::SurfaceError::Lost) => engine.resize(engine.size),
+                            Err(wgpu::SurfaceError::OutOfMemory) => elwt.exit(),
+                            Err(e) => eprintln!("{:?}", e),
+                        }
                     }
+                    
+                    if action == EngineAction::OpenFile {
+                        let app_state_clone = Arc::clone(&app_state);
+                        std::thread::spawn(move || {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Tracker Modules", &["mod", "s3m", "xm", "it", "stm", "669", "mtm", "med", "okt", "psm"])
+                                .add_filter("All Files", &["*"])
+                                .pick_file() {
+                                let mut state = app_state_clone.lock().unwrap();
+                                state.load_request = Some(path.display().to_string());
+                                state.file_loaded = true;
+                            }
+                        });
+                    }
+                    
                     window.request_redraw();
                 }
                 _ => {}
