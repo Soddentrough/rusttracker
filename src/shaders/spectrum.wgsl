@@ -229,8 +229,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             // True exponential decay (e^-kx) like a real CRT phosphor
             // i=59 is the newest frame (frames_old = 0)
             let frames_old = 59.0 - f32(i);
-            // k=0.1 means it decays to ~5% brightness over 30 frames (0.5 seconds)
-            let age = exp(-frames_old * 0.1); 
+            
+            // The audio DSP sends a new waveform frame roughly every 93ms.
+            // k=0.8 means it decays to ~5% brightness over 4 frames (4 * 93ms = ~370ms)
+            // This provides a realistic "fraction of a second" phosphor decay.
+            let age = exp(-frames_old * 0.8); 
             
             // Anti-aliased line thickness
             let thickness = 0.003;
