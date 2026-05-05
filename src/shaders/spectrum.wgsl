@@ -140,42 +140,51 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     } 
     else if audio.mode == 1u {
-        // --- MODE 1: FIRE EFFECT ---
-        let heat_val = get_fire_heat(in.uv.x);
-        let heat = clamp(heat_val / 100.0, 0.0, 1.0);
+        // --- MODE 1: PROCEDURAL COMBUSTION ---
+        // Smooth out the incoming heat (fuel) by sampling slightly around it
+        let fuel1 = get_fire_heat(in.uv.x - 0.005) / 100.0;
+        let fuel2 = get_fire_heat(in.uv.x) / 100.0;
+        let fuel3 = get_fire_heat(in.uv.x + 0.005) / 100.0;
+        let fuel = clamp((fuel1 + fuel2 * 2.0 + fuel3) / 4.0, 0.0, 1.0);
+        
         let y = 1.0 - in.uv.y;
         
-        // Base shape of fire based on frequency amplitude
-        let shape = smoothstep(heat + 0.1, heat - 0.2, y);
+        // Base shape tapers off vertically
+        let base_mask = pow(1.0 - y, 2.0);
         
-        // Flowing noise
-        let t = audio.time * 3.0;
-        let n = fbm(vec2<f32>(in.uv.x * 15.0, y * 8.0 - t));
+        // Two layers of noise moving at different speeds for organic licks
+        let t = audio.time * 1.5;
+        let n1 = fbm(vec2<f32>(in.uv.x * 12.0, y * 6.0 - t * 1.8));
+        let n2 = fbm(vec2<f32>(in.uv.x * 25.0 - t * 0.5, y * 12.0 - t * 3.0));
+        let noise_mask = (n1 * 0.65 + n2 * 0.35);
         
-        // Combine shape and noise. The fire "licks" upwards
-        let final_heat = shape * n * 2.0;
+        // Intensity combines fuel, vertical falloff, and noise.
+        // We push the flame upwards but tear it apart with noise.
+        let intensity = (fuel * 1.2 + 0.1) * noise_mask * base_mask * 2.5;
+        let final_heat = clamp(intensity - (y * 0.8), 0.0, 1.2);
+        
+        // Procedural Fire Gradient Mapping
+        let color_smoke    = vec3<f32>(0.02, 0.02, 0.03);
+        let color_dark_red = vec3<f32>(0.5, 0.05, 0.0);
+        let color_orange   = vec3<f32>(1.0, 0.35, 0.0);
+        let color_yellow   = vec3<f32>(1.0, 0.85, 0.1);
+        let color_white    = vec3<f32>(1.0, 1.0, 1.0);
+        
+        var color = color_smoke;
+        color = mix(color, color_dark_red, smoothstep(0.05, 0.3, final_heat));
+        color = mix(color, color_orange,   smoothstep(0.3,  0.55, final_heat));
+        color = mix(color, color_yellow,   smoothstep(0.55, 0.8, final_heat));
+        color = mix(color, color_white,    smoothstep(0.8,  1.0, final_heat));
         
         // Embers / Sparks
-        let spark_n = fbm(vec2<f32>(in.uv.x * 50.0, y * 30.0 - t * 2.0));
-        let spark_mask = smoothstep(0.8, 1.0, spark_n) * smoothstep(0.0, 0.4, y) * smoothstep(heat + 0.3, heat, y);
+        let spark_t = audio.time * 2.5;
+        let spark_n = fbm(vec2<f32>(in.uv.x * 60.0 + spark_t * 0.2, y * 40.0 - spark_t));
+        // Sparks appear in high noise areas, and fade out towards the top or where fuel is zero
+        let spark_mask = smoothstep(0.85, 1.0, spark_n) * smoothstep(0.0, fuel + 0.3, 1.0 - y);
+        let spark_color = vec3<f32>(1.0, 0.7, 0.2) * spark_mask * 2.0;
         
-        var color = vec3<f32>(0.0, 0.0, 0.0);
-        if final_heat > 0.8 {
-            color = vec3<f32>(1.0, 1.0, 1.0); // White
-        } else if final_heat > 0.5 {
-            color = vec3<f32>(1.0, 0.8, 0.1); // Yellow
-        } else if final_heat > 0.2 {
-            color = vec3<f32>(1.0, 0.3, 0.0); // Orange
-        } else if final_heat > 0.05 {
-            color = vec3<f32>(0.6, 0.05, 0.0); // Dark red
-        } else if final_heat > 0.01 {
-            color = vec3<f32>(0.05, 0.05, 0.08); // Smoke
-        }
-        
-        // Add sparks
-        if spark_mask > 0.5 {
-            color = vec3<f32>(1.0, 0.7, 0.2); // Glowing ember
-        }
+        // Add sparks on top of the fire
+        color = color + spark_color;
         
         return vec4<f32>(color, 1.0);
     } 
