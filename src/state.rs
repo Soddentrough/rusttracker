@@ -6,6 +6,7 @@ pub struct PerformanceStats {
     pub fft_us: f32,
     pub ui_us: f32,
     pub render_us: f32,
+    pub shader_us: f32,
 }
 
 #[derive(Debug, Clone)]

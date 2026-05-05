@@ -331,11 +331,14 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                     let mut ui_time = 0.0;
                     let mut render_time = 0.0;
                     
+                    let mut shader_time = None;
+                    
                     match engine.render(&window, &egui_ctx, &mut egui_state, &state_copy) {
-                            Ok((res, ui_el, ren_el)) => {
+                            Ok((res, ui_el, ren_el, sh_el)) => {
                                 action = res;
                                 ui_time = ui_el;
                                 render_time = ren_el;
+                                shader_time = sh_el;
                             },
                             Err(wgpu::SurfaceError::Lost) => engine.resize(engine.size),
                             Err(wgpu::SurfaceError::OutOfMemory) => elwt.exit(),
@@ -346,6 +349,9 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                         let mut state = app_state.lock().unwrap();
                         state.stats.ui_us = state.stats.ui_us * 0.9 + ui_time * 0.1;
                         state.stats.render_us = state.stats.render_us * 0.9 + render_time * 0.1;
+                        if let Some(sh) = shader_time {
+                            state.stats.shader_us = state.stats.shader_us * 0.9 + sh * 0.1;
+                        }
                     }
                     
                     if action == EngineAction::OpenFile {

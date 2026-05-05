@@ -33,6 +33,12 @@ pub struct VulkanEngine<'a> {
     pub egui_renderer: egui_wgpu::Renderer,
     pub heatmap_texture: Option<egui::TextureHandle>,
     pub fire_buffer: Vec<u8>,
+    
+    query_set: Option<wgpu::QuerySet>,
+    query_resolve_buffer: Option<wgpu::Buffer>,
+    query_read_buffer: Option<wgpu::Buffer>,
+    timestamp_period: f32,
+    query_in_flight: bool,
 }
 
 impl<'a> VulkanEngine<'a> {
@@ -55,9 +61,15 @@ impl<'a> VulkanEngine<'a> {
             },
         ).await.unwrap();
 
+        let mut required_features = wgpu::Features::empty();
+        let supports_timestamps = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        if supports_timestamps {
+            required_features |= wgpu::Features::TIMESTAMP_QUERY;
+        }
+
         let (device, queue) = adapter.request_device(
             &wgpu::DeviceDescriptor {
-                required_features: wgpu::Features::empty(),
+                required_features,
                 required_limits: wgpu::Limits::default(),
                 memory_hints: Default::default(),
                 label: None,
@@ -168,6 +180,33 @@ impl<'a> VulkanEngine<'a> {
 
         let egui_renderer = egui_wgpu::Renderer::new(&device, config.format, None, 1, false);
 
+        let mut query_set = None;
+        let mut query_resolve_buffer = None;
+        let mut query_read_buffer = None;
+        let timestamp_period = queue.get_timestamp_period();
+
+        if supports_timestamps {
+            query_set = Some(device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("Shader Timestamps"),
+                count: 2,
+                ty: wgpu::QueryType::Timestamp,
+            }));
+
+            query_resolve_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Query Resolve Buffer"),
+                size: 16,
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }));
+
+            query_read_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Query Read Buffer"),
+                size: 16,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            }));
+        }
+
         Self {
             surface,
             device,
@@ -180,6 +219,11 @@ impl<'a> VulkanEngine<'a> {
             egui_renderer,
             heatmap_texture: None,
             fire_buffer: vec![0; 80 * 20],
+            query_set,
+            query_resolve_buffer,
+            query_read_buffer,
+            timestamp_period,
+            query_in_flight: false,
         }
     }
 
@@ -222,10 +266,33 @@ impl<'a> VulkanEngine<'a> {
         egui_ctx: &egui::Context,
         egui_state: &mut egui_winit::State,
         state: &AppState,
-    ) -> Result<(EngineAction, f32, f32), wgpu::SurfaceError> {
+    ) -> Result<(EngineAction, f32, f32, Option<f32>), wgpu::SurfaceError> {
         let ui_start = std::time::Instant::now();
         let output = self.surface.get_current_texture()?;
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut shader_time_us = None;
+        if self.query_in_flight {
+            if let Some(read_buffer) = &self.query_read_buffer {
+                let slice = read_buffer.slice(..);
+                let (tx, rx) = std::sync::mpsc::channel();
+                slice.map_async(wgpu::MapMode::Read, move |v| tx.send(v).unwrap());
+                self.device.poll(wgpu::Maintain::Wait);
+                if rx.recv().unwrap().is_ok() {
+                    let data = slice.get_mapped_range();
+                    let start: u64 = u64::from_le_bytes(data[0..8].try_into().unwrap());
+                    let end: u64 = u64::from_le_bytes(data[8..16].try_into().unwrap());
+                    drop(data);
+                    read_buffer.unmap();
+                    self.query_in_flight = false;
+                    
+                    if end > start {
+                        let elapsed_ns = (end - start) as f32 * self.timestamp_period;
+                        shader_time_us = Some(elapsed_ns / 1_000.0);
+                    }
+                }
+            }
+        }
 
         // Process egui UI
         let raw_input = egui_state.take_egui_input(window);
@@ -256,6 +323,10 @@ impl<'a> VulkanEngine<'a> {
                         );
                         ui.label(
                             egui::RichText::new(format!("FFT: {:.2} ms | Decode: {:.2} ms", state.stats.fft_us / 1000.0, state.stats.decode_us / 1000.0))
+                                .color(egui::Color32::GRAY)
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("Shader: {:.2} ms", state.stats.shader_us / 1000.0))
                                 .color(egui::Color32::GRAY)
                         );
                     });
@@ -789,7 +860,13 @@ impl<'a> VulkanEngine<'a> {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None,
+                timestamp_writes: if let Some(qs) = &self.query_set {
+                    Some(wgpu::RenderPassTimestampWrites {
+                        query_set: qs,
+                        beginning_of_pass_write_index: Some(0),
+                        end_of_pass_write_index: Some(1),
+                    })
+                } else { None },
                 occlusion_query_set: None,
             });
 
@@ -827,6 +904,12 @@ impl<'a> VulkanEngine<'a> {
             self.egui_renderer.render(&mut render_pass, &clipped_primitives, &screen_descriptor);
         }
 
+        if let (Some(qs), Some(res_buf), Some(read_buf)) = (&self.query_set, &self.query_resolve_buffer, &self.query_read_buffer) {
+            encoder.resolve_query_set(qs, 0..2, res_buf, 0);
+            encoder.copy_buffer_to_buffer(res_buf, 0, read_buf, 0, 16);
+            self.query_in_flight = true;
+        }
+
         self.queue.submit(std::iter::once(encoder.finish()));
         output.present();
 
@@ -836,6 +919,6 @@ impl<'a> VulkanEngine<'a> {
         
         let render_elapsed = render_start.elapsed().as_micros() as f32;
 
-        Ok((engine_action, ui_elapsed, render_elapsed))
+        Ok((engine_action, ui_elapsed, render_elapsed, shader_time_us))
     }
 }
