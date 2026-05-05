@@ -68,6 +68,23 @@ fn spawn_dsp_thread(
                 
                 state.raw_spectrum_data.copy_from_slice(&binned_data);
                 
+                // --- Waveform extraction ---
+                // Take 512 samples from the center of the 4096 buffer for a stable waveform
+                let offset = (4096 - 512) / 2;
+                for i in 0..512 {
+                    state.raw_waveform[i] = msg.audio_data[offset + i];
+                }
+                
+                // --- Fire Heat Decay ---
+                for i in 0..512 {
+                    let current = binned_data[i];
+                    if current > state.fire_heat[i] {
+                        state.fire_heat[i] = current; // Instant ignition
+                    } else {
+                        state.fire_heat[i] = (state.fire_heat[i] - 1.5).max(0.0); // Slow decay
+                    }
+                }
+                
                 if msg.bpm != 0 { state.bpm = msg.bpm; }
                 if msg.speed != 0 { state.speed = msg.speed; }
                 state.current_seconds = msg.current_seconds;

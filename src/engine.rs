@@ -12,6 +12,8 @@ pub enum EngineAction {
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct AudioUniforms {
     pub spectrum: [f32; 512],
+    pub waveform: [f32; 512],
+    pub fire_heat: [f32; 512],
     pub channels: [f32; 32],
     pub num_channels: u32,
     pub mode: u32,
@@ -193,6 +195,8 @@ impl<'a> VulkanEngine<'a> {
     pub fn update(&mut self, state: &AppState) {
         let mut uniforms = AudioUniforms {
             spectrum: [0.0; 512],
+            waveform: [0.0; 512],
+            fire_heat: [0.0; 512],
             channels: [0.0; 32],
             num_channels: state.num_channels as u32,
             mode: state.visualizer_mode,
@@ -201,6 +205,8 @@ impl<'a> VulkanEngine<'a> {
         };
 
         uniforms.spectrum.copy_from_slice(&state.spectrum_data);
+        uniforms.waveform.copy_from_slice(&state.raw_waveform);
+        uniforms.fire_heat.copy_from_slice(&state.fire_heat);
         
         let ch_len = state.channel_vus.len().min(32);
         uniforms.channels[..ch_len].copy_from_slice(&state.channel_vus[..ch_len]);

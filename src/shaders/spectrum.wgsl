@@ -15,6 +15,8 @@ fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
 
 struct AudioUniforms {
     spectrum: array<vec4<f32>, 128>,
+    waveform: array<vec4<f32>, 128>,
+    fire_heat: array<vec4<f32>, 128>,
     channels: array<vec4<f32>, 8>,
     num_channels: u32,
     mode: u32,
@@ -85,6 +87,32 @@ fn get_amplitude(x: f32) -> f32 {
     else { return spec_vec.w; }
 }
 
+fn get_fire_heat(x: f32) -> f32 {
+    let freq_idx = u32(x * 512.0);
+    let clamped_idx = clamp(freq_idx, 0u, 511u);
+    let vec_idx = clamped_idx / 4u;
+    let component_idx = clamped_idx % 4u;
+    
+    let spec_vec = audio.fire_heat[vec_idx];
+    if component_idx == 0u { return spec_vec.x; }
+    else if component_idx == 1u { return spec_vec.y; }
+    else if component_idx == 2u { return spec_vec.z; }
+    else { return spec_vec.w; }
+}
+
+fn get_waveform(x: f32) -> f32 {
+    let freq_idx = u32(x * 512.0);
+    let clamped_idx = clamp(freq_idx, 0u, 511u);
+    let vec_idx = clamped_idx / 4u;
+    let component_idx = clamped_idx % 4u;
+    
+    let spec_vec = audio.waveform[vec_idx];
+    if component_idx == 0u { return spec_vec.x; }
+    else if component_idx == 1u { return spec_vec.y; }
+    else if component_idx == 2u { return spec_vec.z; }
+    else { return spec_vec.w; }
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     
@@ -113,8 +141,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     } 
     else if audio.mode == 1u {
         // --- MODE 1: FIRE EFFECT ---
-        let amplitude = get_amplitude(in.uv.x);
-        let heat = clamp(amplitude / 100.0, 0.0, 1.0);
+        let heat_val = get_fire_heat(in.uv.x);
+        let heat = clamp(heat_val / 100.0, 0.0, 1.0);
         let y = 1.0 - in.uv.y;
         
         // Base shape of fire based on frequency amplitude
@@ -154,17 +182,19 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             return vec4<f32>(0.0, 0.0, 0.0, 1.0);
         }
         
-        let amplitude = get_amplitude(final_uv.x);
-        let y = 1.0 - final_uv.y;
-        let target_h = amplitude / 100.0;
+        let raw_wave = get_waveform(final_uv.x); // -1.0 to 1.0
+        let wave_y = raw_wave * 0.4 + 0.5; // Map to 0.1 - 0.9 range
+        
+        // Distance to the waveform line
+        let dist = abs(final_uv.y - wave_y);
         
         var intensity = 0.0;
-        if y < target_h {
+        if dist < 0.01 {
             intensity = 1.0;
         } else {
-            // Soft glow falloff above the bar
-            intensity = 0.05 / (y - target_h + 0.05);
-            intensity = clamp(intensity, 0.0, 0.5);
+            // Soft glow falloff
+            intensity = 0.005 / (dist + 0.005);
+            intensity = clamp(intensity, 0.0, 0.8);
         }
         
         let vignette = smoothstep(1.5, 0.2, length(distorted_uv));
