@@ -493,14 +493,17 @@ impl<'a> VulkanEngine<'a> {
                                             let px_x = start_x + x as f32 * pixel_size;
                                             let px_y = start_y + y as f32 * pixel_size;
                                             
-                                            painter.rect_filled(
-                                                egui::Rect::from_min_size(
-                                                    egui::pos2(px_x, px_y),
-                                                    egui::vec2(pixel_size, pixel_size)
-                                                ),
-                                                0.0,
-                                                egui::Color32::from_rgba_unmultiplied(r, g, b, a)
-                                            );
+                                            // Clip fire to the start of the progress bar
+                                            if px_x >= rect.min.x {
+                                                painter.rect_filled(
+                                                    egui::Rect::from_min_size(
+                                                        egui::pos2(px_x, px_y),
+                                                        egui::vec2(pixel_size, pixel_size)
+                                                    ),
+                                                    0.0,
+                                                    egui::Color32::from_rgba_unmultiplied(r, g, b, a)
+                                                );
+                                            }
                                         }
                                     }
                                 }
