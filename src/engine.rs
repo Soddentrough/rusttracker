@@ -545,7 +545,39 @@ impl<'a> VulkanEngine<'a> {
                             } else {
                                 0.0
                             }.clamp(0.0, 1.0);
-                            columns[2].add(egui::ProgressBar::new(progress).text(format!("{:.1}s / {:.1}s", state.current_seconds, state.duration_seconds)));
+                            
+                            // Custom Fire/Charred Progress Bar
+                            let (rect, _response) = columns[2].allocate_exact_size(egui::vec2(columns[2].available_width(), 20.0), egui::Sense::hover());
+                            let painter = columns[2].painter();
+                            
+                            // Unplayed background (Grey)
+                            painter.rect_filled(rect, 2.0, egui::Color32::from_gray(50));
+                            
+                            // Played section (Charred/Burned look)
+                            let played_width = rect.width() * progress;
+                            let played_rect = egui::Rect::from_min_size(rect.min, egui::vec2(played_width, rect.height()));
+                            painter.rect_filled(played_rect, 2.0, egui::Color32::from_rgb(45, 20, 15)); // Deep charred red/brown
+                            
+                            // Fire indicator (Current position)
+                            if progress > 0.0 && progress < 1.0 {
+                                let fire_x = rect.min.x + played_width;
+                                let fire_rect = egui::Rect::from_min_max(
+                                    egui::pos2(fire_x - 3.0, rect.min.y),
+                                    egui::pos2(fire_x + 2.0, rect.max.y)
+                                );
+                                painter.rect_filled(fire_rect, 1.0, egui::Color32::from_rgb(255, 120, 0)); // Orange glow
+                                let hot_core = fire_rect.expand(-1.0);
+                                painter.rect_filled(hot_core, 1.0, egui::Color32::from_rgb(255, 220, 50)); // Yellow/white hot core
+                            }
+                            
+                            // Text Overlay
+                            painter.text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                format!("{:.1}s / {:.1}s", state.current_seconds, state.duration_seconds),
+                                egui::FontId::proportional(12.0),
+                                egui::Color32::WHITE,
+                            );
                         });
                     });
             }
