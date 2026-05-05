@@ -10,15 +10,12 @@ jobs:
   build-windows:
     runs-on: windows-latest
     
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
-      
     defaults:
       run:
         shell: msys2 {0}
         
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
     
     - name: Set up MSYS2
       uses: msys2/setup-msys2@v2
@@ -50,7 +47,7 @@ jobs:
         cp /mingw64/bin/libvorbisfile-3.dll release/
         
     - name: Upload Artifact
-      uses: actions/upload-artifact@v4
+      uses: actions/upload-artifact@v7
       with:
         name: RustTracker-Windows
         path: release/
