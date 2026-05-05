@@ -75,6 +75,10 @@ fn spawn_dsp_thread(
                     state.raw_waveform[i] = msg.audio_data[offset + i];
                 }
                 
+                state.waveform_history.pop_front();
+                let wave_clone = state.raw_waveform.clone();
+                state.waveform_history.push_back(wave_clone);
+                
                 // --- Fire Heat Decay ---
                 for i in 0..512 {
                     let current = binned_data[i];

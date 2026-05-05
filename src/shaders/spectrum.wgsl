@@ -100,13 +100,13 @@ fn get_fire_heat(x: f32) -> f32 {
     else { return spec_vec.w; }
 }
 
-fn get_waveform(x: f32) -> f32 {
+fn get_waveform(hist_idx: u32, x: f32) -> f32 {
     let freq_idx = u32(x * 512.0);
     let clamped_idx = clamp(freq_idx, 0u, 511u);
     let vec_idx = clamped_idx / 4u;
     let component_idx = clamped_idx % 4u;
     
-    let spec_vec = audio.waveform[vec_idx];
+    let spec_vec = audio.waveform[hist_idx * 128u + vec_idx];
     if component_idx == 0u { return spec_vec.x; }
     else if component_idx == 1u { return spec_vec.y; }
     else if component_idx == 2u { return spec_vec.z; }
@@ -155,6 +155,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Combine shape and noise. The fire "licks" upwards
         let final_heat = shape * n * 2.0;
         
+        // Embers / Sparks
+        let spark_n = fbm(vec2<f32>(in.uv.x * 50.0, y * 30.0 - t * 2.0));
+        let spark_mask = smoothstep(0.8, 1.0, spark_n) * smoothstep(0.0, 0.4, y) * smoothstep(heat + 0.3, heat, y);
+        
         var color = vec3<f32>(0.0, 0.0, 0.0);
         if final_heat > 0.8 {
             color = vec3<f32>(1.0, 1.0, 1.0); // White
@@ -165,7 +169,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         } else if final_heat > 0.05 {
             color = vec3<f32>(0.6, 0.05, 0.0); // Dark red
         } else if final_heat > 0.01 {
-            color = vec3<f32>(0.1, 0.1, 0.12); // Smoke
+            color = vec3<f32>(0.05, 0.05, 0.08); // Smoke
+        }
+        
+        // Add sparks
+        if spark_mask > 0.5 {
+            color = vec3<f32>(1.0, 0.7, 0.2); // Glowing ember
         }
         
         return vec4<f32>(color, 1.0);
@@ -182,32 +191,42 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             return vec4<f32>(0.0, 0.0, 0.0, 1.0);
         }
         
-        let raw_wave = get_waveform(final_uv.x); // -1.0 to 1.0
-        let wave_y = raw_wave * 0.4 + 0.5; // Map to 0.1 - 0.9 range
+        let aspect = dpdx(in.uv.x) / dpdy(in.uv.y);
+        var final_color = vec3<f32>(0.0);
+        let amber = vec3<f32>(1.0, 0.65, 0.1);
         
-        // Distance to the waveform line
-        let dist = abs(final_uv.y - wave_y);
-        
-        var intensity = 0.0;
-        if dist < 0.01 {
-            intensity = 1.0;
-        } else {
-            // Soft glow falloff
-            intensity = 0.005 / (dist + 0.005);
-            intensity = clamp(intensity, 0.0, 0.8);
+        // Accumulate 4 history frames for ghosting
+        // audio.waveform[0] is oldest, audio.waveform[3] is newest
+        for (var i = 0u; i < 4u; i = i + 1u) {
+            let raw_wave = get_waveform(i, final_uv.x); // -1.0 to 1.0
+            let wave_y = raw_wave * 0.4 + 0.5; // Map to 0.1 - 0.9 range
+            let dist = abs(final_uv.y - wave_y);
+            
+            // Age factor: oldest is 0.25, newest is 1.0
+            let age = f32(i + 1u) / 4.0; 
+            
+            // Anti-aliased line thickness
+            let thickness = 0.003;
+            let line_intensity = smoothstep(thickness, 0.0, dist);
+            
+            // Bloom / phosphor glow
+            let bloom = 0.001 / (dist * dist + 0.001) * 0.5;
+            
+            let frame_intensity = (line_intensity + bloom) * age;
+            final_color = final_color + amber * frame_intensity;
         }
         
+        // Shadow mask: High frequency RGB dot pattern
+        let mask_x = fract(in.uv.x * 600.0);
+        let mask_y = fract(in.uv.y * 600.0 * aspect);
+        let mask_intensity = 0.7 + 0.3 * sin(mask_x * 3.14159) * sin(mask_y * 3.14159);
+        final_color = final_color * mask_intensity;
+        
         let vignette = smoothstep(1.5, 0.2, length(distorted_uv));
-        
-        // Scanlines
-        let aspect = dpdx(in.uv.x) / dpdy(in.uv.y);
         let scanlines = sin(final_uv.y * 400.0 * aspect) * 0.15 + 0.85;
-        
-        // CRT Flicker
         let flicker = sin(audio.time * 60.0) * 0.03 + 0.97;
         
-        let amber = vec3<f32>(1.0, 0.65, 0.1);
-        let final_color = amber * intensity * vignette * scanlines * flicker;
+        final_color = final_color * vignette * scanlines * flicker;
         
         return vec4<f32>(final_color, 1.0);
     }

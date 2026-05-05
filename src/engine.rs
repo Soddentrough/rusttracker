@@ -12,7 +12,7 @@ pub enum EngineAction {
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct AudioUniforms {
     pub spectrum: [f32; 512],
-    pub waveform: [f32; 512],
+    pub waveform: [[f32; 512]; 4],
     pub fire_heat: [f32; 512],
     pub channels: [f32; 32],
     pub num_channels: u32,
@@ -195,7 +195,7 @@ impl<'a> VulkanEngine<'a> {
     pub fn update(&mut self, state: &AppState) {
         let mut uniforms = AudioUniforms {
             spectrum: [0.0; 512],
-            waveform: [0.0; 512],
+            waveform: [[0.0; 512]; 4],
             fire_heat: [0.0; 512],
             channels: [0.0; 32],
             num_channels: state.num_channels as u32,
@@ -205,7 +205,9 @@ impl<'a> VulkanEngine<'a> {
         };
 
         uniforms.spectrum.copy_from_slice(&state.spectrum_data);
-        uniforms.waveform.copy_from_slice(&state.raw_waveform);
+        for (i, wave) in state.waveform_history.iter().enumerate().take(4) {
+            uniforms.waveform[i].copy_from_slice(wave);
+        }
         uniforms.fire_heat.copy_from_slice(&state.fire_heat);
         
         let ch_len = state.channel_vus.len().min(32);
@@ -242,6 +244,10 @@ impl<'a> VulkanEngine<'a> {
                             egui::RichText::new(format!("FPS: {:.1}", state.current_fps))
                                 .color(egui::Color32::GREEN)
                                 .strong()
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("Frame Time: {:.2} ms", 1000.0 / state.current_fps.max(1.0)))
+                                .color(egui::Color32::LIGHT_GREEN)
                         );
                     });
             }
@@ -698,31 +704,33 @@ impl<'a> VulkanEngine<'a> {
             // Central Panel (Transparent background) for Frequency Labels
             let frame = egui::Frame::NONE.fill(egui::Color32::TRANSPARENT);
             egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
-                // Draw frequency labels at the bottom
-                let rect = ui.available_rect_before_wrap();
-                central_rect = rect;
-                let painter = ui.painter();
-                let y = rect.bottom() - 20.0;
-                
-                let max_freq = state.max_frequency;
-                let labels = [
-                    (0.0, "0Hz".to_string()),
-                    (0.25, format!("{:.1}kHz", max_freq * 0.25 / 1000.0)),
-                    (0.50, format!("{:.1}kHz", max_freq * 0.50 / 1000.0)),
-                    (0.75, format!("{:.1}kHz", max_freq * 0.75 / 1000.0)),
-                    (0.95, format!("{:.1}kHz", max_freq / 1000.0)),
-                ];
-                
-                let width = rect.width();
-                for (x_pct, text) in labels.iter() {
-                    let x = rect.left() + width * x_pct;
-                    painter.text(
-                        egui::pos2(x, y),
-                        egui::Align2::LEFT_BOTTOM,
-                        text,
-                        egui::FontId::proportional(16.0),
-                        egui::Color32::WHITE,
-                    );
+                if state.visualizer_mode != 1 {
+                    // Draw frequency labels at the bottom
+                    let rect = ui.available_rect_before_wrap();
+                    central_rect = rect;
+                    let painter = ui.painter();
+                    let y = rect.bottom() - 20.0;
+                    
+                    let max_freq = state.max_frequency;
+                    let labels = [
+                        (0.0, "0Hz".to_string()),
+                        (0.25, format!("{:.1}kHz", max_freq * 0.25 / 1000.0)),
+                        (0.50, format!("{:.1}kHz", max_freq * 0.50 / 1000.0)),
+                        (0.75, format!("{:.1}kHz", max_freq * 0.75 / 1000.0)),
+                        (0.95, format!("{:.1}kHz", max_freq / 1000.0)),
+                    ];
+                    
+                    let width = rect.width();
+                    for (x_pct, text) in labels.iter() {
+                        let x = rect.left() + width * x_pct;
+                        painter.text(
+                            egui::pos2(x, y),
+                            egui::Align2::LEFT_BOTTOM,
+                            text,
+                            egui::FontId::proportional(16.0),
+                            egui::Color32::WHITE,
+                        );
+                    }
                 }
             });
         });

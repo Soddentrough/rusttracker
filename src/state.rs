@@ -19,6 +19,7 @@ pub struct AppState {
     pub spectrum_data: Vec<f32>,
     pub spectrum_peaks: Vec<f32>,
     pub spectrum_history: VecDeque<Vec<f32>>,
+    pub waveform_history: VecDeque<Vec<f32>>,
     pub raw_waveform: Vec<f32>,
     pub fire_heat: Vec<f32>,
     pub show_hud: bool,
@@ -42,12 +43,17 @@ pub struct AppState {
 
 impl AppState {
     pub fn new(title: String) -> Self {
-        let mut history = VecDeque::with_capacity(120);
+        let mut history = VecDeque::new();
         for _ in 0..120 {
             history.push_back(vec![0.0; 512]);
         }
+        
+        let mut wave_history = VecDeque::new();
+        for _ in 0..4 {
+            wave_history.push_back(vec![0.0; 512]);
+        }
 
-        Self {
+        AppState {
             file_loaded: !title.is_empty(),
             song_title: title,
             artist: "Unknown".to_string(),
@@ -66,6 +72,7 @@ impl AppState {
             spectrum_data: vec![0.0; 512],
             spectrum_peaks: vec![0.0; 512],
             spectrum_history: history,
+            waveform_history: wave_history,
             raw_waveform: vec![0.0; 512],
             fire_heat: vec![0.0; 512],
             show_hud: true,
