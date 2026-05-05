@@ -46,8 +46,13 @@ jobs:
         cp /mingw64/bin/libvorbis-0.dll release/
         cp /mingw64/bin/libvorbisfile-3.dll release/
         
+    - name: Build Installer
+      shell: cmd
+      run: |
+        "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+        
     - name: Upload Artifact
       uses: actions/upload-artifact@v7
       with:
         name: RustTracker-Windows
-        path: release/
+        path: setup/RustTracker-Setup.exe
