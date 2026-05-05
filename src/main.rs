@@ -245,16 +245,17 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                         engine.update(&state);
                     }
 
+                    let state_copy = {
+                        app_state.lock().unwrap().clone()
+                    };
+
                     let mut action = EngineAction::None;
-                    {
-                        let mut state = app_state.lock().unwrap();
-                        match engine.render(&window, &egui_ctx, &mut egui_state, &mut state) {
+                    match engine.render(&window, &egui_ctx, &mut egui_state, &state_copy) {
                             Ok(res) => action = res,
                             Err(wgpu::SurfaceError::Lost) => engine.resize(engine.size),
                             Err(wgpu::SurfaceError::OutOfMemory) => elwt.exit(),
                             Err(e) => eprintln!("{:?}", e),
                         }
-                    }
                     
                     if action == EngineAction::OpenFile {
                         let app_state_clone = Arc::clone(&app_state);
