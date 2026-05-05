@@ -367,7 +367,7 @@ impl<'a> VulkanEngine<'a> {
                                     );
                                     
                                     // Label
-                                    if channels <= 16 {
+                                    if num_channels <= 16 {
                                         painter.text(
                                             egui::pos2(x + bw * 0.5, y_bottom + 2.0),
                                             egui::Align2::CENTER_TOP,
