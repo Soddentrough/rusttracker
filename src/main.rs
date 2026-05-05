@@ -13,6 +13,10 @@ use winit::{
     event_loop::{ControlFlow, EventLoop},
     keyboard::{PhysicalKey, KeyCode as WinitKeyCode},
 };
+#[cfg(target_os = "linux")]
+use winit::platform::wayland::WindowAttributesExtWayland;
+#[cfg(target_os = "linux")]
+use winit::platform::x11::WindowAttributesExtX11;
 
 mod audio;
 mod state;
@@ -110,13 +114,20 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
     };
     let window_icon = winit::window::Icon::from_rgba(icon_rgba, icon_width, icon_height).unwrap();
 
+    #[allow(unused_mut)]
+    let mut attrs = winit::window::Window::default_attributes()
+        .with_title("RustTracker Vulkan Visualizer")
+        .with_inner_size(winit::dpi::PhysicalSize::new(1920, 1080))
+        .with_window_icon(Some(window_icon));
+        
+    #[cfg(target_os = "linux")]
+    {
+        attrs = WindowAttributesExtWayland::with_name(attrs, "rusttracker", "rusttracker");
+        attrs = WindowAttributesExtX11::with_name(attrs, "rusttracker", "rusttracker");
+    }
+
     #[allow(deprecated)]
-    let window = Arc::new(event_loop.create_window(
-        winit::window::Window::default_attributes()
-            .with_title("RustTracker Vulkan Visualizer")
-            .with_inner_size(winit::dpi::PhysicalSize::new(1920, 1080))
-            .with_window_icon(Some(window_icon))
-    ).unwrap());
+    let window = Arc::new(event_loop.create_window(attrs).unwrap());
 
     let mut engine = VulkanEngine::new(window.clone()).await;
     let mut last_update = Instant::now();
