@@ -1,0 +1,92 @@
+   Compiling rusttracker v0.1.0 (/home/naoki/Development/rusttracker)
+error[E0432]: unresolved import `openmpt::Logger`
+ --> src/audio.rs:7:5
+  |
+7 | use openmpt::Logger;
+  |     ^^^^^^^^^^^^^^^ no `Logger` in the root
+  |
+help: consider importing this enum instead
+  |
+7 | use openmpt::module::Logger;
+  |              ++++++++
+
+warning: unused import: `StreamTrait`
+ --> src/audio.rs:2:44
+  |
+2 | use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+  |                                            ^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `Arc` and `Mutex`
+ --> src/state.rs:1:17
+  |
+1 | use std::sync::{Arc, Mutex};
+  |                 ^^^  ^^^^^
+
+warning: unused imports: `backend::Backend` and `text::Line`
+ --> src/ui.rs:2:5
+  |
+2 |     backend::Backend,
+  |     ^^^^^^^^^^^^^^^^
+...
+5 |     text::Line,
+  |     ^^^^^^^^^^
+
+error[E0610]: `u32` is a primitive type and therefore doesn't have fields
+  --> src/audio.rs:18:44
+   |
+18 |     let sample_rate = config.sample_rate().0; 
+   |                                            ^
+
+error[E0599]: the method `context` exists for enum `Result<Module, ()>`, but its trait bounds were not satisfied
+  --> src/audio.rs:24:63
+   |
+24 | ...gger::None, &[]).context("Failed to create module")?;
+   |                     ^^^^^^^ method cannot be called on `Result<Module, ()>` due to unsatisfied trait bounds
+   |
+   = note: the following trait bounds were not satisfied:
+           `(): anyhow::context::ext::StdError`
+           which is required by `Result<Module, ()>: anyhow::Context<Module, ()>`
+
+error[E0277]: `*mut openmpt_sys::openmpt_module` cannot be sent between threads safely
+   --> src/audio.rs:62:9
+    |
+ 60 |       let stream = device.build_output_stream(
+    |                           ------------------- required by a bound introduced by this call
+ 61 |           config,
+ 62 |           move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+    |           ^--------------------------------------------------
+    |           |
+    |  _________within this `{closure@src/audio.rs:62:9: 62:60}`
+    | |
+ 63 | |             let module = &mut send_module.0; 
+ 64 | |             let frames_to_render = data.len() / channels;
+...   |
+115 | |         },
+    | |_________^ `*mut openmpt_sys::openmpt_module` cannot be sent between threads safely
+    |
+    = help: within `{closure@src/audio.rs:62:9: 62:60}`, the trait `Send` is not implemented for `*mut openmpt_sys::openmpt_module`
+note: required because it appears within the type `Module`
+   --> /home/naoki/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/openmpt-0.3.1/src/module/mod.rs:32:12
+    |
+ 32 | pub struct Module {
+    |            ^^^^^^
+note: required because it's used within this closure
+   --> src/audio.rs:62:9
+    |
+ 62 | ...   move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+    |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+note: required by a bound in `build_output_stream`
+   --> /home/naoki/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/cpal-0.17.1/src/traits.rs:219:51
+    |
+210 | ...fn build_output_stream<T, D, E>(
+    |       ------------------- required by a bound in this associated function
+...
+219 | ...    D: FnMut(&mut [T], &OutputCallbackInfo) + Send + ...
+    |                                                  ^^^^ required by this bound in `DeviceTrait::build_output_stream`
+
+Some errors have detailed explanations: E0277, E0432, E0599, E0610.
+For more information about an error, try `rustc --explain E0277`.
+warning: `rusttracker` (bin "rusttracker") generated 3 warnings
+error: could not compile `rusttracker` (bin "rusttracker") due to 4 previous errors; 3 warnings emitted

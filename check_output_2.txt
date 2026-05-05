@@ -1,0 +1,127 @@
+    Checking rusttracker v0.1.0 (/home/naoki/Development/rusttracker)
+warning: unused import: `StreamTrait`
+ --> src/audio.rs:2:44
+  |
+2 | use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+  |                                            ^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused imports: `Arc` and `Mutex`
+ --> src/state.rs:1:17
+  |
+1 | use std::sync::{Arc, Mutex};
+  |                 ^^^  ^^^^^
+
+warning: unused import: `text::Line`
+ --> src/ui.rs:5:5
+  |
+5 |     text::Line,
+  |     ^^^^^^^^^^
+
+error[E0107]: struct takes 0 generic arguments but 1 generic argument was supplied
+  --> src/ui.rs:13:33
+   |
+13 | ...Backend>(f: &mut Frame<B>, app_state: &Arc<Mutex<Ap...
+   |                     ^^^^^ - help: remove the unnecessary generic argument
+   |                     |
+   |                     expected 0 generic arguments
+   |
+note: struct defined here, with 0 generic parameters
+  --> /home/naoki/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/ratatui-core-0.1.0/src/terminal/frame.rs:17:12
+   |
+17 | pub struct Frame<'a> {
+   |            ^^^^^
+
+error[E0610]: `u32` is a primitive type and therefore doesn't have fields
+  --> src/audio.rs:12:44
+   |
+12 |     let sample_rate = config.sample_rate().0;
+   |                                            ^
+
+error[E0308]: mismatched types
+  --> src/audio.rs:17:44
+   |
+17 | ...le = Module::create(&mut file, log_callback, &[]).c...
+   |         --------------            ^^^^^^^^^^^^ expected `Logger`, found fn item
+   |         |
+   |         arguments to this function are incorrect
+   |
+   = note: expected enum `Logger`
+           found fn item `for<'a> fn(&'a str) {log_callback}`
+note: associated function defined here
+  --> /home/naoki/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/openmpt-0.3.1/src/module/mod.rs:94:9
+   |
+94 |     pub fn create<T : stream::ModuleStream>(stream : &mut...
+   |            ^^^^^^
+
+error[E0599]: the method `context` exists for enum `Result<Module, ()>`, but its trait bounds were not satisfied
+  --> src/audio.rs:17:63
+   |
+17 | ...g_callback, &[]).context("Failed to create module")?;
+   |                     ^^^^^^^ method cannot be called on `Result<Module, ()>` due to unsatisfied trait bounds
+   |
+   = note: the following trait bounds were not satisfied:
+           `(): anyhow::context::ext::StdError`
+           which is required by `Result<Module, ()>: anyhow::Context<Module, ()>`
+
+error[E0308]: arguments to this method are incorrect
+  --> src/audio.rs:67:38
+   |
+67 |             let frames_read = module.read_float_stereo(
+   |                                      ^^^^^^^^^^^^^^^^^
+   |
+note: expected `&mut Vec<f32>`, found `&mut [{float}]`
+  --> src/audio.rs:69:17
+   |
+69 |                 &mut left_buffer[..frames_to_render],
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: expected mutable reference `&mut Vec<f32>`
+              found mutable reference `&mut [{float}]`
+note: expected `&mut Vec<f32>`, found `&mut [{float}]`
+  --> src/audio.rs:70:17
+   |
+70 |                 &mut right_buffer[..frames_to_render],
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+   = note: expected mutable reference `&mut Vec<f32>`
+              found mutable reference `&mut [{float}]`
+note: method defined here
+  --> /home/naoki/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/openmpt-0.3.1/src/module/render.rs:85:9
+   |
+85 |     pub fn read_float_stereo(&mut self, sample_rate : i32...
+   |            ^^^^^^^^^^^^^^^^^
+
+error[E0599]: no method named `val` found for reference `&u32` in the current scope
+  --> src/ui.rs:80:30
+   |
+80 |                 let f = freq.val();
+   |                              ^^^ method not found in `&u32`
+
+error[E0599]: no method named `val` found for reference `&f32` in the current scope
+  --> src/ui.rs:81:29
+   |
+81 |                 let v = val.val();
+   |                             ^^^ method not found in `&f32`
+
+error[E0277]: `?` couldn't convert the error to `std::io::Error`
+  --> src/main.rs:76:51
+   |
+71 | ...Backend>(terminal: &mut Terminal<B>, app_state: Arc<Mutex<AppState>>) -> io::Result<()> {
+   |                                                                             -------------- expected `std::io::Error` because of this
+...
+76 | ...al.draw(|f| ui::draw(f, &app_state))?;
+   |       ---------------------------------^ unsatisfied trait bound
+   |       |
+   |       this can't be annotated with `?` because it has type `Result<_, <B as Backend>::Error>`
+   |
+   = help: the trait `From<<B as Backend>::Error>` is not implemented for `std::io::Error`
+   = note: the question mark operation (`?`) implicitly performs a conversion on the error value using the `From` trait
+help: consider introducing a `where` clause, but there might be an alternative better way to express this requirement
+   |
+71 | fn run_app<B: Backend>(terminal: &mut Terminal<B>, app_state: Arc<Mutex<AppState>>) -> io::Result<()> where std::io::Error: From<<B as Backend>::Error> {
+   |                                                                                                       +++++++++++++++++++++++++++++++++++++++++++++++++
+
+Some errors have detailed explanations: E0107, E0277, E0308, E0599, E0610.
+For more information about an error, try `rustc --explain E0107`.
+warning: `rusttracker` (bin "rusttracker") generated 3 warnings
+error: could not compile `rusttracker` (bin "rusttracker") due to 8 previous errors; 3 warnings emitted
