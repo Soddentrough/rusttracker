@@ -128,6 +128,19 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                                     let mut state = app_state.lock().unwrap();
                                     state.show_hud = !state.show_hud;
                                 },
+                                WinitKeyCode::KeyO => {
+                                    let app_state_clone = Arc::clone(&app_state);
+                                    std::thread::spawn(move || {
+                                        if let Some(path) = rfd::FileDialog::new()
+                                            .add_filter("Tracker Modules", &["mod", "s3m", "xm", "it", "stm", "669", "mtm", "med", "okt", "psm"])
+                                            .add_filter("All Files", &["*"])
+                                            .pick_file() {
+                                            let mut state = app_state_clone.lock().unwrap();
+                                            state.load_request = Some(path.display().to_string());
+                                            state.file_loaded = true;
+                                        }
+                                    });
+                                },
                                 WinitKeyCode::Space => {
                                     let mut state = app_state.lock().unwrap();
                                     state.is_paused = !state.is_paused;

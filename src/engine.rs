@@ -260,6 +260,7 @@ impl<'a> VulkanEngine<'a> {
                         ui.add_space(60.0);
                         ui.label(egui::RichText::new("Keyboard Shortcuts").color(egui::Color32::LIGHT_GRAY).strong().size(18.0));
                         ui.add_space(10.0);
+                        ui.label(egui::RichText::new("O : Open File").color(egui::Color32::GRAY));
                         ui.label(egui::RichText::new("Tab / F : Toggle HUD").color(egui::Color32::GRAY));
                         ui.label(egui::RichText::new("Q / Esc : Quit").color(egui::Color32::GRAY));
                         ui.label(egui::RichText::new("Space : Play / Pause").color(egui::Color32::GRAY));
