@@ -401,52 +401,69 @@ impl<'a> VulkanEngine<'a> {
                             // Played section (Charred/Burned look)
                             let played_width = rect.width() * progress;
                             let played_rect = egui::Rect::from_min_size(rect.min, egui::vec2(played_width, rect.height()));
-                            painter.rect_filled(played_rect, 2.0, egui::Color32::from_rgb(45, 20, 15)); // Deep charred red/brown
+                            painter.rect_filled(played_rect, 2.0, egui::Color32::from_rgb(15, 15, 15)); // Black charred
+                            
+                            // Glowing embers at base of played section
+                            let base_y = rect.max.y - 2.0;
+                            let ember_count = (played_width / 4.0) as usize;
+                            for i in 0..ember_count {
+                                let ember_x = rect.min.x + (i * 4) as f32;
+                                let seed = ((ember_x as f64 * 12.34 + state.current_seconds as f64 * 2.0).sin() * 43758.5453).fract().abs();
+                                if seed > 0.8 {
+                                    let brightness = ((seed - 0.8) * 5.0 * 255.0) as u8;
+                                    painter.rect_filled(
+                                        egui::Rect::from_min_size(egui::pos2(ember_x, base_y - 2.0), egui::vec2(2.0, 2.0)),
+                                        0.0,
+                                        egui::Color32::from_rgba_premultiplied(255, brightness / 3, 0, brightness)
+                                    );
+                                }
+                            }
                             
                             // Fire indicator (Demoscene Fire Array)
                             if progress > 0.0 && progress < 1.0 {
                                 let fire_x = rect.min.x + played_width;
                                 let fire_w = 40;
-                                let fire_h = 16;
+                                let fire_h = 10;
                                 let pixel_size = 2.0;
                                 let t = state.current_seconds * 1000.0;
                                 
-                                // Randomize bottom row
+                                // Randomize bottom row, hot on the right, tapering left
                                 for x in 0..fire_w {
+                                    let intensity = (x as f64 / fire_w as f64).powf(2.0);
                                     let seed = (x as f64 * 31.415 + t as f64).sin() * 43758.5453;
-                                    let r = (seed.fract().abs() * 255.0) as u8;
-                                    self.fire_buffer[(fire_h - 1) * fire_w + x] = if r > 100 { 255 } else { r };
+                                    let mut r = (seed.fract().abs() * 255.0) * intensity;
+                                    if x >= fire_w - 2 { r = 255.0; } // Playhead core
+                                    self.fire_buffer[(fire_h - 1) * fire_w + x] = r as u8;
                                 }
                                 
-                                // Propagate up
+                                // Propagate up and drift left (wind)
                                 for y in 0..(fire_h - 1) {
                                     for x in 0..fire_w {
                                         let src_idx = (y + 1) * fire_w + x;
-                                        let mut sum = self.fire_buffer[src_idx] as u32 * 2; // Weight directly below
+                                        let mut sum = self.fire_buffer[src_idx] as u32 * 2; // directly below
                                         
                                         if x > 0 { sum += self.fire_buffer[src_idx - 1] as u32; }
-                                        if x < fire_w - 1 { sum += self.fire_buffer[src_idx + 1] as u32; }
-                                        sum += self.fire_buffer[(y + 2).min(fire_h - 1) * fire_w + x] as u32;
+                                        if x < fire_w - 1 { sum += self.fire_buffer[src_idx + 1] as u32 * 2; } // bottom-right pulls left
+                                        sum += self.fire_buffer[(y + 2).min(fire_h - 1) * fire_w + x] as u32; // two below
                                         
-                                        let avg = sum / 5;
+                                        let avg = sum / 6;
                                         let seed2 = (y as f64 * 12.34 + x as f64 * 45.67 + t as f64).sin() * 43758.5453;
-                                        let cool = (seed2.fract().abs() * 4.0) as u32; // Random cooling 0-3
+                                        let cool = (seed2.fract().abs() * 5.0) as u32; // Random cooling 0-4
                                         
                                         self.fire_buffer[y * fire_w + x] = avg.saturating_sub(cool) as u8;
                                     }
                                 }
 
-                                let start_x = fire_x - (fire_w as f32 * pixel_size) / 2.0;
+                                let start_x = fire_x - (fire_w as f32 * pixel_size) + pixel_size; // Anchor right side to playhead
                                 let start_y = rect.max.y - 1.0 - (fire_h as f32 * pixel_size);
                                 
                                 for y in 0..fire_h {
                                     for x in 0..fire_w {
                                         let temp = self.fire_buffer[y * fire_w + x];
                                         if temp > 15 {
-                                            // Map temperature to classic fire gradient
                                             let r = temp;
-                                            let g = (temp as f32 * 0.7).clamp(0.0, 255.0) as u8;
-                                            let b = (temp.saturating_sub(160) as f32 * 2.0).clamp(0.0, 255.0) as u8;
+                                            let g = (temp as f32 * 0.9).clamp(0.0, 255.0) as u8;
+                                            let b = if temp > 220 { 255 } else { (temp.saturating_sub(160) as f32 * 2.0).clamp(0.0, 255.0) as u8 };
                                             let a = temp.min(220);
                                             
                                             let px_x = start_x + x as f32 * pixel_size;
