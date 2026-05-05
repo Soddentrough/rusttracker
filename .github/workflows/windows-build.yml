@@ -1,0 +1,53 @@
+name: Windows Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    
+    defaults:
+      run:
+        shell: msys2 {0}
+        
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Set up MSYS2
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: MINGW64
+        update: true
+        install: >-
+          mingw-w64-x86_64-toolchain
+          mingw-w64-x86_64-rust
+          mingw-w64-x86_64-libopenmpt
+          
+    - name: Build RustTracker
+      run: |
+        cargo build --release
+        
+    - name: Package Release
+      run: |
+        mkdir release
+        cp target/release/rusttracker.exe release/
+        # Copy required DLLs from MSYS2 environment
+        cp /mingw64/bin/libopenmpt-0.dll release/
+        cp /mingw64/bin/libgcc_s_seh-1.dll release/
+        cp /mingw64/bin/libstdc++-6.dll release/
+        cp /mingw64/bin/libwinpthread-1.dll release/
+        cp /mingw64/bin/zlib1.dll release/
+        cp /mingw64/bin/libmpg123-0.dll release/
+        cp /mingw64/bin/libogg-0.dll release/
+        cp /mingw64/bin/libvorbis-0.dll release/
+        cp /mingw64/bin/libvorbisfile-3.dll release/
+        
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: RustTracker-Windows
+        path: release/
