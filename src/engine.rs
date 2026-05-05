@@ -324,7 +324,10 @@ impl<'a> VulkanEngine<'a> {
                             // Column 0: Channels
                             columns[0].heading("Channels");
                             columns[0].separator();
-                            let channel_rect = columns[0].available_rect_before_wrap();
+                            let (channel_rect, _) = columns[0].allocate_exact_size(
+                                egui::vec2(columns[0].available_width(), columns[0].available_height() - 25.0), 
+                                egui::Sense::hover()
+                            );
                             let painter = columns[0].painter();
                             let num_channels = state.channel_vus.len();
                             if num_channels > 0 {
@@ -378,6 +381,59 @@ impl<'a> VulkanEngine<'a> {
                                     }
                                 }
                             }
+                            
+                            columns[0].add_space(5.0);
+                            let progress = if state.duration_seconds > 0.0 {
+                                (state.current_seconds / state.duration_seconds) as f32
+                            } else {
+                                0.0
+                            }.clamp(0.0, 1.0);
+                            
+                            // Custom Fire/Charred Progress Bar
+                            let (rect, _) = columns[0].allocate_exact_size(egui::vec2(columns[0].available_width(), 16.0), egui::Sense::hover());
+                            let painter = columns[0].painter();
+                            
+                            // Unplayed background (Grey)
+                            painter.rect_filled(rect, 2.0, egui::Color32::from_gray(50));
+                            
+                            // Played section (Charred/Burned look)
+                            let played_width = rect.width() * progress;
+                            let played_rect = egui::Rect::from_min_size(rect.min, egui::vec2(played_width, rect.height()));
+                            painter.rect_filled(played_rect, 2.0, egui::Color32::from_rgb(45, 20, 15)); // Deep charred red/brown
+                            
+                            // Fire indicator (Current position)
+                            if progress > 0.0 && progress < 1.0 {
+                                let fire_x = rect.min.x + played_width;
+                                let time = state.current_seconds as f32;
+                                
+                                // Draw multiple flickering fire layers
+                                for i in 0..3 {
+                                    let phase = i as f32 * 1.5;
+                                    let flicker_w = ((time * 12.0 + phase).sin() * 0.5 + 0.5) * 4.0;
+                                    let flicker_h = ((time * 18.0 + phase * 2.0).cos() * 0.5 + 0.5) * 8.0;
+                                    
+                                    let f_rect = egui::Rect::from_min_max(
+                                        egui::pos2(fire_x - 2.0 - flicker_w, rect.min.y - flicker_h),
+                                        egui::pos2(fire_x + 2.0, rect.max.y)
+                                    );
+                                    
+                                    let color = match i {
+                                        0 => egui::Color32::from_rgba_unmultiplied(255, 50, 0, 100),   // Red glow
+                                        1 => egui::Color32::from_rgba_unmultiplied(255, 120, 0, 180),  // Orange mid
+                                        _ => egui::Color32::from_rgba_unmultiplied(255, 255, 100, 255), // White/Yellow hot core
+                                    };
+                                    painter.rect_filled(f_rect, 2.0, color);
+                                }
+                            }
+                            
+                            // Text Overlay
+                            painter.text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                format!("{:.1}s / {:.1}s", state.current_seconds, state.duration_seconds),
+                                egui::FontId::proportional(11.0),
+                                egui::Color32::WHITE,
+                            );
                             
                             // Column 1: Heatmap History & Tracker Pattern
                             columns[1].heading("Pattern Heatmap");
@@ -539,45 +595,6 @@ impl<'a> VulkanEngine<'a> {
                             if state.num_samples > 0 { columns[2].horizontal(|ui| { ui.label("Samples"); ui.label(format!("{}", state.num_samples)); }); }
                             columns[2].horizontal(|ui| { ui.label("Channels"); ui.label(format!("{}", state.num_channels)); });
                             columns[2].horizontal(|ui| { ui.label("Length"); ui.label(format!("{:.1}s", state.duration_seconds)); });
-                            columns[2].add_space(8.0);
-                            let progress = if state.duration_seconds > 0.0 {
-                                (state.current_seconds / state.duration_seconds) as f32
-                            } else {
-                                0.0
-                            }.clamp(0.0, 1.0);
-                            
-                            // Custom Fire/Charred Progress Bar
-                            let (rect, _response) = columns[2].allocate_exact_size(egui::vec2(columns[2].available_width(), 20.0), egui::Sense::hover());
-                            let painter = columns[2].painter();
-                            
-                            // Unplayed background (Grey)
-                            painter.rect_filled(rect, 2.0, egui::Color32::from_gray(50));
-                            
-                            // Played section (Charred/Burned look)
-                            let played_width = rect.width() * progress;
-                            let played_rect = egui::Rect::from_min_size(rect.min, egui::vec2(played_width, rect.height()));
-                            painter.rect_filled(played_rect, 2.0, egui::Color32::from_rgb(45, 20, 15)); // Deep charred red/brown
-                            
-                            // Fire indicator (Current position)
-                            if progress > 0.0 && progress < 1.0 {
-                                let fire_x = rect.min.x + played_width;
-                                let fire_rect = egui::Rect::from_min_max(
-                                    egui::pos2(fire_x - 3.0, rect.min.y),
-                                    egui::pos2(fire_x + 2.0, rect.max.y)
-                                );
-                                painter.rect_filled(fire_rect, 1.0, egui::Color32::from_rgb(255, 120, 0)); // Orange glow
-                                let hot_core = fire_rect.expand(-1.0);
-                                painter.rect_filled(hot_core, 1.0, egui::Color32::from_rgb(255, 220, 50)); // Yellow/white hot core
-                            }
-                            
-                            // Text Overlay
-                            painter.text(
-                                rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                format!("{:.1}s / {:.1}s", state.current_seconds, state.duration_seconds),
-                                egui::FontId::proportional(12.0),
-                                egui::Color32::WHITE,
-                            );
                         });
                     });
             }
