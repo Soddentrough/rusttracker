@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait};
 use openmpt::module::{Logger, Module};
-use spectrum_analyzer::{samples_fft_to_spectrum, scaling::divide_by_N_sqrt, windows::hann_window, FrequencyLimit};
+use spectrum_analyzer::{samples_fft_to_spectrum, windows::hann_window, FrequencyLimit};
 use std::fs::File;
 use std::io::{Cursor, Read};
 use std::sync::{Arc, Mutex};
@@ -13,6 +13,89 @@ use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
 use crate::state::AppState;
+use crossbeam_channel::{bounded, Sender, Receiver};
+
+struct DspMessage {
+    audio_data: Vec<f32>,
+    channel_vus: Vec<f32>,
+    current_order: i32,
+    current_row: i32,
+    bpm: i32,
+    speed: i32,
+    current_seconds: f64,
+}
+
+fn spawn_dsp_thread(
+    rx: Receiver<DspMessage>,
+    shared_state: Arc<Mutex<AppState>>,
+    sample_rate: u32,
+    max_frequency: f32,
+) {
+    std::thread::spawn(move || {
+        let mut windowed_buffer = vec![0.0; 4096];
+        let mut binned_data = vec![0.0; 512];
+
+        while let Ok(msg) = rx.recv() {
+            // Apply windowing and FFT
+            for i in 0..4096 {
+                windowed_buffer[i] = *msg.audio_data.get(i).unwrap_or(&0.0);
+            }
+            let hann = hann_window(&windowed_buffer);
+            if let Ok(spectrum) = samples_fft_to_spectrum(
+                &hann,
+                sample_rate,
+                FrequencyLimit::Max(max_frequency),
+                Some(&spectrum_analyzer::scaling::divide_by_N_sqrt),
+            ) {
+                binned_data.fill(0.0);
+                let bands: Vec<_> = spectrum.data().iter().collect();
+                let step = std::cmp::max(1, (bands.len() as f32 / 512.0).ceil() as usize);
+                
+                for (i, chunk) in bands.chunks(step).enumerate() {
+                    if i < 512 {
+                        let max_val = chunk.iter().map(|(_, val)| val.val()).fold(0.0, f32::max);
+                        binned_data[i] = (max_val * 150.0).clamp(0.0, 100.0);
+                    }
+                }
+            }
+
+            // Sync to UI state
+            if let Ok(mut state) = shared_state.try_lock() {
+                state.raw_channel_vus.clear();
+                for vu in msg.channel_vus {
+                    state.raw_channel_vus.push(vu);
+                }
+                
+                state.raw_spectrum_data.copy_from_slice(&binned_data);
+                
+                if msg.bpm != 0 { state.bpm = msg.bpm; }
+                if msg.speed != 0 { state.speed = msg.speed; }
+                state.current_seconds = msg.current_seconds;
+                
+                if state.current_tracker_order != msg.current_order || state.current_tracker_row != msg.current_row {
+                    let cur_order = state.current_tracker_order;
+                    let cur_row = state.current_tracker_row;
+                    
+                    if cur_order == msg.current_order && msg.current_row > cur_row {
+                        for r in cur_row..msg.current_row {
+                            state.tracker_row_history.push_front((cur_order, r));
+                        }
+                    } else {
+                        state.tracker_row_history.push_front((cur_order, cur_row));
+                    }
+                    
+                    state.tracker_row_history.truncate(128);
+                    
+                    state.current_tracker_order = msg.current_order;
+                    state.current_tracker_row = msg.current_row;
+                }
+                
+                state.spectrum_history.pop_front();
+                state.spectrum_history.push_back(binned_data.to_vec());
+            }
+        }
+    });
+}
 
 pub trait AudioSource: Send {
     fn read_float_stereo(&mut self, sample_rate: u32, left: &mut [f32], right: &mut [f32]) -> usize;
@@ -25,6 +108,13 @@ pub trait AudioSource: Send {
     fn get_type(&mut self) -> String;
     fn get_tempo(&mut self) -> i32;
     fn get_speed(&mut self) -> i32;
+    fn get_intrinsic_sample_rate(&mut self) -> Option<u32>;
+    fn get_num_samples(&mut self) -> i32;
+    fn get_num_instruments(&mut self) -> i32;
+    fn get_num_patterns(&mut self) -> i32;
+    fn get_current_order(&mut self) -> i32;
+    fn get_current_row(&mut self) -> i32;
+    fn pre_format_tracker_data(&mut self) -> Vec<Vec<String>>;
 }
 
 // ---------------------------------------------------------
@@ -69,6 +159,40 @@ impl AudioSource for OpenMptSource {
     
     fn get_tempo(&mut self) -> i32 { self.module.0.get_current_tempo() }
     fn get_speed(&mut self) -> i32 { self.module.0.get_current_speed() }
+    fn get_intrinsic_sample_rate(&mut self) -> Option<u32> { None }
+    fn get_num_samples(&mut self) -> i32 { self.module.0.get_num_samples() }
+    fn get_num_instruments(&mut self) -> i32 { self.module.0.get_num_instruments() }
+    fn get_num_patterns(&mut self) -> i32 { self.module.0.get_num_patterns() }
+    fn get_current_order(&mut self) -> i32 { self.module.0.get_current_order() }
+    fn get_current_row(&mut self) -> i32 { self.module.0.get_current_row() }
+    
+    fn pre_format_tracker_data(&mut self) -> Vec<Vec<String>> {
+        let mut patterns_by_order = Vec::new();
+        let num_orders = self.module.0.get_num_orders();
+        let num_channels = self.module.0.get_num_channels();
+        
+        for o in 0..num_orders {
+            let mut row_strings = Vec::new();
+            if let Some(mut pattern) = self.module.0.get_pattern_by_order(o) {
+                let num_rows = pattern.get_num_rows();
+                for r in 0..num_rows {
+                    if let Some(mut row) = pattern.get_row_by_number(r) {
+                        let mut row_str = String::new();
+                        for c in 0..num_channels {
+                            if let Some(mut cell) = row.get_cell_by_channel(c) {
+                                if c != 0 { row_str.push_str(" | "); }
+                                row_str.push_str(&cell.get_formatted(0, false));
+                            }
+                        }
+                        row_strings.push(row_str);
+                    }
+                }
+            }
+            patterns_by_order.push(row_strings);
+        }
+        
+        patterns_by_order
+    }
 }
 
 // ---------------------------------------------------------
@@ -87,6 +211,7 @@ struct SymphoniaSource {
     channel_vus: Vec<f32>,
     artist: String,
     ext_type: String,
+    intrinsic_sample_rate: Option<u32>,
 }
 
 impl AudioSource for SymphoniaSource {
@@ -165,6 +290,15 @@ impl AudioSource for SymphoniaSource {
     fn get_type(&mut self) -> String { self.ext_type.clone() }
     fn get_tempo(&mut self) -> i32 { 0 }
     fn get_speed(&mut self) -> i32 { 0 }
+    fn get_intrinsic_sample_rate(&mut self) -> Option<u32> { self.intrinsic_sample_rate }
+    fn get_num_samples(&mut self) -> i32 { 0 }
+    fn get_num_instruments(&mut self) -> i32 { 0 }
+    fn get_num_patterns(&mut self) -> i32 { 0 }
+    fn get_current_order(&mut self) -> i32 { 0 }
+    fn get_current_row(&mut self) -> i32 { 0 }
+    fn pre_format_tracker_data(&mut self) -> Vec<Vec<String>> {
+        Vec::new()
+    }
 }
 
 fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
@@ -200,6 +334,8 @@ fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
         let time_base = track.codec_params.time_base.map(|t| t.calc_time(1).seconds as f64 + t.calc_time(1).frac).unwrap_or(1.0 / 44100.0);
         let duration = track.codec_params.n_frames.map(|n| n as f64 * time_base).unwrap_or(0.0);
 
+        let intrinsic_sample_rate = track.codec_params.sample_rate;
+
         return Ok(Box::new(SymphoniaSource {
             format,
             decoder,
@@ -213,6 +349,7 @@ fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
             channel_vus: vec![0.0; channels as usize],
             artist: "Unknown".to_string(),
             ext_type: ext.to_uppercase(),
+            intrinsic_sample_rate,
         }));
     }
 
@@ -267,6 +404,7 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
     };
 
     let config: cpal::StreamConfig = supported_config.clone().into();
+    let (tx, rx) = bounded::<DspMessage>(32);
 
     if mic {
         {
@@ -281,10 +419,13 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
             state.max_frequency = config.sample_rate as f32 / 2.0;
         }
 
+        let max_frequency = { shared_state.lock().unwrap().max_frequency };
+        spawn_dsp_thread(rx, shared_state.clone(), config.sample_rate, max_frequency);
+
         let stream = match supported_config.sample_format() {
-            cpal::SampleFormat::F32 => run_mic::<f32>(&device, &config, shared_state, config.sample_rate),
-            cpal::SampleFormat::I16 => run_mic::<i16>(&device, &config, shared_state, config.sample_rate),
-            cpal::SampleFormat::U16 => run_mic::<u16>(&device, &config, shared_state, config.sample_rate),
+            cpal::SampleFormat::F32 => run_mic::<f32>(&device, &config, shared_state, tx, config.sample_rate),
+            cpal::SampleFormat::I16 => run_mic::<i16>(&device, &config, shared_state, tx, config.sample_rate),
+            cpal::SampleFormat::U16 => run_mic::<u16>(&device, &config, shared_state, tx, config.sample_rate),
             _ => return Err(anyhow::anyhow!("Unsupported sample format")),
         }?;
         return Ok(stream);
@@ -301,13 +442,24 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
         state.channel_vus = vec![0.0; state.num_channels as usize];
         state.bpm = audio_source.get_tempo();
         state.speed = audio_source.get_speed();
-        state.max_frequency = config.sample_rate as f32 / 2.0;
+        state.max_frequency = audio_source.get_intrinsic_sample_rate()
+            .map(|r| r as f32 / 2.0)
+            .unwrap_or(10000.0);
+        state.num_samples = audio_source.get_num_samples();
+        state.num_instruments = audio_source.get_num_instruments();
+        state.num_patterns = audio_source.get_num_patterns();
+        
+        let formatted = audio_source.pre_format_tracker_data();
+        state.tracker_patterns_by_order = formatted;
     }
 
+    let max_frequency = { shared_state.lock().unwrap().max_frequency };
+    spawn_dsp_thread(rx, shared_state.clone(), config.sample_rate, max_frequency);
+
     let stream = match supported_config.sample_format() {
-        cpal::SampleFormat::F32 => run::<f32>(&device, &config, audio_source, shared_state, config.sample_rate),
-        cpal::SampleFormat::I16 => run::<i16>(&device, &config, audio_source, shared_state, config.sample_rate),
-        cpal::SampleFormat::U16 => run::<u16>(&device, &config, audio_source, shared_state, config.sample_rate),
+        cpal::SampleFormat::F32 => run::<f32>(&device, &config, audio_source, shared_state, tx, config.sample_rate, max_frequency),
+        cpal::SampleFormat::I16 => run::<i16>(&device, &config, audio_source, shared_state, tx, config.sample_rate, max_frequency),
+        cpal::SampleFormat::U16 => run::<u16>(&device, &config, audio_source, shared_state, tx, config.sample_rate, max_frequency),
         _ => return Err(anyhow::anyhow!("Unsupported sample format")),
     }?;
 
@@ -319,7 +471,9 @@ fn run<T>(
     config: &cpal::StreamConfig,
     mut audio_source: Box<dyn AudioSource>,
     shared_state: Arc<Mutex<AppState>>,
+    tx: Sender<DspMessage>,
     sample_rate: u32,
+    _max_frequency: f32,
 ) -> Result<cpal::Stream>
 where
     T: cpal::Sample + cpal::FromSample<f32> + cpal::SizedSample,
@@ -330,17 +484,18 @@ where
     
     let mut fft_buffer: Vec<f32> = vec![0.0; 4096];
     let mut windowed_buffer: Vec<f32> = vec![0.0; 4096];
-    let mut binned_data: Vec<f32> = vec![0.0; 512];
     let mut fft_index = 0;
+    
+    let mut was_paused = false;
 
     let stream = device.build_output_stream(
         config,
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-            let mut paused = false;
             if let Ok(state) = shared_state.try_lock() {
-                paused = state.is_paused;
+                was_paused = state.is_paused;
             }
-            if paused {
+            
+            if was_paused {
                 for sample in data.iter_mut() {
                     *sample = T::from_sample(0.0);
                 }
@@ -400,46 +555,33 @@ where
                 }
             }
 
-            // FFT
             for i in 0..4096 {
                 windowed_buffer[i] = fft_buffer[(fft_index + i) % 4096];
             }
             
-            let hann = hann_window(&windowed_buffer);
-            if let Ok(spectrum) = samples_fft_to_spectrum(
-                &hann,
-                sample_rate,
-                FrequencyLimit::Max(sample_rate as f32 / 2.0),
-                Some(&divide_by_N_sqrt),
-            ) {
-                binned_data.fill(0.0);
-                let bands = spectrum.data();
-                let step = std::cmp::max(1, (bands.len() as f32 / 512.0).ceil() as usize);
-                
-                for (i, chunk) in bands.chunks(step).enumerate() {
-                    if i < 512 {
-                        let max_val = chunk.iter().map(|(_, val)| val.val()).fold(0.0, f32::max);
-                        binned_data[i] = (max_val * 150.0).clamp(0.0, 100.0);
-                    }
-                }
+            let mut channel_vus = Vec::new();
+            let num_mod_channels = audio_source.get_num_channels();
+            for i in 0..num_mod_channels {
+                channel_vus.push(audio_source.get_current_channel_vu_mono(i));
             }
+
+            let msg = DspMessage {
+                audio_data: windowed_buffer.clone(),
+                channel_vus,
+                current_order: audio_source.get_current_order(),
+                current_row: audio_source.get_current_row(),
+                bpm: audio_source.get_tempo(),
+                speed: audio_source.get_speed(),
+                current_seconds: audio_source.get_position_seconds(),
+            };
+            
+            let _ = tx.try_send(msg);
 
             // Zero-allocation UI state sync via lock-free try_lock
             if let Ok(mut state) = shared_state.try_lock() {
                 if let Some(pos) = state.seek_request.take() {
                     audio_source.set_position_seconds(pos);
                 }
-                
-                let num_mod_channels = audio_source.get_num_channels();
-                state.raw_channel_vus.clear();
-                for i in 0..num_mod_channels {
-                    state.raw_channel_vus.push(audio_source.get_current_channel_vu_mono(i));
-                }
-                
-                state.raw_spectrum_data.copy_from_slice(&binned_data);
-                state.bpm = audio_source.get_tempo();
-                state.speed = audio_source.get_speed();
-                state.current_seconds = audio_source.get_position_seconds();
             }
         },
         |err| eprintln!("an error occurred on stream: {}", err),
@@ -453,7 +595,8 @@ fn run_mic<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
     shared_state: Arc<Mutex<AppState>>,
-    sample_rate: u32,
+    tx: Sender<DspMessage>,
+    _sample_rate: u32,
 ) -> Result<cpal::Stream>
 where
     T: cpal::Sample + cpal::FromSample<f32> + cpal::SizedSample + Into<f32>,
@@ -461,12 +604,25 @@ where
     let channels = config.channels as usize;
     let mut fft_buffer: Vec<f32> = vec![0.0; 4096];
     let mut windowed_buffer: Vec<f32> = vec![0.0; 4096];
-    let mut binned_data: Vec<f32> = vec![0.0; 512];
     let mut fft_index = 0;
+    
+    let mut was_paused = false;
 
     let stream = device.build_input_stream(
         config,
         move |data: &[T], _: &cpal::InputCallbackInfo| {
+            if let Ok(state) = shared_state.try_lock() {
+                was_paused = state.is_paused;
+            }
+            
+            if was_paused {
+                if let Ok(mut state) = shared_state.try_lock() {
+                    state.raw_channel_vus.fill(0.0);
+                    state.raw_spectrum_data.fill(0.0);
+                }
+                return;
+            }
+
             let mut left_peak = 0.0_f32;
             let mut right_peak = 0.0_f32;
 
@@ -482,40 +638,25 @@ where
                 fft_index = (fft_index + 1) % 4096;
             }
 
-            // FFT
             for i in 0..4096 {
                 windowed_buffer[i] = fft_buffer[(fft_index + i) % 4096];
             }
             
-            let hann = hann_window(&windowed_buffer);
-            if let Ok(spectrum) = samples_fft_to_spectrum(
-                &hann,
-                sample_rate,
-                FrequencyLimit::Max(sample_rate as f32 / 2.0),
-                Some(&divide_by_N_sqrt),
-            ) {
-                binned_data.fill(0.0);
-                let bands = spectrum.data();
-                let step = std::cmp::max(1, (bands.len() as f32 / 512.0).ceil() as usize);
-                
-                for (i, chunk) in bands.chunks(step).enumerate() {
-                    if i < 512 {
-                        let max_val = chunk.iter().map(|(_, val)| val.val()).fold(0.0, f32::max);
-                        binned_data[i] = (max_val * 150.0).clamp(0.0, 100.0);
-                    }
-                }
-            }
+            let mut channel_vus = Vec::new();
+            if channels >= 1 { channel_vus.push(left_peak); }
+            if channels >= 2 { channel_vus.push(right_peak); }
 
-            if let Ok(mut state) = shared_state.try_lock() {
-                if state.raw_channel_vus.len() >= 1 {
-                    state.raw_channel_vus[0] = left_peak;
-                }
-                if state.raw_channel_vus.len() >= 2 {
-                    state.raw_channel_vus[1] = right_peak;
-                }
-                
-                state.raw_spectrum_data.copy_from_slice(&binned_data);
-            }
+            let msg = DspMessage {
+                audio_data: windowed_buffer.clone(),
+                channel_vus,
+                current_order: 0,
+                current_row: 0,
+                bpm: 0,
+                speed: 0,
+                current_seconds: 0.0,
+            };
+            
+            let _ = tx.try_send(msg);
         },
         |err| eprintln!("an error occurred on input stream: {}", err),
         None,

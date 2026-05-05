@@ -276,21 +276,34 @@ impl<'a> VulkanEngine<'a> {
                                 }
                             }
                             
-                            // Column 1: Heatmap History
-                            columns[1].heading("Heatmap History");
+                            // Column 1: Heatmap History & Tracker Pattern
+                            columns[1].heading("Pattern Heatmap");
                             columns[1].separator();
                             let hm_rect = columns[1].available_rect_before_wrap();
-                            let painter = columns[1].painter();
+                            let painter = columns[1].painter().with_clip_rect(hm_rect);
                             let history_len = state.spectrum_history.len();
                             if history_len > 0 && state.spectrum_history[0].len() > 0 {
-                                let cell_w = hm_rect.width() / history_len as f32;
                                 let raw_bands = state.spectrum_history[0].len();
                                 let chunks = 64; // Downsample 512 bands to 64 for visual clarity & performance
                                 let chunk_size = raw_bands / chunks;
-                                let cell_h = hm_rect.height() / chunks as f32;
                                 
+                                let cell_h = hm_rect.height() / history_len as f32; // Fill entire height
+                                let cell_w = hm_rect.width() / chunks as f32; // Horizontal frequency scale
+                                
+                                let center_y = hm_rect.top() + hm_rect.height() / 2.0;
+                                
+                                // Draw faint background grid
+                                painter.rect_filled(hm_rect, 0.0, egui::Color32::from_rgb(20, 20, 22));
+                                for c in 0..=chunks {
+                                    let x = hm_rect.left() + c as f32 * cell_w;
+                                    painter.line_segment([egui::pos2(x, hm_rect.top()), egui::pos2(x, hm_rect.bottom())], (1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 5)));
+                                }
+                                
+                                // Draw vertical heatmap
                                 for (time_idx, bands) in state.spectrum_history.iter().enumerate() {
-                                    let x = hm_rect.left() + time_idx as f32 * cell_w;
+                                    // time_idx 119 (newest) at bottom. time_idx 0 (oldest) at top.
+                                    let y = hm_rect.bottom() - (history_len - 1 - time_idx) as f32 * cell_h;
+                                    
                                     for c in 0..chunks {
                                         let mut max_val = 0.0;
                                         for k in 0..chunk_size {
@@ -301,22 +314,103 @@ impl<'a> VulkanEngine<'a> {
                                         }
                                         
                                         if max_val > 5.0 {
-                                            let y = hm_rect.bottom() - c as f32 * cell_h;
+                                            let x = hm_rect.left() + c as f32 * cell_w;
                                             let color = if max_val > 60.0 {
-                                                egui::Color32::from_rgb(255, 255, 255)
+                                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 128)
                                             } else if max_val > 30.0 {
-                                                egui::Color32::from_rgb(255, 140, 0)
+                                                egui::Color32::from_rgba_unmultiplied(255, 140, 0, 128)
                                             } else {
-                                                egui::Color32::from_rgb(180, 20, 20)
+                                                egui::Color32::from_rgba_unmultiplied(180, 20, 20, 128)
                                             };
                                             painter.rect_filled(
                                                 egui::Rect::from_min_max(
-                                                    egui::pos2(x, y - cell_h),
-                                                    egui::pos2(x + cell_w + 1.0, y + 1.0)
+                                                    egui::pos2(x, y),
+                                                    egui::pos2(x + cell_w + 1.0, y + cell_h + 1.0)
                                                 ),
                                                 0.0,
                                                 color
                                             );
+                                        }
+                                    }
+                                }
+                                
+                                // Draw Tracker Text Overlay
+                                if state.tracker_patterns_by_order.len() > 0 && state.current_tracker_order >= 0 && (state.current_tracker_order as usize) < state.tracker_patterns_by_order.len() {
+                                    let current_pattern = &state.tracker_patterns_by_order[state.current_tracker_order as usize];
+                                    let current_row = state.current_tracker_row as i32;
+                                    
+                                    let row_height = 14.0;
+                                    let num_rows_to_draw = (hm_rect.height() / row_height) as i32;
+                                    
+                                    for offset in (-num_rows_to_draw/2)..(num_rows_to_draw/2) {
+                                        let mut resolved_order = state.current_tracker_order as i32;
+                                        let mut resolved_row = current_row + offset;
+                                        
+                                        if offset < 0 {
+                                            // Read exact playback sequence from history
+                                            let history_idx = (-offset - 1) as usize;
+                                            if history_idx < state.tracker_row_history.len() {
+                                                let (hist_order, hist_row) = state.tracker_row_history[history_idx];
+                                                resolved_order = hist_order;
+                                                resolved_row = hist_row;
+                                            } else {
+                                                // Fall back to underflow if history hasn't built up yet
+                                                while resolved_row < 0 && resolved_order > 0 {
+                                                    resolved_order -= 1;
+                                                    resolved_row += state.tracker_patterns_by_order[resolved_order as usize].len() as i32;
+                                                }
+                                            }
+                                        } else {
+                                            // Handle overflow (next predicted patterns)
+                                            while resolved_order >= 0 
+                                                && (resolved_order as usize) < state.tracker_patterns_by_order.len() 
+                                                && resolved_row >= state.tracker_patterns_by_order[resolved_order as usize].len() as i32 
+                                            {
+                                                resolved_row -= state.tracker_patterns_by_order[resolved_order as usize].len() as i32;
+                                                resolved_order += 1;
+                                            }
+                                        }
+                                        
+                                        if resolved_order >= 0 && (resolved_order as usize) < state.tracker_patterns_by_order.len() && resolved_row >= 0 {
+                                            let text = &state.tracker_patterns_by_order[resolved_order as usize][resolved_row as usize];
+                                            let y = center_y + offset as f32 * row_height;
+                                            
+                                            // Fade out based on distance
+                                            let distance = offset.abs() as f32 / (num_rows_to_draw as f32 / 2.0);
+                                            let alpha = (1.0 - distance).max(0.0);
+                                            
+                                            let color = if offset == 0 {
+                                                egui::Color32::from_rgba_premultiplied(255, 255, 255, 255)
+                                            } else {
+                                                egui::Color32::from_rgba_premultiplied(150, 150, 150, (alpha * 100.0) as u8)
+                                            };
+                                            let font_id = egui::FontId::monospace(12.0);
+                                            
+                                            // Draw text centered horizontally
+                                            let rect = painter.text(
+                                                egui::pos2(hm_rect.center().x, y),
+                                                egui::Align2::CENTER_CENTER,
+                                                format!("{:02X}  {}", resolved_row, text),
+                                                font_id,
+                                                color
+                                            );
+                                            
+                                            // Optional: highlight background of active row
+                                            if offset == 0 {
+                                                painter.rect_filled(
+                                                    rect.expand2(egui::vec2(10.0, 2.0)),
+                                                    2.0,
+                                                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20)
+                                                );
+                                            }
+                                            
+                                            // Pattern boundary indicator
+                                            if resolved_row == 0 {
+                                                painter.line_segment(
+                                                    [egui::pos2(hm_rect.left(), y - row_height / 2.0), egui::pos2(hm_rect.right(), y - row_height / 2.0)],
+                                                    (1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, (alpha * 150.0) as u8))
+                                                );
+                                            }
                                         }
                                     }
                                 }
@@ -328,8 +422,11 @@ impl<'a> VulkanEngine<'a> {
                             columns[2].horizontal(|ui| { ui.label("Title"); ui.label(&state.song_title); });
                             columns[2].horizontal(|ui| { ui.label("Artist"); ui.label(&state.artist); });
                             columns[2].horizontal(|ui| { ui.label("Type"); ui.label(&state.module_type); });
-                            columns[2].horizontal(|ui| { ui.label("BPM"); ui.label(format!("{}", state.bpm)); });
-                            columns[2].horizontal(|ui| { ui.label("Speed"); ui.label(format!("{}", state.speed)); });
+                            if state.bpm > 0 { columns[2].horizontal(|ui| { ui.label("BPM"); ui.label(format!("{}", state.bpm)); }); }
+                            if state.speed > 0 { columns[2].horizontal(|ui| { ui.label("Speed"); ui.label(format!("{}", state.speed)); }); }
+                            if state.num_patterns > 0 { columns[2].horizontal(|ui| { ui.label("Patterns"); ui.label(format!("{}", state.num_patterns)); }); }
+                            if state.num_instruments > 0 { columns[2].horizontal(|ui| { ui.label("Instruments"); ui.label(format!("{}", state.num_instruments)); }); }
+                            if state.num_samples > 0 { columns[2].horizontal(|ui| { ui.label("Samples"); ui.label(format!("{}", state.num_samples)); }); }
                             columns[2].horizontal(|ui| { ui.label("Channels"); ui.label(format!("{}", state.num_channels)); });
                             columns[2].horizontal(|ui| { ui.label("Length"); ui.label(format!("{:.1}s", state.duration_seconds)); });
                         });
@@ -418,8 +515,10 @@ impl<'a> VulkanEngine<'a> {
             let scale_factor = window.scale_factor() as f32;
             let vp_x = (central_rect.min.x * scale_factor).clamp(0.0, self.config.width as f32);
             let vp_y = (central_rect.min.y * scale_factor).clamp(0.0, self.config.height as f32);
-            let vp_w = (central_rect.width() * scale_factor).clamp(1.0, self.config.width as f32 - vp_x);
-            let vp_h = (central_rect.height() * scale_factor).clamp(1.0, self.config.height as f32 - vp_y);
+            let max_w = (self.config.width as f32 - vp_x).max(1.0);
+            let vp_w = (central_rect.width() * scale_factor).clamp(1.0, max_w);
+            let max_h = (self.config.height as f32 - vp_y).max(1.0);
+            let vp_h = (central_rect.height() * scale_factor).clamp(1.0, max_h);
             
             render_pass.set_viewport(vp_x, vp_y, vp_w, vp_h, 0.0, 1.0);
 
