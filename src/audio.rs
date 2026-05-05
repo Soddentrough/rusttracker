@@ -74,11 +74,18 @@ fn spawn_dsp_thread(
                 
                 state.raw_spectrum_data.copy_from_slice(&binned_data);
                 
-                // --- Waveform extraction ---
-                // Take 512 samples from the center of the 4096 buffer for a stable waveform
-                let offset = (4096 - 512) / 2;
+                // --- Waveform extraction (Zero-Crossing Edge Trigger) ---
+                // Scan the 4096 buffer for a zero-crossing (negative to positive) to stabilize the wave
+                let mut start_idx = 0;
+                for i in 0..(msg.audio_data.len() - 512) {
+                    if msg.audio_data[i] < 0.0 && msg.audio_data[i + 1] >= 0.0 {
+                        start_idx = i;
+                        break;
+                    }
+                }
+                
                 for i in 0..512 {
-                    state.raw_waveform[i] = msg.audio_data[offset + i];
+                    state.raw_waveform[i] = msg.audio_data[start_idx + i];
                 }
                 
                 state.waveform_history.pop_front();

@@ -59,7 +59,7 @@ impl AppState {
         }
         
         let mut wave_history = VecDeque::new();
-        for _ in 0..4 {
+        for _ in 0..60 {
             wave_history.push_back(vec![0.0; 512]);
         }
 

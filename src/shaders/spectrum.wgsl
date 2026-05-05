@@ -15,7 +15,6 @@ fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
 
 struct AudioUniforms {
     spectrum: array<vec4<f32>, 128>,
-    waveform: array<vec4<f32>, 512>,
     fire_heat: array<vec4<f32>, 128>,
     channels: array<vec4<f32>, 8>,
     num_channels: u32,
@@ -26,6 +25,9 @@ struct AudioUniforms {
 
 @group(0) @binding(0)
 var<uniform> audio: AudioUniforms;
+
+@group(0) @binding(1)
+var<storage, read> waveform_history: array<vec4<f32>>;
 
 fn val_to_color(val: f32) -> vec3<f32> {
     let v = clamp(val, 0.0, 100.0);
@@ -106,7 +108,7 @@ fn get_waveform(hist_idx: u32, x: f32) -> f32 {
     let vec_idx = clamped_idx / 4u;
     let component_idx = clamped_idx % 4u;
     
-    let spec_vec = audio.waveform[hist_idx * 128u + vec_idx];
+    let spec_vec = waveform_history[hist_idx * 128u + vec_idx];
     if component_idx == 0u { return spec_vec.x; }
     else if component_idx == 1u { return spec_vec.y; }
     else if component_idx == 2u { return spec_vec.z; }
@@ -204,22 +206,24 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         var final_color = vec3<f32>(0.0);
         let amber = vec3<f32>(1.0, 0.65, 0.1);
         
-        // Accumulate 4 history frames for ghosting
-        // audio.waveform[0] is oldest, audio.waveform[3] is newest
-        for (var i = 0u; i < 4u; i = i + 1u) {
+        // Accumulate 60 history frames for ghosting
+        // waveform_history[0] is oldest, waveform_history[59] is newest
+        for (var i = 0u; i < 60u; i = i + 1u) {
             let raw_wave = get_waveform(i, final_uv.x); // -1.0 to 1.0
             let wave_y = raw_wave * 0.4 + 0.5; // Map to 0.1 - 0.9 range
             let dist = abs(final_uv.y - wave_y);
             
-            // Age factor: oldest is 0.25, newest is 1.0
-            let age = f32(i + 1u) / 4.0; 
+            // Age factor: oldest is 1/60, newest is 1.0
+            // We use an exponential decay so the newest frame is brightest, and it fades quickly
+            let age_linear = f32(i + 1u) / 60.0;
+            let age = pow(age_linear, 3.0); 
             
             // Anti-aliased line thickness
             let thickness = 0.003;
             let line_intensity = smoothstep(thickness, 0.0, dist);
             
             // Bloom / phosphor glow
-            let bloom = 0.001 / (dist * dist + 0.001) * 0.5;
+            let bloom = 0.001 / (dist * dist + 0.001) * 0.3;
             
             let frame_intensity = (line_intensity + bloom) * age;
             final_color = final_color + amber * frame_intensity;

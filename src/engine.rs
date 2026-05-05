@@ -12,13 +12,18 @@ pub enum EngineAction {
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct AudioUniforms {
     pub spectrum: [f32; 512],
-    pub waveform: [[f32; 512]; 4],
     pub fire_heat: [f32; 512],
     pub channels: [f32; 32],
     pub num_channels: u32,
     pub mode: u32,
     pub time: f32,
     pub _padding: u32,
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct WaveformHistoryStorage {
+    pub waveforms: [[f32; 512]; 60],
 }
 
 pub struct VulkanEngine<'a> {
@@ -29,6 +34,7 @@ pub struct VulkanEngine<'a> {
     pub size: winit::dpi::PhysicalSize<u32>,
     render_pipeline: wgpu::RenderPipeline,
     uniform_buffer: wgpu::Buffer,
+    waveform_storage_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
     pub egui_renderer: egui_wgpu::Renderer,
     pub heatmap_texture: Option<egui::TextureHandle>,
@@ -107,6 +113,13 @@ impl<'a> VulkanEngine<'a> {
             mapped_at_creation: false,
         });
 
+        let waveform_storage_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Waveform History Storage Buffer"),
+            size: std::mem::size_of::<WaveformHistoryStorage>() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             entries: &[
                 wgpu::BindGroupLayoutEntry {
@@ -114,6 +127,16 @@ impl<'a> VulkanEngine<'a> {
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false,
                         min_binding_size: None,
                     },
@@ -129,6 +152,10 @@ impl<'a> VulkanEngine<'a> {
                 wgpu::BindGroupEntry {
                     binding: 0,
                     resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: waveform_storage_buffer.as_entire_binding(),
                 }
             ],
             label: Some("audio_bind_group"),
@@ -215,6 +242,7 @@ impl<'a> VulkanEngine<'a> {
             size,
             render_pipeline,
             uniform_buffer,
+            waveform_storage_buffer,
             uniform_bind_group,
             egui_renderer,
             heatmap_texture: None,
@@ -239,7 +267,6 @@ impl<'a> VulkanEngine<'a> {
     pub fn update(&mut self, state: &AppState) {
         let mut uniforms = AudioUniforms {
             spectrum: [0.0; 512],
-            waveform: [[0.0; 512]; 4],
             fire_heat: [0.0; 512],
             channels: [0.0; 32],
             num_channels: state.num_channels as u32,
@@ -249,15 +276,20 @@ impl<'a> VulkanEngine<'a> {
         };
 
         uniforms.spectrum.copy_from_slice(&state.spectrum_data);
-        for (i, wave) in state.waveform_history.iter().enumerate().take(4) {
-            uniforms.waveform[i].copy_from_slice(wave);
-        }
         uniforms.fire_heat.copy_from_slice(&state.fire_heat);
+        
+        let mut history_storage = WaveformHistoryStorage {
+            waveforms: [[0.0; 512]; 60],
+        };
+        for (i, wave) in state.waveform_history.iter().enumerate().take(60) {
+            history_storage.waveforms[i].copy_from_slice(wave);
+        }
         
         let ch_len = state.channel_vus.len().min(32);
         uniforms.channels[..ch_len].copy_from_slice(&state.channel_vus[..ch_len]);
 
         self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+        self.queue.write_buffer(&self.waveform_storage_buffer, 0, bytemuck::cast_slice(&[history_storage]));
     }
 
     pub fn render(
