@@ -408,13 +408,17 @@ impl<'a> VulkanEngine<'a> {
                             let ember_count = (played_width / 4.0) as usize;
                             for i in 0..ember_count {
                                 let ember_x = rect.min.x + (i * 4) as f32;
-                                let seed = ((ember_x as f64 * 12.34 + state.current_seconds as f64 * 2.0).sin() * 43758.5453).fract().abs();
-                                if seed > 0.8 {
-                                    let brightness = ((seed - 0.8) * 5.0 * 255.0) as u8;
+                                let static_seed = ((ember_x as f64 * 12.34).sin() * 43758.5453).fract().abs();
+                                if static_seed > 0.85 {
+                                    let phase = ember_x as f64 * 0.5;
+                                    let pulse = ((state.current_seconds as f64 * 2.0 + phase).sin() * 0.5 + 0.5) as f32;
+                                    let max_brightness = ((static_seed - 0.85) / 0.15 * 255.0) as f32;
+                                    let brightness = (max_brightness * (0.3 + 0.7 * pulse)) as u8;
+                                    
                                     painter.rect_filled(
                                         egui::Rect::from_min_size(egui::pos2(ember_x, base_y - 2.0), egui::vec2(2.0, 2.0)),
                                         0.0,
-                                        egui::Color32::from_rgba_premultiplied(255, brightness / 3, 0, brightness)
+                                        egui::Color32::from_rgba_unmultiplied(255, brightness / 4, 0, brightness)
                                     );
                                 }
                             }
@@ -460,12 +464,26 @@ impl<'a> VulkanEngine<'a> {
                                 for y in 0..fire_h {
                                     for x in 0..fire_w {
                                         let temp = self.fire_buffer[y * fire_w + x];
-                                        if temp > 15 {
-                                            let r = temp;
-                                            let g = (temp as f32 * 0.9).clamp(0.0, 255.0) as u8;
-                                            let b = if temp > 220 { 255 } else { (temp.saturating_sub(160) as f32 * 2.0).clamp(0.0, 255.0) as u8 };
-                                            let a = temp.min(220);
-                                            
+                                        let (r, g, b, a) = if temp > 230 {
+                                            (255, 255, 255, 255) // White hot
+                                        } else if temp > 150 {
+                                            let n = (temp - 150) as f32 / 80.0;
+                                            (255, (n * 255.0) as u8, (n * 100.0) as u8, 255) // Orange/Yellow
+                                        } else if temp > 80 {
+                                            let n = (temp - 80) as f32 / 70.0;
+                                            (255, (n * 100.0) as u8, 0, 240) // Bright Red to Deep Orange
+                                        } else if temp > 30 {
+                                            let n = (temp - 30) as f32 / 50.0;
+                                            ((100.0 + n * 155.0) as u8, 0, 0, 200) // Deep Red
+                                        } else if temp > 10 {
+                                            let n = (temp - 10) as f32 / 20.0;
+                                            let grey = 30 + (n * 40.0) as u8;
+                                            (grey, grey, grey, (n * 150.0) as u8) // Grey Smoke
+                                        } else {
+                                            (0, 0, 0, 0)
+                                        };
+                                        
+                                        if a > 0 {
                                             let px_x = start_x + x as f32 * pixel_size;
                                             let px_y = start_y + y as f32 * pixel_size;
                                             
@@ -475,7 +493,7 @@ impl<'a> VulkanEngine<'a> {
                                                     egui::vec2(pixel_size, pixel_size)
                                                 ),
                                                 0.0,
-                                                egui::Color32::from_rgba_premultiplied(r, g, b, a)
+                                                egui::Color32::from_rgba_unmultiplied(r, g, b, a)
                                             );
                                         }
                                     }
