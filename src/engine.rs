@@ -367,13 +367,15 @@ impl<'a> VulkanEngine<'a> {
                                     );
                                     
                                     // Label
-                                    painter.text(
-                                        egui::pos2(x + bw * 0.5, y_bottom + 2.0),
-                                        egui::Align2::CENTER_TOP,
-                                        format!("{}", i + 1),
-                                        egui::FontId::proportional(12.0),
-                                        egui::Color32::GRAY,
-                                    );
+                                    if channels <= 16 {
+                                        painter.text(
+                                            egui::pos2(x + bw * 0.5, y_bottom + 2.0),
+                                            egui::Align2::CENTER_TOP,
+                                            format!("{}", i + 1),
+                                            egui::FontId::proportional(12.0),
+                                            egui::Color32::GRAY,
+                                        );
+                                    }
                                 }
                             }
                             

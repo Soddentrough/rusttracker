@@ -100,11 +100,22 @@ fn main() -> Result<(), Box<dyn Error>> {
 async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal::Stream>) {
     let event_loop = EventLoop::new().unwrap();
     
+    let (icon_rgba, icon_width, icon_height) = {
+        let image = image::load_from_memory(include_bytes!("../icon.png"))
+            .expect("Failed to load icon")
+            .into_rgba8();
+        let (width, height) = image.dimensions();
+        let rgba = image.into_raw();
+        (rgba, width, height)
+    };
+    let window_icon = winit::window::Icon::from_rgba(icon_rgba, icon_width, icon_height).unwrap();
+
     #[allow(deprecated)]
     let window = Arc::new(event_loop.create_window(
         winit::window::Window::default_attributes()
             .with_title("RustTracker Vulkan Visualizer")
             .with_inner_size(winit::dpi::PhysicalSize::new(1920, 1080))
+            .with_window_icon(Some(window_icon))
     ).unwrap());
 
     let mut engine = VulkanEngine::new(window.clone()).await;
