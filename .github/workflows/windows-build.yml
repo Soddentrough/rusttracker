@@ -41,21 +41,8 @@ jobs:
       run: |
         mkdir release
         cp target/release/rusttracker.exe release/
-        # Copy required DLLs from MSYS2 environment
-        cp /mingw64/bin/libopenmpt-0.dll release/
-        cp /mingw64/bin/libgcc_s_seh-1.dll release/
-        cp /mingw64/bin/libstdc++-6.dll release/
-        cp /mingw64/bin/libwinpthread-1.dll release/
-        cp /mingw64/bin/zlib1.dll release/
-        cp /mingw64/bin/libmpg123-0.dll release/
-        cp /mingw64/bin/libogg-0.dll release/
-        cp /mingw64/bin/libvorbis-0.dll release/
-        cp /mingw64/bin/libvorbisfile-3.dll release/
-        cp /mingw64/bin/avcodec-*.dll release/ || true
-        cp /mingw64/bin/avformat-*.dll release/ || true
-        cp /mingw64/bin/avutil-*.dll release/ || true
-        cp /mingw64/bin/swresample-*.dll release/ || true
-        cp /mingw64/bin/swscale-*.dll release/ || true
+        # Automatically resolve and copy all required MSYS2 DLLs (including FFmpeg transitive dependencies)
+        ldd target/release/rusttracker.exe | grep -i '/mingw64' | awk '{print $3}' | xargs -I '{}' cp '{}' release/
         
     - name: Build Installer
       shell: cmd
