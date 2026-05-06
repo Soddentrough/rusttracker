@@ -32,6 +32,8 @@ jobs:
           mingw-w64-x86_64-clang
           
     - name: Build RustTracker
+      env:
+        BINDGEN_EXTRA_CLANG_ARGS: "-target x86_64-pc-windows-gnu"
       run: |
         cargo build --release
         
