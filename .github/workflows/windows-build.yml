@@ -26,6 +26,7 @@ jobs:
           mingw-w64-x86_64-toolchain
           mingw-w64-x86_64-rust
           mingw-w64-x86_64-libopenmpt
+          mingw-w64-x86_64-ffmpeg
           
     - name: Build RustTracker
       run: |
@@ -45,6 +46,11 @@ jobs:
         cp /mingw64/bin/libogg-0.dll release/
         cp /mingw64/bin/libvorbis-0.dll release/
         cp /mingw64/bin/libvorbisfile-3.dll release/
+        cp /mingw64/bin/avcodec-*.dll release/ || true
+        cp /mingw64/bin/avformat-*.dll release/ || true
+        cp /mingw64/bin/avutil-*.dll release/ || true
+        cp /mingw64/bin/swresample-*.dll release/ || true
+        cp /mingw64/bin/swscale-*.dll release/ || true
         
     - name: Build Installer
       shell: cmd

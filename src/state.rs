@@ -22,6 +22,7 @@ pub struct AppState {
     pub bpm: i32,
     pub speed: i32,
     pub num_channels: i32,
+    pub hardware_channels: i32,
     pub raw_channel_vus: Vec<f32>,
     pub channel_vus: Vec<f32>,
     pub peak_vus: Vec<f32>,
@@ -43,6 +44,7 @@ pub struct AppState {
     pub tracker_patterns_by_order: Vec<Vec<String>>,
     pub load_request: Option<String>,
     pub file_loaded: bool,
+    pub video_info: Option<String>,
     pub show_stats: bool,
     pub stats: PerformanceStats,
     pub current_fps: f32,
@@ -50,6 +52,8 @@ pub struct AppState {
     pub playlist_index: usize,
     pub track_ended: bool,
     pub visualizer_mode: u32,
+    pub available_visualizers: Vec<u32>,
+    pub current_visualizer_idx: usize,
 }
 
 impl AppState {
@@ -65,7 +69,7 @@ impl AppState {
         }
 
         AppState {
-            file_loaded: !title.is_empty(),
+            file_loaded: false,
             song_title: title,
             artist: "Unknown".to_string(),
             module_type: "Unknown".to_string(),
@@ -76,6 +80,7 @@ impl AppState {
             bpm: 0,
             speed: 0,
             num_channels: 0,
+            hardware_channels: 0,
             raw_channel_vus: Vec::new(),
             channel_vus: Vec::new(),
             peak_vus: Vec::new(),
@@ -96,6 +101,8 @@ impl AppState {
             tracker_row_history: VecDeque::with_capacity(128),
             tracker_patterns_by_order: Vec::new(),
             load_request: None,
+
+            video_info: None,
             show_stats: false,
             stats: PerformanceStats::default(),
             current_fps: 0.0,
@@ -103,6 +110,8 @@ impl AppState {
             playlist_index: 0,
             track_ended: false,
             visualizer_mode: 0,
+            available_visualizers: vec![0, 1, 2],
+            current_visualizer_idx: 0,
         }
     }
 }

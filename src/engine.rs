@@ -44,7 +44,7 @@ pub struct VulkanEngine<'a> {
     queue: wgpu::Queue,
     pub config: wgpu::SurfaceConfiguration,
     pub size: winit::dpi::PhysicalSize<u32>,
-    render_pipeline: wgpu::RenderPipeline,
+    render_pipelines: Vec<wgpu::RenderPipeline>,
     hud_pipeline: wgpu::RenderPipeline,
     uniform_buffer: wgpu::Buffer,
     waveform_storage_buffer: wgpu::Buffer,
@@ -122,7 +122,7 @@ impl<'a> VulkanEngine<'a> {
         };
         surface.configure(&device, &config);
 
-        let shader = device.create_shader_module(wgpu::include_wgsl!("shaders/crt_oscilloscope.wgsl"));
+
 
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Audio Uniform Buffer"),
@@ -206,43 +206,56 @@ impl<'a> VulkanEngine<'a> {
             push_constant_ranges: &[],
         });
 
-        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Render Pipeline"),
-            layout: Some(&render_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: None,
-            multisample: wgpu::MultisampleState {
-                count: 1,
-                mask: !0,
-                alpha_to_coverage_enabled: false,
-            },
-            multiview: None,
-            cache: None,
-        });
+        let shader_modules = vec![
+            device.create_shader_module(wgpu::include_wgsl!("shaders/vis_spectrum.wgsl")),
+            device.create_shader_module(wgpu::include_wgsl!("shaders/vis_flame.wgsl")),
+            device.create_shader_module(wgpu::include_wgsl!("shaders/vis_oscilloscope.wgsl")),
+            device.create_shader_module(wgpu::include_wgsl!("shaders/vis_spatial.wgsl")),
+            device.create_shader_module(wgpu::include_wgsl!("shaders/vis_ferrofluid.wgsl")),
+            device.create_shader_module(wgpu::include_wgsl!("shaders/vis_neon.wgsl")),
+        ];
+
+        let mut render_pipelines = Vec::new();
+        for (i, shader) in shader_modules.iter().enumerate() {
+            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(&format!("Render Pipeline {}", i)),
+                layout: Some(&render_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview: None,
+                cache: None,
+            });
+            render_pipelines.push(pipeline);
+        }
 
         let hud_shader = device.create_shader_module(wgpu::include_wgsl!("shaders/hud.wgsl"));
         let hud_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -318,7 +331,7 @@ impl<'a> VulkanEngine<'a> {
             queue,
             config,
             size,
-            render_pipeline,
+            render_pipelines,
             hud_pipeline,
             uniform_buffer,
             waveform_storage_buffer,
@@ -517,7 +530,7 @@ impl<'a> VulkanEngine<'a> {
                             ui.add_space(40.0);
                             
                             let btn = egui::Button::new(
-                                egui::RichText::new("  OPEN TRACKER MODULE  ")
+                                egui::RichText::new("  OPEN AUDIO FILE  ")
                                     .size(24.0)
                                     .color(egui::Color32::WHITE)
                                     .strong()
@@ -597,10 +610,19 @@ impl<'a> VulkanEngine<'a> {
                                     
                                     // Label
                                     if num_channels <= 16 {
+                                        let label = match num_channels {
+                                            2 => ["L", "R"].get(i).unwrap_or(&"?").to_string(), // Stereo
+                                            3 => ["L", "R", "LFE"].get(i).unwrap_or(&"?").to_string(), // 2.1
+                                            4 => ["L", "R", "Ls", "Rs"].get(i).unwrap_or(&"?").to_string(), // Quad
+                                            6 => ["L", "R", "C", "LFE", "Ls", "Rs"].get(i).unwrap_or(&"?").to_string(), // 5.1
+                                            8 => ["L", "R", "C", "LFE", "Ls", "Rs", "Lrs", "Rrs"].get(i).unwrap_or(&"?").to_string(), // 7.1
+                                            12 => ["L", "R", "C", "LFE", "Ls", "Rs", "Lrs", "Rrs", "Ltf", "Rtf", "Ltr", "Rtr"].get(i).unwrap_or(&"?").to_string(), // 7.1.4 Dolby Atmos standard
+                                            _ => format!("{}", i + 1),
+                                        };
                                         painter.text(
                                             egui::pos2(x + bw * 0.5, y_bottom + 2.0),
                                             egui::Align2::CENTER_TOP,
-                                            format!("{}", i + 1),
+                                            label,
                                             egui::FontId::proportional(12.0),
                                             egui::Color32::GRAY,
                                         );
@@ -744,15 +766,42 @@ impl<'a> VulkanEngine<'a> {
                             if state.playlist.len() > 1 {
                                 columns[2].horizontal(|ui| { ui.label("Playlist"); ui.label(format!("{} / {}", state.playlist_index + 1, state.playlist.len())); });
                             }
-                            columns[2].horizontal(|ui| { ui.label("Title"); ui.label(&state.song_title); });
+                            let title_path = std::path::Path::new(&state.song_title);
+                            let file_name = title_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                            let file_dir = title_path.parent().unwrap_or(std::path::Path::new("")).to_string_lossy().to_string();
+                            columns[2].horizontal(|ui| { ui.label("File"); ui.label(&file_name); });
+                            columns[2].horizontal(|ui| { ui.label("Path"); ui.label(&file_dir); });
                             columns[2].horizontal(|ui| { ui.label("Artist"); ui.label(&state.artist); });
                             columns[2].horizontal(|ui| { ui.label("Type"); ui.label(&state.module_type); });
+                            if let Some(video) = &state.video_info {
+                                columns[2].horizontal(|ui| { ui.label("Video"); ui.label(video); });
+                            }
                             if state.bpm > 0 { columns[2].horizontal(|ui| { ui.label("BPM"); ui.label(format!("{}", state.bpm)); }); }
                             if state.speed > 0 { columns[2].horizontal(|ui| { ui.label("Speed"); ui.label(format!("{}", state.speed)); }); }
                             if state.num_patterns > 0 { columns[2].horizontal(|ui| { ui.label("Patterns"); ui.label(format!("{}", state.num_patterns)); }); }
                             if state.num_instruments > 0 { columns[2].horizontal(|ui| { ui.label("Instruments"); ui.label(format!("{}", state.num_instruments)); }); }
                             if state.num_samples > 0 { columns[2].horizontal(|ui| { ui.label("Samples"); ui.label(format!("{}", state.num_samples)); }); }
-                            columns[2].horizontal(|ui| { ui.label("Channels"); ui.label(format!("{}", state.num_channels)); });
+                            columns[2].horizontal(|ui| { 
+                                ui.label("Channels"); 
+                                if state.num_channels > state.hardware_channels && state.hardware_channels > 0 {
+                                    ui.label(format!("{} (Downmixed to {})", state.num_channels, state.hardware_channels));
+                                } else {
+                                    ui.label(format!("{}", state.num_channels));
+                                }
+                            });
+                            
+                            // Visualizer Mode
+                            let vis_name = match state.visualizer_mode {
+                                0 => "Frequency Spectrum",
+                                1 => "Fire",
+                                2 => "CRT Oscilloscope",
+                                3 => "Spatial Vectors",
+                                4 => "Chrome Ferrofluid",
+                                5 => "Neon Corridor",
+                                _ => "Unknown",
+                            };
+                            columns[2].horizontal(|ui| { ui.label("Visualizer"); ui.label(vis_name); });
+                            
                             columns[2].horizontal(|ui| { ui.label("Length"); ui.label(format!("{:.1}s", state.duration_seconds)); });
                         });
                     });
@@ -761,10 +810,11 @@ impl<'a> VulkanEngine<'a> {
             // Central Panel (Transparent background) for Frequency Labels
             let frame = egui::Frame::NONE.fill(egui::Color32::TRANSPARENT);
             egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
-                if state.visualizer_mode != 1 {
+                let rect = ui.available_rect_before_wrap();
+                central_rect = rect;
+                
+                if state.visualizer_mode == 0 {
                     // Draw frequency labels at the bottom
-                    let rect = ui.available_rect_before_wrap();
-                    central_rect = rect;
                     let painter = ui.painter();
                     let y = rect.bottom() - 20.0;
                     
@@ -872,7 +922,8 @@ impl<'a> VulkanEngine<'a> {
             
             render_pass.set_viewport(vp_x, vp_y, vp_w, vp_h, 0.0, 1.0);
 
-            render_pass.set_pipeline(&self.render_pipeline);
+            let mode_idx = (state.visualizer_mode as usize).min(self.render_pipelines.len() - 1);
+            render_pass.set_pipeline(&self.render_pipelines[mode_idx]);
             render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
             render_pass.draw(0..3, 0..1);
             

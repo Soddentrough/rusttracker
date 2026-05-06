@@ -66,6 +66,20 @@ impl Drop for Tui {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    std::panic::set_hook(Box::new(|info| {
+        let backtrace = std::backtrace::Backtrace::force_capture();
+        let msg = match info.payload().downcast_ref::<&'static str>() {
+            Some(s) => *s,
+            None => match info.payload().downcast_ref::<String>() {
+                Some(s) => &s[..],
+                None => "Box<dyn std::any::Any>",
+            },
+        };
+        let location = info.location().map(|loc| format!("{}:{}", loc.file(), loc.line())).unwrap_or_else(|| "unknown location".to_string());
+        let crash_report = format!("RustTracker Panic at {}:\n{}\n\nBacktrace:\n{}", location, msg, backtrace);
+        let _ = std::fs::write("rusttracker_crash.log", crash_report);
+    }));
+
     let args = Args::parse();
     let title = if args.mic {
         "Microphone Input".to_string()
@@ -84,7 +98,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut initial_stream = None;
     if args.mic || !args.file.is_empty() {
         let file_path = args.file.first().cloned().unwrap_or_default();
-        initial_stream = audio::start_audio_thread(&file_path, args.mic, Arc::clone(&app_state)).ok();
+        initial_stream = match audio::start_audio_thread(&file_path, args.mic, Arc::clone(&app_state)) {
+            Ok(stream) => {
+                let mut state = app_state.lock().unwrap();
+                state.file_loaded = true;
+                Some(stream)
+            },
+            Err(e) => {
+                eprintln!("AUDIO LOAD ERROR: {:?}", e);
+                None
+            }
+        };
     }
 
     if args.tui {
@@ -173,7 +197,7 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                                     let app_state_clone = Arc::clone(&app_state);
                                     std::thread::spawn(move || {
                                         if let Some(paths) = rfd::FileDialog::new()
-                                            .add_filter("Tracker Modules", &["mod", "s3m", "xm", "it", "stm", "669", "mtm", "med", "okt", "psm"])
+                                            .add_filter("Audio/Video Files", &["flac", "wav", "mp3", "ogg", "aac", "m4a", "mp4", "mkv", "avi", "webm", "opus", "mod", "s3m", "xm", "it", "stm", "669", "mtm", "med", "okt", "psm"])
                                             .add_filter("All Files", &["*"])
                                             .pick_files() {
                                             if !paths.is_empty() {
@@ -188,11 +212,18 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                                 },
                                 WinitKeyCode::Space => {
                                     let mut state = app_state.lock().unwrap();
-                                    state.is_paused = !state.is_paused;
+                                    if state.current_seconds >= state.duration_seconds - 0.1 && state.duration_seconds > 0.0 {
+                                        state.seek_request = Some(0.0);
+                                        state.spectrum_history.clear();
+                                        for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 512]); }
+                                        state.is_paused = false;
+                                    } else {
+                                        state.is_paused = !state.is_paused;
+                                    }
                                 },
                                 WinitKeyCode::ArrowRight => {
                                     let mut state = app_state.lock().unwrap();
-                                    let target = (state.current_seconds + 5.0).min(state.duration_seconds);
+                                    let target = state.current_seconds + 5.0;
                                     state.seek_request = Some(target);
                                     state.spectrum_history.clear();
                                     for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 512]); }
@@ -206,11 +237,21 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                                 },
                                 WinitKeyCode::ArrowUp => {
                                     let mut state = app_state.lock().unwrap();
-                                    state.visualizer_mode = (state.visualizer_mode + 1) % 3;
+                                    if !state.available_visualizers.is_empty() {
+                                        state.current_visualizer_idx = (state.current_visualizer_idx + 1) % state.available_visualizers.len();
+                                        state.visualizer_mode = state.available_visualizers[state.current_visualizer_idx];
+                                    }
                                 },
                                 WinitKeyCode::ArrowDown => {
                                     let mut state = app_state.lock().unwrap();
-                                    state.visualizer_mode = if state.visualizer_mode == 0 { 2 } else { state.visualizer_mode - 1 };
+                                    if !state.available_visualizers.is_empty() {
+                                        if state.current_visualizer_idx == 0 {
+                                            state.current_visualizer_idx = state.available_visualizers.len() - 1;
+                                        } else {
+                                            state.current_visualizer_idx -= 1;
+                                        }
+                                        state.visualizer_mode = state.available_visualizers[state.current_visualizer_idx];
+                                    }
                                 },
                                 _ => {}
                             }
@@ -245,7 +286,13 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                     };
                     
                     if let Some(path) = load_path {
-                        active_stream = audio::start_audio_thread(&path, false, Arc::clone(&app_state)).ok();
+                        if let Ok(stream) = audio::start_audio_thread(&path, false, Arc::clone(&app_state)) {
+                            let mut state = app_state.lock().unwrap();
+                            state.file_loaded = true;
+                            active_stream = Some(stream);
+                        } else {
+                            active_stream = None;
+                        }
                     }
 
                     let now = Instant::now();
@@ -368,7 +415,7 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                         let app_state_clone = Arc::clone(&app_state);
                         std::thread::spawn(move || {
                             if let Some(paths) = rfd::FileDialog::new()
-                                .add_filter("Tracker Modules", &["mod", "s3m", "xm", "it", "stm", "669", "mtm", "med", "okt", "psm"])
+                                .add_filter("Audio/Video Files", &["flac", "wav", "mp3", "ogg", "aac", "m4a", "mp4", "mkv", "avi", "webm", "opus", "mod", "s3m", "xm", "it", "stm", "669", "mtm", "med", "okt", "psm"])
                                 .add_filter("All Files", &["*"])
                                 .pick_files() {
                                 if !paths.is_empty() {
