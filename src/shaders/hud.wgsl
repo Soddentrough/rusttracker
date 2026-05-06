@@ -31,12 +31,12 @@ struct AudioUniforms {
     ui_fire_rect: vec4<f32>,
 };
 
-struct HeatmapHistoryStorage {
+struct VisualizerStorage {
     history: array<array<f32, 64>, 120>,
 };
 
 @group(0) @binding(0) var<uniform> uniforms: AudioUniforms;
-@group(0) @binding(2) var<storage, read> heatmap_storage: HeatmapHistoryStorage;
+@group(0) @binding(2) var<storage, read> heatmap_storage: VisualizerStorage;
 
 fn hash(p: vec2<f32>) -> f32 {
     let p3  = fract(vec3<f32>(p.xyx) * 0.1031);

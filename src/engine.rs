@@ -35,8 +35,9 @@ pub struct WaveformHistoryStorage {
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct HeatmapHistoryStorage {
+pub struct VisualizerStorage {
     pub history: [[f32; 64]; 120],
+    pub fire_grid: [[f32; 512]; 144],
 }
 
 pub struct VulkanEngine<'a> {
@@ -49,7 +50,7 @@ pub struct VulkanEngine<'a> {
     hud_pipeline: wgpu::RenderPipeline,
     uniform_buffer: wgpu::Buffer,
     waveform_storage_buffer: wgpu::Buffer,
-    heatmap_storage_buffer: wgpu::Buffer,
+    visualizer_storage_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
     pub egui_renderer: egui_wgpu::Renderer,
     
@@ -62,6 +63,7 @@ pub struct VulkanEngine<'a> {
     pub meters_uv_rect: [f32; 4],
     pub heatmap_uv_rect: [f32; 4],
     pub fire_uv_rect: [f32; 4],
+    fire_grid: Box<[[f32; 512]; 144]>,
     
     pub start_time: std::time::Instant,
 }
@@ -139,9 +141,9 @@ impl<'a> VulkanEngine<'a> {
             mapped_at_creation: false,
         });
 
-        let heatmap_storage_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+        let visualizer_storage_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Heatmap History Storage Buffer"),
-            size: std::mem::size_of::<HeatmapHistoryStorage>() as u64,
+            size: std::mem::size_of::<VisualizerStorage>() as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -195,7 +197,7 @@ impl<'a> VulkanEngine<'a> {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: heatmap_storage_buffer.as_entire_binding(),
+                    resource: visualizer_storage_buffer.as_entire_binding(),
                 }
             ],
             label: Some("audio_bind_group"),
@@ -336,7 +338,7 @@ impl<'a> VulkanEngine<'a> {
             hud_pipeline,
             uniform_buffer,
             waveform_storage_buffer,
-            heatmap_storage_buffer,
+            visualizer_storage_buffer,
             uniform_bind_group,
             egui_renderer,
             query_set,
@@ -347,6 +349,7 @@ impl<'a> VulkanEngine<'a> {
             meters_uv_rect: [0.0; 4],
             heatmap_uv_rect: [0.0; 4],
             fire_uv_rect: [0.0; 4],
+            fire_grid: Box::new([[0.0; 512]; 144]),
             start_time: std::time::Instant::now(),
         }
     }
@@ -388,15 +391,27 @@ impl<'a> VulkanEngine<'a> {
         }
         
         let ch_len = state.channel_vus.len().min(32);
-        uniforms.channels[..ch_len].copy_from_slice(&state.channel_vus[..ch_len]);
-        let peak_len = state.peak_vus.len().min(32);
-        uniforms.channel_peaks[..peak_len].copy_from_slice(&state.peak_vus[..peak_len]);
+        
+        let mut display_order: Vec<usize> = (0..ch_len).collect();
+        if ch_len == 6 {
+            display_order = vec![4, 0, 2, 3, 1, 5]; // Ls, L, C, LFE, R, Rs
+        } else if ch_len == 8 {
+            display_order = vec![6, 4, 0, 2, 3, 1, 5, 7]; // SBL, Ls, L, C, LFE, R, Rs, SBR
+        }
+
+        for (disp_idx, &src_idx) in display_order.iter().enumerate() {
+            if src_idx < state.channel_vus.len() {
+                uniforms.channels[disp_idx] = state.channel_vus[src_idx];
+                uniforms.channel_peaks[disp_idx] = state.peak_vus[src_idx];
+            }
+        }
 
         self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
         self.queue.write_buffer(&self.waveform_storage_buffer, 0, bytemuck::cast_slice(&[history_storage]));
         
-        let mut heatmap_storage = HeatmapHistoryStorage {
+        let mut visualizer_storage = VisualizerStorage {
             history: [[0.0; 64]; 120],
+            fire_grid: *self.fire_grid,
         };
         let chunks = 64;
         let history_len = state.spectrum_history.len().min(120);
@@ -412,11 +427,65 @@ impl<'a> VulkanEngine<'a> {
                             max_val = bands[idx];
                         }
                     }
-                    heatmap_storage.history[time_idx][x] = max_val;
+                    visualizer_storage.history[time_idx][x] = max_val;
                 }
             }
         }
-        self.queue.write_buffer(&self.heatmap_storage_buffer, 0, bytemuck::cast_slice(&[heatmap_storage]));
+        
+        // Classic Doom Fire Cellular Automaton
+        if state.visualizer_mode == 1 {
+            let mut seed = (state.current_seconds * 1000.0) as u32;
+            let mut rng = || {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                seed
+            };
+            
+            // 1. Inject Fuel at the bottom (y = 143)
+            let n_ch = state.channel_vus.len().max(1).min(32);
+            let channel_width = 512.0 / n_ch as f32;
+            
+            for x in 0..512 {
+                let mut fuel = 0.0;
+                for i in 0..n_ch {
+                    let center_x = (i as f32 + 0.5) * channel_width;
+                    let dist = (x as f32 - center_x).abs();
+                    // Use the mapped layout so Ls is on the far left, etc.
+                    let ch_vu = uniforms.channels[i];
+                    let ch_peak = uniforms.channel_peaks[i];
+                    
+                    let sigma = channel_width * 0.4;
+                    let influence = (- (dist * dist) / (2.0 * sigma * sigma)).exp();
+                    
+                    // Base fuel + sudden spikes from peaks
+                    fuel += (ch_vu + ch_peak * 0.5) * influence;
+                }
+                // Add some random noise to the fuel line to prevent smooth edges
+                if fuel > 0.1 && (rng() % 100) > 20 {
+                    self.fire_grid[143][x] = fuel.max(0.0).min(1.0);
+                } else {
+                    self.fire_grid[143][x] = 0.0;
+                }
+            }
+            
+            // 2. Propagate Heat Upwards
+            for y in 0..143 {
+                for x in 0..512 {
+                    // Random horizontal spread (-1, 0, 1)
+                    let spread = (rng() % 3) as i32 - 1;
+                    let src_x = (x as i32 + spread).clamp(0, 511) as usize;
+                    
+                    let heat = self.fire_grid[y + 1][src_x];
+                    
+                    // Random cooling
+                    let cooling = (rng() % 3) as f32 * 0.03;
+                    
+                    self.fire_grid[y][x] = (heat - cooling).max(0.0);
+                }
+            }
+            visualizer_storage.fire_grid = *self.fire_grid;
+        }
+
+        self.queue.write_buffer(&self.visualizer_storage_buffer, 0, bytemuck::cast_slice(&[visualizer_storage]));
     }
 
     pub fn render(
@@ -615,8 +684,8 @@ impl<'a> VulkanEngine<'a> {
                                             2 => ["L", "R"].get(i).unwrap_or(&"?").to_string(), // Stereo
                                             3 => ["L", "R", "LFE"].get(i).unwrap_or(&"?").to_string(), // 2.1
                                             4 => ["L", "R", "Ls", "Rs"].get(i).unwrap_or(&"?").to_string(), // Quad
-                                            6 => ["L", "R", "C", "LFE", "Ls", "Rs"].get(i).unwrap_or(&"?").to_string(), // 5.1
-                                            8 => ["L", "R", "C", "LFE", "Ls", "Rs", "Lrs", "Rrs"].get(i).unwrap_or(&"?").to_string(), // 7.1
+                                            6 => ["Ls", "L", "C", "LFE", "R", "Rs"].get(i).unwrap_or(&"?").to_string(), // 5.1 mapped
+                                            8 => ["SBL", "Ls", "L", "C", "LFE", "R", "Rs", "SBR"].get(i).unwrap_or(&"?").to_string(), // 7.1 mapped
                                             12 => ["L", "R", "C", "LFE", "Ls", "Rs", "Lrs", "Rrs", "Ltf", "Rtf", "Ltr", "Rtr"].get(i).unwrap_or(&"?").to_string(), // 7.1.4 Dolby Atmos standard
                                             _ => format!("{}", i + 1),
                                         };
