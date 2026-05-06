@@ -80,7 +80,7 @@ fn spawn_dsp_thread(
                 // rather than triggering randomly on high-frequency noise ripples.
                 let mut start_idx = 0;
                 let mut best_slope = 0.0;
-                let search_limit = msg.audio_data.len().saturating_sub(512);
+                let search_limit = msg.audio_data.len().saturating_sub(1024);
                 for i in 0..search_limit {
                     if msg.audio_data[i] <= 0.0 && msg.audio_data[i + 1] > 0.0 {
                         let slope = msg.audio_data[i + 1] - msg.audio_data[i];
@@ -91,7 +91,7 @@ fn spawn_dsp_thread(
                     }
                 }
                 
-                for i in 0..512 {
+                for i in 0..1024 {
                     state.raw_waveform[i] = msg.audio_data[start_idx + i];
                 }
                 
@@ -99,15 +99,7 @@ fn spawn_dsp_thread(
                 let wave_clone = state.raw_waveform.clone();
                 state.waveform_history.push_back(wave_clone);
                 
-                // --- Fire Heat Decay ---
-                for i in 0..512 {
-                    let current = binned_data[i];
-                    if current > state.fire_heat[i] {
-                        state.fire_heat[i] = current; // Instant ignition
-                    } else {
-                        state.fire_heat[i] = (state.fire_heat[i] - 1.5).max(0.0); // Slow decay
-                    }
-                }
+
                 
                 if msg.bpm != 0 { state.bpm = msg.bpm; }
                 if msg.speed != 0 { state.speed = msg.speed; }

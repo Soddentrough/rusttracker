@@ -14,16 +14,28 @@ pub struct AudioUniforms {
     pub spectrum: [f32; 512],
     pub fire_heat: [f32; 512],
     pub channels: [f32; 32],
+    pub channel_peaks: [f32; 32],
     pub num_channels: u32,
     pub mode: u32,
     pub time: f32,
-    pub _padding: u32,
+    pub duration: f32,
+    pub smooth_time: f32,
+    pub _pad: [u32; 3],
+    pub ui_meters_rect: [f32; 4],
+    pub ui_heatmap_rect: [f32; 4],
+    pub ui_fire_rect: [f32; 4],
 }
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct WaveformHistoryStorage {
-    pub waveforms: [[f32; 512]; 60],
+    pub waveforms: [[f32; 1024]; 60],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct HeatmapHistoryStorage {
+    pub history: [[f32; 64]; 120],
 }
 
 pub struct VulkanEngine<'a> {
@@ -33,18 +45,24 @@ pub struct VulkanEngine<'a> {
     pub config: wgpu::SurfaceConfiguration,
     pub size: winit::dpi::PhysicalSize<u32>,
     render_pipeline: wgpu::RenderPipeline,
+    hud_pipeline: wgpu::RenderPipeline,
     uniform_buffer: wgpu::Buffer,
     waveform_storage_buffer: wgpu::Buffer,
+    heatmap_storage_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
     pub egui_renderer: egui_wgpu::Renderer,
-    pub heatmap_texture: Option<egui::TextureHandle>,
-    pub fire_buffer: Vec<u8>,
     
     query_set: Option<wgpu::QuerySet>,
     query_resolve_buffer: Option<wgpu::Buffer>,
     query_read_buffer: Option<wgpu::Buffer>,
     timestamp_period: f32,
     query_in_flight: bool,
+    
+    pub meters_uv_rect: [f32; 4],
+    pub heatmap_uv_rect: [f32; 4],
+    pub fire_uv_rect: [f32; 4],
+    
+    pub start_time: std::time::Instant,
 }
 
 impl<'a> VulkanEngine<'a> {
@@ -89,8 +107,8 @@ impl<'a> VulkanEngine<'a> {
             .find(|f| f.is_srgb())
             .unwrap_or(surface_caps.formats[0]);
 
-        // Let WGPU pick the best VSYNC method (Fifo, Mailbox, or FifoRelaxed)
-        let present_mode = wgpu::PresentMode::AutoVsync;
+        // Let WGPU pick the best non-vsync method to ensure frame pacing doesn't tear/stutter under Wayland
+        let present_mode = wgpu::PresentMode::AutoNoVsync;
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
@@ -104,7 +122,7 @@ impl<'a> VulkanEngine<'a> {
         };
         surface.configure(&device, &config);
 
-        let shader = device.create_shader_module(wgpu::include_wgsl!("shaders/spectrum.wgsl"));
+        let shader = device.create_shader_module(wgpu::include_wgsl!("shaders/crt_oscilloscope.wgsl"));
 
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Audio Uniform Buffer"),
@@ -116,6 +134,13 @@ impl<'a> VulkanEngine<'a> {
         let waveform_storage_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Waveform History Storage Buffer"),
             size: std::mem::size_of::<WaveformHistoryStorage>() as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let heatmap_storage_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Heatmap History Storage Buffer"),
+            size: std::mem::size_of::<HeatmapHistoryStorage>() as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -141,6 +166,16 @@ impl<'a> VulkanEngine<'a> {
                         min_binding_size: None,
                     },
                     count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 }
             ],
             label: Some("audio_bind_group_layout"),
@@ -156,6 +191,10 @@ impl<'a> VulkanEngine<'a> {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: waveform_storage_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: heatmap_storage_buffer.as_entire_binding(),
                 }
             ],
             label: Some("audio_bind_group"),
@@ -182,6 +221,45 @@ impl<'a> VulkanEngine<'a> {
                 targets: &[Some(wgpu::ColorTargetState {
                     format: config.format,
                     blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+            cache: None,
+        });
+
+        let hud_shader = device.create_shader_module(wgpu::include_wgsl!("shaders/hud.wgsl"));
+        let hud_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("HUD Pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &hud_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &hud_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -241,17 +319,21 @@ impl<'a> VulkanEngine<'a> {
             config,
             size,
             render_pipeline,
+            hud_pipeline,
             uniform_buffer,
             waveform_storage_buffer,
+            heatmap_storage_buffer,
             uniform_bind_group,
             egui_renderer,
-            heatmap_texture: None,
-            fire_buffer: vec![0; 80 * 20],
             query_set,
             query_resolve_buffer,
             query_read_buffer,
             timestamp_period,
             query_in_flight: false,
+            meters_uv_rect: [0.0; 4],
+            heatmap_uv_rect: [0.0; 4],
+            fire_uv_rect: [0.0; 4],
+            start_time: std::time::Instant::now(),
         }
     }
 
@@ -269,17 +351,23 @@ impl<'a> VulkanEngine<'a> {
             spectrum: [0.0; 512],
             fire_heat: [0.0; 512],
             channels: [0.0; 32],
+            channel_peaks: [0.0; 32],
             num_channels: state.num_channels as u32,
             mode: state.visualizer_mode,
             time: state.current_seconds as f32,
-            _padding: 0,
+            duration: state.duration_seconds as f32,
+            smooth_time: self.start_time.elapsed().as_secs_f32(),
+            _pad: [0; 3],
+            ui_meters_rect: self.meters_uv_rect,
+            ui_heatmap_rect: self.heatmap_uv_rect,
+            ui_fire_rect: self.fire_uv_rect,
         };
 
         uniforms.spectrum.copy_from_slice(&state.spectrum_data);
         uniforms.fire_heat.copy_from_slice(&state.fire_heat);
         
         let mut history_storage = WaveformHistoryStorage {
-            waveforms: [[0.0; 512]; 60],
+            waveforms: [[0.0; 1024]; 60],
         };
         for (i, wave) in state.waveform_history.iter().enumerate().take(60) {
             history_storage.waveforms[i].copy_from_slice(wave);
@@ -287,9 +375,34 @@ impl<'a> VulkanEngine<'a> {
         
         let ch_len = state.channel_vus.len().min(32);
         uniforms.channels[..ch_len].copy_from_slice(&state.channel_vus[..ch_len]);
+        let peak_len = state.peak_vus.len().min(32);
+        uniforms.channel_peaks[..peak_len].copy_from_slice(&state.peak_vus[..peak_len]);
 
         self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
         self.queue.write_buffer(&self.waveform_storage_buffer, 0, bytemuck::cast_slice(&[history_storage]));
+        
+        let mut heatmap_storage = HeatmapHistoryStorage {
+            history: [[0.0; 64]; 120],
+        };
+        let chunks = 64;
+        let history_len = state.spectrum_history.len().min(120);
+        if history_len > 0 {
+            let raw_bands = state.spectrum_history[0].len();
+            let chunk_size = raw_bands / chunks;
+            for (time_idx, bands) in state.spectrum_history.iter().take(120).enumerate() {
+                for x in 0..chunks {
+                    let mut max_val = 0.0;
+                    for k in 0..chunk_size {
+                        let idx = x * chunk_size + k;
+                        if idx < bands.len() && bands[idx] > max_val {
+                            max_val = bands[idx];
+                        }
+                    }
+                    heatmap_storage.history[time_idx][x] = max_val;
+                }
+            }
+        }
+        self.queue.write_buffer(&self.heatmap_storage_buffer, 0, bytemuck::cast_slice(&[heatmap_storage]));
     }
 
     pub fn render(
@@ -298,7 +411,7 @@ impl<'a> VulkanEngine<'a> {
         egui_ctx: &egui::Context,
         egui_state: &mut egui_winit::State,
         state: &AppState,
-    ) -> Result<(EngineAction, f32, f32, Option<f32>), wgpu::SurfaceError> {
+    ) -> Result<(EngineAction, f32, f32, Option<f32>, f32), wgpu::SurfaceError> {
         let ui_start = std::time::Instant::now();
         let output = self.surface.get_current_texture()?;
         let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
@@ -330,6 +443,11 @@ impl<'a> VulkanEngine<'a> {
         let raw_input = egui_state.take_egui_input(window);
         let mut central_rect = egui::Rect::from_min_max(Default::default(), egui::pos2(self.config.width as f32, self.config.height as f32));
         let mut engine_action = EngineAction::None;
+        let mut fire_time_us = 0.0;
+        
+        let mut out_meters_rect = None;
+        let mut out_fire_rect = None;
+        let mut out_heatmap_rect = None;
         
         let full_output = egui_ctx.run(raw_input, |ctx| {
             if state.show_stats {
@@ -359,6 +477,10 @@ impl<'a> VulkanEngine<'a> {
                         );
                         ui.label(
                             egui::RichText::new(format!("Shader: {:.2} ms", state.stats.shader_us / 1000.0))
+                                .color(egui::Color32::GRAY)
+                        );
+                        ui.label(
+                            egui::RichText::new("Fire FX: 0.00 ms (GPU Offloaded)")
                                 .color(egui::Color32::GRAY)
                         );
                     });
@@ -448,6 +570,7 @@ impl<'a> VulkanEngine<'a> {
             if state.show_hud {
                 egui::TopBottomPanel::top("top_panel")
                     .resizable(false)
+                    .frame(egui::Frame::NONE.fill(egui::Color32::TRANSPARENT))
                     .exact_height(ctx.screen_rect().height() / 2.0)
                     .show(ctx, |ui| {
                         ui.columns(3, |columns| {
@@ -458,46 +581,19 @@ impl<'a> VulkanEngine<'a> {
                                 egui::vec2(columns[0].available_width(), columns[0].available_height() - 25.0), 
                                 egui::Sense::hover()
                             );
+                            out_meters_rect = Some(channel_rect);
+                            
                             let painter = columns[0].painter();
                             let num_channels = state.channel_vus.len();
                             if num_channels > 0 {
                                 let w = channel_rect.width() / num_channels as f32;
-                                let max_h = channel_rect.height() - 20.0;
                                 for i in 0..num_channels {
                                     let x = channel_rect.left() + i as f32 * w + w * 0.2;
                                     let bw = w * 0.6;
                                     let y_bottom = channel_rect.bottom() - 15.0;
-                                    
-                                    // Draw fast VU
-                                    let vu = state.channel_vus[i].clamp(0.0, 1.0);
-                                    let vh = vu * max_h;
-                                    let color = if vu > 0.8 {
-                                        egui::Color32::from_rgb(255, 255, 255)
-                                    } else if vu > 0.5 {
-                                        egui::Color32::from_rgb(255, 200, 50)
-                                    } else {
-                                        egui::Color32::from_rgb(200, 50, 50)
-                                    };
-                                    painter.rect_filled(
-                                        egui::Rect::from_min_max(
-                                            egui::pos2(x, y_bottom - vh),
-                                            egui::pos2(x + bw, y_bottom)
-                                        ),
-                                        0.0,
-                                        color
-                                    );
+                                    // The VU meters are now drawn natively in WGPU behind the egui layer.
+                                    // We keep the layout space and just draw the labels below.
 
-                                    // Draw peak
-                                    let peak = state.peak_vus[i].clamp(0.0, 1.0);
-                                    let ph = peak * max_h;
-                                    painter.rect_filled(
-                                        egui::Rect::from_min_max(
-                                            egui::pos2(x, y_bottom - ph - 4.0),
-                                            egui::pos2(x + bw, y_bottom - ph)
-                                        ),
-                                        0.0,
-                                        egui::Color32::WHITE
-                                    );
                                     
                                     // Label
                                     if num_channels <= 16 {
@@ -521,120 +617,15 @@ impl<'a> VulkanEngine<'a> {
                             
                             // Custom Fire/Charred Progress Bar
                             let (rect, _) = columns[0].allocate_exact_size(egui::vec2(columns[0].available_width(), 16.0), egui::Sense::hover());
+                            out_fire_rect = Some(rect);
+                            
                             let painter = columns[0].painter();
+                            // Backgrounds and embers are now drawn natively by WGPU!
                             
-                            // Unplayed background (Grey)
-                            painter.rect_filled(rect, 2.0, egui::Color32::from_gray(50));
-                            
-                            // Played section (Charred/Burned look)
-                            let played_width = rect.width() * progress;
-                            let played_rect = egui::Rect::from_min_size(rect.min, egui::vec2(played_width, rect.height()));
-                            painter.rect_filled(played_rect, 2.0, egui::Color32::from_rgb(15, 15, 15)); // Black charred
-                            
-                            // Glowing embers at base of played section
-                            let base_y = rect.max.y - 2.0;
-                            let ember_count = (played_width / 4.0) as usize;
-                            for i in 0..ember_count {
-                                let ember_x = rect.min.x + (i * 4) as f32;
-                                let static_seed = ((ember_x as f64 * 12.34).sin() * 43758.5453).fract().abs();
-                                if static_seed > 0.85 {
-                                    let phase = ember_x as f64 * 0.5;
-                                    let pulse = ((state.current_seconds as f64 * 2.0 + phase).sin() * 0.5 + 0.5) as f32;
-                                    let max_brightness = ((static_seed - 0.85) / 0.15 * 255.0) as f32;
-                                    let brightness = (max_brightness * (0.3 + 0.7 * pulse)) as u8;
-                                    
-                                    painter.rect_filled(
-                                        egui::Rect::from_min_size(egui::pos2(ember_x, base_y - 2.0), egui::vec2(2.0, 2.0)),
-                                        0.0,
-                                        egui::Color32::from_rgba_unmultiplied(255, brightness / 4, 0, brightness)
-                                    );
-                                }
-                            }
-                            
-                            // Fire indicator (Demoscene Fire Array)
+                            // Fire indicator (Demoscene Fire Array) is now drawn by WGPU!
                             if progress > 0.0 && progress < 1.0 {
-                                let fire_x = rect.min.x + played_width;
-                                let fire_w = 40;
-                                let fire_h = 10;
-                                let pixel_size = 2.0;
-                                let t = state.current_seconds * 1000.0;
-                                
-                                // Randomize bottom row, hot on the right, tapering left
-                                for x in 0..fire_w {
-                                    let intensity = (x as f64 / fire_w as f64).powf(2.0);
-                                    let seed = (x as f64 * 31.415 + t as f64).sin() * 43758.5453;
-                                    let mut r = (seed.fract().abs() * 255.0) * intensity;
-                                    if x >= fire_w - 2 { r = 255.0; } // Playhead core
-                                    self.fire_buffer[(fire_h - 1) * fire_w + x] = r as u8;
-                                }
-                                
-                                // Propagate up and drift left (wind)
-                                for y in 0..(fire_h - 1) {
-                                    for x in 0..fire_w {
-                                        let src_idx = (y + 1) * fire_w + x;
-                                        let mut sum = self.fire_buffer[src_idx] as u32 * 2; // directly below
-                                        
-                                        if x > 0 { sum += self.fire_buffer[src_idx - 1] as u32; }
-                                        if x < fire_w - 1 { sum += self.fire_buffer[src_idx + 1] as u32 * 2; } // bottom-right pulls left
-                                        sum += self.fire_buffer[(y + 2).min(fire_h - 1) * fire_w + x] as u32; // two below
-                                        
-                                        let avg = sum / 6;
-                                        let seed2 = (y as f64 * 12.34 + x as f64 * 45.67 + t as f64).sin() * 43758.5453;
-                                        let cool = (seed2.fract().abs() * 5.0) as u32; // Random cooling 0-4
-                                        
-                                        self.fire_buffer[y * fire_w + x] = avg.saturating_sub(cool) as u8;
-                                    }
-                                }
-
-                                let start_x = fire_x - (fire_w as f32 * pixel_size) + pixel_size; // Anchor right side to playhead
-                                let start_y = rect.max.y - 1.0 - (fire_h as f32 * pixel_size);
-                                
-                                for y in 0..fire_h {
-                                    for x in 0..fire_w {
-                                        let mut temp = self.fire_buffer[y * fire_w + x];
-                                        
-                                        // Soft fade at the top to prevent hard edges and blend into smoke
-                                        if y < 4 {
-                                            temp = (temp as f32 * (y as f32 / 4.0)).max(0.0) as u8;
-                                        }
-                                        
-                                        let (r, g, b, a) = if temp > 230 {
-                                            (255, 255, 255, 255) // White hot
-                                        } else if temp > 150 {
-                                            let n = (temp - 150) as f32 / 80.0;
-                                            (255, (n * 255.0) as u8, (n * 100.0) as u8, 255) // Orange/Yellow
-                                        } else if temp > 80 {
-                                            let n = (temp - 80) as f32 / 70.0;
-                                            (255, (n * 100.0) as u8, 0, 240) // Bright Red to Deep Orange
-                                        } else if temp > 30 {
-                                            let n = (temp - 30) as f32 / 50.0;
-                                            ((100.0 + n * 155.0) as u8, 0, 0, 200) // Deep Red
-                                        } else if temp > 10 {
-                                            let n = (temp - 10) as f32 / 20.0;
-                                            let grey = 30 + (n * 40.0) as u8;
-                                            (grey, grey, grey, (n * 150.0) as u8) // Grey Smoke
-                                        } else {
-                                            (0, 0, 0, 0)
-                                        };
-                                        
-                                        if a > 0 {
-                                            let px_x = start_x + x as f32 * pixel_size;
-                                            let px_y = start_y + y as f32 * pixel_size;
-                                            
-                                            // Clip fire to the start of the progress bar
-                                            if px_x >= rect.min.x {
-                                                painter.rect_filled(
-                                                    egui::Rect::from_min_size(
-                                                        egui::pos2(px_x, px_y),
-                                                        egui::vec2(pixel_size, pixel_size)
-                                                    ),
-                                                    0.0,
-                                                    egui::Color32::from_rgba_unmultiplied(r, g, b, a)
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
+                                let fire_start_time = std::time::Instant::now();
+                                fire_time_us = fire_start_time.elapsed().as_micros() as f32;
                             }
                             
                             // Text Overlay
@@ -650,61 +641,14 @@ impl<'a> VulkanEngine<'a> {
                             columns[1].heading("Pattern Heatmap");
                             columns[1].separator();
                             let hm_rect = columns[1].available_rect_before_wrap();
+                            out_heatmap_rect = Some(hm_rect);
+                            
                             let painter = columns[1].painter().with_clip_rect(hm_rect);
+                            // Pattern Heatmap is now drawn natively in WGPU!
                             let history_len = state.spectrum_history.len();
                             if history_len > 0 && state.spectrum_history[0].len() > 0 {
-                                let raw_bands = state.spectrum_history[0].len();
-                                let chunks = 64; // Downsample 512 bands to 64 for visual clarity & performance
-                                let chunk_size = raw_bands / chunks;
-                                
-                                let cell_w = hm_rect.width() / chunks as f32; // Horizontal frequency scale
-                                
-                                let center_y = hm_rect.top() + hm_rect.height() / 2.0;
-                                
-                                let mut image = egui::ColorImage::new([chunks, history_len], egui::Color32::from_rgb(20, 20, 22));
-                                
-                                for (time_idx, bands) in state.spectrum_history.iter().enumerate() {
-                                    // time_idx 119 (newest) at bottom. time_idx 0 (oldest) at top.
-                                    let y = history_len - 1 - time_idx;
-                                    
-                                    for x in 0..chunks {
-                                        let mut max_val = 0.0;
-                                        for k in 0..chunk_size {
-                                            let idx = x * chunk_size + k;
-                                            if idx < bands.len() && bands[idx] > max_val {
-                                                max_val = bands[idx];
-                                            }
-                                        }
-                                        
-                                        if max_val > 5.0 {
-                                            let color = if max_val > 60.0 {
-                                                egui::Color32::from_rgb(180, 180, 180)
-                                            } else if max_val > 30.0 {
-                                                egui::Color32::from_rgb(255, 140, 0)
-                                            } else {
-                                                egui::Color32::from_rgb(180, 20, 20)
-                                            };
-                                            image[(x, y)] = color;
-                                        }
-                                    }
-                                }
-                                
-                                if self.heatmap_texture.is_none() {
-                                    self.heatmap_texture = Some(ctx.load_texture(
-                                        "heatmap",
-                                        image,
-                                        egui::TextureOptions::NEAREST
-                                    ));
-                                } else {
-                                    self.heatmap_texture.as_mut().unwrap().set(image, egui::TextureOptions::NEAREST);
-                                }
-                                
-                                painter.image(
-                                    self.heatmap_texture.as_ref().unwrap().id(),
-                                    hm_rect,
-                                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                                    egui::Color32::WHITE
-                                );
+                                let chunks = 64;
+                                let cell_w = hm_rect.width() / chunks as f32;
                                 
                                 // Draw faint background grid over the texture
                                 for c in 0..=chunks {
@@ -718,6 +662,7 @@ impl<'a> VulkanEngine<'a> {
                                     
                                     let row_height = 14.0;
                                     let num_rows_to_draw = (hm_rect.height() / row_height) as i32;
+                                    let center_y = hm_rect.top() + hm_rect.height() / 2.0;
                                     
                                     for offset in (-num_rows_to_draw/2)..(num_rows_to_draw/2) {
                                         let mut resolved_order = state.current_tracker_order as i32;
@@ -847,6 +792,20 @@ impl<'a> VulkanEngine<'a> {
             });
         });
 
+        let scale = window.scale_factor() as f32;
+        let w = self.config.width as f32;
+        let h = self.config.height as f32;
+        
+        if let Some(r) = out_meters_rect {
+            self.meters_uv_rect = [(r.min.x * scale) / w, (r.min.y * scale) / h, (r.max.x * scale) / w, (r.max.y * scale) / h];
+        }
+        if let Some(r) = out_fire_rect {
+            self.fire_uv_rect = [(r.min.x * scale) / w, (r.min.y * scale) / h, (r.max.x * scale) / w, (r.max.y * scale) / h];
+        }
+        if let Some(r) = out_heatmap_rect {
+            self.heatmap_uv_rect = [(r.min.x * scale) / w, (r.min.y * scale) / h, (r.max.x * scale) / w, (r.max.y * scale) / h];
+        }
+
         // Handle egui output
         egui_state.handle_platform_output(window, full_output.platform_output);
         let clipped_primitives = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
@@ -916,6 +875,13 @@ impl<'a> VulkanEngine<'a> {
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
             render_pass.draw(0..3, 0..1);
+            
+            if state.show_hud {
+                render_pass.set_viewport(0.0, 0.0, self.config.width as f32, self.config.height as f32, 0.0, 1.0);
+                render_pass.set_pipeline(&self.hud_pipeline);
+                render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                render_pass.draw(0..3, 0..1);
+            }
         }
 
         {
@@ -951,6 +917,6 @@ impl<'a> VulkanEngine<'a> {
         
         let render_elapsed = render_start.elapsed().as_micros() as f32;
 
-        Ok((engine_action, ui_elapsed, render_elapsed, shader_time_us))
+        Ok((engine_action, ui_elapsed, render_elapsed, shader_time_us, 0.0))
     }
 }

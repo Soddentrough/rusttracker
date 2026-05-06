@@ -7,6 +7,7 @@ pub struct PerformanceStats {
     pub ui_us: f32,
     pub render_us: f32,
     pub shader_us: f32,
+    pub fire_us: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -60,7 +61,7 @@ impl AppState {
         
         let mut wave_history = VecDeque::new();
         for _ in 0..60 {
-            wave_history.push_back(vec![0.0; 512]);
+            wave_history.push_back(vec![0.0; 1024]);
         }
 
         AppState {
@@ -83,7 +84,7 @@ impl AppState {
             spectrum_peaks: vec![0.0; 512],
             spectrum_history: history,
             waveform_history: wave_history,
-            raw_waveform: vec![0.0; 512],
+            raw_waveform: vec![0.0; 1024],
             fire_heat: vec![0.0; 512],
             show_hud: true,
             max_frequency: 10000.0,

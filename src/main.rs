@@ -302,6 +302,13 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                             } else {
                                 state.spectrum_data[i] = (state.spectrum_data[i] - (1.5 * time_scale)).max(state.raw_spectrum_data[i]);
                             }
+                            
+                            // Smoothly decay fire heat using display refresh rate
+                            if state.raw_spectrum_data[i] > state.fire_heat[i] {
+                                state.fire_heat[i] = state.raw_spectrum_data[i];
+                            } else {
+                                state.fire_heat[i] = (state.fire_heat[i] - (1.5 * time_scale)).max(0.0);
+                            }
                         }
 
                         if state.spectrum_peaks.len() != state.spectrum_data.len() {
@@ -330,15 +337,17 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                     let mut action = EngineAction::None;
                     let mut ui_time = 0.0;
                     let mut render_time = 0.0;
+                    let mut fire_time = 0.0;
                     
                     let mut shader_time = None;
                     
                     match engine.render(&window, &egui_ctx, &mut egui_state, &state_copy) {
-                            Ok((res, ui_el, ren_el, sh_el)) => {
+                            Ok((res, ui_el, ren_el, sh_el, fire_el)) => {
                                 action = res;
                                 ui_time = ui_el;
                                 render_time = ren_el;
                                 shader_time = sh_el;
+                                fire_time = fire_el;
                             },
                             Err(wgpu::SurfaceError::Lost) => engine.resize(engine.size),
                             Err(wgpu::SurfaceError::OutOfMemory) => elwt.exit(),
@@ -352,6 +361,7 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                         if let Some(sh) = shader_time {
                             state.stats.shader_us = state.stats.shader_us * 0.9 + sh * 0.1;
                         }
+                        state.stats.fire_us = state.stats.fire_us * 0.9 + fire_time * 0.1;
                     }
                     
                     if action == EngineAction::OpenFile {
