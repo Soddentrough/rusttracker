@@ -53,17 +53,17 @@ pub struct VulkanEngine<'a> {
     visualizer_storage_buffer: wgpu::Buffer,
     uniform_bind_group: wgpu::BindGroup,
     pub egui_renderer: egui_wgpu::Renderer,
-    
+    timestamp_period: f32,
+    query_in_flight: bool,
     query_set: Option<wgpu::QuerySet>,
     query_resolve_buffer: Option<wgpu::Buffer>,
     query_read_buffer: Option<wgpu::Buffer>,
-    timestamp_period: f32,
-    query_in_flight: bool,
     
     pub meters_uv_rect: [f32; 4],
     pub heatmap_uv_rect: [f32; 4],
     pub fire_uv_rect: [f32; 4],
     fire_grid: Box<[[f32; 512]; 144]>,
+    last_fire_time: f32,
     
     pub start_time: std::time::Instant,
 }
@@ -350,6 +350,7 @@ impl<'a> VulkanEngine<'a> {
             heatmap_uv_rect: [0.0; 4],
             fire_uv_rect: [0.0; 4],
             fire_grid: Box::new([[0.0; 512]; 144]),
+            last_fire_time: 0.0,
             start_time: std::time::Instant::now(),
         }
     }
@@ -434,54 +435,97 @@ impl<'a> VulkanEngine<'a> {
         
         // Classic Doom Fire Cellular Automaton
         if state.visualizer_mode == 1 {
-            let mut seed = (state.current_seconds * 1000.0) as u32;
+            let current_time = self.start_time.elapsed().as_secs_f32();
+            if self.last_fire_time == 0.0 {
+                self.last_fire_time = current_time;
+            }
+            
+            let mut seed = (current_time * 1000.0) as u32;
             let mut rng = || {
                 seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
                 seed
             };
             
-            // 1. Inject Fuel at the bottom (y = 143)
-            let n_ch = state.channel_vus.len().max(1).min(32);
-            let channel_width = 512.0 / n_ch as f32;
-            
-            for x in 0..512 {
-                let mut fuel = 0.0;
-                for i in 0..n_ch {
-                    let center_x = (i as f32 + 0.5) * channel_width;
-                    let dist = (x as f32 - center_x).abs();
-                    // Use the mapped layout so Ls is on the far left, etc.
-                    let ch_vu = uniforms.channels[i];
-                    let ch_peak = uniforms.channel_peaks[i];
-                    
-                    let sigma = channel_width * 0.4;
-                    let influence = (- (dist * dist) / (2.0 * sigma * sigma)).exp();
-                    
-                    // Base fuel + sudden spikes from peaks
-                    fuel += (ch_vu + ch_peak * 0.5) * influence;
+            // Run at a fixed 60Hz timestep to prevent 800+ FPS visual blowout
+            while current_time - self.last_fire_time >= 1.0 / 60.0 {
+                self.last_fire_time += 1.0 / 60.0;
+                
+                // 1. Propagate Heat Upwards
+                for y in 0usize..143 {
+                    for x in 0usize..512 {
+                        // Random spread (-1, 0, +1)
+                        let spread = (rng() % 3) as i32 - 1;
+                        let src_x = (x as i32 + spread).clamp(0, 511) as usize;
+                        
+                        let heat = self.fire_grid[y + 1][src_x];
+                        
+                        // Base cooling
+                        let mut cooling = (rng() % 3) as f32 * 0.015;
+                        
+                        // Occasionally "bite" a large chunk of heat out to create detached rising sparks
+                        if rng() % 100 < 3 {
+                            cooling += 0.15;
+                        }
+                        
+                        self.fire_grid[y][x] = (heat - cooling).max(0.0);
+                    }
                 }
-                // Add some random noise to the fuel line to prevent smooth edges
-                if fuel > 0.1 && (rng() % 100) > 20 {
+                
+                // 2. Inject Fuel at the bottom (y = 143)
+                let n_ch = state.channel_vus.len().max(1).min(32);
+                let lfe_idx = if n_ch == 6 { 3 } else if n_ch == 8 { 4 } else { 999 };
+                
+                // We divide the screen width by the number of SPATIAL channels (excluding LFE)
+                // This guarantees the Center channel (which is exactly in the middle of the remaining channels)
+                // is mapped perfectly to x = 256.
+                let n_spatial_ch = if lfe_idx < n_ch { n_ch - 1 } else { n_ch };
+                let channel_width = 512.0 / n_spatial_ch as f32;
+                
+                let mut base_lfe_fuel = 0.0;
+                if lfe_idx < n_ch {
+                    let ch_vu = uniforms.channels[lfe_idx];
+                    let ch_peak = uniforms.channel_peaks[lfe_idx];
+                    // LFE power
+                    base_lfe_fuel = (ch_vu + ch_peak * 0.5) * 0.6;
+                }
+                
+                for x in 0usize..512 {
+                    // Apply a tighter normal distribution (Bell Curve) to the LFE bed
+                    // Centered at 256, fades sharply towards the edges
+                    let lfe_dist = (x as f32 - 256.0).abs();
+                    let lfe_sigma = 70.0;
+                    let lfe_influence = (- (lfe_dist * lfe_dist) / (2.0 * lfe_sigma * lfe_sigma)).exp();
+                    
+                    let mut fuel = base_lfe_fuel * lfe_influence;
+                    
+                    let mut spatial_idx = 0;
+                    for i in 0..n_ch {
+                        if i == lfe_idx { continue; } // Skip LFE as a spatial pillar
+                        
+                        let center_x = (spatial_idx as f32 + 0.5) * channel_width;
+                        let dist = (x as f32 - center_x).abs();
+                        
+                        let ch_vu = uniforms.channels[i];
+                        let ch_peak = uniforms.channel_peaks[i];
+                        
+                        // Narrow the Gaussian so channels don't merge into a giant blob
+                        let sigma = channel_width * 0.15;
+                        let influence = (- (dist * dist) / (2.0 * sigma * sigma)).exp();
+                        
+                        // Base fuel + sudden spikes from peaks
+                        fuel += (ch_vu + ch_peak * 0.5) * influence;
+                        
+                        spatial_idx += 1;
+                    }
+                    
+                    // Aggressive spatial jitter to break up the smooth Gaussian curve
+                    let jitter = (rng() % 100) as f32 / 100.0;
+                    fuel *= 0.4 + 0.6 * jitter; // Huge variance
+                    
                     self.fire_grid[143][x] = fuel.max(0.0).min(1.0);
-                } else {
-                    self.fire_grid[143][x] = 0.0;
                 }
             }
             
-            // 2. Propagate Heat Upwards
-            for y in 0..143 {
-                for x in 0..512 {
-                    // Random horizontal spread (-1, 0, 1)
-                    let spread = (rng() % 3) as i32 - 1;
-                    let src_x = (x as i32 + spread).clamp(0, 511) as usize;
-                    
-                    let heat = self.fire_grid[y + 1][src_x];
-                    
-                    // Random cooling
-                    let cooling = (rng() % 3) as f32 * 0.03;
-                    
-                    self.fire_grid[y][x] = (heat - cooling).max(0.0);
-                }
-            }
             visualizer_storage.fire_grid = *self.fire_grid;
         }
 
