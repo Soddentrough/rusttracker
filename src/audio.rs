@@ -851,8 +851,12 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
         } else {
             state.available_visualizers = vec![0, 1, 2];
         }
-        state.current_visualizer_idx = 0;
-        state.visualizer_mode = state.available_visualizers[0];
+        if !state.available_visualizers.contains(&state.visualizer_mode) {
+            state.visualizer_mode = state.available_visualizers[0];
+            state.current_visualizer_idx = 0;
+        } else {
+            state.current_visualizer_idx = state.available_visualizers.iter().position(|&x| x == state.visualizer_mode).unwrap_or(0);
+        }
         state.hardware_channels = config.channels as i32;
         
         let formatted = audio_source.pre_format_tracker_data();

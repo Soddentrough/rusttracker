@@ -36,6 +36,12 @@ struct Args {
 
     #[arg(long, default_value_t = false)]
     mic: bool,
+
+    #[arg(long, default_value_t = false)]
+    fullscreen: bool,
+
+    #[arg(long)]
+    vis: Option<String>,
 }
 
 struct Tui {
@@ -93,6 +99,25 @@ fn main() -> Result<(), Box<dyn Error>> {
         let mut state = app_state.lock().unwrap();
         state.playlist = args.file.clone();
         state.playlist_index = 0;
+        
+        if let Some(vis) = &args.vis {
+            let vis_lower = vis.to_lowercase();
+            state.visualizer_mode = if vis_lower.contains("spectrum") || vis_lower.contains("freq") {
+                0
+            } else if vis_lower.contains("fire") || vis_lower.contains("flame") {
+                1
+            } else if vis_lower.contains("osc") || vis_lower.contains("crt") {
+                2
+            } else if vis_lower.contains("spatial") || vis_lower.contains("vector") {
+                3
+            } else if vis_lower.contains("ferrofluid") || vis_lower.contains("chrome") {
+                4
+            } else if vis_lower.contains("neon") || vis_lower.contains("corridor") {
+                5
+            } else {
+                0
+            };
+        }
     }
     
     let mut initial_stream = None;
@@ -124,14 +149,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             eprintln!("App error: {:?}", err);
         }
     } else {
-        pollster::block_on(run_gui(app_state, initial_stream));
+        pollster::block_on(run_gui(app_state, initial_stream, args.fullscreen));
     }
 
     Ok(())
 }
 
 #[allow(unused_variables, unused_assignments)]
-async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal::Stream>) {
+async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal::Stream>, is_fullscreen: bool) {
     let event_loop = EventLoop::new().unwrap();
     
     let (icon_rgba, icon_width, icon_height) = {
@@ -149,6 +174,10 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
         .with_title("RustTracker Vulkan Visualizer")
         .with_inner_size(winit::dpi::PhysicalSize::new(1920, 1080))
         .with_window_icon(Some(window_icon));
+        
+    if is_fullscreen {
+        attrs = attrs.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+    }
         
     #[cfg(target_os = "linux")]
     {
@@ -411,7 +440,13 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                         state.stats.fire_us = state.stats.fire_us * 0.9 + fire_time * 0.1;
                     }
                     
-                    if action == EngineAction::OpenFile {
+                    if let EngineAction::Seek(pct) = action {
+                        let mut state = app_state.lock().unwrap();
+                        let target = (state.duration_seconds * pct as f64).clamp(0.0, state.duration_seconds);
+                        state.seek_request = Some(target);
+                        state.spectrum_history.clear();
+                        for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 512]); }
+                    } else if action == EngineAction::OpenFile {
                         let app_state_clone = Arc::clone(&app_state);
                         std::thread::spawn(move || {
                             if let Some(paths) = rfd::FileDialog::new()

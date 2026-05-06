@@ -9,6 +9,8 @@ on:
 jobs:
   build-windows:
     runs-on: windows-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     
     defaults:
       run:
@@ -27,6 +29,7 @@ jobs:
           mingw-w64-x86_64-rust
           mingw-w64-x86_64-libopenmpt
           mingw-w64-x86_64-ffmpeg
+          mingw-w64-x86_64-clang
           
     - name: Build RustTracker
       run: |

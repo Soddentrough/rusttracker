@@ -2,10 +2,11 @@ use std::sync::Arc;
 use winit::window::Window;
 use crate::state::AppState;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq)]
 pub enum EngineAction {
     None,
     OpenFile,
+    Seek(f32),
 }
 
 #[repr(C)]
@@ -638,8 +639,16 @@ impl<'a> VulkanEngine<'a> {
                             }.clamp(0.0, 1.0);
                             
                             // Custom Fire/Charred Progress Bar
-                            let (rect, _) = columns[0].allocate_exact_size(egui::vec2(columns[0].available_width(), 16.0), egui::Sense::hover());
+                            let (rect, response) = columns[0].allocate_exact_size(egui::vec2(columns[0].available_width(), 16.0), egui::Sense::click_and_drag());
                             out_fire_rect = Some(rect);
+                            
+                            if response.dragged() || response.clicked() {
+                                if let Some(mouse_pos) = response.interact_pointer_pos() {
+                                    let rel_x = (mouse_pos.x - rect.left()).clamp(0.0, rect.width());
+                                    let pct = rel_x / rect.width();
+                                    engine_action = EngineAction::Seek(pct);
+                                }
+                            }
                             
                             let painter = columns[0].painter();
                             // Backgrounds and embers are now drawn natively by WGPU!

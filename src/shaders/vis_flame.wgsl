@@ -67,104 +67,130 @@ fn fbm(p: vec2<f32>) -> f32 {
     return v;
 }
 
-fn get_fire_heat(x: f32) -> f32 {
-    if (x < 0.0 || x >= 1.0) {
-        return 0.0;
-    }
-    let freq_idx = u32(x * 512.0);
-    let clamped_idx = clamp(freq_idx, 0u, 511u);
-    let vec_idx = clamped_idx / 4u;
-    let component_idx = clamped_idx % 4u;
-    
-    let spec_vec = audio.fire_heat[vec_idx];
-    if component_idx == 0u { return spec_vec.x; }
-    else if component_idx == 1u { return spec_vec.y; }
-    else if component_idx == 2u { return spec_vec.z; }
-    else { return spec_vec.w; }
-}
-
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    // Prevent floating-point precision loss over hours of playback
+    let t = (audio.smooth_time % 10000.0) * 1.5; 
+    let ember_t = (audio.smooth_time % 10000.0) * 2.5;
     
-    // Extract global energies
+    // Y coordinates: 0.0 at the bottom, 1.0 at the top
+    let y = 1.0 - in.uv.y;
+    
+    // --- 1. AUDIO ANALYSIS ---
     var bass_energy = 0.0;
-    for (var i = 0u; i < 2u; i = i + 1u) { // Average first 8 bands
+    for (var i = 0u; i < 2u; i = i + 1u) {
         let v = audio.spectrum[i];
         bass_energy += (v.x + v.y + v.z + v.w);
     }
     bass_energy = clamp(bass_energy / (8.0 * 100.0), 0.0, 1.0);
 
     var treble_energy = 0.0;
-    for (var i = 25u; i < 30u; i = i + 1u) { // Average some upper bands
+    for (var i = 25u; i < 30u; i = i + 1u) {
         let v = audio.spectrum[i];
         treble_energy += (v.x + v.y + v.z + v.w);
     }
     treble_energy = clamp(treble_energy / (20.0 * 100.0), 0.0, 1.0);
 
-    var volume = 0.0;
-    let n_ch = min(audio.num_channels, 32u);
+    // --- 2. MULTI-CHANNEL FUEL MAP ---
+    // Distribute channels across the X axis
+    let n_ch = max(1u, min(audio.num_channels, 32u));
+    let channel_width = 1.0 / f32(n_ch);
+    
+    var local_fuel = 0.0;
     for (var i = 0u; i < n_ch; i = i + 1u) {
+        // Calculate the center x-coordinate for this channel
+        let center_x = (f32(i) + 0.5) * channel_width;
+        let dist = abs(in.uv.x - center_x);
+        
         let vec_idx = i / 4u;
         let comp = i % 4u;
-        let v = audio.channels[vec_idx];
-        if (comp == 0u) { volume += v.x; }
-        else if (comp == 1u) { volume += v.y; }
-        else if (comp == 2u) { volume += v.z; }
-        else { volume += v.w; }
+        let ch_vu = audio.channels[vec_idx][comp];
+        
+        // Create an overlapping gaussian-like bell curve for each channel
+        let spread = channel_width * 1.2;
+        let influence = smoothstep(spread, 0.0, dist);
+        
+        local_fuel += ch_vu * influence;
     }
-    if (n_ch > 0u) {
-        volume = clamp(volume / f32(n_ch), 0.0, 1.0);
-    }
-
-    let y = 1.0 - in.uv.y;
-
-    // Smooth out the incoming local heat
-    let fuel1 = get_fire_heat(in.uv.x - 0.005) / 100.0;
-    let fuel2 = get_fire_heat(in.uv.x) / 100.0;
-    let fuel3 = get_fire_heat(in.uv.x + 0.005) / 100.0;
-    let local_heat = clamp((fuel1 + fuel2 * 2.0 + fuel3) / 4.0, 0.0, 1.0);
     
-    // Fuel combines global bass foundation with local frequency spikes
-    let fuel = clamp(bass_energy * 0.8 + local_heat * 0.6, 0.0, 1.0);
+    // Add a baseline of fuel from the global bass energy so the fire never completely dies if there's audio
+    local_fuel = clamp(local_fuel * 1.5 + bass_energy * 0.2, 0.0, 1.0);
     
-    // Wind based on treble
-    let wind = treble_energy * 3.0;
+    // --- 3. PROCEDURAL COOLING MAP ---
+    // We simulate the "cooling map" of fluid fire by generating upward-scrolling noise.
+    
+    // Wind drift based on treble
+    let wind = treble_energy * 1.5;
     let x_drift = wind * y;
-    let px = in.uv.x + x_drift;
     
-    // Base shape tapers off vertically
-    // Height is modulated by overall volume!
-    let height_mod = mix(1.5, 0.3, volume); 
-    let base_mask = pow(1.0 - y, height_mod);
+    // Convective acceleration: noise moves faster at the top
+    let convection_speed = 1.0 + y * 2.0; 
+    let convective_y = y * 6.0 - t * convection_speed;
     
-    // Two layers of noise moving at different speeds for organic licks
-    let t = audio.smooth_time * 1.5;
-    let n1 = fbm(vec2<f32>(px * 12.0, y * 6.0 - t * 1.8));
-    let n2 = fbm(vec2<f32>(px * 25.0 - t * 0.5, y * 12.0 - t * 3.0));
-    let noise_mask = (n1 * 0.65 + n2 * 0.35);
+    // Turbulence field
+    let turbulence = 0.5 + treble_energy * 1.0; 
+    let warp_uv = vec2<f32>(in.uv.x * 4.0 + x_drift, convective_y * 0.5);
+    let warp_dx = fbm(warp_uv + vec2<f32>(t * 0.2, 0.0)) * 2.0 - 1.0;
+    let warp_dy = fbm(warp_uv + vec2<f32>(100.0, t * 0.2)) * 2.0 - 1.0;
+    let warp_offset = vec2<f32>(warp_dx, warp_dy) * turbulence;
     
-    // Intensity combines fuel, vertical falloff, and noise.
-    let intensity = (fuel * 1.5 + 0.1) * noise_mask * base_mask * 2.5;
-    let final_heat = clamp(intensity - (y * 0.8), 0.0, 1.2);
+    // Read the cooling map (noise)
+    let px = in.uv.x * 12.0 + x_drift + warp_offset.x * 2.0;
+    let py = convective_y + warp_offset.y * 2.0;
+    let cooling_noise = fbm(vec2<f32>(px, py));
     
-    // Procedural Fire Gradient Mapping
-    let color_smoke    = vec3<f32>(0.02, 0.02, 0.03);
-    let color_dark_red = vec3<f32>(0.5, 0.05, 0.0);
-    let color_orange   = vec3<f32>(1.0, 0.35, 0.0);
-    let color_yellow   = vec3<f32>(1.0, 0.85, 0.1);
+    // Calculate flame height based on fuel
+    // Higher fuel -> fire reaches higher before cooling map extinguishes it
+    let height_multiplier = mix(4.0, 0.5, local_fuel); // Y falloff multiplier
+    let cooling = (y * height_multiplier) * (cooling_noise * 1.5 + 0.5);
+    
+    // Subtract cooling from fuel (classic algorithm)
+    let heat = max(local_fuel * 1.2 - cooling, 0.0);
+    
+    // --- 4. COLOR AND SMOKE MAPPING ---
+    let color_bg       = vec3<f32>(0.0, 0.0, 0.0);
+    let color_smoke    = vec3<f32>(0.05, 0.05, 0.06);
+    let color_dark_red = vec3<f32>(0.8, 0.1, 0.0);
+    let color_orange   = vec3<f32>(1.0, 0.5, 0.0);
+    let color_yellow   = vec3<f32>(1.0, 0.9, 0.2);
     let color_white    = vec3<f32>(1.0, 1.0, 1.0);
     
-    var color = color_smoke;
-    color = mix(color, color_dark_red, smoothstep(0.05, 0.3, final_heat));
-    color = mix(color, color_orange,   smoothstep(0.3,  0.55, final_heat));
-    color = mix(color, color_yellow,   smoothstep(0.55, 0.8, final_heat));
-    color = mix(color, color_white,    smoothstep(0.8,  1.0, final_heat));
+    // Non-linear heat curve to emphasize bright cores
+    let h = pow(heat, 1.2);
     
-    // Embers / Sparks
-    let spark_t = audio.smooth_time * 2.5;
-    let spark_n = fbm(vec2<f32>(px * 60.0 + spark_t * 0.2, y * 40.0 - spark_t));
-    let spark_mask = smoothstep(0.85, 1.0, spark_n) * smoothstep(0.0, fuel + 0.3, 1.0 - y);
-    let spark_color = vec3<f32>(1.0, 0.7, 0.2) * spark_mask * 2.0;
+    var color = color_bg;
+    
+    // Smoke generation: Smoke appears where heat has died off but was recently hot
+    // We use a broader, slower noise for smoke
+    let smoke_py = (y * 4.0) - t * 0.5;
+    let smoke_noise = fbm(vec2<f32>(in.uv.x * 6.0 + x_drift * 2.0, smoke_py));
+    let smoke_density = smoothstep(0.0, 0.6, smoke_noise) * smoothstep(0.8, 0.0, heat) * smoothstep(0.0, 0.5, y) * smoothstep(0.0, 0.5, local_fuel);
+    
+    color = mix(color_bg, color_smoke, smoke_density);
+    
+    // Fire color ramp
+    color = mix(color, color_dark_red, smoothstep(0.05, 0.3, h));
+    color = mix(color, color_orange,   smoothstep(0.3,  0.6, h));
+    color = mix(color, color_yellow,   smoothstep(0.6,  0.85, h));
+    color = mix(color, color_white,    smoothstep(0.85, 1.0, h));
+    
+    // --- 5. EMBERS & SPARKS ---
+    // Embers follow the turbulence but move faster
+    let spark_px = in.uv.x * 60.0 + x_drift * 5.0 + warp_offset.x * 8.0;
+    let spark_py = (y * 40.0) - ember_t * (convection_speed * 1.2) + warp_offset.y * 8.0;
+    
+    let spark_n = fbm(vec2<f32>(spark_px, spark_py));
+    
+    // Twinkle modulation
+    let twinkle_phase = (in.uv.x * 123.4 + y * 456.7);
+    let twinkle = sin(audio.time * 30.0 + twinkle_phase) * 0.5 + 0.5;
+    
+    // Embers only appear in or just above the fire (guided by fuel and y)
+    // They burst more when treble is high
+    let spark_burst = treble_energy * 0.5;
+    let spark_mask = smoothstep(0.85 - spark_burst, 1.0, spark_n) * smoothstep(0.0, local_fuel + 0.3, 1.0 - y) * twinkle;
+    
+    let spark_color = vec3<f32>(1.0, 0.8, 0.4) * spark_mask * 2.5;
     
     color = color + spark_color;
     
