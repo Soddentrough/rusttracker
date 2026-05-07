@@ -860,7 +860,12 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
         state.artist = audio_source.get_artist();
         state.module_type = audio_source.get_type();
         state.duration_seconds = audio_source.get_duration_seconds();
-        state.num_channels = audio_source.get_num_channels();
+        let tracker_channels = audio_source.get_tracker_channels();
+        state.num_channels = if let Some(tc) = tracker_channels {
+            tc + 2
+        } else {
+            audio_source.get_num_channels()
+        };
         state.channel_vus = vec![0.0; state.num_channels as usize];
         state.bpm = audio_source.get_tempo();
         state.speed = audio_source.get_speed();
@@ -963,6 +968,9 @@ where
                 }
             }
 
+            let mut left_peak = 0.0_f32;
+            let mut right_peak = 0.0_f32;
+
             for (i, frame) in data.chunks_mut(hardware_channels).enumerate() {
                 if i < frames_read {
                     let mut mono = 0.0;
@@ -970,6 +978,15 @@ where
                         let sample = interleaved_buffer[i * hardware_channels + c].clamp(-1.0, 1.0);
                         frame[c] = T::from_sample(sample);
                         mono += sample;
+                        
+                        if c == 0 {
+                            left_peak = left_peak.max(sample.abs());
+                        } else if c == 1 {
+                            right_peak = right_peak.max(sample.abs());
+                        }
+                    }
+                    if hardware_channels == 1 {
+                        right_peak = left_peak; // Mono fallback
                     }
                     mono /= hardware_channels as f32;
                     
@@ -987,9 +1004,19 @@ where
             }
             
             let mut channel_vus = Vec::new();
-            let num_mod_channels = audio_source.get_num_channels();
-            for i in 0..num_mod_channels {
-                channel_vus.push(audio_source.get_current_channel_vu_mono(i));
+            if let Some(num_mod_channels) = audio_source.get_tracker_channels() {
+                // Tracker module layout: [L, Track1, Track2, ..., TrackN, R]
+                channel_vus.push(left_peak);
+                for i in 0..num_mod_channels {
+                    channel_vus.push(audio_source.get_current_channel_vu_mono(i));
+                }
+                channel_vus.push(right_peak);
+            } else {
+                // Media file layout: [FL, FR, FC, LFE, ...]
+                let num_spatial_channels = audio_source.get_num_channels();
+                for i in 0..num_spatial_channels {
+                    channel_vus.push(audio_source.get_current_channel_vu_mono(i));
+                }
             }
 
             let msg = DspMessage {
