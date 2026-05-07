@@ -442,9 +442,10 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                                 shader_time = sh_el;
                                 fire_time = fire_el;
                             },
-                            Err(wgpu::SurfaceError::Lost) => engine.resize(engine.size),
-                            Err(wgpu::SurfaceError::OutOfMemory) => elwt.exit(),
-                            Err(e) => eprintln!("{:?}", e),
+                            Err(wgpu::SurfaceStatus::Lost) => engine.resize(engine.size),
+                            Err(wgpu::SurfaceStatus::Outdated) => engine.resize(engine.size),
+                            Err(wgpu::SurfaceStatus::Timeout) => eprintln!("Surface timeout"),
+                            Err(e) => eprintln!("Surface error: {:?}", e),
                         }
                         
                     if ui_time > 0.0 || render_time > 0.0 {

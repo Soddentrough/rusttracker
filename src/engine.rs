@@ -73,9 +73,12 @@ impl<'a> VulkanEngine<'a> {
         let size = window.inner_size();
 
         // The instance is a handle to our GPU
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::VULKAN, // Request Vulkan explicitly!
-            ..Default::default()
+            flags: wgpu::InstanceFlags::default(),
+            backend_options: wgpu::BackendOptions::default(),
+            display: None,
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
         });
 
         let surface = instance.create_surface(window.clone()).unwrap();
@@ -96,12 +99,12 @@ impl<'a> VulkanEngine<'a> {
 
         let (device, queue) = adapter.request_device(
             &wgpu::DeviceDescriptor {
+                label: None,
                 required_features,
                 required_limits: wgpu::Limits::default(),
-                memory_hints: Default::default(),
-                label: None,
+                memory_hints: wgpu::MemoryHints::default(),
+                ..Default::default()
             },
-            None,
         ).await.unwrap();
 
         let surface_caps = surface.get_capabilities(&adapter);
@@ -205,8 +208,8 @@ impl<'a> VulkanEngine<'a> {
 
         let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Render Pipeline Layout"),
-            bind_group_layouts: &[&bind_group_layout],
-            push_constant_ranges: &[],
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
         });
 
         let shader_modules = vec![
@@ -254,7 +257,7 @@ impl<'a> VulkanEngine<'a> {
                     mask: !0,
                     alpha_to_coverage_enabled: false,
                 },
-                multiview: None,
+                multiview_mask: None,
                 cache: None,
             });
             render_pipelines.push(pipeline);
@@ -295,11 +298,11 @@ impl<'a> VulkanEngine<'a> {
                 mask: !0,
                 alpha_to_coverage_enabled: false,
             },
-            multiview: None,
+            multiview_mask: None,
             cache: None,
         });
 
-        let egui_renderer = egui_wgpu::Renderer::new(&device, config.format, None, 1, false);
+        let egui_renderer = egui_wgpu::Renderer::new(&device, config.format, egui_wgpu::RendererOptions::default());
 
         let mut query_set = None;
         let mut query_resolve_buffer = None;
@@ -553,10 +556,17 @@ impl<'a> VulkanEngine<'a> {
         egui_ctx: &egui::Context,
         egui_state: &mut egui_winit::State,
         state: &AppState,
-    ) -> Result<(EngineAction, f32, f32, Option<f32>, f32), wgpu::SurfaceError> {
+    ) -> Result<(EngineAction, f32, f32, Option<f32>, f32), wgpu::SurfaceStatus> {
         let ui_start = std::time::Instant::now();
-        let output = self.surface.get_current_texture()?;
-        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let output = self.surface.get_current_texture();
+        let surface_texture = match output {
+            wgpu::CurrentSurfaceTexture::Success(tex) | wgpu::CurrentSurfaceTexture::Suboptimal(tex) => tex,
+            wgpu::CurrentSurfaceTexture::Lost => return Err(wgpu::SurfaceStatus::Lost),
+            wgpu::CurrentSurfaceTexture::Outdated => return Err(wgpu::SurfaceStatus::Outdated),
+            wgpu::CurrentSurfaceTexture::Timeout => return Err(wgpu::SurfaceStatus::Timeout),
+            _ => return Err(wgpu::SurfaceStatus::Lost),
+        };
+        let view = surface_texture.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let mut shader_time_us = None;
         if self.query_in_flight {
@@ -564,7 +574,7 @@ impl<'a> VulkanEngine<'a> {
                 let slice = read_buffer.slice(..);
                 let (tx, rx) = std::sync::mpsc::channel();
                 slice.map_async(wgpu::MapMode::Read, move |v| tx.send(v).unwrap());
-                self.device.poll(wgpu::Maintain::Wait);
+                self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
                 if rx.recv().unwrap().is_ok() {
                     let data = slice.get_mapped_range();
                     let start: u64 = u64::from_le_bytes(data[0..8].try_into().unwrap());
@@ -585,20 +595,19 @@ impl<'a> VulkanEngine<'a> {
         let raw_input = egui_state.take_egui_input(window);
         let mut central_rect = egui::Rect::from_min_max(Default::default(), egui::pos2(self.config.width as f32, self.config.height as f32));
         let mut engine_action = EngineAction::None;
-        let mut fire_time_us = 0.0;
         
         let mut out_meters_rect = None;
         let mut out_fire_rect = None;
         let mut out_heatmap_rect = None;
         
-        let full_output = egui_ctx.run(raw_input, |ctx| {
+        let full_output = egui_ctx.run_ui(raw_input, |ctx| {
             if state.show_stats {
                 egui::Window::new("Stats")
                     .anchor(egui::Align2::RIGHT_TOP, [-10.0, 10.0])
                     .title_bar(false)
                     .resizable(false)
                     .collapsible(false)
-                    .frame(egui::Frame::window(&ctx.style()).fill(egui::Color32::from_black_alpha(200)))
+                    .frame(egui::Frame::window(&ctx.global_style()).fill(egui::Color32::from_black_alpha(200)))
                     .show(ctx, |ui| {
                         ui.label(
                             egui::RichText::new(format!("FPS: {:.1}", state.current_fps))
@@ -629,13 +638,13 @@ impl<'a> VulkanEngine<'a> {
             }
 
             if !state.file_loaded {
-                central_rect = ctx.screen_rect();
+                central_rect = ctx.content_rect();
                 
                 let frame = egui::Frame::NONE
                     .fill(egui::Color32::from_rgba_unmultiplied(10, 10, 15, 200)) // dark tint to pop text over the visualizer
                     .inner_margin(40.0);
                     
-                egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
+                egui::CentralPanel::default().frame(frame).show_inside(ctx, |ui| {
                     let avail_height = ui.available_height();
                     let content_height = 450.0;
                     let space = (avail_height - content_height) / 2.0;
@@ -664,8 +673,7 @@ impl<'a> VulkanEngine<'a> {
                                     .color(egui::Color32::WHITE)
                                     .strong()
                             )
-                            .fill(egui::Color32::from_rgb(0, 120, 215))
-                            .corner_radius(8.0);
+                            .fill(egui::Color32::from_rgb(0, 120, 215));
                             
                             if ui.add_sized([350.0, 60.0], btn).clicked() {
                                 engine_action = EngineAction::OpenFile;
@@ -710,11 +718,11 @@ impl<'a> VulkanEngine<'a> {
             }
 
             if state.show_hud {
-                egui::TopBottomPanel::top("top_panel")
+                egui::Panel::top("top_panel")
                     .resizable(false)
                     .frame(egui::Frame::NONE.fill(egui::Color32::TRANSPARENT))
-                    .exact_height(ctx.screen_rect().height() / 2.0)
-                    .show(ctx, |ui| {
+                    .exact_size(ctx.content_rect().height() / 2.0)
+                    .show_inside(ctx, |ui| {
                         ui.columns(3, |columns| {
                             // Column 0: Channels
                             columns[0].heading("Channels");
@@ -733,9 +741,6 @@ impl<'a> VulkanEngine<'a> {
                                     let x = channel_rect.left() + i as f32 * w + w * 0.2;
                                     let bw = w * 0.6;
                                     let y_bottom = channel_rect.bottom() - 15.0;
-                                    // The VU meters are now drawn natively in WGPU behind the egui layer.
-                                    // We keep the layout space and just draw the labels below.
-
                                     
                                     // Label
                                     if num_channels <= 16 {
@@ -749,12 +754,12 @@ impl<'a> VulkanEngine<'a> {
                                             }
                                         } else {
                                             match num_channels {
-                                                2 => ["L", "R"].get(i).unwrap_or(&"?").to_string(), // Stereo
-                                                3 => ["L", "C", "R"].get(i).unwrap_or(&"?").to_string(), // 2.1 (visually L, C, R)
-                                                4 => ["Ls", "L", "R", "Rs"].get(i).unwrap_or(&"?").to_string(), // Quad
-                                                6 => ["Ls", "L", "C", "LFE", "R", "Rs"].get(i).unwrap_or(&"?").to_string(), // 5.1 symmetric visual order
-                                                8 => ["SBL", "Ls", "L", "C", "LFE", "R", "Rs", "SBR"].get(i).unwrap_or(&"?").to_string(), // 7.1 symmetric visual order
-                                                12 => ["Ltr", "Ltf", "Ls", "L", "C", "LFE", "R", "Rs", "Rtf", "Rtr", "Lrs", "Rrs"].get(i).unwrap_or(&"?").to_string(), // 7.1.4 Dolby Atmos symmetric
+                                                2 => ["L", "R"].get(i).unwrap_or(&"?").to_string(),
+                                                3 => ["L", "C", "R"].get(i).unwrap_or(&"?").to_string(),
+                                                4 => ["Ls", "L", "R", "Rs"].get(i).unwrap_or(&"?").to_string(),
+                                                6 => ["Ls", "L", "C", "LFE", "R", "Rs"].get(i).unwrap_or(&"?").to_string(),
+                                                8 => ["SBL", "Ls", "L", "C", "LFE", "R", "Rs", "SBR"].get(i).unwrap_or(&"?").to_string(),
+                                                12 => ["Ltr", "Ltf", "Ls", "L", "C", "LFE", "R", "Rs", "Rtf", "Rtr", "Lrs", "Rrs"].get(i).unwrap_or(&"?").to_string(),
                                                 _ => format!("{}", i + 1),
                                             }
                                         };
@@ -770,11 +775,6 @@ impl<'a> VulkanEngine<'a> {
                             }
                             
                             columns[0].add_space(5.0);
-                            let progress = if state.duration_seconds > 0.0 {
-                                (state.current_seconds / state.duration_seconds) as f32
-                            } else {
-                                0.0
-                            }.clamp(0.0, 1.0);
                             
                             // Custom Fire/Charred Progress Bar
                             let (rect, response) = columns[0].allocate_exact_size(egui::vec2(columns[0].available_width(), 16.0), egui::Sense::click_and_drag());
@@ -789,15 +789,6 @@ impl<'a> VulkanEngine<'a> {
                             }
                             
                             let painter = columns[0].painter();
-                            // Backgrounds and embers are now drawn natively by WGPU!
-                            
-                            // Fire indicator (Demoscene Fire Array) is now drawn by WGPU!
-                            if progress > 0.0 && progress < 1.0 {
-                                let fire_start_time = std::time::Instant::now();
-                                fire_time_us = fire_start_time.elapsed().as_micros() as f32;
-                            }
-                            
-                            // Text Overlay
                             painter.text(
                                 rect.center(),
                                 egui::Align2::CENTER_CENTER,
@@ -812,8 +803,6 @@ impl<'a> VulkanEngine<'a> {
                             let hm_rect = columns[1].available_rect_before_wrap();
                             out_heatmap_rect = Some(hm_rect);
                             
-                            // Pattern Heatmap is now drawn natively in WGPU!
-                            // We just reserve the space and draw an empty frame in egui
                             columns[1].painter().rect_filled(hm_rect, 0.0, egui::Color32::TRANSPARENT);
                             
                             let painter = columns[1].painter().with_clip_rect(hm_rect);
@@ -822,13 +811,11 @@ impl<'a> VulkanEngine<'a> {
                                 let chunks = 64;
                                 let cell_w = hm_rect.width() / chunks as f32;
                                 
-                                // Draw faint background grid over the texture
                                 for c in 0..=chunks {
                                     let x = hm_rect.left() + c as f32 * cell_w;
                                     painter.line_segment([egui::pos2(x, hm_rect.top()), egui::pos2(x, hm_rect.bottom())], (1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 5)));
                                 }
                                 
-                                // Draw Tracker Text Overlay
                                 if !state.current_tracker_row_string.is_empty() {
                                     let current_row = state.current_tracker_row as i32;
                                     let center_y = hm_rect.top() + hm_rect.height() / 2.0;
@@ -836,7 +823,6 @@ impl<'a> VulkanEngine<'a> {
                                     let text = &state.current_tracker_row_string;
                                     let font_id = egui::FontId::monospace(12.0);
                                     
-                                    // Pre-calculate exact rect for background behind text
                                     let text_layout = painter.layout(
                                         format!("{:02X}  {}", current_row, text),
                                         font_id.clone(),
@@ -848,14 +834,12 @@ impl<'a> VulkanEngine<'a> {
                                         text_layout.rect.size()
                                     );
                                     
-                                    // Draw a background behind the text for readability FIRST
                                     painter.rect_filled(
                                         text_rect.expand(2.0),
                                         0.0,
                                         egui::Color32::from_black_alpha(200)
                                     );
                                     
-                                    // Draw text SECOND so it sits on top
                                     painter.galley(
                                         text_rect.min,
                                         text_layout,
@@ -899,7 +883,6 @@ impl<'a> VulkanEngine<'a> {
                                 }
                             });
                             
-                            // Visualizer Mode
                             let vis_name = match state.visualizer_mode {
                                 0 => "Frequency Spectrum",
                                 1 => "Fire",
@@ -916,21 +899,17 @@ impl<'a> VulkanEngine<'a> {
                     });
             }
 
-            // Central Panel (Transparent background) for Frequency Labels
             let frame = egui::Frame::NONE.fill(egui::Color32::TRANSPARENT);
-            egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
+            egui::CentralPanel::default().frame(frame).show_inside(ctx, |ui| {
                 let rect = ui.available_rect_before_wrap();
                 central_rect = rect;
                 
                 if state.visualizer_mode == 0 {
-                    // Draw frequency labels at the bottom
                     let painter = ui.painter();
                     let y = rect.bottom() - 20.0;
                     
                     let max_freq = state.max_frequency;
                     let min_freq = 20.0_f32;
-                    // Log scale: freq = min * (max/min)^x
-                    // Inverse: x = log(f/min) / log(max/min)
                     let x_at = |f: f32| -> f32 { (f / min_freq).ln() / (max_freq / min_freq).ln() };
                     let labels = [
                         (0.0, format!("{}Hz", min_freq as u32)),
@@ -969,7 +948,6 @@ impl<'a> VulkanEngine<'a> {
             self.heatmap_uv_rect = [(r.min.x * scale) / w, (r.min.y * scale) / h, (r.max.x * scale) / w, (r.max.y * scale) / h];
         }
 
-        // Handle egui output
         egui_state.handle_platform_output(window, full_output.platform_output);
         let clipped_primitives = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
 
@@ -999,32 +977,31 @@ impl<'a> VulkanEngine<'a> {
 
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Render Pass"),
+                label: Some("Main Render Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
+                    depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.05,
-                            g: 0.05,
-                            b: 0.06,
+                            r: 0.1,
+                            g: 0.1,
+                            b: 0.1,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: if let Some(qs) = &self.query_set {
-                    Some(wgpu::RenderPassTimestampWrites {
-                        query_set: qs,
-                        beginning_of_pass_write_index: Some(0),
-                        end_of_pass_write_index: Some(1),
-                    })
-                } else { None },
+                timestamp_writes: self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites {
+                    query_set: qs,
+                    beginning_of_pass_write_index: Some(0),
+                    end_of_pass_write_index: Some(1),
+                }),
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
 
-            // Set viewport to the CentralPanel rect
             let scale_factor = window.scale_factor() as f32;
             let vp_x = (central_rect.min.x * scale_factor).clamp(0.0, self.config.width as f32);
             let vp_y = (central_rect.min.y * scale_factor).clamp(0.0, self.config.height as f32);
@@ -1054,6 +1031,7 @@ impl<'a> VulkanEngine<'a> {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
+                    depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
@@ -1062,6 +1040,7 @@ impl<'a> VulkanEngine<'a> {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             }).forget_lifetime();
             self.egui_renderer.render(&mut render_pass, &clipped_primitives, &screen_descriptor);
         }
@@ -1073,7 +1052,7 @@ impl<'a> VulkanEngine<'a> {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
-        output.present();
+        surface_texture.present();
 
         for id in &full_output.textures_delta.free {
             self.egui_renderer.free_texture(id);
