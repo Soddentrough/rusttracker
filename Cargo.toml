@@ -1,6 +1,6 @@
 [package]
 name = "rusttracker"
-version = "0.7.2"
+version = "0.7.5"
 edition = "2024"
 default-run = "rusttracker"
 description = "High-Performance Vulkan Tracker Module Visualizer"
@@ -21,7 +21,6 @@ crossbeam-channel = "0.5.15"
 crossterm = "0.29.0"
 openmpt = "0.3.1"
 ratatui = "0.30.0"
-spectrum-analyzer = "1.7.0"
 symphonia = { version = "0.5.4", features = ["all"] }
 wgpu = "24.0.0"
 winit = "0.30.5"
@@ -33,6 +32,7 @@ egui-winit = "0.31.0"
 rfd = "0.17.2"
 image = "0.25.1"
 ffmpeg-next = "8.1.0"
+rustfft = "6.4.1"
 
 [build-dependencies]
 winres = "0.1.12"

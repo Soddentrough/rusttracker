@@ -394,10 +394,12 @@ impl<'a> VulkanEngine<'a> {
         let ch_len = state.channel_vus.len().min(32);
         
         let mut display_order: Vec<usize> = (0..ch_len).collect();
-        if ch_len == 6 {
-            display_order = vec![4, 0, 2, 3, 1, 5]; // Ls, L, C, LFE, R, Rs
-        } else if ch_len == 8 {
-            display_order = vec![6, 4, 0, 2, 3, 1, 5, 7]; // SBL, Ls, L, C, LFE, R, Rs, SBR
+        if state.tracker_channels.is_none() {
+            if ch_len == 6 {
+                display_order = vec![4, 0, 2, 3, 1, 5]; // Ls, L, C, LFE, R, Rs
+            } else if ch_len == 8 {
+                display_order = vec![4, 6, 0, 2, 3, 1, 7, 5]; // SBL, Ls, L, C, LFE, R, Rs, SBR
+            }
         }
 
         for (disp_idx, &src_idx) in display_order.iter().enumerate() {
@@ -737,14 +739,24 @@ impl<'a> VulkanEngine<'a> {
                                     
                                     // Label
                                     if num_channels <= 16 {
-                                        let label = match num_channels {
-                                            2 => ["L", "R"].get(i).unwrap_or(&"?").to_string(), // Stereo
-                                            3 => ["L", "R", "LFE"].get(i).unwrap_or(&"?").to_string(), // 2.1
-                                            4 => ["L", "R", "Ls", "Rs"].get(i).unwrap_or(&"?").to_string(), // Quad
-                                            6 => ["Ls", "L", "C", "LFE", "R", "Rs"].get(i).unwrap_or(&"?").to_string(), // 5.1 mapped
-                                            8 => ["SBL", "Ls", "L", "C", "LFE", "R", "Rs", "SBR"].get(i).unwrap_or(&"?").to_string(), // 7.1 mapped
-                                            12 => ["L", "R", "C", "LFE", "Ls", "Rs", "Lrs", "Rrs", "Ltf", "Rtf", "Ltr", "Rtr"].get(i).unwrap_or(&"?").to_string(), // 7.1.4 Dolby Atmos standard
-                                            _ => format!("{}", i + 1),
+                                        let label = if state.tracker_channels.is_some() {
+                                            if i == 0 {
+                                                "L".to_string()
+                                            } else if i == num_channels - 1 {
+                                                "R".to_string()
+                                            } else {
+                                                format!("{}", i)
+                                            }
+                                        } else {
+                                            match num_channels {
+                                                2 => ["L", "R"].get(i).unwrap_or(&"?").to_string(), // Stereo
+                                                3 => ["L", "C", "R"].get(i).unwrap_or(&"?").to_string(), // 2.1 (visually L, C, R)
+                                                4 => ["Ls", "L", "R", "Rs"].get(i).unwrap_or(&"?").to_string(), // Quad
+                                                6 => ["Ls", "L", "C", "LFE", "R", "Rs"].get(i).unwrap_or(&"?").to_string(), // 5.1 symmetric visual order
+                                                8 => ["SBL", "Ls", "L", "C", "LFE", "R", "Rs", "SBR"].get(i).unwrap_or(&"?").to_string(), // 7.1 symmetric visual order
+                                                12 => ["Ltr", "Ltf", "Ls", "L", "C", "LFE", "R", "Rs", "Rtf", "Rtr", "Lrs", "Rrs"].get(i).unwrap_or(&"?").to_string(), // 7.1.4 Dolby Atmos symmetric
+                                                _ => format!("{}", i + 1),
+                                            }
                                         };
                                         painter.text(
                                             egui::pos2(x + bw * 0.5, y_bottom + 2.0),
@@ -901,12 +913,16 @@ impl<'a> VulkanEngine<'a> {
                     let y = rect.bottom() - 20.0;
                     
                     let max_freq = state.max_frequency;
+                    let min_freq = 20.0_f32;
+                    // Log scale: freq = min * (max/min)^x
+                    // Inverse: x = log(f/min) / log(max/min)
+                    let x_at = |f: f32| -> f32 { (f / min_freq).ln() / (max_freq / min_freq).ln() };
                     let labels = [
-                        (0.0, "0Hz".to_string()),
-                        (0.25, format!("{:.1}kHz", max_freq * 0.25 / 1000.0)),
-                        (0.50, format!("{:.1}kHz", max_freq * 0.50 / 1000.0)),
-                        (0.75, format!("{:.1}kHz", max_freq * 0.75 / 1000.0)),
-                        (0.95, format!("{:.1}kHz", max_freq / 1000.0)),
+                        (0.0, format!("{}Hz", min_freq as u32)),
+                        (x_at(100.0), "100Hz".to_string()),
+                        (x_at(1000.0), "1kHz".to_string()),
+                        (x_at(5000.0), "5kHz".to_string()),
+                        (0.97, format!("{:.0}kHz", max_freq / 1000.0)),
                     ];
                     
                     let width = rect.width();

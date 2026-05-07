@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use openmpt::module::{Logger, Module};
-use spectrum_analyzer::{samples_fft_to_spectrum, windows::hann_window, FrequencyLimit};
+use rustfft::{FftPlanner, num_complex::Complex};
 use std::fs::File;
 use std::io::{Cursor, Read};
 use std::sync::{Arc, Mutex};
@@ -15,6 +15,8 @@ use symphonia::core::probe::Hint;
 
 use crate::state::AppState;
 use crossbeam_channel::{bounded, Sender, Receiver};
+
+const FFT_SIZE: usize = 8192;
 
 struct DspMessage {
     audio_data: Vec<f32>,
@@ -34,63 +36,70 @@ fn spawn_dsp_thread(
     max_frequency: f32,
 ) {
     std::thread::spawn(move || {
-        let mut windowed_buffer = vec![0.0; 4096];
         let mut binned_data = vec![0.0; 1024];
 
+        // Pre-compute Hann window coefficients
+        let hann_window: Vec<f32> = (0..FFT_SIZE)
+            .map(|i| 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / (FFT_SIZE - 1) as f32).cos()))
+            .collect();
+
+        // Pre-plan FFT (rustfft caches the twiddle factors)
+        let mut planner = FftPlanner::<f32>::new();
+        let fft = planner.plan_fft_forward(FFT_SIZE);
+        let mut complex_buf = vec![Complex { re: 0.0f32, im: 0.0f32 }; FFT_SIZE];
+        let mut magnitudes = vec![0.0f32; FFT_SIZE / 2];
+
         while let Ok(msg) = rx.recv() {
-            // Apply windowing and FFT
-            for i in 0..4096 {
-                windowed_buffer[i] = *msg.audio_data.get(i).unwrap_or(&0.0);
-            }
             let fft_start = Instant::now();
-            let hann = hann_window(&windowed_buffer);
-            if let Ok(spectrum) = samples_fft_to_spectrum(
-                &hann,
-                sample_rate,
-                FrequencyLimit::Max(max_frequency),
-                Some(&spectrum_analyzer::scaling::divide_by_N_sqrt),
-            ) {
-                binned_data.fill(0.0);
-                let bands: Vec<_> = spectrum.data().iter().map(|(f, v)| (f.val(), v.val())).collect();
-                
-                if !bands.is_empty() {
-                    let resolution = if bands.len() > 1 { bands[1].0 - bands[0].0 } else { 1.0 };
-                    let min_freq = 20.0f32;
-                    let max_f = max_frequency.max(min_freq * 2.0);
-                    let num_bins = 1024;
-                    
-                    for i in 0..num_bins {
-                        let freq_start = min_freq * (max_f / min_freq).powf(i as f32 / num_bins as f32);
-                        let freq_end = min_freq * (max_f / min_freq).powf((i + 1) as f32 / num_bins as f32);
-                        
-                        let idx_start = freq_start / resolution;
-                        let idx_end = freq_end / resolution;
-                        
-                        let mut max_val: f32 = 0.0;
-                        
-                        if idx_end - idx_start >= 1.0 {
-                            let start = idx_start.ceil() as usize;
-                            let end = idx_end.floor() as usize;
-                            for idx in start..=end {
-                                if idx < bands.len() {
-                                    max_val = max_val.max(bands[idx].1);
-                                }
-                            }
-                        } else {
-                            let exact = (idx_start + idx_end) / 2.0;
-                            let idx0 = exact.floor() as usize;
-                            let idx1 = exact.ceil() as usize;
-                            let fract = exact.fract();
-                            
-                            let val0 = if idx0 < bands.len() { bands[idx0].1 } else { 0.0 };
-                            let val1 = if idx1 < bands.len() { bands[idx1].1 } else { 0.0 };
-                            
-                            max_val = val0 + (val1 - val0) * fract;
+
+            // Apply Hann window and prepare complex input
+            for i in 0..FFT_SIZE {
+                let sample = *msg.audio_data.get(i).unwrap_or(&0.0);
+                complex_buf[i] = Complex { re: sample * hann_window[i], im: 0.0 };
+            }
+
+            // Run FFT
+            fft.process(&mut complex_buf);
+
+            // Compute magnitudes (only first half — up to Nyquist)
+            let n_sqrt = (FFT_SIZE as f32).sqrt();
+            for i in 0..FFT_SIZE / 2 {
+                magnitudes[i] = complex_buf[i].norm() / n_sqrt;
+            }
+
+            // Logarithmic binning into 1024 display bins
+            let resolution = sample_rate as f32 / FFT_SIZE as f32; // Hz per FFT bin
+            let min_freq = 20.0f32;
+            let max_f = max_frequency.max(min_freq * 2.0);
+            let num_bins = 1024;
+            let nyquist = FFT_SIZE / 2;
+
+            binned_data.fill(0.0);
+            for i in 0..num_bins {
+                let freq_start = min_freq * (max_f / min_freq).powf(i as f32 / num_bins as f32);
+                let freq_end = min_freq * (max_f / min_freq).powf((i + 1) as f32 / num_bins as f32);
+
+                let idx_start = freq_start / resolution;
+                let idx_end = freq_end / resolution;
+
+                let mut max_val: f32 = 0.0;
+
+                if idx_end - idx_start >= 1.0 {
+                    let start = idx_start.ceil() as usize;
+                    let end = idx_end.floor() as usize;
+                    for idx in start..=end {
+                        if idx < nyquist {
+                            max_val = max_val.max(magnitudes[idx]);
                         }
-                        
-                        binned_data[i] = (max_val * 60.0).clamp(0.0, 100.0);
+                    }
+                } else {
+                    let nearest = ((idx_start + idx_end) / 2.0).round() as usize;
+                    if nearest < nyquist {
+                        max_val = magnitudes[nearest];
                     }
                 }
+
+                binned_data[i] = (max_val * 100.0).clamp(0.0, 100.0);
             }
             let fft_elapsed = fft_start.elapsed().as_micros() as f32;
 
@@ -195,17 +204,18 @@ struct OpenMptSource {
     module: SafeModule,
     left_buf: Vec<f32>,
     right_buf: Vec<f32>,
-    cached_order: i32,
-    cached_row: i32,
-    cached_row_string: String,
 }
 
 impl AudioSource for OpenMptSource {
     fn read_frames(&mut self, hardware_channels: usize, sample_rate: u32, output: &mut [f32]) -> usize {
         let frames_to_render = output.len() / hardware_channels;
 
-        self.left_buf.resize(frames_to_render, 0.0);
-        self.right_buf.resize(frames_to_render, 0.0);
+        // The openmpt crate uses Vec::capacity() (not len()) to decide how many
+        // frames to render. After Vec::resize(), capacity can exceed length due
+        // to Vec's doubling growth strategy, causing the C library to write past
+        // the Vec's logical length. Allocate exact-size buffers to avoid this.
+        self.left_buf = vec![0.0; frames_to_render];
+        self.right_buf = vec![0.0; frames_to_render];
 
         let frames_read = self.module.0.read_float_stereo(
             sample_rate as i32,
@@ -734,9 +744,6 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
                         module: SafeModule(module),
                         left_buf: Vec::with_capacity(8192),
                         right_buf: Vec::with_capacity(8192),
-                        cached_order: -1,
-                        cached_row: -1,
-                        cached_row_string: String::new(),
                     }));
                 }
             }
@@ -867,6 +874,7 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
             audio_source.get_num_channels()
         };
         state.channel_vus = vec![0.0; state.num_channels as usize];
+        state.peak_vus = vec![0.0; state.num_channels as usize];
         state.bpm = audio_source.get_tempo();
         state.speed = audio_source.get_speed();
         state.video_info = audio_source.get_video_info();
@@ -923,8 +931,8 @@ where
     let hardware_channels = config.channels as usize;
     let mut interleaved_buffer: Vec<f32> = vec![0.0; 8192 * hardware_channels];
     
-    let mut fft_buffer: Vec<f32> = vec![0.0; 4096];
-    let mut windowed_buffer: Vec<f32> = vec![0.0; 4096];
+    let mut fft_buffer: Vec<f32> = vec![0.0; 8192];
+    let mut windowed_buffer: Vec<f32> = vec![0.0; 8192];
     let mut fft_index = 0;
     
     let mut was_paused = false;
@@ -991,7 +999,7 @@ where
                     mono /= hardware_channels as f32;
                     
                     fft_buffer[fft_index] = mono;
-                    fft_index = (fft_index + 1) % 4096;
+                    fft_index = (fft_index + 1) % 8192;
                 } else {
                     for sample in frame.iter_mut() {
                         *sample = T::from_sample(0.0);
@@ -999,8 +1007,8 @@ where
                 }
             }
 
-            for i in 0..4096 {
-                windowed_buffer[i] = fft_buffer[(fft_index + i) % 4096];
+            for i in 0..8192 {
+                windowed_buffer[i] = fft_buffer[(fft_index + i) % 8192];
             }
             
             let mut channel_vus = Vec::new();
@@ -1032,7 +1040,6 @@ where
             
             let _ = tx.try_send(msg);
 
-            // Zero-allocation UI state sync via lock-free try_lock
             if let Ok(mut state) = shared_state.try_lock() {
                 state.stats.decode_us = state.stats.decode_us * 0.9 + decode_elapsed * 0.1;
                 if let Some(pos) = state.seek_request.take() {
@@ -1043,6 +1050,7 @@ where
         |err| eprintln!("an error occurred on stream: {}", err),
         None,
     )?;
+
 
     Ok(stream)
 }
@@ -1058,8 +1066,8 @@ where
     T: cpal::Sample + cpal::FromSample<f32> + cpal::SizedSample + Into<f32>,
 {
     let channels = config.channels as usize;
-    let mut fft_buffer: Vec<f32> = vec![0.0; 4096];
-    let mut windowed_buffer: Vec<f32> = vec![0.0; 4096];
+    let mut fft_buffer: Vec<f32> = vec![0.0; 8192];
+    let mut windowed_buffer: Vec<f32> = vec![0.0; 8192];
     let mut fft_index = 0;
     
     let mut was_paused = false;
@@ -1091,11 +1099,11 @@ where
 
                 let mono = (left + right) / 2.0;
                 fft_buffer[fft_index] = mono;
-                fft_index = (fft_index + 1) % 4096;
+                fft_index = (fft_index + 1) % 8192;
             }
 
-            for i in 0..4096 {
-                windowed_buffer[i] = fft_buffer[(fft_index + i) % 4096];
+            for i in 0..8192 {
+                windowed_buffer[i] = fft_buffer[(fft_index + i) % 8192];
             }
             
             let mut channel_vus = Vec::new();

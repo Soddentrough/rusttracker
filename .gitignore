@@ -12,3 +12,7 @@
 *.okt
 *.psm
 audio_tests/
+
+# Debug / crash artifacts
+*.log
+gdb_output.txt
