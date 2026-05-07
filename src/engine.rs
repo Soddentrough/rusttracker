@@ -412,7 +412,10 @@ impl<'a> VulkanEngine<'a> {
         self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
         self.queue.write_buffer(&self.waveform_storage_buffer, 0, bytemuck::cast_slice(&[history_storage]));
         
-        let mut history_array = [[0.0f32; 64]; 120];
+        let mut visualizer_storage = VisualizerStorage {
+            history: [[0.0; 64]; 120],
+            fire_grid: *self.fire_grid,
+        };
         let chunks = 64;
         let history_len = state.spectrum_history.len().min(120);
         if history_len > 0 {
@@ -440,7 +443,7 @@ impl<'a> VulkanEngine<'a> {
                             }
                         }
                     }
-                    history_array[time_idx][x] = max_val;
+                    visualizer_storage.history[time_idx][x] = max_val;
                 }
             }
         }
@@ -537,11 +540,11 @@ impl<'a> VulkanEngine<'a> {
                     self.fire_grid[143][x] = fuel.max(0.0).min(1.0);
                 }
             }
+            
+            visualizer_storage.fire_grid = *self.fire_grid;
         }
 
-        // Write history and fire_grid separately to avoid massive stack allocations
-        self.queue.write_buffer(&self.visualizer_storage_buffer, 0, bytemuck::cast_slice(&history_array));
-        self.queue.write_buffer(&self.visualizer_storage_buffer, 30720, bytemuck::cast_slice(&*self.fire_grid));
+        self.queue.write_buffer(&self.visualizer_storage_buffer, 0, bytemuck::cast_slice(&[visualizer_storage]));
     }
 
     pub fn render(

@@ -33,7 +33,6 @@ struct AudioUniforms {
 
 struct VisualizerStorage {
     history: array<array<f32, 64>, 120>,
-    fire_grid: array<array<f32, 1024>, 144>,
 };
 
 @group(0) @binding(0) var<uniform> uniforms: AudioUniforms;
