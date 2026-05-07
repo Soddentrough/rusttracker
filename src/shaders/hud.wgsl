@@ -32,7 +32,7 @@ struct AudioUniforms {
 };
 
 struct HistoryRow {
-    bands: array<f32, 256>,
+    bands: array<vec4<f32>, 64>,
 };
 
 struct VisualizerStorage {
@@ -201,7 +201,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         
         // time_idx 0 is newest (bottom of UI). time_idx 119 is oldest (top of UI).
         let time_idx = 119u - y_idx;
-        let val = heatmap_storage.history[time_idx].bands[x_idx];
+        let vec_idx = x_idx / 4u;
+        let comp_idx = x_idx % 4u;
+        let val = heatmap_storage.history[time_idx].bands[vec_idx][comp_idx];
         
         if (val > 5.0) {
             if (val > 60.0) {
