@@ -209,8 +209,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             } else {
                 out_color = vec4<f32>(180.0/255.0, 20.0/255.0, 20.0/255.0, 1.0);
             }
+        } else if (val == 0.0) {
+            out_color = vec4<f32>(0.0, 0.0, 1.0, 1.0); // Debug: Blue if exactly 0.0
         } else {
-            out_color = vec4<f32>(20.0/255.0, 20.0/255.0, 22.0/255.0, 1.0);
+            out_color = vec4<f32>(0.0, 1.0, 0.0, 1.0); // Debug: Green if > 0.0 but <= 5.0
         }
     } else if (fire_rect_max.x > 0.0 && uv.x >= fire_rect_min.x && uv.x <= fire_rect_max.x && uv.y >= fire_rect_min.y && uv.y <= fire_rect_max.y) {
         // Fire FX Progress Bar

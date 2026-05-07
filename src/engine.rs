@@ -64,6 +64,7 @@ pub struct VulkanEngine<'a> {
     pub fire_uv_rect: [f32; 4],
     fire_grid: Box<[f32; 147456]>,
     last_fire_time: f32,
+    last_log_time: f32,
     
     pub start_time: std::time::Instant,
 }
@@ -354,6 +355,7 @@ impl<'a> VulkanEngine<'a> {
             fire_uv_rect: [0.0; 4],
             fire_grid: vec![0.0; 147456].into_boxed_slice().try_into().unwrap(),
             last_fire_time: 0.0,
+            last_log_time: 0.0,
             start_time: std::time::Instant::now(),
         }
     }
@@ -546,6 +548,20 @@ impl<'a> VulkanEngine<'a> {
             }
             
             visualizer_storage.fire_grid.copy_from_slice(&*self.fire_grid);
+        }
+
+        let current_time_log = self.start_time.elapsed().as_secs_f32();
+        if current_time_log - self.last_log_time >= 1.0 {
+            self.last_log_time = current_time_log;
+            use std::io::Write;
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("debug_heatmap.log") {
+                let _ = writeln!(file, "--- Heatmap Debug Log [{:.1}s] ---", current_time_log);
+                let _ = writeln!(file, "state.spectrum_history.len(): {}", state.spectrum_history.len());
+                let _ = writeln!(file, "uniforms.ui_heatmap_rect: {:?}", uniforms.ui_heatmap_rect);
+                let _ = writeln!(file, "history row 0 (oldest) sample: {:?}", &visualizer_storage.history[0..5]);
+                let _ = writeln!(file, "history row 119 (newest) sample: {:?}", &visualizer_storage.history[119 * 256..119 * 256 + 5]);
+                let _ = writeln!(file, "-----------------------------------");
+            }
         }
 
         self.queue.write_buffer(&self.visualizer_storage_buffer, 0, bytemuck::cast_slice(&[visualizer_storage]));
