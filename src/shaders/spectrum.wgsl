@@ -84,8 +84,8 @@ fn fbm(p: vec2<f32>) -> f32 {
 }
 
 fn get_amplitude(x: f32) -> f32 {
-    let freq_idx = u32(x * 512.0);
-    let clamped_idx = clamp(freq_idx, 0u, 511u);
+    let freq_idx = u32(x * 1024.0);
+    let clamped_idx = clamp(freq_idx, 0u, 1023u);
     let vec_idx = clamped_idx / 4u;
     let component_idx = clamped_idx % 4u;
     
@@ -97,8 +97,8 @@ fn get_amplitude(x: f32) -> f32 {
 }
 
 fn get_fire_heat(x: f32) -> f32 {
-    let freq_idx = u32(x * 512.0);
-    let clamped_idx = clamp(freq_idx, 0u, 511u);
+    let freq_idx = u32(x * 1024.0);
+    let clamped_idx = clamp(freq_idx, 0u, 1023u);
     let vec_idx = clamped_idx / 4u;
     let component_idx = clamped_idx % 4u;
     
@@ -140,13 +140,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // --- MODE 0: DEFAULT GRID ---
         let amplitude = get_amplitude(in.uv.x);
         
-        let bar_uv_x = fract(in.uv.x * 512.0);
+        let bar_uv_x = fract(in.uv.x * 1024.0);
         if bar_uv_x < 0.1 || bar_uv_x > 0.9 {
             return vec4<f32>(0.02, 0.02, 0.03, 1.0);
         }
         
         let aspect = dpdx(in.uv.x) / dpdy(in.uv.y);
-        let num_leds = 512.0 * aspect;
+        let num_leds = 1024.0 * aspect;
         
         let led_y = fract((1.0 - in.uv.y) * num_leds);
         if led_y < 0.15 || led_y > 0.85 {

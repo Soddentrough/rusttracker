@@ -244,7 +244,7 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                                     if state.current_seconds >= state.duration_seconds - 0.1 && state.duration_seconds > 0.0 {
                                         state.seek_request = Some(0.0);
                                         state.spectrum_history.clear();
-                                        for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 512]); }
+                                        for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
                                         state.is_paused = false;
                                     } else {
                                         state.is_paused = !state.is_paused;
@@ -255,14 +255,14 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                                     let target = state.current_seconds + 5.0;
                                     state.seek_request = Some(target);
                                     state.spectrum_history.clear();
-                                    for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 512]); }
+                                    for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
                                 },
                                 WinitKeyCode::ArrowLeft => {
                                     let mut state = app_state.lock().unwrap();
                                     let target = (state.current_seconds - 5.0).max(0.0);
                                     state.seek_request = Some(target);
                                     state.spectrum_history.clear();
-                                    for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 512]); }
+                                    for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
                                 },
                                 WinitKeyCode::ArrowUp => {
                                     let mut state = app_state.lock().unwrap();
@@ -337,8 +337,8 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                         
                         if !state.file_loaded {
                             let t = now.elapsed().as_secs_f32();
-                            for i in 0..512 {
-                                let pct = i as f32 / 512.0;
+                            for i in 0..1024 {
+                                let pct = i as f32 / 1024.0;
                                 let wave1 = (t * 2.0 + pct * 10.0).sin();
                                 let wave2 = (t * 1.5 - pct * 15.0).cos();
                                 let wave3 = (t * 0.5 + pct * 5.0).sin();
@@ -445,7 +445,7 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                         let target = (state.duration_seconds * pct as f64).clamp(0.0, state.duration_seconds);
                         state.seek_request = Some(target);
                         state.spectrum_history.clear();
-                        for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 512]); }
+                        for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
                     } else if action == EngineAction::OpenFile {
                         let app_state_clone = Arc::clone(&app_state);
                         std::thread::spawn(move || {

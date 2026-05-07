@@ -60,7 +60,7 @@ impl AppState {
     pub fn new(title: String) -> Self {
         let mut history = VecDeque::new();
         for _ in 0..120 {
-            history.push_back(vec![0.0; 512]);
+            history.push_back(vec![0.0; 1024]);
         }
         
         let mut wave_history = VecDeque::new();
@@ -84,13 +84,13 @@ impl AppState {
             raw_channel_vus: Vec::new(),
             channel_vus: Vec::new(),
             peak_vus: Vec::new(),
-            raw_spectrum_data: vec![0.0; 512],
-            spectrum_data: vec![0.0; 512],
-            spectrum_peaks: vec![0.0; 512],
+            raw_spectrum_data: vec![0.0; 1024],
+            spectrum_data: vec![0.0; 1024],
+            spectrum_peaks: vec![0.0; 1024],
             spectrum_history: history,
             waveform_history: wave_history,
             raw_waveform: vec![0.0; 1024],
-            fire_heat: vec![0.0; 512],
+            fire_heat: vec![0.0; 1024],
             show_hud: true,
             max_frequency: 10000.0,
             num_samples: 0,

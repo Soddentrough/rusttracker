@@ -12,8 +12,8 @@ pub enum EngineAction {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct AudioUniforms {
-    pub spectrum: [f32; 512],
-    pub fire_heat: [f32; 512],
+    pub spectrum: [f32; 1024],
+    pub fire_heat: [f32; 1024],
     pub channels: [f32; 32],
     pub channel_peaks: [f32; 32],
     pub num_channels: u32,
@@ -37,7 +37,7 @@ pub struct WaveformHistoryStorage {
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct VisualizerStorage {
     pub history: [[f32; 64]; 120],
-    pub fire_grid: [[f32; 512]; 144],
+    pub fire_grid: [[f32; 1024]; 144],
 }
 
 pub struct VulkanEngine<'a> {
@@ -62,7 +62,7 @@ pub struct VulkanEngine<'a> {
     pub meters_uv_rect: [f32; 4],
     pub heatmap_uv_rect: [f32; 4],
     pub fire_uv_rect: [f32; 4],
-    fire_grid: Box<[[f32; 512]; 144]>,
+    fire_grid: Box<[[f32; 1024]; 144]>,
     last_fire_time: f32,
     
     pub start_time: std::time::Instant,
@@ -349,7 +349,7 @@ impl<'a> VulkanEngine<'a> {
             meters_uv_rect: [0.0; 4],
             heatmap_uv_rect: [0.0; 4],
             fire_uv_rect: [0.0; 4],
-            fire_grid: Box::new([[0.0; 512]; 144]),
+            fire_grid: Box::new([[0.0; 1024]; 144]),
             last_fire_time: 0.0,
             start_time: std::time::Instant::now(),
         }
@@ -366,8 +366,8 @@ impl<'a> VulkanEngine<'a> {
 
     pub fn update(&mut self, state: &AppState) {
         let mut uniforms = AudioUniforms {
-            spectrum: [0.0; 512],
-            fire_heat: [0.0; 512],
+            spectrum: [0.0; 1024],
+            fire_heat: [0.0; 1024],
             channels: [0.0; 32],
             channel_peaks: [0.0; 32],
             num_channels: state.num_channels as u32,
@@ -417,15 +417,28 @@ impl<'a> VulkanEngine<'a> {
         let chunks = 64;
         let history_len = state.spectrum_history.len().min(120);
         if history_len > 0 {
-            let raw_bands = state.spectrum_history[0].len();
-            let chunk_size = raw_bands / chunks;
             for (time_idx, bands) in state.spectrum_history.iter().take(120).enumerate() {
+                let current_bands = bands.len();
                 for x in 0..chunks {
                     let mut max_val = 0.0;
-                    for k in 0..chunk_size {
-                        let idx = x * chunk_size + k;
-                        if idx < bands.len() && bands[idx] > max_val {
-                            max_val = bands[idx];
+                    if current_bands >= chunks {
+                        let scale_start = (x as f32 / chunks as f32).powf(2.0);
+                        let scale_end = ((x + 1) as f32 / chunks as f32).powf(2.0);
+                        let start_idx = (scale_start * current_bands as f32) as usize;
+                        let end_idx = ((scale_end * current_bands as f32) as usize).max(start_idx + 1);
+                        
+                        for idx in start_idx..end_idx {
+                            if idx < current_bands && bands[idx] > max_val {
+                                max_val = bands[idx];
+                            }
+                        }
+                    } else {
+                        let chunk_size = (current_bands / chunks).max(1);
+                        for k in 0..chunk_size {
+                            let idx = x * chunk_size + k;
+                            if idx < current_bands && bands[idx] > max_val {
+                                max_val = bands[idx];
+                            }
                         }
                     }
                     visualizer_storage.history[time_idx][x] = max_val;
@@ -452,10 +465,10 @@ impl<'a> VulkanEngine<'a> {
                 
                 // 1. Propagate Heat Upwards
                 for y in 0usize..143 {
-                    for x in 0usize..512 {
+                    for x in 0usize..1024 {
                         // Random spread (-1, 0, +1)
                         let spread = (rng() % 3) as i32 - 1;
-                        let src_x = (x as i32 + spread).clamp(0, 511) as usize;
+                        let src_x = (x as i32 + spread).clamp(0, 1023) as usize;
                         
                         let heat = self.fire_grid[y + 1][src_x];
                         
@@ -477,9 +490,9 @@ impl<'a> VulkanEngine<'a> {
                 
                 // We divide the screen width by the number of SPATIAL channels (excluding LFE)
                 // This guarantees the Center channel (which is exactly in the middle of the remaining channels)
-                // is mapped perfectly to x = 256.
+                // is mapped perfectly to x = 512.
                 let n_spatial_ch = if lfe_idx < n_ch { n_ch - 1 } else { n_ch };
-                let channel_width = 512.0 / n_spatial_ch as f32;
+                let channel_width = 1024.0 / n_spatial_ch as f32;
                 
                 let mut base_lfe_fuel = 0.0;
                 if lfe_idx < n_ch {
@@ -489,10 +502,10 @@ impl<'a> VulkanEngine<'a> {
                     base_lfe_fuel = (ch_vu + ch_peak * 0.5) * 0.6;
                 }
                 
-                for x in 0usize..512 {
+                for x in 0usize..1024 {
                     // Apply a tighter normal distribution (Bell Curve) to the LFE bed
-                    // Centered at 256, fades sharply towards the edges
-                    let lfe_dist = (x as f32 - 256.0).abs();
+                    // Centered at 512, fades sharply towards the edges
+                    let lfe_dist = (x as f32 - 512.0).abs();
                     let lfe_sigma = 70.0;
                     let lfe_influence = (- (lfe_dist * lfe_dist) / (2.0 * lfe_sigma * lfe_sigma)).exp();
                     

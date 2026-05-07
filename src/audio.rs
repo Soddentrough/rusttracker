@@ -34,7 +34,7 @@ fn spawn_dsp_thread(
 ) {
     std::thread::spawn(move || {
         let mut windowed_buffer = vec![0.0; 4096];
-        let mut binned_data = vec![0.0; 512];
+        let mut binned_data = vec![0.0; 1024];
 
         while let Ok(msg) = rx.recv() {
             // Apply windowing and FFT
@@ -56,7 +56,7 @@ fn spawn_dsp_thread(
                     let resolution = if bands.len() > 1 { bands[1].0 - bands[0].0 } else { 1.0 };
                     let min_freq = 20.0f32;
                     let max_f = max_frequency.max(min_freq * 2.0);
-                    let num_bins = 512;
+                    let num_bins = 1024;
                     
                     for i in 0..num_bins {
                         let freq_start = min_freq * (max_f / min_freq).powf(i as f32 / num_bins as f32);
