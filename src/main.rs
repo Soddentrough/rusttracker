@@ -195,11 +195,22 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
     let egui_ctx = egui::Context::default();
     let mut egui_state = egui_winit::State::new(egui_ctx.clone(), egui::ViewportId::ROOT, &window, None, None, None);
 
+    let mut last_mouse_move = Instant::now();
+    let mut is_cursor_visible = true;
+
     #[allow(deprecated)]
     let _ = event_loop.run(move |event, elwt| {
         match event {
             Event::WindowEvent { ref event, window_id } if window_id == window.id() => {
                 let response = egui_state.on_window_event(&window, event);
+                
+                if let WindowEvent::CursorMoved { .. } = event {
+                    last_mouse_move = Instant::now();
+                    if !is_cursor_visible {
+                        window.set_cursor_visible(true);
+                        is_cursor_visible = true;
+                    }
+                }
                 
                 // Process global hotkeys regardless of egui consuming them
                 if let WindowEvent::KeyboardInput { event: kb_event, .. } = event {
@@ -315,12 +326,11 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                     };
                     
                     if let Some(path) = load_path {
+                        active_stream = None; // DROP OLD STREAM FIRST to release WASAPI lock!
                         if let Ok(stream) = audio::start_audio_thread(&path, false, Arc::clone(&app_state)) {
                             let mut state = app_state.lock().unwrap();
                             state.file_loaded = true;
                             active_stream = Some(stream);
-                        } else {
-                            active_stream = None;
                         }
                     }
 
@@ -493,6 +503,16 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                 }
             },
             Event::AboutToWait => {
+                if window.fullscreen().is_some() {
+                    if is_cursor_visible && last_mouse_move.elapsed().as_secs_f32() > 2.0 {
+                        window.set_cursor_visible(false);
+                        is_cursor_visible = false;
+                    }
+                } else if !is_cursor_visible {
+                    window.set_cursor_visible(true);
+                    is_cursor_visible = true;
+                }
+                
                 window.request_redraw();
             }
             _ => {}

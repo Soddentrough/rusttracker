@@ -76,10 +76,15 @@ fn spawn_dsp_thread(
                                 }
                             }
                         } else {
-                            let nearest = ((idx_start + idx_end) / 2.0).round() as usize;
-                            if nearest < bands.len() {
-                                max_val = bands[nearest].1;
-                            }
+                            let exact = (idx_start + idx_end) / 2.0;
+                            let idx0 = exact.floor() as usize;
+                            let idx1 = exact.ceil() as usize;
+                            let fract = exact.fract();
+                            
+                            let val0 = if idx0 < bands.len() { bands[idx0].1 } else { 0.0 };
+                            let val1 = if idx1 < bands.len() { bands[idx1].1 } else { 0.0 };
+                            
+                            max_val = val0 + (val1 - val0) * fract;
                         }
                         
                         binned_data[i] = (max_val * 150.0).clamp(0.0, 100.0);
