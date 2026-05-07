@@ -88,7 +88,7 @@ fn spawn_dsp_thread(
                             max_val = val0 + (val1 - val0) * fract;
                         }
                         
-                        binned_data[i] = (max_val * 150.0).clamp(0.0, 100.0);
+                        binned_data[i] = (max_val * 60.0).clamp(0.0, 100.0);
                     }
                 }
             }
@@ -195,6 +195,9 @@ struct OpenMptSource {
     module: SafeModule,
     left_buf: Vec<f32>,
     right_buf: Vec<f32>,
+    cached_order: i32,
+    cached_row: i32,
+    cached_row_string: String,
 }
 
 impl AudioSource for OpenMptSource {
@@ -253,10 +256,15 @@ impl AudioSource for OpenMptSource {
     fn get_tracker_channels(&mut self) -> Option<i32> { Some(self.module.0.get_num_channels()) }
 
     fn get_current_row_string(&mut self) -> String {
-        let mut row_str = String::new();
-        let num_channels = self.module.0.get_num_channels();
         let cur_order = self.module.0.get_current_order();
         let cur_row = self.module.0.get_current_row();
+        
+        if cur_order == self.cached_order && cur_row == self.cached_row {
+            return self.cached_row_string.clone();
+        }
+        
+        let mut row_str = String::new();
+        let num_channels = self.module.0.get_num_channels();
         
         if let Some(mut pattern) = self.module.0.get_pattern_by_order(cur_order) {
             if let Some(mut row) = pattern.get_row_by_number(cur_row) {
@@ -268,6 +276,11 @@ impl AudioSource for OpenMptSource {
                 }
             }
         }
+        
+        self.cached_order = cur_order;
+        self.cached_row = cur_row;
+        self.cached_row_string = row_str.clone();
+        
         row_str
     }
 }
@@ -745,6 +758,9 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
                         module: SafeModule(module),
                         left_buf: Vec::with_capacity(8192),
                         right_buf: Vec::with_capacity(8192),
+                        cached_order: -1,
+                        cached_row: -1,
+                        cached_row_string: String::new(),
                     }));
                 }
             }
