@@ -554,7 +554,8 @@ impl<'a> VulkanEngine<'a> {
         if current_time_log - self.last_log_time >= 1.0 {
             self.last_log_time = current_time_log;
             use std::io::Write;
-            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open("debug_heatmap.log") {
+            let log_path = std::env::temp_dir().join("debug_heatmap.log");
+            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
                 let _ = writeln!(file, "--- Heatmap Debug Log [{:.1}s] ---", current_time_log);
                 let _ = writeln!(file, "state.spectrum_history.len(): {}", state.spectrum_history.len());
                 let _ = writeln!(file, "uniforms.ui_heatmap_rect: {:?}", uniforms.ui_heatmap_rect);
