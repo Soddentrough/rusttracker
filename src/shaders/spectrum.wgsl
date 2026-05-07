@@ -14,8 +14,8 @@ fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
 }
 
 struct AudioUniforms {
-    spectrum: array<vec4<f32>, 128>,
-    fire_heat: array<vec4<f32>, 128>,
+    spectrum: array<vec4<f32>, 256>,
+    fire_heat: array<vec4<f32>, 256>,
     channels: array<vec4<f32>, 8>,
     num_channels: u32,
     mode: u32,
