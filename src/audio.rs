@@ -104,7 +104,7 @@ fn spawn_dsp_thread(
             let fft_elapsed = fft_start.elapsed().as_micros() as f32;
 
             // Sync to UI state
-            if let Ok(mut state) = shared_state.try_lock() {
+            if let Ok(mut state) = shared_state.lock() {
                 // Decay/smooth the execution stats for readability
                 state.stats.fft_us = state.stats.fft_us * 0.9 + fft_elapsed * 0.1;
                 
