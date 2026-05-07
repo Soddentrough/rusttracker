@@ -62,9 +62,10 @@ fn spawn_dsp_thread(
             fft.process(&mut complex_buf);
 
             // Compute magnitudes (only first half — up to Nyquist)
-            let n_sqrt = (FFT_SIZE as f32).sqrt();
+            // Normalization for Hann-windowed FFT: divide by N/4 to get true amplitude
+            let norm_factor = (FFT_SIZE as f32) / 4.0;
             for i in 0..FFT_SIZE / 2 {
-                magnitudes[i] = complex_buf[i].norm() / n_sqrt;
+                magnitudes[i] = complex_buf[i].norm() / norm_factor;
             }
 
             // Logarithmic binning into 1024 display bins
@@ -99,7 +100,7 @@ fn spawn_dsp_thread(
                     }
                 }
 
-                binned_data[i] = (max_val * 100.0).clamp(0.0, 100.0);
+                binned_data[i] = (max_val * 100.0).clamp(0.0, 100.0); // Keep gain scaling, but input is now properly normalized
             }
             let fft_elapsed = fft_start.elapsed().as_micros() as f32;
 
