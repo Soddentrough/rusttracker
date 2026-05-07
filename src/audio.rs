@@ -935,26 +935,7 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
             state.available_visualizers = vec![0, 1, 2];
         }
         if !mic {
-            let mut state = shared_state.lock().unwrap();
-            state.duration_seconds = audio_source.get_duration_seconds();
-            state.artist = audio_source.get_artist();
-            state.module_type = audio_source.get_type();
-            state.bpm = audio_source.get_tempo();
-            state.speed = audio_source.get_speed();
-            state.num_samples = audio_source.get_num_samples();
-            state.num_instruments = audio_source.get_num_instruments();
-            state.num_patterns = audio_source.get_num_patterns();
-            state.video_info = audio_source.get_video_info();
-            state.num_channels = target_channels as i32;
-            
-            state.channel_vus = vec![0.0; target_channels as usize];
-            state.peak_vus = vec![0.0; target_channels as usize];
-            if !state.available_visualizers.contains(&state.visualizer_mode) {
-                state.visualizer_mode = state.available_visualizers[0];
-                state.current_visualizer_idx = state.available_visualizers.iter().position(|&x| x == state.visualizer_mode).unwrap_or(0);
-            }
-            state.hardware_channels = config.channels as i32;
-            state.tracker_channels = audio_source.get_tracker_channels();
+            state.tracker_channels = tracker_channels;
             state.tracker_patterns_by_order = audio_source.pre_format_tracker_data();
         }
     }
