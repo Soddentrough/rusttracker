@@ -812,8 +812,11 @@ impl<'a> VulkanEngine<'a> {
                             let hm_rect = columns[1].available_rect_before_wrap();
                             out_heatmap_rect = Some(hm_rect);
                             
-                            let painter = columns[1].painter().with_clip_rect(hm_rect);
                             // Pattern Heatmap is now drawn natively in WGPU!
+                            // We just reserve the space and draw an empty frame in egui
+                            columns[1].painter().rect_filled(hm_rect, 0.0, egui::Color32::TRANSPARENT);
+                            
+                            let painter = columns[1].painter().with_clip_rect(hm_rect);
                             let history_len = state.spectrum_history.len();
                             if history_len > 0 && state.spectrum_history[0].len() > 0 {
                                 let chunks = 64;
@@ -833,18 +836,30 @@ impl<'a> VulkanEngine<'a> {
                                     let text = &state.current_tracker_row_string;
                                     let font_id = egui::FontId::monospace(12.0);
                                     
-                                    let rect = painter.text(
-                                        egui::pos2(hm_rect.center().x, center_y),
-                                        egui::Align2::CENTER_CENTER,
+                                    // Pre-calculate exact rect for background behind text
+                                    let text_layout = painter.layout(
                                         format!("{:02X}  {}", current_row, text),
-                                        font_id,
-                                        egui::Color32::WHITE
+                                        font_id.clone(),
+                                        egui::Color32::WHITE,
+                                        hm_rect.width()
+                                    );
+                                    let text_rect = egui::Rect::from_center_size(
+                                        egui::pos2(hm_rect.center().x, center_y),
+                                        text_layout.rect.size()
                                     );
                                     
+                                    // Draw a background behind the text for readability FIRST
                                     painter.rect_filled(
-                                        rect.expand2(egui::vec2(10.0, 2.0)),
-                                        2.0,
-                                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20)
+                                        text_rect.expand(2.0),
+                                        0.0,
+                                        egui::Color32::from_black_alpha(200)
+                                    );
+                                    
+                                    // Draw text SECOND so it sits on top
+                                    painter.galley(
+                                        text_rect.min,
+                                        text_layout,
+                                        egui::Color32::WHITE
                                     );
                                 }
                             }
