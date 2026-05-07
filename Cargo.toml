@@ -1,6 +1,6 @@
 [package]
 name = "rusttracker"
-version = "0.7.12"
+version = "0.7.13"
 edition = "2024"
 default-run = "rusttracker"
 description = "High-Performance Vulkan Tracker Module Visualizer"
@@ -15,16 +15,16 @@ assets = [
 
 [dependencies]
 anyhow = "1.0.101"
-clap = { version = "4.5.57", features = ["derive"] }
-cpal = "0.17.1"
+clap = { version = "4.6.1", features = ["derive"] }
+cpal = "0.17.3"
 crossbeam-channel = "0.5.15"
 crossterm = "0.29.0"
 openmpt = "0.3.1"
 ratatui = "0.30.0"
-symphonia = { version = "0.5.4", features = ["all"] }
+symphonia = { version = "0.5.5", features = ["all"] }
 wgpu = "29.0.3"
-winit = "0.30.5"
-bytemuck = { version = "1.21.0", features = ["derive"] }
+winit = "0.30.13"
+bytemuck = { version = "1.25.0", features = ["derive"] }
 pollster = "0.4.0"
 egui = "0.34.2"
 egui-wgpu = "0.34.2"

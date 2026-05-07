@@ -165,8 +165,7 @@ fn spawn_dsp_thread(
                     state.current_tracker_row = msg.current_row;
                 }
                 
-                state.spectrum_history.pop_front();
-                state.spectrum_history.push_back(binned_data.to_vec());
+
             }
         }
     });

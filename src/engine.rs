@@ -36,8 +36,8 @@ pub struct WaveformHistoryStorage {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct VisualizerStorage {
-    pub history: [[f32; 256]; 120],
-    pub fire_grid: [[f32; 1024]; 144],
+    pub history: [f32; 30720],
+    pub fire_grid: [f32; 147456],
 }
 
 pub struct VulkanEngine<'a> {
@@ -62,7 +62,7 @@ pub struct VulkanEngine<'a> {
     pub meters_uv_rect: [f32; 4],
     pub heatmap_uv_rect: [f32; 4],
     pub fire_uv_rect: [f32; 4],
-    fire_grid: Box<[[f32; 1024]; 144]>,
+    fire_grid: Box<[f32; 147456]>,
     last_fire_time: f32,
     
     pub start_time: std::time::Instant,
@@ -352,7 +352,7 @@ impl<'a> VulkanEngine<'a> {
             meters_uv_rect: [0.0; 4],
             heatmap_uv_rect: [0.0; 4],
             fire_uv_rect: [0.0; 4],
-            fire_grid: Box::new([[0.0; 1024]; 144]),
+            fire_grid: vec![0.0; 147456].into_boxed_slice().try_into().unwrap(),
             last_fire_time: 0.0,
             start_time: std::time::Instant::now(),
         }
@@ -416,8 +416,8 @@ impl<'a> VulkanEngine<'a> {
         self.queue.write_buffer(&self.waveform_storage_buffer, 0, bytemuck::cast_slice(&[history_storage]));
         
         let mut visualizer_storage = VisualizerStorage {
-            history: [[0.0; 256]; 120],
-            fire_grid: *self.fire_grid,
+            history: [0.0; 30720],
+            fire_grid: [0.0; 147456],
         };
         let chunks = 256;
         let history_len = state.spectrum_history.len().min(120);
@@ -446,7 +446,8 @@ impl<'a> VulkanEngine<'a> {
                             }
                         }
                     }
-                    visualizer_storage.history[time_idx][x] = max_val;
+                    let flat_idx = time_idx * chunks + x;
+                    visualizer_storage.history[flat_idx] = max_val;
                 }
             }
         }
@@ -475,7 +476,7 @@ impl<'a> VulkanEngine<'a> {
                         let spread = (rng() % 3) as i32 - 1;
                         let src_x = (x as i32 + spread).clamp(0, 1023) as usize;
                         
-                        let heat = self.fire_grid[y + 1][src_x];
+                        let heat = self.fire_grid[(y + 1) * 1024 + src_x];
                         
                         // Base cooling
                         let mut cooling = (rng() % 3) as f32 * 0.015;
@@ -485,7 +486,7 @@ impl<'a> VulkanEngine<'a> {
                             cooling += 0.15;
                         }
                         
-                        self.fire_grid[y][x] = (heat - cooling).max(0.0);
+                        self.fire_grid[y * 1024 + x] = (heat - cooling).max(0.0);
                     }
                 }
                 
@@ -540,11 +541,11 @@ impl<'a> VulkanEngine<'a> {
                     let jitter = (rng() % 100) as f32 / 100.0;
                     fuel *= 0.4 + 0.6 * jitter; // Huge variance
                     
-                    self.fire_grid[143][x] = fuel.max(0.0).min(1.0);
+                    self.fire_grid[143 * 1024 + x] = fuel.max(0.0).min(1.0);
                 }
             }
             
-            visualizer_storage.fire_grid = *self.fire_grid;
+            visualizer_storage.fire_grid.copy_from_slice(&*self.fire_grid);
         }
 
         self.queue.write_buffer(&self.visualizer_storage_buffer, 0, bytemuck::cast_slice(&[visualizer_storage]));
