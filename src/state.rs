@@ -42,6 +42,7 @@ pub struct AppState {
     pub current_tracker_row: i32,
     pub tracker_row_history: VecDeque<(i32, i32)>,
     pub current_tracker_row_string: String,
+    pub tracker_patterns_by_order: Vec<Vec<String>>,
     pub tracker_channels: Option<i32>,
     pub load_request: Option<String>,
     pub file_loaded: bool,
@@ -101,6 +102,7 @@ impl AppState {
             current_tracker_row: 0,
             tracker_row_history: VecDeque::with_capacity(128),
             current_tracker_row_string: String::new(),
+            tracker_patterns_by_order: Vec::new(),
             tracker_channels: None,
             load_request: None,
 

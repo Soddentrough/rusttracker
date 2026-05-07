@@ -1,6 +1,6 @@
 [package]
 name = "rusttracker"
-version = "0.7.9"
+version = "0.7.10"
 edition = "2024"
 default-run = "rusttracker"
 description = "High-Performance Vulkan Tracker Module Visualizer"

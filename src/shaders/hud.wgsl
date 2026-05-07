@@ -32,7 +32,7 @@ struct AudioUniforms {
 };
 
 struct HistoryRow {
-    bands: array<f32, 64>,
+    bands: array<f32, 256>,
 };
 
 struct VisualizerStorage {
@@ -194,7 +194,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Pattern Heatmap
         
         let ch_f = (uv.x - hm_rect_min.x) / (hm_rect_max.x - hm_rect_min.x);
-        let x_idx = u32(clamp(ch_f * 64.0, 0.0, 63.99));
+        let x_idx = u32(clamp(ch_f * 256.0, 0.0, 255.99));
         
         let y_f = (uv.y - hm_rect_min.y) / (hm_rect_max.y - hm_rect_min.y);
         let y_idx = u32(clamp(y_f * 120.0, 0.0, 119.99));

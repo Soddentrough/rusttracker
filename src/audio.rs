@@ -190,6 +190,7 @@ pub trait AudioSource: Send {
     fn get_current_order(&mut self) -> i32;
     fn get_current_row(&mut self) -> i32;
     fn get_tracker_channels(&mut self) -> Option<i32> { None }
+    fn pre_format_tracker_data(&mut self) -> Vec<Vec<String>> { Vec::new() }
     fn get_current_row_string(&mut self) -> String { String::new() }
     fn get_video_info(&mut self) -> Option<String> { None }
 }
@@ -265,9 +266,51 @@ impl AudioSource for OpenMptSource {
     fn get_current_row(&mut self) -> i32 { self.module.0.get_current_row() }
     fn get_tracker_channels(&mut self) -> Option<i32> { Some(self.module.0.get_num_channels()) }
 
+    fn pre_format_tracker_data(&mut self) -> Vec<Vec<String>> {
+        let mut patterns_by_order = Vec::new();
+        let num_orders = self.module.0.get_num_orders();
+        let num_channels = self.module.0.get_num_channels();
+        
+        for o in 0..num_orders {
+            let mut row_strings = Vec::new();
+            if let Some(mut pattern) = self.module.0.get_pattern_by_order(o) {
+                let num_rows = pattern.get_num_rows();
+                for r in 0..num_rows {
+                    if let Some(mut row) = pattern.get_row_by_number(r) {
+                        let mut row_str = String::new();
+                        for c in 0..num_channels {
+                            if let Some(mut cell) = row.get_cell_by_channel(c) {
+                                if c != 0 { row_str.push_str(" | "); }
+                                row_str.push_str(&cell.get_formatted(0, false));
+                            }
+                        }
+                        row_strings.push(row_str);
+                    }
+                }
+            }
+            patterns_by_order.push(row_strings);
+        }
+        
+        patterns_by_order
+    }
+
     fn get_current_row_string(&mut self) -> String {
-        // UI thread handles this now
-        String::new()
+        let mut row_str = String::new();
+        let num_channels = self.module.0.get_num_channels();
+        let cur_order = self.module.0.get_current_order();
+        let cur_row = self.module.0.get_current_row();
+        
+        if let Some(mut pattern) = self.module.0.get_pattern_by_order(cur_order) {
+            if let Some(mut row) = pattern.get_row_by_number(cur_row) {
+                for c in 0..num_channels {
+                    if let Some(mut cell) = row.get_cell_by_channel(c) {
+                        if c != 0 { row_str.push_str(" | "); }
+                        row_str.push_str(&cell.get_formatted(0, false));
+                    }
+                }
+            }
+        }
+        row_str
     }
 }
 
@@ -891,14 +934,29 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
         } else {
             state.available_visualizers = vec![0, 1, 2];
         }
-        if !state.available_visualizers.contains(&state.visualizer_mode) {
-            state.visualizer_mode = state.available_visualizers[0];
-            state.current_visualizer_idx = 0;
-        } else {
-            state.current_visualizer_idx = state.available_visualizers.iter().position(|&x| x == state.visualizer_mode).unwrap_or(0);
+        if !mic {
+            let mut state = shared_state.lock().unwrap();
+            state.duration_seconds = audio_source.get_duration_seconds();
+            state.artist = audio_source.get_artist();
+            state.module_type = audio_source.get_type();
+            state.bpm = audio_source.get_tempo();
+            state.speed = audio_source.get_speed();
+            state.num_samples = audio_source.get_num_samples();
+            state.num_instruments = audio_source.get_num_instruments();
+            state.num_patterns = audio_source.get_num_patterns();
+            state.video_info = audio_source.get_video_info();
+            state.num_channels = target_channels as i32;
+            
+            state.channel_vus = vec![0.0; target_channels as usize];
+            state.peak_vus = vec![0.0; target_channels as usize];
+            if !state.available_visualizers.contains(&state.visualizer_mode) {
+                state.visualizer_mode = state.available_visualizers[0];
+                state.current_visualizer_idx = state.available_visualizers.iter().position(|&x| x == state.visualizer_mode).unwrap_or(0);
+            }
+            state.hardware_channels = config.channels as i32;
+            state.tracker_channels = audio_source.get_tracker_channels();
+            state.tracker_patterns_by_order = audio_source.pre_format_tracker_data();
         }
-        state.hardware_channels = config.channels as i32;
-        state.tracker_channels = audio_source.get_tracker_channels();
     }
 
     let max_frequency = { shared_state.lock().unwrap().max_frequency };

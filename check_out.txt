@@ -1,0 +1,236 @@
+   Compiling rusttracker v0.7.8 (/home/naoki/Development/rusttracker)
+error[E0433]: cannot find `Maintain` in `wgpu`
+   --> src/engine.rs:567:40
+    |
+567 |                 self.device.poll(wgpu::Maintain::Wait);
+    |                                        ^^^^^^^^ could not find `Maintain` in `wgpu`
+
+error[E0433]: cannot find `SurfaceError` in `wgpu`
+   --> src/main.rs:445:39
+    |
+445 | ...                   Err(wgpu::SurfaceError::Lost) => engine.resize(engine.size),
+    |                                 ^^^^^^^^^^^^ could not find `SurfaceError` in `wgpu`
+
+error[E0433]: cannot find `SurfaceError` in `wgpu`
+   --> src/main.rs:446:39
+    |
+446 | ...                   Err(wgpu::SurfaceError::OutOfMemory) => elwt.exit(),
+    |                                 ^^^^^^^^^^^^ could not find `SurfaceError` in `wgpu`
+
+error[E0425]: cannot find type `SurfaceError` in crate `wgpu`
+   --> src/engine.rs:556:67
+    |
+556 |     ) -> Result<(EngineAction, f32, f32, Option<f32>, f32), wgpu::SurfaceError> {
+    |                                                                   ^^^^^^^^^^^^ not found in `wgpu`
+
+warning: use of deprecated type alias `egui::TopBottomPanel`: Use Panel::top or Panel::bottom instead
+   --> src/engine.rs:713:23
+    |
+713 |                 egui::TopBottomPanel::top("top_panel")
+    |                       ^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(deprecated)]` on by default
+
+error[E0277]: the trait bound `wgpu::InstanceDescriptor: std::default::Default` is not satisfied
+  --> src/engine.rs:78:15
+   |
+78 |             ..Default::default()
+   |               ^^^^^^^^^^^^^^^^^^ the trait `std::default::Default` is not implemented for `wgpu::InstanceDescriptor`
+
+error[E0308]: mismatched types
+  --> src/engine.rs:76:44
+   |
+76 |           let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+   |  ________________________-------------------_^
+   | |                        |
+   | |                        arguments to this function are incorrect
+77 | |             backends: wgpu::Backends::VULKAN, // Request Vulkan explicitly!
+78 | |             ..Default::default()
+79 | |         });
+   | |_________^ expected `InstanceDescriptor`, found `&InstanceDescriptor`
+   |
+note: associated function defined here
+  --> /home/naoki/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wgpu-29.0.3/src/api/instance.rs:63:12
+   |
+63 |     pub fn new(desc: InstanceDescriptor) -> Self {
+   |            ^^^
+help: consider removing the borrow
+   |
+76 -         let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+76 +         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+   |
+
+error[E0063]: missing fields `experimental_features` and `trace` in initializer of `DeviceDescriptor<Option<&str>>`
+  --> src/engine.rs:98:14
+   |
+98 |             &wgpu::DeviceDescriptor {
+   |              ^^^^^^^^^^^^^^^^^^^^^^ missing `experimental_features` and `trace`
+
+error[E0061]: this method takes 1 argument but 2 arguments were supplied
+   --> src/engine.rs:97:39
+    |
+ 97 |         let (device, queue) = adapter.request_device(
+    |                                       ^^^^^^^^^^^^^^
+...
+104 |             None,
+    |             ---- unexpected argument #2 of type `Option<_>`
+    |
+note: method defined here
+   --> /home/naoki/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/wgpu-29.0.3/src/api/adapter.rs:58:12
+    |
+ 58 |     pub fn request_device(
+    |            ^^^^^^^^^^^^^^
+help: remove the extra argument
+    |
+103 -             },
+104 -             None,
+103 +             },
+    |
+
+error[E0308]: mismatched types
+   --> src/engine.rs:208:35
+    |
+208 |             bind_group_layouts: &[&bind_group_layout],
+    |                                   ^^^^^^^^^^^^^^^^^^ expected `Option<&BindGroupLayout>`, found `&BindGroupLayout`
+    |
+    = note:   expected enum `Option<&wgpu::BindGroupLayout>`
+            found reference `&wgpu::BindGroupLayout`
+help: try wrapping the expression in `Some`
+    |
+208 |             bind_group_layouts: &[Some(&bind_group_layout)],
+    |                                   +++++                  +
+
+error[E0560]: struct `wgpu::PipelineLayoutDescriptor<'_>` has no field named `push_constant_ranges`
+   --> src/engine.rs:209:13
+    |
+209 |             push_constant_ranges: &[],
+    |             ^^^^^^^^^^^^^^^^^^^^ `wgpu::PipelineLayoutDescriptor<'_>` does not have this field
+    |
+    = note: available fields are: `immediate_size`
+
+error[E0560]: struct `wgpu::RenderPipelineDescriptor<'_>` has no field named `multiview`
+   --> src/engine.rs:257:17
+    |
+257 |                 multiview: None,
+    |                 ^^^^^^^^^ `wgpu::RenderPipelineDescriptor<'_>` does not have this field
+    |
+    = note: available fields are: `multiview_mask`
+
+error[E0560]: struct `wgpu::RenderPipelineDescriptor<'_>` has no field named `multiview`
+   --> src/engine.rs:298:13
+    |
+298 |             multiview: None,
+    |             ^^^^^^^^^ `wgpu::RenderPipelineDescriptor<'_>` does not have this field
+    |
+    = note: available fields are: `multiview_mask`
+
+error[E0061]: this function takes 3 arguments but 5 arguments were supplied
+   --> src/engine.rs:302:29
+    |
+302 |         let egui_renderer = egui_wgpu::Renderer::new(&device, config.format, None, 1, false);
+    |                             ^^^^^^^^^^^^^^^^^^^^^^^^                               -  ----- unexpected argument #5 of type `bool`
+    |                                                                                    |
+    |                                                                                    unexpected argument #4 of type `{integer}`
+    |
+note: expected `RendererOptions`, found `Option<_>`
+   --> src/engine.rs:302:78
+    |
+302 |         let egui_renderer = egui_wgpu::Renderer::new(&device, config.format, None, 1, false);
+    |                                                                              ^^^^
+    = note: expected struct `RendererOptions`
+                 found enum `Option<_>`
+note: associated function defined here
+   --> /home/naoki/.cargo/registry/src/index.crates.io-1949cf8c6b5b557f/egui-wgpu-0.34.2/src/renderer.rs:267:12
+    |
+267 |     pub fn new(
+    |            ^^^
+help: remove the extra arguments
+    |
+302 -         let egui_renderer = egui_wgpu::Renderer::new(&device, config.format, None, 1, false);
+302 +         let egui_renderer = egui_wgpu::Renderer::new(&device, config.format, /* RendererOptions */);
+    |
+
+error[E0277]: the `?` operator can only be applied to values that implement `Try`
+   --> src/engine.rs:558:22
+    |
+558 |         let output = self.surface.get_current_texture()?;
+    |                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ the `?` operator cannot be applied to type `CurrentSurfaceTexture`
+    |
+    = help: the nightly-only, unstable trait `Try` is not implemented for `CurrentSurfaceTexture`
+
+warning: use of deprecated method `egui::Context::run`: Call run_ui instead
+   --> src/engine.rs:594:36
+    |
+594 |         let full_output = egui_ctx.run(raw_input, |ctx| {
+    |                                    ^^^
+
+warning: use of deprecated method `egui::Context::style`: Renamed to `global_style` to avoid confusion with `ui.style()`
+   --> src/engine.rs:601:53
+    |
+601 |                     .frame(egui::Frame::window(&ctx.style()).fill(egui::Color32::from_black_alpha(200)))
+    |                                                     ^^^^^
+
+warning: use of deprecated method `egui::Context::screen_rect`: screen_rect has been split into viewport_rect() and content_rect(). You likely should use content_rect()
+   --> src/engine.rs:632:36
+    |
+632 |                 central_rect = ctx.screen_rect();
+    |                                    ^^^^^^^^^^^
+
+warning: use of deprecated method `egui::CentralPanel::show`: Use show_inside() instead
+   --> src/engine.rs:638:60
+    |
+638 |                 egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
+    |                                                            ^^^^
+
+warning: use of deprecated method `egui::Panel::exact_height`: Renamed exact_size
+   --> src/engine.rs:716:22
+    |
+716 |                     .exact_height(ctx.screen_rect().height() / 2.0)
+    |                      ^^^^^^^^^^^^
+
+warning: use of deprecated method `egui::Context::screen_rect`: screen_rect has been split into viewport_rect() and content_rect(). You likely should use content_rect()
+   --> src/engine.rs:716:39
+    |
+716 |                     .exact_height(ctx.screen_rect().height() / 2.0)
+    |                                       ^^^^^^^^^^^
+
+warning: use of deprecated method `egui::Panel::show`: Use show_inside() instead
+   --> src/engine.rs:717:22
+    |
+717 |                     .show(ctx, |ui| {
+    |                      ^^^^
+
+warning: use of deprecated method `egui::CentralPanel::show`: Use show_inside() instead
+   --> src/engine.rs:921:56
+    |
+921 |             egui::CentralPanel::default().frame(frame).show(ctx, |ui| {
+    |                                                        ^^^^
+
+error[E0063]: missing field `depth_slice` in initializer of `wgpu::RenderPassColorAttachment<'_>`
+    --> src/engine.rs:1003:43
+     |
+1003 |                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+     |                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `depth_slice`
+
+error[E0063]: missing field `multiview_mask` in initializer of `wgpu::RenderPassDescriptor<'_>`
+    --> src/engine.rs:1001:62
+     |
+1001 |             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+     |                                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `multiview_mask`
+
+error[E0063]: missing field `depth_slice` in initializer of `wgpu::RenderPassColorAttachment<'_>`
+    --> src/engine.rs:1054:43
+     |
+1054 |                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+     |                                           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `depth_slice`
+
+error[E0063]: missing field `multiview_mask` in initializer of `wgpu::RenderPassDescriptor<'_>`
+    --> src/engine.rs:1052:62
+     |
+1052 |             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+     |                                                              ^^^^^^^^^^^^^^^^^^^^^^^^^^ missing `multiview_mask`
+
+Some errors have detailed explanations: E0061, E0063, E0277, E0308, E0425, E0433, E0560.
+For more information about an error, try `rustc --explain E0061`.
+warning: `rusttracker` (bin "rusttracker") generated 9 warnings
+error: could not compile `rusttracker` (bin "rusttracker") due to 18 previous errors; 9 warnings emitted

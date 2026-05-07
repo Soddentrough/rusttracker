@@ -36,7 +36,7 @@ pub struct WaveformHistoryStorage {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct VisualizerStorage {
-    pub history: [[f32; 64]; 120],
+    pub history: [[f32; 256]; 120],
     pub fire_grid: [[f32; 1024]; 144],
 }
 
@@ -416,10 +416,10 @@ impl<'a> VulkanEngine<'a> {
         self.queue.write_buffer(&self.waveform_storage_buffer, 0, bytemuck::cast_slice(&[history_storage]));
         
         let mut visualizer_storage = VisualizerStorage {
-            history: [[0.0; 64]; 120],
+            history: [[0.0; 256]; 120],
             fire_grid: *self.fire_grid,
         };
-        let chunks = 64;
+        let chunks = 256;
         let history_len = state.spectrum_history.len().min(120);
         if history_len > 0 {
             for (time_idx, bands) in state.spectrum_history.iter().take(120).enumerate() {
@@ -609,6 +609,12 @@ impl<'a> VulkanEngine<'a> {
                     .collapsible(false)
                     .frame(egui::Frame::window(&ctx.global_style()).fill(egui::Color32::from_black_alpha(200)))
                     .show(ctx, |ui| {
+                        ui.label(
+                            egui::RichText::new(format!("RustTracker v{}", env!("CARGO_PKG_VERSION")))
+                                .color(egui::Color32::WHITE)
+                                .strong()
+                        );
+                        ui.separator();
                         ui.label(
                             egui::RichText::new(format!("FPS: {:.1}", state.current_fps))
                                 .color(egui::Color32::GREEN)
@@ -816,35 +822,90 @@ impl<'a> VulkanEngine<'a> {
                                     painter.line_segment([egui::pos2(x, hm_rect.top()), egui::pos2(x, hm_rect.bottom())], (1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 5)));
                                 }
                                 
-                                if !state.current_tracker_row_string.is_empty() {
+                                if !state.tracker_patterns_by_order.is_empty() {
+                                    let current_order = state.current_tracker_order as i32;
                                     let current_row = state.current_tracker_row as i32;
                                     let center_y = hm_rect.top() + hm_rect.height() / 2.0;
+                                    let row_height = 16.0;
+                                    let num_rows_to_draw = (hm_rect.height() / row_height) as i32;
                                     
-                                    let text = &state.current_tracker_row_string;
-                                    let font_id = egui::FontId::monospace(12.0);
-                                    
-                                    let text_layout = painter.layout(
-                                        format!("{:02X}  {}", current_row, text),
-                                        font_id.clone(),
-                                        egui::Color32::WHITE,
-                                        hm_rect.width()
-                                    );
-                                    let text_rect = egui::Rect::from_center_size(
-                                        egui::pos2(hm_rect.center().x, center_y),
-                                        text_layout.rect.size()
-                                    );
-                                    
-                                    painter.rect_filled(
-                                        text_rect.expand(2.0),
-                                        0.0,
-                                        egui::Color32::from_black_alpha(200)
-                                    );
-                                    
-                                    painter.galley(
-                                        text_rect.min,
-                                        text_layout,
-                                        egui::Color32::WHITE
-                                    );
+                                    for offset in -(num_rows_to_draw / 2)..=(num_rows_to_draw / 2) {
+                                        let mut resolved_order = current_order;
+                                        let mut resolved_row = current_row + offset;
+                                        
+                                        if offset < 0 {
+                                            // Read exact playback sequence from history
+                                            let history_idx = (-offset - 1) as usize;
+                                            if history_idx < state.tracker_row_history.len() {
+                                                let (hist_order, hist_row) = state.tracker_row_history[history_idx];
+                                                resolved_order = hist_order;
+                                                resolved_row = hist_row;
+                                            } else {
+                                                // Fall back to underflow if history hasn't built up yet
+                                                while resolved_row < 0 && resolved_order > 0 {
+                                                    resolved_order -= 1;
+                                                    if (resolved_order as usize) < state.tracker_patterns_by_order.len() {
+                                                        resolved_row += state.tracker_patterns_by_order[resolved_order as usize].len() as i32;
+                                                    } else {
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            // Handle overflow (next predicted patterns)
+                                            while resolved_order >= 0 
+                                                && (resolved_order as usize) < state.tracker_patterns_by_order.len() 
+                                                && resolved_row >= state.tracker_patterns_by_order[resolved_order as usize].len() as i32 
+                                            {
+                                                resolved_row -= state.tracker_patterns_by_order[resolved_order as usize].len() as i32;
+                                                resolved_order += 1;
+                                            }
+                                        }
+                                        
+                                        if resolved_order >= 0 && (resolved_order as usize) < state.tracker_patterns_by_order.len() && resolved_row >= 0 {
+                                            if (resolved_row as usize) < state.tracker_patterns_by_order[resolved_order as usize].len() {
+                                                let text = &state.tracker_patterns_by_order[resolved_order as usize][resolved_row as usize];
+                                                let y = center_y + offset as f32 * row_height;
+                                                
+                                                // Fade out based on distance
+                                                let distance = offset.abs() as f32 / (num_rows_to_draw as f32 / 2.0);
+                                                let alpha = (1.0 - distance).max(0.0);
+                                                
+                                                let color = if offset == 0 {
+                                                    egui::Color32::from_rgba_premultiplied(255, 255, 255, 255)
+                                                } else {
+                                                    egui::Color32::from_rgba_premultiplied(150, 150, 150, (alpha * 100.0) as u8)
+                                                };
+                                                let font_id = egui::FontId::monospace(12.0);
+                                                
+                                                // Draw text centered horizontally
+                                                let rect = painter.text(
+                                                    egui::pos2(hm_rect.center().x, y),
+                                                    egui::Align2::CENTER_CENTER,
+                                                    format!("{:02X}  {}", resolved_row, text),
+                                                    font_id,
+                                                    color
+                                                );
+                                                
+                                                // Optional: highlight background of active row
+                                                if offset == 0 {
+                                                    painter.rect_filled(
+                                                        rect.expand2(egui::vec2(10.0, 2.0)),
+                                                        2.0,
+                                                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20)
+                                                    );
+                                                }
+                                                
+                                                // Pattern boundary indicator
+                                                if resolved_row == 0 {
+                                                    painter.line_segment(
+                                                        [egui::pos2(hm_rect.left(), y - row_height / 2.0), egui::pos2(hm_rect.right(), y - row_height / 2.0)],
+                                                        (1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, (alpha * 150.0) as u8))
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             
