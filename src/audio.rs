@@ -50,12 +50,38 @@ fn spawn_dsp_thread(
                 Some(&spectrum_analyzer::scaling::divide_by_N_sqrt),
             ) {
                 binned_data.fill(0.0);
-                let bands: Vec<_> = spectrum.data().iter().collect();
-                let step = std::cmp::max(1, (bands.len() as f32 / 512.0).ceil() as usize);
+                let bands: Vec<_> = spectrum.data().iter().map(|(f, v)| (f.val(), v.val())).collect();
                 
-                for (i, chunk) in bands.chunks(step).enumerate() {
-                    if i < 512 {
-                        let max_val = chunk.iter().map(|(_, val)| val.val()).fold(0.0, f32::max);
+                if !bands.is_empty() {
+                    let resolution = if bands.len() > 1 { bands[1].0 - bands[0].0 } else { 1.0 };
+                    let min_freq = 20.0f32;
+                    let max_f = max_frequency.max(min_freq * 2.0);
+                    let num_bins = 512;
+                    
+                    for i in 0..num_bins {
+                        let freq_start = min_freq * (max_f / min_freq).powf(i as f32 / num_bins as f32);
+                        let freq_end = min_freq * (max_f / min_freq).powf((i + 1) as f32 / num_bins as f32);
+                        
+                        let idx_start = freq_start / resolution;
+                        let idx_end = freq_end / resolution;
+                        
+                        let mut max_val: f32 = 0.0;
+                        
+                        if idx_end - idx_start >= 1.0 {
+                            let start = idx_start.ceil() as usize;
+                            let end = idx_end.floor() as usize;
+                            for idx in start..=end {
+                                if idx < bands.len() {
+                                    max_val = max_val.max(bands[idx].1);
+                                }
+                            }
+                        } else {
+                            let nearest = ((idx_start + idx_end) / 2.0).round() as usize;
+                            if nearest < bands.len() {
+                                max_val = bands[nearest].1;
+                            }
+                        }
+                        
                         binned_data[i] = (max_val * 150.0).clamp(0.0, 100.0);
                     }
                 }
@@ -159,19 +185,26 @@ unsafe impl Send for SafeModule {}
 
 struct OpenMptSource {
     module: SafeModule,
+    left_buf: Vec<f32>,
+    right_buf: Vec<f32>,
 }
 
 impl AudioSource for OpenMptSource {
     fn read_frames(&mut self, hardware_channels: usize, sample_rate: u32, output: &mut [f32]) -> usize {
         let frames_to_render = output.len() / hardware_channels;
-        let mut left = vec![0.0; frames_to_render];
-        let mut right = vec![0.0; frames_to_render];
 
-        let frames_read = self.module.0.read_float_stereo(sample_rate as i32, &mut left, &mut right);
+        self.left_buf.resize(frames_to_render, 0.0);
+        self.right_buf.resize(frames_to_render, 0.0);
+
+        let frames_read = self.module.0.read_float_stereo(
+            sample_rate as i32,
+            &mut self.left_buf,
+            &mut self.right_buf
+        );
 
         for i in 0..frames_read {
-            let l = left[i];
-            let r = right[i];
+            let l = self.left_buf[i];
+            let r = self.right_buf[i];
             
             output[i * hardware_channels] = l;
             if hardware_channels > 1 {
@@ -703,23 +736,27 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
         }
     }
 
-    // 2. Try FFmpeg native bindings
-    let ffmpeg_result = try_ffmpeg(file_path);
-    if let Ok(source) = ffmpeg_result {
-        return Ok(source);
-    }
-
-    // 3. Fallback to OpenMPT Tracker module ONLY for likely tracker files
+    // 2. Try OpenMPT Tracker module ONLY for likely tracker files first
     if ext == "mod" || ext == "s3m" || ext == "xm" || ext == "it" || ext == "mptm" {
         if let Ok(mut file) = File::open(file_path) {
             let mut data = Vec::new();
             if file.read_to_end(&mut data).is_ok() {
                 let mut module_cursor = Cursor::new(data);
                 if let Ok(module) = Module::create(&mut module_cursor, Logger::None, &[]) {
-                    return Ok(Box::new(OpenMptSource { module: SafeModule(module) }));
+                    return Ok(Box::new(OpenMptSource { 
+                        module: SafeModule(module),
+                        left_buf: Vec::with_capacity(8192),
+                        right_buf: Vec::with_capacity(8192),
+                    }));
                 }
             }
         }
+    }
+
+    // 3. Try FFmpeg native bindings
+    let ffmpeg_result = try_ffmpeg(file_path);
+    if let Ok(source) = ffmpeg_result {
+        return Ok(source);
     }
 
     // If all failed, return the ffmpeg error since it's the most descriptive for standard media
