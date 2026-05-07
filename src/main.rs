@@ -234,21 +234,18 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                                     state.show_stats = !state.show_stats;
                                 },
                                 WinitKeyCode::KeyO => {
-                                    let app_state_clone = Arc::clone(&app_state);
-                                    std::thread::spawn(move || {
-                                        if let Some(paths) = rfd::FileDialog::new()
-                                            .add_filter("Audio/Video Files", &["flac", "wav", "mp3", "ogg", "aac", "m4a", "mp4", "mkv", "avi", "webm", "opus", "mod", "s3m", "xm", "it", "stm", "669", "mtm", "med", "okt", "psm"])
-                                            .add_filter("All Files", &["*"])
-                                            .pick_files() {
-                                            if !paths.is_empty() {
-                                                let mut state = app_state_clone.lock().unwrap();
-                                                state.playlist = paths.into_iter().map(|p| p.display().to_string()).collect();
-                                                state.playlist_index = 0;
-                                                state.load_request = Some(state.playlist[0].clone());
-                                                state.file_loaded = true;
-                                            }
+                                    if let Some(paths) = rfd::FileDialog::new()
+                                        .add_filter("Audio/Video Files", &["flac", "wav", "mp3", "ogg", "aac", "m4a", "mp4", "mkv", "avi", "webm", "opus", "mod", "s3m", "xm", "it", "stm", "669", "mtm", "med", "okt", "psm"])
+                                        .add_filter("All Files", &["*"])
+                                        .pick_files() {
+                                        if !paths.is_empty() {
+                                            let mut state = app_state.lock().unwrap();
+                                            state.playlist = paths.into_iter().map(|p| p.display().to_string()).collect();
+                                            state.playlist_index = 0;
+                                            state.load_request = Some(state.playlist[0].clone());
+                                            state.file_loaded = true;
                                         }
-                                    });
+                                    }
                                 },
                                 WinitKeyCode::Space => {
                                     let mut state = app_state.lock().unwrap();
@@ -457,21 +454,18 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                         state.spectrum_history.clear();
                         for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
                     } else if action == EngineAction::OpenFile {
-                        let app_state_clone = Arc::clone(&app_state);
-                        std::thread::spawn(move || {
-                            if let Some(paths) = rfd::FileDialog::new()
-                                .add_filter("Audio/Video Files", &["flac", "wav", "mp3", "ogg", "aac", "m4a", "mp4", "mkv", "avi", "webm", "opus", "mod", "s3m", "xm", "it", "stm", "669", "mtm", "med", "okt", "psm"])
-                                .add_filter("All Files", &["*"])
-                                .pick_files() {
-                                if !paths.is_empty() {
-                                    let mut state = app_state_clone.lock().unwrap();
-                                    state.playlist = paths.into_iter().map(|p| p.display().to_string()).collect();
-                                    state.playlist_index = 0;
-                                    state.load_request = Some(state.playlist[0].clone());
-                                    state.file_loaded = true;
-                                }
+                        if let Some(paths) = rfd::FileDialog::new()
+                            .add_filter("Audio/Video Files", &["flac", "wav", "mp3", "ogg", "aac", "m4a", "mp4", "mkv", "avi", "webm", "opus", "mod", "s3m", "xm", "it", "stm", "669", "mtm", "med", "okt", "psm"])
+                            .add_filter("All Files", &["*"])
+                            .pick_files() {
+                            if !paths.is_empty() {
+                                let mut state = app_state.lock().unwrap();
+                                state.playlist = paths.into_iter().map(|p| p.display().to_string()).collect();
+                                state.playlist_index = 0;
+                                state.load_request = Some(state.playlist[0].clone());
+                                state.file_loaded = true;
                             }
-                        });
+                        }
                     }
                     
                     // Fallback for Wayland/Mesa broken FIFO vsync:

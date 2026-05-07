@@ -24,6 +24,7 @@ struct DspMessage {
     bpm: i32,
     speed: i32,
     current_seconds: f64,
+    current_row_string: String,
 }
 
 fn spawn_dsp_thread(
@@ -135,6 +136,7 @@ fn spawn_dsp_thread(
                 if msg.bpm != 0 { state.bpm = msg.bpm; }
                 if msg.speed != 0 { state.speed = msg.speed; }
                 state.current_seconds = msg.current_seconds;
+                state.current_tracker_row_string = msg.current_row_string;
                 
                 if state.current_tracker_order != msg.current_order || state.current_tracker_row != msg.current_row {
                     let cur_order = state.current_tracker_order;
@@ -178,7 +180,8 @@ pub trait AudioSource: Send {
     fn get_num_patterns(&mut self) -> i32;
     fn get_current_order(&mut self) -> i32;
     fn get_current_row(&mut self) -> i32;
-    fn pre_format_tracker_data(&mut self) -> Vec<Vec<String>>;
+    fn get_tracker_channels(&mut self) -> Option<i32> { None }
+    fn get_current_row_string(&mut self) -> String { String::new() }
     fn get_video_info(&mut self) -> Option<String> { None }
 }
 
@@ -226,7 +229,7 @@ impl AudioSource for OpenMptSource {
     fn get_duration_seconds(&mut self) -> f64 { self.module.0.get_duration_seconds() }
     fn get_position_seconds(&mut self) -> f64 { self.module.0.get_position_seconds() }
     fn set_position_seconds(&mut self, pos: f64) { self.module.0.set_position_seconds(pos); }
-    fn get_num_channels(&mut self) -> i32 { self.module.0.get_num_channels() }
+    fn get_num_channels(&mut self) -> i32 { 2 }
     fn get_current_channel_vu_mono(&mut self, channel: i32) -> f32 { self.module.0.get_current_channel_vu_mono(channel) }
     
     fn get_artist(&mut self) -> String {
@@ -247,33 +250,25 @@ impl AudioSource for OpenMptSource {
     fn get_num_patterns(&mut self) -> i32 { self.module.0.get_num_patterns() }
     fn get_current_order(&mut self) -> i32 { self.module.0.get_current_order() }
     fn get_current_row(&mut self) -> i32 { self.module.0.get_current_row() }
-    
-    fn pre_format_tracker_data(&mut self) -> Vec<Vec<String>> {
-        let mut patterns_by_order = Vec::new();
-        let num_orders = self.module.0.get_num_orders();
+    fn get_tracker_channels(&mut self) -> Option<i32> { Some(self.module.0.get_num_channels()) }
+
+    fn get_current_row_string(&mut self) -> String {
+        let mut row_str = String::new();
         let num_channels = self.module.0.get_num_channels();
+        let cur_order = self.module.0.get_current_order();
+        let cur_row = self.module.0.get_current_row();
         
-        for o in 0..num_orders {
-            let mut row_strings = Vec::new();
-            if let Some(mut pattern) = self.module.0.get_pattern_by_order(o) {
-                let num_rows = pattern.get_num_rows();
-                for r in 0..num_rows {
-                    if let Some(mut row) = pattern.get_row_by_number(r) {
-                        let mut row_str = String::new();
-                        for c in 0..num_channels {
-                            if let Some(mut cell) = row.get_cell_by_channel(c) {
-                                if c != 0 { row_str.push_str(" | "); }
-                                row_str.push_str(&cell.get_formatted(0, false));
-                            }
-                        }
-                        row_strings.push(row_str);
+        if let Some(mut pattern) = self.module.0.get_pattern_by_order(cur_order) {
+            if let Some(mut row) = pattern.get_row_by_number(cur_row) {
+                for c in 0..num_channels {
+                    if let Some(mut cell) = row.get_cell_by_channel(c) {
+                        if c != 0 { row_str.push_str(" | "); }
+                        row_str.push_str(&cell.get_formatted(0, false));
                     }
                 }
             }
-            patterns_by_order.push(row_strings);
         }
-        
-        patterns_by_order
+        row_str
     }
 }
 
@@ -427,9 +422,7 @@ impl AudioSource for SymphoniaSource {
     fn get_num_patterns(&mut self) -> i32 { 0 }
     fn get_current_order(&mut self) -> i32 { 0 }
     fn get_current_row(&mut self) -> i32 { 0 }
-    fn pre_format_tracker_data(&mut self) -> Vec<Vec<String>> {
-        Vec::new()
-    }
+
     fn get_video_info(&mut self) -> Option<String> { self.video_info.clone() }
 }
 
@@ -612,7 +605,7 @@ impl AudioSource for FfmpegSource {
     fn get_num_patterns(&mut self) -> i32 { 0 }
     fn get_current_order(&mut self) -> i32 { 0 }
     fn get_current_row(&mut self) -> i32 { 0 }
-    fn pre_format_tracker_data(&mut self) -> Vec<Vec<String>> { Vec::new() }
+
     fn get_video_info(&mut self) -> Option<String> { self.video_info.clone() }
 }
 
@@ -900,9 +893,7 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
             state.current_visualizer_idx = state.available_visualizers.iter().position(|&x| x == state.visualizer_mode).unwrap_or(0);
         }
         state.hardware_channels = config.channels as i32;
-        
-        let formatted = audio_source.pre_format_tracker_data();
-        state.tracker_patterns_by_order = formatted;
+        state.tracker_channels = audio_source.get_tracker_channels();
     }
 
     let max_frequency = { shared_state.lock().unwrap().max_frequency };
@@ -1020,6 +1011,7 @@ where
                 bpm: audio_source.get_tempo(),
                 speed: audio_source.get_speed(),
                 current_seconds: audio_source.get_position_seconds(),
+                current_row_string: audio_source.get_current_row_string(),
             };
             
             let _ = tx.try_send(msg);
@@ -1102,6 +1094,7 @@ where
                 bpm: 0,
                 speed: 0,
                 current_seconds: 0.0,
+                current_row_string: String::new(),
             };
             
             let _ = tx.try_send(msg);
