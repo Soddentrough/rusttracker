@@ -188,7 +188,7 @@ pub trait AudioSource: Send {
 // ---------------------------------------------------------
 // OpenMPT Tracker Decoder
 // ---------------------------------------------------------
-struct SafeModule(Module);
+pub struct SafeModule(pub Module);
 unsafe impl Send for SafeModule {}
 
 struct OpenMptSource {
@@ -256,32 +256,8 @@ impl AudioSource for OpenMptSource {
     fn get_tracker_channels(&mut self) -> Option<i32> { Some(self.module.0.get_num_channels()) }
 
     fn get_current_row_string(&mut self) -> String {
-        let cur_order = self.module.0.get_current_order();
-        let cur_row = self.module.0.get_current_row();
-        
-        if cur_order == self.cached_order && cur_row == self.cached_row {
-            return self.cached_row_string.clone();
-        }
-        
-        let mut row_str = String::new();
-        let num_channels = self.module.0.get_num_channels();
-        
-        if let Some(mut pattern) = self.module.0.get_pattern_by_order(cur_order) {
-            if let Some(mut row) = pattern.get_row_by_number(cur_row) {
-                for c in 0..num_channels {
-                    if let Some(mut cell) = row.get_cell_by_channel(c) {
-                        if c != 0 { row_str.push_str(" | "); }
-                        row_str.push_str(&cell.get_formatted(0, false));
-                    }
-                }
-            }
-        }
-        
-        self.cached_order = cur_order;
-        self.cached_row = cur_row;
-        self.cached_row_string = row_str.clone();
-        
-        row_str
+        // UI thread handles this now
+        String::new()
     }
 }
 
@@ -968,21 +944,18 @@ where
 
             let frames_to_render = data.len() / hardware_channels;
 
-            if interleaved_buffer.capacity() < frames_to_render * hardware_channels {
-                interleaved_buffer.reserve(frames_to_render * hardware_channels - interleaved_buffer.len());
+            let needed_len = frames_to_render * hardware_channels;
+            if interleaved_buffer.len() < needed_len {
+                interleaved_buffer.resize(needed_len, 0.0);
             }
-
-            let mut fake_buffer = unsafe { Vec::from_raw_parts(interleaved_buffer.as_mut_ptr(), frames_to_render * hardware_channels, frames_to_render * hardware_channels) };
 
             let decode_start = Instant::now();
             let frames_read = audio_source.read_frames(
                 hardware_channels,
                 sample_rate,
-                &mut fake_buffer,
+                &mut interleaved_buffer[..needed_len],
             );
             let decode_elapsed = decode_start.elapsed().as_micros() as f32;
-
-            std::mem::forget(fake_buffer);
             
             if frames_read == 0 {
                 if let Ok(mut state) = shared_state.try_lock() {

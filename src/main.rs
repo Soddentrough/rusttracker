@@ -121,8 +121,22 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     
     let mut initial_stream = None;
+    let mut ui_tracker_module: Option<openmpt::module::Module> = None;
     if args.mic || !args.file.is_empty() {
         let file_path = args.file.first().cloned().unwrap_or_default();
+        if !args.mic {
+            if let Ok(mut file) = std::fs::File::open(&file_path) {
+                let mut data = Vec::new();
+                if std::io::Read::read_to_end(&mut file, &mut data).is_ok() {
+                    let mut cursor = std::io::Cursor::new(data);
+                    if let Ok(mut module) = openmpt::module::Module::create(&mut cursor, openmpt::module::Logger::None, &[]) {
+                        if module.get_num_channels() > 0 {
+                            ui_tracker_module = Some(module);
+                        }
+                    }
+                }
+            }
+        }
         initial_stream = match audio::start_audio_thread(&file_path, args.mic, Arc::clone(&app_state)) {
             Ok(stream) => {
                 let mut state = app_state.lock().unwrap();
@@ -149,14 +163,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             eprintln!("App error: {:?}", err);
         }
     } else {
-        pollster::block_on(run_gui(app_state, initial_stream, args.fullscreen));
+        pollster::block_on(run_gui(Arc::clone(&app_state), initial_stream, ui_tracker_module, args.fullscreen));
     }
 
     Ok(())
 }
 
 #[allow(unused_variables, unused_assignments)]
-async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal::Stream>, is_fullscreen: bool) {
+async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal::Stream>, mut ui_tracker_module: Option<openmpt::module::Module>, is_fullscreen: bool) {
     let event_loop = EventLoop::new().unwrap();
     
     let (icon_rgba, icon_width, icon_height) = {
@@ -330,9 +344,24 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                     
                     if let Some(path) = load_path {
                         active_stream = None; // DROP OLD STREAM FIRST to release WASAPI lock!
+                        
+                        ui_tracker_module = None;
+                        if let Ok(mut file) = std::fs::File::open(&path) {
+                            let mut data = Vec::new();
+                            if std::io::Read::read_to_end(&mut file, &mut data).is_ok() {
+                                let mut cursor = std::io::Cursor::new(data);
+                                if let Ok(mut module) = openmpt::module::Module::create(&mut cursor, openmpt::module::Logger::None, &[]) {
+                                    if module.get_num_channels() > 0 {
+                                        ui_tracker_module = Some(module);
+                                    }
+                                }
+                            }
+                        }
+
                         if let Ok(stream) = audio::start_audio_thread(&path, false, Arc::clone(&app_state)) {
                             let mut state = app_state.lock().unwrap();
                             state.file_loaded = true;
+                            state.current_tracker_row_string.clear();
                             active_stream = Some(stream);
                         }
                     }
@@ -347,6 +376,28 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                     {
                         let mut state = app_state.lock().unwrap();
                         state.current_fps = state.current_fps * 0.9 + fps * 0.1;
+                        
+                        if let Some(ref mut module) = ui_tracker_module {
+                            let cur_order = state.current_tracker_order;
+                            let cur_row = state.current_tracker_row;
+                            if cur_order != state.ui_last_order || cur_row != state.ui_last_row {
+                                let mut row_str = String::new();
+                                let num_channels = module.get_num_channels();
+                                if let Some(mut pattern) = module.get_pattern_by_order(cur_order) {
+                                    if let Some(mut row) = pattern.get_row_by_number(cur_row) {
+                                        for c in 0..num_channels {
+                                            if let Some(mut cell) = row.get_cell_by_channel(c) {
+                                                if c != 0 { row_str.push_str(" | "); }
+                                                row_str.push_str(&cell.get_formatted(0, false));
+                                            }
+                                        }
+                                    }
+                                }
+                                state.current_tracker_row_string = row_str;
+                                state.ui_last_order = cur_order;
+                                state.ui_last_row = cur_row;
+                            }
+                        }
                         
                         if !state.file_loaded {
                             let t = now.elapsed().as_secs_f32();
