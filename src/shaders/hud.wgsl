@@ -31,13 +31,8 @@ struct AudioUniforms {
     ui_fire_rect: vec4<f32>,
 };
 
-struct VisualizerStorage {
-    history: array<f32, 30720>,
-    fire_grid: array<f32, 147456>,
-};
-
 @group(0) @binding(0) var<uniform> uniforms: AudioUniforms;
-@group(0) @binding(2) var<storage, read> heatmap_storage: VisualizerStorage;
+@group(0) @binding(2) var heatmap_tex: texture_2d<f32>;
 
 fn hash(p: vec2<f32>) -> f32 {
     let p3  = fract(vec3<f32>(p.xyx) * 0.1031);
@@ -198,9 +193,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         
         // time_idx 0 is newest (bottom of UI). time_idx 119 is oldest (top of UI).
         let time_idx = 119u - y_idx;
-        // Explicit 1D indexing guarantees deterministic memory access across all GPU backends
-        let flat_idx = time_idx * 256u + x_idx;
-        let val = heatmap_storage.history[flat_idx];
+        let val = textureLoad(heatmap_tex, vec2<i32>(i32(x_idx), i32(time_idx)), 0).r;
         
         if (val > 5.0) {
             if (val > 60.0) {

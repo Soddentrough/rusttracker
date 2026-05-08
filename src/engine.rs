@@ -33,12 +33,7 @@ pub struct WaveformHistoryStorage {
     pub waveforms: [[f32; 1024]; 60],
 }
 
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct VisualizerStorage {
-    pub history: [f32; 30720],
-    pub fire_grid: [f32; 147456],
-}
+// Removed VisualizerStorage
 
 pub struct VulkanEngine<'a> {
     surface: wgpu::Surface<'a>,
@@ -50,7 +45,8 @@ pub struct VulkanEngine<'a> {
     hud_pipeline: wgpu::RenderPipeline,
     uniform_buffer: wgpu::Buffer,
     waveform_storage_buffer: wgpu::Buffer,
-    visualizer_storage_buffer: wgpu::Buffer,
+    history_texture: wgpu::Texture,
+    fire_grid_texture: wgpu::Texture,
     uniform_bind_group: wgpu::BindGroup,
     pub egui_renderer: egui_wgpu::Renderer,
     timestamp_period: f32,
@@ -145,12 +141,29 @@ impl<'a> VulkanEngine<'a> {
             mapped_at_creation: false,
         });
 
-        let visualizer_storage_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Heatmap History Storage Buffer"),
-            size: std::mem::size_of::<VisualizerStorage>() as u64,
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
+        let history_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Heatmap History Texture"),
+            size: wgpu::Extent3d { width: 256, height: 120, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
         });
+        let history_view = history_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let fire_grid_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Fire Grid Texture"),
+            size: wgpu::Extent3d { width: 1024, height: 144, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let fire_grid_view = fire_grid_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             entries: &[
@@ -177,10 +190,20 @@ impl<'a> VulkanEngine<'a> {
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
                     },
                     count: None,
                 }
@@ -201,7 +224,11 @@ impl<'a> VulkanEngine<'a> {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: visualizer_storage_buffer.as_entire_binding(),
+                    resource: wgpu::BindingResource::TextureView(&history_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&fire_grid_view),
                 }
             ],
             label: Some("audio_bind_group"),
@@ -342,7 +369,8 @@ impl<'a> VulkanEngine<'a> {
             hud_pipeline,
             uniform_buffer,
             waveform_storage_buffer,
-            visualizer_storage_buffer,
+            history_texture,
+            fire_grid_texture,
             uniform_bind_group,
             egui_renderer,
             query_set,
@@ -417,6 +445,10 @@ impl<'a> VulkanEngine<'a> {
         self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
         self.queue.write_buffer(&self.waveform_storage_buffer, 0, bytemuck::cast_slice(&[history_storage]));
         
+        struct VisualizerStorage {
+            history: [f32; 30720],
+            fire_grid: [f32; 147456],
+        }
         let mut visualizer_storage = Box::new(VisualizerStorage {
             history: [0.0; 30720],
             fire_grid: [0.0; 147456],
@@ -565,7 +597,39 @@ impl<'a> VulkanEngine<'a> {
             }
         }
 
-        self.queue.write_buffer(&self.visualizer_storage_buffer, 0, bytemuck::cast_slice(std::slice::from_ref(&*visualizer_storage)));
+        let history_bytes: &[u8] = bytemuck::cast_slice(&visualizer_storage.history);
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.history_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            history_bytes,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(256 * 4),
+                rows_per_image: Some(120),
+            },
+            wgpu::Extent3d { width: 256, height: 120, depth_or_array_layers: 1 },
+        );
+
+        let fire_grid_bytes: &[u8] = bytemuck::cast_slice(&visualizer_storage.fire_grid);
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &self.fire_grid_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            fire_grid_bytes,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: Some(1024 * 4),
+                rows_per_image: Some(144),
+            },
+            wgpu::Extent3d { width: 1024, height: 144, depth_or_array_layers: 1 },
+        );
     }
 
     pub fn render(

@@ -37,19 +37,12 @@ var<uniform> audio: AudioUniforms;
 @group(0) @binding(1)
 var<storage, read> waveform_history: array<vec4<f32>>;
 
-struct VisualizerStorage {
-    history: array<f32, 30720>,
-    fire_grid: array<f32, 147456>,
-};
-
-@group(0) @binding(2)
-var<storage, read> vis_storage: VisualizerStorage;
+@group(0) @binding(3) var fire_grid_tex: texture_2d<f32>;
 
 fn get_heat(x: f32, y: f32) -> f32 {
     let x_idx = clamp(u32(x * 1024.0), 0u, 1023u);
     let y_idx = clamp(u32(y * 144.0), 0u, 143u);
-    let flat_idx = y_idx * 1024u + x_idx;
-    return vis_storage.fire_grid[flat_idx];
+    return textureLoad(fire_grid_tex, vec2<i32>(i32(x_idx), i32(y_idx)), 0).r;
 }
 
 @fragment
