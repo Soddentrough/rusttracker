@@ -582,20 +582,7 @@ impl<'a> VulkanEngine<'a> {
             visualizer_storage.fire_grid.copy_from_slice(&*self.fire_grid);
         }
 
-        let current_time_log = self.start_time.elapsed().as_secs_f32();
-        if current_time_log - self.last_log_time >= 1.0 {
-            self.last_log_time = current_time_log;
-            use std::io::Write;
-            let log_path = std::env::temp_dir().join("debug_heatmap.log");
-            if let Ok(mut file) = std::fs::OpenOptions::new().create(true).append(true).open(&log_path) {
-                let _ = writeln!(file, "--- Heatmap Debug Log [{:.1}s] ---", current_time_log);
-                let _ = writeln!(file, "state.spectrum_history.len(): {}", state.spectrum_history.len());
-                let _ = writeln!(file, "uniforms.ui_heatmap_rect: {:?}", uniforms.ui_heatmap_rect);
-                let _ = writeln!(file, "history row 0 (oldest) sample: {:?}", &visualizer_storage.history[0..5]);
-                let _ = writeln!(file, "history row 119 (newest) sample: {:?}", &visualizer_storage.history[119 * 256..119 * 256 + 5]);
-                let _ = writeln!(file, "-----------------------------------");
-            }
-        }
+
 
         let history_bytes: &[u8] = bytemuck::cast_slice(&visualizer_storage.history);
         self.queue.write_texture(
