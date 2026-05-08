@@ -13,6 +13,14 @@ assets = [
     { source = "icon.png", dest = "/usr/share/icons/hicolor/256x256/apps/rusttracker.png", mode = "644" }
 ]
 
+[package.metadata.deb]
+assets = [
+    ["target/release/rusttracker", "usr/bin/", "755"],
+    ["rusttracker.desktop", "usr/share/applications/", "644"],
+    ["icon.png", "usr/share/icons/hicolor/256x256/apps/rusttracker.png", "644"]
+]
+extended-description = "A high-performance, real-time audio visualizer and tracker module player."
+
 [dependencies]
 anyhow = "1.0.101"
 clap = { version = "4.6.1", features = ["derive"] }

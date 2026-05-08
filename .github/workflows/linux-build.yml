@@ -1,0 +1,84 @@
+name: Linux Release
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*.*.*"
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:latest
+      
+    steps:
+    - name: Install Git (Required for Checkout)
+      run: |
+        dnf update -y
+        dnf install -y git
+        
+    - uses: actions/checkout@v5
+    
+    - name: Install System Dependencies
+      run: |
+        # Enable RPMFusion for ffmpeg-devel
+        dnf install -y https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm
+        # Install build tools and library dependencies
+        dnf install -y gcc gcc-c++ binutils pkgconfig alsa-lib-devel wayland-devel libX11-devel libxkbcommon-devel systemd-devel ffmpeg-devel libopenmpt-devel
+        
+    - name: Install Rust
+      run: |
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+        
+    - name: Build RustTracker
+      run: |
+        source "$HOME/.cargo/env"
+        cargo build --release
+        strip target/release/rusttracker
+        
+    - name: Install cargo-generate-rpm
+      run: |
+        source "$HOME/.cargo/env"
+        cargo install cargo-generate-rpm
+        
+    - name: Package Release (RPM)
+      run: |
+        source "$HOME/.cargo/env"
+        cargo generate-rpm
+        
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v5
+      with:
+        name: RustTracker-Linux-RPM
+        path: target/generate-rpm/*.rpm
+
+  build-ubuntu:
+    runs-on: ubuntu-latest
+      
+    steps:
+    - uses: actions/checkout@v5
+    
+    - name: Install System Dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y gcc g++ binutils pkg-config libasound2-dev libwayland-dev libx11-dev libxkbcommon-x11-dev libudev-dev libavcodec-dev libavformat-dev libavutil-dev libavdevice-dev libavfilter-dev libopenmpt-dev
+        
+    - name: Build RustTracker
+      run: |
+        cargo build --release
+        strip target/release/rusttracker
+        
+    - name: Install cargo-deb
+      run: |
+        cargo install cargo-deb
+        
+    - name: Package Release (DEB)
+      run: |
+        cargo deb
+        
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v5
+      with:
+        name: RustTracker-Linux-DEB
+        path: target/debian/*.deb
