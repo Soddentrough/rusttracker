@@ -1510,7 +1510,11 @@ impl<'a> VulkanEngine<'a> {
                             columns[2].horizontal(|ui| { ui.label("Artist"); ui.label(&state.artist); });
                             columns[2].horizontal(|ui| { ui.label("Type"); ui.label(&state.module_type); });
                             if let Some(video) = &state.video_info {
-                                columns[2].horizontal(|ui| { ui.label("Video"); ui.label(video); });
+                                if video == "Unsupported Codec" {
+                                    columns[2].horizontal(|ui| { ui.label("Video"); ui.label(video); });
+                                } else {
+                                    columns[2].horizontal(|ui| { ui.label("Video"); ui.label(format!("{} (Video stream available)", video)); });
+                                }
                             }
                             if state.bpm > 0 { columns[2].horizontal(|ui| { ui.label("BPM"); ui.label(format!("{}", state.bpm)); }); }
                             if state.speed > 0 { columns[2].horizontal(|ui| { ui.label("Speed"); ui.label(format!("{}", state.speed)); }); }

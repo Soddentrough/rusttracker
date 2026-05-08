@@ -788,7 +788,7 @@ impl AudioSource for VideoOnlySource {
 
 fn try_ffmpeg(file_path: &str) -> Result<Box<dyn AudioSource>> {
     let _ = ffmpeg_next::init();
-    let mut ictx = ffmpeg_next::format::input(&file_path).context("Failed to open file via libavformat")?;
+    let ictx = ffmpeg_next::format::input(&file_path).context("Failed to open file via libavformat")?;
     
     let duration = ictx.duration() as f64 / ffmpeg_next::ffi::AV_TIME_BASE as f64;
     let ext = std::path::Path::new(file_path)
