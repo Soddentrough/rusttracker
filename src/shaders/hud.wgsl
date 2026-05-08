@@ -32,7 +32,8 @@ struct AudioUniforms {
 };
 
 struct VisualizerStorage {
-    bands: array<f32>,
+    history: array<f32, 30720>,
+    fire_grid: array<f32, 147456>,
 };
 
 @group(0) @binding(0) var<uniform> uniforms: AudioUniforms;
@@ -199,7 +200,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let time_idx = 119u - y_idx;
         // Explicit 1D indexing guarantees deterministic memory access across all GPU backends
         let flat_idx = time_idx * 256u + x_idx;
-        let val = heatmap_storage.bands[flat_idx];
+        let val = heatmap_storage.history[flat_idx];
         
         if (val > 5.0) {
             if (val > 60.0) {
