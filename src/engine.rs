@@ -599,14 +599,14 @@ impl<'a> VulkanEngine<'a> {
 
         let history_bytes: &[u8] = bytemuck::cast_slice(&visualizer_storage.history);
         self.queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &self.history_texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
             history_bytes,
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(256 * 4),
                 rows_per_image: Some(120),
@@ -616,14 +616,14 @@ impl<'a> VulkanEngine<'a> {
 
         let fire_grid_bytes: &[u8] = bytemuck::cast_slice(&visualizer_storage.fire_grid);
         self.queue.write_texture(
-            wgpu::ImageCopyTexture {
+            wgpu::TexelCopyTextureInfo {
                 texture: &self.fire_grid_texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
             },
             fire_grid_bytes,
-            wgpu::ImageDataLayout {
+            wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(1024 * 4),
                 rows_per_image: Some(144),
