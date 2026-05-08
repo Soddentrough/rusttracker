@@ -929,9 +929,9 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
         
         let intrinsic = audio_source.get_num_channels();
         if intrinsic > 2 {
-            state.available_visualizers = vec![0, 4, 5, 3, 1, 2];
+            state.available_visualizers = vec![0, 4, 5, 3, 1, 2, 6];
         } else {
-            state.available_visualizers = vec![0, 1, 2];
+            state.available_visualizers = vec![0, 1, 2, 6];
         }
         if !mic {
             state.tracker_channels = tracker_channels;

@@ -101,7 +101,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         
         if let Some(vis) = &args.vis {
             let vis_lower = vis.to_lowercase();
-            state.visualizer_mode = if vis_lower.contains("spectrum") || vis_lower.contains("freq") {
+            state.visualizer_mode = if vis_lower.contains("firesim") {
+                6
+            } else if vis_lower.contains("spectrum") || vis_lower.contains("freq") {
                 0
             } else if vis_lower.contains("fire") || vis_lower.contains("flame") {
                 1

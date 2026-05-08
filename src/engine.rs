@@ -78,6 +78,7 @@ pub struct VulkanEngine<'a> {
     
     // GPU compute fire simulation
     fire_compute_pipeline: wgpu::ComputePipeline,
+    firesim_compute_pipeline: wgpu::ComputePipeline,
     fire_buffer_a: wgpu::Buffer,
     fire_buffer_b: wgpu::Buffer,
     #[allow(dead_code)] // accessed via GPU bind groups, not directly from Rust
@@ -142,7 +143,7 @@ impl<'a> VulkanEngine<'a> {
         let present_mode = wgpu::PresentMode::AutoNoVsync;
 
         let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             format: surface_format,
             width: size.width,
             height: size.height,
@@ -275,6 +276,7 @@ impl<'a> VulkanEngine<'a> {
             device.create_shader_module(wgpu::include_wgsl!("shaders/vis_spatial.wgsl")),
             device.create_shader_module(wgpu::include_wgsl!("shaders/vis_ferrofluid.wgsl")),
             device.create_shader_module(wgpu::include_wgsl!("shaders/vis_neon.wgsl")),
+            device.create_shader_module(wgpu::include_wgsl!("shaders/vis_firesim.wgsl")),
         ];
 
         let mut render_pipelines = Vec::new();
@@ -443,6 +445,7 @@ impl<'a> VulkanEngine<'a> {
         });
 
         let fire_compute_shader = device.create_shader_module(wgpu::include_wgsl!("shaders/fire_compute.wgsl"));
+        let firesim_compute_shader = device.create_shader_module(wgpu::include_wgsl!("shaders/firesim_compute.wgsl"));
         let fire_compute_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("fire_compute_layout"),
             bind_group_layouts: &[Some(&fire_compute_layout)],
@@ -452,6 +455,14 @@ impl<'a> VulkanEngine<'a> {
             label: Some("Fire Compute Pipeline"),
             layout: Some(&fire_compute_pipeline_layout),
             module: &fire_compute_shader,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+        let firesim_compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("FireSim Compute Pipeline"),
+            layout: Some(&fire_compute_pipeline_layout),
+            module: &firesim_compute_shader,
             entry_point: Some("main"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
@@ -507,6 +518,7 @@ impl<'a> VulkanEngine<'a> {
             heatmap_uv_rect: [0.0; 4],
             fire_uv_rect: [0.0; 4],
             fire_compute_pipeline,
+            firesim_compute_pipeline,
             fire_buffer_a,
             fire_buffer_b,
             fire_coal_buffer,
@@ -591,7 +603,7 @@ impl<'a> VulkanEngine<'a> {
             self.queue.write_buffer(&self.waveform_storage_buffer, 0, bytemuck::cast_slice(&[history_storage]));
         }
         
-        if state.visualizer_mode == 1 {
+        if state.visualizer_mode == 1 || state.visualizer_mode == 6 {
             let mut bass_sum = 0.0;
             let mut mids_sum = 0.0;
             let mut highs_sum = 0.0;
@@ -678,6 +690,17 @@ impl<'a> VulkanEngine<'a> {
         let mut out_fire_rect = None;
         let mut out_heatmap_rect = None;
         
+        let vis_name = match state.visualizer_mode {
+            0 => "Frequency Spectrum",
+            1 => "Classic Flame",
+            2 => "CRT Oscilloscope",
+            3 => "Spatial Vectors",
+            4 => "Chrome Ferrofluid",
+            5 => "Neon Corridor",
+            6 => "Fire Simulation",
+            _ => "Unknown",
+        };
+        
         let full_output = egui_ctx.run_ui(raw_input, |ctx| {
             if state.show_stats {
                 egui::Window::new("Stats")
@@ -691,6 +714,10 @@ impl<'a> VulkanEngine<'a> {
                             egui::RichText::new(format!("RustTracker v{}", env!("CARGO_PKG_VERSION")))
                                 .color(egui::Color32::WHITE)
                                 .strong()
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("Visualizer: {}", vis_name))
+                                .color(egui::Color32::YELLOW)
                         );
                         ui.separator();
                         ui.label(
@@ -1022,15 +1049,6 @@ impl<'a> VulkanEngine<'a> {
                                 }
                             });
                             
-                            let vis_name = match state.visualizer_mode {
-                                0 => "Frequency Spectrum",
-                                1 => "Fire",
-                                2 => "CRT Oscilloscope",
-                                3 => "Spatial Vectors",
-                                4 => "Chrome Ferrofluid",
-                                5 => "Neon Corridor",
-                                _ => "Unknown",
-                            };
                             columns[2].horizontal(|ui| { ui.label("Visualizer"); ui.label(vis_name); });
                             
                             columns[2].horizontal(|ui| { ui.label("Length"); ui.label(format!("{:.1}s", state.duration_seconds)); });
@@ -1126,13 +1144,17 @@ impl<'a> VulkanEngine<'a> {
             compute_pass.dispatch_workgroups(1, 1, 1); // 256x1x1 threads
         }
         // GPU fire compute: dispatch simulation + copy result to texture
-        if state.visualizer_mode == 1 {
+        if state.visualizer_mode == 1 || state.visualizer_mode == 6 {
             {
                 let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("Fire Compute"),
                     timestamp_writes: None,
                 });
-                compute_pass.set_pipeline(&self.fire_compute_pipeline);
+                if state.visualizer_mode == 1 {
+                    compute_pass.set_pipeline(&self.fire_compute_pipeline);
+                } else {
+                    compute_pass.set_pipeline(&self.firesim_compute_pipeline);
+                }
                 let bg = if self.fire_ping { &self.fire_bind_group_a } else { &self.fire_bind_group_b };
                 compute_pass.set_bind_group(0, Some(bg), &[]);
                 compute_pass.dispatch_workgroups(64, 36, 1); // 1024/16=64, 576/16=36
@@ -1235,7 +1257,50 @@ impl<'a> VulkanEngine<'a> {
             self.query_in_flight = true;
         }
 
+        let do_capture = std::env::var("CAPTURE_FRAME").is_ok() && state.current_seconds >= 20.0;
+        let mut readback_buffer = None;
+        if do_capture {
+            let bpr = (self.config.width * 4 + 255) & !255;
+            let rb = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Readback"),
+                size: (bpr * self.config.height) as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo { texture: &surface_texture.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                wgpu::TexelCopyBufferInfo { buffer: &rb, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(self.config.height) } },
+                wgpu::Extent3d { width: self.config.width, height: self.config.height, depth_or_array_layers: 1 }
+            );
+            readback_buffer = Some(rb);
+        }
+
         self.queue.submit(std::iter::once(encoder.finish()));
+        
+        if let Some(rb) = readback_buffer {
+            let slice = rb.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |v| tx.send(v).unwrap());
+            self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+            if rx.recv().unwrap().is_ok() {
+                let data = slice.get_mapped_range();
+                let bpr = (self.config.width * 4 + 255) & !255;
+                let mut img = image::RgbaImage::new(self.config.width, self.config.height);
+                for y in 0..self.config.height {
+                    for x in 0..self.config.width {
+                        let offset = (y * bpr + x * 4) as usize;
+                        let b = data[offset];
+                        let g = data[offset + 1];
+                        let r = data[offset + 2];
+                        let _a = data[offset + 3];
+                        img.put_pixel(x, y, image::Rgba([r, g, b, 255])); // Ignore A to force fully opaque screenshot
+                    }
+                }
+                img.save("screenshot.png").unwrap();
+            }
+            std::process::exit(0);
+        }
+        
         surface_texture.present();
 
         for id in &full_output.textures_delta.free {
