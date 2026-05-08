@@ -202,6 +202,7 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
 
     let mut last_mouse_move = Instant::now();
     let mut is_cursor_visible = true;
+    let mut is_first_frame = true;
 
     #[allow(deprecated)]
     let _ = event_loop.run(move |event, elwt| {
@@ -328,6 +329,10 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                     engine.resize(*physical_size);
                 }
                 WindowEvent::RedrawRequested => {
+                    if is_first_frame {
+                        is_first_frame = false;
+                        app_state.lock().unwrap().is_paused = false;
+                    }
                     let load_path = {
                         let mut state = app_state.lock().unwrap();
                         
@@ -571,8 +576,13 @@ where std::io::Error: From<<B as Backend>::Error>
 {
     let tick_rate = Duration::from_millis(16); // ~60fps
     let mut last_tick = Instant::now();
+    let mut is_first_frame = true;
 
     loop {
+        if is_first_frame {
+            is_first_frame = false;
+            app_state.lock().unwrap().is_paused = false;
+        }
         {
             let mut state = app_state.lock().unwrap();
 

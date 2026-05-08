@@ -341,29 +341,82 @@ impl<'a> VulkanEngine<'a> {
             immediate_size: 0,
         });
 
-        let shader_modules = vec![
-            device.create_shader_module(wgpu::include_wgsl!("shaders/vis_spectrum.wgsl")),
-            device.create_shader_module(wgpu::include_wgsl!("shaders/vis_flame.wgsl")),
-            device.create_shader_module(wgpu::include_wgsl!("shaders/vis_oscilloscope.wgsl")),
-            device.create_shader_module(wgpu::include_wgsl!("shaders/vis_spatial.wgsl")),
-            device.create_shader_module(wgpu::include_wgsl!("shaders/vis_ferrofluid.wgsl")),
-            device.create_shader_module(wgpu::include_wgsl!("shaders/vis_neon.wgsl")),
-            device.create_shader_module(wgpu::include_wgsl!("shaders/vis_firesim.wgsl")),
+        let shader_sources = vec![
+            include_str!("shaders/vis_spectrum.wgsl"),
+            include_str!("shaders/vis_flame.wgsl"),
+            include_str!("shaders/vis_oscilloscope.wgsl"),
+            include_str!("shaders/vis_spatial.wgsl"),
+            include_str!("shaders/vis_ferrofluid.wgsl"),
+            include_str!("shaders/vis_neon.wgsl"),
+            include_str!("shaders/vis_firesim.wgsl"),
         ];
 
         let mut render_pipelines = Vec::new();
-        for (i, shader) in shader_modules.iter().enumerate() {
+        
+        let scope_fallback = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let fallback_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Fallback Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(shader_sources[0])),
+        });
+        
+        let fallback_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Fallback Render Pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &fallback_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &fallback_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview_mask: None,
+            cache: None,
+        });
+        let _ = scope_fallback.pop().await;
+
+        for (i, source) in shader_sources.iter().enumerate() {
+            let scope_main = device.push_error_scope(wgpu::ErrorFilter::Validation);
+            
+            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(&format!("Shader {}", i)),
+                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(source)),
+            });
+            
             let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(&format!("Render Pipeline {}", i)),
                 layout: Some(&render_pipeline_layout),
                 vertex: wgpu::VertexState {
-                    module: shader,
+                    module: &shader,
                     entry_point: Some("vs_main"),
                     buffers: &[],
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
-                    module: shader,
+                    module: &shader,
                     entry_point: Some("fs_main"),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: config.format,
@@ -390,7 +443,16 @@ impl<'a> VulkanEngine<'a> {
                 multiview_mask: None,
                 cache: None,
             });
-            render_pipelines.push(pipeline);
+            
+            let error_future = scope_main.pop();
+            let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
+            
+            if let Some(error) = error_future.await {
+                eprintln!("WGSL compilation error in visualizer {}: {:?}", i, error);
+                render_pipelines.push(fallback_pipeline.clone());
+            } else {
+                render_pipelines.push(pipeline);
+            }
         }
 
         // --- Video Pipeline ---
@@ -1211,7 +1273,7 @@ impl<'a> VulkanEngine<'a> {
                     
                 egui::CentralPanel::default().frame(frame).show_inside(ctx, |ui| {
                     let avail_height = ui.available_height();
-                    let content_height = 450.0;
+                    let content_height = 380.0;
                     let space = (avail_height - content_height) / 2.0;
                     if space > 0.0 {
                         ui.add_space(space);
@@ -1249,43 +1311,35 @@ impl<'a> VulkanEngine<'a> {
                             ui.add_space(15.0);
                             
                             egui::Grid::new("shortcuts_grid")
-                                .num_columns(2)
+                                .num_columns(4)
                                 .spacing([30.0, 8.0])
                                 .show(ui, |ui| {
                                     ui.label(egui::RichText::new("O").color(egui::Color32::WHITE).strong());
                                     ui.label(egui::RichText::new("Open File").color(egui::Color32::GRAY));
+                                    ui.label(egui::RichText::new("Space").color(egui::Color32::WHITE).strong());
+                                    ui.label(egui::RichText::new("Play / Pause").color(egui::Color32::GRAY));
                                     ui.end_row();
                                     
                                     ui.label(egui::RichText::new("Tab").color(egui::Color32::WHITE).strong());
                                     ui.label(egui::RichText::new("Toggle HUD").color(egui::Color32::GRAY));
-                                    ui.end_row();
-                                    
-                                    ui.label(egui::RichText::new("F").color(egui::Color32::WHITE).strong());
-                                    ui.label(egui::RichText::new("Toggle Fullscreen").color(egui::Color32::GRAY));
-                                    ui.end_row();
-                                    
-                                    ui.label(egui::RichText::new("S").color(egui::Color32::WHITE).strong());
-                                    ui.label(egui::RichText::new("Toggle Stats").color(egui::Color32::GRAY));
-                                    ui.end_row();
-                                    
-                                    ui.label(egui::RichText::new("G").color(egui::Color32::WHITE).strong());
-                                    ui.label(egui::RichText::new("Toggle GPU FFT").color(egui::Color32::GRAY));
-                                    ui.end_row();
-                                    
-                                    ui.label(egui::RichText::new("Space").color(egui::Color32::WHITE).strong());
-                                    ui.label(egui::RichText::new("Play / Pause").color(egui::Color32::GRAY));
-                                    ui.end_row();
-
                                     ui.label(egui::RichText::new("Left / Right").color(egui::Color32::WHITE).strong());
                                     ui.label(egui::RichText::new("Seek Timeline").color(egui::Color32::GRAY));
                                     ui.end_row();
                                     
+                                    ui.label(egui::RichText::new("F").color(egui::Color32::WHITE).strong());
+                                    ui.label(egui::RichText::new("Toggle Fullscreen").color(egui::Color32::GRAY));
                                     ui.label(egui::RichText::new("Up / Down").color(egui::Color32::WHITE).strong());
                                     ui.label(egui::RichText::new("Change Visualizer").color(egui::Color32::GRAY));
                                     ui.end_row();
                                     
+                                    ui.label(egui::RichText::new("S").color(egui::Color32::WHITE).strong());
+                                    ui.label(egui::RichText::new("Toggle Stats").color(egui::Color32::GRAY));
                                     ui.label(egui::RichText::new("Q / Esc").color(egui::Color32::WHITE).strong());
                                     ui.label(egui::RichText::new("Quit").color(egui::Color32::GRAY));
+                                    ui.end_row();
+                                    
+                                    ui.label(egui::RichText::new("G").color(egui::Color32::WHITE).strong());
+                                    ui.label(egui::RichText::new("Toggle GPU FFT").color(egui::Color32::GRAY));
                                     ui.end_row();
                                 });
                         }

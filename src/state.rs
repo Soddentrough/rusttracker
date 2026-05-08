@@ -119,7 +119,7 @@ impl AppState {
             current_seconds: 0.0,
             seek_request: None,
             seek_epoch: 0,
-            is_paused: false,
+            is_paused: true, // Start paused to prevent audio playback before UI is ready
             bpm: 0,
             speed: 0,
             num_channels: 0,
