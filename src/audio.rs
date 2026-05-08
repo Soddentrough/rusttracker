@@ -194,6 +194,8 @@ pub trait AudioSource: Send {
     fn pre_format_tracker_data(&mut self) -> Vec<Vec<String>> { Vec::new() }
     fn get_current_row_string(&mut self) -> String { String::new() }
     fn get_video_info(&mut self) -> Option<String> { None }
+    fn attach_video_queue(&mut self, _tx: crossbeam_channel::Sender<ffmpeg_next::Packet>) {}
+    fn take_video_parameters(&mut self) -> Option<(ffmpeg_next::codec::Parameters, ffmpeg_next::Rational)> { None }
 }
 
 // ---------------------------------------------------------
@@ -490,6 +492,10 @@ struct FfmpegSource {
     intrinsic_sample_rate: u32,
     video_info: Option<String>,
     channel_vus: Vec<f32>,
+    video_stream_index: Option<usize>,
+    video_tx: Option<crossbeam_channel::Sender<ffmpeg_next::Packet>>,
+    video_params: Option<ffmpeg_next::codec::Parameters>,
+    video_time_base: Option<ffmpeg_next::Rational>,
 }
 
 impl FfmpegSource {
@@ -499,23 +505,40 @@ impl FfmpegSource {
         // 1. Try to receive a frame from already-buffered packets
         if self.decoder.receive_frame(&mut decoded).is_ok() {
             let mut resampled = ffmpeg_next::frame::Audio::empty();
-            if self.resampler.run(&decoded, &mut resampled).is_ok() {
-                // ffmpeg-next has a bug where plane<T>(0) for Packed format only returns length = samples(), 
-                // instead of samples() * channels(). We must manually extract the full interleaved slice.
-                let data = resampled.plane::<f32>(0);
-                let actual_len = resampled.samples() * resampled.channels() as usize;
-                let actual_data = unsafe { std::slice::from_raw_parts(data.as_ptr(), actual_len) };
-                
-                self.sample_buf.clear();
-                self.sample_buf.extend_from_slice(actual_data);
-                self.buf_pos = 0;
-                return true;
+            match self.resampler.run(&decoded, &mut resampled) {
+                Ok(_) => {
+                    let data = resampled.plane::<f32>(0);
+                    let actual_len = resampled.samples() * resampled.channels() as usize;
+                    let actual_data = unsafe { std::slice::from_raw_parts(data.as_ptr(), actual_len) };
+                    
+                    self.sample_buf.clear();
+                    self.sample_buf.extend_from_slice(actual_data);
+                    self.buf_pos = 0;
+                    return true;
+                }
+                Err(_) => {
+                    // Recreate resampler if input format/layout changed mid-stream
+                    if let Ok(new_resampler) = ffmpeg_next::software::resampling::context::Context::get(
+                        decoded.format(),
+                        decoded.channel_layout(),
+                        decoded.rate(),
+                        ffmpeg_next::format::sample::Sample::F32(ffmpeg_next::format::sample::Type::Packed),
+                        self.resampler.output().channel_layout,
+                        self.resampler.output().rate,
+                    ) {
+                        self.resampler = new_resampler;
+                    }
+                }
             }
         }
         
         // 2. Decoder needs more data, read packets
         for (stream, packet) in self.ictx.packets() {
-            if stream.index() == self.stream_index {
+            if Some(stream.index()) == self.video_stream_index {
+                if let Some(tx) = &self.video_tx {
+                    let _ = tx.try_send(packet.clone());
+                }
+            } else if stream.index() == self.stream_index {
                 // Send the packet to the decoder
                 if let Err(_e) = self.decoder.send_packet(&packet) {
                     // Packet might be rejected if decoder is full, but we just drained it above.
@@ -525,19 +548,32 @@ impl FfmpegSource {
                 // Now try to receive a frame
                 if self.decoder.receive_frame(&mut decoded).is_ok() {
                     let mut resampled = ffmpeg_next::frame::Audio::empty();
-                    if self.resampler.run(&decoded, &mut resampled).is_ok() {
-                        // ffmpeg-next bug workaround for Packed formats
-                        let data = resampled.plane::<f32>(0);
-                        let actual_len = resampled.samples() * resampled.channels() as usize;
-                        let actual_data = unsafe { std::slice::from_raw_parts(data.as_ptr(), actual_len) };
-                        
-                        self.sample_buf.clear();
-                        self.sample_buf.extend_from_slice(actual_data);
-                        self.buf_pos = 0;
-                        if let Some(pts) = packet.pts() {
-                            self.current_time = pts as f64 * self.time_base;
+                    match self.resampler.run(&decoded, &mut resampled) {
+                        Ok(_) => {
+                            let data = resampled.plane::<f32>(0);
+                            let actual_len = resampled.samples() * resampled.channels() as usize;
+                            let actual_data = unsafe { std::slice::from_raw_parts(data.as_ptr(), actual_len) };
+                            
+                            self.sample_buf.clear();
+                            self.sample_buf.extend_from_slice(actual_data);
+                            self.buf_pos = 0;
+                            if let Some(pts) = packet.pts() {
+                                self.current_time = pts as f64 * self.time_base;
+                            }
+                            return true;
                         }
-                        return true;
+                        Err(_) => {
+                            if let Ok(new_resampler) = ffmpeg_next::software::resampling::context::Context::get(
+                                decoded.format(),
+                                decoded.channel_layout(),
+                                decoded.rate(),
+                                ffmpeg_next::format::sample::Sample::F32(ffmpeg_next::format::sample::Type::Packed),
+                                self.resampler.output().channel_layout,
+                                self.resampler.output().rate,
+                            ) {
+                                self.resampler = new_resampler;
+                            }
+                        }
                     }
                 }
             }
@@ -650,13 +686,157 @@ impl AudioSource for FfmpegSource {
     fn get_current_row(&mut self) -> i32 { 0 }
 
     fn get_video_info(&mut self) -> Option<String> { self.video_info.clone() }
+    
+    fn attach_video_queue(&mut self, tx: crossbeam_channel::Sender<ffmpeg_next::Packet>) {
+        self.video_tx = Some(tx);
+    }
+    
+    fn take_video_parameters(&mut self) -> Option<(ffmpeg_next::codec::Parameters, ffmpeg_next::Rational)> {
+        if let (Some(p), Some(tb)) = (self.video_params.take(), self.video_time_base.take()) {
+            Some((p, tb))
+        } else {
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------
+// Video Only Source (No Audio)
+// ---------------------------------------------------------
+struct VideoOnlySource {
+    ictx: ffmpeg_next::format::context::Input,
+    video_stream_index: usize,
+    video_tx: Option<crossbeam_channel::Sender<ffmpeg_next::Packet>>,
+    video_params: Option<ffmpeg_next::codec::Parameters>,
+    video_time_base: Option<ffmpeg_next::Rational>,
+    current_time: f64,
+    duration: f64,
+    video_info: Option<String>,
+    ext_type: String,
+}
+
+impl AudioSource for VideoOnlySource {
+    fn read_frames(&mut self, hardware_channels: usize, sample_rate: u32, output: &mut [f32]) -> usize {
+        let frames_to_write = output.len() / hardware_channels;
+        for v in output.iter_mut() {
+            *v = 0.0;
+        }
+        
+        let mut packets_read = 0;
+        while packets_read < 20 {
+            if let Some((stream, packet)) = self.ictx.packets().next() {
+                if stream.index() == self.video_stream_index {
+                    if let Some(tx) = &self.video_tx {
+                        let _ = tx.try_send(packet.clone());
+                    }
+                }
+                packets_read += 1;
+            } else {
+                break;
+            }
+        }
+        
+        self.current_time += frames_to_write as f64 / sample_rate as f64;
+        frames_to_write
+    }
+    
+    fn get_duration_seconds(&mut self) -> f64 { self.duration }
+    fn get_position_seconds(&mut self) -> f64 { self.current_time }
+    
+    fn set_position_seconds(&mut self, pos: f64) {
+        if let Some(stream) = self.ictx.stream(self.video_stream_index) {
+            let tb = stream.time_base();
+            let pts = (pos / (tb.numerator() as f64 / tb.denominator() as f64)) as i64;
+            unsafe {
+                ffmpeg_next::ffi::av_seek_frame(
+                    self.ictx.as_mut_ptr(),
+                    self.video_stream_index as i32,
+                    pts,
+                    ffmpeg_next::ffi::AVSEEK_FLAG_BACKWARD
+                );
+            }
+        }
+        self.current_time = pos;
+    }
+    
+    fn get_num_channels(&mut self) -> i32 { 2 }
+    fn get_current_channel_vu_mono(&mut self, _channel: i32) -> f32 { 0.0 }
+    fn get_artist(&mut self) -> String { "Video Only".to_string() }
+    fn get_type(&mut self) -> String { self.ext_type.clone() }
+    fn get_tempo(&mut self) -> i32 { 0 }
+    fn get_speed(&mut self) -> i32 { 0 }
+    fn get_intrinsic_sample_rate(&mut self) -> Option<u32> { Some(44100) }
+    fn get_num_samples(&mut self) -> i32 { 0 }
+    fn get_num_instruments(&mut self) -> i32 { 0 }
+    fn get_num_patterns(&mut self) -> i32 { 0 }
+    fn get_current_order(&mut self) -> i32 { 0 }
+    fn get_current_row(&mut self) -> i32 { 0 }
+    fn get_video_info(&mut self) -> Option<String> { self.video_info.clone() }
+    
+    fn attach_video_queue(&mut self, tx: crossbeam_channel::Sender<ffmpeg_next::Packet>) {
+        self.video_tx = Some(tx);
+    }
+    
+    fn take_video_parameters(&mut self) -> Option<(ffmpeg_next::codec::Parameters, ffmpeg_next::Rational)> {
+        if let (Some(p), Some(tb)) = (self.video_params.take(), self.video_time_base.take()) {
+            Some((p, tb))
+        } else {
+            None
+        }
+    }
 }
 
 fn try_ffmpeg(file_path: &str) -> Result<Box<dyn AudioSource>> {
     let _ = ffmpeg_next::init();
-    let ictx = ffmpeg_next::format::input(&file_path).context("Failed to open file via libavformat")?;
+    let mut ictx = ffmpeg_next::format::input(&file_path).context("Failed to open file via libavformat")?;
     
-    let stream = ictx.streams().best(ffmpeg_next::media::Type::Audio).context("No audio stream found")?;
+    let duration = ictx.duration() as f64 / ffmpeg_next::ffi::AV_TIME_BASE as f64;
+    let ext = std::path::Path::new(file_path)
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("FFMPEG")
+        .to_uppercase();
+        
+    let mut video_info = None;
+    let mut video_stream_index = None;
+    let mut video_params = None;
+    let mut video_tb = None;
+    if let Some(v_stream) = ictx.streams().best(ffmpeg_next::media::Type::Video) {
+        video_stream_index = Some(v_stream.index());
+        video_params = Some(v_stream.parameters());
+        video_tb = Some(v_stream.time_base());
+        if let Ok(v_ctx) = ffmpeg_next::codec::context::Context::from_parameters(v_stream.parameters()) {
+            if let Ok(v_dec) = v_ctx.decoder().video() {
+                video_info = Some(format!("{} ({}x{})", v_dec.codec().map(|c| c.name().to_string()).unwrap_or("H264".to_string()).to_uppercase(), v_dec.width(), v_dec.height()));
+            } else {
+                video_info = Some("Unsupported Codec".to_string());
+            }
+        } else {
+            video_info = Some("Unsupported Codec".to_string());
+        }
+    }
+
+    let audio_stream = ictx.streams().best(ffmpeg_next::media::Type::Audio);
+    
+    if audio_stream.is_none() {
+        if let Some(v_idx) = video_stream_index {
+            return Ok(Box::new(VideoOnlySource {
+                ictx,
+                video_stream_index: v_idx,
+                video_tx: None,
+                video_params,
+                video_time_base: video_tb,
+                current_time: 0.0,
+                duration,
+                video_info,
+                ext_type: ext,
+            }));
+        } else {
+            return Err(anyhow::anyhow!("No audio stream found and no video stream found"));
+        }
+    }
+    
+    let stream = audio_stream.unwrap();
     let stream_index = stream.index();
     
     let context = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())?;
@@ -666,15 +846,6 @@ fn try_ffmpeg(file_path: &str) -> Result<Box<dyn AudioSource>> {
     let sample_rate = decoder.rate();
     let time_base = stream.time_base();
     let tb = time_base.numerator() as f64 / time_base.denominator() as f64;
-    let duration = ictx.duration() as f64 / ffmpeg_next::ffi::AV_TIME_BASE as f64;
-    
-    let mut video_info = None;
-    if let Some(v_stream) = ictx.streams().best(ffmpeg_next::media::Type::Video) {
-        let v_ctx = ffmpeg_next::codec::context::Context::from_parameters(v_stream.parameters())?;
-        if let Ok(v_dec) = v_ctx.decoder().video() {
-            video_info = Some(format!("{} ({}x{})", v_dec.codec().map(|c| c.name().to_string()).unwrap_or("H264".to_string()).to_uppercase(), v_dec.width(), v_dec.height()));
-        }
-    }
     
     let resampler = ffmpeg_next::software::resampling::context::Context::get(
         decoder.format(),
@@ -684,12 +855,6 @@ fn try_ffmpeg(file_path: &str) -> Result<Box<dyn AudioSource>> {
         decoder.channel_layout(),
         decoder.rate(),
     ).context("Failed to create resampler")?;
-
-    let ext = std::path::Path::new(file_path)
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("FFMPEG")
-        .to_uppercase();
 
     Ok(Box::new(FfmpegSource {
         ictx,
@@ -707,6 +872,10 @@ fn try_ffmpeg(file_path: &str) -> Result<Box<dyn AudioSource>> {
         intrinsic_sample_rate: sample_rate,
         video_info,
         channel_vus: vec![0.0; channels as usize],
+        video_stream_index,
+        video_tx: None,
+        video_params,
+        video_time_base: video_tb,
     }))
 }
 
@@ -991,6 +1160,139 @@ where
     let (ready_tx, ready_rx) = crossbeam_channel::bounded::<AudioChunk>(pool_size);
     let (free_tx, free_rx) = crossbeam_channel::bounded::<AudioChunk>(pool_size);
     
+    let (video_packet_tx, video_packet_rx) = crossbeam_channel::bounded::<ffmpeg_next::Packet>(4096);
+    audio_source.attach_video_queue(video_packet_tx);
+    
+    if let Some((params, time_base)) = audio_source.take_video_parameters() {
+        let (video_frame_tx, video_frame_rx) = crossbeam_channel::bounded::<crate::state::VideoFrame>(16);
+        let (free_video_frame_tx, free_video_frame_rx) = crossbeam_channel::bounded::<crate::state::VideoFrame>(16);
+        
+        for _ in 0..16 {
+            let _ = free_video_frame_tx.try_send(crate::state::VideoFrame {
+                pts: 0.0,
+                width: 0,
+                height: 0,
+                y_plane: Vec::new(),
+                u_plane: Vec::new(),
+                v_plane: Vec::new(),
+                y_stride: 0,
+                u_stride: 0,
+                v_stride: 0,
+                bit_depth: 8,
+                color_space: 0,
+                color_range: 0,
+            });
+        }
+        
+        if let Ok(mut state) = shared_state.lock() {
+            state.video_frame_rx = Some(video_frame_rx);
+            state.free_video_frame_tx = Some(free_video_frame_tx.clone());
+        }
+        
+        let state_for_video = shared_state.clone();
+        let video_packet_rx_for_video = video_packet_rx.clone();
+        std::thread::spawn(move || {
+            if let Ok(context) = ffmpeg_next::codec::context::Context::from_parameters(params) {
+                if let Ok(mut decoder) = context.decoder().video() {
+                    let tb = time_base.numerator() as f64 / time_base.denominator() as f64;
+                    let mut local_epoch = 0;
+                    let mut fallback_pts_seconds = 0.0;
+                    
+                    while let Ok(packet) = video_packet_rx_for_video.recv() {
+                        let mut track_ended = false;
+                        if let Ok(state) = state_for_video.try_lock() {
+                            track_ended = state.track_ended;
+                            if state.seek_epoch > local_epoch {
+                                decoder.flush();
+                                local_epoch = state.seek_epoch;
+                            }
+                        }
+                        
+                        if track_ended { return; }
+                        
+                        if decoder.send_packet(&packet).is_ok() {
+                            let mut decoded = ffmpeg_next::frame::Video::empty();
+                            while decoder.receive_frame(&mut decoded).is_ok() {
+                                let mut pts = decoded.timestamp().map(|t| t as f64 * tb)
+                                    .or_else(|| decoded.pts().map(|p| p as f64 * tb))
+                                    .unwrap_or(-1.0);
+                                    
+                                if pts < 0.0 {
+                                    pts = fallback_pts_seconds;
+                                    fallback_pts_seconds += 1.0 / 30.0;
+                                } else {
+                                    fallback_pts_seconds = pts + (1.0 / 30.0);
+                                }
+                                
+                                loop {
+                                    let (cached_seconds, current_epoch) = {
+                                        if let Ok(state) = state_for_video.try_lock() {
+                                            track_ended = state.track_ended;
+                                            (state.current_seconds, state.seek_epoch)
+                                        } else {
+                                            continue;
+                                        }
+                                    };
+                                    
+                                    if track_ended || current_epoch > local_epoch {
+                                        break;
+                                    }
+                                    
+                                    if pts <= cached_seconds + 0.05 {
+                                        break;
+                                    }
+                                    std::thread::sleep(std::time::Duration::from_millis(2));
+                                }
+                                
+                                if let Ok(mut frame) = free_video_frame_rx.recv() {
+                                    frame.pts = pts;
+                                    frame.width = decoded.width();
+                                    frame.height = decoded.height();
+                                    
+                                    let format_name = format!("{:?}", decoded.format());
+                                    frame.bit_depth = if format_name.contains("10LE") { 10 } else if format_name.contains("12LE") { 12 } else { 8 };
+                                    frame.color_space = decoded.color_space() as u32;
+                                    frame.color_range = decoded.color_range() as u32;
+                                    
+                                    frame.y_stride = decoded.stride(0);
+                                    frame.u_stride = decoded.stride(1);
+                                    frame.v_stride = decoded.stride(2);
+                                    
+                                    let height = decoded.height() as usize;
+                                    let y_len = frame.y_stride * height;
+                                    let u_len = frame.u_stride * (height / 2);
+                                    let v_len = frame.v_stride * (height / 2);
+                                    
+                                    frame.y_plane.clear();
+                                    let ptr_y = decoded.data(0).as_ptr();
+                                    if !ptr_y.is_null() && y_len > 0 {
+                                        frame.y_plane.extend_from_slice(unsafe { std::slice::from_raw_parts(ptr_y, y_len) });
+                                    }
+                                    
+                                    frame.u_plane.clear();
+                                    let ptr_u = decoded.data(1).as_ptr();
+                                    if !ptr_u.is_null() && u_len > 0 {
+                                        frame.u_plane.extend_from_slice(unsafe { std::slice::from_raw_parts(ptr_u, u_len) });
+                                    }
+                                    
+                                    frame.v_plane.clear();
+                                    let ptr_v = decoded.data(2).as_ptr();
+                                    if !ptr_v.is_null() && v_len > 0 {
+                                        frame.v_plane.extend_from_slice(unsafe { std::slice::from_raw_parts(ptr_v, v_len) });
+                                    }
+                                    
+                                    if let Err(crossbeam_channel::TrySendError::Full(f)) = video_frame_tx.try_send(frame) {
+                                        let _ = free_video_frame_tx.try_send(f);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+    
     for _ in 0..pool_size {
         let _ = free_tx.try_send(AudioChunk {
             samples: vec![0.0; chunk_frames * hardware_channels],
@@ -1013,12 +1315,14 @@ where
     let state_for_decoder = shared_state.clone();
     let ready_rx_for_decoder = ready_rx.clone();
     let free_tx_for_decoder = free_tx.clone();
+    let video_rx_for_decoder = video_packet_rx.clone();
     
     std::thread::spawn(move || {
         loop {
             if let Ok(mut state) = state_for_decoder.try_lock() {
                 if let Some(pos) = state.seek_request.take() {
                     audio_source.set_position_seconds(pos);
+                    state.seek_epoch += 1;
                     while let Ok(chunk) = ready_rx_for_decoder.try_recv() {
                         let _ = free_tx_for_decoder.try_send(chunk);
                     }
@@ -1078,6 +1382,8 @@ where
                 state.stats.decode_us = state.stats.decode_us * 0.9 + decode_elapsed * 0.1;
                 let fill_pct = (ready_rx_for_decoder.len() as f32 / pool_size as f32) * 100.0;
                 state.stats.audio_buffer_fill_pct = fill_pct;
+                let video_pct = (video_rx_for_decoder.len() as f32 / 256.0) * 100.0;
+                state.stats.video_buffer_fill_pct = video_pct;
             }
             
             if ready_tx.send(chunk).is_err() {
