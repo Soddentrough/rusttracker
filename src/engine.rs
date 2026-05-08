@@ -881,7 +881,7 @@ impl<'a> VulkanEngine<'a> {
             smooth_time: self.start_time.elapsed().as_secs_f32(),
             heatmap_row: self.heatmap_row,
             fft_channels: state.raw_audio_channels.len() as u32,
-            num_spatial_channels: state.num_spatial_channels,
+            num_spatial_channels: state.channel_vus.len().saturating_sub(state.tracker_channels.unwrap_or(0) as usize) as u32,
             ui_meters_rect: self.meters_uv_rect,
             ui_heatmap_rect: self.heatmap_uv_rect,
             ui_fire_rect: self.fire_uv_rect,
@@ -910,8 +910,8 @@ impl<'a> VulkanEngine<'a> {
         }
         
         // 2. Populate Raw Spatial Channels (strict spatial mapping without UI reordering)
-        let spatial_offset = state.tracker_channels.unwrap_or(0);
-        let spatial_count = state.num_spatial_channels as usize;
+        let spatial_offset = state.tracker_channels.unwrap_or(0) as usize;
+        let spatial_count = state.channel_vus.len().saturating_sub(spatial_offset);
         for i in 0..spatial_count {
             let src_idx = spatial_offset + i;
             if src_idx < state.channel_vus.len() && i < 16 {
