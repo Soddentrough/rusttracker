@@ -907,6 +907,10 @@ impl<'a> VulkanEngine<'a> {
                             egui::RichText::new("Fire FX: 0.00 ms (GPU Offloaded)")
                                 .color(egui::Color32::GRAY)
                         );
+                        ui.label(
+                            egui::RichText::new(format!("Audio Buffer: {:.1}%", state.stats.audio_buffer_fill_pct))
+                                .color(if state.stats.audio_buffer_fill_pct < 20.0 { egui::Color32::RED } else { egui::Color32::GREEN })
+                        );
                     });
             }
 

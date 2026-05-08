@@ -41,6 +41,7 @@ rfd = "0.17.2"
 image = "0.25.10"
 ffmpeg-next = "8.1.0"
 rustfft = "6.4.1"
+ringbuf = "0.5.0"
 
 [build-dependencies]
 winres = "0.1.12"

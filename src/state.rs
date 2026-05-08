@@ -9,6 +9,7 @@ pub struct PerformanceStats {
     pub shader_us: f32,
     pub fire_us: f32,
     pub gpu_fft_us: f32,
+    pub audio_buffer_fill_pct: f32,
 }
 
 #[derive(Debug, Clone)]

@@ -953,6 +953,24 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
     Ok(stream)
 }
 
+
+struct AudioChunk {
+    samples: Vec<f32>,
+    valid_frames: usize,
+    channel_vus: Vec<f32>,
+    left_peak: f32,
+    right_peak: f32,
+    current_order: i32,
+    current_row: i32,
+    bpm: i32,
+    speed: i32,
+    current_seconds: f64,
+    current_row_string: String,
+    tracker_channels: Option<i32>,
+    spatial_channels: i32,
+    track_ended: bool,
+}
+
 fn run<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
@@ -966,13 +984,127 @@ where
     T: cpal::Sample + cpal::FromSample<f32> + cpal::SizedSample,
 {
     let hardware_channels = config.channels as usize;
-    let mut interleaved_buffer: Vec<f32> = vec![0.0; 8192 * hardware_channels];
+    
+    let chunk_frames = 1024;
+    let pool_size = 64; 
+    
+    let (ready_tx, ready_rx) = crossbeam_channel::bounded::<AudioChunk>(pool_size);
+    let (free_tx, free_rx) = crossbeam_channel::bounded::<AudioChunk>(pool_size);
+    
+    for _ in 0..pool_size {
+        let _ = free_tx.try_send(AudioChunk {
+            samples: vec![0.0; chunk_frames * hardware_channels],
+            valid_frames: 0,
+            channel_vus: Vec::with_capacity(32),
+            left_peak: 0.0,
+            right_peak: 0.0,
+            current_order: 0,
+            current_row: 0,
+            bpm: 0,
+            speed: 0,
+            current_seconds: 0.0,
+            current_row_string: String::with_capacity(128),
+            tracker_channels: None,
+            spatial_channels: 0,
+            track_ended: false,
+        });
+    }
+    
+    let state_for_decoder = shared_state.clone();
+    let ready_rx_for_decoder = ready_rx.clone();
+    let free_tx_for_decoder = free_tx.clone();
+    
+    std::thread::spawn(move || {
+        loop {
+            if let Ok(mut state) = state_for_decoder.try_lock() {
+                if let Some(pos) = state.seek_request.take() {
+                    audio_source.set_position_seconds(pos);
+                    while let Ok(chunk) = ready_rx_for_decoder.try_recv() {
+                        let _ = free_tx_for_decoder.try_send(chunk);
+                    }
+                }
+            }
+            
+            let mut chunk = match free_rx.recv() {
+                Ok(c) => c,
+                Err(_) => break, // CPAL died
+            };
+            
+            let decode_start = Instant::now();
+            let frames_read = audio_source.read_frames(hardware_channels, sample_rate, &mut chunk.samples[..chunk_frames * hardware_channels]);
+            let decode_elapsed = decode_start.elapsed().as_micros() as f32;
+            
+            chunk.valid_frames = frames_read;
+            chunk.current_order = audio_source.get_current_order();
+            chunk.current_row = audio_source.get_current_row();
+            chunk.bpm = audio_source.get_tempo();
+            chunk.speed = audio_source.get_speed();
+            chunk.current_seconds = audio_source.get_position_seconds();
+            chunk.current_row_string.clear();
+            chunk.current_row_string.push_str(&audio_source.get_current_row_string());
+            chunk.tracker_channels = audio_source.get_tracker_channels();
+            chunk.spatial_channels = audio_source.get_num_channels();
+            chunk.track_ended = frames_read == 0;
+            
+            let mut left_peak = 0.0_f32;
+            let mut right_peak = 0.0_f32;
+            for i in 0..frames_read {
+                left_peak = left_peak.max(chunk.samples[i * hardware_channels].abs());
+                if hardware_channels > 1 {
+                    right_peak = right_peak.max(chunk.samples[i * hardware_channels + 1].abs());
+                } else {
+                    right_peak = left_peak;
+                }
+            }
+            chunk.left_peak = left_peak;
+            chunk.right_peak = right_peak;
+            
+            let mut channel_vus = Vec::new();
+            if let Some(num_mod_channels) = chunk.tracker_channels {
+                channel_vus.push(left_peak);
+                for i in 0..num_mod_channels {
+                    channel_vus.push(audio_source.get_current_channel_vu_mono(i));
+                }
+                channel_vus.push(right_peak);
+            } else {
+                for i in 0..chunk.spatial_channels {
+                    channel_vus.push(audio_source.get_current_channel_vu_mono(i));
+                }
+            }
+            chunk.channel_vus.clear();
+            chunk.channel_vus.extend_from_slice(&channel_vus);
+            
+            if let Ok(mut state) = state_for_decoder.try_lock() {
+                state.stats.decode_us = state.stats.decode_us * 0.9 + decode_elapsed * 0.1;
+                let fill_pct = (ready_rx_for_decoder.len() as f32 / pool_size as f32) * 100.0;
+                state.stats.audio_buffer_fill_pct = fill_pct;
+            }
+            
+            if ready_tx.send(chunk).is_err() {
+                break;
+            }
+            
+            if frames_read == 0 {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    });
+
+    let mut current_chunk: Option<AudioChunk> = None;
+    let mut chunk_frame_pos = 0;
     
     let mut fft_buffer: Vec<f32> = vec![0.0; 8192];
     let mut channel_fft_buffers: Vec<Vec<f32>> = vec![vec![0.0; 8192]; hardware_channels];
     let mut windowed_buffer: Vec<f32> = vec![0.0; 8192];
     let mut fft_index = 0;
     
+    let mut last_channel_vus = Vec::new();
+    let mut last_current_order = 0;
+    let mut last_current_row = 0;
+    let mut last_bpm = 0;
+    let mut last_speed = 0;
+    let mut last_current_seconds = 0.0;
+    let mut last_current_row_string = String::new();
     let mut was_paused = false;
 
     let stream = device.build_output_stream(
@@ -994,57 +1126,73 @@ where
             }
 
             let frames_to_render = data.len() / hardware_channels;
-
-            let needed_len = frames_to_render * hardware_channels;
-            if interleaved_buffer.len() < needed_len {
-                interleaved_buffer.resize(needed_len, 0.0);
-            }
-
-            let decode_start = Instant::now();
-            let frames_read = audio_source.read_frames(
-                hardware_channels,
-                sample_rate,
-                &mut interleaved_buffer[..needed_len],
-            );
-            let decode_elapsed = decode_start.elapsed().as_micros() as f32;
+            let mut frames_written = 0;
             
-            if frames_read == 0 {
-                if let Ok(mut state) = shared_state.try_lock() {
-                    state.track_ended = true;
-                }
-            }
-
-            let mut left_peak = 0.0_f32;
-            let mut right_peak = 0.0_f32;
-
-            for (i, frame) in data.chunks_mut(hardware_channels).enumerate() {
-                if i < frames_read {
-                    let mut mono = 0.0;
-                    for c in 0..hardware_channels {
-                        let sample = interleaved_buffer[i * hardware_channels + c].clamp(-1.0, 1.0);
-                        frame[c] = T::from_sample(sample);
-                        mono += sample;
-                        
-                        if c == 0 {
-                            left_peak = left_peak.max(sample.abs());
-                        } else if c == 1 {
-                            right_peak = right_peak.max(sample.abs());
+            while frames_written < frames_to_render {
+                if current_chunk.is_none() {
+                    match ready_rx.try_recv() {
+                        Ok(chunk) => {
+                            last_channel_vus.clear();
+                            last_channel_vus.extend_from_slice(&chunk.channel_vus);
+                            last_current_order = chunk.current_order;
+                            last_current_row = chunk.current_row;
+                            last_bpm = chunk.bpm;
+                            last_speed = chunk.speed;
+                            last_current_seconds = chunk.current_seconds;
+                            last_current_row_string.clear();
+                            last_current_row_string.push_str(&chunk.current_row_string);
+                            
+                            if chunk.track_ended {
+                                if let Ok(mut state) = shared_state.try_lock() {
+                                    state.track_ended = true;
+                                }
+                            }
+                            
+                            current_chunk = Some(chunk);
+                            chunk_frame_pos = 0;
+                        }
+                        Err(_) => {
+                            for frame in data[frames_written * hardware_channels..].chunks_mut(hardware_channels) {
+                                for sample in frame.iter_mut() {
+                                    *sample = T::from_sample(0.0);
+                                }
+                            }
+                            break;
                         }
                     }
-                    if hardware_channels == 1 {
-                        right_peak = left_peak; // Mono fallback
-                    }
-                    mono /= hardware_channels as f32;
+                }
+                
+                if let Some(chunk) = current_chunk.as_mut() {
+                    let frames_available = chunk.valid_frames.saturating_sub(chunk_frame_pos);
+                    let frames_needed = frames_to_render - frames_written;
                     
-                    fft_buffer[fft_index] = mono;
-                    for c in 0..hardware_channels {
-                        channel_fft_buffers[c][fft_index] = interleaved_buffer[i * hardware_channels + c].clamp(-1.0, 1.0);
+                    if frames_available == 0 {
+                        let c = current_chunk.take().unwrap();
+                        let _ = free_tx.try_send(c);
+                        continue;
                     }
-                    fft_index = (fft_index + 1) % 8192;
-                } else {
-                    for sample in frame.iter_mut() {
-                        *sample = T::from_sample(0.0);
+                    
+                    let to_copy = std::cmp::min(frames_available, frames_needed);
+                    
+                    for i in 0..to_copy {
+                        let src_frame_idx = chunk_frame_pos + i;
+                        let dst_frame_idx = frames_written + i;
+                        
+                        let mut mono = 0.0;
+                        for c in 0..hardware_channels {
+                            let sample = chunk.samples[src_frame_idx * hardware_channels + c].clamp(-1.0, 1.0);
+                            data[dst_frame_idx * hardware_channels + c] = T::from_sample(sample);
+                            mono += sample;
+                            channel_fft_buffers[c][fft_index] = sample;
+                        }
+                        mono /= hardware_channels as f32;
+                        
+                        fft_buffer[fft_index] = mono;
+                        fft_index = (fft_index + 1) % 8192;
                     }
+                    
+                    chunk_frame_pos += to_copy;
+                    frames_written += to_copy;
                 }
             }
 
@@ -1057,47 +1205,23 @@ where
                 }
             }
             
-            let mut channel_vus = Vec::new();
-            if let Some(num_mod_channels) = audio_source.get_tracker_channels() {
-                // Tracker module layout: [L, Track1, Track2, ..., TrackN, R]
-                channel_vus.push(left_peak);
-                for i in 0..num_mod_channels {
-                    channel_vus.push(audio_source.get_current_channel_vu_mono(i));
-                }
-                channel_vus.push(right_peak);
-            } else {
-                // Media file layout: [FL, FR, FC, LFE, ...]
-                let num_spatial_channels = audio_source.get_num_channels();
-                for i in 0..num_spatial_channels {
-                    channel_vus.push(audio_source.get_current_channel_vu_mono(i));
-                }
-            }
-
             let msg = DspMessage {
                 audio_data: windowed_buffer.clone(),
-                channel_vus,
-                current_order: audio_source.get_current_order(),
-                current_row: audio_source.get_current_row(),
-                bpm: audio_source.get_tempo(),
-                speed: audio_source.get_speed(),
-                current_seconds: audio_source.get_position_seconds(),
-                current_row_string: audio_source.get_current_row_string(),
+                channel_vus: last_channel_vus.clone(),
+                current_order: last_current_order,
+                current_row: last_current_row,
+                bpm: last_bpm,
+                speed: last_speed,
+                current_seconds: last_current_seconds,
+                current_row_string: last_current_row_string.clone(),
                 channel_audio_data: windowed_channels,
             };
             
             let _ = tx.try_send(msg);
-
-            if let Ok(mut state) = shared_state.try_lock() {
-                state.stats.decode_us = state.stats.decode_us * 0.9 + decode_elapsed * 0.1;
-                if let Some(pos) = state.seek_request.take() {
-                    audio_source.set_position_seconds(pos);
-                }
-            }
         },
         |err| eprintln!("an error occurred on stream: {}", err),
         None,
     )?;
-
 
     Ok(stream)
 }
