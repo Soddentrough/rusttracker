@@ -21,7 +21,8 @@ pub struct AudioUniforms {
     pub time: f32,
     pub duration: f32,
     pub smooth_time: f32,
-    pub _pad: [u32; 3],
+    pub heatmap_row: u32,
+    pub _pad: [u32; 2],
     pub ui_meters_rect: [f32; 4],
     pub ui_heatmap_rect: [f32; 4],
     pub ui_fire_rect: [f32; 4],
@@ -30,10 +31,25 @@ pub struct AudioUniforms {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct WaveformHistoryStorage {
-    pub waveforms: [[f32; 1024]; 60],
+    pub waveforms: [[f32; 1024]; 8],  // only the 8 most recent frames (was 60)
 }
 
-// Removed VisualizerStorage
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct FireParams {
+    pub bass: f32,
+    pub mids: f32,
+    pub highs: f32,
+    pub time: f32,
+    pub cooling_factor: f32,
+    pub turb_spread_f: f32,
+    pub width: u32,
+    pub height: u32,
+    pub num_channels: u32,
+    pub lfe_idx: u32,
+    pub _pad: [u32; 2],
+    pub channels: [[f32; 4]; 8],
+}
 
 pub struct VulkanEngine<'a> {
     surface: wgpu::Surface<'a>,
@@ -45,6 +61,7 @@ pub struct VulkanEngine<'a> {
     hud_pipeline: wgpu::RenderPipeline,
     uniform_buffer: wgpu::Buffer,
     waveform_storage_buffer: wgpu::Buffer,
+    #[allow(dead_code)] // accessed via GPU bind groups, not directly from Rust
     history_texture: wgpu::Texture,
     fire_grid_texture: wgpu::Texture,
     uniform_bind_group: wgpu::BindGroup,
@@ -58,10 +75,21 @@ pub struct VulkanEngine<'a> {
     pub meters_uv_rect: [f32; 4],
     pub heatmap_uv_rect: [f32; 4],
     pub fire_uv_rect: [f32; 4],
-    fire_grid: Box<[f32; 147456]>,
-    last_fire_time: f32,
-    last_log_time: f32,
     
+    // GPU compute fire simulation
+    fire_compute_pipeline: wgpu::ComputePipeline,
+    fire_buffer_a: wgpu::Buffer,
+    fire_buffer_b: wgpu::Buffer,
+    #[allow(dead_code)] // accessed via GPU bind groups, not directly from Rust
+    fire_coal_buffer: wgpu::Buffer,
+    fire_params_buffer: wgpu::Buffer,
+    fire_bind_group_a: wgpu::BindGroup, // reads A, writes B
+    fire_bind_group_b: wgpu::BindGroup, // reads B, writes A
+    fire_ping: bool,
+    
+    pub heatmap_row: u32,
+    heatmap_compute_pipeline: wgpu::ComputePipeline,
+    heatmap_bind_group: wgpu::BindGroup,
     pub start_time: std::time::Instant,
 }
 
@@ -148,14 +176,14 @@ impl<'a> VulkanEngine<'a> {
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
             format: wgpu::TextureFormat::R32Float,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
             view_formats: &[],
         });
         let history_view = history_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
         let fire_grid_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Fire Grid Texture"),
-            size: wgpu::Extent3d { width: 1024, height: 144, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d { width: 1024, height: 576, depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -332,6 +360,103 @@ impl<'a> VulkanEngine<'a> {
 
         let egui_renderer = egui_wgpu::Renderer::new(&device, config.format, egui_wgpu::RendererOptions::default());
 
+        // --- Fire Compute Pipeline ---
+        let fire_grid_size = 1024 * 576 * 4; // 1024 × 576 × f32
+        let fire_buffer_a = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Fire Grid A"),
+            size: fire_grid_size as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let fire_buffer_b = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Fire Grid B"),
+            size: fire_grid_size as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let fire_coal_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Coal Bed"),
+            size: (1024 * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let fire_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Fire Params"),
+            size: std::mem::size_of::<FireParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+
+        let heatmap_compute_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("heatmap_compute_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format: wgpu::TextureFormat::R32Float, view_dimension: wgpu::TextureViewDimension::D2 }, count: None },
+            ],
+        });
+        let heatmap_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("heatmap_bind_group"), layout: &heatmap_compute_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniform_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&history_view) },
+            ],
+        });
+        let heatmap_compute_shader = device.create_shader_module(wgpu::include_wgsl!("shaders/heatmap_compute.wgsl"));
+        let heatmap_compute_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("heatmap_compute_layout"), bind_group_layouts: &[Some(&heatmap_compute_layout)], immediate_size: 0,
+        });
+        let heatmap_compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Heatmap Compute Pipeline"), layout: Some(&heatmap_compute_pipeline_layout), module: &heatmap_compute_shader, entry_point: Some("main"), compilation_options: wgpu::PipelineCompilationOptions::default(), cache: None,
+        });
+        let fire_compute_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("fire_compute_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+            ],
+        });
+
+        let fire_bind_group_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fire_bg_a"), layout: &fire_compute_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: fire_buffer_a.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: fire_buffer_b.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: fire_coal_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: fire_params_buffer.as_entire_binding() },
+            ],
+        });
+        let fire_bind_group_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fire_bg_b"), layout: &fire_compute_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: fire_buffer_b.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: fire_buffer_a.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: fire_coal_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 3, resource: fire_params_buffer.as_entire_binding() },
+            ],
+        });
+
+        let fire_compute_shader = device.create_shader_module(wgpu::include_wgsl!("shaders/fire_compute.wgsl"));
+        let fire_compute_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("fire_compute_layout"),
+            bind_group_layouts: &[Some(&fire_compute_layout)],
+            immediate_size: 0,
+        });
+        let fire_compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Fire Compute Pipeline"),
+            layout: Some(&fire_compute_pipeline_layout),
+            module: &fire_compute_shader,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
         let mut query_set = None;
         let mut query_resolve_buffer = None;
         let mut query_read_buffer = None;
@@ -381,9 +506,17 @@ impl<'a> VulkanEngine<'a> {
             meters_uv_rect: [0.0; 4],
             heatmap_uv_rect: [0.0; 4],
             fire_uv_rect: [0.0; 4],
-            fire_grid: vec![0.0; 147456].into_boxed_slice().try_into().unwrap(),
-            last_fire_time: 0.0,
-            last_log_time: 0.0,
+            fire_compute_pipeline,
+            fire_buffer_a,
+            fire_buffer_b,
+            fire_coal_buffer,
+            fire_params_buffer,
+            fire_bind_group_a,
+            fire_bind_group_b,
+            fire_ping: false,
+            heatmap_row: 0,
+            heatmap_compute_pipeline,
+            heatmap_bind_group,
             start_time: std::time::Instant::now(),
         }
     }
@@ -398,6 +531,7 @@ impl<'a> VulkanEngine<'a> {
     }
 
     pub fn update(&mut self, state: &AppState) {
+        self.heatmap_row = (self.heatmap_row + 1) % 120;
         let mut uniforms = AudioUniforms {
             spectrum: [0.0; 1024],
             fire_heat: [0.0; 1024],
@@ -408,7 +542,8 @@ impl<'a> VulkanEngine<'a> {
             time: state.current_seconds as f32,
             duration: state.duration_seconds as f32,
             smooth_time: self.start_time.elapsed().as_secs_f32(),
-            _pad: [0; 3],
+            heatmap_row: self.heatmap_row,
+            _pad: [0; 2],
             ui_meters_rect: self.meters_uv_rect,
             ui_heatmap_rect: self.heatmap_uv_rect,
             ui_fire_rect: self.fire_uv_rect,
@@ -416,13 +551,6 @@ impl<'a> VulkanEngine<'a> {
 
         uniforms.spectrum.copy_from_slice(&state.spectrum_data);
         uniforms.fire_heat.copy_from_slice(&state.fire_heat);
-        
-        let mut history_storage = WaveformHistoryStorage {
-            waveforms: [[0.0; 1024]; 60],
-        };
-        for (i, wave) in state.waveform_history.iter().enumerate().take(60) {
-            history_storage.waveforms[i].copy_from_slice(wave);
-        }
         
         let ch_len = state.channel_vus.len().min(32);
         
@@ -443,180 +571,61 @@ impl<'a> VulkanEngine<'a> {
         }
 
         self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
-        self.queue.write_buffer(&self.waveform_storage_buffer, 0, bytemuck::cast_slice(&[history_storage]));
-        
-        struct VisualizerStorage {
-            history: [f32; 30720],
-            fire_grid: [f32; 147456],
-        }
-        let mut visualizer_storage = Box::new(VisualizerStorage {
-            history: [0.0; 30720],
-            fire_grid: [0.0; 147456],
-        });
-        let chunks = 256;
-        let history_len = state.spectrum_history.len().min(120);
-        if history_len > 0 {
-            for (time_idx, bands) in state.spectrum_history.iter().take(120).enumerate() {
-                let current_bands = bands.len();
-                for x in 0..chunks {
-                    let mut max_val = 0.0;
-                    if current_bands >= chunks {
-                        let scale_start = (x as f32 / chunks as f32).powf(2.0);
-                        let scale_end = ((x + 1) as f32 / chunks as f32).powf(2.0);
-                        let start_idx = (scale_start * current_bands as f32) as usize;
-                        let end_idx = ((scale_end * current_bands as f32) as usize).max(start_idx + 1);
-                        
-                        for idx in start_idx..end_idx {
-                            if idx < current_bands && bands[idx] > max_val {
-                                max_val = bands[idx];
-                            }
-                        }
-                    } else {
-                        let chunk_size = (current_bands / chunks).max(1);
-                        for k in 0..chunk_size {
-                            let idx = x * chunk_size + k;
-                            if idx < current_bands && bands[idx] > max_val {
-                                max_val = bands[idx];
-                            }
-                        }
-                    }
-                    let flat_idx = time_idx * chunks + x;
-                    visualizer_storage.history[flat_idx] = max_val;
+
+        // Only upload waveform history when the oscilloscope visualizer is active
+        if state.visualizer_mode == 2 {
+            let mut history_storage = WaveformHistoryStorage {
+                waveforms: [[0.0; 1024]; 8],
+            };
+            // Upload only the 8 most recent frames (32KB vs 240KB)
+            let hist_len = state.waveform_history.len();
+            let start = hist_len.saturating_sub(8);
+            for (slot, wave) in state.waveform_history.iter().skip(start).enumerate().take(8) {
+                // Pre-smooth with [1,2,1] triangle kernel
+                history_storage.waveforms[slot][0] = (wave[0] * 3.0 + wave[1]) / 4.0;
+                for j in 1..1023 {
+                    history_storage.waveforms[slot][j] = (wave[j - 1] + wave[j] * 2.0 + wave[j + 1]) / 4.0;
                 }
+                history_storage.waveforms[slot][1023] = (wave[1022] + wave[1023] * 3.0) / 4.0;
             }
+            self.queue.write_buffer(&self.waveform_storage_buffer, 0, bytemuck::cast_slice(&[history_storage]));
         }
         
-        // Classic Doom Fire Cellular Automaton
         if state.visualizer_mode == 1 {
-            let current_time = self.start_time.elapsed().as_secs_f32();
-            if self.last_fire_time == 0.0 {
-                self.last_fire_time = current_time;
-            }
+            let mut bass_sum = 0.0;
+            let mut mids_sum = 0.0;
+            let mut highs_sum = 0.0;
+            for i in 0..64 { bass_sum += uniforms.fire_heat[i]; }
+            let bass = (bass_sum / 64.0 / 100.0).min(1.0);
+            for i in 64..512 { mids_sum += uniforms.fire_heat[i]; }
+            let mids = (mids_sum / 448.0 / 100.0).min(1.0);
+            for i in 512..1024 { highs_sum += uniforms.fire_heat[i]; }
+            let highs = (highs_sum / 512.0 / 100.0).min(1.0);
             
-            let mut seed = (current_time * 1000.0) as u32;
-            let mut rng = || {
-                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
-                seed
+            let n_ch = state.channel_vus.len().max(1).min(32);
+            let lfe_idx = if n_ch == 6 { 3 } else if n_ch == 8 { 4 } else { 999 };
+            
+            let mut fire_params = FireParams {
+                bass,
+                mids,
+                highs,
+                time: self.start_time.elapsed().as_secs_f32(),
+                cooling_factor: 1.3 - mids * 0.6,
+                turb_spread_f: 1.0 + highs * 3.0,
+                width: 1024,
+                height: 576,
+                num_channels: n_ch as u32,
+                lfe_idx: lfe_idx as u32,
+                _pad: [0; 2],
+                channels: [[0.0; 4]; 8],
             };
             
-            // Run at a fixed 60Hz timestep to prevent 800+ FPS visual blowout
-            while current_time - self.last_fire_time >= 1.0 / 60.0 {
-                self.last_fire_time += 1.0 / 60.0;
-                
-                // 1. Propagate Heat Upwards
-                for y in 0usize..143 {
-                    for x in 0usize..1024 {
-                        // Random spread (-1, 0, +1)
-                        let spread = (rng() % 3) as i32 - 1;
-                        let src_x = (x as i32 + spread).clamp(0, 1023) as usize;
-                        
-                        let heat = self.fire_grid[(y + 1) * 1024 + src_x];
-                        
-                        // Base cooling
-                        let mut cooling = (rng() % 3) as f32 * 0.015;
-                        
-                        // Occasionally "bite" a large chunk of heat out to create detached rising sparks
-                        if rng() % 100 < 3 {
-                            cooling += 0.15;
-                        }
-                        
-                        self.fire_grid[y * 1024 + x] = (heat - cooling).max(0.0);
-                    }
-                }
-                
-                // 2. Inject Fuel at the bottom (y = 143)
-                let n_ch = state.channel_vus.len().max(1).min(32);
-                let lfe_idx = if n_ch == 6 { 3 } else if n_ch == 8 { 4 } else { 999 };
-                
-                // We divide the screen width by the number of SPATIAL channels (excluding LFE)
-                // This guarantees the Center channel (which is exactly in the middle of the remaining channels)
-                // is mapped perfectly to x = 512.
-                let n_spatial_ch = if lfe_idx < n_ch { n_ch - 1 } else { n_ch };
-                let channel_width = 1024.0 / n_spatial_ch as f32;
-                
-                let mut base_lfe_fuel = 0.0;
-                if lfe_idx < n_ch {
-                    let ch_vu = uniforms.channels[lfe_idx];
-                    let ch_peak = uniforms.channel_peaks[lfe_idx];
-                    // LFE power
-                    base_lfe_fuel = (ch_vu + ch_peak * 0.5) * 0.6;
-                }
-                
-                for x in 0usize..1024 {
-                    // Apply a tighter normal distribution (Bell Curve) to the LFE bed
-                    // Centered at 512, fades sharply towards the edges
-                    let lfe_dist = (x as f32 - 512.0).abs();
-                    let lfe_sigma = 70.0;
-                    let lfe_influence = (- (lfe_dist * lfe_dist) / (2.0 * lfe_sigma * lfe_sigma)).exp();
-                    
-                    let mut fuel = base_lfe_fuel * lfe_influence;
-                    
-                    let mut spatial_idx = 0;
-                    for i in 0..n_ch {
-                        if i == lfe_idx { continue; } // Skip LFE as a spatial pillar
-                        
-                        let center_x = (spatial_idx as f32 + 0.5) * channel_width;
-                        let dist = (x as f32 - center_x).abs();
-                        
-                        let ch_vu = uniforms.channels[i];
-                        let ch_peak = uniforms.channel_peaks[i];
-                        
-                        // Narrow the Gaussian so channels don't merge into a giant blob
-                        let sigma = channel_width * 0.15;
-                        let influence = (- (dist * dist) / (2.0 * sigma * sigma)).exp();
-                        
-                        // Base fuel + sudden spikes from peaks
-                        fuel += (ch_vu + ch_peak * 0.5) * influence;
-                        
-                        spatial_idx += 1;
-                    }
-                    
-                    // Aggressive spatial jitter to break up the smooth Gaussian curve
-                    let jitter = (rng() % 100) as f32 / 100.0;
-                    fuel *= 0.4 + 0.6 * jitter; // Huge variance
-                    
-                    self.fire_grid[143 * 1024 + x] = fuel.max(0.0).min(1.0);
-                }
+            for i in 0..n_ch {
+                fire_params.channels[i / 4][i % 4] = uniforms.channels[i];
             }
             
-            visualizer_storage.fire_grid.copy_from_slice(&*self.fire_grid);
+            self.queue.write_buffer(&self.fire_params_buffer, 0, bytemuck::cast_slice(&[fire_params]));
         }
-
-
-
-        let history_bytes: &[u8] = bytemuck::cast_slice(&visualizer_storage.history);
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.history_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            history_bytes,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(256 * 4),
-                rows_per_image: Some(120),
-            },
-            wgpu::Extent3d { width: 256, height: 120, depth_or_array_layers: 1 },
-        );
-
-        let fire_grid_bytes: &[u8] = bytemuck::cast_slice(&visualizer_storage.fire_grid);
-        self.queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &self.fire_grid_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            fire_grid_bytes,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(1024 * 4),
-                rows_per_image: Some(144),
-            },
-            wgpu::Extent3d { width: 1024, height: 144, depth_or_array_layers: 1 },
-        );
     }
 
     pub fn render(
@@ -1104,6 +1113,51 @@ impl<'a> VulkanEngine<'a> {
             &clipped_primitives,
             &screen_descriptor,
         );
+
+
+        // GPU heatmap compute
+        {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Heatmap Compute Pass"),
+                timestamp_writes: None,
+            });
+            compute_pass.set_pipeline(&self.heatmap_compute_pipeline);
+            compute_pass.set_bind_group(0, Some(&self.heatmap_bind_group), &[]);
+            compute_pass.dispatch_workgroups(1, 1, 1); // 256x1x1 threads
+        }
+        // GPU fire compute: dispatch simulation + copy result to texture
+        if state.visualizer_mode == 1 {
+            {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Fire Compute"),
+                    timestamp_writes: None,
+                });
+                compute_pass.set_pipeline(&self.fire_compute_pipeline);
+                let bg = if self.fire_ping { &self.fire_bind_group_a } else { &self.fire_bind_group_b };
+                compute_pass.set_bind_group(0, Some(bg), &[]);
+                compute_pass.dispatch_workgroups(64, 36, 1); // 1024/16=64, 576/16=36
+            }
+            // Copy output buffer to fire_grid_texture
+            let output_buffer = if self.fire_ping { &self.fire_buffer_b } else { &self.fire_buffer_a };
+            encoder.copy_buffer_to_texture(
+                wgpu::TexelCopyBufferInfo {
+                    buffer: output_buffer,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(1024 * 4),
+                        rows_per_image: Some(576),
+                    },
+                },
+                wgpu::TexelCopyTextureInfo {
+                    texture: &self.fire_grid_texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::Extent3d { width: 1024, height: 576, depth_or_array_layers: 1 },
+            );
+            self.fire_ping = !self.fire_ping;
+        }
 
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {

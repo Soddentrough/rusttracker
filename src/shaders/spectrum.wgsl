@@ -22,7 +22,7 @@ struct AudioUniforms {
     time: f32,
     duration: f32,
     smooth_time: f32,
-    _pad1: u32,
+    heatmap_row: u32,
     _pad2: u32,
     _pad3: u32,
     ui_meters_rect: vec4<f32>,

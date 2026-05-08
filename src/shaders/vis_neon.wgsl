@@ -23,7 +23,7 @@ struct AudioUniforms {
     time: f32,
     duration: f32,
     smooth_time: f32,
-    _pad1: u32,
+    heatmap_row: u32,
     _pad2: u32,
     _pad3: u32,
     ui_meters_rect: vec4<f32>,
@@ -34,212 +34,254 @@ struct AudioUniforms {
 @group(0) @binding(0)
 var<uniform> audio: AudioUniforms;
 
-struct MapData {
-    d: f32,
-    mat_id: i32,
-    glow: vec3<f32>,
-}
-
 fn get_vu(i: u32) -> f32 {
-    let vec_idx = i / 4u;
-    let comp_idx = i % 4u;
-    var vu = 0.0;
-    if comp_idx == 0u { vu = audio.channels[vec_idx].x; }
-    else if comp_idx == 1u { vu = audio.channels[vec_idx].y; }
-    else if comp_idx == 2u { vu = audio.channels[vec_idx].z; }
-    else { vu = audio.channels[vec_idx].w; }
-    return clamp(vu, 0.0, 1.0);
+    let v = audio.channels[i / 4u];
+    let c = i % 4u;
+    if (c == 0u) { return v.x; } else if (c == 1u) { return v.y; }
+    else if (c == 2u) { return v.z; } else { return v.w; }
 }
 
-// Fixed camera Z
-const CAM_Z: f32 = -4.5;
+struct ChannelMap {
+    front_l: f32,
+    front_r: f32,
+    center: f32,
+    lfe: f32,
+    surr_l: f32,
+    surr_r: f32,
+    rear_l: f32,
+    rear_r: f32,
+};
 
-fn map(p: vec3<f32>) -> MapData {
-    var total_glow = vec3<f32>(0.0);
+fn get_channels() -> ChannelMap {
+    var m: ChannelMap;
+    let n = audio.num_channels;
+    if (n <= 2u) {
+        let l = clamp(get_vu(0u), 0.0, 1.0);
+        let r = clamp(get_vu(min(1u, n - 1u)), 0.0, 1.0);
+        m.front_l = l; m.front_r = r;
+        m.center = (l + r) * 0.5;
+        m.lfe = (l + r) * 0.3;
+        m.surr_l = l * 0.5; m.surr_r = r * 0.5;
+        m.rear_l = l * 0.3; m.rear_r = r * 0.3;
+    } else if (n == 6u) {
+        m.front_l = clamp(get_vu(1u), 0.0, 1.0);
+        m.front_r = clamp(get_vu(4u), 0.0, 1.0);
+        m.center  = clamp(get_vu(2u), 0.0, 1.0);
+        m.lfe     = clamp(get_vu(3u), 0.0, 1.0);
+        m.surr_l  = clamp(get_vu(0u), 0.0, 1.0);
+        m.surr_r  = clamp(get_vu(5u), 0.0, 1.0);
+        m.rear_l  = m.surr_l * 0.5;
+        m.rear_r  = m.surr_r * 0.5;
+    } else {
+        m.front_l = clamp(get_vu(2u), 0.0, 1.0);
+        m.front_r = clamp(get_vu(5u), 0.0, 1.0);
+        m.center  = clamp(get_vu(3u), 0.0, 1.0);
+        m.lfe     = clamp(get_vu(4u), 0.0, 1.0);
+        m.surr_l  = clamp(get_vu(1u), 0.0, 1.0);
+        m.surr_r  = clamp(get_vu(6u), 0.0, 1.0);
+        m.rear_l  = clamp(get_vu(0u), 0.0, 1.0);
+        m.rear_r  = clamp(get_vu(min(7u, n - 1u)), 0.0, 1.0);
+    }
+    return m;
+}
+
+fn hash21(p: vec2<f32>) -> f32 {
+    var p3  = fract(vec3<f32>(p.xyx) * 0.1031);
+    p3 = p3 + dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+fn valueNoise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    return mix(mix(hash21(i + vec2<f32>(0.0,0.0)), hash21(i + vec2<f32>(1.0,0.0)), u.x),
+               mix(hash21(i + vec2<f32>(0.0,1.0)), hash21(i + vec2<f32>(1.0,1.0)), u.x), u.y);
+}
+
+// Intersects a ray with the infinite corridor planes. Returns vec4(t, nx, ny, nz)
+fn intersect_corridor(ro: vec3<f32>, rd: vec3<f32>) -> vec4<f32> {
+    var t = 1000.0;
+    var n = vec3<f32>(0.0);
     
-    // 1. Frequency Pillars (Receding down the corridor)
-    let spacing = 4.0;
-    let local_z = (p.z % spacing + spacing) % spacing - spacing/2.0;
-    let freq_global_z = p.z - local_z;
-    
-    // Only draw freq pillars if they are far away enough to not overlap with camera
-    var d_freq = 999.0;
-    if freq_global_z > -4.0 {
-        let dist_to_cam = max(0.0, freq_global_z - CAM_Z);
-        let freq_idx = min(u32(dist_to_cam / spacing), 63u);
-        
-        let vec_f_idx = freq_idx / 4u;
-        let comp_f_idx = freq_idx % 4u;
-        var freq_val = 0.0;
-        if comp_f_idx == 0u { freq_val = audio.spectrum[vec_f_idx].x; }
-        else if comp_f_idx == 1u { freq_val = audio.spectrum[vec_f_idx].y; }
-        else if comp_f_idx == 2u { freq_val = audio.spectrum[vec_f_idx].z; }
-        else { freq_val = audio.spectrum[vec_f_idx].w; }
-        
-        let pillar_r = 0.08;
-        let d_freq_l = length(vec2<f32>(p.x + 4.5, local_z)) - pillar_r;
-        let d_freq_r = length(vec2<f32>(p.x - 4.5, local_z)) - pillar_r;
-        d_freq = min(d_freq_l, d_freq_r);
-        
-        let freq_glow_col = vec3<f32>(1.0, 0.02, 0.0) * freq_val * 4.0;
-        total_glow += freq_glow_col * exp(-abs(d_freq) * 10.0);
+    // Floor (y = -1.5)
+    if (rd.y < -0.001) {
+        let tp = (-1.5 - ro.y) / rd.y;
+        if (tp > 0.0 && tp < t) { t = tp; n = vec3<f32>(0.0, 1.0, 0.0); }
+    }
+    // Ceiling (y = 3.0)
+    if (rd.y > 0.001) {
+        let tp = (3.0 - ro.y) / rd.y;
+        if (tp > 0.0 && tp < t) { t = tp; n = vec3<f32>(0.0, -1.0, 0.0); }
+    }
+    // Left Wall (x = -4.5)
+    if (rd.x < -0.001) {
+        let tp = (-4.5 - ro.x) / rd.x;
+        if (tp > 0.0 && tp < t) { t = tp; n = vec3<f32>(1.0, 0.0, 0.0); }
+    }
+    // Right Wall (x = 4.5)
+    if (rd.x > 0.001) {
+        let tp = (4.5 - ro.x) / rd.x;
+        if (tp > 0.0 && tp < t) { t = tp; n = vec3<f32>(-1.0, 0.0, 0.0); }
     }
     
-    var final_d = d_freq;
+    return vec4<f32>(t, n);
+}
+
+// Calculate lighting and material at a hit point
+fn calc_surface(p: vec3<f32>, n: vec3<f32>, ch: ChannelMap) -> vec3<f32> {
+    let neon_red = vec3<f32>(1.0, 0.02, 0.01);
+    let neon_core = vec3<f32>(1.0, 0.6, 0.4);
     
-    // 2. Spatial Channel Pillars
-    var speaker_pos = array<vec3<f32>, 12>(
-        vec3<f32>(-4.5, 0.0, 6.0),  // L  (Far Front)
-        vec3<f32>(4.5, 0.0, 6.0),   // R  (Far Front)
-        vec3<f32>(0.0, 3.0, 6.0),   // C  (Ceiling Front)
-        vec3<f32>(0.0, -3.0, 2.0),  // LFE (Floor Mid)
-        vec3<f32>(-4.5, 0.0, 2.0),  // Ls  (Side Mid)
-        vec3<f32>(4.5, 0.0, 2.0),   // Rs  (Side Mid)
-        vec3<f32>(-4.5, 0.0, -2.0), // Lrs (Rear -> Foreground corners)
-        vec3<f32>(4.5, 0.0, -2.0),  // Rrs (Rear -> Foreground corners)
-        vec3<f32>(-3.0, 3.0, 6.0),  // Ltf (Ceiling Front)
-        vec3<f32>(3.0, 3.0, 6.0),   // Rtf 
-        vec3<f32>(-3.0, 3.0, -2.0), // Ltr (Ceiling Rear -> Foreground)
-        vec3<f32>(3.0, 3.0, -2.0)   // Rtr 
-    );
+    var col = vec3<f32>(0.0);
     
-    let num_ch = min(audio.num_channels, 12u);
-    for (var i = 0u; i < num_ch; i++) {
-        let pos = speaker_pos[i];
-        var d = 999.0;
+    // --- WALLS ---
+    if (abs(n.x) > 0.5) {
+        let is_left = (n.x > 0.0);
+        let uv = vec2<f32>(p.z, p.y);
         
-        if i == 0u || i == 1u || i == 4u || i == 5u || i == 6u || i == 7u {
-            // Wall Pillars
-            d = length(p.xz - pos.xz) - 0.15;
-        } else if i == 2u {
-            // Center (Ceiling horizontal bar)
-            let strip_d = length(vec2<f32>(p.y - 3.0, p.z - pos.z)) - 0.1;
-            d = max(strip_d, abs(p.x) - 2.0);
-        } else if i == 3u {
-            // LFE (Floor center square/strip)
-            let strip_d = length(vec2<f32>(p.y + 3.0, p.z - pos.z)) - 0.2;
-            d = max(strip_d, abs(p.x) - 1.5);
+        // Wall structure: repeats every 4 units. Pillars are 1.0 wide. Recesses are 3.0 wide.
+        let local_z = fract(p.z / 4.0);
+        let in_recess = (local_z > 0.1 && local_z < 0.9);
+        
+        // Dark metallic/concrete base
+        let noise = valueNoise(uv * 10.0) * 0.05;
+        var base_col = vec3<f32>(0.01 + noise);
+        
+        if (!in_recess) {
+            // Pillar: darker, catches some edge light
+            base_col *= 0.3;
         } else {
-            // Heights (Ceiling small bars)
-            let strip_d = length(vec2<f32>(p.y - 3.0, p.z - pos.z)) - 0.1;
-            d = max(strip_d, abs(p.x - pos.x) - 0.5);
+            // Recess: evaluate distance to the central neon tube
+            let tube_local = abs(local_z - 0.5) * 4.0; // 0 at center, 1.6 at edges
+            let tube_dist = length(vec2<f32>(tube_local, max(0.0, abs(p.y - 0.5) - 0.8)));
+            
+            // Tube intensity driven by front channels
+            let intensity_z_blend = smoothstep(2.0, 15.0, p.z);
+            var intensity = 0.0;
+            if (is_left) {
+                intensity = mix(ch.front_l, ch.surr_l, intensity_z_blend);
+            } else {
+                intensity = mix(ch.front_r, ch.surr_r, intensity_z_blend);
+            }
+            
+            // Glow math
+            let core = exp(-tube_dist * 40.0) * intensity * 2.0;
+            let bloom = exp(-tube_dist * 3.0) * intensity * 1.5;
+            
+            col += neon_core * core + neon_red * bloom;
         }
         
-        let vu = get_vu(i);
-        // Intense red with slight orange/white core at high peaks
-        let ch_glow_col = vec3<f32>(1.0, 0.1, 0.05) * vu * 6.0;
-        total_glow += ch_glow_col * exp(-abs(d) * 12.0);
-        
-        final_d = min(final_d, d);
+        // Add procedural bump roughness
+        let rough = valueNoise(uv * 20.0) * 0.2;
+        col += base_col * (1.0 - rough);
     }
     
-    // 3. Black Glossy Floor
-    let floor_d = p.y + 3.0;
-    final_d = min(final_d, floor_d);
+    // --- CEILING ---
+    else if (n.y < -0.5) {
+        let uv = vec2<f32>(p.x, p.z);
+        let local_z = fract(p.z / 4.0);
+        let is_beam = (local_z < 0.2); // Beams are 0.8 wide
+        
+        let noise = valueNoise(uv * 15.0) * 0.03;
+        var base_col = vec3<f32>(0.005 + noise);
+        
+        if (is_beam) {
+            base_col *= 0.2; // Beams are dark
+        } else {
+            // Recessed ceiling panel glow (driven by center)
+            let panel_dist = max(abs(p.x) - 1.5, abs(local_z - 0.6) * 4.0 - 0.8);
+            let glow = exp(-max(panel_dist, 0.0) * 5.0) * ch.center;
+            col += neon_red * glow * 1.0;
+        }
+        
+        col += base_col;
+    }
     
-    return MapData(final_d, 0, total_glow);
-}
-
-fn calcNormal(p: vec3<f32>) -> vec3<f32> {
-    let e = vec2<f32>(0.005, 0.0);
-    return normalize(vec3<f32>(
-        map(p + e.xyy).d - map(p - e.xyy).d,
-        map(p + e.yxy).d - map(p - e.yxy).d,
-        map(p + e.yyx).d - map(p - e.yyx).d
-    ));
+    // --- FLOOR ---
+    else if (n.y > 0.5) {
+        // Dark, glossy floor
+        let noise = valueNoise(p.xz * 15.0) * 0.02;
+        col += vec3<f32>(0.002 + noise);
+        
+        // Floor Lasers (driven by surround/rear)
+        let x_bias = smoothstep(-0.5, 0.5, p.x / 4.5);
+        let surr_i = mix(ch.surr_l, ch.surr_r, x_bias);
+        let rear_i = mix(ch.rear_l, ch.rear_r, x_bias);
+        
+        // Grid pattern
+        let grid_z = abs(fract(p.z / 2.0 + 0.5) - 0.5) * 2.0;
+        let grid_x = abs(fract(p.x / 2.0 + 0.5) - 0.5) * 2.0;
+        
+        let lz = exp(-grid_z * 40.0) * surr_i;
+        let lx = exp(-grid_x * 40.0) * max(rear_i, surr_i * 0.3);
+        
+        col += neon_red * max(lz, lx) * 1.5;
+        col += neon_core * (lz * lx) * 1.0;
+    }
+    
+    return col;
 }
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let uv = in.uv * 2.0 - 1.0;
-    
-    // Aspect ratio and invert Y (so camera isn't upside down like ferrofluid was!)
-    let aspect = dpdy(in.uv.y) / dpdx(in.uv.x);
-    let p = vec2<f32>(uv.x * abs(aspect), -uv.y);
-    
-    let ro = vec3<f32>(0.0, 0.0, CAM_Z);
-    let cam_target = ro + vec3<f32>(0.0, 0.0, 1.0);
-    
-    let ww = normalize(cam_target - ro);
-    let uu = normalize(cross(ww, vec3<f32>(0.0, 1.0, 0.0)));
-    let vv = normalize(cross(uu, ww));
-    
-    // Wider FOV so user can see side pillars!
-    let fov = 0.8; 
-    let rd = normalize(p.x * uu + p.y * vv + fov * ww);
-    
+    let aspect = dpdx(in.uv.x) / dpdy(in.uv.y);
+    let p = vec2<f32>(uv.x * aspect, uv.y);
+    let ch = get_channels();
+
+    // Camera
+    let ro = vec3<f32>(0.0, 0.3, 0.0);
+    let rd = normalize(vec3<f32>(p.x, p.y, 0.85));
+
     var col = vec3<f32>(0.0);
-    var glow = vec3<f32>(0.0);
-    
-    var t = 0.0;
-    let max_t = 80.0;
-    var hit = false;
-    var final_p = vec3<f32>(0.0);
-    
-    // Primary Raymarch
-    for (var i = 0; i < 90; i++) {
-        let p_current = ro + rd * t;
-        let map_data = map(p_current);
-        let d = map_data.d;
+
+    // Primary Intersection
+    let hit = intersect_corridor(ro, rd);
+    let t = hit.x;
+    let n = hit.yzw;
+
+    if (t < 900.0) {
+        let p_hit = ro + rd * t;
         
-        glow += map_data.glow * 0.02 / (1.0 + abs(d) * 15.0);
+        // Calculate primary surface lighting
+        col = calc_surface(p_hit, n, ch);
         
-        if d < 0.005 {
-            hit = true;
-            final_p = p_current;
-            break;
-        }
-        
-        t += d;
-        if t > max_t {
-            break;
-        }
-    }
-    
-    if hit {
-        let n = calcNormal(final_p);
-        let base_col = vec3<f32>(0.0); // Pure black material
-        
-        if final_p.y < -2.99 {
-            // Floor Mirror Reflection
-            let ref_dir = reflect(rd, n);
-            var ref_t = 0.1;
-            var ref_glow = vec3<f32>(0.0);
-            var ref_hit = false;
-            
-            // Secondary Raymarch
-            for (var j = 0; j < 50; j++) {
-                let ref_p = final_p + ref_dir * ref_t;
-                let ref_data = map(ref_p);
-                let d = ref_data.d;
+        // Floor Reflection
+        if (n.y > 0.5) {
+            let ref_rd = reflect(rd, vec3<f32>(0.0, 1.0, 0.0));
+            // Tiny offset to prevent self-intersection
+            let ref_hit = intersect_corridor(p_hit + ref_rd * 0.01, ref_rd);
+            if (ref_hit.x < 900.0) {
+                let p_ref = p_hit + ref_rd * ref_hit.x;
+                let ref_col = calc_surface(p_ref, ref_hit.yzw, ch);
                 
-                ref_glow += ref_data.glow * 0.015 / (1.0 + abs(d) * 15.0);
+                // Fresnel reflection factor
+                let fresnel = pow(1.0 - max(0.0, dot(vec3<f32>(0.0, 1.0, 0.0), -rd)), 2.0);
+                let reflectivity = mix(0.1, 0.6, fresnel);
                 
-                if d < 0.01 {
-                    ref_hit = true;
-                    break;
-                }
-                ref_t += d;
-                if ref_t > 40.0 { break; }
+                col = mix(col, ref_col, reflectivity);
             }
-            
-            // Floor base color + reflection
-            let fresnel = pow(1.0 - max(0.0, dot(n, -rd)), 3.0);
-            col = ref_glow * mix(0.1, 0.4, fresnel);
-        } else {
-            // Physical pillars
-            col = base_col;
         }
     }
-    
-    // Add primary volumetric glow
-    col += glow;
-    
-    // Distance fog (pure black abyss)
-    col = mix(col, vec3<f32>(0.0), smoothstep(40.0, max_t, t));
-    
-    // Tone mapping
+
+    // Depth Fog
+    let fog_col = vec3<f32>(0.02, 0.001, 0.0008);
+    let fog = 1.0 - exp(-t * 0.025);
+    col = mix(col, fog_col, fog);
+
+    // LFE Ambient Pulse
+    col += vec3<f32>(1.0, 0.02, 0.0) * (ch.lfe * ch.lfe) * 0.02;
+
+    // Vignette
+    let vr = length(uv);
+    col *= smoothstep(1.9, 0.5, vr);
+
+    // ACES Tonemapping
     col = (col * (2.51 * col + 0.03)) / (col * (2.43 * col + 0.59) + 0.14);
-    
-    return vec4<f32>(pow(col, vec3<f32>(1.0 / 2.2)), 1.0);
+
+    // Gamma
+    col = pow(col, vec3<f32>(1.0 / 2.2));
+
+    return vec4<f32>(col, 1.0);
 }

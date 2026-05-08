@@ -417,6 +417,17 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                         let cloned_data = state.spectrum_data.clone();
                         state.spectrum_history.push_back(cloned_data);
 
+                        // Temporal smoothing for waveform history to prevent jerky oscilloscope motion.
+                        // Lerp the display waveform toward the raw DSP data each frame,
+                        // decoupling visual smoothness from the DSP callback rate.
+                        let raw_wave = state.raw_waveform.clone();
+                        if let Some(newest) = state.waveform_history.back_mut() {
+                            let lerp_speed = (12.0 * dt).min(1.0); // fast attack, smooth motion
+                            for i in 0..newest.len().min(1024) {
+                                newest[i] += (raw_wave[i] - newest[i]) * lerp_speed;
+                            }
+                        }
+
                         engine.update(&state);
                     }
 

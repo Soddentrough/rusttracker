@@ -39,16 +39,31 @@ var<storage, read> waveform_history: array<vec4<f32>>;
 
 @group(0) @binding(3) var fire_grid_tex: texture_2d<f32>;
 
-fn get_heat(x: f32, y: f32) -> f32 {
-    let x_idx = clamp(u32(x * 1024.0), 0u, 1023u);
-    let y_idx = clamp(u32(y * 144.0), 0u, 143u);
-    return textureLoad(fire_grid_tex, vec2<i32>(i32(x_idx), i32(y_idx)), 0).r;
+// --- Bilinear heat sampling (eliminates blocky stair-stepping) ---
+
+fn get_heat(uv: vec2<f32>) -> f32 {
+    let tex_size = vec2<f32>(1024.0, 576.0);
+    let p = uv * tex_size - 0.5;
+    let ip = floor(p);
+    let fp = fract(p);
+
+    let x0 = clamp(i32(ip.x), 0, 1023);
+    let x1 = clamp(x0 + 1, 0, 1023);
+    let y0 = clamp(i32(ip.y), 0, 575);
+    let y1 = clamp(y0 + 1, 0, 575);
+
+    let h00 = textureLoad(fire_grid_tex, vec2<i32>(x0, y0), 0).r;
+    let h10 = textureLoad(fire_grid_tex, vec2<i32>(x1, y0), 0).r;
+    let h01 = textureLoad(fire_grid_tex, vec2<i32>(x0, y1), 0).r;
+    let h11 = textureLoad(fire_grid_tex, vec2<i32>(x1, y1), 0).r;
+
+    return mix(mix(h00, h10, fp.x), mix(h01, h11, fp.x), fp.y);
 }
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // We smooth out the grid by sampling continuously
-    let heat = get_heat(in.uv.x, in.uv.y);
+    let heat = get_heat(in.uv);
     
     let color_bg       = vec3<f32>(0.0, 0.0, 0.0);
     let color_dark_red = vec3<f32>(0.5, 0.0, 0.0);

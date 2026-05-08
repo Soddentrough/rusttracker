@@ -23,7 +23,7 @@ struct AudioUniforms {
     time: f32,
     duration: f32,
     smooth_time: f32,
-    _pad1: u32,
+    heatmap_row: u32,
     _pad2: u32,
     _pad3: u32,
     ui_meters_rect: vec4<f32>,
@@ -191,9 +191,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let y_f = (uv.y - hm_rect_min.y) / (hm_rect_max.y - hm_rect_min.y);
         let y_idx = u32(clamp(y_f * 120.0, 0.0, 119.99));
         
-        // time_idx 0 is newest (bottom of UI). time_idx 119 is oldest (top of UI).
-        let time_idx = 119u - y_idx;
-        let val = textureLoad(heatmap_tex, vec2<i32>(i32(x_idx), i32(time_idx)), 0).r;
+        // y_idx 0 is newest (bottom of UI). y_idx 119 is oldest (top of UI).
+        let physical_row = (uniforms.heatmap_row + 120u - y_idx) % 120u;
+        let val = textureLoad(heatmap_tex, vec2<i32>(i32(x_idx), i32(physical_row)), 0).r;
         
         if (val > 5.0) {
             if (val > 60.0) {
