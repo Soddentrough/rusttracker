@@ -1,4 +1,10 @@
 /target
+dist/
+
+# Installer / Build Outputs
+*.exe
+*.msi
+*.rpm
 
 # Tracker Modules
 *.mod
@@ -16,3 +22,8 @@ audio_tests/
 # Debug / crash artifacts
 *.log
 gdb_output.txt
+*.txt
+
+# Scratch / Temp files
+scratch.*
+test_*

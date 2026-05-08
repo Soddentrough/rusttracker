@@ -19,7 +19,7 @@ Support playing the background video stream from loaded media files (like MP4, M
 ## Version 0.9: Neon Room Ray Traced Visualizer
 
 **Feature Request:**
-Load `neon_room.blend` to use as the basis for a new visualizer. It is a basic room scene with objects labelled after spatial channels (Front, LFE, center, rear, etc). 
+Load `assets/neon_room.blend` to use as the basis for a new visualizer. It is a basic room scene with objects labelled after spatial channels (Front, LFE, center, rear, etc). 
 
 The idea will be to load this scene and use a ray tracing engine to light up these objects in time to the audio streams.
 
@@ -28,4 +28,4 @@ The idea will be to load this scene and use a ray tracing engine to light up the
 
 **Concerns:**
 *   Binary file size bloat.
-*   Computational intensity of a ray traced scene with dynamic lighting. Obviously only available on supported hardware.
+*   Computational intensity of a ray traced scene with dynamic lighting. Obviously only available on supported hardware. Must render very fast to maintain 120Hz.
