@@ -18,14 +18,15 @@ struct AudioUniforms {
     fire_heat: array<vec4<f32>, 256>,
     channels: array<vec4<f32>, 8>,
     channel_peaks: array<vec4<f32>, 8>,
+    spatial_channels: array<vec4<f32>, 4>,
     num_channels: u32,
     mode: u32,
     time: f32,
     duration: f32,
     smooth_time: f32,
     heatmap_row: u32,
-    _pad2: u32,
-    _pad3: u32,
+    fft_channels: u32,
+    num_spatial_channels: u32,
     ui_meters_rect: vec4<f32>,
     ui_heatmap_rect: vec4<f32>,
     ui_fire_rect: vec4<f32>,
@@ -126,8 +127,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         vec3<f32>(0.8, -0.4, 0.7)     // 11: Rtr (Right Top Rear)
     );
     
-    // Always render the full 12-channel (7.1.4) room layout
-    let render_channels = 12u;
+    // Only render the number of actual spatial speakers present in the audio file
+    let render_channels = min(audio.num_spatial_channels, 12u);
     
     for (var i = 0u; i < render_channels; i = i + 1u) {
         let room_xy = vec2<f32>(speaker_data[i].x, speaker_data[i].y);
@@ -136,13 +137,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Rotate to world coordinates
         let world_xy = rotate2d(room_xy, room_angle);
         
-        // Get VU for this channel (only if the track actually provides it)
+        // Get VU for this spatial channel
         var vu = 0.0;
-        if i < audio.num_channels {
-            let vec_idx = i / 4u;
-            let component_idx = i % 4u;
-            let ch_vec = audio.channels[vec_idx];
-            if component_idx == 0u { vu = ch_vec.x; }
+        let vec_idx = i / 4u;
+        let component_idx = i % 4u;
+        let ch_vec = audio.spatial_channels[vec_idx];
+        if component_idx == 0u { vu = ch_vec.x; }
             else if component_idx == 1u { vu = ch_vec.y; }
             else if component_idx == 2u { vu = ch_vec.z; }
             else { vu = ch_vec.w; }

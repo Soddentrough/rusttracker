@@ -16,6 +16,7 @@ pub struct AudioUniforms {
     pub fire_heat: [f32; 1024],
     pub channels: [f32; 32],
     pub channel_peaks: [f32; 32],
+    pub spatial_channels: [f32; 16],
     pub num_channels: u32,
     pub mode: u32,
     pub time: f32,
@@ -23,7 +24,7 @@ pub struct AudioUniforms {
     pub smooth_time: f32,
     pub heatmap_row: u32,
     pub fft_channels: u32,
-    pub _pad: u32,
+    pub num_spatial_channels: u32,
     pub ui_meters_rect: [f32; 4],
     pub ui_heatmap_rect: [f32; 4],
     pub ui_fire_rect: [f32; 4],
@@ -872,6 +873,7 @@ impl<'a> VulkanEngine<'a> {
             fire_heat: [0.0; 1024],
             channels: [0.0; 32],
             channel_peaks: [0.0; 32],
+            spatial_channels: [0.0; 16],
             num_channels: state.channel_vus.len().min(32) as u32,
             mode: state.visualizer_mode,
             time: state.current_seconds as f32,
@@ -879,7 +881,7 @@ impl<'a> VulkanEngine<'a> {
             smooth_time: self.start_time.elapsed().as_secs_f32(),
             heatmap_row: self.heatmap_row,
             fft_channels: state.raw_audio_channels.len() as u32,
-            _pad: 0,
+            num_spatial_channels: state.num_spatial_channels,
             ui_meters_rect: self.meters_uv_rect,
             ui_heatmap_rect: self.heatmap_uv_rect,
             ui_fire_rect: self.fire_uv_rect,
@@ -890,6 +892,7 @@ impl<'a> VulkanEngine<'a> {
         
         let ch_len = state.channel_vus.len().min(32);
         
+        // 1. Populate UI Display Channels (may be visually remapped)
         let mut display_order: Vec<usize> = (0..ch_len).collect();
         if state.tracker_channels.is_none() {
             if ch_len == 6 {
@@ -903,6 +906,16 @@ impl<'a> VulkanEngine<'a> {
             if src_idx < state.channel_vus.len() {
                 uniforms.channels[disp_idx] = state.channel_vus[src_idx];
                 uniforms.channel_peaks[disp_idx] = state.peak_vus[src_idx];
+            }
+        }
+        
+        // 2. Populate Raw Spatial Channels (strict spatial mapping without UI reordering)
+        let spatial_offset = state.tracker_channels.unwrap_or(0);
+        let spatial_count = state.num_spatial_channels as usize;
+        for i in 0..spatial_count {
+            let src_idx = spatial_offset + i;
+            if src_idx < state.channel_vus.len() && i < 16 {
+                uniforms.spatial_channels[i] = state.channel_vus[src_idx];
             }
         }
 
