@@ -27,6 +27,7 @@ struct DspMessage {
     speed: i32,
     current_seconds: f64,
     current_row_string: String,
+    channel_audio_data: Vec<Vec<f32>>,
 }
 
 fn spawn_dsp_thread(
@@ -114,6 +115,7 @@ fn spawn_dsp_thread(
                 }
                 
                 state.raw_spectrum_data.copy_from_slice(&binned_data);
+                state.raw_audio_channels = msg.channel_audio_data;
                 
                 // --- Waveform extraction (Zero-Crossing Edge Trigger) ---
                 // Scan the first half of the buffer for the steepest positive zero-crossing.
@@ -927,12 +929,9 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
         state.num_instruments = audio_source.get_num_instruments();
         state.num_patterns = audio_source.get_num_patterns();
         
-        let intrinsic = audio_source.get_num_channels();
-        if intrinsic > 2 {
-            state.available_visualizers = vec![0, 4, 5, 3, 1, 2, 6];
-        } else {
-            state.available_visualizers = vec![0, 1, 2, 6];
-        }
+        let _intrinsic = audio_source.get_num_channels();
+        state.available_visualizers = vec![0, 4, 5, 3, 1, 2, 6];
+        
         if !mic {
             state.tracker_channels = tracker_channels;
             state.tracker_patterns_by_order = audio_source.pre_format_tracker_data();
@@ -970,6 +969,7 @@ where
     let mut interleaved_buffer: Vec<f32> = vec![0.0; 8192 * hardware_channels];
     
     let mut fft_buffer: Vec<f32> = vec![0.0; 8192];
+    let mut channel_fft_buffers: Vec<Vec<f32>> = vec![vec![0.0; 8192]; hardware_channels];
     let mut windowed_buffer: Vec<f32> = vec![0.0; 8192];
     let mut fft_index = 0;
     
@@ -1037,6 +1037,9 @@ where
                     mono /= hardware_channels as f32;
                     
                     fft_buffer[fft_index] = mono;
+                    for c in 0..hardware_channels {
+                        channel_fft_buffers[c][fft_index] = interleaved_buffer[i * hardware_channels + c].clamp(-1.0, 1.0);
+                    }
                     fft_index = (fft_index + 1) % 8192;
                 } else {
                     for sample in frame.iter_mut() {
@@ -1045,8 +1048,13 @@ where
                 }
             }
 
+            let mut windowed_channels = vec![vec![0.0; 8192]; hardware_channels];
             for i in 0..8192 {
-                windowed_buffer[i] = fft_buffer[(fft_index + i) % 8192];
+                let idx = (fft_index + i) % 8192;
+                windowed_buffer[i] = fft_buffer[idx];
+                for c in 0..hardware_channels {
+                    windowed_channels[c][i] = channel_fft_buffers[c][idx];
+                }
             }
             
             let mut channel_vus = Vec::new();
@@ -1074,6 +1082,7 @@ where
                 speed: audio_source.get_speed(),
                 current_seconds: audio_source.get_position_seconds(),
                 current_row_string: audio_source.get_current_row_string(),
+                channel_audio_data: windowed_channels,
             };
             
             let _ = tx.try_send(msg);
@@ -1105,6 +1114,7 @@ where
 {
     let channels = config.channels as usize;
     let mut fft_buffer: Vec<f32> = vec![0.0; 8192];
+    let mut channel_fft_buffers: Vec<Vec<f32>> = vec![vec![0.0; 8192]; channels];
     let mut windowed_buffer: Vec<f32> = vec![0.0; 8192];
     let mut fft_index = 0;
     
@@ -1137,11 +1147,19 @@ where
 
                 let mono = (left + right) / 2.0;
                 fft_buffer[fft_index] = mono;
+                for c in 0..channels {
+                    channel_fft_buffers[c][fft_index] = if c < frame.len() { frame[c].into() } else { 0.0 };
+                }
                 fft_index = (fft_index + 1) % 8192;
             }
 
+            let mut windowed_channels = vec![vec![0.0; 8192]; channels];
             for i in 0..8192 {
-                windowed_buffer[i] = fft_buffer[(fft_index + i) % 8192];
+                let idx = (fft_index + i) % 8192;
+                windowed_buffer[i] = fft_buffer[idx];
+                for c in 0..channels {
+                    windowed_channels[c][i] = channel_fft_buffers[c][idx];
+                }
             }
             
             let mut channel_vus = Vec::new();
@@ -1157,6 +1175,7 @@ where
                 speed: 0,
                 current_seconds: 0.0,
                 current_row_string: String::new(),
+                channel_audio_data: windowed_channels,
             };
             
             let _ = tx.try_send(msg);

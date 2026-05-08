@@ -17,6 +17,7 @@ struct FireParams {
 @group(0) @binding(1) var<storage, read_write> output_grid: array<f32>;
 @group(0) @binding(2) var<storage, read_write> coal_bed: array<f32>;
 @group(0) @binding(3) var<uniform> params: FireParams;
+@group(0) @binding(4) var<storage, read> multi_spectrum: array<f32>;
 
 fn pcg_hash(input: u32) -> u32 {
     var state = input * 747796405u + 2891336453u;
@@ -108,28 +109,29 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             let sigma = channel_width * sigma_scale;
             let influence = exp(-(dist * dist) / (2.0 * sigma * sigma));
             
-            let vec_idx = i / 4u;
-            let comp_idx = i % 4u;
-            var ch_val = params.channels[vec_idx].x;
-            if comp_idx == 1u { ch_val = params.channels[vec_idx].y; }
-            else if comp_idx == 2u { ch_val = params.channels[vec_idx].z; }
-            else if comp_idx == 3u { ch_val = params.channels[vec_idx].w; }
+            // Sample low frequencies (bins 2 to 30) for this specific channel
+            var ch_bass = 0.0;
+            let offset = i * 1024u;
+            for (var b = 2u; b < 30u; b = b + 1u) {
+                ch_bass += multi_spectrum[offset + b];
+            }
+            ch_bass = (ch_bass / 28.0) / 100.0;
             
-            activity += pow(ch_val, 1.5) * influence;
+            activity += pow(ch_bass, 1.5) * influence * 2.5;
             spatial_idx += 1u;
         }
         if lfe_idx < n_ch {
             let lfe_dist = f32(x) - 512.0;
             let lfe_influence = exp(-(lfe_dist * lfe_dist) / (2.0 * 90.0 * 90.0));
             
-            let vec_idx = lfe_idx / 4u;
-            let comp_idx = lfe_idx % 4u;
-            var lfe_val = params.channels[vec_idx].x;
-            if comp_idx == 1u { lfe_val = params.channels[vec_idx].y; }
-            else if comp_idx == 2u { lfe_val = params.channels[vec_idx].z; }
-            else if comp_idx == 3u { lfe_val = params.channels[vec_idx].w; }
+            var lfe_bass = 0.0;
+            let offset = lfe_idx * 1024u;
+            for (var b = 0u; b < 20u; b = b + 1u) {
+                lfe_bass += multi_spectrum[offset + b];
+            }
+            lfe_bass = (lfe_bass / 20.0) / 100.0;
             
-            activity += lfe_val * lfe_influence * 0.6;
+            activity += lfe_bass * lfe_influence * 1.5;
         }
 
         let coal_target = min(params.bass * 0.15 + activity * 1.8, 1.0);

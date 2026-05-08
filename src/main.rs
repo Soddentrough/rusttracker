@@ -42,6 +42,9 @@ struct Args {
 
     #[arg(long)]
     vis: Option<String>,
+
+    #[arg(long, default_value_t = false)]
+    gpu_fft: bool,
 }
 
 struct Tui {
@@ -146,16 +149,19 @@ fn main() -> Result<(), Box<dyn Error>> {
             eprintln!("App error: {:?}", err);
         }
     } else {
-        let args_vec: Vec<String> = std::env::args().collect();
-        pollster::block_on(run_gui(app_state, initial_stream, args.fullscreen, args_vec));
+        pollster::block_on(run_gui(app_state, initial_stream, args.fullscreen, args.gpu_fft));
     }
 
     Ok(())
 }
 
 #[allow(unused_variables, unused_assignments)]
-async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal::Stream>, is_fullscreen: bool, args: Vec<String>) {
+async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal::Stream>, is_fullscreen: bool, use_gpu_fft: bool) {
 
+    if use_gpu_fft {
+        let mut state = app_state.lock().unwrap();
+        state.gpu_fft = true;
+    }
 
     let event_loop = EventLoop::new().unwrap();
     
@@ -228,6 +234,10 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                                     } else {
                                         window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
                                     }
+                                },
+                                WinitKeyCode::KeyG => {
+                                    let mut state = app_state.lock().unwrap();
+                                    state.gpu_fft = !state.gpu_fft;
                                 },
                                 WinitKeyCode::KeyS => {
                                     let mut state = app_state.lock().unwrap();
@@ -440,17 +450,16 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                     let mut action = EngineAction::None;
                     let mut ui_time = 0.0;
                     let mut render_time = 0.0;
-                    let mut fire_time = 0.0;
-                    
-                    let mut shader_time = None;
+                    let mut fire_time = None;
+                    let mut fft_time = None;
                     
                     match engine.render(&window, &egui_ctx, &mut egui_state, &state_copy) {
-                            Ok((res, ui_el, ren_el, sh_el, fire_el)) => {
+                            Ok((res, ui_el, ren_el, fire_el, fft_el)) => {
                                 action = res;
                                 ui_time = ui_el;
                                 render_time = ren_el;
-                                shader_time = sh_el;
                                 fire_time = fire_el;
+                                fft_time = fft_el;
                             },
                             Err(wgpu::SurfaceStatus::Lost) => engine.resize(engine.size),
                             Err(wgpu::SurfaceStatus::Outdated) => engine.resize(engine.size),
@@ -462,10 +471,13 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                         let mut state = app_state.lock().unwrap();
                         state.stats.ui_us = state.stats.ui_us * 0.9 + ui_time * 0.1;
                         state.stats.render_us = state.stats.render_us * 0.9 + render_time * 0.1;
-                        if let Some(sh) = shader_time {
-                            state.stats.shader_us = state.stats.shader_us * 0.9 + sh * 0.1;
+                        if let Some(sh) = fire_time {
+                            state.stats.fire_us = state.stats.fire_us * 0.9 + sh * 0.1;
+                            state.stats.shader_us = state.stats.fire_us; // Keep alias updated for existing code
                         }
-                        state.stats.fire_us = state.stats.fire_us * 0.9 + fire_time * 0.1;
+                        if let Some(ft) = fft_time {
+                            state.stats.gpu_fft_us = state.stats.gpu_fft_us * 0.9 + ft * 0.1;
+                        }
                     }
                     
                     if let EngineAction::Seek(pct) = action {

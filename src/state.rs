@@ -8,6 +8,7 @@ pub struct PerformanceStats {
     pub render_us: f32,
     pub shader_us: f32,
     pub fire_us: f32,
+    pub gpu_fft_us: f32,
 }
 
 #[derive(Debug, Clone)]
@@ -32,8 +33,10 @@ pub struct AppState {
     pub spectrum_history: VecDeque<Vec<f32>>,
     pub waveform_history: VecDeque<Vec<f32>>,
     pub raw_waveform: Vec<f32>,
+    pub raw_audio_channels: Vec<Vec<f32>>,
     pub fire_heat: Vec<f32>,
     pub show_hud: bool,
+    pub gpu_fft: bool,
     pub max_frequency: f32,
     pub num_samples: i32,
     pub num_instruments: i32,
@@ -92,8 +95,10 @@ impl AppState {
             spectrum_history: history,
             waveform_history: wave_history,
             raw_waveform: vec![0.0; 1024],
+            raw_audio_channels: Vec::new(),
             fire_heat: vec![0.0; 1024],
             show_hud: true,
+            gpu_fft: false,
             max_frequency: 10000.0,
             num_samples: 0,
             num_instruments: 0,

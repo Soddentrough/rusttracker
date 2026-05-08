@@ -107,6 +107,8 @@ fn blackbody(temperature: f32) -> vec3<f32> {
     return color;
 }
 
+@group(0) @binding(4) var<storage, read> multi_spectrum: array<f32>;
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Aspect ratio correction for noise
@@ -141,9 +143,26 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
     
+    // Spatially-accurate high frequency audio reactivity from GPU FFT
+    let n_ch = max(1u, audio.num_channels);
+    let channel_idx = min(u32(in.uv.x * f32(n_ch)), n_ch - 1u);
+    let offset = channel_idx * 1024u;
+    
+    // Sample high frequencies for this specific spatial channel
+    var high_energy = 0.0;
+    for (var b = 150u; b < 300u; b = b + 4u) {
+        high_energy += multi_spectrum[offset + b];
+    }
+    high_energy = min((high_energy / 37.0) / 100.0, 1.0);
+    
     // Final color using blackbody
     let fire_color = blackbody(final_heat);
-    let final_color = fire_color + vec3<f32>(1.0, 0.5, 0.1) * ember_glow;
+    
+    // Tint the fire with a vivid blue/purple flash for high frequencies in this channel, but only where fire exists
+    let tint = vec3<f32>(0.2, 0.4, 1.0) * (high_energy * final_heat * 2.5);
+    
+    // Also make embers react to highs, but ONLY scale the existing ember_glow, don't add flat color to the void
+    let final_color = fire_color + tint + vec3<f32>(1.0, 0.5, 0.1) * (ember_glow * (1.0 + high_energy * 3.0));
     
     return vec4<f32>(final_color, 1.0);
 }

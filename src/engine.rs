@@ -51,6 +51,15 @@ pub struct FireParams {
     pub channels: [[f32; 4]; 8],
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct FFTParams {
+    pub num_channels: u32,
+    pub sample_rate: f32,
+    pub min_freq: f32,
+    pub max_freq: f32,
+}
+
 pub struct VulkanEngine<'a> {
     surface: wgpu::Surface<'a>,
     device: wgpu::Device,
@@ -92,6 +101,13 @@ pub struct VulkanEngine<'a> {
     heatmap_compute_pipeline: wgpu::ComputePipeline,
     heatmap_bind_group: wgpu::BindGroup,
     pub start_time: std::time::Instant,
+
+    // GPU FFT
+    fft_compute_pipeline: wgpu::ComputePipeline,
+    fft_bind_group: wgpu::BindGroup,
+    raw_audio_buffer: wgpu::Buffer,
+    _gpu_spectrum_buffer: wgpu::Buffer,
+    fft_params_buffer: wgpu::Buffer,
 }
 
 impl<'a> VulkanEngine<'a> {
@@ -163,6 +179,12 @@ impl<'a> VulkanEngine<'a> {
             mapped_at_creation: false,
         });
 
+        let gpu_spectrum_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("GPU FFT Spectrum Buffer"),
+            size: 32 * 1024 * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
         let waveform_storage_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Waveform History Storage Buffer"),
             size: std::mem::size_of::<WaveformHistoryStorage>() as u64,
@@ -235,6 +257,16 @@ impl<'a> VulkanEngine<'a> {
                         multisampled: false,
                     },
                     count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 }
             ],
             label: Some("audio_bind_group_layout"),
@@ -258,6 +290,10 @@ impl<'a> VulkanEngine<'a> {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: wgpu::BindingResource::TextureView(&fire_grid_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: gpu_spectrum_buffer.as_entire_binding(),
                 }
             ],
             label: Some("audio_bind_group"),
@@ -422,6 +458,8 @@ impl<'a> VulkanEngine<'a> {
                     ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None },
                 wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::COMPUTE,
                     ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 4, visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
             ],
         });
 
@@ -432,6 +470,7 @@ impl<'a> VulkanEngine<'a> {
                 wgpu::BindGroupEntry { binding: 1, resource: fire_buffer_b.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: fire_coal_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: fire_params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: gpu_spectrum_buffer.as_entire_binding() },
             ],
         });
         let fire_bind_group_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -441,6 +480,7 @@ impl<'a> VulkanEngine<'a> {
                 wgpu::BindGroupEntry { binding: 1, resource: fire_buffer_a.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 2, resource: fire_coal_buffer.as_entire_binding() },
                 wgpu::BindGroupEntry { binding: 3, resource: fire_params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 4, resource: gpu_spectrum_buffer.as_entire_binding() },
             ],
         });
 
@@ -476,24 +516,103 @@ impl<'a> VulkanEngine<'a> {
         if supports_timestamps {
             query_set = Some(device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("Shader Timestamps"),
-                count: 2,
+                count: 4, // 0-1 for FFT, 2-3 for Fire
                 ty: wgpu::QueryType::Timestamp,
             }));
 
             query_resolve_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Query Resolve Buffer"),
-                size: 16,
+                size: 32, // 4 * 8 bytes
                 usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             }));
 
             query_read_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Query Read Buffer"),
-                size: 16,
+                size: 32,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             }));
         }
+
+        // --- GPU FFT INIT ---
+        let raw_audio_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("GPU FFT Raw Audio Buffer"),
+            size: 32 * 8192 * 4,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+
+        let fft_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("GPU FFT Params Buffer"),
+            size: std::mem::size_of::<FFTParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let fft_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+            label: Some("fft_bind_group_layout"),
+        });
+
+        let fft_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fft_bind_group"),
+            layout: &fft_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: raw_audio_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: gpu_spectrum_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: fft_params_buffer.as_entire_binding() },
+            ],
+        });
+
+        let fft_compute_shader = device.create_shader_module(wgpu::include_wgsl!("shaders/gpu_fft.wgsl"));
+        let fft_compute_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("fft_compute_layout"),
+            bind_group_layouts: &[Some(&fft_bind_group_layout)],
+            immediate_size: 0,
+        });
+
+        let fft_compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("FFT Compute Pipeline"),
+            layout: Some(&fft_compute_pipeline_layout),
+            module: &fft_compute_shader,
+            entry_point: Some("main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+        // --- END GPU FFT INIT ---
 
         Self {
             surface,
@@ -525,11 +644,16 @@ impl<'a> VulkanEngine<'a> {
             fire_params_buffer,
             fire_bind_group_a,
             fire_bind_group_b,
-            fire_ping: false,
+            fire_ping: true,
             heatmap_row: 0,
             heatmap_compute_pipeline,
             heatmap_bind_group,
             start_time: std::time::Instant::now(),
+            fft_compute_pipeline,
+            fft_bind_group,
+            raw_audio_buffer,
+            _gpu_spectrum_buffer: gpu_spectrum_buffer,
+            fft_params_buffer,
         }
     }
 
@@ -638,6 +762,24 @@ impl<'a> VulkanEngine<'a> {
             
             self.queue.write_buffer(&self.fire_params_buffer, 0, bytemuck::cast_slice(&[fire_params]));
         }
+
+        if state.gpu_fft {
+            let num_channels = state.raw_audio_channels.len().min(32);
+            let mut flat_raw_audio = vec![0.0f32; 32 * 8192];
+            for (c, channel_data) in state.raw_audio_channels.iter().take(32).enumerate() {
+                let len = channel_data.len().min(8192);
+                flat_raw_audio[(c * 8192)..(c * 8192 + len)].copy_from_slice(&channel_data[..len]);
+            }
+            self.queue.write_buffer(&self.raw_audio_buffer, 0, bytemuck::cast_slice(&flat_raw_audio));
+
+            let fft_params = FFTParams {
+                num_channels: num_channels as u32,
+                sample_rate: 44100.0, // TODO: Use actual sample rate if available
+                min_freq: 20.0,
+                max_freq: state.max_frequency,
+            };
+            self.queue.write_buffer(&self.fft_params_buffer, 0, bytemuck::cast_slice(&[fft_params]));
+        }
     }
 
     pub fn render(
@@ -646,7 +788,7 @@ impl<'a> VulkanEngine<'a> {
         egui_ctx: &egui::Context,
         egui_state: &mut egui_winit::State,
         state: &AppState,
-    ) -> Result<(EngineAction, f32, f32, Option<f32>, f32), wgpu::SurfaceStatus> {
+    ) -> Result<(EngineAction, f32, f32, Option<f32>, Option<f32>), wgpu::SurfaceStatus> {
         let ui_start = std::time::Instant::now();
         let output = self.surface.get_current_texture();
         let surface_texture = match output {
@@ -658,7 +800,8 @@ impl<'a> VulkanEngine<'a> {
         };
         let view = surface_texture.texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let mut shader_time_us = None;
+        let mut fft_shader_time_us = None;
+        let mut fire_shader_time_us = None;
         if self.query_in_flight {
             if let Some(read_buffer) = &self.query_read_buffer {
                 let slice = read_buffer.slice(..);
@@ -667,16 +810,24 @@ impl<'a> VulkanEngine<'a> {
                 self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
                 if rx.recv().unwrap().is_ok() {
                     let data = slice.get_mapped_range();
-                    let start: u64 = u64::from_le_bytes(data[0..8].try_into().unwrap());
-                    let end: u64 = u64::from_le_bytes(data[8..16].try_into().unwrap());
+                    
+                    let fft_start: u64 = u64::from_le_bytes(data[0..8].try_into().unwrap());
+                    let fft_end: u64 = u64::from_le_bytes(data[8..16].try_into().unwrap());
+                    if fft_end > fft_start {
+                        let elapsed_ns = (fft_end - fft_start) as f32 * self.timestamp_period;
+                        fft_shader_time_us = Some(elapsed_ns / 1_000.0);
+                    }
+
+                    let fire_start: u64 = u64::from_le_bytes(data[16..24].try_into().unwrap());
+                    let fire_end: u64 = u64::from_le_bytes(data[24..32].try_into().unwrap());
+                    if fire_end > fire_start {
+                        let elapsed_ns = (fire_end - fire_start) as f32 * self.timestamp_period;
+                        fire_shader_time_us = Some(elapsed_ns / 1_000.0);
+                    }
+
                     drop(data);
                     read_buffer.unmap();
                     self.query_in_flight = false;
-                    
-                    if end > start {
-                        let elapsed_ns = (end - start) as f32 * self.timestamp_period;
-                        shader_time_us = Some(elapsed_ns / 1_000.0);
-                    }
                 }
             }
         }
@@ -733,10 +884,17 @@ impl<'a> VulkanEngine<'a> {
                             egui::RichText::new(format!("UI: {:.2} ms | Render: {:.2} ms", state.stats.ui_us / 1000.0, state.stats.render_us / 1000.0))
                                 .color(egui::Color32::GRAY)
                         );
-                        ui.label(
-                            egui::RichText::new(format!("FFT: {:.2} ms | Decode: {:.2} ms", state.stats.fft_us / 1000.0, state.stats.decode_us / 1000.0))
-                                .color(egui::Color32::GRAY)
-                        );
+                        if state.gpu_fft {
+                            ui.label(
+                                egui::RichText::new(format!("GPU FFT: {:.2} ms | Decode: {:.2} ms", state.stats.gpu_fft_us / 1000.0, state.stats.decode_us / 1000.0))
+                                    .color(egui::Color32::LIGHT_BLUE)
+                            );
+                        } else {
+                            ui.label(
+                                egui::RichText::new(format!("CPU FFT: {:.2} ms | Decode: {:.2} ms", state.stats.fft_us / 1000.0, state.stats.decode_us / 1000.0))
+                                    .color(egui::Color32::GRAY)
+                            );
+                        }
                         ui.label(
                             egui::RichText::new(format!("Shader: {:.2} ms", state.stats.shader_us / 1000.0))
                                 .color(egui::Color32::GRAY)
@@ -1143,12 +1301,32 @@ impl<'a> VulkanEngine<'a> {
             compute_pass.set_bind_group(0, Some(&self.heatmap_bind_group), &[]);
             compute_pass.dispatch_workgroups(1, 1, 1); // 256x1x1 threads
         }
+        
+        // GPU FFT compute
+        if state.gpu_fft {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("FFT Compute Pass"),
+                timestamp_writes: self.query_set.as_ref().map(|qs| wgpu::ComputePassTimestampWrites {
+                    query_set: qs,
+                    beginning_of_pass_write_index: Some(0),
+                    end_of_pass_write_index: Some(1),
+                }),
+            });
+            compute_pass.set_pipeline(&self.fft_compute_pipeline);
+            compute_pass.set_bind_group(0, Some(&self.fft_bind_group), &[]);
+            compute_pass.dispatch_workgroups(64, 2, 1); // 1024/16=64, 32/16=2
+        }
+
         // GPU fire compute: dispatch simulation + copy result to texture
         if state.visualizer_mode == 1 || state.visualizer_mode == 6 {
             {
                 let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("Fire Compute"),
-                    timestamp_writes: None,
+                    timestamp_writes: self.query_set.as_ref().map(|qs| wgpu::ComputePassTimestampWrites {
+                        query_set: qs,
+                        beginning_of_pass_write_index: Some(2),
+                        end_of_pass_write_index: Some(3),
+                    }),
                 });
                 if state.visualizer_mode == 1 {
                     compute_pass.set_pipeline(&self.fire_compute_pipeline);
@@ -1199,11 +1377,7 @@ impl<'a> VulkanEngine<'a> {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites {
-                    query_set: qs,
-                    beginning_of_pass_write_index: Some(0),
-                    end_of_pass_write_index: Some(1),
-                }),
+                timestamp_writes: None, // Moved render timing to fire compute (2,3) to avoid overlapping/complex query sets. We don't trace render pass anymore.
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -1252,8 +1426,8 @@ impl<'a> VulkanEngine<'a> {
         }
 
         if let (Some(qs), Some(res_buf), Some(read_buf)) = (&self.query_set, &self.query_resolve_buffer, &self.query_read_buffer) {
-            encoder.resolve_query_set(qs, 0..2, res_buf, 0);
-            encoder.copy_buffer_to_buffer(res_buf, 0, read_buf, 0, 16);
+            encoder.resolve_query_set(qs, 0..4, res_buf, 0);
+            encoder.copy_buffer_to_buffer(res_buf, 0, read_buf, 0, 32);
             self.query_in_flight = true;
         }
 
@@ -1309,6 +1483,6 @@ impl<'a> VulkanEngine<'a> {
         
         let render_elapsed = render_start.elapsed().as_micros() as f32;
 
-        Ok((engine_action, ui_elapsed, render_elapsed, shader_time_us, 0.0))
+        Ok((engine_action, ui_elapsed, render_elapsed, fire_shader_time_us, fft_shader_time_us))
     }
 }
