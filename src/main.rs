@@ -106,6 +106,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             let vis_lower = vis.to_lowercase();
             state.visualizer_mode = if vis_lower.contains("firesim") {
                 6
+            } else if vis_lower.contains("3dosc") || vis_lower.contains("3dcrt") {
+                7
             } else if vis_lower.contains("spectrum") || vis_lower.contains("freq") {
                 0
             } else if vis_lower.contains("fire") || vis_lower.contains("flame") {

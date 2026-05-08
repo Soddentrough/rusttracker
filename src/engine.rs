@@ -350,6 +350,7 @@ impl<'a> VulkanEngine<'a> {
             include_str!("shaders/vis_ferrofluid.wgsl"),
             include_str!("shaders/vis_neon.wgsl"),
             include_str!("shaders/vis_firesim.wgsl"),
+            include_str!("shaders/vis_3doscilloscope.wgsl"),
         ];
 
         let mut render_pipelines = Vec::new();
@@ -1187,6 +1188,7 @@ impl<'a> VulkanEngine<'a> {
             4 => "Chrome Ferrofluid",
             5 => "Neon Corridor",
             6 => "Fire Simulation",
+            7 => "3D CRT Oscilloscope",
             _ => "Unknown",
         };
         

@@ -157,7 +157,7 @@ impl AppState {
             playlist_index: 0,
             track_ended: false,
             visualizer_mode: 0,
-            available_visualizers: vec![0, 1, 2, 3, 4, 5, 6],
+            available_visualizers: vec![0, 1, 2, 3, 4, 5, 6, 7],
             current_visualizer_idx: 0,
             video_frame_rx: None,
             free_video_frame_tx: None,
