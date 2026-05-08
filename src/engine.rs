@@ -62,6 +62,32 @@ pub struct FFTParams {
     pub max_freq: f32,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct VideoParams {
+    pub color_space: u32,
+    pub color_range: u32,
+    pub bit_depth: u32,
+    pub _pad: u32,
+    pub viewport_width: f32,
+    pub viewport_height: f32,
+    pub video_width: f32,
+    pub video_height: f32,
+}
+
+pub struct VideoState {
+    pub y_texture: wgpu::Texture,
+    pub u_texture: wgpu::Texture,
+    pub v_texture: wgpu::Texture,
+    pub bind_group: wgpu::BindGroup,
+    pub params_buffer: wgpu::Buffer,
+    pub width: u32,
+    pub height: u32,
+    pub color_space: u32,
+    pub color_range: u32,
+    pub bit_depth: u32,
+}
+
 pub struct VulkanEngine<'a> {
     surface: wgpu::Surface<'a>,
     device: wgpu::Device,
@@ -110,6 +136,11 @@ pub struct VulkanEngine<'a> {
     raw_audio_buffer: wgpu::Buffer,
     _gpu_spectrum_buffer: wgpu::Buffer,
     fft_params_buffer: wgpu::Buffer,
+    
+    // Video
+    video_bind_group_layout: wgpu::BindGroupLayout,
+    video_pipeline: wgpu::RenderPipeline,
+    video_state: Option<VideoState>,
 }
 
 impl<'a> VulkanEngine<'a> {
@@ -139,6 +170,9 @@ impl<'a> VulkanEngine<'a> {
         let supports_timestamps = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
         if supports_timestamps {
             required_features |= wgpu::Features::TIMESTAMP_QUERY;
+        }
+        if adapter.features().contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM) {
+            required_features |= wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
         }
 
         let (device, queue) = adapter.request_device(
@@ -358,6 +392,100 @@ impl<'a> VulkanEngine<'a> {
             });
             render_pipelines.push(pipeline);
         }
+
+        // --- Video Pipeline ---
+        let video_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Video Bind Group Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry { // Y
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry { // U
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry { // V
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry { // Sampler
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry { // Params
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let video_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Video Pipeline Layout"),
+            bind_group_layouts: &[Some(&video_bind_group_layout)],
+            immediate_size: 0,
+        });
+
+        let video_shader = device.create_shader_module(wgpu::include_wgsl!("shaders/vis_video.wgsl"));
+        let video_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Video Render Pipeline"),
+            layout: Some(&video_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &video_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &video_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
 
         let hud_shader = device.create_shader_module(wgpu::include_wgsl!("shaders/hud.wgsl"));
         let hud_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -656,6 +784,9 @@ impl<'a> VulkanEngine<'a> {
             raw_audio_buffer,
             _gpu_spectrum_buffer: gpu_spectrum_buffer,
             fft_params_buffer,
+            video_bind_group_layout,
+            video_pipeline,
+            video_state: None,
         }
     }
 
@@ -666,6 +797,10 @@ impl<'a> VulkanEngine<'a> {
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
         }
+    }
+
+    pub fn clear_video_state(&mut self) {
+        self.video_state = None;
     }
 
     pub fn update(&mut self, state: &AppState) {
@@ -784,6 +919,128 @@ impl<'a> VulkanEngine<'a> {
             };
             self.queue.write_buffer(&self.fft_params_buffer, 0, bytemuck::cast_slice(&[fft_params]));
         }
+        
+        if let Some(rx) = &state.video_frame_rx {
+            let mut latest_frame = None;
+            while let Ok(frame) = rx.try_recv() {
+                if let Some(old_frame) = latest_frame.take() {
+                    if let Some(tx) = &state.free_video_frame_tx {
+                        let _ = tx.try_send(old_frame);
+                    }
+                }
+                latest_frame = Some(frame);
+            }
+            
+            if let Some(frame) = latest_frame {
+                let needs_init = self.video_state.as_ref().map_or(true, |vs| vs.width != frame.width || vs.height != frame.height || vs.bit_depth != frame.bit_depth as u32);
+                if needs_init {
+                    let tex_format = if frame.bit_depth > 8 { wgpu::TextureFormat::R16Unorm } else { wgpu::TextureFormat::R8Unorm };
+                    let y_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("Video Y Texture"),
+                        size: wgpu::Extent3d { width: frame.width, height: frame.height, depth_or_array_layers: 1 },
+                        mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+                        format: tex_format,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                        view_formats: &[],
+                    });
+                    let u_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("Video U Texture"),
+                        size: wgpu::Extent3d { width: frame.width / 2, height: frame.height / 2, depth_or_array_layers: 1 },
+                        mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+                        format: tex_format,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                        view_formats: &[],
+                    });
+                    let v_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                        label: Some("Video V Texture"),
+                        size: wgpu::Extent3d { width: frame.width / 2, height: frame.height / 2, depth_or_array_layers: 1 },
+                        mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
+                        format: tex_format,
+                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                        view_formats: &[],
+                    });
+                    
+                    let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+                        label: Some("Video Sampler"),
+                        address_mode_u: wgpu::AddressMode::ClampToEdge,
+                        address_mode_v: wgpu::AddressMode::ClampToEdge,
+                        address_mode_w: wgpu::AddressMode::ClampToEdge,
+                        mag_filter: wgpu::FilterMode::Linear,
+                        min_filter: wgpu::FilterMode::Linear,
+                        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+                        ..Default::default()
+                    });
+                    
+                    let params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("Video Params Buffer"),
+                        size: std::mem::size_of::<VideoParams>() as u64,
+                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    
+                    let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: Some("Video Bind Group"),
+                        layout: &self.video_bind_group_layout,
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&y_texture.create_view(&wgpu::TextureViewDescriptor::default())) },
+                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&u_texture.create_view(&wgpu::TextureViewDescriptor::default())) },
+                            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&v_texture.create_view(&wgpu::TextureViewDescriptor::default())) },
+                            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&sampler) },
+                            wgpu::BindGroupEntry { binding: 4, resource: params_buffer.as_entire_binding() },
+                        ],
+                    });
+                    
+                    self.video_state = Some(VideoState { 
+                        y_texture, u_texture, v_texture, bind_group, params_buffer, 
+                        width: frame.width, height: frame.height,
+                        color_space: frame.color_space,
+                        color_range: frame.color_range,
+                        bit_depth: frame.bit_depth as u32,
+                    });
+                } else if let Some(vs) = &mut self.video_state {
+                    vs.color_space = frame.color_space;
+                    vs.color_range = frame.color_range;
+                    vs.bit_depth = frame.bit_depth as u32;
+                }
+                
+                if let Some(vs) = &self.video_state {
+                    self.queue.write_texture(
+                        wgpu::TexelCopyTextureInfo { texture: &vs.y_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                        &frame.y_plane,
+                        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(frame.y_stride as u32), rows_per_image: Some(frame.height) },
+                        wgpu::Extent3d { width: frame.width, height: frame.height, depth_or_array_layers: 1 }
+                    );
+                    self.queue.write_texture(
+                        wgpu::TexelCopyTextureInfo { texture: &vs.u_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                        &frame.u_plane,
+                        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(frame.u_stride as u32), rows_per_image: Some(frame.height / 2) },
+                        wgpu::Extent3d { width: frame.width / 2, height: frame.height / 2, depth_or_array_layers: 1 }
+                    );
+                    self.queue.write_texture(
+                        wgpu::TexelCopyTextureInfo { texture: &vs.v_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                        &frame.v_plane,
+                        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(frame.v_stride as u32), rows_per_image: Some(frame.height / 2) },
+                        wgpu::Extent3d { width: frame.width / 2, height: frame.height / 2, depth_or_array_layers: 1 }
+                    );
+                    
+                    let params = VideoParams {
+                        color_space: frame.color_space,
+                        color_range: frame.color_range,
+                        bit_depth: frame.bit_depth as u32,
+                        _pad: 0,
+                        viewport_width: 1920.0,
+                        viewport_height: 1080.0,
+                        video_width: frame.width as f32,
+                        video_height: frame.height as f32,
+                    };
+                    self.queue.write_buffer(&vs.params_buffer, 0, bytemuck::cast_slice(&[params]));
+                }
+                
+                if let Some(tx) = &state.free_video_frame_tx {
+                    let _ = tx.try_send(frame);
+                }
+            }
+        }
     }
 
     pub fn render(
@@ -844,6 +1101,8 @@ impl<'a> VulkanEngine<'a> {
         let mut out_meters_rect = None;
         let mut out_fire_rect = None;
         let mut out_heatmap_rect = None;
+        let mut out_track_info_rect = None;
+        let mut out_top_panel_rect = None;
         
         let vis_name = match state.visualizer_mode {
             0 => "Frequency Spectrum",
@@ -855,6 +1114,20 @@ impl<'a> VulkanEngine<'a> {
             6 => "Fire Simulation",
             _ => "Unknown",
         };
+        
+        let mut video_info_str = None;
+        if let Some(vs) = &self.video_state {
+            let cs = match vs.color_space {
+                9 | 10 => "HDR BT.2020",
+                5 | 6 => "SD BT.601",
+                _ => "HD BT.709",
+            };
+            let cr = match vs.color_range {
+                2 => "Full Range",
+                _ => "Limited Range",
+            };
+            video_info_str = Some(format!("{}x{} | {} {}-bit {}", vs.width, vs.height, cs, vs.bit_depth, cr));
+        }
         
         let full_output = egui_ctx.run_ui(raw_input, |ctx| {
             if state.show_stats {
@@ -909,8 +1182,23 @@ impl<'a> VulkanEngine<'a> {
                         );
                         ui.label(
                             egui::RichText::new(format!("Audio Buffer: {:.1}%", state.stats.audio_buffer_fill_pct))
-                                .color(if state.stats.audio_buffer_fill_pct < 20.0 { egui::Color32::RED } else { egui::Color32::GREEN })
+                                .color(if state.stats.audio_buffer_fill_pct < 5.0 { egui::Color32::RED } else if state.stats.audio_buffer_fill_pct > 95.0 { egui::Color32::YELLOW } else { egui::Color32::GREEN })
                         );
+                        ui.label(
+                            egui::RichText::new(format!("Video Buffer: {:.1}%", state.stats.video_buffer_fill_pct))
+                                .color(if state.stats.video_buffer_fill_pct < 1.0 { egui::Color32::RED } else if state.stats.video_buffer_fill_pct > 95.0 { egui::Color32::YELLOW } else { egui::Color32::GREEN })
+                        );
+                        if let Some(vi) = &video_info_str {
+                            ui.separator();
+                            ui.label(
+                                egui::RichText::new("Video Stream:")
+                                    .color(egui::Color32::GRAY)
+                            );
+                            ui.label(
+                                egui::RichText::new(vi)
+                                    .color(egui::Color32::YELLOW)
+                            );
+                        }
                     });
             }
 
@@ -1012,9 +1300,13 @@ impl<'a> VulkanEngine<'a> {
                     .frame(egui::Frame::NONE.fill(egui::Color32::TRANSPARENT))
                     .exact_size(ctx.content_rect().height() / 2.0)
                     .show_inside(ctx, |ui| {
-                        ui.columns(3, |columns| {
-                            // Column 0: Channels
-                            columns[0].heading("Channels");
+                        out_top_panel_rect = Some(ui.max_rect());
+                        if state.video_mode == 2 {
+                            out_top_panel_rect = Some(ui.max_rect());
+                        } else {
+                            ui.columns(3, |columns| {
+                                // Column 0: Channels
+                                columns[0].heading("Channels");
                             columns[0].separator();
                             let (channel_rect, _) = columns[0].allocate_exact_size(
                                 egui::vec2(columns[0].available_width(), columns[0].available_height() - 25.0), 
@@ -1078,10 +1370,17 @@ impl<'a> VulkanEngine<'a> {
                             }
                             
                             let painter = columns[0].painter();
+                            let format_time = |secs: f64| -> String {
+                                let m = (secs / 60.0).floor() as u32;
+                                let s = (secs % 60.0).floor() as u32;
+                                let f = (secs.fract() * 10.0).floor() as u32;
+                                format!("{:02}:{:02}.{}", m, s, f)
+                            };
+                            
                             painter.text(
                                 rect.center(),
                                 egui::Align2::CENTER_CENTER,
-                                format!("{:.1}s / {:.1}s", state.current_seconds, state.duration_seconds),
+                                format!("{} / {}", format_time(state.current_seconds), format_time(state.duration_seconds)),
                                 egui::FontId::proportional(11.0),
                                 egui::Color32::WHITE,
                             );
@@ -1193,8 +1492,13 @@ impl<'a> VulkanEngine<'a> {
                             }
                             
                             // Column 2: Track Info
-                            columns[2].heading("Track Info");
-                            columns[2].separator();
+                            if state.video_mode == 1 {
+                                let available = columns[2].available_size();
+                                let (rect, _) = columns[2].allocate_exact_size(available, egui::Sense::hover());
+                                out_track_info_rect = Some(rect);
+                            } else {
+                                columns[2].heading("Track Info");
+                                columns[2].separator();
                             if state.playlist.len() > 1 {
                                 columns[2].horizontal(|ui| { ui.label("Playlist"); ui.label(format!("{} / {}", state.playlist_index + 1, state.playlist.len())); });
                             }
@@ -1227,12 +1531,13 @@ impl<'a> VulkanEngine<'a> {
                                 }
                             });
                             
-                            columns[2].horizontal(|ui| { ui.label("Visualizer"); ui.label(vis_name); });
-                            
                             columns[2].horizontal(|ui| { ui.label("Length"); ui.label(format!("{:.1}s", state.duration_seconds)); });
-                        });
+                            out_track_info_rect = Some(columns[2].min_rect());
+                        }
                     });
-            }
+                }
+            });
+        }
 
             let frame = egui::Frame::NONE.fill(egui::Color32::TRANSPARENT);
             egui::CentralPanel::default().frame(frame).show_inside(ctx, |ui| {
@@ -1275,12 +1580,20 @@ impl<'a> VulkanEngine<'a> {
         
         if let Some(r) = out_meters_rect {
             self.meters_uv_rect = [(r.min.x * scale) / w, (r.min.y * scale) / h, (r.max.x * scale) / w, (r.max.y * scale) / h];
+        } else {
+            self.meters_uv_rect = [0.0; 4];
         }
+        
         if let Some(r) = out_fire_rect {
             self.fire_uv_rect = [(r.min.x * scale) / w, (r.min.y * scale) / h, (r.max.x * scale) / w, (r.max.y * scale) / h];
+        } else {
+            self.fire_uv_rect = [0.0; 4];
         }
+        
         if let Some(r) = out_heatmap_rect {
             self.heatmap_uv_rect = [(r.min.x * scale) / w, (r.min.y * scale) / h, (r.max.x * scale) / w, (r.max.y * scale) / h];
+        } else {
+            self.heatmap_uv_rect = [0.0; 4];
         }
 
         egui_state.handle_platform_output(window, full_output.platform_output);
@@ -1416,6 +1729,49 @@ impl<'a> VulkanEngine<'a> {
             render_pass.set_pipeline(&self.render_pipelines[mode_idx]);
             render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
             render_pass.draw(0..3, 0..1);
+            
+            if state.video_mode > 0 && self.video_state.is_some() {
+                let mut v_vp_x = 0.0;
+                let mut v_vp_y = 0.0;
+                let mut v_vp_w = self.config.width as f32;
+                let mut v_vp_h = self.config.height as f32;
+                
+                let target_rect = if state.video_mode == 1 {
+                    out_track_info_rect
+                } else if state.video_mode == 2 {
+                    out_top_panel_rect
+                } else {
+                    None // mode 3: full screen
+                };
+                
+                if let Some(r) = target_rect {
+                    v_vp_x = ((r.min.x * scale_factor).clamp(0.0, self.config.width as f32)).round();
+                    v_vp_y = ((r.min.y * scale_factor).clamp(0.0, self.config.height as f32)).round();
+                    let max_w = (self.config.width as f32 - v_vp_x).max(1.0);
+                    v_vp_w = ((r.width() * scale_factor).clamp(1.0, max_w)).round();
+                    let max_h = (self.config.height as f32 - v_vp_y).max(1.0);
+                    v_vp_h = ((r.height() * scale_factor).clamp(1.0, max_h)).round();
+                }
+                
+                render_pass.set_viewport(v_vp_x, v_vp_y, v_vp_w, v_vp_h, 0.0, 1.0);
+                
+                if let Some(vs) = &self.video_state {
+                    let params = VideoParams {
+                        color_space: vs.color_space,
+                        color_range: vs.color_range,
+                        bit_depth: vs.bit_depth,
+                        _pad: 0,
+                        viewport_width: v_vp_w,
+                        viewport_height: v_vp_h,
+                        video_width: vs.width as f32,
+                        video_height: vs.height as f32,
+                    };
+                    self.queue.write_buffer(&vs.params_buffer, 0, bytemuck::cast_slice(&[params]));
+                    render_pass.set_pipeline(&self.video_pipeline);
+                    render_pass.set_bind_group(0, &vs.bind_group, &[]);
+                }
+                render_pass.draw(0..3, 0..1);
+            }
             
             if state.show_hud {
                 render_pass.set_viewport(0.0, 0.0, self.config.width as f32, self.config.height as f32, 0.0, 1.0);

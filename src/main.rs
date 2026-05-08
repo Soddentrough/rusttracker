@@ -157,7 +157,6 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 #[allow(unused_variables, unused_assignments)]
 async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal::Stream>, is_fullscreen: bool, use_gpu_fft: bool) {
-
     if use_gpu_fft {
         let mut state = app_state.lock().unwrap();
         state.gpu_fft = true;
@@ -260,6 +259,14 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                                         }
                                     });
                                 },
+                                WinitKeyCode::KeyV => {
+                                    let mut state = app_state.lock().unwrap();
+                                    if state.video_frame_rx.is_some() {
+                                        state.video_mode = (state.video_mode + 1) % 3;
+                                    } else {
+                                        state.video_mode = 0;
+                                    }
+                                },
                                 WinitKeyCode::Space => {
                                     let mut state = app_state.lock().unwrap();
                                     if state.current_seconds >= state.duration_seconds - 0.1 && state.duration_seconds > 0.0 {
@@ -337,6 +344,15 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                     
                     if let Some(path) = load_path {
                         active_stream = None; // DROP OLD STREAM FIRST to release WASAPI lock!
+                        
+                        // Cleanup old video state completely before loading the next file
+                        engine.clear_video_state();
+                        {
+                            let mut state = app_state.lock().unwrap();
+                            state.video_frame_rx = None;
+                            state.free_video_frame_tx = None;
+                        }
+                        
                         // We rely entirely on DSP thread messages to update tracker string state
                         if let Ok(stream) = audio::start_audio_thread(&path, false, Arc::clone(&app_state)) {
                             let mut state = app_state.lock().unwrap();

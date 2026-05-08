@@ -285,7 +285,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     color *= smoothstep(2.5, 0.5, vr);
     
     var final_col = (color * (2.51 * color + 0.03)) / (color * (2.43 * color + 0.59) + 0.14);
-    final_col = pow(max(final_col, vec3<f32>(0.0)), vec3<f32>(1.0 / 2.2));
+    // Output Linear RGB. WGPU Srgb surface will apply the sRGB gamma curve automatically.
+    final_col = max(final_col, vec3<f32>(0.0));
     
     return vec4<f32>(final_col, 1.0);
 }

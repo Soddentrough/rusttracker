@@ -226,5 +226,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Tone mapping
     col = (col * (2.51 * col + 0.03)) / (col * (2.43 * col + 0.59) + 0.14);
     
-    return vec4<f32>(pow(col, vec3<f32>(1.0 / 2.2)), 1.0);
+    // Output Linear RGB. WGPU Srgb surface will apply the sRGB gamma curve automatically.
+    return vec4<f32>(col, 1.0);
 }

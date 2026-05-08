@@ -170,9 +170,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     final_color = final_color * bezel;
     final_color = final_color + noise_color;
 
-    // Gamma correction
-    final_color = pow(final_color, vec3<f32>(1.0 / 2.2));
-
+    // Output Linear RGB. WGPU Srgb surface will apply the sRGB gamma curve automatically.
     return vec4<f32>(final_color, 1.0);
 }
 

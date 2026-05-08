@@ -10,6 +10,38 @@ pub struct PerformanceStats {
     pub fire_us: f32,
     pub gpu_fft_us: f32,
     pub audio_buffer_fill_pct: f32,
+    pub video_buffer_fill_pct: f32,
+}
+
+#[derive(Clone)]
+pub struct VideoFrame {
+    pub pts: f64,
+    pub width: u32,
+    pub height: u32,
+    pub y_plane: Vec<u8>,
+    pub u_plane: Vec<u8>,
+    pub v_plane: Vec<u8>,
+    pub y_stride: usize,
+    pub u_stride: usize,
+    pub v_stride: usize,
+    
+    // HDR Metadata
+    pub bit_depth: u8,
+    pub color_space: u32,
+    pub color_range: u32,
+}
+
+impl std::fmt::Debug for VideoFrame {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VideoFrame")
+            .field("pts", &self.pts)
+            .field("width", &self.width)
+            .field("height", &self.height)
+            .field("bit_depth", &self.bit_depth)
+            .field("color_space", &self.color_space)
+            .field("color_range", &self.color_range)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -20,6 +52,7 @@ pub struct AppState {
     pub duration_seconds: f64,
     pub current_seconds: f64,
     pub seek_request: Option<f64>,
+    pub seek_epoch: u64,
     pub is_paused: bool,
     pub bpm: i32,
     pub speed: i32,
@@ -49,6 +82,7 @@ pub struct AppState {
     pub tracker_patterns_by_order: Vec<Vec<String>>,
     pub tracker_channels: Option<i32>,
     pub load_request: Option<String>,
+    pub video_mode: u32,
     pub file_loaded: bool,
     pub video_info: Option<String>,
     pub show_stats: bool,
@@ -60,6 +94,8 @@ pub struct AppState {
     pub visualizer_mode: u32,
     pub available_visualizers: Vec<u32>,
     pub current_visualizer_idx: usize,
+    pub video_frame_rx: Option<crossbeam_channel::Receiver<VideoFrame>>,
+    pub free_video_frame_tx: Option<crossbeam_channel::Sender<VideoFrame>>,
 }
 
 impl AppState {
@@ -82,6 +118,7 @@ impl AppState {
             duration_seconds: 0.0,
             current_seconds: 0.0,
             seek_request: None,
+            seek_epoch: 0,
             is_paused: false,
             bpm: 0,
             speed: 0,
@@ -122,6 +159,9 @@ impl AppState {
             visualizer_mode: 0,
             available_visualizers: vec![0, 1, 2, 3, 4, 5, 6],
             current_visualizer_idx: 0,
+            video_frame_rx: None,
+            free_video_frame_tx: None,
+            video_mode: 0,
         }
     }
 }
