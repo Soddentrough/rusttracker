@@ -417,10 +417,10 @@ impl<'a> VulkanEngine<'a> {
         self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
         self.queue.write_buffer(&self.waveform_storage_buffer, 0, bytemuck::cast_slice(&[history_storage]));
         
-        let mut visualizer_storage = VisualizerStorage {
+        let mut visualizer_storage = Box::new(VisualizerStorage {
             history: [0.0; 30720],
             fire_grid: [0.0; 147456],
-        };
+        });
         let chunks = 256;
         let history_len = state.spectrum_history.len().min(120);
         if history_len > 0 {
@@ -565,7 +565,7 @@ impl<'a> VulkanEngine<'a> {
             }
         }
 
-        self.queue.write_buffer(&self.visualizer_storage_buffer, 0, bytemuck::cast_slice(&[visualizer_storage]));
+        self.queue.write_buffer(&self.visualizer_storage_buffer, 0, bytemuck::cast_slice(std::slice::from_ref(&*visualizer_storage)));
     }
 
     pub fn render(
