@@ -23,9 +23,9 @@ struct AudioUniforms {
     time: f32,
     duration: f32,
     smooth_time: f32,
-    _pad1: u32,
-    _pad2: u32,
-    _pad3: u32,
+    heatmap_row: u32,
+    fft_channels: u32,
+    _pad: u32,
     ui_meters_rect: vec4<f32>,
     ui_heatmap_rect: vec4<f32>,
     ui_fire_rect: vec4<f32>,
@@ -146,14 +146,31 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Spatially-accurate high frequency audio reactivity from GPU FFT
     let n_ch = max(1u, audio.num_channels);
     let channel_idx = min(u32(in.uv.x * f32(n_ch)), n_ch - 1u);
-    let offset = channel_idx * 1024u;
     
-    // Sample high frequencies for this specific spatial channel
+    var fft_ch = channel_idx;
+    var vu_scale = 1.0;
+    if (audio.fft_channels < n_ch) {
+        fft_ch = channel_idx % max(audio.fft_channels, 1u);
+        
+        let vec_idx = channel_idx / 4u;
+        let elem_idx = channel_idx % 4u;
+        var val = 0.0;
+        if (elem_idx == 0u) { val = audio.channels[vec_idx].x; }
+        else if (elem_idx == 1u) { val = audio.channels[vec_idx].y; }
+        else if (elem_idx == 2u) { val = audio.channels[vec_idx].z; }
+        else { val = audio.channels[vec_idx].w; }
+        
+        vu_scale = max(val * 1.5, 0.05);
+    }
+    
+    let offset = fft_ch * 1024u;
+    
+    // Sample high frequencies for this specific spatial channel (approx 4000Hz - 20000Hz)
     var high_energy = 0.0;
-    for (var b = 150u; b < 300u; b = b + 4u) {
+    for (var b = 780u; b < 1000u; b = b + 5u) {
         high_energy += multi_spectrum[offset + b];
     }
-    high_energy = min((high_energy / 37.0) / 100.0, 1.0);
+    high_energy = min((high_energy / 44.0) / 100.0 * vu_scale, 1.0);
     
     // Final color using blackbody
     let fire_color = blackbody(final_heat);

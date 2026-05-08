@@ -9,7 +9,8 @@ struct FireParams {
     height: u32,
     num_channels: u32,
     lfe_idx: u32,
-    _pad: vec2<u32>,
+    fft_channels: u32,
+    _pad: u32,
     channels: array<vec4<f32>, 8>,
 };
 
@@ -109,15 +110,31 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             let sigma = channel_width * sigma_scale;
             let influence = exp(-(dist * dist) / (2.0 * sigma * sigma));
             
-            // Sample low frequencies (bins 2 to 30) for this specific channel
+            var fft_ch = i;
+            var vu_scale = 1.0;
+            if (params.fft_channels < params.num_channels) {
+                fft_ch = i % max(params.fft_channels, 1u);
+                
+                let vec_idx = i / 4u;
+                let elem_idx = i % 4u;
+                var val = 0.0;
+                if (elem_idx == 0u) { val = params.channels[vec_idx].x; }
+                else if (elem_idx == 1u) { val = params.channels[vec_idx].y; }
+                else if (elem_idx == 2u) { val = params.channels[vec_idx].z; }
+                else { val = params.channels[vec_idx].w; }
+                
+                vu_scale = max(val * 1.5, 0.05);
+            }
+            
+            // Sample low frequencies (bins 10 to 350) for this specific channel (approx 20Hz - 200Hz)
             var ch_bass = 0.0;
-            let offset = i * 1024u;
-            for (var b = 2u; b < 30u; b = b + 1u) {
+            let offset = fft_ch * 1024u;
+            for (var b = 10u; b < 350u; b = b + 10u) {
                 ch_bass += multi_spectrum[offset + b];
             }
-            ch_bass = (ch_bass / 28.0) / 100.0;
+            ch_bass = (ch_bass / 34.0) / 100.0;
             
-            activity += pow(ch_bass, 1.5) * influence * 2.5;
+            activity += pow(ch_bass, 1.5) * influence * 2.5 * vu_scale;
             spatial_idx += 1u;
         }
         if lfe_idx < n_ch {
@@ -126,10 +143,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             
             var lfe_bass = 0.0;
             let offset = lfe_idx * 1024u;
-            for (var b = 0u; b < 20u; b = b + 1u) {
+            for (var b = 0u; b < 200u; b = b + 5u) {
                 lfe_bass += multi_spectrum[offset + b];
             }
-            lfe_bass = (lfe_bass / 20.0) / 100.0;
+            lfe_bass = (lfe_bass / 40.0) / 100.0;
             
             activity += lfe_bass * lfe_influence * 1.5;
         }

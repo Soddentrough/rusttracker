@@ -1,6 +1,6 @@
 [Setup]
 AppName=RustTracker
-AppVersion=1.0.0
+AppVersion=0.7.21
 DefaultDirName={autopf}\RustTracker
 ArchitecturesAllowed=x64
 ArchitecturesInstallIn64BitMode=x64
