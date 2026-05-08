@@ -15,3 +15,17 @@ Support playing the background video stream from loaded media files (like MP4, M
     *   The demuxing process must be refactored. A background thread will read raw packets from the container and push them to separate Audio and Video ring buffers.
     *   This ensures the high-priority CPAL audio thread is never blocked by video packet fetching or decoding.
 *   **Difficulty Adjustment:** By shifting the decoding and scaling from CPU to GPU hardware, the performance impact on the main application is minimized, significantly lowering the risk of audio underruns or frame drops, making the feature highly viable.
+
+## Version 0.9: Neon Room Ray Traced Visualizer
+
+**Feature Request:**
+Load `neon_room.blend` to use as the basis for a new visualizer. It is a basic room scene with objects labelled after spatial channels (Front, LFE, center, rear, etc). 
+
+The idea will be to load this scene and use a ray tracing engine to light up these objects in time to the audio streams.
+
+**Implementation Notes:**
+*   This may require the 'blend-rs' crate or some other system to load the 3d object data. It may require changes to the materials in Blender.
+
+**Concerns:**
+*   Binary file size bloat.
+*   Computational intensity of a ray traced scene with dynamic lighting. Obviously only available on supported hardware.
