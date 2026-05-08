@@ -972,12 +972,24 @@ impl<'a> VulkanEngine<'a> {
                                     ui.label(egui::RichText::new("Toggle Fullscreen").color(egui::Color32::GRAY));
                                     ui.end_row();
                                     
+                                    ui.label(egui::RichText::new("S").color(egui::Color32::WHITE).strong());
+                                    ui.label(egui::RichText::new("Toggle Stats").color(egui::Color32::GRAY));
+                                    ui.end_row();
+                                    
+                                    ui.label(egui::RichText::new("G").color(egui::Color32::WHITE).strong());
+                                    ui.label(egui::RichText::new("Toggle GPU FFT").color(egui::Color32::GRAY));
+                                    ui.end_row();
+                                    
                                     ui.label(egui::RichText::new("Space").color(egui::Color32::WHITE).strong());
                                     ui.label(egui::RichText::new("Play / Pause").color(egui::Color32::GRAY));
                                     ui.end_row();
 
-                                    ui.label(egui::RichText::new("Arrows").color(egui::Color32::WHITE).strong());
+                                    ui.label(egui::RichText::new("Left / Right").color(egui::Color32::WHITE).strong());
                                     ui.label(egui::RichText::new("Seek Timeline").color(egui::Color32::GRAY));
+                                    ui.end_row();
+                                    
+                                    ui.label(egui::RichText::new("Up / Down").color(egui::Color32::WHITE).strong());
+                                    ui.label(egui::RichText::new("Change Visualizer").color(egui::Color32::GRAY));
                                     ui.end_row();
                                     
                                     ui.label(egui::RichText::new("Q / Esc").color(egui::Color32::WHITE).strong());

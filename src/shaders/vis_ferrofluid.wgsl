@@ -99,7 +99,9 @@ fn map(p: vec3<f32>) -> MapData {
         let dist_to_spike = abs(dist_xz - spike_pos_r);
         let spatial_falloff = exp(-dist_to_spike * 3.0);
         
-        let lobe = pow(alignment, 12.0) * vu * 1.5 * spatial_falloff;
+        // Soften the shape of the spikes (pow 8 instead of 12) to make the slopes
+        // less extreme, which helps the raymarcher calculate accurate distances
+        let lobe = pow(alignment, 8.0) * vu * 1.5 * spatial_falloff;
         total_displacement = smax(total_displacement, lobe, 0.3);
         
         // Inner glow for spikes
@@ -119,11 +121,12 @@ fn map(p: vec3<f32>) -> MapData {
     
     let d = p.y + 0.5 - fluid_h;
     
-    return MapData(d * 0.6, 1, glow);
+    // Drop step multiplier further to completely eliminate overshooting
+    return MapData(d * 0.15, 1, glow);
 }
 
 fn calcNormal(p: vec3<f32>) -> vec3<f32> {
-    let e = vec2<f32>(0.005, 0.0);
+    let e = vec2<f32>(0.015, 0.0); // Increased epsilon for smoother, anti-aliased normals
     return normalize(vec3<f32>(
         map(p + e.xyy).d - map(p - e.xyy).d,
         map(p + e.yxy).d - map(p - e.yxy).d,
@@ -139,9 +142,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let aspect = dpdy(in.uv.y) / dpdx(in.uv.x);
     let p = vec2<f32>(uv.x * abs(aspect), -uv.y);
     
-    // Camera looking slightly down at the puddle
-    let ro = vec3<f32>(0.0, 2.5, 4.0);
-    let cam_target = vec3<f32>(0.0, -0.5, 0.0);
+    // Camera looking slightly down at the puddle (zoomed in to take up more space)
+    let ro = vec3<f32>(0.0, 1.25, 2.0);
+    let cam_target = vec3<f32>(0.0, -0.25, 0.0);
     
     let ww = normalize(cam_target - ro);
     let uu = normalize(cross(ww, vec3<f32>(0.0, 1.0, 0.0)));
@@ -158,7 +161,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var hit = false;
     var final_p = vec3<f32>(0.0);
     
-    for (var i = 0; i < 100; i++) {
+    // Increase max iterations to compensate for the very small step size
+    for (var i = 0; i < 350; i++) {
         let p_current = ro + rd * t;
         let map_data = map(p_current);
         let d = map_data.d;
@@ -180,8 +184,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if hit {
         let n = calcNormal(final_p);
         
-        // Fluid transition based on height
-        let is_fluid = smoothstep(-0.495, -0.47, final_p.y);
+        // Fluid transition based on height (widened for a soft, anti-aliased gradient edge)
+        let is_fluid = smoothstep(-0.55, -0.42, final_p.y);
         
         // Floor Material (Pure White Studio)
         // No diffuse shading to keep it looking like a pure white void/backdrop
@@ -192,14 +196,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let ref_dir = reflect(rd, n);
         let fresnel = pow(1.0 - max(0.0, dot(n, -rd)), 5.0);
         
-        // Sharp specular highlights mimicking studio softboxes
-        let light1 = pow(max(0.0, dot(ref_dir, normalize(vec3<f32>(1.0, 1.5, 1.0)))), 64.0);
-        let light2 = pow(max(0.0, dot(ref_dir, normalize(vec3<f32>(-1.0, 1.0, -1.0)))), 32.0);
+        // Softened specular highlights to reduce shimmering/aliasing
+        let light_time = audio.time * 0.4;
+        let light_dir1 = normalize(vec3<f32>(sin(light_time) * 1.5, 1.5, cos(light_time) * 1.5));
+        let light1 = pow(max(0.0, dot(ref_dir, light_dir1)), 24.0);
         let rim_light = smoothstep(0.7, 1.0, max(0.0, ref_dir.y));
         
         var fluid_ref = vec3<f32>(0.0); // Pure black base reflection
         fluid_ref += vec3<f32>(5.0) * light1 * 2.0; // Intense white highlight
-        fluid_ref += vec3<f32>(3.0) * light2;       // Intense white highlight
         fluid_ref += vec3<f32>(1.0) * rim_light;    // Rim light from the white environment
         
         let fluid_col = mix(vec3<f32>(0.0), fluid_ref, 0.2 + 0.8 * fresnel);

@@ -71,7 +71,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     for (var i = 0u; i < num_ch; i = i + 1u) {
         var angle_deg = 0.0;
         var radius = 0.8;
-        if audio.num_channels == 6u || audio.num_channels == 8u || audio.num_channels == 12u {
+        if audio.num_channels == 2u || audio.num_channels == 6u || audio.num_channels == 8u || audio.num_channels == 12u {
             angle_deg = speaker_angles[i].x;
             radius = speaker_angles[i].y;
         } else {

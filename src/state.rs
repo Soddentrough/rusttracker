@@ -98,7 +98,7 @@ impl AppState {
             raw_audio_channels: Vec::new(),
             fire_heat: vec![0.0; 1024],
             show_hud: true,
-            gpu_fft: false,
+            gpu_fft: true,
             max_frequency: 10000.0,
             num_samples: 0,
             num_instruments: 0,
