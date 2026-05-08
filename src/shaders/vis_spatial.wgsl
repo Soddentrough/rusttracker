@@ -146,7 +146,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             else if component_idx == 1u { vu = ch_vec.y; }
             else if component_idx == 2u { vu = ch_vec.z; }
             else { vu = ch_vec.w; }
-        }
         vu = clamp(vu, 0.0, 1.0);
         
         // Add physical "bounce" to the speaker based on its volume

@@ -1,4 +1,8 @@
 #!/bin/bash
+echo "-----------------------------------------------------"
+echo "DO NOT RUN UNLESS YOU KNOW THE CODE COMPILES CLEANLY"
+echo "THIS CAN TAKE 15 MINUTES TO COMPLETE"
+echo "-----------------------------------------------------"
 echo "Waiting for Github Actions to complete..."
 while true; do
   STATUS=$(gh run list --branch v0.8.1 --json status,conclusion -q '.[0].status')
