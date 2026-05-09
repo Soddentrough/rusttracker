@@ -28,6 +28,21 @@ Run with live microphone input:
 cargo run -- --mic
 ```
 
+## Steam Deck Installation
+
+RustTracker provides a fully optimized native AppImage specifically built for SteamOS, featuring out-of-the-box gamepad controls.
+
+1. Download the latest `RustTracker-SteamDeck-GamePad.AppImage` from the **Releases** page.
+2. Switch your Steam Deck to **Desktop Mode**.
+3. Open your Downloads folder, right-click the AppImage file, and select **Properties** -> **Permissions**. Check the box for **"Is executable"**.
+4. Right-click the file again and select **"Add to Steam"**.
+5. Switch back to **Gaming Mode** and launch RustTracker from your Non-Steam games library.
+
+**Important Note on Controls:** 
+RustTracker expects native Gamepad inputs. Launching it via Gaming Mode ensures Steam Input sends proper gamepad signals (Y, X, A, B, etc.). If you run the AppImage from Desktop Mode without adding it to Steam, Steam Input defaults to its "Desktop Configuration" (which translates your button presses into keyboard keys like `Escape` and `Tab`), rendering the native Gamepad UI features unresponsive. 
+
+To force Gamepad Mode while on the desktop, hold the **Start (Menu)** button for 3 seconds!
+
 ## Built With
 * `wgpu` & `egui` - Hardware-accelerated UI
 * `cpal` - Cross-platform Audio I/O
