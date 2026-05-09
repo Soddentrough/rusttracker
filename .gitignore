@@ -5,6 +5,11 @@ dist/
 *.exe
 *.msi
 *.rpm
+*.deb
+*.AppImage
+linux_rpm/
+linux_deb/
+windows_release/
 
 # Tracker Modules
 *.mod
