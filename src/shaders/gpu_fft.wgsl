@@ -6,7 +6,7 @@ struct FFTParams {
 }
 
 @group(0) @binding(0) var<storage, read> raw_audio: array<f32>; // [32 * 8192]
-@group(0) @binding(1) var<storage, read_write> spectrum: array<f32>; // [32 * 1024]
+@group(0) @binding(1) var<storage, read_write> spectrum: array<vec2<f32>>; // [32 * 1024]
 @group(0) @binding(2) var<uniform> params: FFTParams;
 
 const NUM_BINS: u32 = 1024u;
@@ -44,8 +44,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         im -= w_sample * sin(phase);
     }
     
-    let mag = sqrt(re * re + im * im) / sqrt(f32(NUM_SAMPLES));
+    let norm_re = re / sqrt(f32(NUM_SAMPLES));
+    let norm_im = im / sqrt(f32(NUM_SAMPLES));
     
-    // Write out normalized magnitude
-    spectrum[ch_idx * NUM_BINS + bin_idx] = clamp(mag * 100.0, 0.0, 100.0);
+    // Write out normalized complex values
+    spectrum[ch_idx * NUM_BINS + bin_idx] = vec2<f32>(norm_re, norm_im);
 }

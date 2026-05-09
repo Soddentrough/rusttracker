@@ -108,7 +108,7 @@ fn blackbody(temperature: f32) -> vec3<f32> {
     return color;
 }
 
-@group(0) @binding(4) var<storage, read> multi_spectrum: array<f32>;
+@group(0) @binding(4) var<storage, read> multi_spectrum: array<vec2<f32>>;
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
@@ -169,7 +169,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Sample high frequencies for this specific spatial channel (approx 4000Hz - 20000Hz)
     var high_energy = 0.0;
     for (var b = 780u; b < 1000u; b = b + 5u) {
-        high_energy += multi_spectrum[offset + b];
+        let c = multi_spectrum[offset + b];
+        high_energy += clamp(length(c) * 100.0, 0.0, 100.0);
     }
     high_energy = min((high_energy / 44.0) / 100.0 * vu_scale, 1.0);
     

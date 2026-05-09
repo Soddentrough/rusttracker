@@ -18,7 +18,7 @@ struct FireParams {
 @group(0) @binding(1) var<storage, read_write> output_grid: array<f32>;
 @group(0) @binding(2) var<storage, read_write> coal_bed: array<f32>;
 @group(0) @binding(3) var<uniform> params: FireParams;
-@group(0) @binding(4) var<storage, read> multi_spectrum: array<f32>;
+@group(0) @binding(4) var<storage, read> multi_spectrum: array<vec2<f32>>;
 
 fn pcg_hash(input: u32) -> u32 {
     var state = input * 747796405u + 2891336453u;
@@ -130,7 +130,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             var ch_bass = 0.0;
             let offset = fft_ch * 1024u;
             for (var b = 10u; b < 350u; b = b + 10u) {
-                ch_bass += multi_spectrum[offset + b];
+                let c = multi_spectrum[offset + b];
+                ch_bass += clamp(length(c) * 100.0, 0.0, 100.0);
             }
             ch_bass = (ch_bass / 34.0) / 100.0;
             
@@ -144,7 +145,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             var lfe_bass = 0.0;
             let offset = lfe_idx * 1024u;
             for (var b = 0u; b < 200u; b = b + 5u) {
-                lfe_bass += multi_spectrum[offset + b];
+                let c = multi_spectrum[offset + b];
+                lfe_bass += clamp(length(c) * 100.0, 0.0, 100.0);
             }
             lfe_bass = (lfe_bass / 40.0) / 100.0;
             

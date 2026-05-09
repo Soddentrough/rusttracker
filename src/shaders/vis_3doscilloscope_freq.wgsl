@@ -38,6 +38,9 @@ var<uniform> audio: AudioUniforms;
 @group(0) @binding(1)
 var<storage, read> waveform_history: array<vec4<f32>>;
 
+@group(0) @binding(4)
+var<storage, read> gpu_spectrum: array<vec2<f32>>;
+
 // Hash function for analog noise
 fn hash12(p: vec2<f32>) -> f32 {
     var p3 = fract(vec3<f32>(p.xyx) * 0.1031);
@@ -45,24 +48,11 @@ fn hash12(p: vec2<f32>) -> f32 {
     return fract((p3.x + p3.y) * p3.z);
 }
 
-fn get_fft_amplitude(line_idx: u32, num_lines: u32) -> f32 {
-    // Ensure every single line gets a strictly unique frequency bin
-    // Maps line 0 to bin 1 (bass), up to line 31 to bin ~132 (treble)
-    let non_linear = u32(pow(f32(line_idx) / f32(num_lines - 1u), 2.0) * 100.0);
-    let bin_idx = line_idx + non_linear + 1u;
-    
-    let vec_idx = bin_idx / 4u;
-    let comp_idx = bin_idx % 4u;
-    
-    let spec = audio.spectrum[vec_idx];
-    var amp = 0.0;
-    if comp_idx == 0u { amp = spec.x; }
-    else if comp_idx == 1u { amp = spec.y; }
-    else if comp_idx == 2u { amp = spec.z; }
-    else { amp = spec.w; }
-    
-    // Smooth the amplitude over time a bit to avoid jitter
-    return min(amp * 1.5, 2.0);
+fn get_resynthesized_wave(line_idx: u32, x_norm: f32) -> f32 {
+    let point_idx = clamp(u32(x_norm * 511.0), 0u, 511u);
+    let base_offset = 16u * 1024u;
+    let flat_idx = line_idx * 512u + point_idx;
+    return gpu_spectrum[base_offset + flat_idx].x;
 }
 
 fn sd_segment(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
@@ -112,56 +102,49 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let rd = normalize(w + p.x * u - p.y * v_cam);
 
     var accumulated_intensity = 0.0;
-
-    let num_lines = 32u;
-    let num_points = 512u; // Increased resolution for wider lines
     
+    let num_lines = 32u;
+    let num_points = 512u;
+    
+    // We render the 3D grid back-to-front
     for (var i = 0u; i < num_lines; i = i + 1u) {
-        // Z layout: back to front.
-        // Maintain same 0.24 spacing: 31 * 0.24 = 7.44 span. Front remains -1.8, back becomes 5.64.
-        let y_line = mix(5.64, -1.8, f32(i) / f32(num_lines - 1u));
-        
-        // 1. Get the real FFT amplitude for this specific frequency band
-        let fft_amp = get_fft_amplitude(i, num_lines);
-        
-        // 2. Calculate the visual frequency of this band (from 1 cycle to ~32 cycles)
-        let cycles = pow(1.25, f32(i) * (16.0 / f32(num_lines))); 
-        let phase = audio.time * cycles * 2.0;
+        // Z layout: back to front. i=0 is back (low freq), i=31 is front (high freq).
+        let i_f = f32(i);
+        let y_line = mix(5.64, -1.8, i_f / 31.0);
         
         let t = (y_line - ro.y) / rd.y;
+        
         if t > 0.0 {
             let hit_x = ro.x + rd.x * t;
             
-            // Map X from -8.0 to 8.0
             let float_idx = (hit_x + 8.0) / 16.0 * f32(num_points - 1u);
             let idx = i32(round(float_idx));
             
-            let start_idx = max(0, idx - 12);
-            let end_idx = min(i32(num_points) - 2, idx + 12);
+            let start_idx = max(0, idx - 4);
+            let end_idx = min(i32(num_points) - 2, idx + 4);
             
             var min_dist = 1000.0;
+            
+            // Hoist the first point evaluation to halve the workload
+            let j_start_u = u32(start_idx);
+            let x0_init = mix(-8.0, 8.0, f32(j_start_u) / f32(num_points - 1u));
+            var mask0 = smoothstep(8.0, 5.0, abs(x0_init));
+            var x_norm0 = f32(j_start_u) / f32(num_points - 1u);
+            var v0 = get_resynthesized_wave(i, x_norm0);
+            var x0 = x0_init;
             
             for (var j = start_idx; j <= end_idx; j = j + 1) {
                 let j_u = u32(j);
                 
-                let x0 = mix(-8.0, 8.0, f32(j_u) / f32(num_points - 1u));
                 let x1 = mix(-8.0, 8.0, f32(j_u + 1u) / f32(num_points - 1u));
-                
-                // Falloff mask so lines flatten out perfectly at the left/right edges
-                let mask0 = smoothstep(8.0, 5.0, abs(x0));
                 let mask1 = smoothstep(8.0, 5.0, abs(x1));
-                
-                let x_norm0 = f32(j_u) / f32(num_points - 1u);
                 let x_norm1 = f32(j_u + 1u) / f32(num_points - 1u);
                 
-                // 3. Synthesize the bandpassed waveform!
-                let v0 = sin(x_norm0 * cycles * 6.28318 - phase) * fft_amp;
-                let v1 = sin(x_norm1 * cycles * 6.28318 - phase) * fft_amp;
+                let v1 = get_resynthesized_wave(i, x_norm1);
                 
-                // Only go UP (positive Z) from the baseline. 
-                // We use abs() so both positive and negative waveform phases create peaks
-                let p0 = abs(v0) * mask0 * 0.8;
-                let p1 = abs(v1) * mask1 * 0.8;
+                // Allow true negative waveforms, just apply mask
+                let p0 = v0 * mask0 * 1.5;
+                let p1 = v1 * mask1 * 1.5;
                 
                 let p3_0 = vec3<f32>(x0, y_line, p0);
                 let p3_1 = vec3<f32>(x1, y_line, p1);
@@ -173,6 +156,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                     let d = sd_segment(p, proj0.xy, proj1.xy);
                     min_dist = min(min_dist, d);
                 }
+                
+                v0 = v1;
+                x0 = x1;
+                mask0 = mask1;
             }
             
             let r = length(crt_uv);
@@ -187,10 +174,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let depth_fade = exp(-t * 0.35);
             let edge_fade = smoothstep(8.0, 5.0, abs(hit_x));
             
-            // Age fade (older lines fade out)
-            let age_fade = mix(0.05, 1.0, f32(i) / f32(num_lines - 1u));
-            
-            accumulated_intensity += (core + bloom) * depth_fade * edge_fade * age_fade;
+            accumulated_intensity += (core + bloom) * depth_fade * edge_fade;
         }
     }
     

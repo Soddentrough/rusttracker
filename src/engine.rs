@@ -134,6 +134,8 @@ pub struct VulkanEngine<'a> {
     // GPU FFT
     fft_compute_pipeline: wgpu::ComputePipeline,
     fft_bind_group: wgpu::BindGroup,
+    resynth_compute_pipeline: wgpu::ComputePipeline,
+    resynth_bind_group: wgpu::BindGroup,
     raw_audio_buffer: wgpu::Buffer,
     _gpu_spectrum_buffer: wgpu::Buffer,
     fft_params_buffer: wgpu::Buffer,
@@ -218,7 +220,7 @@ impl<'a> VulkanEngine<'a> {
 
         let gpu_spectrum_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("GPU FFT Spectrum Buffer"),
-            size: 32 * 1024 * 4,
+            size: 32 * 1024 * 8, // 32 channels, 1024 bins, vec2<f32>
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
             mapped_at_creation: false,
         });
@@ -807,6 +809,26 @@ impl<'a> VulkanEngine<'a> {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
         });
+        
+        let resynth_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("resynth_bind_group_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+            ],
+        });
+        let resynth_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("resynth_bind_group"), layout: &resynth_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: gpu_spectrum_buffer.as_entire_binding() },
+            ],
+        });
+        let resynth_compute_shader = device.create_shader_module(wgpu::include_wgsl!("shaders/resynth_compute.wgsl"));
+        let resynth_compute_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("resynth_compute_layout"), bind_group_layouts: &[Some(&resynth_bind_group_layout)], immediate_size: 0,
+        });
+        let resynth_compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Resynth Compute Pipeline"), layout: Some(&resynth_compute_pipeline_layout), module: &resynth_compute_shader, entry_point: Some("main"), compilation_options: wgpu::PipelineCompilationOptions::default(), cache: None,
+        });
         // --- END GPU FFT INIT ---
 
         Self {
@@ -846,6 +868,8 @@ impl<'a> VulkanEngine<'a> {
             start_time: std::time::Instant::now(),
             fft_compute_pipeline,
             fft_bind_group,
+            resynth_compute_pipeline,
+            resynth_bind_group,
             raw_audio_buffer,
             _gpu_spectrum_buffer: gpu_spectrum_buffer,
             fft_params_buffer,
@@ -1716,17 +1740,28 @@ impl<'a> VulkanEngine<'a> {
         
         // GPU FFT compute
         if state.gpu_fft {
-            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("FFT Compute Pass"),
-                timestamp_writes: self.query_set.as_ref().map(|qs| wgpu::ComputePassTimestampWrites {
-                    query_set: qs,
-                    beginning_of_pass_write_index: Some(0),
-                    end_of_pass_write_index: Some(1),
-                }),
-            });
-            compute_pass.set_pipeline(&self.fft_compute_pipeline);
-            compute_pass.set_bind_group(0, Some(&self.fft_bind_group), &[]);
-            compute_pass.dispatch_workgroups(64, 2, 1); // 1024/16=64, 32/16=2
+            {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("FFT Compute Pass"),
+                    timestamp_writes: self.query_set.as_ref().map(|qs| wgpu::ComputePassTimestampWrites {
+                        query_set: qs,
+                        beginning_of_pass_write_index: Some(0),
+                        end_of_pass_write_index: Some(1),
+                    }),
+                });
+                compute_pass.set_pipeline(&self.fft_compute_pipeline);
+                compute_pass.set_bind_group(0, Some(&self.fft_bind_group), &[]);
+                compute_pass.dispatch_workgroups(64, 2, 1); // 1024/16=64, 32/16=2
+            }
+            if state.visualizer_mode == 8 {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Resynth Compute Pass"),
+                    timestamp_writes: None,
+                });
+                compute_pass.set_pipeline(&self.resynth_compute_pipeline);
+                compute_pass.set_bind_group(0, Some(&self.resynth_bind_group), &[]);
+                compute_pass.dispatch_workgroups(32, 2, 1); // 512/16=32, 32/16=2
+            }
         }
 
         // GPU fire compute: dispatch simulation + copy result to texture
