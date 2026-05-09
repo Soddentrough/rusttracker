@@ -242,17 +242,15 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                                         state.is_file_picker_open = true;
                                         let app_state_clone = Arc::clone(&app_state);
                                         std::thread::spawn(move || {
-                                            if let Some(paths) = rfd::FileDialog::new()
+                                            if let Some(path) = rfd::FileDialog::new()
                                                 .add_filter("Audio/Video Files", &["flac", "wav", "mp3", "ogg", "aac", "m4a", "mp4", "mkv", "avi", "webm", "opus", "mod", "s3m", "xm", "it", "stm", "669", "mtm", "med", "okt", "psm"])
                                                 .add_filter("All Files", &["*"])
-                                                .pick_files() {
-                                                if !paths.is_empty() {
-                                                    let mut state = app_state_clone.lock().unwrap();
-                                                    state.playlist = paths.into_iter().map(|p| p.display().to_string()).collect();
-                                                    state.playlist_index = 0;
-                                                    state.load_request = Some(state.playlist[0].clone());
-                                                    state.file_loaded = true;
-                                                }
+                                                .pick_file() {
+                                                let mut state = app_state_clone.lock().unwrap();
+                                                state.playlist = vec![path.display().to_string()];
+                                                state.playlist_index = 0;
+                                                state.load_request = Some(state.playlist[0].clone());
+                                                state.file_loaded = true;
                                             }
                                             app_state_clone.lock().unwrap().is_file_picker_open = false;
                                         });
@@ -507,17 +505,15 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                             state.is_file_picker_open = true;
                             let app_state_clone = Arc::clone(&app_state);
                             std::thread::spawn(move || {
-                                if let Some(paths) = rfd::FileDialog::new()
+                                if let Some(path) = rfd::FileDialog::new()
                                     .add_filter("Audio/Video Files", &["flac", "wav", "mp3", "ogg", "aac", "m4a", "mp4", "mkv", "avi", "webm", "opus", "mod", "s3m", "xm", "it", "stm", "669", "mtm", "med", "okt", "psm"])
                                     .add_filter("All Files", &["*"])
-                                    .pick_files() {
-                                    if !paths.is_empty() {
-                                        let mut state = app_state_clone.lock().unwrap();
-                                        state.playlist = paths.into_iter().map(|p| p.display().to_string()).collect();
-                                        state.playlist_index = 0;
-                                        state.load_request = Some(state.playlist[0].clone());
-                                        state.file_loaded = true;
-                                    }
+                                    .pick_file() {
+                                    let mut state = app_state_clone.lock().unwrap();
+                                    state.playlist = vec![path.display().to_string()];
+                                    state.playlist_index = 0;
+                                    state.load_request = Some(state.playlist[0].clone());
+                                    state.file_loaded = true;
                                 }
                                 app_state_clone.lock().unwrap().is_file_picker_open = false;
                             });
@@ -574,17 +570,15 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                                         state.is_file_picker_open = true;
                                         let app_state_clone = Arc::clone(&app_state);
                                         std::thread::spawn(move || {
-                                            if let Some(paths) = rfd::FileDialog::new()
+                                            if let Some(path) = rfd::FileDialog::new()
                                                 .add_filter("Audio/Video Files", &["flac", "wav", "mp3", "ogg", "aac", "m4a", "mp4", "mkv", "avi", "webm", "opus", "mod", "s3m", "xm", "it", "stm", "669", "mtm", "med", "okt", "psm"])
                                                 .add_filter("All Files", &["*"])
-                                                .pick_files() {
-                                                if !paths.is_empty() {
-                                                    let mut state = app_state_clone.lock().unwrap();
-                                                    state.playlist = paths.into_iter().map(|p| p.display().to_string()).collect();
-                                                    state.playlist_index = 0;
-                                                    state.load_request = Some(state.playlist[0].clone());
-                                                    state.file_loaded = true;
-                                                }
+                                                .pick_file() {
+                                                let mut state = app_state_clone.lock().unwrap();
+                                                state.playlist = vec![path.display().to_string()];
+                                                state.playlist_index = 0;
+                                                state.load_request = Some(state.playlist[0].clone());
+                                                state.file_loaded = true;
                                             }
                                             app_state_clone.lock().unwrap().is_file_picker_open = false;
                                         });

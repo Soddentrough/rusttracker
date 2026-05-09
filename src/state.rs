@@ -49,6 +49,7 @@ pub struct VisualizerDef {
     pub id: u32,
     pub name: &'static str,
     pub filename: &'static str,
+    #[allow(dead_code)]
     pub description: &'static str,
     pub requires_history: bool,
     pub requires_fire: bool,
