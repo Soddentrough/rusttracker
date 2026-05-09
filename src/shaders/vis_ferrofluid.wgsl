@@ -1,3 +1,18 @@
+// =====================================================
+// Chrome Ferrofluid Visualizer
+// Raymarched liquid metal puddle with audio-reactive spikes
+// =====================================================
+
+// --- Tuning Constants ---
+const PUDDLE_RADIUS: f32 = 4.0;
+const STEP_SCALE: f32 = 0.45;       // Lipschitz correction for pow-8 lobes + smax(k=0.3)
+const MAX_MARCH_STEPS: i32 = 180;   // Safe ceiling with corrected step scale
+const HIT_THRESHOLD: f32 = 0.005;
+const NORMAL_EPS: f32 = 0.015;      // Increased epsilon for smoother, anti-aliased normals
+const HDR_WHITE: f32 = 5.0;         // Blown-out white that tonemaps to ~1.0
+const SPEC_POWER: f32 = 24.0;
+const MAX_MARCH_DIST: f32 = 30.0;
+
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
@@ -35,10 +50,22 @@ struct AudioUniforms {
 @group(0) @binding(0)
 var<uniform> audio: AudioUniforms;
 
-struct MapData {
-    d: f32,
-    mat_id: i32,
-    glow: vec3<f32>,
+// --- Utility Functions ---
+
+// Bounds-clamped channel VU accessor (consistent with vis_neon.wgsl)
+fn get_vu(i: u32) -> f32 {
+    let n = max(1u, audio.num_channels);
+    let idx = min(i, n - 1u);
+    let v = audio.channels[idx / 4u];
+    let c = idx % 4u;
+    if (c == 0u) { return v.x; } else if (c == 1u) { return v.y; }
+    else if (c == 2u) { return v.z; } else { return v.w; }
+}
+
+fn hash(n: f32) -> f32 { return fract(sin(n) * 43758.5453123); }
+
+fn hash3(p: vec3<f32>) -> f32 {
+    return hash(dot(floor(p), vec3<f32>(1.0, 57.0, 113.0)));
 }
 
 fn smax(a: f32, b: f32, k: f32) -> f32 {
@@ -46,187 +73,255 @@ fn smax(a: f32, b: f32, k: f32) -> f32 {
     return mix(b, a, h) + k * h * (1.0 - h);
 }
 
-fn map(p: vec3<f32>) -> MapData {
-    let puddle_radius = 4.0;
-    let dist_xz = length(p.xz);
-    
-    // Base puddle thickness
-    var fluid_h = 0.1 * smoothstep(puddle_radius, puddle_radius * 0.5, dist_xz);
-    var glow = vec3<f32>(0.0);
+// --- Speaker Layout (up to 7.1.4) ---
+// Note: This shader maps channels[] (instrument/track data) to speaker positions.
+// For surround content where spatial_channels[] carries the speaker mix,
+// swap get_vu(i) for a spatial accessor if needed.
+fn get_speaker_dir(i: u32) -> vec3<f32> {
+    switch i {
+        case 0u  { return vec3<f32>(-0.5, 0.0, -0.866); } // L
+        case 1u  { return vec3<f32>( 0.5, 0.0, -0.866); } // R
+        case 2u  { return vec3<f32>( 0.0, 0.0, -1.0);   } // C
+        case 3u  { return vec3<f32>( 0.0, 0.0,  0.0);   } // LFE (center blob)
+        case 4u  { return vec3<f32>(-0.94, 0.0, 0.34);  } // Ls
+        case 5u  { return vec3<f32>( 0.94, 0.0, 0.34);  } // Rs
+        case 6u  { return vec3<f32>(-0.5, 0.0,  0.866); } // Lrs
+        case 7u  { return vec3<f32>( 0.5, 0.0,  0.866); } // Rrs
+        case 8u  { return vec3<f32>(-0.7, 0.0, -0.7);   } // Ltf
+        case 9u  { return vec3<f32>( 0.7, 0.0, -0.7);   } // Rtf
+        case 10u { return vec3<f32>(-0.7, 0.0,  0.7);   } // Ltr
+        default  { return vec3<f32>( 0.7, 0.0,  0.7);   } // Rtr
+    }
+}
 
-    var speaker_dirs = array<vec3<f32>, 12>(
-        vec3<f32>(-0.5, 0.0, -0.866), // L
-        vec3<f32>(0.5, 0.0, -0.866),  // R
-        vec3<f32>(0.0, 0.0, -1.0),    // C
-        vec3<f32>(0.0, 0.0, 0.0),     // LFE (Center blob)
-        vec3<f32>(-0.94, 0.0, 0.34),  // Ls
-        vec3<f32>(0.94, 0.0, 0.34),   // Rs
-        vec3<f32>(-0.5, 0.0, 0.866),  // Lrs
-        vec3<f32>(0.5, 0.0, 0.866),   // Rrs
-        vec3<f32>(-0.7, 0.0, -0.7),   // Ltf
-        vec3<f32>(0.7, 0.0, -0.7),    // Rtf
-        vec3<f32>(-0.7, 0.0, 0.7),    // Ltr
-        vec3<f32>(0.7, 0.0, 0.7)      // Rtr
-    );
-    
+// --- SDF: Distance-only (used by calcNormal — no glow computation) ---
+
+fn map_dist(p: vec3<f32>) -> f32 {
+    let dist_xz = length(p.xz);
+
+    // Base puddle thickness
+    var fluid_h = 0.1 * smoothstep(PUDDLE_RADIUS, PUDDLE_RADIUS * 0.5, dist_xz);
+
     let num_ch = min(audio.num_channels, 12u);
     var total_displacement = 0.0;
-    
+
     // Normalized xz for angle alignment
     let p_xz_norm = normalize(p.xz + vec2<f32>(0.001)); // avoid div zero
-    
+
     for (var i = 0u; i < num_ch; i++) {
-        let vec_idx = i / 4u;
-        let comp_idx = i % 4u;
-        var vu = 0.0;
-        if comp_idx == 0u { vu = audio.channels[vec_idx].x; }
-        else if comp_idx == 1u { vu = audio.channels[vec_idx].y; }
-        else if comp_idx == 2u { vu = audio.channels[vec_idx].z; }
-        else { vu = audio.channels[vec_idx].w; }
-        vu = clamp(vu, 0.0, 1.0);
-        
+        let vu = clamp(get_vu(i), 0.0, 1.0);
+
         var alignment = 1.0;
         var spike_pos_r = 1.5;
-        
-        if i == 3u { // LFE channel in center
+
+        if i == 3u { // LFE channel — center blob
             alignment = 1.0;
             spike_pos_r = 0.0;
         } else {
-            let dir2d = normalize(speaker_dirs[i].xz);
+            let dir2d = normalize(get_speaker_dir(i).xz);
             alignment = max(0.0, dot(p_xz_norm, dir2d));
             spike_pos_r = 1.5;
         }
-        
+
         let dist_to_spike = abs(dist_xz - spike_pos_r);
         let spatial_falloff = exp(-dist_to_spike * 3.0);
-        
-        // Soften the shape of the spikes (pow 8 instead of 12) to make the slopes
-        // less extreme, which helps the raymarcher calculate accurate distances
+
+        // Soften spike shape (pow 8) to keep SDF slopes within Lipschitz bound
         let lobe = pow(alignment, 8.0) * vu * 1.5 * spatial_falloff;
         total_displacement = smax(total_displacement, lobe, 0.3);
-        
-        // Inner glow for spikes
+    }
+
+    // Subtle ripples from spectrum bass
+    let bass = audio.spectrum[0].x + audio.spectrum[1].x;
+    let ripple = sin(dist_xz * 12.0 - audio.time * 8.0) * 0.015 * bass * smoothstep(PUDDLE_RADIUS, 0.0, dist_xz);
+
+    // Organic surface perturbation (magnetic domain noise)
+    let noise_p = p * 8.0 + vec3<f32>(audio.time * 0.5, 0.0, audio.time * 0.3);
+    let surface_noise = (hash3(noise_p) - 0.5) * 0.03;
+
+    fluid_h += total_displacement + ripple + surface_noise;
+
+    let d = p.y + 0.5 - fluid_h;
+
+    // Lipschitz-corrected step size
+    return d * STEP_SCALE;
+}
+
+// --- SDF: Full map with glow (used only in march loop) ---
+
+struct MapData {
+    d: f32,
+    mat_id: i32,
+    glow: vec3<f32>,
+}
+
+fn map(p: vec3<f32>) -> MapData {
+    let dist_xz = length(p.xz);
+
+    // Base puddle thickness
+    var fluid_h = 0.1 * smoothstep(PUDDLE_RADIUS, PUDDLE_RADIUS * 0.5, dist_xz);
+    var glow = vec3<f32>(0.0);
+
+    let num_ch = min(audio.num_channels, 12u);
+    var total_displacement = 0.0;
+
+    let p_xz_norm = normalize(p.xz + vec2<f32>(0.001));
+
+    for (var i = 0u; i < num_ch; i++) {
+        let vu = clamp(get_vu(i), 0.0, 1.0);
+
+        var alignment = 1.0;
+        var spike_pos_r = 1.5;
+
+        if i == 3u {
+            alignment = 1.0;
+            spike_pos_r = 0.0;
+        } else {
+            let dir2d = normalize(get_speaker_dir(i).xz);
+            alignment = max(0.0, dot(p_xz_norm, dir2d));
+            spike_pos_r = 1.5;
+        }
+
+        let dist_to_spike = abs(dist_xz - spike_pos_r);
+        let spatial_falloff = exp(-dist_to_spike * 3.0);
+
+        let lobe = pow(alignment, 8.0) * vu * 1.5 * spatial_falloff;
+        total_displacement = smax(total_displacement, lobe, 0.3);
+
+        // Inner glow for active spikes
         if lobe > 0.1 {
+            // Warm tones for front channels, cool for surround, red for LFE
             var ch_color = vec3<f32>(0.2, 0.6, 1.0);
             if i < 3u { ch_color = vec3<f32>(1.0, 0.4, 0.1); }
             if i == 3u { ch_color = vec3<f32>(1.0, 0.1, 0.2); }
             glow += ch_color * pow(lobe, 2.0) * 2.0;
         }
     }
-    
-    // Add subtle ripples from spectrum bass
+
+    // Subtle ripples from spectrum bass
     let bass = audio.spectrum[0].x + audio.spectrum[1].x;
-    let ripple = sin(dist_xz * 12.0 - audio.time * 8.0) * 0.015 * bass * smoothstep(puddle_radius, 0.0, dist_xz);
-    
-    fluid_h += total_displacement + ripple;
-    
+    let ripple = sin(dist_xz * 12.0 - audio.time * 8.0) * 0.015 * bass * smoothstep(PUDDLE_RADIUS, 0.0, dist_xz);
+
+    // Organic surface perturbation (magnetic domain noise)
+    let noise_p = p * 8.0 + vec3<f32>(audio.time * 0.5, 0.0, audio.time * 0.3);
+    let surface_noise = (hash3(noise_p) - 0.5) * 0.03;
+
+    fluid_h += total_displacement + ripple + surface_noise;
+
     let d = p.y + 0.5 - fluid_h;
-    
-    // Drop step multiplier further to completely eliminate overshooting
-    return MapData(d * 0.15, 1, glow);
+
+    return MapData(d * STEP_SCALE, 1, glow);
 }
 
 fn calcNormal(p: vec3<f32>) -> vec3<f32> {
-    let e = vec2<f32>(0.015, 0.0); // Increased epsilon for smoother, anti-aliased normals
+    let e = vec2<f32>(NORMAL_EPS, 0.0);
     return normalize(vec3<f32>(
-        map(p + e.xyy).d - map(p - e.xyy).d,
-        map(p + e.yxy).d - map(p - e.yxy).d,
-        map(p + e.yyx).d - map(p - e.yyx).d
+        map_dist(p + e.xyy) - map_dist(p - e.xyy),
+        map_dist(p + e.yxy) - map_dist(p - e.yxy),
+        map_dist(p + e.yyx) - map_dist(p - e.yyx)
     ));
 }
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let uv = in.uv * 2.0 - 1.0;
-    
-    // Fix aspect ratio and INVERT Y axis so we aren't upside down!
-    let aspect = dpdy(in.uv.y) / dpdx(in.uv.x);
-    let p = vec2<f32>(uv.x * abs(aspect), -uv.y);
-    
-    // Camera looking slightly down at the puddle (zoomed in to take up more space)
+
+    // Fix aspect ratio with safe division guard, and invert Y
+    var aspect = 1.7777;
+    let dy = abs(dpdy(in.uv.y));
+    let dx = abs(dpdx(in.uv.x));
+    if (dx > 0.0001 && dy > 0.0001) { aspect = dy / dx; }
+    let p = vec2<f32>(uv.x * aspect, -uv.y);
+
+    // Camera looking slightly down at the puddle
     let ro = vec3<f32>(0.0, 1.25, 2.0);
     let cam_target = vec3<f32>(0.0, -0.25, 0.0);
-    
+
     let ww = normalize(cam_target - ro);
     let uu = normalize(cross(ww, vec3<f32>(0.0, 1.0, 0.0)));
     let vv = normalize(cross(uu, ww));
-    
+
     let fov = 1.0;
     let rd = normalize(p.x * uu + p.y * vv + fov * ww);
-    
+
     var col = vec3<f32>(0.0);
     var glow = vec3<f32>(0.0);
-    
+
     var t = 0.0;
-    let max_t = 30.0;
     var hit = false;
     var final_p = vec3<f32>(0.0);
-    
-    // Increase max iterations to compensate for the very small step size
-    for (var i = 0; i < 350; i++) {
+
+    for (var i = 0; i < MAX_MARCH_STEPS; i++) {
         let p_current = ro + rd * t;
         let map_data = map(p_current);
         let d = map_data.d;
-        
-        glow += map_data.glow * 0.05 / (1.0 + abs(d) * 20.0);
-        
-        if d < 0.005 {
+
+        // Accumulate glow with distance attenuation to prevent oversaturation on long rays
+        glow += map_data.glow * 0.05 / (1.0 + abs(d) * 20.0 + t * 0.5);
+
+        if d < HIT_THRESHOLD {
             hit = true;
             final_p = p_current;
             break;
         }
-        
+
         t += d;
-        if t > max_t {
+        if t > MAX_MARCH_DIST {
             break;
         }
     }
-    
+
     if hit {
         let n = calcNormal(final_p);
-        
+
         // Fluid transition based on height (widened for a soft, anti-aliased gradient edge)
         let is_fluid = smoothstep(-0.55, -0.42, final_p.y);
-        
+
         // Floor Material (Pure White Studio)
         // No diffuse shading to keep it looking like a pure white void/backdrop
         let floor_ao = smoothstep(1.0, 2.5, length(final_p.xz)); // subtle shadow under puddle
-        let final_floor = vec3<f32>(5.0) * (0.8 + 0.2 * floor_ao); // Boosted to blow out to pure white after tonemapping
-        
-        // Fluid Material (Pure Black Liquid with Highlights)
+        let final_floor = vec3<f32>(HDR_WHITE) * (0.8 + 0.2 * floor_ao);
+
+        // Fluid Material (Chrome Liquid with Environment Reflection)
         let ref_dir = reflect(rd, n);
         let fresnel = pow(1.0 - max(0.0, dot(n, -rd)), 5.0);
-        
-        // Softened specular highlights to reduce shimmering/aliasing
+
+        // Orbiting key light
         let light_time = audio.time * 0.4;
         let light_dir1 = normalize(vec3<f32>(sin(light_time) * 1.5, 1.5, cos(light_time) * 1.5));
-        let light1 = pow(max(0.0, dot(ref_dir, light_dir1)), 24.0);
-        let rim_light = smoothstep(0.7, 1.0, max(0.0, ref_dir.y));
-        
-        var fluid_ref = vec3<f32>(0.0); // Pure black base reflection
-        fluid_ref += vec3<f32>(5.0) * light1 * 2.0; // Intense white highlight
-        fluid_ref += vec3<f32>(1.0) * rim_light;    // Rim light from the white environment
-        
+        let light1 = pow(max(0.0, dot(ref_dir, light_dir1)), SPEC_POWER);
+
+        // Counter-orbiting fill light to eliminate periodic blackouts
+        let light_dir2 = normalize(vec3<f32>(-sin(light_time) * 1.0, 2.0, -cos(light_time) * 1.0));
+        let light2 = pow(max(0.0, dot(ref_dir, light_dir2)), 32.0);
+
+        // Fake environment map: white above, dark below (simulates HDRI dome)
+        let env = mix(vec3<f32>(0.02), vec3<f32>(HDR_WHITE), smoothstep(-0.2, 0.5, ref_dir.y));
+
+        var fluid_ref = env * (0.15 + 0.85 * fresnel);       // Environment reflection
+        fluid_ref += vec3<f32>(HDR_WHITE) * light1 * 2.0;    // Key light specular
+        fluid_ref += vec3<f32>(3.0) * light2 * 0.5;          // Fill light specular
+
         let fluid_col = mix(vec3<f32>(0.0), fluid_ref, 0.2 + 0.8 * fresnel);
-        
+
         col = mix(final_floor, fluid_col, is_fluid);
     } else {
         // Background color (Pure white void)
-        col = vec3<f32>(5.0);
+        col = vec3<f32>(HDR_WHITE);
     }
-    
+
     // Fade out to pure white environment to hide the sharp horizon
-    col = mix(col, vec3<f32>(5.0), smoothstep(15.0, 30.0, t));
-    
+    col = mix(col, vec3<f32>(HDR_WHITE), smoothstep(15.0, MAX_MARCH_DIST, t));
+
     col += glow;
-    
+
     // Vignette
     let vignette = 1.0 - smoothstep(0.5, 1.5, length(uv));
     col *= vignette;
-    
-    // Tone mapping
+
+    // Narkowicz ACES fitted tonemap (sRGB gamma applied by WGPU surface)
     col = (col * (2.51 * col + 0.03)) / (col * (2.43 * col + 0.59) + 0.14);
-    
+
     // Output Linear RGB. WGPU Srgb surface will apply the sRGB gamma curve automatically.
     return vec4<f32>(col, 1.0);
 }

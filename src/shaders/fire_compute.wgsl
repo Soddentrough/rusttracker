@@ -103,10 +103,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             activity += lfe_val * lfe_influence * 0.6;
         }
 
-        let coal_target = min(params.bass * 0.15 + activity * 1.8, 1.0);
+        let coal_target = min(params.bass * 0.25 + activity * 2.5, 1.0);
         let current = coal_bed[x];
         if (coal_target > current) {
-            coal_bed[x] = current + (coal_target - current) * 0.10;
+            coal_bed[x] = current + (coal_target - current) * 0.18;
         } else {
             coal_bed[x] = current + (coal_target - current) * 0.008;
         }
@@ -147,7 +147,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     // Cooling varies spatially to create uneven tips and licks
     let cool_noise = perlin_noise(p1 * 3.0 - vec2<f32>(params.time * 2.0, 0.0));
-    let base_cooling = 0.002 + (cool_noise + 1.0) * 0.0015;
+    let base_cooling = 0.001 + (cool_noise + 1.0) * 0.0008;
     
     // Occasional sparks (holes in the flame) for realism, clumped by noise
     let spark = select(0.0, 0.06, cool_noise > 0.8 && y > 100u);

@@ -153,10 +153,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             activity += lfe_bass * lfe_influence * 1.5;
         }
 
-        let coal_target = min(params.bass * 0.15 + activity * 1.8, 1.0);
+        let coal_target = min(params.bass * 0.25 + activity * 2.5, 1.0);
         let current = coal_bed[x];
         if (coal_target > current) {
-            coal_bed[x] = current + (coal_target - current) * 0.10;
+            coal_bed[x] = current + (coal_target - current) * 0.18;
         } else {
             coal_bed[x] = current + (coal_target - current) * 0.008;
         }
@@ -185,7 +185,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     
     // Upward buoyancy based on heat
     let current_heat = input_grid[idx];
-    let buoyancy_vel = vec2<f32>(0.0, -1.0) * (1.0 + current_heat * 2.0 + params.bass * 1.5);
+    let buoyancy_vel = vec2<f32>(0.0, -1.0) * (1.0 + current_heat * 2.0 + params.bass * 3.0);
     
     // Curl noise for swirling
     let noise_scale = 0.012;
@@ -202,7 +202,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     
     // Cooling
     let cool_noise = perlin_noise(p1 * 0.04 - vec2<f32>(0.0, params.time * 2.5));
-    let base_cooling = 0.005 + (cool_noise + 1.0) * 0.004;
+    let base_cooling = 0.002 + (cool_noise + 1.0) * 0.0015;
     
     output_grid[idx] = max(advected_heat - base_cooling * params.cooling_factor, 0.0);
 }

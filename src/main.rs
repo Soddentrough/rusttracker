@@ -518,6 +518,9 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                                 app_state_clone.lock().unwrap().is_file_picker_open = false;
                             });
                         }
+                    } else if let EngineAction::SetForceStereo(val) = action {
+                        let mut state = app_state.lock().unwrap();
+                        state.force_stereo_downmix = val;
                     }
                     
                     // Fallback for Wayland/Mesa broken FIFO vsync:

@@ -629,8 +629,9 @@ impl AudioSource for FfmpegSource {
                     let l_surround = self.sample_buf[in_idx + 4];
                     let r_surround = self.sample_buf[in_idx + 5];
                     
-                    output[out_idx] = (l + c * 0.707 + l_surround * 0.707).clamp(-1.0, 1.0);
-                    output[out_idx + 1] = (r + c * 0.707 + r_surround * 0.707).clamp(-1.0, 1.0);
+                    // Normalize by 1.5 to prevent hard clipping when summing loud correlated channels
+                    output[out_idx] = ((l + c * 0.707 + l_surround * 0.707) / 1.5).clamp(-1.0, 1.0);
+                    output[out_idx + 1] = ((r + c * 0.707 + r_surround * 0.707) / 1.5).clamp(-1.0, 1.0);
                 } else {
                     // Fallback generic mapping
                     for c in 0..hardware_channels {
@@ -992,7 +993,11 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
     let mut audio_source_opt = if mic { None } else { Some(load_audio_source(file_path)?) };
     let rate = audio_source_opt.as_mut().and_then(|a| a.get_intrinsic_sample_rate()).unwrap_or(48000);
     let target_rate: cpal::SampleRate = rate;
-    let target_channels = audio_source_opt.as_mut().map(|a| a.get_num_channels() as u16).unwrap_or(2);
+    let force_stereo = shared_state.lock().unwrap().force_stereo_downmix;
+    let mut target_channels = audio_source_opt.as_mut().map(|a| a.get_num_channels() as u16).unwrap_or(2);
+    if force_stereo {
+        target_channels = 2;
+    }
 
     let supported_config = if mic {
         let device = host.default_input_device().context("No input device available")?;
@@ -1100,6 +1105,7 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
         } else {
             audio_source.get_num_channels()
         };
+        state.hardware_channels = config.channels as i32;
         state.channel_vus = vec![0.0; state.num_channels as usize];
         state.peak_vus = vec![0.0; state.num_channels as usize];
         state.bpm = audio_source.get_tempo();
@@ -1366,10 +1372,16 @@ where
             
             let mut left_peak = 0.0_f32;
             let mut right_peak = 0.0_f32;
+            let mut clips = 0;
             for i in 0..frames_read {
-                left_peak = left_peak.max(chunk.samples[i * hardware_channels].abs());
+                let l_val = chunk.samples[i * hardware_channels];
+                left_peak = left_peak.max(l_val.abs());
+                if l_val.abs() >= 1.0 { clips += 1; }
+                
                 if hardware_channels > 1 {
-                    right_peak = right_peak.max(chunk.samples[i * hardware_channels + 1].abs());
+                    let r_val = chunk.samples[i * hardware_channels + 1];
+                    right_peak = right_peak.max(r_val.abs());
+                    if r_val.abs() >= 1.0 { clips += 1; }
                 } else {
                     right_peak = left_peak;
                 }
@@ -1398,6 +1410,7 @@ where
                 state.stats.audio_buffer_fill_pct = fill_pct;
                 let video_pct = (video_rx_for_decoder.len() as f32 / 256.0) * 100.0;
                 state.stats.video_buffer_fill_pct = video_pct;
+                state.stats.clipping_events += clips;
             }
             
             if ready_tx.send(chunk).is_err() {

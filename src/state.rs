@@ -11,6 +11,7 @@ pub struct PerformanceStats {
     pub gpu_fft_us: f32,
     pub audio_buffer_fill_pct: f32,
     pub video_buffer_fill_pct: f32,
+    pub clipping_events: u32,
 }
 
 #[derive(Clone)]
@@ -61,7 +62,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
     VisualizerDef { id: 2, name: "CRT Oscilloscope", filename: "vis_oscilloscope.wgsl", description: "2D glowing CRT wave trace", requires_history: true, requires_fire: false, requires_resynth: false },
     VisualizerDef { id: 7, name: "3D CRT Oscilloscope", filename: "vis_3doscilloscope.wgsl", description: "3D waterfall history of waveform", requires_history: true, requires_fire: false, requires_resynth: false },
     VisualizerDef { id: 8, name: "3D Freq Oscilloscope", filename: "vis_3doscilloscope_freq.wgsl", description: "3D topographical frequency view", requires_history: false, requires_fire: false, requires_resynth: true },
-    VisualizerDef { id: 1, name: "Classic Flame", filename: "vis_flame.wgsl", description: "Classic fiery bottom-up visualizer", requires_history: false, requires_fire: true, requires_resynth: false },
+    VisualizerDef { id: 1, name: "Retro Fire", filename: "vis_flame.wgsl", description: "Demoscene pixel fire with CRT filter", requires_history: false, requires_fire: true, requires_resynth: false },
     VisualizerDef { id: 6, name: "Fire Simulation", filename: "vis_firesim.wgsl", description: "Multi-channel procedural fire simulation", requires_history: false, requires_fire: true, requires_resynth: false },
     VisualizerDef { id: 3, name: "Spatial Vectors", filename: "vis_spatial.wgsl", description: "Multi-channel spatial audio map", requires_history: false, requires_fire: false, requires_resynth: false },
     VisualizerDef { id: 4, name: "Chrome Ferrofluid", filename: "vis_ferrofluid.wgsl", description: "Raymarched liquid metal simulation", requires_history: false, requires_fire: false, requires_resynth: false },
@@ -120,6 +121,7 @@ pub struct AppState {
     pub video_frame_rx: Option<crossbeam_channel::Receiver<VideoFrame>>,
     pub free_video_frame_tx: Option<crossbeam_channel::Sender<VideoFrame>>,
     pub is_file_picker_open: bool,
+    pub force_stereo_downmix: bool,
 }
 
 impl AppState {
@@ -133,6 +135,10 @@ impl AppState {
         for _ in 0..60 {
             wave_history.push_back(vec![0.0; 1024]);
         }
+
+        let is_steam_deck = std::fs::read_to_string("/sys/class/dmi/id/sys_vendor")
+            .map(|s| s.trim().to_lowercase().contains("valve"))
+            .unwrap_or(false);
 
         AppState {
             file_loaded: false,
@@ -186,6 +192,7 @@ impl AppState {
             free_video_frame_tx: None,
             video_mode: 0,
             is_file_picker_open: false,
+            force_stereo_downmix: is_steam_deck,
         }
     }
 }

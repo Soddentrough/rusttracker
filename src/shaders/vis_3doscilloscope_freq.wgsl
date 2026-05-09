@@ -101,7 +101,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     
     let rd = normalize(w + p.x * u - p.y * v_cam);
 
-    var accumulated_intensity = 0.0;
+    var accumulated_color = vec3<f32>(0.0);
+    let amber_lo = vec3<f32>(0.6, 0.18, 0.02);
+    let amber_hi = vec3<f32>(1.0, 0.55, 0.08);
     
     let num_lines = 32u;
     let num_points = 512u;
@@ -143,8 +145,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 let v1 = get_resynthesized_wave(i, x_norm1);
                 
                 // Allow true negative waveforms, just apply mask
-                let p0 = v0 * mask0 * 1.5;
-                let p1 = v1 * mask1 * 1.5;
+                let p0 = v0 * mask0 * 4.0;
+                let p1 = v1 * mask1 * 4.0;
                 
                 let p3_0 = vec3<f32>(x0, y_line, p0);
                 let p3_1 = vec3<f32>(x1, y_line, p1);
@@ -171,15 +173,19 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let bloom = 0.0004 / (min_dist * min_dist + 0.0001) * 0.15;
             
             // Depth fade (lines further back are slightly darker)
-            let depth_fade = exp(-t * 0.35);
+            let depth_fade = exp(-t * 0.20);
             let edge_fade = smoothstep(8.0, 5.0, abs(hit_x));
             
-            accumulated_intensity += (core + bloom) * depth_fade * edge_fade;
+            // Sample waveform height at hit point for color grading
+            let hit_x_norm = clamp((hit_x + 8.0) / 16.0, 0.0, 1.0);
+            let wave_height = clamp(abs(get_resynthesized_wave(i, hit_x_norm)) * 2.0, 0.0, 1.0);
+            let line_amber = mix(amber_lo, amber_hi, wave_height);
+            
+            accumulated_color += line_amber * (core + bloom) * depth_fade * edge_fade;
         }
     }
     
-    let amber = vec3<f32>(1.0, 0.45, 0.05);
-    let mapped = accumulated_intensity * amber;
+    let mapped = accumulated_color;
     var tonemapped = (mapped * (2.51 * mapped + 0.03)) / (mapped * (2.43 * mapped + 0.59) + 0.14);
     
     var final_color = tonemapped;
@@ -194,7 +200,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     
     // Analog noise
     let noise_val = hash12(in.clip_position.xy + fract(audio.smooth_time) * 100.0);
-    let noise_color = amber * noise_val * 0.02 * bezel * (0.3 + 0.7 * clamp(accumulated_intensity * 0.5, 0.0, 1.0));
+    let acc_lum = dot(accumulated_color, vec3<f32>(0.299, 0.587, 0.114));
+    let noise_color = vec3<f32>(0.8, 0.35, 0.05) * noise_val * 0.02 * bezel * (0.3 + 0.7 * clamp(acc_lum * 0.5, 0.0, 1.0));
     
     final_color = final_color * bezel + noise_color;
     

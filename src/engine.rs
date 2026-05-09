@@ -7,6 +7,7 @@ pub enum EngineAction {
     None,
     OpenFile,
     Seek(f32),
+    SetForceStereo(bool),
 }
 
 #[repr(C)]
@@ -991,7 +992,7 @@ impl<'a> VulkanEngine<'a> {
                 mids,
                 highs,
                 time: self.start_time.elapsed().as_secs_f32(),
-                cooling_factor: 1.3 - mids * 0.6,
+                cooling_factor: 1.0 - mids * 0.5,
                 turb_spread_f: 1.0 + highs * 3.0,
                 width: 1024,
                 height: 576,
@@ -1291,6 +1292,15 @@ impl<'a> VulkanEngine<'a> {
                                     .color(if state.stats.video_buffer_fill_pct < 1.0 { egui::Color32::RED } else if state.stats.video_buffer_fill_pct > 95.0 { egui::Color32::YELLOW } else { egui::Color32::GREEN })
                             );
                         }
+                        ui.separator();
+                        ui.label(
+                            egui::RichText::new(format!("Hardware Channels: {} | Source: {}", state.hardware_channels, state.num_channels))
+                                .color(if state.hardware_channels != state.num_channels { egui::Color32::YELLOW } else { egui::Color32::GRAY })
+                        );
+                        ui.label(
+                            egui::RichText::new(format!("Clipping Events: {}", state.stats.clipping_events))
+                                .color(if state.stats.clipping_events > 0 { egui::Color32::RED } else { egui::Color32::GRAY })
+                        );
                         if let Some(vi) = &video_info_str {
                             ui.separator();
                             ui.label(
@@ -1347,7 +1357,13 @@ impl<'a> VulkanEngine<'a> {
                                 engine_action = EngineAction::OpenFile;
                             }
                             
-                            ui.add_space(60.0);
+                            ui.add_space(20.0);
+                            let mut force_stereo = state.force_stereo_downmix;
+                            if ui.checkbox(&mut force_stereo, "Force Stereo Downmix (Fixes crackling on some devices)").changed() {
+                                engine_action = EngineAction::SetForceStereo(force_stereo);
+                            }
+                            
+                            ui.add_space(40.0);
                             ui.label(egui::RichText::new("Keyboard & Gamepad Shortcuts").color(egui::Color32::LIGHT_GRAY).strong().size(18.0));
                             ui.add_space(15.0);
                             
