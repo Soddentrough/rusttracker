@@ -4,17 +4,19 @@
 
 A high-performance, real-time audio visualizer and tracker module player built in Rust. 
 
-RustTracker leverages a **3-Thread DSP Architecture** to ensure zero-latency audio playback while simultaneously computing Fast Fourier Transforms (FFT) and rendering beautiful, fluid visualizations at 60FPS.
+RustTracker leverages a **3-Thread DSP Architecture** and **Hardware-Accelerated Compute Shaders** to ensure zero-latency audio playback while simultaneously computing **GPU-accelerated Fast Fourier Transforms (FFT) on each spatial audio channel** to render beautiful, fluid visualizations at 120FPS.
 
 ## Features
 
+* **Advanced Visualizers:** High-fidelity, cinematic shaders (including a photorealistic Ferrofluid simulator, a dynamic multi-channel 3D Fire simulation, and retro CRT Oscilloscopes) mapped tightly to precise acoustic frequencies.
+* **GPU-Accelerated FFT:** Offloads audio-reactive spatial weights directly to the GPU using WGPU compute shaders, mapping individual surround-sound speaker channels to local geometry in real-time.
+* **Cinematic Video Integration & HDR:** Features integrated hardware-accelerated video stream playback, rendering vibrant visual environments with HDR color precision.
 * **Real-time Tracker UI:** Seamlessly decodes and visualizes `.mod` files, rendering a classic piano-roll style pattern editor that aligns perfectly with the audio playback, complete with flawless cross-pattern scrolling and jumping.
-* **Vertical Acoustic Heatmap:** A continuous waterfall spectrogram mapping the frequencies of the audio in real-time.
-* **Graceful Degradation:** Supports playing standard audio files (`.mp3`, `.flac`, etc.) or capturing live microphone input (`--mic`), instantly adapting the UI to remove tracker elements and focus on acoustic analysis.
+* **Graceful Degradation:** Supports playing standard audio/video files (`.mp3`, `.flac`, `.mp4`, `.mkv`, etc.) or capturing live microphone input (`--mic`), instantly adapting the UI to remove tracker elements and focus on acoustic analysis.
 * **Zero-Latency Architecture:**
   * **Audio Thread (`cpal`):** A lock-free, ultra-high-priority thread dedicated solely to IO, preventing stuttering and audio underruns.
-  * **DSP Thread:** A background worker that computes windowing and FFT spectrum data without blocking the audio stream.
-  * **GUI Thread (`wgpu` + `egui`):** Hardware-accelerated UI rendering.
+  * **DSP Thread:** A background worker that computes windowing and frequency history data without blocking the audio stream.
+  * **GPU Render Pipeline (`wgpu` + `egui`):** Low-overhead, high-performance hardware rendering.
 
 ## Quick Start
 
