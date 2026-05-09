@@ -5,8 +5,8 @@ echo "THIS CAN TAKE 15 MINUTES TO COMPLETE"
 echo "-----------------------------------------------------"
 echo "Waiting for Github Actions to complete..."
 while true; do
-  STATUS=$(gh run list --branch v0.8.2 --json status,conclusion -q '.[0].status')
-  CONCLUSION=$(gh run list --branch v0.8.2 --json status,conclusion -q '.[0].conclusion')
+  STATUS=$(gh run list --branch v0.8.5 --json status,conclusion -q '.[0].status')
+  CONCLUSION=$(gh run list --branch v0.8.5 --json status,conclusion -q '.[0].conclusion')
   if [ "$STATUS" == "completed" ]; then
     break
   fi
@@ -26,6 +26,6 @@ if [ "$CONCLUSION" == "success" ]; then
   gh run download -n RustTracker-Linux-DEB --dir ./linux_deb
 
   echo "Creating GitHub Release..."
-  gh release create v0.8.2 ./windows_release/*.exe ./linux_rpm/*.rpm ./linux_deb/*.deb --title "RustTracker v0.8.2" --notes "Release v0.8.2"
+  gh release create v0.8.5 ./windows_release/*.exe ./linux_rpm/*.rpm ./linux_deb/*.deb --title "RustTracker v0.8.5" --notes "Release v0.8.5"
 fi
 echo "Done!"

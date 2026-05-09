@@ -937,8 +937,22 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
         
     let video_info = None; // Symphonia doesn't do video
 
-    // 1. Try standard audio formats natively via Symphonia first
-    if ext == "wav" || ext == "flac" || ext == "mp3" || ext == "ogg" || ext == "mp4" || ext == "m4a" || ext == "aac" || ext == "mkv" {
+    // 1. Prioritize FFmpeg for video containers (MKV, MP4) to ensure video streams are processed.
+    // Symphonia might successfully parse the audio in these containers but would ignore the video.
+    if ext == "mkv" || ext == "mp4" {
+        if let Ok(source) = try_ffmpeg(file_path) {
+            return Ok(source);
+        }
+        // Fallback to Symphonia if FFmpeg fails
+        if let Ok(file) = File::open(file_path) {
+            if let Ok(source) = try_symphonia(file, &ext, &ext, video_info.clone()) {
+                return Ok(source);
+            }
+        }
+    }
+
+    // 2. Try standard audio formats natively via Symphonia first
+    if ext == "wav" || ext == "flac" || ext == "mp3" || ext == "ogg" || ext == "m4a" || ext == "aac" {
         if let Ok(file) = File::open(file_path) {
             if let Ok(source) = try_symphonia(file, &ext, &ext, video_info.clone()) {
                 return Ok(source);
