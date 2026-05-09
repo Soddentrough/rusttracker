@@ -33,7 +33,7 @@ pub struct AudioUniforms {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct WaveformHistoryStorage {
-    pub waveforms: [[f32; 1024]; 8],  // only the 8 most recent frames (was 60)
+    pub waveforms: [[f32; 1024]; 32],  // only the 32 most recent frames (was 16)
 }
 
 #[repr(C)]
@@ -351,6 +351,7 @@ impl<'a> VulkanEngine<'a> {
             include_str!("shaders/vis_neon.wgsl"),
             include_str!("shaders/vis_firesim.wgsl"),
             include_str!("shaders/vis_3doscilloscope.wgsl"),
+            include_str!("shaders/vis_3doscilloscope_freq.wgsl"),
         ];
 
         let mut render_pipelines = Vec::new();
@@ -923,14 +924,14 @@ impl<'a> VulkanEngine<'a> {
         self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
         // Only upload waveform history when the oscilloscope visualizer is active
-        if state.visualizer_mode == 2 {
+        if state.visualizer_mode == 2 || state.visualizer_mode == 7 {
             let mut history_storage = WaveformHistoryStorage {
-                waveforms: [[0.0; 1024]; 8],
+                waveforms: [[0.0; 1024]; 32],
             };
-            // Upload only the 8 most recent frames (32KB vs 240KB)
+            // Upload only the 32 most recent frames
             let hist_len = state.waveform_history.len();
-            let start = hist_len.saturating_sub(8);
-            for (slot, wave) in state.waveform_history.iter().skip(start).enumerate().take(8) {
+            let start = hist_len.saturating_sub(32);
+            for (slot, wave) in state.waveform_history.iter().skip(start).enumerate().take(32) {
                 // Pre-smooth with [1,2,1] triangle kernel
                 history_storage.waveforms[slot][0] = (wave[0] * 3.0 + wave[1]) / 4.0;
                 for j in 1..1023 {
@@ -1184,11 +1185,12 @@ impl<'a> VulkanEngine<'a> {
             0 => "Frequency Spectrum",
             1 => "Classic Flame",
             2 => "CRT Oscilloscope",
+            7 => "3D CRT Oscilloscope",
+            8 => "3D Freq Oscilloscope",
             3 => "Spatial Vectors",
             4 => "Chrome Ferrofluid",
             5 => "Neon Corridor",
             6 => "Fire Simulation",
-            7 => "3D CRT Oscilloscope",
             _ => "Unknown",
         };
         
@@ -1331,31 +1333,31 @@ impl<'a> VulkanEngine<'a> {
                                 .num_columns(4)
                                 .spacing([30.0, 8.0])
                                 .show(ui, |ui| {
-                                    ui.label(egui::RichText::new("o / Ⓨ").color(egui::Color32::WHITE).strong());
+                                    ui.label(egui::RichText::new("o / (Y)").color(egui::Color32::WHITE).strong());
                                     ui.label(egui::RichText::new("Open File").color(egui::Color32::GRAY));
-                                    ui.label(egui::RichText::new("space / Ⓐ").color(egui::Color32::WHITE).strong());
+                                    ui.label(egui::RichText::new("space / (A)").color(egui::Color32::WHITE).strong());
                                     ui.label(egui::RichText::new("Play / Pause").color(egui::Color32::GRAY));
                                     ui.end_row();
                                     
-                                    ui.label(egui::RichText::new("v / Ⓧ").color(egui::Color32::WHITE).strong());
+                                    ui.label(egui::RichText::new("v / (X)").color(egui::Color32::WHITE).strong());
                                     ui.label(egui::RichText::new("Toggle Video").color(egui::Color32::GRAY));
-                                    ui.label(egui::RichText::new("left/right / ◂▸").color(egui::Color32::WHITE).strong());
+                                    ui.label(egui::RichText::new("left/right / D-Pad L/R").color(egui::Color32::WHITE).strong());
                                     ui.label(egui::RichText::new("Seek Timeline").color(egui::Color32::GRAY));
                                     ui.end_row();
                                     
                                     ui.label(egui::RichText::new("tab / L1").color(egui::Color32::WHITE).strong());
                                     ui.label(egui::RichText::new("Toggle HUD").color(egui::Color32::GRAY));
-                                    ui.label(egui::RichText::new("up/down / ▴▾").color(egui::Color32::WHITE).strong());
+                                    ui.label(egui::RichText::new("up/down / D-Pad U/D").color(egui::Color32::WHITE).strong());
                                     ui.label(egui::RichText::new("Change Visualizer").color(egui::Color32::GRAY));
                                     ui.end_row();
                                     
-                                    ui.label(egui::RichText::new("s / Ⓑ").color(egui::Color32::WHITE).strong());
+                                    ui.label(egui::RichText::new("s / (B)").color(egui::Color32::WHITE).strong());
                                     ui.label(egui::RichText::new("Toggle Stats").color(egui::Color32::GRAY));
-                                    ui.label(egui::RichText::new("q / esc / ⧉").color(egui::Color32::WHITE).strong());
+                                    ui.label(egui::RichText::new("q / esc / Select").color(egui::Color32::WHITE).strong());
                                     ui.label(egui::RichText::new("Quit").color(egui::Color32::GRAY));
                                     ui.end_row();
                                     
-                                    ui.label(egui::RichText::new("f / ☰").color(egui::Color32::WHITE).strong());
+                                    ui.label(egui::RichText::new("f / Start").color(egui::Color32::WHITE).strong());
                                     ui.label(egui::RichText::new("Toggle Fullscreen").color(egui::Color32::GRAY));
                                     ui.label(egui::RichText::new("g / R1").color(egui::Color32::WHITE).strong());
                                     ui.label(egui::RichText::new("Toggle GPU FFT").color(egui::Color32::GRAY));

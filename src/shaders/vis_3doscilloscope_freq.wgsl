@@ -45,17 +45,24 @@ fn hash12(p: vec2<f32>) -> f32 {
     return fract((p3.x + p3.y) * p3.z);
 }
 
-// Waveforms are pre-smoothed on CPU, so we can read directly
-fn get_waveform(hist_idx: u32, idx: u32) -> f32 {
-    let clamped_idx = clamp(idx, 0u, 1023u);
-    let vec_idx = clamped_idx / 4u;
-    let component_idx = clamped_idx % 4u;
-
-    let spec_vec = waveform_history[hist_idx * 256u + vec_idx];
-    if component_idx == 0u { return spec_vec.x; }
-    else if component_idx == 1u { return spec_vec.y; }
-    else if component_idx == 2u { return spec_vec.z; }
-    else { return spec_vec.w; }
+fn get_fft_amplitude(line_idx: u32, num_lines: u32) -> f32 {
+    // Ensure every single line gets a strictly unique frequency bin
+    // Maps line 0 to bin 1 (bass), up to line 31 to bin ~132 (treble)
+    let non_linear = u32(pow(f32(line_idx) / f32(num_lines - 1u), 2.0) * 100.0);
+    let bin_idx = line_idx + non_linear + 1u;
+    
+    let vec_idx = bin_idx / 4u;
+    let comp_idx = bin_idx % 4u;
+    
+    let spec = audio.spectrum[vec_idx];
+    var amp = 0.0;
+    if comp_idx == 0u { amp = spec.x; }
+    else if comp_idx == 1u { amp = spec.y; }
+    else if comp_idx == 2u { amp = spec.z; }
+    else { amp = spec.w; }
+    
+    // Smooth the amplitude over time a bit to avoid jitter
+    return min(amp * 1.5, 2.0);
 }
 
 fn sd_segment(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
@@ -110,10 +117,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let num_points = 512u; // Increased resolution for wider lines
     
     for (var i = 0u; i < num_lines; i = i + 1u) {
-        // Z layout: back to front. i=0 is back (oldest), i=31 is front (newest).
+        // Z layout: back to front.
         // Maintain same 0.24 spacing: 31 * 0.24 = 7.44 span. Front remains -1.8, back becomes 5.64.
         let y_line = mix(5.64, -1.8, f32(i) / f32(num_lines - 1u));
-        let hist_idx = i;
+        
+        // 1. Get the real FFT amplitude for this specific frequency band
+        let fft_amp = get_fft_amplitude(i, num_lines);
+        
+        // 2. Calculate the visual frequency of this band (from 1 cycle to ~32 cycles)
+        let cycles = pow(1.25, f32(i) * (16.0 / f32(num_lines))); 
+        let phase = audio.time * cycles * 2.0;
         
         let t = (y_line - ro.y) / rd.y;
         if t > 0.0 {
@@ -123,8 +136,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let float_idx = (hit_x + 8.0) / 16.0 * f32(num_points - 1u);
             let idx = i32(round(float_idx));
             
-            let start_idx = max(0, idx - 4);
-            let end_idx = min(i32(num_points) - 2, idx + 4);
+            let start_idx = max(0, idx - 12);
+            let end_idx = min(i32(num_points) - 2, idx + 12);
             
             var min_dist = 1000.0;
             
@@ -138,17 +151,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 let mask0 = smoothstep(8.0, 5.0, abs(x0));
                 let mask1 = smoothstep(8.0, 5.0, abs(x1));
                 
-                let wave_idx0 = u32(f32(j_u) / f32(num_points - 1u) * 1023.0);
-                let wave_idx1 = u32(f32(j_u + 1u) / f32(num_points - 1u) * 1023.0);
+                let x_norm0 = f32(j_u) / f32(num_points - 1u);
+                let x_norm1 = f32(j_u + 1u) / f32(num_points - 1u);
                 
-                // Use the history frame corresponding to this line (0 is oldest, 15 is newest)
-                let v0 = get_waveform(hist_idx, wave_idx0);
-                let v1 = get_waveform(hist_idx, wave_idx1);
+                // 3. Synthesize the bandpassed waveform!
+                let v0 = sin(x_norm0 * cycles * 6.28318 - phase) * fft_amp;
+                let v1 = sin(x_norm1 * cycles * 6.28318 - phase) * fft_amp;
                 
                 // Only go UP (positive Z) from the baseline. 
                 // We use abs() so both positive and negative waveform phases create peaks
-                let p0 = abs(v0) * mask0 * 3.0;
-                let p1 = abs(v1) * mask1 * 3.0;
+                let p0 = abs(v0) * mask0 * 0.8;
+                let p1 = abs(v1) * mask1 * 0.8;
                 
                 let p3_0 = vec3<f32>(x0, y_line, p0);
                 let p3_1 = vec3<f32>(x1, y_line, p1);

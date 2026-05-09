@@ -36,7 +36,7 @@ RustTracker provides a fully optimized native AppImage specifically built for St
 
 1. **Get the AppImage onto your Steam Deck:**
    - **Browser:** Open Firefox/Chrome on the Deck in Desktop Mode and download `RustTracker-SteamDeck-GamePad.AppImage` directly from the **Releases** page to your `Downloads` folder.
-   - **Network (SSH/SCP):** If SSH is enabled on your Deck, copy it from your PC: `scp RustTracker-SteamDeck-GamePad.AppImage deck@<DECK_IP>:/home/deck/Downloads/`
+   - **Network (SSH/SCP):** If SSH is enabled on your Deck (`sudo systemctl start sshd`), copy it from your PC: `scp RustTracker-SteamDeck-GamePad.AppImage deck@<DECK_IP>:/home/deck/Downloads/`
    - **USB/SD Card:** Copy the file to a USB-C drive or SD card and transfer it via the Deck's file manager (Dolphin).
 2. Switch your Steam Deck to **Desktop Mode** (if you aren't already).
 3. Open your Downloads folder, right-click the AppImage file, and select **Properties** -> **Permissions**. Check the box for **"Is executable"**.
