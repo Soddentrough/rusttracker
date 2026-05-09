@@ -1,0 +1,10 @@
+#!/bin/bash
+# Automatically discover the directory this script is in
+APPDIR="$(dirname "$(readlink -f "$0")")"
+
+# Force winit to use Wayland natively to bypass the SteamOS X11 xkbcommon bug
+export WINIT_UNIX_BACKEND=wayland
+export XKB_DEFAULT_LAYOUT=us
+
+# Execute the actual binary directly from the mounted AppDir
+exec "$APPDIR/usr/bin/rusttracker" "$@"

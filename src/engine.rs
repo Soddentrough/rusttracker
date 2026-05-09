@@ -1261,10 +1261,12 @@ impl<'a> VulkanEngine<'a> {
                             egui::RichText::new(format!("Audio Buffer: {:.1}%", state.stats.audio_buffer_fill_pct))
                                 .color(if state.stats.audio_buffer_fill_pct < 5.0 { egui::Color32::RED } else if state.stats.audio_buffer_fill_pct > 95.0 { egui::Color32::YELLOW } else { egui::Color32::GREEN })
                         );
-                        ui.label(
-                            egui::RichText::new(format!("Video Buffer: {:.1}%", state.stats.video_buffer_fill_pct))
-                                .color(if state.stats.video_buffer_fill_pct < 1.0 { egui::Color32::RED } else if state.stats.video_buffer_fill_pct > 95.0 { egui::Color32::YELLOW } else { egui::Color32::GREEN })
-                        );
+                        if state.video_frame_rx.is_some() {
+                            ui.label(
+                                egui::RichText::new(format!("Video Buffer: {:.1}%", state.stats.video_buffer_fill_pct))
+                                    .color(if state.stats.video_buffer_fill_pct < 1.0 { egui::Color32::RED } else if state.stats.video_buffer_fill_pct > 95.0 { egui::Color32::YELLOW } else { egui::Color32::GREEN })
+                            );
+                        }
                         if let Some(vi) = &video_info_str {
                             ui.separator();
                             ui.label(
@@ -1322,38 +1324,40 @@ impl<'a> VulkanEngine<'a> {
                             }
                             
                             ui.add_space(60.0);
-                            ui.label(egui::RichText::new("Keyboard Shortcuts").color(egui::Color32::LIGHT_GRAY).strong().size(18.0));
+                            ui.label(egui::RichText::new("Keyboard & Gamepad Shortcuts").color(egui::Color32::LIGHT_GRAY).strong().size(18.0));
                             ui.add_space(15.0);
                             
                             egui::Grid::new("shortcuts_grid")
                                 .num_columns(4)
                                 .spacing([30.0, 8.0])
                                 .show(ui, |ui| {
-                                    ui.label(egui::RichText::new("O").color(egui::Color32::WHITE).strong());
+                                    ui.label(egui::RichText::new("o / Ⓨ").color(egui::Color32::WHITE).strong());
                                     ui.label(egui::RichText::new("Open File").color(egui::Color32::GRAY));
-                                    ui.label(egui::RichText::new("Space").color(egui::Color32::WHITE).strong());
+                                    ui.label(egui::RichText::new("space / Ⓐ").color(egui::Color32::WHITE).strong());
                                     ui.label(egui::RichText::new("Play / Pause").color(egui::Color32::GRAY));
                                     ui.end_row();
                                     
-                                    ui.label(egui::RichText::new("Tab").color(egui::Color32::WHITE).strong());
-                                    ui.label(egui::RichText::new("Toggle HUD").color(egui::Color32::GRAY));
-                                    ui.label(egui::RichText::new("Left / Right").color(egui::Color32::WHITE).strong());
+                                    ui.label(egui::RichText::new("v / Ⓧ").color(egui::Color32::WHITE).strong());
+                                    ui.label(egui::RichText::new("Toggle Video").color(egui::Color32::GRAY));
+                                    ui.label(egui::RichText::new("left/right / ◂▸").color(egui::Color32::WHITE).strong());
                                     ui.label(egui::RichText::new("Seek Timeline").color(egui::Color32::GRAY));
                                     ui.end_row();
                                     
-                                    ui.label(egui::RichText::new("F").color(egui::Color32::WHITE).strong());
-                                    ui.label(egui::RichText::new("Toggle Fullscreen").color(egui::Color32::GRAY));
-                                    ui.label(egui::RichText::new("Up / Down").color(egui::Color32::WHITE).strong());
+                                    ui.label(egui::RichText::new("tab / L1").color(egui::Color32::WHITE).strong());
+                                    ui.label(egui::RichText::new("Toggle HUD").color(egui::Color32::GRAY));
+                                    ui.label(egui::RichText::new("up/down / ▴▾").color(egui::Color32::WHITE).strong());
                                     ui.label(egui::RichText::new("Change Visualizer").color(egui::Color32::GRAY));
                                     ui.end_row();
                                     
-                                    ui.label(egui::RichText::new("S").color(egui::Color32::WHITE).strong());
+                                    ui.label(egui::RichText::new("s / Ⓑ").color(egui::Color32::WHITE).strong());
                                     ui.label(egui::RichText::new("Toggle Stats").color(egui::Color32::GRAY));
-                                    ui.label(egui::RichText::new("Q / Esc").color(egui::Color32::WHITE).strong());
+                                    ui.label(egui::RichText::new("q / esc / ⧉").color(egui::Color32::WHITE).strong());
                                     ui.label(egui::RichText::new("Quit").color(egui::Color32::GRAY));
                                     ui.end_row();
                                     
-                                    ui.label(egui::RichText::new("G").color(egui::Color32::WHITE).strong());
+                                    ui.label(egui::RichText::new("f / ☰").color(egui::Color32::WHITE).strong());
+                                    ui.label(egui::RichText::new("Toggle Fullscreen").color(egui::Color32::GRAY));
+                                    ui.label(egui::RichText::new("g / R1").color(egui::Color32::WHITE).strong());
                                     ui.label(egui::RichText::new("Toggle GPU FFT").color(egui::Color32::GRAY));
                                     ui.end_row();
                                 });

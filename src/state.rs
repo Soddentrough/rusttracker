@@ -96,6 +96,7 @@ pub struct AppState {
     pub current_visualizer_idx: usize,
     pub video_frame_rx: Option<crossbeam_channel::Receiver<VideoFrame>>,
     pub free_video_frame_tx: Option<crossbeam_channel::Sender<VideoFrame>>,
+    pub is_file_picker_open: bool,
 }
 
 impl AppState {
@@ -162,6 +163,7 @@ impl AppState {
             video_frame_rx: None,
             free_video_frame_tx: None,
             video_mode: 0,
+            is_file_picker_open: false,
         }
     }
 }

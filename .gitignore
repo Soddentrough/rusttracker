@@ -10,6 +10,10 @@ dist/
 linux_rpm/
 linux_deb/
 windows_release/
+AppDir/
+target_appimage/
+extracted_deb/
+rusttracker.png
 
 # Tracker Modules
 *.mod

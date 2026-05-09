@@ -127,7 +127,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     
     let file_path = args.file.first().cloned().unwrap_or_default();
-    let initial_stream = match audio::start_audio_thread(&file_path, args.mic, Arc::clone(&app_state)) {
+    let initial_stream = if !file_path.is_empty() || args.mic {
+        match audio::start_audio_thread(&file_path, args.mic, Arc::clone(&app_state)) {
             Ok(stream) => {
                 let mut state = app_state.lock().unwrap();
                 state.file_loaded = true;
@@ -137,7 +138,10 @@ fn main() -> Result<(), Box<dyn Error>> {
                 eprintln!("AUDIO LOAD ERROR: {:?}", e);
                 None
             }
-        };
+        }
+    } else {
+        None
+    };
     if args.tui {
         let original_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |panic_info| {
@@ -206,6 +210,8 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
     let mut is_cursor_visible = true;
     let mut is_first_frame = true;
 
+    let mut gilrs = gilrs::Gilrs::new().unwrap_or_else(|_| gilrs::GilrsBuilder::new().build().unwrap());
+
     #[allow(deprecated)]
     let _ = event_loop.run(move |event, elwt| {
         match event {
@@ -246,21 +252,26 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                                     state.show_stats = !state.show_stats;
                                 },
                                 WinitKeyCode::KeyO => {
-                                    let app_state_clone = Arc::clone(&app_state);
-                                    std::thread::spawn(move || {
-                                        if let Some(paths) = rfd::FileDialog::new()
-                                            .add_filter("Audio/Video Files", &["flac", "wav", "mp3", "ogg", "aac", "m4a", "mp4", "mkv", "avi", "webm", "opus", "mod", "s3m", "xm", "it", "stm", "669", "mtm", "med", "okt", "psm"])
-                                            .add_filter("All Files", &["*"])
-                                            .pick_files() {
-                                            if !paths.is_empty() {
-                                                let mut state = app_state_clone.lock().unwrap();
-                                                state.playlist = paths.into_iter().map(|p| p.display().to_string()).collect();
-                                                state.playlist_index = 0;
-                                                state.load_request = Some(state.playlist[0].clone());
-                                                state.file_loaded = true;
+                                    let mut state = app_state.lock().unwrap();
+                                    if !state.is_file_picker_open {
+                                        state.is_file_picker_open = true;
+                                        let app_state_clone = Arc::clone(&app_state);
+                                        std::thread::spawn(move || {
+                                            if let Some(paths) = rfd::FileDialog::new()
+                                                .add_filter("Audio/Video Files", &["flac", "wav", "mp3", "ogg", "aac", "m4a", "mp4", "mkv", "avi", "webm", "opus", "mod", "s3m", "xm", "it", "stm", "669", "mtm", "med", "okt", "psm"])
+                                                .add_filter("All Files", &["*"])
+                                                .pick_files() {
+                                                if !paths.is_empty() {
+                                                    let mut state = app_state_clone.lock().unwrap();
+                                                    state.playlist = paths.into_iter().map(|p| p.display().to_string()).collect();
+                                                    state.playlist_index = 0;
+                                                    state.load_request = Some(state.playlist[0].clone());
+                                                    state.file_loaded = true;
+                                                }
                                             }
-                                        }
-                                    });
+                                            app_state_clone.lock().unwrap().is_file_picker_open = false;
+                                        });
+                                    }
                                 },
                                 WinitKeyCode::KeyV => {
                                     let mut state = app_state.lock().unwrap();
@@ -510,21 +521,26 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                         state.spectrum_history.clear();
                         for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
                     } else if action == EngineAction::OpenFile {
-                        let app_state_clone = Arc::clone(&app_state);
-                        std::thread::spawn(move || {
-                            if let Some(paths) = rfd::FileDialog::new()
-                                .add_filter("Audio/Video Files", &["flac", "wav", "mp3", "ogg", "aac", "m4a", "mp4", "mkv", "avi", "webm", "opus", "mod", "s3m", "xm", "it", "stm", "669", "mtm", "med", "okt", "psm"])
-                                .add_filter("All Files", &["*"])
-                                .pick_files() {
-                                if !paths.is_empty() {
-                                    let mut state = app_state_clone.lock().unwrap();
-                                    state.playlist = paths.into_iter().map(|p| p.display().to_string()).collect();
-                                    state.playlist_index = 0;
-                                    state.load_request = Some(state.playlist[0].clone());
-                                    state.file_loaded = true;
+                        let mut state = app_state.lock().unwrap();
+                        if !state.is_file_picker_open {
+                            state.is_file_picker_open = true;
+                            let app_state_clone = Arc::clone(&app_state);
+                            std::thread::spawn(move || {
+                                if let Some(paths) = rfd::FileDialog::new()
+                                    .add_filter("Audio/Video Files", &["flac", "wav", "mp3", "ogg", "aac", "m4a", "mp4", "mkv", "avi", "webm", "opus", "mod", "s3m", "xm", "it", "stm", "669", "mtm", "med", "okt", "psm"])
+                                    .add_filter("All Files", &["*"])
+                                    .pick_files() {
+                                    if !paths.is_empty() {
+                                        let mut state = app_state_clone.lock().unwrap();
+                                        state.playlist = paths.into_iter().map(|p| p.display().to_string()).collect();
+                                        state.playlist_index = 0;
+                                        state.load_request = Some(state.playlist[0].clone());
+                                        state.file_loaded = true;
+                                    }
                                 }
-                            }
-                        });
+                                app_state_clone.lock().unwrap().is_file_picker_open = false;
+                            });
+                        }
                     }
                     
                     // Fallback for Wayland/Mesa broken FIFO vsync:
@@ -556,6 +572,112 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                 }
             },
             Event::AboutToWait => {
+                while let Some(gilrs::Event { id: _, event: g_event, time: _, .. }) = gilrs.next_event() {
+                    match g_event {
+                        gilrs::EventType::ButtonPressed(button, _) => {
+                            match button {
+                                gilrs::Button::Select => {
+                                    elwt.exit();
+                                }
+                                gilrs::Button::LeftTrigger => { // L1 Bumper
+                                    let mut state = app_state.lock().unwrap();
+                                    state.show_hud = !state.show_hud;
+                                }
+                                gilrs::Button::RightTrigger => { // R1 Bumper
+                                    let mut state = app_state.lock().unwrap();
+                                    state.gpu_fft = !state.gpu_fft;
+                                }
+                                gilrs::Button::North => { // 'Y' or Triangle
+                                    let mut state = app_state.lock().unwrap();
+                                    if !state.is_file_picker_open {
+                                        state.is_file_picker_open = true;
+                                        let app_state_clone = Arc::clone(&app_state);
+                                        std::thread::spawn(move || {
+                                            if let Some(paths) = rfd::FileDialog::new()
+                                                .add_filter("Audio/Video Files", &["flac", "wav", "mp3", "ogg", "aac", "m4a", "mp4", "mkv", "avi", "webm", "opus", "mod", "s3m", "xm", "it", "stm", "669", "mtm", "med", "okt", "psm"])
+                                                .add_filter("All Files", &["*"])
+                                                .pick_files() {
+                                                if !paths.is_empty() {
+                                                    let mut state = app_state_clone.lock().unwrap();
+                                                    state.playlist = paths.into_iter().map(|p| p.display().to_string()).collect();
+                                                    state.playlist_index = 0;
+                                                    state.load_request = Some(state.playlist[0].clone());
+                                                    state.file_loaded = true;
+                                                }
+                                            }
+                                            app_state_clone.lock().unwrap().is_file_picker_open = false;
+                                        });
+                                    }
+                                }
+                                gilrs::Button::West => { // 'X' or Square
+                                    let mut state = app_state.lock().unwrap();
+                                    if state.video_frame_rx.is_some() {
+                                        state.video_mode = (state.video_mode + 1) % 3;
+                                    } else {
+                                        state.video_mode = 0;
+                                    }
+                                }
+                                gilrs::Button::East => { // 'B' or Circle
+                                    let mut state = app_state.lock().unwrap();
+                                    state.show_stats = !state.show_stats;
+                                }
+                                gilrs::Button::DPadRight => {
+                                    let mut state = app_state.lock().unwrap();
+                                    let target = state.current_seconds + 5.0;
+                                    state.seek_request = Some(target);
+                                    state.spectrum_history.clear();
+                                    for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
+                                }
+                                gilrs::Button::DPadLeft => {
+                                    let mut state = app_state.lock().unwrap();
+                                    let target = (state.current_seconds - 5.0).max(0.0);
+                                    state.seek_request = Some(target);
+                                    state.spectrum_history.clear();
+                                    for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
+                                }
+                                gilrs::Button::DPadUp => {
+                                    let mut state = app_state.lock().unwrap();
+                                    if !state.available_visualizers.is_empty() {
+                                        state.current_visualizer_idx = (state.current_visualizer_idx + 1) % state.available_visualizers.len();
+                                        state.visualizer_mode = state.available_visualizers[state.current_visualizer_idx];
+                                    }
+                                }
+                                gilrs::Button::DPadDown => {
+                                    let mut state = app_state.lock().unwrap();
+                                    if !state.available_visualizers.is_empty() {
+                                        if state.current_visualizer_idx == 0 {
+                                            state.current_visualizer_idx = state.available_visualizers.len() - 1;
+                                        } else {
+                                            state.current_visualizer_idx -= 1;
+                                        }
+                                        state.visualizer_mode = state.available_visualizers[state.current_visualizer_idx];
+                                    }
+                                }
+                                gilrs::Button::Start => {
+                                    if window.fullscreen().is_some() {
+                                        window.set_fullscreen(None);
+                                    } else {
+                                        window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+                                    }
+                                }
+                                gilrs::Button::South => {
+                                    let mut state = app_state.lock().unwrap();
+                                    if state.current_seconds >= state.duration_seconds - 0.1 && state.duration_seconds > 0.0 {
+                                        state.seek_request = Some(0.0);
+                                        state.spectrum_history.clear();
+                                        for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
+                                        state.is_paused = false;
+                                    } else {
+                                        state.is_paused = !state.is_paused;
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+
                 if window.fullscreen().is_some() {
                     if is_cursor_visible && last_mouse_move.elapsed().as_secs_f32() > 2.0 {
                         window.set_cursor_visible(false);
