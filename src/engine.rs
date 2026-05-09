@@ -344,17 +344,22 @@ impl<'a> VulkanEngine<'a> {
             immediate_size: 0,
         });
 
-        let shader_sources = vec![
-            include_str!("shaders/vis_spectrum.wgsl"),
-            include_str!("shaders/vis_flame.wgsl"),
-            include_str!("shaders/vis_oscilloscope.wgsl"),
-            include_str!("shaders/vis_spatial.wgsl"),
-            include_str!("shaders/vis_ferrofluid.wgsl"),
-            include_str!("shaders/vis_neon.wgsl"),
-            include_str!("shaders/vis_firesim.wgsl"),
-            include_str!("shaders/vis_3doscilloscope.wgsl"),
-            include_str!("shaders/vis_3doscilloscope_freq.wgsl"),
-        ];
+        let get_shader_source = |id: u32| -> &'static str {
+            match id {
+                0 => include_str!("shaders/vis_spectrum.wgsl"),
+                1 => include_str!("shaders/vis_flame.wgsl"),
+                2 => include_str!("shaders/vis_oscilloscope.wgsl"),
+                3 => include_str!("shaders/vis_spatial.wgsl"),
+                4 => include_str!("shaders/vis_ferrofluid.wgsl"),
+                5 => include_str!("shaders/vis_neon.wgsl"),
+                6 => include_str!("shaders/vis_firesim.wgsl"),
+                7 => include_str!("shaders/vis_3doscilloscope.wgsl"),
+                8 => include_str!("shaders/vis_3doscilloscope_freq.wgsl"),
+                _ => include_str!("shaders/vis_spectrum.wgsl"),
+            }
+        };
+
+        let shader_sources: Vec<&'static str> = crate::state::VISUALIZERS.iter().map(|v| get_shader_source(v.id)).collect();
 
         let mut render_pipelines = Vec::new();
         
@@ -947,8 +952,9 @@ impl<'a> VulkanEngine<'a> {
 
         self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
-        // Only upload waveform history when the oscilloscope visualizer is active
-        if state.visualizer_mode == 2 || state.visualizer_mode == 7 {
+        // Only upload waveform history when the active visualizer requires it
+        let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
+        if vis_def.requires_history {
             let mut history_storage = WaveformHistoryStorage {
                 waveforms: [[0.0; 1024]; 32],
             };
@@ -966,7 +972,7 @@ impl<'a> VulkanEngine<'a> {
             self.queue.write_buffer(&self.waveform_storage_buffer, 0, bytemuck::cast_slice(&[history_storage]));
         }
         
-        if state.visualizer_mode == 1 || state.visualizer_mode == 6 {
+        if vis_def.requires_fire {
             let mut bass_sum = 0.0;
             let mut mids_sum = 0.0;
             let mut highs_sum = 0.0;
@@ -1205,18 +1211,10 @@ impl<'a> VulkanEngine<'a> {
         let mut out_track_info_rect = None;
         let mut out_top_panel_rect = None;
         
-        let vis_name = match state.visualizer_mode {
-            0 => "Frequency Spectrum",
-            1 => "Classic Flame",
-            2 => "CRT Oscilloscope",
-            7 => "3D CRT Oscilloscope",
-            8 => "3D Freq Oscilloscope",
-            3 => "Spatial Vectors",
-            4 => "Chrome Ferrofluid",
-            5 => "Neon Corridor",
-            6 => "Fire Simulation",
-            _ => "Unknown",
-        };
+        let vis_name = crate::state::VISUALIZERS
+            .get(state.current_visualizer_idx)
+            .map(|v| v.name)
+            .unwrap_or("Unknown");
         
         let mut video_info_str = None;
         if let Some(vs) = &self.video_state {
@@ -1753,7 +1751,8 @@ impl<'a> VulkanEngine<'a> {
                 compute_pass.set_bind_group(0, Some(&self.fft_bind_group), &[]);
                 compute_pass.dispatch_workgroups(64, 2, 1); // 1024/16=64, 32/16=2
             }
-            if state.visualizer_mode == 8 {
+            let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
+            if vis_def.requires_resynth {
                 let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("Resynth Compute Pass"),
                     timestamp_writes: None,
@@ -1765,7 +1764,8 @@ impl<'a> VulkanEngine<'a> {
         }
 
         // GPU fire compute: dispatch simulation + copy result to texture
-        if state.visualizer_mode == 1 || state.visualizer_mode == 6 {
+        let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
+        if vis_def.requires_fire {
             {
                 let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("Fire Compute"),
@@ -1775,7 +1775,7 @@ impl<'a> VulkanEngine<'a> {
                         end_of_pass_write_index: Some(3),
                     }),
                 });
-                if state.visualizer_mode == 1 {
+                if vis_def.id == 1 {
                     compute_pass.set_pipeline(&self.fire_compute_pipeline);
                 } else {
                     compute_pass.set_pipeline(&self.firesim_compute_pipeline);
@@ -1839,7 +1839,7 @@ impl<'a> VulkanEngine<'a> {
             
             render_pass.set_viewport(vp_x, vp_y, vp_w, vp_h, 0.0, 1.0);
 
-            let mode_idx = (state.visualizer_mode as usize).min(self.render_pipelines.len() - 1);
+            let mode_idx = state.current_visualizer_idx.min(self.render_pipelines.len() - 1);
             render_pass.set_pipeline(&self.render_pipelines[mode_idx]);
             render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
             render_pass.draw(0..3, 0..1);

@@ -44,6 +44,29 @@ impl std::fmt::Debug for VideoFrame {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct VisualizerDef {
+    pub id: u32,
+    pub name: &'static str,
+    pub filename: &'static str,
+    pub description: &'static str,
+    pub requires_history: bool,
+    pub requires_fire: bool,
+    pub requires_resynth: bool,
+}
+
+pub const VISUALIZERS: &[VisualizerDef] = &[
+    VisualizerDef { id: 0, name: "Frequency Spectrum", filename: "vis_spectrum.wgsl", description: "Standard 2D FFT spectrum analyzer", requires_history: false, requires_fire: false, requires_resynth: false },
+    VisualizerDef { id: 2, name: "CRT Oscilloscope", filename: "vis_oscilloscope.wgsl", description: "2D glowing CRT wave trace", requires_history: true, requires_fire: false, requires_resynth: false },
+    VisualizerDef { id: 7, name: "3D CRT Oscilloscope", filename: "vis_3doscilloscope.wgsl", description: "3D waterfall history of waveform", requires_history: true, requires_fire: false, requires_resynth: false },
+    VisualizerDef { id: 8, name: "3D Freq Oscilloscope", filename: "vis_3doscilloscope_freq.wgsl", description: "3D topographical frequency view", requires_history: false, requires_fire: false, requires_resynth: true },
+    VisualizerDef { id: 1, name: "Classic Flame", filename: "vis_flame.wgsl", description: "Classic fiery bottom-up visualizer", requires_history: false, requires_fire: true, requires_resynth: false },
+    VisualizerDef { id: 6, name: "Fire Simulation", filename: "vis_firesim.wgsl", description: "Multi-channel procedural fire simulation", requires_history: false, requires_fire: true, requires_resynth: false },
+    VisualizerDef { id: 3, name: "Spatial Vectors", filename: "vis_spatial.wgsl", description: "Multi-channel spatial audio map", requires_history: false, requires_fire: false, requires_resynth: false },
+    VisualizerDef { id: 4, name: "Chrome Ferrofluid", filename: "vis_ferrofluid.wgsl", description: "Raymarched liquid metal simulation", requires_history: false, requires_fire: false, requires_resynth: false },
+    VisualizerDef { id: 5, name: "Neon Corridor", filename: "vis_neon.wgsl", description: "Raymarched neon sci-fi tunnel", requires_history: false, requires_fire: false, requires_resynth: false },
+];
+
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub song_title: String,
@@ -92,7 +115,6 @@ pub struct AppState {
     pub playlist_index: usize,
     pub track_ended: bool,
     pub visualizer_mode: u32,
-    pub available_visualizers: Vec<u32>,
     pub current_visualizer_idx: usize,
     pub video_frame_rx: Option<crossbeam_channel::Receiver<VideoFrame>>,
     pub free_video_frame_tx: Option<crossbeam_channel::Sender<VideoFrame>>,
@@ -157,8 +179,7 @@ impl AppState {
             playlist: Vec::new(),
             playlist_index: 0,
             track_ended: false,
-            visualizer_mode: 0,
-            available_visualizers: vec![0, 1, 2, 7, 8, 3, 4, 5, 6],
+            visualizer_mode: VISUALIZERS[0].id,
             current_visualizer_idx: 0,
             video_frame_rx: None,
             free_video_frame_tx: None,

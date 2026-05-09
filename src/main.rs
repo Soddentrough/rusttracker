@@ -104,25 +104,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         
         if let Some(vis) = &args.vis {
             let vis_lower = vis.to_lowercase();
-            state.visualizer_mode = if vis_lower.contains("firesim") {
-                6
-            } else if vis_lower.contains("3dosc") || vis_lower.contains("3dcrt") {
-                7
-            } else if vis_lower.contains("spectrum") || vis_lower.contains("freq") {
-                0
-            } else if vis_lower.contains("fire") || vis_lower.contains("flame") {
-                1
-            } else if vis_lower.contains("osc") || vis_lower.contains("crt") {
-                2
-            } else if vis_lower.contains("spatial") || vis_lower.contains("vector") {
-                3
-            } else if vis_lower.contains("ferrofluid") || vis_lower.contains("chrome") {
-                4
-            } else if vis_lower.contains("neon") || vis_lower.contains("corridor") {
-                5
-            } else {
-                0
-            };
+            if let Some(idx) = crate::state::VISUALIZERS.iter().position(|v| v.filename.to_lowercase().contains(&vis_lower) || v.name.to_lowercase().contains(&vis_lower)) {
+                state.current_visualizer_idx = idx;
+                state.visualizer_mode = crate::state::VISUALIZERS[idx].id;
+            }
         }
     }
     
@@ -308,21 +293,17 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                                 },
                                 WinitKeyCode::ArrowUp => {
                                     let mut state = app_state.lock().unwrap();
-                                    if !state.available_visualizers.is_empty() {
-                                        state.current_visualizer_idx = (state.current_visualizer_idx + 1) % state.available_visualizers.len();
-                                        state.visualizer_mode = state.available_visualizers[state.current_visualizer_idx];
-                                    }
+                                    state.current_visualizer_idx = (state.current_visualizer_idx + 1) % crate::state::VISUALIZERS.len();
+                                    state.visualizer_mode = crate::state::VISUALIZERS[state.current_visualizer_idx].id;
                                 },
                                 WinitKeyCode::ArrowDown => {
                                     let mut state = app_state.lock().unwrap();
-                                    if !state.available_visualizers.is_empty() {
-                                        if state.current_visualizer_idx == 0 {
-                                            state.current_visualizer_idx = state.available_visualizers.len() - 1;
-                                        } else {
-                                            state.current_visualizer_idx -= 1;
-                                        }
-                                        state.visualizer_mode = state.available_visualizers[state.current_visualizer_idx];
+                                    if state.current_visualizer_idx == 0 {
+                                        state.current_visualizer_idx = crate::state::VISUALIZERS.len() - 1;
+                                    } else {
+                                        state.current_visualizer_idx -= 1;
                                     }
+                                    state.visualizer_mode = crate::state::VISUALIZERS[state.current_visualizer_idx].id;
                                 },
                                 _ => {}
                             }
@@ -637,21 +618,17 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                                 }
                                 gilrs::Button::DPadUp => {
                                     let mut state = app_state.lock().unwrap();
-                                    if !state.available_visualizers.is_empty() {
-                                        state.current_visualizer_idx = (state.current_visualizer_idx + 1) % state.available_visualizers.len();
-                                        state.visualizer_mode = state.available_visualizers[state.current_visualizer_idx];
-                                    }
+                                    state.current_visualizer_idx = (state.current_visualizer_idx + 1) % crate::state::VISUALIZERS.len();
+                                    state.visualizer_mode = crate::state::VISUALIZERS[state.current_visualizer_idx].id;
                                 }
                                 gilrs::Button::DPadDown => {
                                     let mut state = app_state.lock().unwrap();
-                                    if !state.available_visualizers.is_empty() {
-                                        if state.current_visualizer_idx == 0 {
-                                            state.current_visualizer_idx = state.available_visualizers.len() - 1;
-                                        } else {
-                                            state.current_visualizer_idx -= 1;
-                                        }
-                                        state.visualizer_mode = state.available_visualizers[state.current_visualizer_idx];
+                                    if state.current_visualizer_idx == 0 {
+                                        state.current_visualizer_idx = crate::state::VISUALIZERS.len() - 1;
+                                    } else {
+                                        state.current_visualizer_idx -= 1;
                                     }
+                                    state.visualizer_mode = crate::state::VISUALIZERS[state.current_visualizer_idx].id;
                                 }
                                 gilrs::Button::Start => {
                                     if window.fullscreen().is_some() {
