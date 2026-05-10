@@ -187,15 +187,24 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let phys_val = get_base_heat(uv);
     
     // Positive values = Heat (Fire & Embers). Negative values = Smoke density.
-    let heat = max(phys_val, 0.0);
+    let base_heat = max(phys_val, 0.0);
+    
+    // Procedural edge erosion!
+    // The physics simulation provides the distinct columns and vertical advection.
+    // We use noise to erode the *edges* of the flame, leaving the core solid, which 
+    // creates perfect, crisp plasma filaments!
+    let detail_uv = uv_c * 12.0 + vec2<f32>(0.0, time * 4.0);
+    let flame_noise = fbm(detail_uv) * 0.5 + 0.5;
+    
+    // High erosion at the edges (base_heat=0), low erosion at the core (base_heat=1)
+    let erosion = mix(0.85, 0.05, smoothstep(0.0, 0.8, base_heat));
+    let heat = base_heat * (1.0 - flame_noise * erosion);
     
     // Smoke density is negative values.
     // Add a tiny 2% global ambient smoke haze to prevent empty space (0.0) from causing a black gap!
     let smoke_density = max(-phys_val, 0.0) + 0.02;
     
     // 2. Render Fire & Embers (Emission)
-    // The compute shader now uses Laplacian sharpening, so the heat map is naturally 
-    // sharp, chaotic, and detailed. No procedural erosion needed!
     var emission = blackbody(min(heat, 1.0) * 1.15);
     
     // Embers: Because the physics engine is now sharpened, embers (heat > 1.2) do not 
@@ -251,7 +260,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let bloom = vec3<f32>(1.0, 0.85, 0.25) * bloom_intensity;
 
     // 5. Final Composition
-    var final_color = emission * transmittance + in_scattering + halation + bloom;
+    // Fire is the light source; it should not be blocked by its own smoke in this additive model.
+    var final_color = emission + in_scattering + halation + bloom;
     
     // ACES Filmic Tonemapping
     let a = 2.51;
