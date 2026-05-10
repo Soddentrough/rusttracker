@@ -19,6 +19,7 @@ struct AudioUniforms {
     channels: array<vec4<f32>, 8>,
     channel_peaks: array<vec4<f32>, 8>,
     spatial_channels: array<vec4<f32>, 4>,
+    display_order: array<vec4<u32>, 4>,
     num_channels: u32,
     mode: u32,
     time: f32,
@@ -36,6 +37,40 @@ struct AudioUniforms {
 @group(0) @binding(1) var<storage, read> waveform_history: array<vec4<f32>>;
 @group(0) @binding(3) var fire_grid_tex: texture_2d<f32>;
 @group(0) @binding(4) var<storage, read> multi_spectrum: array<vec2<f32>>;
+
+// --- 3x5 bitmap font for debug labels ---
+fn glyph_bitmap(ch: u32) -> u32 {
+    // 3x5 pixel font. 15 bits per glyph, MSB = top-left.
+    // Index: 0-9=digits, 10=L, 11=R, 12=C, 13=S, 14=F, 15=E, 16=space
+    switch ch {
+        case 0u  { return 31599u; } // 0
+        case 1u  { return 11415u; } // 1
+        case 2u  { return 29671u; } // 2
+        case 3u  { return 29647u; } // 3
+        case 4u  { return 23497u; } // 4
+        case 5u  { return 31183u; } // 5
+        case 6u  { return 31215u; } // 6
+        case 7u  { return 29330u; } // 7
+        case 8u  { return 31727u; } // 8
+        case 9u  { return 31695u; } // 9
+        case 10u { return 18727u; } // L: #.. #.. #.. #.. ###
+        case 11u { return 31733u; } // R: ### #.# ### ##. #.#
+        case 12u { return 31015u; } // C: ### #.. #.. #.. ###
+        case 13u { return 31183u; } // S (same as 5)
+        case 14u { return 31204u; } // F: ### #.. ### #.. #..
+        case 15u { return 31207u; } // E: ### #.. ### #.. ###
+        default  { return 0u; }     // space
+    }
+}
+
+fn draw_label_char(ch: u32, frag: vec2<f32>, origin: vec2<f32>, px: f32) -> f32 {
+    let local = frag - origin;
+    if local.x < 0.0 || local.x >= px * 3.0 || local.y < 0.0 || local.y >= px * 5.0 { return 0.0; }
+    let col = u32(floor(local.x / px));
+    let row = u32(floor(local.y / px));
+    let bit = (4u - row) * 3u + (2u - col);
+    return f32((glyph_bitmap(ch) >> bit) & 1u);
+}
 
 // --- Noise primitives ---
 
@@ -140,60 +175,57 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     let volume = bass * 0.5 + mids * 0.3 + highs * 0.2;
 
-    // --- UV perturbation (gentle, for macro shape only) ---
-    let uv_scaled = vec2<f32>(in.uv.x * 1.77, in.uv.y);
-    let edge_noise = fbm(uv_scaled * 4.0 - vec2<f32>(0.0, audio.time * 0.6));
-    let gentle_dist = edge_noise * 0.025 * (1.0 - in.uv.y);
-    let sample_uv = in.uv + vec2<f32>(gentle_dist, 0.0);
-
-    let base_heat = get_base_heat(sample_uv);
-
-    // --- Ragged edge technique: add noise TO the heat BEFORE thresholding ---
-    // This pushes the fire boundary around irregularly.
-    // Where noise is positive, fire extends outward; where negative, it retreats.
-    // This is fundamentally different from multiplicative noise (which only changes brightness).
+    let time = audio.time;
+    let uv = in.uv;
     
-    // Medium-frequency tears (large ragged chunks)
-    let tear_noise = fbm(uv_scaled * 8.0 - vec2<f32>(0.0, audio.time * 2.0));
-    // Fine wisps at the very edge (small tendrils)
-    let wisp_noise = perlin_noise(uv_scaled * 22.0 - vec2<f32>(0.0, audio.time * 3.5));
+    // Center UV and scale for aspect ratio
+    let uv_c = vec2<f32>(uv.x * 1.77, uv.y);
     
-    // Scale the noise contribution by height — more ragged at flame tips, smoother at base
-    let tip_factor = clamp(1.0 - in.uv.y * 1.3, 0.0, 1.0);
-    let noisy_heat = base_heat + tear_noise * 0.18 * tip_factor + wisp_noise * 0.08 * tip_factor;
+    // 1. Direct Base Heat Sampling
+    // The flame structure and fluid dynamics are entirely driven by the compute shader simulation.
+    // Audio affects fuel/wind inside the compute shader, not via visual warping here.
+    let base_heat = get_base_heat(uv);
+    
+    // 2. Procedural Noise Masking for Flame Detail
+    // We add high-frequency detail to the boundaries of the simulated heat,
+    // but the underlying structure remains stable.
+    let detail_uv = uv_c * 12.0 - vec2<f32>(0.0, time * 3.5);
+    let flame_detail = fbm(detail_uv);
+    
+    let core_mask = smoothstep(0.25, 0.75, base_heat);
+    let edge_detail = flame_detail * (1.0 - core_mask);
+    
+    // Active heat forms the sharp, detailed flame boundaries
+    let active_heat = smoothstep(0.1, 0.65, base_heat + edge_detail * 0.45);
 
-    // Tight smoothstep: sharp cutoff from fire to void with the noisy boundary
-    let sharp_heat = smoothstep(0.05, 0.45, noisy_heat) * pow(max(base_heat, 0.0), 0.7);
+    // 3. Smoke and Haze (Beer's Law)
+    let smoke_uv = uv_c * 2.5 - vec2<f32>(time * 0.15, time * 1.0);
+    let smoke_noise = fbm(smoke_uv);
+    
+    // Smoke appears where heat is dissipating (above flames)
+    let smoke_proximity = smoothstep(0.0, 0.35, get_base_heat(uv + vec2<f32>(0.0, 0.15)));
+    let smoke_density = smoothstep(0.3, 0.8, smoke_noise) * smoke_proximity * (1.0 - active_heat) * uv.y * 1.8;
+    
+    // Beer's Law: Transmission through smoke medium
+    let absorption_coeff = 3.5; 
+    let transmittance = exp(-smoke_density * absorption_coeff);
+    
+    // In-scattering: Ambient light and fire glow scattered by smoke
+    let scatter_color = mix(vec3<f32>(1.0, 0.3, 0.05), vec3<f32>(0.1, 0.12, 0.18), uv.y);
+    let in_scattering = scatter_color * smoke_density * (1.0 - transmittance) * 0.4;
 
-    // --- Subtle multiplicative texture (light touch — edge noise does the heavy lifting) ---
-    let turb_speed = 1.5 + mids * 1.5;
-    let crackle = perlin_noise(uv_scaled * 30.0 - vec2<f32>(0.0, audio.time * turb_speed)) * 0.5 + 0.5;
-    var final_heat = sharp_heat * (0.88 + 0.18 * crackle);
+    // 4. Emission (Blackbody Radiation)
+    var emission = blackbody(active_heat * 1.15);
 
-    // Bass-driven brightness surge
-    final_heat *= 1.0 + bass * 0.5;
-
-    // --- Embers in negative space ---
-    var ember_glow = 0.0;
-    if base_heat < 0.3 && in.uv.y < 0.90 {
-        let ember_speed = 2.0 + highs * 3.0;
-        let ember_uv = uv_scaled * 20.0 - vec2<f32>(0.0, audio.time * ember_speed);
-        let ember_noise = fbm(ember_uv);
-        let proximity = get_base_heat(in.uv + vec2<f32>(0.0, 0.05));
-        let threshold = 0.6 - highs * 0.15;
-        if ember_noise > threshold {
-            ember_glow = smoothstep(threshold, 1.0, ember_noise) * proximity * 6.0;
-        }
-    }
-
-    // --- Per-channel spatial FFT reactivity ---
+    // Per-channel spatial FFT reactivity
     let n_ch = max(1u, audio.num_channels);
-    let channel_idx = min(u32(in.uv.x * f32(n_ch)), n_ch - 1u);
+    let channel_idx = min(u32(uv.x * f32(n_ch)), n_ch - 1u);
 
-    var fft_ch = channel_idx;
+    var raw_ch = audio.display_order[channel_idx / 4u][channel_idx % 4u];
+    var fft_ch = raw_ch;
     var vu_scale = 1.0;
     if audio.fft_channels < n_ch {
-        fft_ch = channel_idx % max(audio.fft_channels, 1u);
+        fft_ch = raw_ch % max(audio.fft_channels, 1u);
         let vec_idx = channel_idx / 4u;
         let elem_idx = channel_idx % 4u;
         var val = 0.0;
@@ -212,20 +244,116 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
     high_energy = min((high_energy / 44.0) / 100.0 * vu_scale, 1.0);
 
-    // --- Final color ---
-    let fire_color = blackbody(final_heat) * (1.0 + volume * 0.4);
+    // High-frequency spectral tint (hot blue core)
+    let tint = vec3<f32>(0.1, 0.35, 1.0) * (high_energy * active_heat * 1.8);
+    emission += tint;
 
-    // High-frequency spectral tint (subtle blue in hot zones)
-    let tint = vec3<f32>(0.2, 0.35, 0.9) * (high_energy * final_heat * 2.5);
+    // 5. Particle Systems (Sparks / Embers)
+    let spark_speed = time * 2.0;
+    let spark_pos = uv_c * vec2<f32>(18.0, 28.0) - vec2<f32>(0.0, spark_speed);
+    
+    // Add local noise to spark position so they wiggle as they rise organically
+    let spark_wiggle = vec2<f32>(
+        fbm(uv_c * 5.0 + vec2<f32>(0.0, time * 2.0)),
+        fbm(uv_c * 5.0 - vec2<f32>(time * 1.5, 0.0))
+    ) * 3.0;
+    let displaced_spark_pos = spark_pos + spark_wiggle;
+    
+    let grid_uv = floor(displaced_spark_pos);
+    let local_uv = fract(displaced_spark_pos);
+    let spark_hash = hash22(grid_uv).x * 0.5 + 0.5; // [0, 1]
+    
+    // Add organic jitter to particle position within cell
+    let jitter = hash22(grid_uv + vec2<f32>(13.3, 7.1)) * 0.35;
+    let spark_dist = length(local_uv - 0.5 - jitter);
+    
+    // Only ~3% of cells spawn sparks
+    let is_spark = step(0.97, spark_hash); 
+    let spark_dot = smoothstep(0.2, 0.02, spark_dist) * is_spark;
+    
+    // Sparks only spawn where the compute shader simulation has heat
+    let spark_proximity = smoothstep(0.05, 0.4, get_base_heat(uv + vec2<f32>(0.0, 0.05)));
+    let spark_intensity = spark_dot * spark_proximity * (1.0 - active_heat) * 1.5;
+    let spark_color = vec3<f32>(1.0, 0.65, 0.15) * spark_intensity * (4.0 + highs * 4.0);
 
-    // Embers
-    let ember_color = vec3<f32>(1.0, 0.5, 0.1) * ember_glow * (1.0 + highs * 3.0);
+    // 6. Post-Processing: Bloom and Halation
+    let halation_intensity = smoothstep(0.15, 0.55, base_heat) * 0.4;
+    let halation = vec3<f32>(1.0, 0.1, 0.02) * halation_intensity;
+    
+    let bloom_intensity = smoothstep(0.4, 0.8, active_heat) * 0.6;
+    let bloom = vec3<f32>(1.0, 0.85, 0.25) * bloom_intensity;
 
-    // Soft bloom halo around bright areas
-    let bloom_intensity = max(final_heat - 0.6, 0.0) * 2.0;
-    let bloom = vec3<f32>(1.0, 0.6, 0.2) * bloom_intensity * 0.25 * (1.0 + bass * 0.5);
+    // 7. Final Composition (CGI Compositing Model)
+    // Render equation: Color = Emission * Transmittance + In-Scattering
+    var final_color = emission * transmittance + in_scattering;
+    
+    // Add foreground particles
+    final_color += spark_color;
+    
+    // Add optical glow/bloom
+    final_color += halation + bloom;
+    
+    // ACES Filmic Tonemapping
+    let a = 2.51;
+    let b = 0.03;
+    let c = 2.43;
+    let d = 0.59;
+    let e = 0.14;
+    final_color = (final_color * (a * final_color + b)) / (final_color * (c * final_color + d) + e);
 
-    let final_color = fire_color + tint + ember_color + bloom;
+    // --- Draw Debug Labels for Channels ---
+    if (uv.y > 0.95) {
+        let n_ch = max(1u, audio.num_channels);
+        let channel_width = 1.0 / f32(n_ch);
+        
+        let hover_idx = min(u32(uv.x * f32(n_ch)), n_ch - 1u);
+        let center_x = (f32(hover_idx) + 0.5) * channel_width;
+        
+        let center_xc = center_x * 1.77;
+        let uv_c = vec2<f32>(uv.x * 1.77, uv.y);
+        
+        let raw_ch = audio.display_order[hover_idx / 4u][hover_idx % 4u];
+        
+        var lbl = array<u32, 3>(16u, 16u, 16u);
+        var lbl_len = 1u;
+        switch raw_ch {
+            case 0u  { lbl[0]=10u; }                                // L
+            case 1u  { lbl[0]=11u; }                                // R
+            case 2u  { lbl[0]=12u; }                                // C
+            case 3u  { lbl[0]=10u; lbl[1]=14u; lbl[2]=15u; lbl_len=3u; } // LFE
+            case 4u  { lbl[0]=10u; lbl[1]=13u; lbl_len=2u; }       // LS
+            case 5u  { lbl[0]=11u; lbl[1]=13u; lbl_len=2u; }       // RS
+            case 6u  { lbl[0]=10u; lbl[1]=11u; lbl[2]=13u; lbl_len=3u; } // LRS
+            case 7u  { lbl[0]=11u; lbl[1]=11u; lbl[2]=13u; lbl_len=3u; } // RRS
+            case 8u  { lbl[0]=10u; lbl[1]=14u; lbl_len=2u; }       // LF
+            case 9u  { lbl[0]=11u; lbl[1]=14u; lbl_len=2u; }       // RF
+            case 10u { lbl[0]=10u; lbl[1]=11u; lbl_len=2u; }       // LR
+            case 11u { lbl[0]=11u; lbl[1]=11u; lbl_len=2u; }       // RR
+            default  { }
+        }
+        
+        let px_size = 0.003;
+        let char_w = px_size * 4.0;
+        let total_w = char_w * f32(lbl_len) - px_size;
+        let label_origin = vec2<f32>(center_xc - total_w * 0.5, 0.97);
+        
+        let box_w = total_w + 0.01;
+        let box_h = px_size * 5.0 + 0.01;
+        let dx = abs(uv_c.x - center_xc);
+        let dy = abs(uv_c.y - (0.97 + px_size * 2.5));
+        
+        if (dx < box_w * 0.5 && dy < box_h * 0.5) {
+            final_color = vec3<f32>(0.0); // Black box
+            var text_alpha = 0.0;
+            for (var c_idx = 0u; c_idx < lbl_len; c_idx = c_idx + 1u) {
+                let char_origin = label_origin + vec2<f32>(char_w * f32(c_idx), 0.0);
+                text_alpha = max(text_alpha, draw_label_char(lbl[c_idx], uv_c, char_origin, px_size));
+            }
+            if (text_alpha > 0.0) {
+                final_color = vec3<f32>(1.0); // White text
+            }
+        }
+    }
 
     return vec4<f32>(final_color, 1.0);
 }

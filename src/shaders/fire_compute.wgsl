@@ -9,7 +9,9 @@ struct FireParams {
     height: u32,
     num_channels: u32,
     lfe_idx: u32,
-    _pad: vec2<u32>,
+    fft_channels: u32,
+    _pad1: u32,
+    display_order: array<vec4<u32>, 2>,
     channels: array<vec4<f32>, 8>,
 };
 

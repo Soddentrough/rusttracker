@@ -19,6 +19,7 @@ struct AudioUniforms {
     channels: array<vec4<f32>, 8>,
     channel_peaks: array<vec4<f32>, 8>,
     spatial_channels: array<vec4<f32>, 4>,
+    display_order: array<vec4<u32>, 4>,
     num_channels: u32,
     mode: u32,
     time: f32,
@@ -79,10 +80,10 @@ fn glyph_bitmap(ch: u32) -> u32 {
         case 9u  { return 31695u; } // 9
         case 10u { return 18727u; } // L: #.. #.. #.. #.. ###
         case 11u { return 31733u; } // R: ### #.# ### ##. #.#
-        case 12u { return 29257u; } // C: ### #.. #.. #.. ###
+        case 12u { return 31015u; } // C: ### #.. #.. #.. ###
         case 13u { return 31183u; } // S (same as 5)
-        case 14u { return 29576u; } // F: ### #.. ### #.. #..
-        case 15u { return 29671u; } // E (same as 2 shape): ### #.. ### #.. ###
+        case 14u { return 31204u; } // F: ### #.. ### #.. #..
+        case 15u { return 31207u; } // E: ### #.. ### #.. ###
         default  { return 0u; }     // space
     }
 }

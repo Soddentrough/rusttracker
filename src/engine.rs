@@ -19,6 +19,7 @@ pub struct AudioUniforms {
     pub channels: [f32; 32],
     pub channel_peaks: [f32; 32],
     pub spatial_channels: [f32; 16],
+    pub display_order: [u32; 16],
     pub num_channels: u32,
     pub mode: u32,
     pub time: f32,
@@ -52,7 +53,8 @@ pub struct FireParams {
     pub num_channels: u32,
     pub lfe_idx: u32,
     pub fft_channels: u32,
-    pub _pad: u32,
+    pub _pad1: u32,
+    pub display_order: [u32; 8],
     pub channels: [[f32; 4]; 8],
 }
 
@@ -907,6 +909,7 @@ impl<'a> VulkanEngine<'a> {
             channels: [0.0; 32],
             channel_peaks: [0.0; 32],
             spatial_channels: [0.0; 16],
+            display_order: [0; 16],
             num_channels: state.channel_vus.len().min(32) as u32,
             mode: state.visualizer_mode,
             time: state.current_seconds as f32,
@@ -937,6 +940,9 @@ impl<'a> VulkanEngine<'a> {
         }
 
         for (disp_idx, &src_idx) in display_order.iter().enumerate() {
+            if disp_idx < 16 {
+                uniforms.display_order[disp_idx] = src_idx as u32;
+            }
             if src_idx < state.channel_vus.len() {
                 uniforms.channels[disp_idx] = state.channel_vus[src_idx];
                 uniforms.channel_peaks[disp_idx] = state.peak_vus[src_idx];
@@ -1001,11 +1007,13 @@ impl<'a> VulkanEngine<'a> {
                 num_channels: ch_len as u32,
                 lfe_idx: lfe_idx as u32,
                 fft_channels: state.raw_audio_channels.len() as u32,
-                _pad: 0,
+                _pad1: 0,
+                display_order: [0; 8],
                 channels: [[0.0; 4]; 8],
             };
             
             for i in 0..n_ch {
+                if i < 8 { fire_params.display_order[i] = uniforms.display_order[i]; }
                 fire_params.channels[i / 4][i % 4] = uniforms.channels[i];
             }
             

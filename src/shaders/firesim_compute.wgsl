@@ -10,7 +10,8 @@ struct FireParams {
     num_channels: u32,
     lfe_idx: u32,
     fft_channels: u32,
-    _pad: u32,
+    _pad1: u32,
+    display_order: array<vec4<u32>, 2>,
     channels: array<vec4<f32>, 8>,
 };
 
@@ -111,9 +112,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             let influence = exp(-(dist * dist) / (2.0 * sigma * sigma));
             
             var fft_ch = i;
+            var raw_ch = params.display_order[i / 4u][i % 4u];
             var vu_scale = 1.0;
             if (params.fft_channels < params.num_channels) {
-                fft_ch = i % max(params.fft_channels, 1u);
+                fft_ch = raw_ch % max(params.fft_channels, 1u);
                 
                 let vec_idx = i / 4u;
                 let elem_idx = i % 4u;
