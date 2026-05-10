@@ -44,10 +44,15 @@ jobs:
         # Automatically resolve and copy all required MSYS2 DLLs (including FFmpeg transitive dependencies)
         ldd target/release/rusttracker.exe | grep -i '/mingw64' | awk '{print $3}' | xargs -I '{}' cp '{}' release/
         
+    - name: Get Version
+      run: |
+        VERSION=$(grep -m 1 '^version' Cargo.toml | cut -d '"' -f 2)
+        echo "VERSION=$VERSION" >> $GITHUB_ENV
+        
     - name: Build Installer
       shell: cmd
       run: |
-        "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+        "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DMyAppVersion=%VERSION%" installer.iss
         
     - name: Upload Artifact
       uses: actions/upload-artifact@v5

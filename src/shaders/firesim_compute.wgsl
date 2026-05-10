@@ -98,10 +98,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             n_spatial_ch = n_ch - 1u;
         }
         let channel_width = 1024.0 / f32(max(n_spatial_ch, 1u));
-        var sigma_scale = 0.18;
-        if n_spatial_ch <= 2u {
-            sigma_scale = 0.4;
-        }
+        // Extremely narrow fuel sources to maintain perfect channel separation
+        var sigma_scale = 0.04;
+        if n_spatial_ch <= 2u { sigma_scale = 0.1; }
         
         var spatial_idx = 0u;
         for (var i = 0u; i < n_ch; i = i + 1u) {
@@ -111,24 +110,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             let sigma = channel_width * sigma_scale;
             let influence = exp(-(dist * dist) / (2.0 * sigma * sigma));
             
-            var fft_ch = i;
-            var raw_ch = params.display_order[i / 4u][i % 4u];
-            var vu_scale = 1.0;
+            var fft_ch = params.display_order[i / 4u][i % 4u];
             if (params.fft_channels < params.num_channels) {
-                fft_ch = raw_ch % max(params.fft_channels, 1u);
-                
-                let vec_idx = i / 4u;
-                let elem_idx = i % 4u;
-                var val = 0.0;
-                if (elem_idx == 0u) { val = params.channels[vec_idx].x; }
-                else if (elem_idx == 1u) { val = params.channels[vec_idx].y; }
-                else if (elem_idx == 2u) { val = params.channels[vec_idx].z; }
-                else { val = params.channels[vec_idx].w; }
-                
-                vu_scale = max(val * 1.5, 0.05);
+                fft_ch = fft_ch % max(params.fft_channels, 1u);
             }
             
-            // Sample low frequencies (bins 10 to 350) for this specific channel (approx 20Hz - 200Hz)
             var ch_bass = 0.0;
             let offset = fft_ch * 1024u;
             for (var b = 10u; b < 350u; b = b + 10u) {
@@ -137,13 +123,10 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             }
             ch_bass = (ch_bass / 34.0) / 100.0;
             
-            activity += pow(ch_bass, 1.5) * influence * 2.5 * vu_scale;
+            activity += pow(ch_bass, 1.5) * influence * 2.5;
             spatial_idx += 1u;
         }
         if lfe_idx < n_ch {
-            let lfe_dist = f32(x) - 512.0;
-            let lfe_influence = exp(-(lfe_dist * lfe_dist) / (2.0 * 90.0 * 90.0));
-            
             var lfe_bass = 0.0;
             let offset = lfe_idx * 1024u;
             for (var b = 0u; b < 200u; b = b + 5u) {
@@ -152,10 +135,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             }
             lfe_bass = (lfe_bass / 40.0) / 100.0;
             
-            activity += lfe_bass * lfe_influence * 1.5;
+            // Apply LFE fuel globally across the entire bottom bed, but scaled down so it doesn't max out the whole screen and wash out the spatial channels
+            activity += lfe_bass * 0.4;
         }
 
-        let coal_target = min(params.bass * 0.25 + activity * 2.5, 1.0);
+        // Reduce global params.bass so spatial channels control local flame height
+        let coal_target = min(params.bass * 0.05 + activity * 1.2, 1.0);
         let current = coal_bed[x];
         if (coal_target > current) {
             coal_bed[x] = current + (coal_target - current) * 0.18;
@@ -168,43 +153,101 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         return;
     }
 
-    // === Hearth rows: inject coal heat ===
+    // === Hearth rows: Heat rising from the coals ===
     if (y >= bottom - 2u) {
         let coal_heat = min(coal_bed[x], 1.0);
-        let jitter = (perlin_noise(vec2<f32>(f32(x) * 0.5, params.time * 10.0)) + 1.0) * 0.5;
+        // Chaotic high-frequency jitter at the hearth breaks the fluid into chaotic licks
+        let jitter = (perlin_noise(vec2<f32>(f32(x) * 0.15, params.time * 15.0)) + 1.0) * 0.5;
         
-        if (y == bottom - 1u) {
-            output_grid[idx] = coal_heat * (0.85 + 0.15 * jitter);
-        } else {
-            output_grid[idx] = coal_heat * (0.7 + 0.15 * jitter);
+        var out_val = coal_heat * (0.6 + 0.4 * jitter);
+        
+        // Embers generation: Inject moderate heat packets. 
+        // The new Laplacian sharpening will prevent them from blurring, so they stay as crisp sparks!
+        let ember_hash = pcg_hash(x + y * 1337u + bitcast<u32>(params.time * 100.0));
+        let ember_chance = f32(ember_hash % 1000u) / 1000.0;
+        if (coal_heat > 0.5 && ember_chance > 0.99) {
+            out_val = 6.0; // Crisp ember packet
         }
+        
+        output_grid[idx] = out_val;
         return;
     }
-
-    // === ADVECTION FLUID SIMULATION ===
+    // === PHYSICAL FLUID DYNAMICS SIMULATION ===
     let p1 = vec2<f32>(f32(x), f32(y));
-    let uv = p1 / vec2<f32>(1024.0, 576.0);
+    let current_val = input_grid[idx];
     
-    // Upward buoyancy based on heat
-    let current_heat = input_grid[idx];
-    let buoyancy_vel = vec2<f32>(0.0, -1.0) * (1.0 + current_heat * 2.0 + params.bass * 3.0);
+    // Positive values = Heat (Fire/Embers). Negative values = Smoke density.
+    let heat = max(current_val, 0.0);
+    let smoke = max(-current_val, 0.0);
     
-    // Curl noise for swirling
-    let noise_scale = 0.012;
-    let scroll = vec2<f32>(0.0, params.time * 0.8);
-    let curl = curl_noise((p1 * noise_scale) - scroll);
+    // 1. Thermal Buoyancy: Hot air and warm smoke rise.
+    var buoyancy = 0.2; // Base updraft
+    buoyancy += heat * 4.5;
+    buoyancy += smoke * 1.0;
+    let buoyancy_vel = vec2<f32>(0.0, -1.0) * buoyancy;
     
-    let vel = buoyancy_vel + curl * (1.2 + params.highs * 2.5);
+    // 2. Vorticity Confinement & Multi-Octave Turbulence
+    let g_left = sample_grid(p1.x - 1.0, p1.y);
+    let g_right = sample_grid(p1.x + 1.0, p1.y);
+    let g_up = sample_grid(p1.x, p1.y - 1.0);
+    let g_down = sample_grid(p1.x, p1.y + 1.0);
     
-    // Reverse advection (where did this pixel come from?)
+    let grad_mag = clamp(length(vec2<f32>(g_right - g_left, g_down - g_up)), 0.0, 1.0);
+    
+    // Fractal curl noise creates sharp, chaotic tearing just like real fire plasma
+    let curl1 = curl_noise(p1 * 0.015 - vec2<f32>(0.0, params.time * 1.5));
+    let curl2 = curl_noise(p1 * 0.04 - vec2<f32>(0.0, params.time * 3.0));
+    let raw_curl = curl1 + curl2 * 0.5;
+    
+    // Pure physics: turbulence driven by fluid gradient, NO global audio reactivity!
+    let turbulence = raw_curl * (0.5 + grad_mag * 6.0);
+    
+    // 3. Advection
+    // Keep horizontal turbulence constrained so flames remain distinctly columnated
+    let controlled_turb = turbulence * vec2<f32>(0.4, 1.0);
+    let vel = clamp(buoyancy_vel + controlled_turb, vec2<f32>(-2.0, -6.0), vec2<f32>(2.0, 3.0));
     let dt = 1.0;
     let src_p = p1 - vel * dt;
+    var advected_val = sample_grid(src_p.x, src_p.y);
     
-    let advected_heat = sample_grid(src_p.x, src_p.y);
+    // 4. Eulerian Sharpening (Combat Numerical Diffusion)
+    // Applying negative diffusion (Laplacian) keeps the fire edges razor sharp!
+    let laplacian = g_up + g_down + g_left + g_right - 4.0 * current_val;
+    var new_val = advected_val - laplacian * 0.18;
     
-    // Cooling
-    let cool_noise = perlin_noise(p1 * 0.04 - vec2<f32>(0.0, params.time * 2.5));
-    let base_cooling = 0.002 + (cool_noise + 1.0) * 0.0015;
+    // Clamp to neighbor min/max to prevent mathematical explosion
+    let min_g = min(min(g_up, g_down), min(g_left, g_right));
+    let max_g = max(max(g_up, g_down), max(g_left, g_right));
     
-    output_grid[idx] = max(advected_heat - base_cooling * params.cooling_factor, 0.0);
+    // Only sharpen the active fire to keep smoke soft and rolling
+    if (advected_val > 0.0) {
+        new_val = clamp(new_val, min_g, max_g);
+    } else {
+        new_val = advected_val;
+    }
+    
+    if (new_val > 0.0) {
+        // Fire cooling
+        let cool_noise = perlin_noise(p1 * 0.05 - vec2<f32>(0.0, params.time * 3.0));
+        let base_cooling = 0.008 + (cool_noise + 1.0) * 0.006;
+        
+        var cooling_rate = base_cooling * params.cooling_factor;
+        // Embers (val > 1.0) cool logarithmically so they survive the journey upwards
+        if (new_val > 1.0) { cooling_rate = new_val * 0.02; } 
+        
+        new_val -= cooling_rate;
+        
+        // COMBUSTION: When fire runs out of heat (crosses 0), the burnt fuel chemically turns into smoke!
+        if (new_val <= 0.0) {
+            // Multiply the remainder to represent expansive smoke generation
+            new_val = new_val * 150.0; 
+            new_val = clamp(new_val, -3.0, 0.0);
+        }
+    } else if (new_val < 0.0) {
+        // Smoke dissipating slowly as it mixes with cold air
+        new_val += 0.001; 
+        if (new_val > 0.0) { new_val = 0.0; }
+    }
+    
+    output_grid[idx] = new_val;
 }

@@ -183,41 +183,27 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     
     // 1. Direct Base Heat Sampling
     // The flame structure and fluid dynamics are entirely driven by the compute shader simulation.
-    // Audio affects fuel/wind inside the compute shader, not via visual warping here.
-    let base_heat = get_base_heat(uv);
+    // 1. Read Raw Physics Simulation State
+    let phys_val = get_base_heat(uv);
     
-    // 2. Procedural Noise Masking for Flame Detail
-    // We add high-frequency detail to the boundaries of the simulated heat,
-    // but the underlying structure remains stable.
-    let detail_uv = uv_c * 12.0 - vec2<f32>(0.0, time * 3.5);
-    let flame_detail = fbm(detail_uv);
+    // Positive values = Heat (Fire & Embers). Negative values = Smoke density.
+    let heat = max(phys_val, 0.0);
     
-    let core_mask = smoothstep(0.25, 0.75, base_heat);
-    let edge_detail = flame_detail * (1.0 - core_mask);
+    // Smoke density is negative values.
+    // Add a tiny 2% global ambient smoke haze to prevent empty space (0.0) from causing a black gap!
+    let smoke_density = max(-phys_val, 0.0) + 0.02;
     
-    // Active heat forms the sharp, detailed flame boundaries
-    let active_heat = smoothstep(0.1, 0.65, base_heat + edge_detail * 0.45);
+    // 2. Render Fire & Embers (Emission)
+    // The compute shader now uses Laplacian sharpening, so the heat map is naturally 
+    // sharp, chaotic, and detailed. No procedural erosion needed!
+    var emission = blackbody(min(heat, 1.0) * 1.15);
+    
+    // Embers: Because the physics engine is now sharpened, embers (heat > 1.2) do not 
+    // blur into fireballs. They remain perfectly crisp, physical dots riding the fluid.
+    let ember_glow = smoothstep(1.5, 4.0, heat);
+    emission += vec3<f32>(1.0, 0.9, 0.4) * ember_glow * 8.0;
 
-    // 3. Smoke and Haze (Beer's Law)
-    let smoke_uv = uv_c * 2.5 - vec2<f32>(time * 0.15, time * 1.0);
-    let smoke_noise = fbm(smoke_uv);
-    
-    // Smoke appears where heat is dissipating (above flames)
-    let smoke_proximity = smoothstep(0.0, 0.35, get_base_heat(uv + vec2<f32>(0.0, 0.15)));
-    let smoke_density = smoothstep(0.3, 0.8, smoke_noise) * smoke_proximity * (1.0 - active_heat) * uv.y * 1.8;
-    
-    // Beer's Law: Transmission through smoke medium
-    let absorption_coeff = 3.5; 
-    let transmittance = exp(-smoke_density * absorption_coeff);
-    
-    // In-scattering: Ambient light and fire glow scattered by smoke
-    let scatter_color = mix(vec3<f32>(1.0, 0.3, 0.05), vec3<f32>(0.1, 0.12, 0.18), uv.y);
-    let in_scattering = scatter_color * smoke_density * (1.0 - transmittance) * 0.4;
-
-    // 4. Emission (Blackbody Radiation)
-    var emission = blackbody(active_heat * 1.15);
-
-    // Per-channel spatial FFT reactivity
+    // Per-channel spatial FFT reactivity for core tint
     let n_ch = max(1u, audio.num_channels);
     let channel_idx = min(u32(uv.x * f32(n_ch)), n_ch - 1u);
 
@@ -245,53 +231,27 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     high_energy = min((high_energy / 44.0) / 100.0 * vu_scale, 1.0);
 
     // High-frequency spectral tint (hot blue core)
-    let tint = vec3<f32>(0.1, 0.35, 1.0) * (high_energy * active_heat * 1.8);
+    let tint = vec3<f32>(0.1, 0.35, 1.0) * (high_energy * smoothstep(0.4, 0.8, heat) * 1.8);
     emission += tint;
 
-    // 5. Particle Systems (Sparks / Embers)
-    let spark_speed = time * 2.0;
-    let spark_pos = uv_c * vec2<f32>(18.0, 28.0) - vec2<f32>(0.0, spark_speed);
+    // 3. Render Smoke (Beer's Law)
+    // Transmission through the physically simulated smoke
+    let absorption_coeff = 4.0; 
+    let transmittance = exp(-smoke_density * absorption_coeff);
     
-    // Add local noise to spark position so they wiggle as they rise organically
-    let spark_wiggle = vec2<f32>(
-        fbm(uv_c * 5.0 + vec2<f32>(0.0, time * 2.0)),
-        fbm(uv_c * 5.0 - vec2<f32>(time * 1.5, 0.0))
-    ) * 3.0;
-    let displaced_spark_pos = spark_pos + spark_wiggle;
-    
-    let grid_uv = floor(displaced_spark_pos);
-    let local_uv = fract(displaced_spark_pos);
-    let spark_hash = hash22(grid_uv).x * 0.5 + 0.5; // [0, 1]
-    
-    // Add organic jitter to particle position within cell
-    let jitter = hash22(grid_uv + vec2<f32>(13.3, 7.1)) * 0.35;
-    let spark_dist = length(local_uv - 0.5 - jitter);
-    
-    // Only ~3% of cells spawn sparks
-    let is_spark = step(0.97, spark_hash); 
-    let spark_dot = smoothstep(0.2, 0.02, spark_dist) * is_spark;
-    
-    // Sparks only spawn where the compute shader simulation has heat
-    let spark_proximity = smoothstep(0.05, 0.4, get_base_heat(uv + vec2<f32>(0.0, 0.05)));
-    let spark_intensity = spark_dot * spark_proximity * (1.0 - active_heat) * 1.5;
-    let spark_color = vec3<f32>(1.0, 0.65, 0.15) * spark_intensity * (4.0 + highs * 4.0);
+    // In-scattering: Ambient light and fire glow scattered by smoke
+    let scatter_color = mix(vec3<f32>(0.04, 0.05, 0.08), vec3<f32>(1.0, 0.3, 0.05), pow(uv.y, 3.0));
+    let in_scattering = scatter_color * (1.0 - transmittance) * 1.5;
 
-    // 6. Post-Processing: Bloom and Halation
-    let halation_intensity = smoothstep(0.15, 0.55, base_heat) * 0.4;
+    // 4. Post-Processing: Bloom and Halation
+    let halation_intensity = smoothstep(0.15, 0.55, min(heat, 1.0)) * 0.4;
     let halation = vec3<f32>(1.0, 0.1, 0.02) * halation_intensity;
     
-    let bloom_intensity = smoothstep(0.4, 0.8, active_heat) * 0.6;
+    let bloom_intensity = smoothstep(0.4, 0.8, min(heat, 1.0)) * 0.6;
     let bloom = vec3<f32>(1.0, 0.85, 0.25) * bloom_intensity;
 
-    // 7. Final Composition (CGI Compositing Model)
-    // Render equation: Color = Emission * Transmittance + In-Scattering
-    var final_color = emission * transmittance + in_scattering;
-    
-    // Add foreground particles
-    final_color += spark_color;
-    
-    // Add optical glow/bloom
-    final_color += halation + bloom;
+    // 5. Final Composition
+    var final_color = emission * transmittance + in_scattering + halation + bloom;
     
     // ACES Filmic Tonemapping
     let a = 2.51;
@@ -304,15 +264,32 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // --- Draw Debug Labels for Channels ---
     if (uv.y > 0.95) {
         let n_ch = max(1u, audio.num_channels);
-        let channel_width = 1.0 / f32(n_ch);
+        var lfe_idx = 999u;
+        if n_ch == 6u { lfe_idx = 3u; }
+        else if n_ch == 8u { lfe_idx = 4u; }
         
-        let hover_idx = min(u32(uv.x * f32(n_ch)), n_ch - 1u);
-        let center_x = (f32(hover_idx) + 0.5) * channel_width;
+        var n_spatial_ch = n_ch;
+        if lfe_idx < n_ch { n_spatial_ch = n_ch - 1u; }
+        let channel_width = 1.0 / f32(max(n_spatial_ch, 1u));
+        
+        let hover_spatial_idx = min(u32(uv.x * f32(n_spatial_ch)), n_spatial_ch - 1u);
+        let center_x = (f32(hover_spatial_idx) + 0.5) * channel_width;
         
         let center_xc = center_x * 1.77;
         let uv_c = vec2<f32>(uv.x * 1.77, uv.y);
         
-        let raw_ch = audio.display_order[hover_idx / 4u][hover_idx % 4u];
+        var hover_display_idx = 0u;
+        var spatial_idx = 0u;
+        for (var i = 0u; i < n_ch; i = i + 1u) {
+            if i == lfe_idx { continue; }
+            if spatial_idx == hover_spatial_idx {
+                hover_display_idx = i;
+                break;
+            }
+            spatial_idx = spatial_idx + 1u;
+        }
+        
+        let raw_ch = audio.display_order[hover_display_idx / 4u][hover_display_idx % 4u];
         
         var lbl = array<u32, 3>(16u, 16u, 16u);
         var lbl_len = 1u;
