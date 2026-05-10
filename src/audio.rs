@@ -50,6 +50,9 @@ fn spawn_dsp_thread(
         let mut complex_buf = vec![Complex { re: 0.0f32, im: 0.0f32 }; FFT_SIZE];
         let mut magnitudes = vec![0.0f32; FFT_SIZE / 2];
 
+        let mut last_waveform_push = Instant::now();
+        let waveform_push_interval = std::time::Duration::from_secs_f64(1.0 / 60.0);
+
         while let Ok(msg) = rx.recv() {
             let fft_start = Instant::now();
 
@@ -138,9 +141,13 @@ fn spawn_dsp_thread(
                     state.raw_waveform[i] = msg.audio_data[start_idx + i];
                 }
                 
-                state.waveform_history.pop_front();
-                let wave_clone = state.raw_waveform.clone();
-                state.waveform_history.push_back(wave_clone);
+                let now = Instant::now();
+                if now.duration_since(last_waveform_push) >= waveform_push_interval {
+                    state.waveform_history.pop_front();
+                    let wave_clone = state.raw_waveform.clone();
+                    state.waveform_history.push_back(wave_clone);
+                    last_waveform_push = now;
+                }
                 
 
                 

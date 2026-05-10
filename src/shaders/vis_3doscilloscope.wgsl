@@ -108,21 +108,21 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let amber_lo = vec3<f32>(0.6, 0.18, 0.02);
     let amber_hi = vec3<f32>(1.0, 0.55, 0.08);
 
-    let num_lines = 32u;
-    let num_points = 512u; // Increased resolution for wider lines
+    let num_lines = 48u;
+    let num_points = 1024u; // Increased resolution for wider lines
     
     for (var i = 0u; i < num_lines; i = i + 1u) {
-        // Z layout: back to front. i=0 is back (oldest), i=31 is front (newest).
-        // Maintain same 0.24 spacing: 31 * 0.24 = 7.44 span. Front remains -1.8, back becomes 5.64.
-        let y_line = mix(5.64, -1.8, f32(i) / f32(num_lines - 1u));
+        // Z layout: back to front. i=0 is back (oldest), i=47 is front (newest).
+        // Maintain same 0.24 spacing: 47 * 0.24 = 11.28 span. Front remains -1.8, back becomes 9.48.
+        let y_line = mix(9.48, -1.8, f32(i) / f32(num_lines - 1u));
         let hist_idx = i;
         
         let t = (y_line - ro.y) / rd.y;
         if t > 0.0 {
             let hit_x = ro.x + rd.x * t;
             
-            // Map X from -8.0 to 8.0
-            let float_idx = (hit_x + 8.0) / 16.0 * f32(num_points - 1u);
+            // Map X from -9.6 to 9.6
+            let float_idx = (hit_x + 9.6) / 19.2 * f32(num_points - 1u);
             let idx = i32(round(float_idx));
             
             let start_idx = max(0, idx - 4);
@@ -133,12 +133,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             for (var j = start_idx; j <= end_idx; j = j + 1) {
                 let j_u = u32(j);
                 
-                let x0 = mix(-8.0, 8.0, f32(j_u) / f32(num_points - 1u));
-                let x1 = mix(-8.0, 8.0, f32(j_u + 1u) / f32(num_points - 1u));
+                let x0 = mix(-9.6, 9.6, f32(j_u) / f32(num_points - 1u));
+                let x1 = mix(-9.6, 9.6, f32(j_u + 1u) / f32(num_points - 1u));
                 
                 // Falloff mask so lines flatten out perfectly at the left/right edges
-                let mask0 = smoothstep(8.0, 5.0, abs(x0));
-                let mask1 = smoothstep(8.0, 5.0, abs(x1));
+                let mask0 = smoothstep(9.6, 6.6, abs(x0));
+                let mask1 = smoothstep(9.6, 6.6, abs(x1));
                 
                 let wave_idx0 = u32(f32(j_u) / f32(num_points - 1u) * 1023.0);
                 let wave_idx1 = u32(f32(j_u + 1u) / f32(num_points - 1u) * 1023.0);
@@ -174,13 +174,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             
             // Depth fade (lines further back are slightly darker)
             let depth_fade = exp(-t * 0.20);
-            let edge_fade = smoothstep(8.0, 5.0, abs(hit_x));
+            let edge_fade = smoothstep(9.6, 6.6, abs(hit_x));
             
             // Age fade (older lines fade out)
             let age_fade = mix(0.05, 1.0, f32(i) / f32(num_lines - 1u));
             
             // Sample waveform height at hit point for color grading
-            let hit_wave_idx = u32(clamp((hit_x + 8.0) / 16.0 * 1023.0, 0.0, 1023.0));
+            let hit_wave_idx = u32(clamp((hit_x + 9.6) / 19.2 * 1023.0, 0.0, 1023.0));
             let wave_height = clamp(abs(get_waveform(hist_idx, hit_wave_idx)) * 2.0, 0.0, 1.0);
             let line_amber = mix(amber_lo, amber_hi, wave_height);
             

@@ -217,6 +217,14 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                         if let PhysicalKey::Code(keycode) = kb_event.physical_key {
                             match keycode {
                                 WinitKeyCode::Escape | WinitKeyCode::KeyQ => elwt.exit(),
+                                WinitKeyCode::BracketLeft => {
+                                    let mut state = app_state.lock().unwrap();
+                                    state.panel_split_ratio = (state.panel_split_ratio - 0.05).clamp(0.15, 0.85);
+                                },
+                                WinitKeyCode::BracketRight => {
+                                    let mut state = app_state.lock().unwrap();
+                                    state.panel_split_ratio = (state.panel_split_ratio + 0.05).clamp(0.15, 0.85);
+                                },
                                 WinitKeyCode::Tab => {
                                     let mut state = app_state.lock().unwrap();
                                     state.show_hud = !state.show_hud;
@@ -453,6 +461,15 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                             }
                         }
 
+                        // Gamepad analog panel scaling (Stage 2)
+                        for (_id, gamepad) in gilrs.gamepads() {
+                            let right_y = gamepad.value(gilrs::Axis::RightStickY);
+                            if right_y.abs() > 0.1 {
+                                let scaled_delta = right_y * dt * 1.0; // Subtract moving UP (positive Y stick)
+                                state.panel_split_ratio = (state.panel_split_ratio - scaled_delta).clamp(0.15, 0.85);
+                            }
+                        }
+
                         engine.update(&state);
                     }
 
@@ -521,6 +538,9 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                     } else if let EngineAction::SetForceStereo(val) = action {
                         let mut state = app_state.lock().unwrap();
                         state.force_stereo_downmix = val;
+                    } else if let EngineAction::SetSplitRatio(val) = action {
+                        let mut state = app_state.lock().unwrap();
+                        state.panel_split_ratio = val;
                     }
                     
                     // Fallback for Wayland/Mesa broken FIFO vsync:

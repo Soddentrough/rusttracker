@@ -8,6 +8,7 @@ pub enum EngineAction {
     OpenFile,
     Seek(f32),
     SetForceStereo(bool),
+    SetSplitRatio(f32),
 }
 
 #[repr(C)]
@@ -34,7 +35,7 @@ pub struct AudioUniforms {
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct WaveformHistoryStorage {
-    pub waveforms: [[f32; 1024]; 32],  // only the 32 most recent frames (was 16)
+    pub waveforms: [[f32; 1024]; 60],
 }
 
 #[repr(C)]
@@ -958,12 +959,12 @@ impl<'a> VulkanEngine<'a> {
         let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
         if vis_def.requires_history {
             let mut history_storage = WaveformHistoryStorage {
-                waveforms: [[0.0; 1024]; 32],
+                waveforms: [[0.0; 1024]; 60],
             };
-            // Upload only the 32 most recent frames
+            // Upload only the 60 most recent frames
             let hist_len = state.waveform_history.len();
-            let start = hist_len.saturating_sub(32);
-            for (slot, wave) in state.waveform_history.iter().skip(start).enumerate().take(32) {
+            let start = hist_len.saturating_sub(60);
+            for (slot, wave) in state.waveform_history.iter().skip(start).enumerate().take(60) {
                 // Pre-smooth with [1,2,1] triangle kernel
                 history_storage.waveforms[slot][0] = (wave[0] * 3.0 + wave[1]) / 4.0;
                 for j in 1..1023 {
@@ -1401,6 +1402,10 @@ impl<'a> VulkanEngine<'a> {
                                     ui.label(egui::RichText::new("g / R1").color(egui::Color32::WHITE).strong());
                                     ui.label(egui::RichText::new("Toggle GPU FFT").color(egui::Color32::GRAY));
                                     ui.end_row();
+                                    
+                                    ui.label(egui::RichText::new("[ / ]").color(egui::Color32::WHITE).strong());
+                                    ui.label(egui::RichText::new("Scale Panels").color(egui::Color32::GRAY));
+                                    ui.end_row();
                                 });
                         }
                     );
@@ -1412,7 +1417,7 @@ impl<'a> VulkanEngine<'a> {
                 egui::Panel::top("top_panel")
                     .resizable(false)
                     .frame(egui::Frame::NONE.fill(egui::Color32::TRANSPARENT))
-                    .exact_size(ctx.content_rect().height() / 2.0)
+                    .exact_size(ctx.content_rect().height() * state.panel_split_ratio)
                     .show_inside(ctx, |ui| {
                         out_top_panel_rect = Some(ui.max_rect());
                         if state.video_mode == 2 {
@@ -1656,6 +1661,30 @@ impl<'a> VulkanEngine<'a> {
                     });
                 }
             });
+        }
+
+        if state.show_hud {
+            let total_height = ctx.content_rect().height();
+            let total_width = ctx.content_rect().width();
+            egui::Area::new("split_drag_area".into())
+                .fixed_pos(egui::pos2(0.0, total_height * state.panel_split_ratio - 6.0))
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    let drag_rect = egui::Rect::from_min_size(
+                        ui.min_rect().min,
+                        egui::vec2(total_width, 12.0)
+                    );
+                    let response = ui.allocate_rect(drag_rect, egui::Sense::click_and_drag());
+                    if response.hovered() || response.dragged() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                    }
+                    if response.dragged() {
+                        if let Some(mouse_pos) = response.interact_pointer_pos() {
+                            let new_ratio = mouse_pos.y / total_height;
+                            engine_action = EngineAction::SetSplitRatio(new_ratio.clamp(0.15, 0.85));
+                        }
+                    }
+                });
         }
 
             let frame = egui::Frame::NONE.fill(egui::Color32::TRANSPARENT);

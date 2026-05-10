@@ -122,6 +122,7 @@ pub struct AppState {
     pub free_video_frame_tx: Option<crossbeam_channel::Sender<VideoFrame>>,
     pub is_file_picker_open: bool,
     pub force_stereo_downmix: bool,
+    pub panel_split_ratio: f32,
 }
 
 impl AppState {
@@ -193,6 +194,7 @@ impl AppState {
             video_mode: 0,
             is_file_picker_open: false,
             force_stereo_downmix: is_steam_deck,
+            panel_split_ratio: 0.5,
         }
     }
 }
