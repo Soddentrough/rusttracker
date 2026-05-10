@@ -15,8 +15,7 @@ echo 'Building RustTracker...'
 cargo build --release --target-dir target_appimage
 
 # Resize icon to 512x512 to appease linuxdeploy, and name it to match the desktop file
-mogrify -resize 512x512! icon.png
-cp icon.png rusttracker.png
+convert icon.png -resize 512x512! rusttracker.png
 
 # Clean previous AppDir
 rm -rf AppDir
