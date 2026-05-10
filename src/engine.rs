@@ -930,7 +930,8 @@ impl<'a> VulkanEngine<'a> {
             if ch_len == 6 {
                 display_order = vec![4, 0, 2, 3, 1, 5]; // Ls, L, C, LFE, R, Rs
             } else if ch_len == 8 {
-                display_order = vec![4, 6, 0, 2, 3, 1, 7, 5]; // SBL, Ls, L, C, LFE, R, Rs, SBR
+                // SMPTE 7.1: ch4=Ls(side), ch5=Rs(side), ch6=Lrs(rear), ch7=Rrs(rear)
+                display_order = vec![6, 4, 0, 2, 3, 1, 5, 7]; // Lrs, Ls, L, C, LFE, R, Rs, Rrs
             }
         }
 
@@ -1452,7 +1453,8 @@ impl<'a> VulkanEngine<'a> {
                                                 3 => ["L", "C", "R"].get(i).unwrap_or(&"?").to_string(),
                                                 4 => ["Ls", "L", "R", "Rs"].get(i).unwrap_or(&"?").to_string(),
                                                 6 => ["Ls", "L", "C", "LFE", "R", "Rs"].get(i).unwrap_or(&"?").to_string(),
-                                                8 => ["SBL", "Ls", "L", "C", "LFE", "R", "Rs", "SBR"].get(i).unwrap_or(&"?").to_string(),
+                                                // SMPTE 7.1: display matches display_order [Lrs, Ls, L, C, LFE, R, Rs, Rrs]
+                                                8 => ["Lrs", "Ls", "L", "C", "LFE", "R", "Rs", "Rrs"].get(i).unwrap_or(&"?").to_string(),
                                                 12 => ["Ltr", "Ltf", "Ls", "L", "C", "LFE", "R", "Rs", "Rtf", "Rtr", "Lrs", "Rrs"].get(i).unwrap_or(&"?").to_string(),
                                                 _ => format!("{}", i + 1),
                                             }
