@@ -2,10 +2,11 @@ use std::sync::Arc;
 use winit::window::Window;
 use crate::state::AppState;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub enum EngineAction {
     None,
     OpenFile,
+    LoadFile(String),
     Seek(f32),
     SetForceStereo(bool),
     SetSplitRatio(f32),
@@ -1172,6 +1173,8 @@ impl<'a> VulkanEngine<'a> {
         egui_ctx: &egui::Context,
         egui_state: &mut egui_winit::State,
         state: &AppState,
+        file_dialog: &mut egui_file_dialog::FileDialog,
+        gamepad_events: Vec<egui::Event>
     ) -> Result<(EngineAction, f32, f32, Option<f32>, Option<f32>), wgpu::SurfaceStatus> {
         let ui_start = std::time::Instant::now();
         let output = self.surface.get_current_texture();
@@ -1217,7 +1220,8 @@ impl<'a> VulkanEngine<'a> {
         }
 
         // Process egui UI
-        let raw_input = egui_state.take_egui_input(window);
+        let mut raw_input = egui_state.take_egui_input(window);
+        raw_input.events.extend(gamepad_events);
         let mut central_rect = egui::Rect::from_min_max(Default::default(), egui::pos2(self.config.width as f32, self.config.height as f32));
         let mut engine_action = EngineAction::None;
         
@@ -1330,6 +1334,11 @@ impl<'a> VulkanEngine<'a> {
                     });
             }
 
+            file_dialog.update(ctx);
+            if let Some(path) = file_dialog.take_picked() {
+                engine_action = EngineAction::LoadFile(path.display().to_string());
+            }
+
             if !state.file_loaded {
                 central_rect = ctx.content_rect();
                 
@@ -1426,15 +1435,14 @@ impl<'a> VulkanEngine<'a> {
                 return;
             }
 
-            if state.show_hud {
-                egui::Panel::top("top_panel")
+            if state.show_hud && state.video_mode != 3 {
+                let panel_resp = egui::Panel::top("top_panel")
                     .resizable(false)
                     .frame(egui::Frame::NONE.fill(egui::Color32::TRANSPARENT))
                     .exact_size(ctx.content_rect().height() * state.panel_split_ratio)
                     .show_inside(ctx, |ui| {
-                        out_top_panel_rect = Some(ui.max_rect());
                         if state.video_mode == 2 {
-                            out_top_panel_rect = Some(ui.max_rect());
+                            // Do nothing
                         } else {
                             ui.columns(3, |columns| {
                                 // Column 0: Channels
@@ -1674,13 +1682,17 @@ impl<'a> VulkanEngine<'a> {
                     });
                 }
             });
+            out_top_panel_rect = Some(panel_resp.response.rect);
         }
 
-        if state.show_hud {
+        if state.show_hud && state.video_mode != 3 {
             let total_height = ctx.content_rect().height();
             let total_width = ctx.content_rect().width();
+            
+            let drag_y = out_top_panel_rect.map(|r| r.bottom()).unwrap_or(total_height * state.panel_split_ratio);
+            
             egui::Area::new("split_drag_area".into())
-                .fixed_pos(egui::pos2(0.0, total_height * state.panel_split_ratio - 6.0))
+                .fixed_pos(egui::pos2(0.0, drag_y - 6.0))
                 .order(egui::Order::Foreground)
                 .show(ctx, |ui| {
                     let drag_rect = egui::Rect::from_min_size(
@@ -1705,7 +1717,7 @@ impl<'a> VulkanEngine<'a> {
                 let rect = ui.available_rect_before_wrap();
                 central_rect = rect;
                 
-                if state.visualizer_mode == 0 {
+                if state.visualizer_mode == 0 && state.show_hud && state.video_mode != 3 {
                     let painter = ui.painter();
                     let y = rect.bottom() - 20.0;
                     
@@ -1947,7 +1959,7 @@ impl<'a> VulkanEngine<'a> {
                 render_pass.draw(0..3, 0..1);
             }
             
-            if state.show_hud {
+            if state.show_hud && state.video_mode != 3 {
                 render_pass.set_viewport(0.0, 0.0, self.config.width as f32, self.config.height as f32, 0.0, 1.0);
                 render_pass.set_pipeline(&self.hud_pipeline);
                 render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);

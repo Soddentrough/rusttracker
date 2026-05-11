@@ -121,6 +121,8 @@ pub struct AppState {
     pub video_frame_rx: Option<crossbeam_channel::Receiver<VideoFrame>>,
     pub free_video_frame_tx: Option<crossbeam_channel::Sender<VideoFrame>>,
     pub is_file_picker_open: bool,
+    pub open_file_request: bool,
+    pub egui_gamepad_events: Vec<egui::Event>,
     pub force_stereo_downmix: bool,
     pub panel_split_ratio: f32,
 }
@@ -193,6 +195,8 @@ impl AppState {
             free_video_frame_tx: None,
             video_mode: 0,
             is_file_picker_open: false,
+            open_file_request: false,
+            egui_gamepad_events: Vec::new(),
             force_stereo_downmix: is_steam_deck,
             panel_split_ratio: 0.5,
         }

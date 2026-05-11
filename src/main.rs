@@ -193,9 +193,16 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
 
     let mut last_mouse_move = Instant::now();
     let mut is_cursor_visible = true;
+    let mut is_fullscreen = false;
     let mut is_first_frame = true;
 
     let mut gilrs = gilrs::Gilrs::new().unwrap_or_else(|_| gilrs::GilrsBuilder::new().build().unwrap());
+
+    let is_game_mode = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_lowercase() == "gamescope" || 
+                       std::env::var("XDG_SESSION_DESKTOP").unwrap_or_default().to_lowercase() == "gamescope" ||
+                       std::env::var("STEAM_DECK").is_ok();
+
+    let mut file_dialog = egui_file_dialog::FileDialog::new();
 
     #[allow(deprecated)]
     let _ = event_loop.run(move |event, elwt| {
@@ -230,10 +237,11 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                                     state.show_hud = !state.show_hud;
                                 },
                                 WinitKeyCode::KeyF => {
-                                    if window.fullscreen().is_some() {
-                                        window.set_fullscreen(None);
-                                    } else {
+                                    is_fullscreen = !is_fullscreen;
+                                    if is_fullscreen {
                                         window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+                                    } else {
+                                        window.set_fullscreen(None);
                                     }
                                 },
                                 WinitKeyCode::KeyG => {
@@ -246,28 +254,12 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                                 },
                                 WinitKeyCode::KeyO => {
                                     let mut state = app_state.lock().unwrap();
-                                    if !state.is_file_picker_open {
-                                        state.is_file_picker_open = true;
-                                        let app_state_clone = Arc::clone(&app_state);
-                                        std::thread::spawn(move || {
-                                            if let Some(path) = rfd::FileDialog::new()
-                                                .add_filter("Audio/Video Files", &["flac", "wav", "mp3", "ogg", "aac", "m4a", "mp4", "mkv", "avi", "webm", "opus", "mod", "s3m", "xm", "it", "stm", "669", "mtm", "med", "okt", "psm"])
-                                                .add_filter("All Files", &["*"])
-                                                .pick_file() {
-                                                let mut state = app_state_clone.lock().unwrap();
-                                                state.playlist = vec![path.display().to_string()];
-                                                state.playlist_index = 0;
-                                                state.load_request = Some(state.playlist[0].clone());
-                                                state.file_loaded = true;
-                                            }
-                                            app_state_clone.lock().unwrap().is_file_picker_open = false;
-                                        });
-                                    }
+                                    state.open_file_request = true;
                                 },
                                 WinitKeyCode::KeyV => {
                                     let mut state = app_state.lock().unwrap();
                                     if state.video_frame_rx.is_some() {
-                                        state.video_mode = (state.video_mode + 1) % 3;
+                                        state.video_mode = (state.video_mode + 1) % 4;
                                     } else {
                                         state.video_mode = 0;
                                     }
@@ -483,9 +475,16 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                     let mut fire_time = None;
                     let mut fft_time = None;
                     
-                    match engine.render(&window, &egui_ctx, &mut egui_state, &state_copy) {
+                    let gamepad_events = {
+                        let mut state = app_state.lock().unwrap();
+                        let events = state.egui_gamepad_events.clone();
+                        state.egui_gamepad_events.clear();
+                        events
+                    };
+
+                    match engine.render(&window, &egui_ctx, &mut egui_state, &state_copy, &mut file_dialog, gamepad_events) {
                             Ok((res, ui_el, ren_el, fire_el, fft_el)) => {
-                                action = res;
+                                action = res.clone();
                                 ui_time = ui_el;
                                 render_time = ren_el;
                                 fire_time = fire_el;
@@ -518,8 +517,43 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                         for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
                     } else if action == EngineAction::OpenFile {
                         let mut state = app_state.lock().unwrap();
-                        if !state.is_file_picker_open {
+                        state.open_file_request = true;
+                    } else if let EngineAction::LoadFile(path) = action {
+                        let mut state = app_state.lock().unwrap();
+                        state.playlist = vec![path];
+                        state.playlist_index = 0;
+                        state.load_request = Some(state.playlist[0].clone());
+                        state.file_loaded = true;
+                        state.is_file_picker_open = false;
+                    } else if let EngineAction::SetForceStereo(val) = action {
+                        let mut state = app_state.lock().unwrap();
+                        state.force_stereo_downmix = val;
+                    } else if let EngineAction::SetSplitRatio(val) = action {
+                        let mut state = app_state.lock().unwrap();
+                        state.panel_split_ratio = val;
+                    }
+
+                    {
+                        let mut state = app_state.lock().unwrap();
+                        if is_game_mode {
+                            state.is_file_picker_open = *file_dialog.state() != egui_file_dialog::DialogState::Closed;
+                        }
+                    }
+                    
+                    let mut trigger_picker = false;
+                    {
+                        let mut state = app_state.lock().unwrap();
+                        if state.open_file_request && !state.is_file_picker_open {
+                            state.open_file_request = false;
                             state.is_file_picker_open = true;
+                            trigger_picker = true;
+                        }
+                    }
+                    
+                    if trigger_picker {
+                        if is_game_mode {
+                            file_dialog.pick_file();
+                        } else {
                             let app_state_clone = Arc::clone(&app_state);
                             std::thread::spawn(move || {
                                 if let Some(path) = rfd::FileDialog::new()
@@ -535,12 +569,6 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                                 app_state_clone.lock().unwrap().is_file_picker_open = false;
                             });
                         }
-                    } else if let EngineAction::SetForceStereo(val) = action {
-                        let mut state = app_state.lock().unwrap();
-                        state.force_stereo_downmix = val;
-                    } else if let EngineAction::SetSplitRatio(val) = action {
-                        let mut state = app_state.lock().unwrap();
-                        state.panel_split_ratio = val;
                     }
                     
                     // Fallback for Wayland/Mesa broken FIFO vsync:
@@ -572,13 +600,47 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                 }
             },
             Event::AboutToWait => {
-                while let Some(gilrs::Event { id: _, event: g_event, time: _, .. }) = gilrs.next_event() {
+                    let is_dialog_open = *file_dialog.state() != egui_file_dialog::DialogState::Closed;
+                    
+                    while let Some(gilrs::Event { id: _, event: g_event, time: _, .. }) = gilrs.next_event() {
                     match g_event {
                         gilrs::EventType::ButtonPressed(button, _) => {
+                            // System-critical buttons always work regardless of dialog state
                             match button {
                                 gilrs::Button::Select => {
                                     elwt.exit();
+                                    continue;
                                 }
+                                gilrs::Button::Start => {
+                                    is_fullscreen = !is_fullscreen;
+                                    if is_fullscreen {
+                                        window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+                                    } else {
+                                        window.set_fullscreen(None);
+                                    }
+                                    continue;
+                                }
+                                _ => {}
+                            }
+
+                            if is_dialog_open {
+                                let mut state = app_state.lock().unwrap();
+                                let mut push_key = |key: egui::Key| {
+                                    state.egui_gamepad_events.push(egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE });
+                                    state.egui_gamepad_events.push(egui::Event::Key { key, physical_key: None, pressed: false, repeat: false, modifiers: egui::Modifiers::NONE });
+                                };
+                                match button {
+                                    gilrs::Button::DPadUp => { push_key(egui::Key::ArrowUp); continue; }
+                                    gilrs::Button::DPadDown => { push_key(egui::Key::ArrowDown); continue; }
+                                    gilrs::Button::DPadLeft => { push_key(egui::Key::ArrowLeft); continue; }
+                                    gilrs::Button::DPadRight => { push_key(egui::Key::ArrowRight); continue; }
+                                    gilrs::Button::South => { push_key(egui::Key::Enter); continue; }
+                                    gilrs::Button::East => { push_key(egui::Key::Escape); continue; }
+                                    _ => {}
+                                }
+                            }
+                            
+                            match button {
                                 gilrs::Button::LeftTrigger => { // L1 Bumper
                                     let mut state = app_state.lock().unwrap();
                                     state.show_hud = !state.show_hud;
@@ -589,28 +651,12 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                                 }
                                 gilrs::Button::North => { // 'Y' or Triangle
                                     let mut state = app_state.lock().unwrap();
-                                    if !state.is_file_picker_open {
-                                        state.is_file_picker_open = true;
-                                        let app_state_clone = Arc::clone(&app_state);
-                                        std::thread::spawn(move || {
-                                            if let Some(path) = rfd::FileDialog::new()
-                                                .add_filter("Audio/Video Files", &["flac", "wav", "mp3", "ogg", "aac", "m4a", "mp4", "mkv", "avi", "webm", "opus", "mod", "s3m", "xm", "it", "stm", "669", "mtm", "med", "okt", "psm"])
-                                                .add_filter("All Files", &["*"])
-                                                .pick_file() {
-                                                let mut state = app_state_clone.lock().unwrap();
-                                                state.playlist = vec![path.display().to_string()];
-                                                state.playlist_index = 0;
-                                                state.load_request = Some(state.playlist[0].clone());
-                                                state.file_loaded = true;
-                                            }
-                                            app_state_clone.lock().unwrap().is_file_picker_open = false;
-                                        });
-                                    }
+                                    state.open_file_request = true;
                                 }
                                 gilrs::Button::West => { // 'X' or Square
                                     let mut state = app_state.lock().unwrap();
                                     if state.video_frame_rx.is_some() {
-                                        state.video_mode = (state.video_mode + 1) % 3;
+                                        state.video_mode = (state.video_mode + 1) % 4;
                                     } else {
                                         state.video_mode = 0;
                                     }
@@ -647,13 +693,6 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                                     }
                                     state.visualizer_mode = crate::state::VISUALIZERS[state.current_visualizer_idx].id;
                                 }
-                                gilrs::Button::Start => {
-                                    if window.fullscreen().is_some() {
-                                        window.set_fullscreen(None);
-                                    } else {
-                                        window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
-                                    }
-                                }
                                 gilrs::Button::South => {
                                     let mut state = app_state.lock().unwrap();
                                     if state.current_seconds >= state.duration_seconds - 0.1 && state.duration_seconds > 0.0 {
@@ -672,7 +711,7 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                     }
                 }
 
-                if window.fullscreen().is_some() {
+                if is_fullscreen {
                     if is_cursor_visible && last_mouse_move.elapsed().as_secs_f32() > 2.0 {
                         window.set_cursor_visible(false);
                         is_cursor_visible = false;
@@ -796,3 +835,4 @@ where std::io::Error: From<<B as Backend>::Error>
         }
     }
 }
+
