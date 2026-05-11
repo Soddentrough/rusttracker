@@ -1595,29 +1595,53 @@ impl<'a> VulkanEngine<'a> {
                                                 let alpha = (1.0 - distance).max(0.0);
                                                 
                                                 let color = if offset == 0 {
-                                                    egui::Color32::from_rgba_premultiplied(255, 255, 255, 255)
+                                                    egui::Color32::WHITE
                                                 } else {
                                                     egui::Color32::from_rgba_premultiplied(150, 150, 150, (alpha * 100.0) as u8)
                                                 };
                                                 let font_id = egui::FontId::monospace(12.0);
                                                 
-                                                // Draw text centered horizontally
-                                                let rect = painter.text(
+                                                // Optional: highlight background of active row
+                                                if offset == 0 {
+                                                    let rect = painter.text(
+                                                        egui::pos2(hm_rect.center().x, y),
+                                                        egui::Align2::CENTER_CENTER,
+                                                        format!("{:02X}  {}", resolved_row, text),
+                                                        font_id.clone(),
+                                                        egui::Color32::TRANSPARENT,
+                                                    );
+                                                    painter.rect_filled(
+                                                        rect.expand2(egui::vec2(10.0, 5.0)), // Taller highlight background
+                                                        4.0,
+                                                        egui::Color32::from_black_alpha(220)
+                                                    );
+                                                    
+                                                    // Draw text with a sub-pixel vertical offset to simulate a taller/bolder weight
+                                                    // without altering the monospace character width/alignment
+                                                    painter.text(
+                                                        egui::pos2(hm_rect.center().x, y - 0.5),
+                                                        egui::Align2::CENTER_CENTER,
+                                                        format!("{:02X}  {}", resolved_row, text),
+                                                        font_id.clone(),
+                                                        color
+                                                    );
+                                                    painter.text(
+                                                        egui::pos2(hm_rect.center().x, y + 0.5),
+                                                        egui::Align2::CENTER_CENTER,
+                                                        format!("{:02X}  {}", resolved_row, text),
+                                                        font_id.clone(),
+                                                        color
+                                                    );
+                                                }
+
+                                                // Draw text centered horizontally (base text)
+                                                painter.text(
                                                     egui::pos2(hm_rect.center().x, y),
                                                     egui::Align2::CENTER_CENTER,
                                                     format!("{:02X}  {}", resolved_row, text),
                                                     font_id,
                                                     color
                                                 );
-                                                
-                                                // Optional: highlight background of active row
-                                                if offset == 0 {
-                                                    painter.rect_filled(
-                                                        rect.expand2(egui::vec2(10.0, 2.0)),
-                                                        2.0,
-                                                        egui::Color32::from_rgba_unmultiplied(255, 255, 255, 20)
-                                                    );
-                                                }
                                                 
                                                 // Pattern boundary indicator
                                                 if resolved_row == 0 {
@@ -1902,12 +1926,12 @@ impl<'a> VulkanEngine<'a> {
             });
 
             let scale_factor = window.scale_factor() as f32;
-            let vp_x = (central_rect.min.x * scale_factor).clamp(0.0, self.config.width as f32);
-            let vp_y = (central_rect.min.y * scale_factor).clamp(0.0, self.config.height as f32);
+            let vp_x = ((central_rect.min.x * scale_factor).clamp(0.0, self.config.width as f32)).round();
+            let vp_y = ((central_rect.min.y * scale_factor).clamp(0.0, self.config.height as f32)).round();
             let max_w = (self.config.width as f32 - vp_x).max(1.0);
-            let vp_w = (central_rect.width() * scale_factor).clamp(1.0, max_w);
+            let vp_w = ((central_rect.width() * scale_factor).clamp(1.0, max_w)).round();
             let max_h = (self.config.height as f32 - vp_y).max(1.0);
-            let vp_h = (central_rect.height() * scale_factor).clamp(1.0, max_h);
+            let vp_h = ((central_rect.height() * scale_factor).clamp(1.0, max_h)).round();
             
             render_pass.set_viewport(vp_x, vp_y, vp_w, vp_h, 0.0, 1.0);
 
