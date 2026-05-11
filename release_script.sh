@@ -18,16 +18,10 @@ done
 
 if [ "$CONCLUSION" == "success" ]; then
   echo "CI pipeline completed successfully."
-  
-  #echo "Downloading Windows artifact..."
-  #gh run download -n RustTracker-Windows --dir ./windows_release
-  
+   
   echo "Downloading Linux RPM artifact..."
   gh run download -n RustTracker-Linux-RPM --dir ./linux_rpm
   
-  #echo "Downloading Linux DEB artifact..."
-  #gh run download -n RustTracker-Linux-DEB --dir ./linux_deb
-
   echo "Creating GitHub Release..."
   gh release create "$TAG" ./windows_release/*.exe ./linux_rpm/*.rpm ./linux_deb/*.deb ./RustTracker-SteamDeck-GamePad.AppImage --title "RustTracker $TAG" --notes "Release $TAG"
 fi
