@@ -59,6 +59,9 @@ fn glyph_bitmap(ch: u32) -> u32 {
         case 13u { return 31183u; } // S (same as 5)
         case 14u { return 31204u; } // F: ### #.. ### #.. #..
         case 15u { return 31207u; } // E: ### #.. ### #.. ###
+        case 16u { return 29842u; } // T: ### .#. .#. .#. .#.
+        case 17u { return 24429u; } // M: #.# ### #.# #.# #.#
+        case 18u { return 23421u; } // W: #.# #.# #.# ### #.#
         default  { return 0u; }     // space
     }
 }
@@ -201,8 +204,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let heat = base_heat * (1.0 - flame_noise * erosion);
     
     // Smoke density is negative values.
-    // Add a tiny 2% global ambient smoke haze to prevent empty space (0.0) from causing a black gap!
-    let smoke_density = max(-phys_val, 0.0) + 0.02;
+    // Removed ambient haze so the background is clean.
+    let smoke_density = max(-phys_val, 0.0);
     
     // 2. Render Fire & Embers (Emission)
     var emission = blackbody(min(heat, 1.0) * 1.15);
@@ -214,15 +217,32 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // Per-channel spatial FFT reactivity for core tint
     let n_ch = max(1u, audio.num_channels);
-    let channel_idx = min(u32(uv.x * f32(n_ch)), n_ch - 1u);
+    var lfe_idx = 999u;
+    if (n_ch == 6u || n_ch == 8u || n_ch == 16u) && audio.num_spatial_channels == n_ch { lfe_idx = 3u; }
+    
+    var n_spatial_ch = n_ch;
+    if lfe_idx < n_ch { n_spatial_ch = n_ch - 1u; }
+    
+    let hover_spatial_idx = min(u32(uv.x * f32(n_spatial_ch)), n_spatial_ch - 1u);
+    
+    var hover_display_idx = 0u;
+    var spatial_idx = 0u;
+    for (var i = 0u; i < n_ch; i = i + 1u) {
+        if i == lfe_idx { continue; }
+        if spatial_idx == hover_spatial_idx {
+            hover_display_idx = i;
+            break;
+        }
+        spatial_idx = spatial_idx + 1u;
+    }
 
-    var raw_ch = audio.display_order[channel_idx / 4u][channel_idx % 4u];
+    var raw_ch = audio.display_order[hover_display_idx / 4u][hover_display_idx % 4u];
     var fft_ch = raw_ch;
     var vu_scale = 1.0;
     if audio.fft_channels < n_ch {
         fft_ch = raw_ch % max(audio.fft_channels, 1u);
-        let vec_idx = channel_idx / 4u;
-        let elem_idx = channel_idx % 4u;
+        let vec_idx = hover_display_idx / 4u;
+        let elem_idx = hover_display_idx % 4u;
         var val = 0.0;
         if elem_idx == 0u { val = audio.channels[vec_idx].x; }
         else if elem_idx == 1u { val = audio.channels[vec_idx].y; }
@@ -244,8 +264,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     emission += tint;
 
     // 3. Render Smoke (Beer's Law)
-    // Transmission through the physically simulated smoke
-    let absorption_coeff = 4.0; 
+    // Transmission through the physically simulated smoke. Reduced coefficient for lighter smoke.
+    let absorption_coeff = 2.0; 
     let transmittance = exp(-smoke_density * absorption_coeff);
     
     // In-scattering: Ambient light and fire glow scattered by smoke
@@ -273,50 +293,45 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // --- Draw Debug Labels for Channels ---
     if (uv.y > 0.95) {
-        let n_ch = max(1u, audio.num_channels);
-        var lfe_idx = 999u;
-        if n_ch == 6u { lfe_idx = 3u; }
-        else if n_ch == 8u { lfe_idx = 4u; }
-        
-        var n_spatial_ch = n_ch;
-        if lfe_idx < n_ch { n_spatial_ch = n_ch - 1u; }
         let channel_width = 1.0 / f32(max(n_spatial_ch, 1u));
-        
-        let hover_spatial_idx = min(u32(uv.x * f32(n_spatial_ch)), n_spatial_ch - 1u);
         let center_x = (f32(hover_spatial_idx) + 0.5) * channel_width;
         
         let center_xc = center_x * 1.77;
         let uv_c = vec2<f32>(uv.x * 1.77, uv.y);
         
-        var hover_display_idx = 0u;
-        var spatial_idx = 0u;
-        for (var i = 0u; i < n_ch; i = i + 1u) {
-            if i == lfe_idx { continue; }
-            if spatial_idx == hover_spatial_idx {
-                hover_display_idx = i;
-                break;
-            }
-            spatial_idx = spatial_idx + 1u;
-        }
-        
-        let raw_ch = audio.display_order[hover_display_idx / 4u][hover_display_idx % 4u];
-        
-        var lbl = array<u32, 3>(16u, 16u, 16u);
+        var lbl = array<u32, 3>(19u, 19u, 19u);
         var lbl_len = 1u;
-        switch raw_ch {
-            case 0u  { lbl[0]=10u; }                                // L
-            case 1u  { lbl[0]=11u; }                                // R
-            case 2u  { lbl[0]=12u; }                                // C
-            case 3u  { lbl[0]=10u; lbl[1]=14u; lbl[2]=15u; lbl_len=3u; } // LFE
-            case 4u  { lbl[0]=10u; lbl[1]=13u; lbl_len=2u; }       // LS
-            case 5u  { lbl[0]=11u; lbl[1]=13u; lbl_len=2u; }       // RS
-            case 6u  { lbl[0]=10u; lbl[1]=11u; lbl[2]=13u; lbl_len=3u; } // LRS
-            case 7u  { lbl[0]=11u; lbl[1]=11u; lbl[2]=13u; lbl_len=3u; } // RRS
-            case 8u  { lbl[0]=10u; lbl[1]=14u; lbl_len=2u; }       // LF
-            case 9u  { lbl[0]=11u; lbl[1]=14u; lbl_len=2u; }       // RF
-            case 10u { lbl[0]=10u; lbl[1]=11u; lbl_len=2u; }       // LR
-            case 11u { lbl[0]=11u; lbl[1]=11u; lbl_len=2u; }       // RR
-            default  { }
+        
+        if audio.num_spatial_channels < n_ch {
+            let ch_num = raw_ch + 1u;
+            if ch_num < 10u {
+                lbl[0] = ch_num;
+                lbl_len = 1u;
+            } else {
+                lbl[0] = ch_num / 10u;
+                lbl[1] = ch_num % 10u;
+                lbl_len = 2u;
+            }
+        } else {
+            switch raw_ch {
+                case 0u  { lbl[0]=10u; }                                // L
+                case 1u  { lbl[0]=11u; }                                // R
+                case 2u  { lbl[0]=12u; }                                // C
+                case 3u  { lbl[0]=10u; lbl[1]=14u; lbl[2]=15u; lbl_len=3u; } // LFE
+                case 4u  { lbl[0]=10u; lbl[1]=13u; lbl_len=2u; }       // LS
+                case 5u  { lbl[0]=11u; lbl[1]=13u; lbl_len=2u; }       // RS
+                case 6u  { lbl[0]=10u; lbl[1]=11u; lbl[2]=13u; lbl_len=3u; } // LRS
+                case 7u  { lbl[0]=11u; lbl[1]=11u; lbl[2]=13u; lbl_len=3u; } // RRS
+                case 8u  { lbl[0]=10u; lbl[1]=18u; lbl_len=2u; }       // LW (Left Wide)
+                case 9u  { lbl[0]=11u; lbl[1]=18u; lbl_len=2u; }       // RW (Right Wide)
+                case 10u { lbl[0]=10u; lbl[1]=16u; lbl[2]=14u; lbl_len=3u; } // LTF (Left Top Front)
+                case 11u { lbl[0]=11u; lbl[1]=16u; lbl[2]=14u; lbl_len=3u; } // RTF (Right Top Front)
+                case 12u { lbl[0]=10u; lbl[1]=16u; lbl[2]=17u; lbl_len=3u; } // LTM (Left Top Middle)
+                case 13u { lbl[0]=11u; lbl[1]=16u; lbl[2]=17u; lbl_len=3u; } // RTM (Right Top Middle)
+                case 14u { lbl[0]=10u; lbl[1]=16u; lbl[2]=11u; lbl_len=3u; } // LTR (Left Top Rear)
+                case 15u { lbl[0]=11u; lbl[1]=16u; lbl[2]=11u; lbl_len=3u; } // RTR (Right Top Rear)
+                default  { }
+            }
         }
         
         let px_size = 0.003;

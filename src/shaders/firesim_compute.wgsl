@@ -11,7 +11,7 @@ struct FireParams {
     lfe_idx: u32,
     fft_channels: u32,
     _pad1: u32,
-    display_order: array<vec4<u32>, 2>,
+    display_order: array<vec4<u32>, 4>,
     channels: array<vec4<f32>, 8>,
 };
 
@@ -104,7 +104,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         
         var spatial_idx = 0u;
         for (var i = 0u; i < n_ch; i = i + 1u) {
-            if i == lfe_idx { continue; }
+            let raw_ch = params.display_order[i / 4u][i % 4u];
+            if raw_ch == lfe_idx { continue; }
             let center_x = (f32(spatial_idx) + 0.5) * channel_width;
             let dist = f32(x) - center_x;
             let sigma = channel_width * sigma_scale;
@@ -123,7 +124,15 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             }
             ch_bass = (ch_bass / 34.0) / 100.0;
             
-            activity += pow(ch_bass, 1.5) * influence * 2.5;
+            let vec_idx = i / 4u;
+            let comp_idx = i % 4u;
+            var ch_vu = params.channels[vec_idx].x;
+            if comp_idx == 1u { ch_vu = params.channels[vec_idx].y; }
+            else if comp_idx == 2u { ch_vu = params.channels[vec_idx].z; }
+            else if comp_idx == 3u { ch_vu = params.channels[vec_idx].w; }
+            
+            let fuel = max(ch_bass, ch_vu);
+            activity += pow(fuel, 1.5) * influence * 2.5;
             spatial_idx += 1u;
         }
         if lfe_idx < n_ch {
@@ -148,15 +157,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             coal_bed[x] = current + (coal_target - current) * 0.008;
         }
         
-        // The high frequencies drive the random jitter at the solid fuel layer!
-        let hf_bin = 400u + (x % 300u);
-        var hf_noise = 0.0;
-        for (var i = 0u; i < n_ch; i = i + 1u) {
-            hf_noise += length(multi_spectrum[i * 1024u + hf_bin]);
-        }
-        hf_noise = clamp(hf_noise * 60.0, 0.0, 1.0);
-        
-        output_grid[idx] = min(coal_bed[x] * (0.6 + 0.4 * hf_noise), 1.0);
+        output_grid[idx] = min(coal_bed[x], 1.0);
         return;
     }
 
@@ -164,14 +165,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     if (y >= bottom - 2u) {
         let coal_heat = min(coal_bed[x], 1.0);
         
-        // High frequencies directly tear the flames at the source
-        let hf_bin = 500u + (x % 400u);
-        var hf_noise = 0.0;
-        for (var i = 0u; i < params.num_channels; i = i + 1u) {
-            hf_noise += length(multi_spectrum[i * 1024u + hf_bin]);
-        }
-        hf_noise = clamp(hf_noise * 80.0, 0.0, 1.0);
-        var out_val = coal_heat * (0.5 + 0.5 * hf_noise);
+        var out_val = coal_heat;
         
         // Embers are directly spawned by extreme high-frequency transients (snares, hi-hats)
         let spark_bin = 800u + (x % 200u);
@@ -183,6 +177,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         if (coal_heat > 0.4 && spark_noise * 150.0 > 1.0) {
             out_val = 6.0; // Crisp ember packet
         }
+        
+        // NaN/Infinity sanitizer for hot-reload buffer corruption
+        if (!(out_val >= -10.0 && out_val <= 10.0)) { out_val = 0.0; }
         
         output_grid[idx] = out_val;
         return;
@@ -222,15 +219,18 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     // and reduce vertical turbulence so it doesn't fight the upward buoyancy!
     let controlled_turb = turbulence * vec2<f32>(0.6, 0.2);
     let vel = clamp(buoyancy_vel + controlled_turb, vec2<f32>(-3.0, -10.0), vec2<f32>(3.0, 2.0));
+    // Add vertical micro-jitter to shatter Eulerian advection banding (Moiré patterns)
+    let jitter_seed = u32(x + y * params.width) + bitcast<u32>(params.time * 100.0);
+    let jitter = (f32(pcg_hash(jitter_seed) % 100u) / 100.0) - 0.5; // -0.5 to 0.5
+    
     let dt = 1.0;
-    let src_p = p1 - vel * dt;
+    let src_p = p1 - vel * dt + vec2<f32>(0.0, jitter * 2.0);
     
     var new_val = sample_grid(src_p.x, src_p.y);
     
     if (new_val > 0.0) {
-        // Fire cooling
-        let cool_noise = perlin_noise(p1 * 0.05 - vec2<f32>(0.0, params.time * 3.0));
-        let base_cooling = 0.008 + (cool_noise + 1.0) * 0.006;
+        // Fire cooling (Constant to prevent spatial standing-wave interference)
+        let base_cooling = 0.02; 
         
         var cooling_rate = base_cooling * params.cooling_factor;
         // Embers (val > 1.0) cool logarithmically so they survive the journey upwards
@@ -238,16 +238,20 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         
         new_val -= cooling_rate;
         
-        // COMBUSTION: When fire runs out of heat (crosses 0), the burnt fuel chemically turns into smoke!
+        // COMBUSTION: When fire runs out of heat (crosses 0), it becomes smoke.
         if (new_val <= 0.0) {
-            // Multiply the remainder to represent expansive smoke generation
-            new_val = new_val * 150.0; 
-            new_val = clamp(new_val, -3.0, 0.0);
+            // A gentle puff of smoke when the flame dies (prevents screen-wide smoke explosion)
+            new_val = -0.15; 
         }
     } else if (new_val < 0.0) {
         // Smoke dissipating slowly as it mixes with cold air
-        new_val += 0.001; 
+        new_val += 0.005; 
         if (new_val > 0.0) { new_val = 0.0; }
+    }
+    
+    // NaN/Infinity sanitizer to cure permanent buffer infections!
+    if (!(new_val >= -10.0 && new_val <= 10.0)) {
+        new_val = 0.0;
     }
     
     output_grid[idx] = new_val;

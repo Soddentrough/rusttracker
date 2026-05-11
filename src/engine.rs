@@ -54,7 +54,7 @@ pub struct FireParams {
     pub lfe_idx: u32,
     pub fft_channels: u32,
     pub _pad1: u32,
-    pub display_order: [u32; 8],
+    pub display_order: [u32; 16],
     pub channels: [[f32; 4]; 8],
 }
 
@@ -936,6 +936,9 @@ impl<'a> VulkanEngine<'a> {
             } else if ch_len == 8 {
                 // SMPTE 7.1: ch4=Ls(side), ch5=Rs(side), ch6=Lrs(rear), ch7=Rrs(rear)
                 display_order = vec![6, 4, 0, 2, 3, 1, 5, 7]; // Lrs, Ls, L, C, LFE, R, Rs, Rrs
+            } else if ch_len == 16 {
+                // 16 channels: fan out symmetrically from C with LFE (3) positioned physically but skipped by shaders
+                display_order = vec![14, 12, 10, 8, 6, 4, 0, 2, 3, 1, 5, 7, 9, 11, 13, 15];
             }
         }
 
@@ -993,7 +996,7 @@ impl<'a> VulkanEngine<'a> {
             let highs = (highs_sum / 512.0 / 100.0).min(1.0);
             
             let n_ch = state.channel_vus.len().max(1).min(32);
-            let lfe_idx = if n_ch == 6 { 3 } else if n_ch == 8 { 4 } else { 999 };
+            let lfe_idx = if (n_ch == 6 || n_ch == 8 || n_ch == 16) && state.tracker_channels.is_none() { 3 } else { 999 };
             
             let mut fire_params = FireParams {
                 bass,
@@ -1008,12 +1011,14 @@ impl<'a> VulkanEngine<'a> {
                 lfe_idx: lfe_idx as u32,
                 fft_channels: state.raw_audio_channels.len() as u32,
                 _pad1: 0,
-                display_order: [0; 8],
+                display_order: [0; 16],
                 channels: [[0.0; 4]; 8],
             };
             
+            for i in 0..16 {
+                fire_params.display_order[i] = uniforms.display_order[i];
+            }
             for i in 0..n_ch {
-                if i < 8 { fire_params.display_order[i] = uniforms.display_order[i]; }
                 fire_params.channels[i / 4][i % 4] = uniforms.channels[i];
             }
             

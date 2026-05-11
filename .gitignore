@@ -36,3 +36,4 @@ gdb_output.txt
 # Scratch / Temp files
 scratch.*
 test_*
+screenshot.png

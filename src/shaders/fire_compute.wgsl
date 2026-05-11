@@ -11,7 +11,7 @@ struct FireParams {
     lfe_idx: u32,
     fft_channels: u32,
     _pad1: u32,
-    display_order: array<vec4<u32>, 2>,
+    display_order: array<vec4<u32>, 4>,
     channels: array<vec4<f32>, 8>,
 };
 
@@ -75,7 +75,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         
         var spatial_idx = 0u;
         for (var i = 0u; i < n_ch; i = i + 1u) {
-            if i == lfe_idx { continue; }
+            let raw_ch = params.display_order[i / 4u][i % 4u];
+            if raw_ch == lfe_idx { continue; }
             let center_x = (f32(spatial_idx) + 0.5) * channel_width;
             let dist = f32(x) - center_x;
             let sigma = channel_width * sigma_scale;
@@ -94,15 +95,23 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         if lfe_idx < n_ch {
             let lfe_dist = f32(x) - 512.0;
             let lfe_influence = exp(-(lfe_dist * lfe_dist) / (2.0 * 90.0 * 90.0));
-            
-            let vec_idx = lfe_idx / 4u;
-            let comp_idx = lfe_idx % 4u;
-            var lfe_val = params.channels[vec_idx].x;
-            if comp_idx == 1u { lfe_val = params.channels[vec_idx].y; }
-            else if comp_idx == 2u { lfe_val = params.channels[vec_idx].z; }
-            else if comp_idx == 3u { lfe_val = params.channels[vec_idx].w; }
-            
-            activity += lfe_val * lfe_influence * 0.6;
+            var lfe_disp_idx = 999u;
+            for (var i = 0u; i < n_ch; i = i + 1u) {
+                if params.display_order[i / 4u][i % 4u] == lfe_idx {
+                    lfe_disp_idx = i;
+                    break;
+                }
+            }
+            if lfe_disp_idx < n_ch {
+                let vec_idx = lfe_disp_idx / 4u;
+                let comp_idx = lfe_disp_idx % 4u;
+                var lfe_val = params.channels[vec_idx].x;
+                if comp_idx == 1u { lfe_val = params.channels[vec_idx].y; }
+                else if comp_idx == 2u { lfe_val = params.channels[vec_idx].z; }
+                else if comp_idx == 3u { lfe_val = params.channels[vec_idx].w; }
+                
+                activity += lfe_val * lfe_influence * 0.6;
+            }
         }
 
         let coal_target = min(params.bass * 0.25 + activity * 2.5, 1.0);
