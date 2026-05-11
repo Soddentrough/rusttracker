@@ -373,7 +373,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                     var min_d: array<f32, 5>;
                     for (var f = 0u; f < g_num_frames; f++) { min_d[f] = 100.0; }
 
-                    for(var j=0; j<25; j++) {
+                    for(var j=0; j<15; j++) {
                         let rp = p_hit + r_rd_b * rt;
                         var d_min_all = 100.0;
 

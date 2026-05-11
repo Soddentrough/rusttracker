@@ -6,7 +6,7 @@
 // --- Tuning Constants ---
 const PUDDLE_RADIUS: f32 = 4.0;
 const STEP_SCALE: f32 = 0.45;       // Lipschitz correction for pow-8 lobes + smax(k=0.3)
-const MAX_MARCH_STEPS: i32 = 180;   // Safe ceiling with corrected step scale
+const MAX_MARCH_STEPS: i32 = 120;   // Safe ceiling with corrected step scale
 const HIT_THRESHOLD: f32 = 0.005;
 const NORMAL_EPS: f32 = 0.015;      // Increased epsilon for smoother, anti-aliased normals
 const HDR_WHITE: f32 = 5.0;         // Blown-out white that tonemaps to ~1.0
@@ -123,6 +123,8 @@ fn map_dist(p: vec3<f32>) -> f32 {
             alignment = max(0.0, dot(p_xz_norm, dir2d));
             spike_pos_r = 1.5;
         }
+        
+        if (alignment < 0.5 && i != 3u) { continue; }
 
         let dist_to_spike = abs(dist_xz - spike_pos_r);
         let spatial_falloff = exp(-dist_to_spike * 3.0);
@@ -182,6 +184,8 @@ fn map(p: vec3<f32>) -> MapData {
             alignment = max(0.0, dot(p_xz_norm, dir2d));
             spike_pos_r = 1.5;
         }
+        
+        if (alignment < 0.5 && i != 3u) { continue; }
 
         let dist_to_spike = abs(dist_xz - spike_pos_r);
         let spatial_falloff = exp(-dist_to_spike * 3.0);
@@ -214,13 +218,16 @@ fn map(p: vec3<f32>) -> MapData {
     return MapData(d * STEP_SCALE, 1, glow);
 }
 
+// 4-sample tetrahedron normal
 fn calcNormal(p: vec3<f32>) -> vec3<f32> {
-    let e = vec2<f32>(NORMAL_EPS, 0.0);
-    return normalize(vec3<f32>(
-        map_dist(p + e.xyy) - map_dist(p - e.xyy),
-        map_dist(p + e.yxy) - map_dist(p - e.yxy),
-        map_dist(p + e.yyx) - map_dist(p - e.yyx)
-    ));
+    let h = NORMAL_EPS;
+    let k = vec2<f32>(1.0, -1.0);
+    return normalize(
+        k.xyy * map_dist(p + k.xyy * h) + 
+        k.yyx * map_dist(p + k.yyx * h) + 
+        k.yxy * map_dist(p + k.yxy * h) + 
+        k.xxx * map_dist(p + k.xxx * h)
+    );
 }
 
 @fragment
