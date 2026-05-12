@@ -157,7 +157,7 @@ impl<'a> VulkanEngine<'a> {
 
         // The instance is a handle to our GPU
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::VULKAN, // Request Vulkan explicitly!
+            backends: wgpu::Backends::PRIMARY, // Use platform native: Vulkan (Linux/Win) or Metal (MacOS)
             flags: wgpu::InstanceFlags::default(),
             backend_options: wgpu::BackendOptions::default(),
             display: None,
