@@ -5,20 +5,45 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+        
       - name: Install dependencies
-        run: brew install ffmpeg libopenmpt
-      - name: Build
+        run: brew install ffmpeg libopenmpt dylibbundler create-dmg
+        
+      - name: Build executable
         env:
           LIBRARY_PATH: /opt/homebrew/lib
           CPATH: /opt/homebrew/include
           PKG_CONFIG_PATH: /opt/homebrew/lib/pkgconfig:/opt/homebrew/share/pkgconfig
           BINDGEN_EXTRA_CLANG_ARGS: "-I/opt/homebrew/include"
+        run: cargo build --release
+        
+      - name: Package Application
         run: |
-          cargo build --release
+          VERSION=$(grep -m1 '^version =' Cargo.toml | cut -d '"' -f2)
+          
           mkdir -p RustTracker.app/Contents/MacOS
-          # Add Info.plist
+          mkdir -p RustTracker.app/Contents/Resources
+          mkdir -p RustTracker.app/Contents/Frameworks
+          
+          # Create ICNS icon
+          mkdir -p RustTracker.iconset
+          sips -z 16 16     icon.png --out RustTracker.iconset/icon_16x16.png
+          sips -z 32 32     icon.png --out RustTracker.iconset/icon_16x16@2x.png
+          sips -z 32 32     icon.png --out RustTracker.iconset/icon_32x32.png
+          sips -z 64 64     icon.png --out RustTracker.iconset/icon_32x32@2x.png
+          sips -z 128 128   icon.png --out RustTracker.iconset/icon_128x128.png
+          sips -z 256 256   icon.png --out RustTracker.iconset/icon_128x128@2x.png
+          sips -z 256 256   icon.png --out RustTracker.iconset/icon_256x256.png
+          sips -z 512 512   icon.png --out RustTracker.iconset/icon_256x256@2x.png
+          sips -z 512 512   icon.png --out RustTracker.iconset/icon_512x512.png
+          sips -z 1024 1024 icon.png --out RustTracker.iconset/icon_512x512@2x.png
+          iconutil -c icns RustTracker.iconset -o RustTracker.app/Contents/Resources/AppIcon.icns
+          rm -rf RustTracker.iconset
+          
+          # Generate Info.plist
           cat <<EOF > RustTracker.app/Contents/Info.plist
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -30,13 +55,26 @@ jobs:
               <string>com.soddentrough.rusttracker</string>
               <key>CFBundleName</key>
               <string>RustTracker</string>
+              <key>CFBundleIconFile</key>
+              <string>AppIcon</string>
+              <key>CFBundleShortVersionString</key>
+              <string>${VERSION}</string>
+              <key>CFBundleVersion</key>
+              <string>${VERSION}</string>
               <key>CFBundlePackageType</key>
               <string>APPL</string>
+              <key>LSMinimumSystemVersion</key>
+              <string>10.15</string>
           </dict>
           </plist>
           EOF
+          
+          # Copy binary and bundle libraries
           cp target/release/rusttracker RustTracker.app/Contents/MacOS/
-          brew install create-dmg
+          dylibbundler -od -b -x RustTracker.app/Contents/MacOS/rusttracker -d RustTracker.app/Contents/Frameworks/ -p @executable_path/../Frameworks/
+          
+      - name: Create DMG
+        run: |
           create-dmg \
             --volname "RustTracker Installer" \
             --window-pos 200 120 \
@@ -46,6 +84,7 @@ jobs:
             --app-drop-link 400 190 \
             "RustTracker-MacOS-Installer.dmg" \
             "RustTracker.app"
+            
       - name: Upload Artifact
         uses: actions/upload-artifact@v5
         with:
