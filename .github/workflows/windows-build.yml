@@ -38,11 +38,11 @@ jobs:
         cargo build --release
         
     - name: Package Release
-      run: |
-        mkdir release
-        cp target/release/rusttracker.exe release/
-        # Automatically resolve and copy all required MSYS2 DLLs (including FFmpeg transitive dependencies)
-        ldd target/release/rusttracker.exe | grep -i '/mingw64' | awk '{print $3}' | xargs -I '{}' cp '{}' release/
+        run: |
+          mkdir release
+          cp target/release/rusttracker.exe release/RustTracker-Windows.exe
+          # Automatically resolve and copy all required MSYS2 DLLs (including FFmpeg transitive dependencies)
+          ldd target/release/rusttracker.exe | grep -i '/mingw64' | awk '{print $3}' | xargs -I '{}' cp '{}' release/
         
     - name: Get Version
       run: |

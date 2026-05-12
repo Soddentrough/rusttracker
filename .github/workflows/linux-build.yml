@@ -82,3 +82,12 @@ jobs:
       with:
         name: RustTracker-Linux-DEB
         path: target/debian/*.deb
+
+    - name: Rename SteamDeck AppImage
+      run: mv target/release/rusttracker-SteamDeck-GamePad.AppImage target/release/RustTracker-SteamDeck.AppImage
+
+    - name: Upload SteamDeck Artifact
+      uses: actions/upload-artifact@v5
+      with:
+        name: RustTracker-SteamDeck
+        path: target/release/RustTracker-SteamDeck.AppImage
