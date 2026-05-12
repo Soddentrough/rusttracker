@@ -13,4 +13,6 @@ jobs:
         env:
           LIBRARY_PATH: /opt/homebrew/lib
           CPATH: /opt/homebrew/include
+          PKG_CONFIG_PATH: /opt/homebrew/lib/pkgconfig:/opt/homebrew/share/pkgconfig
+          BINDGEN_EXTRA_CLANG_ARGS: "-I/opt/homebrew/include"
         run: cargo build --release
