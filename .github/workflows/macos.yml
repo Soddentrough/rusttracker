@@ -15,9 +15,22 @@ jobs:
           CPATH: /opt/homebrew/include
           PKG_CONFIG_PATH: /opt/homebrew/lib/pkgconfig:/opt/homebrew/share/pkgconfig
           BINDGEN_EXTRA_CLANG_ARGS: "-I/opt/homebrew/include"
-        run: cargo build --release
+        run: |
+          cargo build --release
+          mkdir -p RustTracker.app/Contents/MacOS
+          cp target/release/rusttracker RustTracker.app/Contents/MacOS/
+          brew install create-dmg
+          create-dmg \
+            --volname "RustTracker Installer" \
+            --window-pos 200 120 \
+            --window-size 600 400 \
+            --icon-size 100 \
+            --icon "RustTracker.app" 200 190 \
+            --app-drop-link 400 190 \
+            "RustTracker-Installer.dmg" \
+            "RustTracker.app"
       - name: Upload Artifact
         uses: actions/upload-artifact@v5
         with:
           name: RustTracker-MacOS
-          path: target/release/rusttracker
+          path: RustTracker-Installer.dmg
