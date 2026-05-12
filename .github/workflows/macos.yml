@@ -8,6 +8,9 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Install dependencies
-        run: brew install ffmpeg
+        run: brew install ffmpeg libopenmpt
       - name: Build
+        env:
+          LIBRARY_PATH: /opt/homebrew/lib
+          CPATH: /opt/homebrew/include
         run: cargo build --release
