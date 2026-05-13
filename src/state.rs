@@ -1,5 +1,13 @@
 use std::collections::VecDeque;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GamepadType {
+    Xbox,
+    PlayStation,
+    Nintendo,
+    SteamDeck,
+}
+
 #[derive(Clone, Default, Debug)]
 pub struct PerformanceStats {
     pub decode_us: f32,
@@ -111,6 +119,7 @@ pub struct AppState {
     pub file_loaded: bool,
     pub video_info: Option<String>,
     pub show_stats: bool,
+    pub show_help: bool,
     pub stats: PerformanceStats,
     pub current_fps: f32,
     pub playlist: Vec<String>,
@@ -124,7 +133,10 @@ pub struct AppState {
     pub open_file_request: bool,
     pub egui_gamepad_events: Vec<egui::Event>,
     pub force_stereo_downmix: bool,
+    pub append_to_playlist: bool,
     pub panel_split_ratio: f32,
+    pub gamepad_type: GamepadType,
+    pub has_gamepad: bool,
 }
 
 impl AppState {
@@ -184,6 +196,7 @@ impl AppState {
 
             video_info: None,
             show_stats: false,
+            show_help: false,
             stats: PerformanceStats::default(),
             current_fps: 0.0,
             playlist: Vec::new(),
@@ -198,7 +211,10 @@ impl AppState {
             open_file_request: false,
             egui_gamepad_events: Vec::new(),
             force_stereo_downmix: is_steam_deck,
+            append_to_playlist: false,
             panel_split_ratio: 0.5,
+            gamepad_type: if is_steam_deck { GamepadType::SteamDeck } else { GamepadType::Xbox },
+            has_gamepad: is_steam_deck,
         }
     }
 }

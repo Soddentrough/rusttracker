@@ -2,14 +2,55 @@ use std::sync::Arc;
 use winit::window::Window;
 use crate::state::AppState;
 
+fn gamepad_icon(g_type: crate::state::GamepadType, action: &str) -> String {
+    match action {
+        "A" => match g_type {
+            crate::state::GamepadType::PlayStation => "\u{e997}",
+            crate::state::GamepadType::Nintendo => "\u{e974}",
+            _ => "\u{e994}",
+        },
+        "B" => match g_type {
+            crate::state::GamepadType::PlayStation => "\u{e999}",
+            crate::state::GamepadType::Nintendo => "\u{e994}",
+            _ => "\u{e974}",
+        },
+        "X" => match g_type {
+            crate::state::GamepadType::PlayStation => "\u{e998}",
+            crate::state::GamepadType::Nintendo => "\u{e996}",
+            _ => "\u{e995}",
+        },
+        "Y" => match g_type {
+            crate::state::GamepadType::PlayStation => "\u{e99a}",
+            crate::state::GamepadType::Nintendo => "\u{e995}",
+            _ => "\u{e996}",
+        },
+        "L1" => match g_type {
+            crate::state::GamepadType::PlayStation => "\u{e99d}",
+            crate::state::GamepadType::Nintendo => "\u{e99c}",
+            _ => "\u{e99f}",
+        },
+        "R1" => match g_type {
+            crate::state::GamepadType::PlayStation => "\u{e9a4}",
+            crate::state::GamepadType::Nintendo => "\u{e9a5}",
+            _ => "\u{e9a2}",
+        },
+        "Select" => "\u{e9a9}",
+        "Start" => "\u{e9a8}",
+        "D-Pad L/R" => "\u{e9af} \u{e9ad}",
+        "D-Pad U/D" => "\u{e9ac} \u{e9ae}",
+        _ => action,
+    }.to_string()
+}
+
 #[derive(Clone, PartialEq)]
 pub enum EngineAction {
     None,
     OpenFile,
-    LoadFile(String),
+    LoadFiles(Vec<String>, bool),
     Seek(f32),
     SetForceStereo(bool),
     SetSplitRatio(f32),
+    SetAppendToPlaylist(bool),
 }
 
 #[repr(C)]
@@ -1334,22 +1375,124 @@ impl<'a> VulkanEngine<'a> {
                     });
             }
 
-            file_dialog.update(ctx);
-            if let Some(path) = file_dialog.take_picked() {
-                engine_action = EngineAction::LoadFile(path.display().to_string());
+            if state.show_help {
+                egui::Window::new("Help")
+                    .anchor(egui::Align2::LEFT_TOP, [10.0, 10.0])
+                    .title_bar(false)
+                    .resizable(false)
+                    .collapsible(false)
+                    .frame(egui::Frame::window(&ctx.global_style()).fill(egui::Color32::from_black_alpha(200)))
+                    .show(ctx, |ui| {
+                        ui.label(egui::RichText::new("Shortcuts").color(egui::Color32::WHITE).strong().size(16.0));
+                        ui.separator();
+                        egui::Grid::new("help_shortcuts_grid")
+                            .num_columns(2)
+                            .spacing([20.0, 6.0])
+                            .show(ui, |ui| {
+                                let shortcut = |ui: &mut egui::Ui, key: &str, gp: Option<&str>, desc: &str| {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 2.0;
+                                        ui.label(egui::RichText::new(key).color(egui::Color32::WHITE).strong());
+                                        if let Some(gp_act) = gp {
+                                            ui.label(egui::RichText::new(" / ").color(egui::Color32::DARK_GRAY));
+                                            ui.label(egui::RichText::new(gamepad_icon(state.gamepad_type, gp_act))
+                                                .color(egui::Color32::LIGHT_BLUE)
+                                                .size(16.0)
+                                            );
+                                        }
+                                    });
+                                    ui.label(egui::RichText::new(desc).color(egui::Color32::GRAY));
+                                    ui.end_row();
+                                };
+                                shortcut(ui, "o", Some("Y"), "Open File");
+                                shortcut(ui, "space", Some("A"), "Play / Pause");
+                                shortcut(ui, "v", Some("X"), "Toggle Video");
+                                shortcut(ui, "left/right", Some("D-Pad L/R"), "Seek Timeline");
+                                shortcut(ui, "tab", Some("L1"), "Toggle HUD");
+                                shortcut(ui, "up/down", Some("D-Pad U/D"), "Change Visualizer");
+                                shortcut(ui, "s", Some("B"), "Toggle Stats");
+                                shortcut(ui, "h", None, "Toggle Help");
+                                shortcut(ui, "q / esc", Some("Select"), "Quit");
+                                shortcut(ui, "f", Some("Start"), "Toggle Fullscreen");
+                                shortcut(ui, "g", Some("R1"), "Toggle GPU FFT");
+                                shortcut(ui, "[ / ]", None, "Scale Panels");
+                            });
+                    });
+            }
+
+            let mut append = state.append_to_playlist;
+            file_dialog.update_with_right_panel_ui(ctx, &mut |ui, _fd| {
+                ui.add_space(10.0);
+                ui.heading("Options");
+                ui.separator();
+                ui.checkbox(&mut append, "Add to Playlist instead of replacing");
+            });
+            if append != state.append_to_playlist {
+                engine_action = EngineAction::SetAppendToPlaylist(append);
+            }
+
+            if let Some(paths) = file_dialog.take_picked_multiple() {
+                let strings = paths.into_iter().map(|p| p.display().to_string()).collect();
+                engine_action = EngineAction::LoadFiles(strings, append);
+            } else if let Some(path) = file_dialog.take_picked() {
+                engine_action = EngineAction::LoadFiles(vec![path.display().to_string()], append);
             }
 
             if !state.file_loaded {
                 central_rect = ctx.content_rect();
+                let time = self.start_time.elapsed().as_secs_f32();
+                
+                // --- Background Retro Grid (Demoscene Vibe) ---
+                let bg_painter = ctx.layer_painter(egui::LayerId::background());
+                let rect = ctx.content_rect();
+                let horizon_y = rect.top() + rect.height() * 0.20;
+                let center_x = rect.center().x;
+                
+                // Color cycle the grid slightly
+                let grid_hue = (time * 0.02).fract();
+                let grid_color: egui::Color32 = egui::ecolor::Hsva::new(grid_hue, 0.8, 1.0, 0.4).into();
+                
+                // Draw horizon line
+                bg_painter.line_segment(
+                    [egui::pos2(rect.left(), horizon_y), egui::pos2(rect.right(), horizon_y)],
+                    egui::Stroke::new(2.0, grid_color)
+                );
+                
+                // Vertical radiating lines
+                let num_v_lines = 40;
+                for i in 0..=num_v_lines {
+                    let t = i as f32 / num_v_lines as f32;
+                    let bottom_x = rect.left() + (t - 0.5) * rect.width() * 8.0;
+                    bg_painter.line_segment(
+                        [egui::pos2(center_x, horizon_y), egui::pos2(bottom_x, rect.bottom())],
+                        egui::Stroke::new(1.0, grid_color)
+                    );
+                }
+                
+                // Horizontal scrolling perspective lines
+                let num_h_lines = 30;
+                for i in 0..num_h_lines {
+                    let offset = (i as f32 - (time * 1.5).fract()) / num_h_lines as f32;
+                    if offset <= 0.0 { continue; }
+                    let y = horizon_y + (rect.bottom() - horizon_y) * offset.powf(3.0);
+                    let thickness = 1.0 + offset * 3.0;
+                    let fade = (offset * 3.0).min(1.0); // Fade in near horizon
+                    let line_color: egui::Color32 = egui::ecolor::Hsva::new(grid_hue, 0.8, 1.0, 0.4 * fade).into();
+                    
+                    bg_painter.line_segment(
+                        [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                        egui::Stroke::new(thickness, line_color)
+                    );
+                }
+                // --- End Retro Grid ---
                 
                 let frame = egui::Frame::NONE
-                    .fill(egui::Color32::from_rgba_unmultiplied(10, 10, 15, 200)) // dark tint to pop text over the visualizer
+                    .fill(egui::Color32::from_rgba_unmultiplied(10, 10, 15, 180)) // Translucent to show grid
                     .inner_margin(40.0);
                     
                 egui::CentralPanel::default().frame(frame).show_inside(ctx, |ui| {
                     let avail_height = ui.available_height();
-                    let content_height = 380.0;
-                    let space = (avail_height - content_height) / 2.0;
+                    let space = avail_height * 0.10;
                     if space > 0.0 {
                         ui.add_space(space);
                     }
@@ -1358,14 +1501,87 @@ impl<'a> VulkanEngine<'a> {
                         ui.available_size(),
                         egui::Layout::top_down(egui::Align::Center),
                         |ui| {
-                            ui.label(
-                                egui::RichText::new("RustTracker")
-                                    .size(72.0)
-                                    .color(egui::Color32::from_rgb(100, 200, 255))
-                                    .strong()
-                            );
+                            // --- Glowing Animated Title ---
+                            let (title_rect, _) = ui.allocate_exact_size(egui::vec2(1000.0, 160.0), egui::Sense::hover());
+                            let painter = ui.painter();
+                            let text = "RustTracker";
+                            
+                            let font_id = egui::FontId::new(140.0, egui::FontFamily::Name("Orbitron".into()));
+                            
+                            // 1. Silver Outer Bevel (3px offset)
+                            let silver_color = egui::Color32::from_rgb(200, 220, 255);
+                            for dx in [-3.0, 0.0, 3.0] {
+                                for dy in [-3.0, 0.0, 3.0] {
+                                    if dx == 0.0 && dy == 0.0 { continue; }
+                                    painter.text(
+                                        title_rect.center() + egui::vec2(dx, dy),
+                                        egui::Align2::CENTER_CENTER,
+                                        text,
+                                        font_id.clone(),
+                                        silver_color,
+                                    );
+                                }
+                            }
+                            
+                            // 2. Black Inner Outline (1px offset)
+                            for dx in [-1.0, 0.0, 1.0] {
+                                for dy in [-1.0, 0.0, 1.0] {
+                                    if dx == 0.0 && dy == 0.0 { continue; }
+                                    painter.text(
+                                        title_rect.center() + egui::vec2(dx, dy),
+                                        egui::Align2::CENTER_CENTER,
+                                        text,
+                                        font_id.clone(),
+                                        egui::Color32::BLACK,
+                                    );
+                                }
+                            }
+                            
+                            // 3. Sliced Chrome Gradient Interior
+                            let steps = 40;
+                            let top_y = title_rect.center().y - 65.0;
+                            let bottom_y = title_rect.center().y + 65.0;
+                            let height = bottom_y - top_y;
+                            
+                            for i in 0..steps {
+                                let t = i as f32 / steps as f32;
+                                let next_t = (i + 1) as f32 / steps as f32;
+                                let min_y = top_y + t * height;
+                                let max_y = top_y + next_t * height;
+                                
+                                let clip_rect = egui::Rect::from_min_max(
+                                    egui::pos2(title_rect.left(), min_y),
+                                    egui::pos2(title_rect.right(), max_y),
+                                );
+                                
+                                let color = if t < 0.48 {
+                                    // Sky: Cyan to Dark Blue
+                                    let sky_t = t / 0.48;
+                                    let r = (0.0 * (1.0 - sky_t) + 10.0 * sky_t) as u8;
+                                    let g = (220.0 * (1.0 - sky_t) + 30.0 * sky_t) as u8;
+                                    let b = (255.0 * (1.0 - sky_t) + 120.0 * sky_t) as u8;
+                                    egui::Color32::from_rgb(r, g, b)
+                                } else if t < 0.52 {
+                                    // Chrome Horizon Reflection
+                                    egui::Color32::WHITE
+                                } else {
+                                    // Ground Reflection: Dark Brown to Orange/Tan
+                                    let ground_t = (t - 0.52) / 0.48;
+                                    let r = (50.0 * (1.0 - ground_t) + 255.0 * ground_t) as u8;
+                                    let g = (15.0 * (1.0 - ground_t) + 160.0 * ground_t) as u8;
+                                    let b = (0.0 * (1.0 - ground_t) + 50.0 * ground_t) as u8;
+                                    egui::Color32::from_rgb(r, g, b)
+                                };
+
+                                painter.with_clip_rect(clip_rect).text(
+                                    title_rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    text,
+                                    font_id.clone(),
+                                    color,
+                                );
+                            }
                             ui.add_space(10.0);
-                            ui.label(egui::RichText::new("A High-Performance Vulkan Module Visualizer").size(18.0).color(egui::Color32::GRAY));
                             
                             ui.add_space(40.0);
                             
@@ -1386,49 +1602,101 @@ impl<'a> VulkanEngine<'a> {
                             if ui.checkbox(&mut force_stereo, "Force Stereo Downmix (Fixes crackling on some devices)").changed() {
                                 engine_action = EngineAction::SetForceStereo(force_stereo);
                             }
+
                             
-                            ui.add_space(40.0);
-                            ui.label(egui::RichText::new("Keyboard & Gamepad Shortcuts").color(egui::Color32::LIGHT_GRAY).strong().size(18.0));
-                            ui.add_space(15.0);
+                            let is_game_mode = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_lowercase() == "gamescope" || 
+                                               std::env::var("XDG_SESSION_DESKTOP").unwrap_or_default().to_lowercase() == "gamescope" ||
+                                               std::env::var("STEAM_DECK").is_ok();
+                                               
+                            let show_kb = !is_game_mode;
+                            let show_gp = state.has_gamepad;
                             
-                            egui::Grid::new("shortcuts_grid")
-                                .num_columns(4)
-                                .spacing([30.0, 8.0])
-                                .show(ui, |ui| {
-                                    ui.label(egui::RichText::new("o / (Y)").color(egui::Color32::WHITE).strong());
-                                    ui.label(egui::RichText::new("Open File").color(egui::Color32::GRAY));
-                                    ui.label(egui::RichText::new("space / (A)").color(egui::Color32::WHITE).strong());
-                                    ui.label(egui::RichText::new("Play / Pause").color(egui::Color32::GRAY));
-                                    ui.end_row();
-                                    
-                                    ui.label(egui::RichText::new("v / (X)").color(egui::Color32::WHITE).strong());
-                                    ui.label(egui::RichText::new("Toggle Video").color(egui::Color32::GRAY));
-                                    ui.label(egui::RichText::new("left/right / D-Pad L/R").color(egui::Color32::WHITE).strong());
-                                    ui.label(egui::RichText::new("Seek Timeline").color(egui::Color32::GRAY));
-                                    ui.end_row();
-                                    
-                                    ui.label(egui::RichText::new("tab / L1").color(egui::Color32::WHITE).strong());
-                                    ui.label(egui::RichText::new("Toggle HUD").color(egui::Color32::GRAY));
-                                    ui.label(egui::RichText::new("up/down / D-Pad U/D").color(egui::Color32::WHITE).strong());
-                                    ui.label(egui::RichText::new("Change Visualizer").color(egui::Color32::GRAY));
-                                    ui.end_row();
-                                    
-                                    ui.label(egui::RichText::new("s / (B)").color(egui::Color32::WHITE).strong());
-                                    ui.label(egui::RichText::new("Toggle Stats").color(egui::Color32::GRAY));
-                                    ui.label(egui::RichText::new("q / esc / Select").color(egui::Color32::WHITE).strong());
-                                    ui.label(egui::RichText::new("Quit").color(egui::Color32::GRAY));
-                                    ui.end_row();
-                                    
-                                    ui.label(egui::RichText::new("f / Start").color(egui::Color32::WHITE).strong());
-                                    ui.label(egui::RichText::new("Toggle Fullscreen").color(egui::Color32::GRAY));
-                                    ui.label(egui::RichText::new("g / R1").color(egui::Color32::WHITE).strong());
-                                    ui.label(egui::RichText::new("Toggle GPU FFT").color(egui::Color32::GRAY));
-                                    ui.end_row();
-                                    
-                                    ui.label(egui::RichText::new("[ / ]").color(egui::Color32::WHITE).strong());
-                                    ui.label(egui::RichText::new("Scale Panels").color(egui::Color32::GRAY));
-                                    ui.end_row();
+                            if show_kb || show_gp {
+                                let (rect, _) = ui.allocate_exact_size(egui::vec2(1.0, 40.0), egui::Sense::hover());
+                                
+                                egui::Area::new("shortcuts_area".into())
+                                    .fixed_pos(egui::pos2(ui.ctx().content_rect().center().x, rect.bottom()))
+                                    .pivot(egui::Align2::CENTER_TOP)
+                                    .show(ui.ctx(), |ui| {
+                                        egui::Frame::NONE
+                                            .fill(egui::Color32::from_black_alpha(200))
+                                            .corner_radius(10.0)
+                                            .inner_margin(20.0)
+                                            .show(ui, |ui| {
+                                                ui.horizontal(|ui| {
+                                            if show_kb {
+                                                ui.vertical(|ui| {
+                                                    ui.label(egui::RichText::new("🖮 Keyboard Shortcuts").color(egui::Color32::LIGHT_GRAY).strong().size(18.0));
+                                                    ui.add_space(15.0);
+                                                    
+                                                    egui::Grid::new("kb_shortcuts")
+                                                        .num_columns(2)
+                                                        .spacing([30.0, 8.0])
+                                                        .show(ui, |ui| {
+                                                            let mut kb_shortcut = |key: &str, desc: &str| {
+                                                                ui.label(egui::RichText::new(key).color(egui::Color32::WHITE).strong());
+                                                                ui.label(egui::RichText::new(desc).color(egui::Color32::GRAY));
+                                                                ui.end_row();
+                                                            };
+                                                            kb_shortcut("o", "Open File");
+                                                            kb_shortcut("space", "Play / Pause");
+                                                            kb_shortcut("v", "Toggle Video");
+                                                            kb_shortcut("left/right", "Seek Timeline");
+                                                            kb_shortcut("tab", "Toggle HUD");
+                                                            kb_shortcut("up/down", "Change Visualizer");
+                                                            kb_shortcut("s", "Toggle Stats");
+                                                            kb_shortcut("q / esc", "Quit");
+                                                            kb_shortcut("f", "Toggle Fullscreen");
+                                                            kb_shortcut("g", "Toggle GPU FFT");
+                                                            kb_shortcut("ctrl+L/R", "Prev/Next Track");
+                                                            kb_shortcut("[ / ]", "Scale Panels");
+                                                            kb_shortcut("h", "Toggle Help");
+                                                        });
+                                                });
+                                            }
+                                            
+                                            if show_kb && show_gp {
+                                                ui.add_space(30.0);
+                                                let (rect, _) = ui.allocate_exact_size(egui::vec2(1.0, 300.0), egui::Sense::hover());
+                                                ui.painter().line_segment(
+                                                    [rect.center_top(), rect.center_bottom()],
+                                                    (1.0, egui::Color32::from_gray(60))
+                                                );
+                                                ui.add_space(30.0);
+                                            }
+                                            
+                                            if show_gp {
+                                                ui.vertical(|ui| {
+                                                    ui.label(egui::RichText::new("🎮 Gamepad Shortcuts").color(egui::Color32::LIGHT_GRAY).strong().size(18.0));
+                                                    ui.add_space(15.0);
+                                                    
+                                                    egui::Grid::new("gp_shortcuts")
+                                                        .num_columns(2)
+                                                        .spacing([30.0, 8.0])
+                                                        .show(ui, |ui| {
+                                                            let mut gp_shortcut = |gp: &str, desc: &str| {
+                                                                ui.label(egui::RichText::new(gamepad_icon(state.gamepad_type, gp)).color(egui::Color32::LIGHT_BLUE).size(16.0));
+                                                                ui.label(egui::RichText::new(desc).color(egui::Color32::GRAY));
+                                                                ui.end_row();
+                                                            };
+                                                            gp_shortcut("Y", "Open File");
+                                                            gp_shortcut("A", "Play / Pause");
+                                                            gp_shortcut("X", "Toggle Video Mode");
+                                                            gp_shortcut("D-Pad L/R", "Seek Timeline");
+                                                            gp_shortcut("L2", "Toggle HUD");
+                                                            gp_shortcut("D-Pad U/D", "Change Visualizer");
+                                                            gp_shortcut("B", "Toggle Stats");
+                                                            gp_shortcut("Select", "Quit");
+                                                            gp_shortcut("Start", "Toggle Fullscreen");
+                                                            gp_shortcut("R2", "Toggle GPU FFT");
+                                                            gp_shortcut("L1 / R1", "Prev/Next Track");
+                                                        });
+                                                });
+                                            }
+                                        });
+                                    });
                                 });
+                            }
                         }
                     );
                 });
@@ -1662,17 +1930,38 @@ impl<'a> VulkanEngine<'a> {
                                 let (rect, _) = columns[2].allocate_exact_size(available, egui::Sense::hover());
                                 out_track_info_rect = Some(rect);
                             } else {
+                                columns[2].style_mut().visuals.override_text_color = Some(egui::Color32::from_gray(235)); // Slightly lighter for contrast
                                 columns[2].heading("Track Info");
                                 columns[2].separator();
-                            if state.playlist.len() > 1 {
-                                columns[2].horizontal(|ui| { ui.label("Playlist"); ui.label(format!("{} / {}", state.playlist_index + 1, state.playlist.len())); });
-                            }
                             let title_path = std::path::Path::new(&state.song_title);
                             let file_name = title_path.file_name().unwrap_or_default().to_string_lossy().to_string();
                             let file_dir = title_path.parent().unwrap_or(std::path::Path::new("")).to_string_lossy().to_string();
                             columns[2].horizontal(|ui| { ui.label("File"); ui.label(&file_name); });
-                            columns[2].horizontal(|ui| { ui.label("Path"); ui.label(&file_dir); });
                             columns[2].horizontal(|ui| { ui.label("Artist"); ui.label(&state.artist); });
+                            columns[2].horizontal(|ui| { ui.label("Path"); ui.label(&file_dir); });
+                            if state.playlist.len() > 1 {
+                                columns[2].horizontal(|ui| { ui.label("Playlist"); ui.label(format!("{} / {}", state.playlist_index + 1, state.playlist.len())); });
+                            }
+                            if state.playlist_index + 1 < state.playlist.len() {
+                                let next_path = std::path::Path::new(&state.playlist[state.playlist_index + 1]);
+                                let next_song = next_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                                let max_len = 30;
+                                let display_str = if next_song.chars().count() > max_len {
+                                    let chars_count = next_song.chars().count();
+                                    let offset = (state.current_seconds * 4.0) as usize % (chars_count + 10);
+                                    if offset < chars_count {
+                                        let mut padded = next_song.clone();
+                                        padded.push_str("          ");
+                                        padded.push_str(&next_song);
+                                        padded.chars().skip(offset).take(max_len).collect::<String>()
+                                    } else {
+                                        next_song.chars().take(max_len).collect::<String>()
+                                    }
+                                } else {
+                                    next_song
+                                };
+                                columns[2].horizontal(|ui| { ui.label("Next Song:"); ui.label(display_str); });
+                            }
                             columns[2].horizontal(|ui| { ui.label("Type"); ui.label(&state.module_type); });
                             if let Some(video) = &state.video_info {
                                 if video == "Unsupported Codec" {

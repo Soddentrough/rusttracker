@@ -189,6 +189,22 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
     event_loop.set_control_flow(ControlFlow::Poll);
     
     let egui_ctx = egui::Context::default();
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "kenney_icons".to_owned(),
+        egui::FontData::from_static(include_bytes!("../assets/kenney-icon-font.ttf")).into(),
+    );
+    fonts.font_data.insert(
+        "orbitron".to_owned(),
+        egui::FontData::from_static(include_bytes!("../assets/Orbitron-Black.ttf")).into(),
+    );
+    fonts.families.insert(
+        egui::FontFamily::Name("Orbitron".into()),
+        vec!["orbitron".to_owned()],
+    );
+    fonts.families.get_mut(&egui::FontFamily::Proportional).unwrap().push("kenney_icons".to_owned());
+    egui_ctx.set_fonts(fonts);
+    
     let mut egui_state = egui_winit::State::new(egui_ctx.clone(), egui::ViewportId::ROOT, &window, None, None, None);
 
     let mut last_mouse_move = Instant::now();
@@ -202,7 +218,11 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                        std::env::var("XDG_SESSION_DESKTOP").unwrap_or_default().to_lowercase() == "gamescope" ||
                        std::env::var("STEAM_DECK").is_ok();
 
-    let mut file_dialog = egui_file_dialog::FileDialog::new();
+    let mut file_dialog = egui_file_dialog::FileDialog::new()
+        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .add_file_filter_extensions("Audio/Video Files", vec!["flac", "wav", "mp3", "ogg", "aac", "m4a", "mp4", "mkv", "avi", "webm", "opus", "mod", "s3m", "xm", "it", "stm", "669", "mtm", "med", "okt", "psm"])
+        .default_file_filter("Audio/Video Files");
+    let mut modifiers = winit::keyboard::ModifiersState::empty();
 
     #[allow(deprecated)]
     let _ = event_loop.run(move |event, elwt| {
@@ -218,92 +238,122 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                     }
                 }
                 
+                if let WindowEvent::ModifiersChanged(m) = &event {
+                    modifiers = m.state();
+                }
+
                 // Process global hotkeys regardless of egui consuming them
-                if let WindowEvent::KeyboardInput { event: kb_event, .. } = event {
-                    if kb_event.state == ElementState::Pressed && !kb_event.repeat {
+                if let WindowEvent::KeyboardInput { event: kb_event, .. } = &event {
+                    if kb_event.state == ElementState::Pressed {
                         if let PhysicalKey::Code(keycode) = kb_event.physical_key {
                             match keycode {
-                                WinitKeyCode::Escape | WinitKeyCode::KeyQ => elwt.exit(),
-                                WinitKeyCode::BracketLeft => {
-                                    let mut state = app_state.lock().unwrap();
-                                    state.panel_split_ratio = (state.panel_split_ratio - 0.05).clamp(0.15, 0.85);
-                                },
-                                WinitKeyCode::BracketRight => {
-                                    let mut state = app_state.lock().unwrap();
-                                    state.panel_split_ratio = (state.panel_split_ratio + 0.05).clamp(0.15, 0.85);
-                                },
-                                WinitKeyCode::Tab => {
-                                    let mut state = app_state.lock().unwrap();
-                                    state.show_hud = !state.show_hud;
-                                },
-                                WinitKeyCode::KeyF => {
-                                    is_fullscreen = !is_fullscreen;
-                                    if is_fullscreen {
-                                        window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
-                                    } else {
-                                        window.set_fullscreen(None);
-                                    }
-                                },
-                                WinitKeyCode::KeyG => {
-                                    let mut state = app_state.lock().unwrap();
-                                    state.gpu_fft = !state.gpu_fft;
-                                },
-                                WinitKeyCode::KeyS => {
-                                    let mut state = app_state.lock().unwrap();
-                                    state.show_stats = !state.show_stats;
-                                },
-                                WinitKeyCode::KeyO => {
-                                    let mut state = app_state.lock().unwrap();
-                                    state.open_file_request = true;
-                                },
-                                WinitKeyCode::KeyV => {
-                                    let mut state = app_state.lock().unwrap();
-                                    if state.video_frame_rx.is_some() {
-                                        state.video_mode = (state.video_mode + 1) % 4;
-                                    } else {
-                                        state.video_mode = 0;
-                                    }
-                                },
-                                WinitKeyCode::Space => {
-                                    let mut state = app_state.lock().unwrap();
-                                    if state.current_seconds >= state.duration_seconds - 0.1 && state.duration_seconds > 0.0 {
-                                        state.seek_request = Some(0.0);
-                                        state.spectrum_history.clear();
-                                        for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
-                                        state.is_paused = false;
-                                    } else {
-                                        state.is_paused = !state.is_paused;
-                                    }
-                                },
                                 WinitKeyCode::ArrowRight => {
                                     let mut state = app_state.lock().unwrap();
-                                    let target = state.current_seconds + 5.0;
-                                    state.seek_request = Some(target);
-                                    state.spectrum_history.clear();
-                                    for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
+                                    if modifiers.control_key() {
+                                        if !kb_event.repeat {
+                                            state.track_ended = true;
+                                        }
+                                    } else {
+                                        let target = state.current_seconds + 5.0;
+                                        state.seek_request = Some(target);
+                                        state.spectrum_history.clear();
+                                        for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
+                                    }
                                 },
                                 WinitKeyCode::ArrowLeft => {
                                     let mut state = app_state.lock().unwrap();
-                                    let target = (state.current_seconds - 5.0).max(0.0);
-                                    state.seek_request = Some(target);
-                                    state.spectrum_history.clear();
-                                    for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
-                                },
-                                WinitKeyCode::ArrowUp => {
-                                    let mut state = app_state.lock().unwrap();
-                                    state.current_visualizer_idx = (state.current_visualizer_idx + 1) % crate::state::VISUALIZERS.len();
-                                    state.visualizer_mode = crate::state::VISUALIZERS[state.current_visualizer_idx].id;
-                                },
-                                WinitKeyCode::ArrowDown => {
-                                    let mut state = app_state.lock().unwrap();
-                                    if state.current_visualizer_idx == 0 {
-                                        state.current_visualizer_idx = crate::state::VISUALIZERS.len() - 1;
+                                    if modifiers.control_key() {
+                                        if !kb_event.repeat {
+                                            if state.playlist_index > 0 {
+                                                state.playlist_index -= 1;
+                                                state.load_request = Some(state.playlist[state.playlist_index].clone());
+                                                state.track_ended = false;
+                                            }
+                                        }
                                     } else {
-                                        state.current_visualizer_idx -= 1;
+                                        let target = (state.current_seconds - 5.0).max(0.0);
+                                        state.seek_request = Some(target);
+                                        state.spectrum_history.clear();
+                                        for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
                                     }
-                                    state.visualizer_mode = crate::state::VISUALIZERS[state.current_visualizer_idx].id;
                                 },
-                                _ => {}
+                                _ => {
+                                    if !kb_event.repeat {
+                                        match keycode {
+                                            WinitKeyCode::Escape | WinitKeyCode::KeyQ => elwt.exit(),
+                                            WinitKeyCode::BracketLeft => {
+                                                let mut state = app_state.lock().unwrap();
+                                                state.panel_split_ratio = (state.panel_split_ratio - 0.05).clamp(0.15, 0.85);
+                                            },
+                                            WinitKeyCode::BracketRight => {
+                                                let mut state = app_state.lock().unwrap();
+                                                state.panel_split_ratio = (state.panel_split_ratio + 0.05).clamp(0.15, 0.85);
+                                            },
+                                            WinitKeyCode::Tab => {
+                                                let mut state = app_state.lock().unwrap();
+                                                state.show_hud = !state.show_hud;
+                                            },
+                                            WinitKeyCode::KeyF => {
+                                                is_fullscreen = !is_fullscreen;
+                                                if is_fullscreen {
+                                                    window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+                                                } else {
+                                                    window.set_fullscreen(None);
+                                                }
+                                            },
+                                            WinitKeyCode::KeyG => {
+                                                let mut state = app_state.lock().unwrap();
+                                                state.gpu_fft = !state.gpu_fft;
+                                            },
+                                            WinitKeyCode::KeyS => {
+                                                let mut state = app_state.lock().unwrap();
+                                                state.show_stats = !state.show_stats;
+                                            },
+                                            WinitKeyCode::KeyH => {
+                                                let mut state = app_state.lock().unwrap();
+                                                state.show_help = !state.show_help;
+                                            },
+                                            WinitKeyCode::KeyO => {
+                                                let mut state = app_state.lock().unwrap();
+                                                state.open_file_request = true;
+                                            },
+                                            WinitKeyCode::KeyV => {
+                                                let mut state = app_state.lock().unwrap();
+                                                if state.video_frame_rx.is_some() {
+                                                    state.video_mode = (state.video_mode + 1) % 4;
+                                                } else {
+                                                    state.video_mode = 0;
+                                                }
+                                            },
+                                            WinitKeyCode::Space => {
+                                                let mut state = app_state.lock().unwrap();
+                                                if state.current_seconds >= state.duration_seconds - 0.1 && state.duration_seconds > 0.0 {
+                                                    state.seek_request = Some(0.0);
+                                                    state.spectrum_history.clear();
+                                                    for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
+                                                    state.is_paused = false;
+                                                } else {
+                                                    state.is_paused = !state.is_paused;
+                                                }
+                                            },
+                                            WinitKeyCode::ArrowUp => {
+                                                let mut state = app_state.lock().unwrap();
+                                                state.current_visualizer_idx = (state.current_visualizer_idx + 1) % crate::state::VISUALIZERS.len();
+                                                state.visualizer_mode = crate::state::VISUALIZERS[state.current_visualizer_idx].id;
+                                            },
+                                            WinitKeyCode::ArrowDown => {
+                                                let mut state = app_state.lock().unwrap();
+                                                if state.current_visualizer_idx == 0 {
+                                                    state.current_visualizer_idx = crate::state::VISUALIZERS.len() - 1;
+                                                } else {
+                                                    state.current_visualizer_idx -= 1;
+                                                }
+                                                state.visualizer_mode = crate::state::VISUALIZERS[state.current_visualizer_idx].id;
+                                            },
+                                            _ => {}
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -518,13 +568,22 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                     } else if action == EngineAction::OpenFile {
                         let mut state = app_state.lock().unwrap();
                         state.open_file_request = true;
-                    } else if let EngineAction::LoadFile(path) = action {
+                    } else if let EngineAction::LoadFiles(paths, append) = action {
                         let mut state = app_state.lock().unwrap();
-                        state.playlist = vec![path];
-                        state.playlist_index = 0;
-                        state.load_request = Some(state.playlist[0].clone());
+                        if append && !state.playlist.is_empty() {
+                            state.playlist.extend(paths);
+                        } else {
+                            if !paths.is_empty() {
+                                state.playlist = paths;
+                                state.playlist_index = 0;
+                                state.load_request = Some(state.playlist[0].clone());
+                            }
+                        }
                         state.file_loaded = true;
                         state.is_file_picker_open = false;
+                    } else if let EngineAction::SetAppendToPlaylist(val) = action {
+                        let mut state = app_state.lock().unwrap();
+                        state.append_to_playlist = val;
                     } else if let EngineAction::SetForceStereo(val) = action {
                         let mut state = app_state.lock().unwrap();
                         state.force_stereo_downmix = val;
@@ -535,9 +594,7 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
 
                     {
                         let mut state = app_state.lock().unwrap();
-                        if is_game_mode {
-                            state.is_file_picker_open = *file_dialog.state() != egui_file_dialog::DialogState::Closed;
-                        }
+                        state.is_file_picker_open = *file_dialog.state() != egui_file_dialog::DialogState::Closed;
                     }
                     
                     let mut trigger_picker = false;
@@ -551,24 +608,7 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                     }
                     
                     if trigger_picker {
-                        if is_game_mode {
-                            file_dialog.pick_file();
-                        } else {
-                            let app_state_clone = Arc::clone(&app_state);
-                            std::thread::spawn(move || {
-                                if let Some(path) = rfd::FileDialog::new()
-                                    .add_filter("Audio/Video Files", &["flac", "wav", "mp3", "ogg", "aac", "m4a", "mp4", "mkv", "avi", "webm", "opus", "mod", "s3m", "xm", "it", "stm", "669", "mtm", "med", "okt", "psm"])
-                                    .add_filter("All Files", &["*"])
-                                    .pick_file() {
-                                    let mut state = app_state_clone.lock().unwrap();
-                                    state.playlist = vec![path.display().to_string()];
-                                    state.playlist_index = 0;
-                                    state.load_request = Some(state.playlist[0].clone());
-                                    state.file_loaded = true;
-                                }
-                                app_state_clone.lock().unwrap().is_file_picker_open = false;
-                            });
-                        }
+                        file_dialog.pick_multiple();
                     }
                     
                     // Fallback for Wayland/Mesa broken FIFO vsync:
@@ -602,9 +642,61 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
             Event::AboutToWait => {
                     let is_dialog_open = *file_dialog.state() != egui_file_dialog::DialogState::Closed;
                     
+                    {
+                        let mut state = app_state.lock().unwrap();
+                        
+                        let mut has_gp = false;
+                        for _ in gilrs.gamepads() {
+                            has_gp = true;
+                        }
+                        state.has_gamepad = is_game_mode || has_gp;
+
+                        if !is_game_mode {
+                            let mut g_type = crate::state::GamepadType::Xbox;
+                            for (_id, gamepad) in gilrs.gamepads() {
+                                let name = gamepad.name().to_lowercase();
+                                if name.contains("sony") || name.contains("dualshock") || name.contains("dualsense") || name.contains("ps4") || name.contains("ps5") {
+                                    g_type = crate::state::GamepadType::PlayStation;
+                                    break;
+                                } else if name.contains("nintendo") || name.contains("pro controller") || name.contains("joy-con") {
+                                    g_type = crate::state::GamepadType::Nintendo;
+                                    break;
+                                }
+                            }
+                            state.gamepad_type = g_type;
+                        }
+                    }
+                    
                     while let Some(gilrs::Event { id: _, event: g_event, time: _, .. }) = gilrs.next_event() {
-                    match g_event {
-                        gilrs::EventType::ButtonPressed(button, _) => {
+                    let is_pressed = matches!(g_event, gilrs::EventType::ButtonPressed(_, _));
+                    let is_repeated = matches!(g_event, gilrs::EventType::ButtonRepeated(_, _));
+                    if is_pressed || is_repeated {
+                        let button = match g_event {
+                            gilrs::EventType::ButtonPressed(b, _) => b,
+                            gilrs::EventType::ButtonRepeated(b, _) => b,
+                            _ => unreachable!(),
+                        };
+
+                        if is_repeated {
+                            match button {
+                                gilrs::Button::DPadRight => {
+                                    let mut state = app_state.lock().unwrap();
+                                    let target = state.current_seconds + 5.0;
+                                    state.seek_request = Some(target);
+                                    state.spectrum_history.clear();
+                                    for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
+                                }
+                                gilrs::Button::DPadLeft => {
+                                    let mut state = app_state.lock().unwrap();
+                                    let target = (state.current_seconds - 5.0).max(0.0);
+                                    state.seek_request = Some(target);
+                                    state.spectrum_history.clear();
+                                    for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
+                                }
+                                _ => {}
+                            }
+                            continue;
+                        }
                             // System-critical buttons always work regardless of dialog state
                             match button {
                                 gilrs::Button::Select => {
@@ -643,9 +735,21 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                             match button {
                                 gilrs::Button::LeftTrigger => { // L1 Bumper
                                     let mut state = app_state.lock().unwrap();
-                                    state.show_hud = !state.show_hud;
+                                    if state.playlist_index > 0 {
+                                        state.playlist_index -= 1;
+                                        state.load_request = Some(state.playlist[state.playlist_index].clone());
+                                        state.track_ended = false;
+                                    }
                                 }
                                 gilrs::Button::RightTrigger => { // R1 Bumper
+                                    let mut state = app_state.lock().unwrap();
+                                    state.track_ended = true;
+                                }
+                                gilrs::Button::LeftTrigger2 => { // L2
+                                    let mut state = app_state.lock().unwrap();
+                                    state.show_hud = !state.show_hud;
+                                }
+                                gilrs::Button::RightTrigger2 => { // R2
                                     let mut state = app_state.lock().unwrap();
                                     state.gpu_fft = !state.gpu_fft;
                                 }
@@ -707,9 +811,7 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                                 _ => {}
                             }
                         }
-                        _ => {}
                     }
-                }
 
                 if is_fullscreen {
                     if is_cursor_visible && last_mouse_move.elapsed().as_secs_f32() > 2.0 {
