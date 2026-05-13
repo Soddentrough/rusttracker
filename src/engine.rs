@@ -1239,7 +1239,6 @@ impl<'a> VulkanEngine<'a> {
         file_dialog: &mut egui_file_dialog::FileDialog,
         gamepad_events: Vec<egui::Event>
     ) -> Result<(EngineAction, f32, f32, Option<f32>, Option<f32>, Option<f32>, f32, f32, f32, f32), wgpu::SurfaceStatus> {
-        let ui_start = std::time::Instant::now();
         let surface_start = std::time::Instant::now();
         let output = self.surface.get_current_texture();
         let surface_texture = match output {
@@ -1299,6 +1298,7 @@ impl<'a> VulkanEngine<'a> {
         }
 
         // Process egui UI
+        let ui_start = std::time::Instant::now();
         let mut raw_input = egui_state.take_egui_input(window);
         raw_input.events.extend(gamepad_events);
         let mut central_rect = egui::Rect::from_min_max(Default::default(), egui::pos2(self.config.width as f32, self.config.height as f32));
@@ -1900,6 +1900,13 @@ impl<'a> VulkanEngine<'a> {
                                     let row_height = 16.0;
                                     let num_rows_to_draw = (hm_rect.height() / row_height) as i32;
                                     
+                                    let font_id = egui::FontId::monospace(12.0);
+                                    let char_width = 7.0; // Approx monospace char width at 12pt
+                                    let max_chars = ((hm_rect.width() - 20.0) / char_width).max(10.0) as usize;
+                                    let max_text_chars = max_chars.saturating_sub(4);
+                                    
+                                    let mut formatted = String::with_capacity(max_text_chars + 16);
+                                    
                                     for offset in -(num_rows_to_draw / 2)..=(num_rows_to_draw / 2) {
                                         let mut resolved_order = current_order;
                                         let mut resolved_row = current_row + offset;
@@ -1941,44 +1948,52 @@ impl<'a> VulkanEngine<'a> {
                                                 // Fade out based on distance
                                                 let distance = offset.abs() as f32 / (num_rows_to_draw as f32 / 2.0);
                                                 let alpha = (1.0 - distance).max(0.0);
+                                                if alpha <= 0.02 { continue; } // Skip invisible rows to save layout time
                                                 
-                                                let font_id = egui::FontId::monospace(12.0);
-                                                // Format once, reuse for all draws
-                                                let formatted = format!("{:02X}  {}", resolved_row, text);
+                                                let (text_slice, is_truncated) = if text.len() > max_text_chars {
+                                                    let end_idx = max_text_chars.saturating_sub(3);
+                                                    let safe_end = text.char_indices().map(|(i, _)| i).find(|&i| i >= end_idx).unwrap_or(text.len());
+                                                    (&text[..safe_end], true)
+                                                } else {
+                                                    (text.as_str(), false)
+                                                };
+                                                
+                                                formatted.clear();
+                                                use std::fmt::Write;
+                                                if is_truncated {
+                                                    let _ = write!(formatted, "{:02X}  {}...", resolved_row, text_slice);
+                                                } else {
+                                                    let _ = write!(formatted, "{:02X}  {}", resolved_row, text_slice);
+                                                };
+                                                
                                                 let pos = egui::pos2(hm_rect.center().x, y);
                                                 
                                                 if offset == 0 {
-                                                    // Active row: draw highlight background + bold text (2 calls instead of 4)
-                                                    let rect = painter.text(
-                                                        pos,
-                                                        egui::Align2::CENTER_CENTER,
-                                                        &formatted,
+                                                    let galley = painter.layout_no_wrap(
+                                                        formatted.clone(),
                                                         font_id.clone(),
                                                         egui::Color32::WHITE,
                                                     );
-                                                    // Draw background behind text
+                                                    let rect = egui::Rect::from_center_size(pos, galley.size());
+                                                    
                                                     painter.rect_filled(
-                                                        rect.expand2(egui::vec2(10.0, 5.0)),
+                                                        rect.expand2(egui::vec2(10.0, 2.0)),
                                                         4.0,
                                                         egui::Color32::from_black_alpha(220)
                                                     );
-                                                    // Redraw text on top of background
-                                                    painter.text(
-                                                        pos,
-                                                        egui::Align2::CENTER_CENTER,
-                                                        &formatted,
-                                                        font_id,
+                                                    painter.galley(rect.min, galley, egui::Color32::WHITE);
+                                                } else {
+                                                    // Valid unmultiplied alpha color
+                                                    let color = egui::Color32::from_rgba_unmultiplied(150, 150, 150, (alpha * 100.0) as u8);
+                                                    
+                                                    let galley = painter.layout_no_wrap(
+                                                        formatted.clone(),
+                                                        font_id.clone(),
                                                         egui::Color32::WHITE,
                                                     );
-                                                } else {
-                                                    let color = egui::Color32::from_rgba_premultiplied(150, 150, 150, (alpha * 100.0) as u8);
-                                                    painter.text(
-                                                        pos,
-                                                        egui::Align2::CENTER_CENTER,
-                                                        &formatted,
-                                                        font_id,
-                                                        color
-                                                    );
+                                                    
+                                                    let rect = egui::Rect::from_center_size(pos, galley.size());
+                                                    painter.galley(rect.min, galley, color);
                                                 }
                                                 
                                                 // Pattern boundary indicator
@@ -2155,6 +2170,9 @@ impl<'a> VulkanEngine<'a> {
         egui_state.handle_platform_output(window, full_output.platform_output);
         let clipped_primitives = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
 
+        let ui_elapsed = ui_start.elapsed().as_micros() as f32;
+        let phase_egui_layout_us = ui_elapsed; // Egui layout now accurately measures only UI logic and tessellation
+
         for (id, image_delta) in &full_output.textures_delta.set {
             self.egui_renderer.update_texture(&self.device, &self.queue, *id, image_delta);
         }
@@ -2163,9 +2181,6 @@ impl<'a> VulkanEngine<'a> {
             size_in_pixels: [self.config.width, self.config.height],
             pixels_per_point: window.scale_factor() as f32,
         };
-        
-        let ui_elapsed = ui_start.elapsed().as_micros() as f32;
-        let phase_egui_layout_us = ui_elapsed - phase_surface_us; // Egui layout = total UI - surface acquisition
         let render_start = std::time::Instant::now();
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {

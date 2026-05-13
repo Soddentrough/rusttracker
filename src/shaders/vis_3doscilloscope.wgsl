@@ -53,10 +53,7 @@ fn get_waveform(hist_idx: u32, idx: u32) -> f32 {
     let component_idx = clamped_idx % 4u;
 
     let spec_vec = waveform_history[hist_idx * 256u + vec_idx];
-    if component_idx == 0u { return spec_vec.x; }
-    else if component_idx == 1u { return spec_vec.y; }
-    else if component_idx == 2u { return spec_vec.z; }
-    else { return spec_vec.w; }
+    return spec_vec[component_idx];
 }
 
 fn sd_segment(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
@@ -122,47 +119,43 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         if t > 0.0 {
             let hit_x = ro.x + rd.x * t;
             
+            let edge_fade = smoothstep(9.6, 6.6, abs(hit_x));
+            if edge_fade <= 0.00001 {
+                continue;
+            }
+            
             // Map X from -9.6 to 9.6
-            let float_idx = (hit_x + 9.6) / 19.2 * f32(num_points - 1u);
+            let float_idx = (hit_x + 9.6) / 19.2 * 1023.0;
             let idx = i32(round(float_idx));
             
             let start_idx = max(0, idx - 4);
-            let end_idx = min(i32(num_points) - 2, idx + 4);
+            let end_idx = min(1022, idx + 4);
             
             var min_dist = 1000.0;
             
+            var j_u = u32(start_idx);
+            var x_prev = -9.6 + f32(j_u) * 0.01876832844;
+            var mask_prev = smoothstep(9.6, 6.6, abs(x_prev));
+            var v_prev = get_waveform(hist_idx, j_u);
+            var p_prev = abs(v_prev) * mask_prev * 6.0;
+            var p3_prev = vec3<f32>(x_prev, y_line, p_prev);
+            var proj_prev = project_3d(p3_prev, ro, u, v_cam, w);
+            
             for (var j = start_idx; j <= end_idx; j = j + 1) {
-                let j_u = u32(j);
+                j_u = u32(j + 1);
+                let x_curr = -9.6 + f32(j_u) * 0.01876832844;
+                let mask_curr = smoothstep(9.6, 6.6, abs(x_curr));
+                let v_curr = get_waveform(hist_idx, j_u);
+                let p_curr = abs(v_curr) * mask_curr * 6.0;
+                let p3_curr = vec3<f32>(x_curr, y_line, p_curr);
+                let proj_curr = project_3d(p3_curr, ro, u, v_cam, w);
                 
-                let x0 = mix(-9.6, 9.6, f32(j_u) / f32(num_points - 1u));
-                let x1 = mix(-9.6, 9.6, f32(j_u + 1u) / f32(num_points - 1u));
-                
-                // Falloff mask so lines flatten out perfectly at the left/right edges
-                let mask0 = smoothstep(9.6, 6.6, abs(x0));
-                let mask1 = smoothstep(9.6, 6.6, abs(x1));
-                
-                let wave_idx0 = u32(f32(j_u) / f32(num_points - 1u) * 1023.0);
-                let wave_idx1 = u32(f32(j_u + 1u) / f32(num_points - 1u) * 1023.0);
-                
-                // Use the history frame corresponding to this line (0 is oldest, 15 is newest)
-                let v0 = get_waveform(hist_idx, wave_idx0);
-                let v1 = get_waveform(hist_idx, wave_idx1);
-                
-                // Only go UP (positive Z) from the baseline. 
-                // We use abs() so both positive and negative waveform phases create peaks
-                let p0 = abs(v0) * mask0 * 6.0;
-                let p1 = abs(v1) * mask1 * 6.0;
-                
-                let p3_0 = vec3<f32>(x0, y_line, p0);
-                let p3_1 = vec3<f32>(x1, y_line, p1);
-                
-                let proj0 = project_3d(p3_0, ro, u, v_cam, w);
-                let proj1 = project_3d(p3_1, ro, u, v_cam, w);
-                
-                if proj0.z > 0.001 && proj1.z > 0.001 {
-                    let d = sd_segment(p, proj0.xy, proj1.xy);
+                if proj_prev.z > 0.001 && proj_curr.z > 0.001 {
+                    let d = sd_segment(p, proj_prev.xy, proj_curr.xy);
                     min_dist = min(min_dist, d);
                 }
+                
+                proj_prev = proj_curr;
             }
             
             let r = length(crt_uv);
@@ -175,7 +168,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             
             // Depth fade (lines further back are slightly darker)
             let depth_fade = exp(-t * 0.20);
-            let edge_fade = smoothstep(9.6, 6.6, abs(hit_x));
             
             // Age fade (older lines fade out)
             let age_fade = mix(0.05, 1.0, f32(i) / f32(num_lines - 1u));

@@ -13,6 +13,9 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
+use rustysynth::{MidiFile, MidiFileSequencer, SoundFont, Synthesizer, SynthesizerSettings};
+use midly::{Smf, TrackEventKind, MetaMessage, MidiMessage};
+
 use crate::state::AppState;
 use crossbeam_channel::{bounded, Sender, Receiver};
 
@@ -321,6 +324,278 @@ impl AudioSource for OpenMptSource {
             }
         }
         row_str
+    }
+}
+
+// ---------------------------------------------------------
+// MidiTracker Audio Decoder
+// ---------------------------------------------------------
+#[derive(Clone)]
+struct MidiEvent {
+    time_sec: f64,
+    channel: i32,
+    velocity: u8,
+    is_note_on: bool,
+}
+
+struct MidiSource {
+    sequencer: MidiFileSequencer,
+    events: Vec<MidiEvent>,
+    event_idx: usize,
+    channel_vus: Vec<f32>,
+    duration: f64,
+    artist: String,
+    title: String,
+    tracker_data: Vec<Vec<String>>,
+    tempo: i32,
+    left_buf: Vec<f32>,
+    right_buf: Vec<f32>,
+    midi_file: Arc<MidiFile>,
+}
+
+unsafe impl Send for MidiSource {}
+
+impl MidiSource {
+    pub fn new(file_path: &str, soundfont_path: &str, sample_rate: i32) -> anyhow::Result<Self> {
+        let mut sf2_file = File::open(soundfont_path)?;
+        let sf2 = Arc::new(SoundFont::new(&mut sf2_file).map_err(|e| anyhow::anyhow!("SoundFont error: {:?}", e))?);
+        let settings = SynthesizerSettings::new(sample_rate);
+        let synth = Synthesizer::new(&sf2, &settings).map_err(|e| anyhow::anyhow!("Synth error: {:?}", e))?;
+        let mut sequencer = MidiFileSequencer::new(synth);
+        
+        let mut midi_file = File::open(file_path)?;
+        let midi = Arc::new(MidiFile::new(&mut midi_file).map_err(|e| anyhow::anyhow!("Midi parse error: {:?}", e))?);
+        
+        let duration = midi.get_length();
+        sequencer.play(&midi, false);
+        
+        let data = std::fs::read(file_path)?;
+        let smf = Smf::parse(&data).map_err(|e| anyhow::anyhow!("Midly parse error: {:?}", e))?;
+        
+        let mut artist = String::new();
+        let mut title = String::new();
+        
+        let mut absolute_events = Vec::new();
+        let ticks_per_beat = match smf.header.timing {
+            midly::Timing::Metrical(ticks) => ticks.as_int() as f64,
+            _ => 480.0,
+        };
+        
+        for track in &smf.tracks {
+            let mut current_tick = 0;
+            for event in track {
+                current_tick += event.delta.as_int();
+                match &event.kind {
+                    TrackEventKind::Meta(MetaMessage::TrackName(name)) => {
+                        if title.is_empty() {
+                            title = String::from_utf8_lossy(name).to_string();
+                        }
+                    }
+                    TrackEventKind::Meta(MetaMessage::Text(text)) => {
+                        if artist.is_empty() {
+                            artist = String::from_utf8_lossy(text).to_string();
+                        }
+                    }
+                    TrackEventKind::Midi { channel, message } => {
+                        match message {
+                            MidiMessage::NoteOn { key, vel } => {
+                                absolute_events.push((current_tick, channel.as_int(), key.as_int(), vel.as_int(), vel.as_int() > 0));
+                            }
+                            MidiMessage::NoteOff { key, vel } => {
+                                absolute_events.push((current_tick, channel.as_int(), key.as_int(), vel.as_int(), false));
+                            }
+                            _ => {}
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        
+        absolute_events.sort_by_key(|e| e.0);
+        
+        let tempo = 500000.0;
+        let mut current_tick = 0;
+        let mut current_time = 0.0;
+        
+        let mut parsed_events = Vec::new();
+        for (tick, channel, _key, vel, is_on) in absolute_events {
+            let delta_ticks = tick - current_tick;
+            let beats = delta_ticks as f64 / ticks_per_beat;
+            let seconds = beats * (tempo / 1000000.0);
+            current_time += seconds;
+            current_tick = tick;
+            
+            parsed_events.push(MidiEvent {
+                time_sec: current_time,
+                channel: channel as i32,
+                velocity: vel,
+                is_note_on: is_on,
+            });
+        }
+        
+        let mut pattern_rows: Vec<Vec<String>> = Vec::new();
+        for track in &smf.tracks {
+            let mut tick = 0;
+            for event in track {
+                tick += event.delta.as_int();
+                if let TrackEventKind::Midi { channel, message } = &event.kind {
+                    if let MidiMessage::NoteOn { key, vel } = message {
+                        if *vel > 0 {
+                            let row_idx = (tick as f64 / (ticks_per_beat / 4.0)) as usize;
+                            while pattern_rows.len() <= row_idx {
+                                pattern_rows.push(vec!["... .. ..".to_string(); 16]);
+                            }
+                            let notes = ["C-", "C#", "D-", "D#", "E-", "F-", "F#", "G-", "G#", "A-", "A#", "B-"];
+                            let octave = key.as_int() / 12;
+                            let note = key.as_int() % 12;
+                            let note_name = format!("{}{}", notes[note as usize], octave);
+                            let note_str = format!("{} .. {:02X}", note_name, vel.as_int());
+                            pattern_rows[row_idx][channel.as_int() as usize] = note_str;
+                        }
+                    }
+                }
+            }
+        }
+        
+        let mut final_rows = Vec::new();
+        for row in pattern_rows {
+            final_rows.push(row.join(" | "));
+        }
+        let tracker_data = vec![final_rows];
+        
+        if artist.is_empty() {
+            artist = "Unknown MIDI".to_string();
+        }
+        
+        Ok(Self {
+            sequencer,
+            events: parsed_events,
+            event_idx: 0,
+            channel_vus: vec![0.0; 16],
+            duration,
+            artist,
+            title,
+            tracker_data,
+            tempo: 120,
+            left_buf: vec![0.0; 8192],
+            right_buf: vec![0.0; 8192],
+            midi_file: midi,
+        })
+    }
+}
+
+impl AudioSource for MidiSource {
+    fn read_frames(&mut self, hardware_channels: usize, _sample_rate: u32, output: &mut [f32]) -> usize {
+        let frames_to_render = output.len() / hardware_channels;
+        
+        if self.left_buf.len() < frames_to_render {
+            self.left_buf.resize(frames_to_render, 0.0);
+            self.right_buf.resize(frames_to_render, 0.0);
+        }
+        
+        self.sequencer.render(&mut self.left_buf[..frames_to_render], &mut self.right_buf[..frames_to_render]);
+        
+        for c in 0..16 {
+            self.channel_vus[c] = (self.channel_vus[c] - 0.02).max(0.0);
+        }
+        
+        let pos = self.sequencer.get_position();
+        while self.event_idx < self.events.len() && self.events[self.event_idx].time_sec <= pos {
+            let ev = &self.events[self.event_idx];
+            if ev.is_note_on {
+                let ch = ev.channel as usize;
+                if ch < 16 {
+                    self.channel_vus[ch] = (ev.velocity as f32 / 127.0).clamp(0.1, 1.0);
+                }
+            }
+            self.event_idx += 1;
+        }
+        
+        for i in 0..frames_to_render {
+            let l = self.left_buf[i];
+            let r = self.right_buf[i];
+            
+            output[i * hardware_channels] = l;
+            if hardware_channels > 1 {
+                output[i * hardware_channels + 1] = r;
+                for j in 2..hardware_channels {
+                    output[i * hardware_channels + j] = 0.0;
+                }
+            }
+        }
+        
+        if self.sequencer.end_of_sequence() {
+            0
+        } else {
+            frames_to_render
+        }
+    }
+    
+    fn get_duration_seconds(&mut self) -> f64 { self.duration }
+    fn get_position_seconds(&mut self) -> f64 { self.sequencer.get_position() }
+    
+    fn set_position_seconds(&mut self, pos: f64) {
+        if pos < self.get_position_seconds() {
+            self.sequencer.play(&self.midi_file, false);
+        }
+        
+        let mut trash_left = vec![0.0; 8192];
+        let mut trash_right = vec![0.0; 8192];
+        while self.sequencer.get_position() < pos && !self.sequencer.end_of_sequence() {
+            self.sequencer.render(&mut trash_left, &mut trash_right);
+        }
+        
+        self.event_idx = 0;
+        while self.event_idx < self.events.len() && self.events[self.event_idx].time_sec < pos {
+            self.event_idx += 1;
+        }
+        for c in 0..16 { self.channel_vus[c] = 0.0; }
+    }
+    
+    fn get_num_channels(&mut self) -> i32 { 2 }
+    fn get_current_channel_vu_mono(&mut self, channel: i32) -> f32 {
+        if channel >= 0 && channel < 16 {
+            self.channel_vus[channel as usize]
+        } else {
+            0.0
+        }
+    }
+    
+    fn get_artist(&mut self) -> String {
+        if !self.title.is_empty() {
+            format!("{} - {}", self.artist, self.title)
+        } else {
+            self.artist.clone()
+        }
+    }
+    
+    fn get_type(&mut self) -> String { "MIDI".to_string() }
+    fn get_tempo(&mut self) -> i32 { self.tempo }
+    fn get_speed(&mut self) -> i32 { 0 }
+    fn get_intrinsic_sample_rate(&mut self) -> Option<u32> { Some(48000) }
+    fn get_num_samples(&mut self) -> i32 { 0 }
+    fn get_num_instruments(&mut self) -> i32 { 128 }
+    fn get_num_patterns(&mut self) -> i32 { 1 }
+    
+    fn get_current_order(&mut self) -> i32 { 0 }
+    fn get_current_row(&mut self) -> i32 {
+        (self.sequencer.get_position() * (self.tempo as f64 / 60.0) * 4.0) as i32
+    }
+    
+    fn get_tracker_channels(&mut self) -> Option<i32> { Some(16) }
+    
+    fn pre_format_tracker_data(&mut self) -> Vec<Vec<String>> {
+        self.tracker_data.clone()
+    }
+    
+    fn get_current_row_string(&mut self) -> String {
+        let row = self.get_current_row() as usize;
+        if self.tracker_data.len() > 0 && row < self.tracker_data[0].len() {
+            self.tracker_data[0][row].clone()
+        } else {
+            vec!["... .. ..".to_string(); 16].join(" | ")
+        }
     }
 }
 
@@ -985,7 +1260,22 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
         }
     }
 
-    // 3. Try FFmpeg native bindings
+    // 3. Try MIDI
+    if ext == "mid" || ext == "midi" {
+        // Look for soundfont in project dir, then fallback
+        let sf_path = if std::path::Path::new("assets/soundfont.sf2").exists() {
+            "assets/soundfont.sf2"
+        } else {
+            "soundfont.sf2" // User must provide it in the working dir if not in assets
+        };
+        if let Ok(source) = MidiSource::new(file_path, sf_path, 48000) {
+            return Ok(Box::new(source));
+        } else {
+            return Err(anyhow::anyhow!("Failed to parse MIDI or missing SoundFont ({}). Please place a SoundFont in assets/soundfont.sf2", sf_path));
+        }
+    }
+
+    // 4. Try FFmpeg native bindings
     let ffmpeg_result = try_ffmpeg(file_path);
     if let Ok(source) = ffmpeg_result {
         return Ok(source);
