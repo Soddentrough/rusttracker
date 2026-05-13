@@ -1380,17 +1380,15 @@ impl<'a> VulkanEngine<'a> {
                                     .color(egui::Color32::WHITE)
                             );
                         }
+                        let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
+                        let mut total_vis_us = state.stats.shader_us;
+                        if vis_def.requires_fire {
+                            total_vis_us += state.stats.fire_us;
+                        }
                         ui.label(
-                            egui::RichText::new(format!("Visualization Shader (GPU): {:.2} ms", state.stats.shader_us / 1000.0))
+                            egui::RichText::new(format!("Visualization Shader (GPU): {:.2} ms", total_vis_us / 1000.0))
                                 .color(egui::Color32::LIGHT_BLUE)
                         );
-                        let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
-                        if vis_def.requires_fire {
-                            ui.label(
-                                egui::RichText::new(format!("Fire Compute (GPU): {:.2} ms", state.stats.fire_us / 1000.0))
-                                    .color(egui::Color32::LIGHT_BLUE)
-                            );
-                        }
                         ui.label(
                             egui::RichText::new(format!("Audio Buffer: {:.1}%", state.stats.audio_buffer_fill_pct))
                                 .color(if state.stats.audio_buffer_fill_pct < 5.0 { egui::Color32::RED } else if state.stats.audio_buffer_fill_pct > 95.0 { egui::Color32::YELLOW } else { egui::Color32::GREEN })

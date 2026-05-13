@@ -65,7 +65,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // --- CRT barrel distortion ---
     let crt_uv = in.uv * 2.0 - 1.0;
     let r2 = dot(crt_uv, crt_uv);
-    let distorted = crt_uv * (1.0 + r2 * 0.08);
+    // Reduced from 0.08 to 0.03 for a more subtle bend
+    let distorted = crt_uv * (1.0 + r2 * 0.03);
     let uv = distorted * 0.5 + 0.5;
 
     // Outside the CRT tube → pure black
