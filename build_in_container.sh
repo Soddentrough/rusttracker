@@ -47,6 +47,6 @@ cp AppRun.template AppDir/AppRun
 chmod +x AppDir/AppRun
 
 echo 'Building final AppImage...'
-APPIMAGE_EXTRACT_AND_RUN=1 ./appimagetool-x86_64.AppImage AppDir RustTracker-SteamDeck-v0.8.8.AppImage
+APPIMAGE_EXTRACT_AND_RUN=1 ./appimagetool-x86_64.AppImage AppDir RustTracker-SteamDeck-v0.8.9.AppImage
 
 echo 'Done!'
