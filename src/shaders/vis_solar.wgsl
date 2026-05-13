@@ -9,6 +9,17 @@ const HIT_THRESHOLD: f32 = 0.01;
 const NORMAL_EPS: f32 = 0.01;
 const HDR_WHITE: f32 = 5.0;
 
+var<private> g_flare_rot1_s: array<f32, 12>;
+var<private> g_flare_rot1_c: array<f32, 12>;
+var<private> g_flare_rot2_s: array<f32, 12>;
+var<private> g_flare_rot2_c: array<f32, 12>;
+var<private> g_flare_rot3_s: array<f32, 12>;
+var<private> g_flare_rot3_c: array<f32, 12>;
+var<private> g_flare_loop_height: array<f32, 12>;
+var<private> g_flare_loop_thick: array<f32, 12>;
+var<private> g_flare_ex1: array<f32, 12>;
+var<private> g_flare_ex2: array<f32, 12>;
+
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
@@ -104,16 +115,11 @@ fn get_flare_dist(p: vec3<f32>, full_detail: bool) -> f32 {
     var flare_d = 100.0;
     // Reduce flare count from 24 to 12 for performance
     for (var i = 0u; i < 12u; i++) {
-        let vu = get_vu(i % 12u);
         let seed = f32(i) * 123.45;
         
-        let angle1 = hash(seed) * 6.28 + audio.time * 0.05 * (hash(seed+1.0)*2.0-1.0); 
-        let angle2 = (hash(seed + 2.0) - 0.5) * 3.14; 
-        let angle3 = hash(seed + 3.0) * 6.28; 
-        
-        let s1 = sin(angle1); let c1 = cos(angle1);
-        let s2 = sin(angle2); let c2 = cos(angle2);
-        let s3 = sin(angle3); let c3 = cos(angle3);
+        let s1 = g_flare_rot1_s[i]; let c1 = g_flare_rot1_c[i];
+        let s2 = g_flare_rot2_s[i]; let c2 = g_flare_rot2_c[i];
+        let s3 = g_flare_rot3_s[i]; let c3 = g_flare_rot3_c[i];
         
         var lp = p;
         lp = vec3<f32>(lp.x * c1 + lp.z * s1, lp.y, -lp.x * s1 + lp.z * c1);
@@ -122,8 +128,8 @@ fn get_flare_dist(p: vec3<f32>, full_detail: bool) -> f32 {
         
         lp.x -= BASE_RADIUS - 0.02;
         
-        let loop_height = 0.08 + vu * 0.4;
-        let loop_thick = 0.015 + vu * 0.02;
+        let loop_height = g_flare_loop_height[i];
+        let loop_thick = g_flare_loop_thick[i];
         
         // BOUNDING VOLUME: Only evaluate expensive 3D noise if the ray is close to the flare
         var t_dist = sdTorus(lp, vec2<f32>(loop_height, loop_thick));
@@ -132,16 +138,14 @@ fn get_flare_dist(p: vec3<f32>, full_detail: bool) -> f32 {
             t_dist -= plasma_noise * 0.035;
         }
         
-        let t_shoot1 = fract(audio.time * 0.4 + seed);
-        let ex1 = t_shoot1 * (0.8 + vu * 1.5); 
+        let ex1 = g_flare_ex1[i]; 
         let ejecta_p1 = lp - vec3<f32>(ex1, (hash(seed+4.0)-0.5)*ex1, (hash(seed+5.0)-0.5)*ex1);
         var ejecta_dist1 = length(ejecta_p1) - 0.015;
         if full_detail && ejecta_dist1 < 0.1 {
             ejecta_dist1 -= snoise3(ejecta_p1 * 15.0) * 0.02; // Single octave noise for ejecta
         }
 
-        let t_shoot2 = fract(audio.time * 0.6 + seed * 1.3);
-        let ex2 = t_shoot2 * (0.6 + vu * 2.0);
+        let ex2 = g_flare_ex2[i];
         let ejecta_p2 = lp - vec3<f32>(ex2, (hash(seed+6.0)-0.5)*ex2, (hash(seed+7.0)-0.5)*ex2);
         var ejecta_dist2 = length(ejecta_p2) - 0.01;
         if full_detail && ejecta_dist2 < 0.1 {
@@ -154,6 +158,30 @@ fn get_flare_dist(p: vec3<f32>, full_detail: bool) -> f32 {
         flare_d = min(flare_d, obj);
     }
     return flare_d;
+}
+
+fn setup_flares() {
+    for (var i = 0u; i < 12u; i++) {
+        let vu = get_vu(i % 12u);
+        let seed = f32(i) * 123.45;
+        
+        let angle1 = hash(seed) * 6.28 + audio.time * 0.05 * (hash(seed+1.0)*2.0-1.0); 
+        let angle2 = (hash(seed + 2.0) - 0.5) * 3.14; 
+        let angle3 = hash(seed + 3.0) * 6.28; 
+        
+        g_flare_rot1_s[i] = sin(angle1); g_flare_rot1_c[i] = cos(angle1);
+        g_flare_rot2_s[i] = sin(angle2); g_flare_rot2_c[i] = cos(angle2);
+        g_flare_rot3_s[i] = sin(angle3); g_flare_rot3_c[i] = cos(angle3);
+        
+        g_flare_loop_height[i] = 0.08 + vu * 0.4;
+        g_flare_loop_thick[i] = 0.015 + vu * 0.02;
+        
+        let t_shoot1 = fract(audio.time * 0.4 + seed);
+        g_flare_ex1[i] = t_shoot1 * (0.8 + vu * 1.5); 
+        
+        let t_shoot2 = fract(audio.time * 0.6 + seed * 1.3);
+        g_flare_ex2[i] = t_shoot2 * (0.6 + vu * 2.0);
+    }
 }
 
 fn map(p: vec3<f32>, full_detail: bool) -> f32 {
@@ -194,6 +222,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let dx = abs(dpdx(in.uv.x));
     if (dx > 0.0001 && dy > 0.0001) { aspect = dy / dx; }
     let p = vec2<f32>(uv.x * aspect, -uv.y);
+
+    setup_flares();
 
     // Camera
     let ro = vec3<f32>(0.0, 0.0, 11.0);

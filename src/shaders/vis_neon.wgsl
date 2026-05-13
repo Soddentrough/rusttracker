@@ -14,6 +14,7 @@ const MAX_AMBIENTS: u32 = 7u;
 // Per-invocation frame state (set once in fs_main, read everywhere)
 var<private> g_frame_pos: array<vec3<f32>, 5>;
 var<private> g_frame_light: array<vec3<f32>, 5>;
+var<private> g_frame_dist: array<f32, 5>;
 var<private> g_frame_w: f32;
 var<private> g_num_frames: u32;
 
@@ -85,7 +86,7 @@ fn fbm(p_in: vec3<f32>) -> f32 {
     var p = p_in;
     var f = 0.0;
     var amp = 0.5;
-    for(var i=0; i<4; i++) {  // 4 octaves (was 5 — negligible visual diff in dark smoke)
+    for(var i=0; i<4; i++) {  // Restore to 4 octaves for smoke detail
         f += amp * noise(p);
         p *= 2.1;
         amp *= 0.5;
@@ -120,11 +121,9 @@ fn sdBox(p: vec3<f32>, b: vec3<f32>) -> f32 {
 }
 
 fn sdFrame(p: vec3<f32>, w: f32, h: f32, t: f32) -> f32 {
-    let b1 = sdBox(p - vec3<f32>(0.0, h, 0.0), vec3<f32>(w, t, t));
-    let b2 = sdBox(p - vec3<f32>(0.0, -h, 0.0), vec3<f32>(w, t, t));
-    let b3 = sdBox(p - vec3<f32>(-w, 0.0, 0.0), vec3<f32>(t, h+t, t));
-    let b4 = sdBox(p - vec3<f32>(w, 0.0, 0.0), vec3<f32>(t, h+t, t));
-    return min(min(b1, b2), min(b3, b4));
+    let d_out = sdBox(p, vec3<f32>(w+t, h+t, t));
+    let d_in = sdBox(p, vec3<f32>(w-t, h-t, t * 2.0));
+    return max(d_out, -d_in);
 }
 
 // Returns (distance, material_id).  mat_id: -1=floor, 0=wall/ceil, 1..N=frame index (1-based)
@@ -145,6 +144,7 @@ fn map_scene(p: vec3<f32>) -> vec2<f32> {
     // Test all active frames
     for (var i = 0u; i < g_num_frames; i++) {
         let d_f = sdFrame(p - g_frame_pos[i], g_frame_w, FRAME_HALF_HEIGHT, FRAME_THICKNESS);
+        g_frame_dist[i] = d_f;
         if (d_f < best_d) {
             best_d = d_f;
             best_mat = f32(i) + 1.0; // 1-based frame index
@@ -168,9 +168,9 @@ fn get_smoke_density(p: vec3<f32>, time: f32, audio_activity: f32) -> f32 {
     let dist = length(p - center);
 
     // Early-out: skip FBM outside the smoke bounding volume
-    if (dist > 6.0 || p.y > 3.0) { return 0.0; }
+    if (dist > 5.5 || p.y > 3.0) { return 0.0; }
 
-    var mask = smoothstep(6.0, 0.0, dist);
+    var mask = smoothstep(5.5, 2.0, dist);
     mask *= smoothstep(3.0, -1.0, p.y);
 
     if (mask < 0.01) { return 0.0; }
@@ -179,7 +179,7 @@ fn get_smoke_density(p: vec3<f32>, time: f32, audio_activity: f32) -> f32 {
     let n = fbm(np);
 
     // Higher threshold (0.45) to create distinct wispy chunks
-    var dens = (n - 0.45) * (4.0 + audio_activity * 5.0);
+    var dens = (n - 0.45) * (2.5 + audio_activity * 3.0);
     return max(dens, 0.0) * mask;
 }
 
@@ -323,7 +323,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
         // Accumulate bloom from all neon frames (smooth, no Voronoi seams)
         for (var f = 0u; f < g_num_frames; f++) {
-            let d_f = sdFrame(p_hit - g_frame_pos[f], g_frame_w, FRAME_HALF_HEIGHT, FRAME_THICKNESS);
+            let d_f = g_frame_dist[f];
             neon_glow += g_frame_light[f] * 0.03 / (1.0 + d_f * d_f * 20.0);
         }
 

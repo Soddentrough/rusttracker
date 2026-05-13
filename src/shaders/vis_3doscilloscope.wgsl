@@ -128,8 +128,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let float_idx = (hit_x + 9.6) / 19.2 * 1023.0;
             let idx = i32(round(float_idx));
             
-            let start_idx = max(0, idx - 4);
-            let end_idx = min(1022, idx + 4);
+            let start_idx = max(0, idx - 2);
+            let end_idx = min(1022, idx + 2);
             
             var min_dist = 1000.0;
             
