@@ -1648,7 +1648,8 @@ impl<'a> VulkanEngine<'a> {
                                                             kb_shortcut("q / esc", "Quit");
                                                             kb_shortcut("f", "Toggle Fullscreen");
                                                             kb_shortcut("g", "Toggle GPU FFT");
-                                                            kb_shortcut("ctrl+L/R", "Prev/Next Track");
+                                                            let ctrl_mod = if std::env::consts::OS == "macos" { "⌘" } else { "ctrl+" };
+                                                            kb_shortcut(&format!("{}L/R", ctrl_mod), "Prev/Next Track");
                                                             kb_shortcut("[ / ]", "Scale Panels");
                                                             kb_shortcut("h", "Toggle Help");
                                                         });
