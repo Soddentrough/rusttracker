@@ -420,6 +420,7 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                     let time_scale = dt * 60.0; // Decay logic built for 60fps
                     let fps = if raw_dt > 0.0 { 1.0 / raw_dt } else { 0.0 };
 
+                    let phase_timer = Instant::now();
                     {
                         let mut state = app_state.lock().unwrap();
                         state.current_fps = state.current_fps * 0.9 + fps * 0.1;
@@ -514,31 +515,40 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
 
                         engine.update(&state);
                     }
+                    let phase_lock_update_us = phase_timer.elapsed().as_micros() as f32;
 
-                    let state_copy = {
-                        app_state.lock().unwrap().clone()
+                    // Create a lightweight snapshot for render (skips ~1.3 MB of audio data)
+                    // and drain gamepad events in the same lock acquisition
+                    let snapshot_timer = Instant::now();
+                    let (state_copy, gamepad_events) = {
+                        let mut state = app_state.lock().unwrap();
+                        let events = state.egui_gamepad_events.clone();
+                        state.egui_gamepad_events.clear();
+                        (state.render_snapshot(), events)
                     };
+                    let phase_snapshot_us = snapshot_timer.elapsed().as_micros() as f32;
 
                     let mut action = EngineAction::None;
                     let mut ui_time = 0.0;
                     let mut render_time = 0.0;
                     let mut fire_time = None;
                     let mut fft_time = None;
-                    
-                    let gamepad_events = {
-                        let mut state = app_state.lock().unwrap();
-                        let events = state.egui_gamepad_events.clone();
-                        state.egui_gamepad_events.clear();
-                        events
-                    };
+                    let mut vis_shader_time = None;
+                    let mut phase_surface_us = 0.0f32;
+                    let mut phase_egui_us = 0.0f32;
+                    let mut phase_encode_us = 0.0f32;
 
                     match engine.render(&window, &egui_ctx, &mut egui_state, &state_copy, &mut file_dialog, gamepad_events) {
-                            Ok((res, ui_el, ren_el, fire_el, fft_el)) => {
+                            Ok((res, ui_el, ren_el, fire_el, fft_el, vis_el, surf, egui_l, enc, _sub)) => {
                                 action = res.clone();
                                 ui_time = ui_el;
                                 render_time = ren_el;
                                 fire_time = fire_el;
                                 fft_time = fft_el;
+                                vis_shader_time = vis_el;
+                                phase_surface_us = surf;
+                                phase_egui_us = egui_l;
+                                phase_encode_us = enc;
                             },
                             Err(wgpu::SurfaceStatus::Lost) => engine.resize(engine.size),
                             Err(wgpu::SurfaceStatus::Outdated) => engine.resize(engine.size),
@@ -546,65 +556,76 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                             Err(e) => eprintln!("Surface error: {:?}", e),
                         }
                         
-                    if ui_time > 0.0 || render_time > 0.0 {
-                        let mut state = app_state.lock().unwrap();
-                        state.stats.ui_us = state.stats.ui_us * 0.9 + ui_time * 0.1;
-                        state.stats.render_us = state.stats.render_us * 0.9 + render_time * 0.1;
-                        if let Some(sh) = fire_time {
-                            state.stats.fire_us = state.stats.fire_us * 0.9 + sh * 0.1;
-                            state.stats.shader_us = state.stats.fire_us; // Keep alias updated for existing code
-                        }
-                        if let Some(ft) = fft_time {
-                            state.stats.gpu_fft_us = state.stats.gpu_fft_us * 0.9 + ft * 0.1;
-                        }
-                    }
-                    
-                    if let EngineAction::Seek(pct) = action {
-                        let mut state = app_state.lock().unwrap();
-                        let target = (state.duration_seconds * pct as f64).clamp(0.0, state.duration_seconds);
-                        state.seek_request = Some(target);
-                        state.spectrum_history.clear();
-                        for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
-                    } else if action == EngineAction::OpenFile {
-                        let mut state = app_state.lock().unwrap();
-                        state.open_file_request = true;
-                    } else if let EngineAction::LoadFiles(paths, append) = action {
-                        let mut state = app_state.lock().unwrap();
-                        if append && !state.playlist.is_empty() {
-                            state.playlist.extend(paths);
-                        } else {
-                            if !paths.is_empty() {
-                                state.playlist = paths;
-                                state.playlist_index = 0;
-                                state.load_request = Some(state.playlist[0].clone());
-                            }
-                        }
-                        state.file_loaded = true;
-                        state.is_file_picker_open = false;
-                    } else if let EngineAction::SetAppendToPlaylist(val) = action {
-                        let mut state = app_state.lock().unwrap();
-                        state.append_to_playlist = val;
-                    } else if let EngineAction::SetForceStereo(val) = action {
-                        let mut state = app_state.lock().unwrap();
-                        state.force_stereo_downmix = val;
-                    } else if let EngineAction::SetSplitRatio(val) = action {
-                        let mut state = app_state.lock().unwrap();
-                        state.panel_split_ratio = val;
-                    }
-
-                    {
-                        let mut state = app_state.lock().unwrap();
-                        state.is_file_picker_open = *file_dialog.state() != egui_file_dialog::DialogState::Closed;
-                    }
-                    
+                    // Consolidate all post-render state writes into a single lock
+                    let post_timer = Instant::now();
                     let mut trigger_picker = false;
                     {
                         let mut state = app_state.lock().unwrap();
+                        
+                        // Write back timing stats
+                        if ui_time > 0.0 || render_time > 0.0 {
+                            state.stats.ui_us = state.stats.ui_us * 0.9 + ui_time * 0.1;
+                            state.stats.render_us = state.stats.render_us * 0.9 + render_time * 0.1;
+                            if let Some(sh) = fire_time {
+                                state.stats.fire_us = state.stats.fire_us * 0.9 + sh * 0.1;
+                            }
+                            if let Some(vis) = vis_shader_time {
+                                state.stats.shader_us = state.stats.shader_us * 0.9 + vis * 0.1;
+                            }
+                            if let Some(ft) = fft_time {
+                                state.stats.gpu_fft_us = state.stats.gpu_fft_us * 0.9 + ft * 0.1;
+                            }
+                        }
+                        
+                        // Process engine actions
+                        match action {
+                            EngineAction::Seek(pct) => {
+                                let target = (state.duration_seconds * pct as f64).clamp(0.0, state.duration_seconds);
+                                state.seek_request = Some(target);
+                                state.spectrum_history.clear();
+                                for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
+                            }
+                            EngineAction::OpenFile => {
+                                state.open_file_request = true;
+                            }
+                            EngineAction::LoadFiles(paths, append) => {
+                                if append && !state.playlist.is_empty() {
+                                    state.playlist.extend(paths);
+                                } else if !paths.is_empty() {
+                                    state.playlist = paths;
+                                    state.playlist_index = 0;
+                                    state.load_request = Some(state.playlist[0].clone());
+                                }
+                                state.file_loaded = true;
+                                state.is_file_picker_open = false;
+                            }
+                            EngineAction::SetAppendToPlaylist(val) => {
+                                state.append_to_playlist = val;
+                            }
+                            EngineAction::SetForceStereo(val) => {
+                                state.force_stereo_downmix = val;
+                            }
+                            EngineAction::SetSplitRatio(val) => {
+                                state.panel_split_ratio = val;
+                            }
+                            EngineAction::None => {}
+                        }
+                        
+                        // File picker state
+                        state.is_file_picker_open = *file_dialog.state() != egui_file_dialog::DialogState::Closed;
                         if state.open_file_request && !state.is_file_picker_open {
                             state.open_file_request = false;
                             state.is_file_picker_open = true;
                             trigger_picker = true;
                         }
+                        
+                        // Write phase timings
+                        state.stats.phase_lock_update_us = state.stats.phase_lock_update_us * 0.9 + phase_lock_update_us * 0.1;
+                        state.stats.phase_snapshot_us = state.stats.phase_snapshot_us * 0.9 + phase_snapshot_us * 0.1;
+                        state.stats.phase_surface_us = state.stats.phase_surface_us * 0.9 + phase_surface_us * 0.1;
+                        state.stats.phase_egui_layout_us = state.stats.phase_egui_layout_us * 0.9 + phase_egui_us * 0.1;
+                        state.stats.phase_encode_us = state.stats.phase_encode_us * 0.9 + phase_encode_us * 0.1;
+                        state.stats.phase_post_us = state.stats.phase_post_us * 0.9 + post_timer.elapsed().as_micros() as f32 * 0.1;
                     }
                     
                     if trigger_picker {

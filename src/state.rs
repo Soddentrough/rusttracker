@@ -20,6 +20,16 @@ pub struct PerformanceStats {
     pub audio_buffer_fill_pct: f32,
     pub video_buffer_fill_pct: f32,
     pub clipping_events: u32,
+    
+    // Fine-grained frame phase timings (microseconds)
+    pub phase_lock_update_us: f32,   // Main loop: lock + smoothing + engine.update()
+    pub phase_snapshot_us: f32,      // Main loop: render_snapshot() creation
+    pub phase_surface_us: f32,       // render(): get_current_texture()
+    pub phase_egui_layout_us: f32,   // render(): egui ctx.run() UI layout
+    pub phase_encode_us: f32,        // render(): GPU command encoding (compute + render passes)
+    #[allow(dead_code)]
+    pub phase_submit_us: f32,        // render(): queue.submit() + present
+    pub phase_post_us: f32,          // Main loop: post-render state writeback
 }
 
 #[derive(Clone)]
@@ -72,6 +82,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
     VisualizerDef { id: 8, name: "3D Freq Oscilloscope", filename: "vis_3doscilloscope_freq.wgsl", description: "3D topographical frequency view", requires_history: false, requires_fire: false, requires_resynth: true },
     VisualizerDef { id: 1, name: "Retro Fire", filename: "vis_flame.wgsl", description: "Demoscene pixel fire with CRT filter", requires_history: false, requires_fire: true, requires_resynth: false },
     VisualizerDef { id: 6, name: "Fire Simulation", filename: "vis_firesim.wgsl", description: "Multi-channel procedural fire simulation", requires_history: false, requires_fire: true, requires_resynth: false },
+    VisualizerDef { id: 9, name: "Solar Flare", filename: "vis_solar.wgsl", description: "Audio-reactive raymarched sun", requires_history: true, requires_fire: false, requires_resynth: false },
     VisualizerDef { id: 3, name: "Spatial Vectors", filename: "vis_spatial.wgsl", description: "Multi-channel spatial audio map", requires_history: false, requires_fire: false, requires_resynth: false },
     VisualizerDef { id: 4, name: "Chrome Ferrofluid", filename: "vis_ferrofluid.wgsl", description: "Raymarched liquid metal simulation", requires_history: false, requires_fire: false, requires_resynth: false },
     VisualizerDef { id: 5, name: "Neon Corridor", filename: "vis_neon.wgsl", description: "Raymarched neon sci-fi tunnel", requires_history: false, requires_fire: false, requires_resynth: false },
@@ -215,6 +226,79 @@ impl AppState {
             panel_split_ratio: 0.5,
             gamepad_type: if is_steam_deck { GamepadType::SteamDeck } else { GamepadType::Xbox },
             has_gamepad: is_steam_deck,
+        }
+    }
+    
+    /// Create a lightweight clone for the render pass, skipping heavy audio data fields
+    /// that are only consumed by engine.update() (which runs under the mutex lock).
+    /// This saves ~1.3 MB of deep copies per frame vs a full .clone().
+    pub fn render_snapshot(&self) -> Self {
+        AppState {
+            song_title: self.song_title.clone(),
+            artist: self.artist.clone(),
+            module_type: self.module_type.clone(),
+            duration_seconds: self.duration_seconds,
+            current_seconds: self.current_seconds,
+            seek_request: None,
+            seek_epoch: self.seek_epoch,
+            is_paused: self.is_paused,
+            bpm: self.bpm,
+            speed: self.speed,
+            num_channels: self.num_channels,
+            hardware_channels: self.hardware_channels,
+            raw_channel_vus: Vec::new(),         // Only used in main.rs smoothing (under lock)
+            channel_vus: self.channel_vus.clone(), // Small, needed for VU meters
+            peak_vus: self.peak_vus.clone(),       // Small, needed for VU meters
+            raw_spectrum_data: Vec::new(),         // Only used in main.rs smoothing (under lock)
+            spectrum_data: Vec::new(),             // Only used in engine.update() (under lock)
+            spectrum_peaks: Vec::new(),            // Only used in engine.update() (under lock)
+            spectrum_history: {
+                // Render only checks .len() and [0].len() — provide minimal metadata
+                let mut sh = VecDeque::new();
+                if let Some(first) = self.spectrum_history.front() {
+                    sh.push_back(vec![0.0; first.len()]);
+                }
+                sh
+            },
+            waveform_history: VecDeque::new(),     // Only used in engine.update() (under lock)
+            raw_waveform: Vec::new(),              // Only used in main.rs smoothing (under lock)
+            raw_audio_channels: Vec::new(),        // ~1 MB, only used in engine.update()
+            fire_heat: Vec::new(),                 // Only used in engine.update() (under lock)
+            show_hud: self.show_hud,
+            gpu_fft: self.gpu_fft,
+            max_frequency: self.max_frequency,
+            num_samples: self.num_samples,
+            num_instruments: self.num_instruments,
+            num_patterns: self.num_patterns,
+            current_tracker_order: self.current_tracker_order,
+            current_tracker_row: self.current_tracker_row,
+            tracker_row_history: self.tracker_row_history.clone(),
+            current_tracker_row_string: self.current_tracker_row_string.clone(),
+            tracker_patterns_by_order: self.tracker_patterns_by_order.clone(),
+            tracker_channels: self.tracker_channels,
+            load_request: None,
+            video_mode: self.video_mode,
+            file_loaded: self.file_loaded,
+            video_info: self.video_info.clone(),
+            show_stats: self.show_stats,
+            show_help: self.show_help,
+            stats: self.stats.clone(),
+            current_fps: self.current_fps,
+            playlist: self.playlist.clone(),
+            playlist_index: self.playlist_index,
+            track_ended: self.track_ended,
+            visualizer_mode: self.visualizer_mode,
+            current_visualizer_idx: self.current_visualizer_idx,
+            video_frame_rx: self.video_frame_rx.clone(),
+            free_video_frame_tx: self.free_video_frame_tx.clone(),
+            is_file_picker_open: self.is_file_picker_open,
+            open_file_request: false,
+            egui_gamepad_events: Vec::new(),
+            force_stereo_downmix: self.force_stereo_downmix,
+            append_to_playlist: self.append_to_playlist,
+            panel_split_ratio: self.panel_split_ratio,
+            gamepad_type: self.gamepad_type,
+            has_gamepad: self.has_gamepad,
         }
     }
 }

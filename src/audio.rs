@@ -1436,6 +1436,8 @@ where
     let mut fft_buffer: Vec<f32> = vec![0.0; 8192];
     let mut channel_fft_buffers: Vec<Vec<f32>> = vec![vec![0.0; 8192]; hardware_channels];
     let mut windowed_buffer: Vec<f32> = vec![0.0; 8192];
+    let mut windowed_channels: Vec<Vec<f32>> = vec![vec![0.0; 8192]; hardware_channels];
+    let mut spare_channels: Vec<Vec<f32>> = vec![vec![0.0; 8192]; hardware_channels];
     let mut fft_index = 0;
     
     let mut last_channel_vus = Vec::new();
@@ -1536,7 +1538,7 @@ where
                 }
             }
 
-            let mut windowed_channels = vec![vec![0.0; 8192]; hardware_channels];
+            // Re-use pre-allocated windowed_channels instead of heap-allocating per callback
             for i in 0..8192 {
                 let idx = (fft_index + i) % 8192;
                 windowed_buffer[i] = fft_buffer[idx];
@@ -1544,6 +1546,10 @@ where
                     windowed_channels[c][i] = channel_fft_buffers[c][idx];
                 }
             }
+            
+            // Swap filled buffers with spare set — zero allocations in the hot path
+            std::mem::swap(&mut windowed_channels, &mut spare_channels);
+            // spare_channels now has the filled data, windowed_channels has the empties
             
             let msg = DspMessage {
                 audio_data: windowed_buffer.clone(),
@@ -1554,7 +1560,7 @@ where
                 speed: last_speed,
                 current_seconds: last_current_seconds,
                 current_row_string: last_current_row_string.clone(),
-                channel_audio_data: windowed_channels,
+                channel_audio_data: std::mem::replace(&mut spare_channels, vec![vec![0.0; 8192]; hardware_channels]),
             };
             
             let _ = tx.try_send(msg);

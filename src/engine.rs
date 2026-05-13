@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use winit::window::Window;
 use crate::state::AppState;
 
@@ -151,7 +152,11 @@ pub struct VulkanEngine<'a> {
     uniform_bind_group: wgpu::BindGroup,
     pub egui_renderer: egui_wgpu::Renderer,
     timestamp_period: f32,
-    query_in_flight: bool,
+    timestamp_mapping_active: bool,
+    timestamp_map_complete: Arc<AtomicBool>,
+    cached_fft_us: Option<f32>,
+    cached_fire_us: Option<f32>,
+    cached_vis_us: Option<f32>,
     query_set: Option<wgpu::QuerySet>,
     query_resolve_buffer: Option<wgpu::Buffer>,
     query_read_buffer: Option<wgpu::Buffer>,
@@ -185,6 +190,10 @@ pub struct VulkanEngine<'a> {
     raw_audio_buffer: wgpu::Buffer,
     _gpu_spectrum_buffer: wgpu::Buffer,
     fft_params_buffer: wgpu::Buffer,
+    
+    // Pre-allocated buffers to avoid per-frame heap allocations
+    flat_raw_audio: Vec<f32>,
+    waveform_history_storage: WaveformHistoryStorage,
     
     // Video
     video_bind_group_layout: wgpu::BindGroupLayout,
@@ -401,6 +410,7 @@ impl<'a> VulkanEngine<'a> {
                 6 => include_str!("shaders/vis_firesim.wgsl"),
                 7 => include_str!("shaders/vis_3doscilloscope.wgsl"),
                 8 => include_str!("shaders/vis_3doscilloscope_freq.wgsl"),
+                9 => include_str!("shaders/vis_solar.wgsl"),
                 _ => include_str!("shaders/vis_spectrum.wgsl"),
             }
         };
@@ -764,20 +774,20 @@ impl<'a> VulkanEngine<'a> {
         if supports_timestamps {
             query_set = Some(device.create_query_set(&wgpu::QuerySetDescriptor {
                 label: Some("Shader Timestamps"),
-                count: 4, // 0-1 for FFT, 2-3 for Fire
+                count: 6, // 0-1 for FFT, 2-3 for Fire, 4-5 for Main Vis Render
                 ty: wgpu::QueryType::Timestamp,
             }));
 
             query_resolve_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Query Resolve Buffer"),
-                size: 32, // 4 * 8 bytes
+                size: 48, // 6 * 8 bytes
                 usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
                 mapped_at_creation: false,
             }));
 
             query_read_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some("Query Read Buffer"),
-                size: 32,
+                size: 48,
                 usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
                 mapped_at_creation: false,
             }));
@@ -900,7 +910,11 @@ impl<'a> VulkanEngine<'a> {
             query_resolve_buffer,
             query_read_buffer,
             timestamp_period,
-            query_in_flight: false,
+            timestamp_mapping_active: false,
+            timestamp_map_complete: Arc::new(AtomicBool::new(false)),
+            cached_fft_us: None,
+            cached_fire_us: None,
+            cached_vis_us: None,
             meters_uv_rect: [0.0; 4],
             heatmap_uv_rect: [0.0; 4],
             fire_uv_rect: [0.0; 4],
@@ -924,6 +938,8 @@ impl<'a> VulkanEngine<'a> {
             raw_audio_buffer,
             _gpu_spectrum_buffer: gpu_spectrum_buffer,
             fft_params_buffer,
+            flat_raw_audio: vec![0.0f32; 32 * 8192],
+            waveform_history_storage: WaveformHistoryStorage { waveforms: [[0.0; 1024]; 60] },
             video_bind_group_layout,
             video_pipeline,
             video_state: None,
@@ -1009,21 +1025,24 @@ impl<'a> VulkanEngine<'a> {
         // Only upload waveform history when the active visualizer requires it
         let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
         if vis_def.requires_history {
-            let mut history_storage = WaveformHistoryStorage {
-                waveforms: [[0.0; 1024]; 60],
-            };
+            // Re-use persistent storage to avoid 240KB stack allocation per frame
             // Upload only the 60 most recent frames
             let hist_len = state.waveform_history.len();
             let start = hist_len.saturating_sub(60);
             for (slot, wave) in state.waveform_history.iter().skip(start).enumerate().take(60) {
                 // Pre-smooth with [1,2,1] triangle kernel
-                history_storage.waveforms[slot][0] = (wave[0] * 3.0 + wave[1]) / 4.0;
+                self.waveform_history_storage.waveforms[slot][0] = (wave[0] * 3.0 + wave[1]) / 4.0;
                 for j in 1..1023 {
-                    history_storage.waveforms[slot][j] = (wave[j - 1] + wave[j] * 2.0 + wave[j + 1]) / 4.0;
+                    self.waveform_history_storage.waveforms[slot][j] = (wave[j - 1] + wave[j] * 2.0 + wave[j + 1]) / 4.0;
                 }
-                history_storage.waveforms[slot][1023] = (wave[1022] + wave[1023] * 3.0) / 4.0;
+                self.waveform_history_storage.waveforms[slot][1023] = (wave[1022] + wave[1023] * 3.0) / 4.0;
             }
-            self.queue.write_buffer(&self.waveform_storage_buffer, 0, bytemuck::cast_slice(&[history_storage]));
+            // Zero out unused slots
+            let used_slots = state.waveform_history.len().min(60);
+            for slot in used_slots..60 {
+                self.waveform_history_storage.waveforms[slot] = [0.0; 1024];
+            }
+            self.queue.write_buffer(&self.waveform_storage_buffer, 0, bytemuck::cast_slice(&[self.waveform_history_storage]));
         }
         
         if vis_def.requires_fire {
@@ -1069,12 +1088,15 @@ impl<'a> VulkanEngine<'a> {
 
         if state.gpu_fft {
             let num_channels = state.raw_audio_channels.len().min(32);
-            let mut flat_raw_audio = vec![0.0f32; 32 * 8192];
-            for (c, channel_data) in state.raw_audio_channels.iter().take(32).enumerate() {
+            // Re-use pre-allocated buffer; only zero and fill active channels
+            self.flat_raw_audio.fill(0.0);
+            for (c, channel_data) in state.raw_audio_channels.iter().take(num_channels).enumerate() {
                 let len = channel_data.len().min(8192);
-                flat_raw_audio[(c * 8192)..(c * 8192 + len)].copy_from_slice(&channel_data[..len]);
+                self.flat_raw_audio[(c * 8192)..(c * 8192 + len)].copy_from_slice(&channel_data[..len]);
             }
-            self.queue.write_buffer(&self.raw_audio_buffer, 0, bytemuck::cast_slice(&flat_raw_audio));
+            // Only upload the active channels' data instead of the full 32-channel buffer
+            let upload_size = num_channels.max(1) * 8192;
+            self.queue.write_buffer(&self.raw_audio_buffer, 0, bytemuck::cast_slice(&self.flat_raw_audio[..upload_size]));
 
             let fft_params = FFTParams {
                 num_channels: num_channels as u32,
@@ -1216,8 +1238,9 @@ impl<'a> VulkanEngine<'a> {
         state: &AppState,
         file_dialog: &mut egui_file_dialog::FileDialog,
         gamepad_events: Vec<egui::Event>
-    ) -> Result<(EngineAction, f32, f32, Option<f32>, Option<f32>), wgpu::SurfaceStatus> {
+    ) -> Result<(EngineAction, f32, f32, Option<f32>, Option<f32>, Option<f32>, f32, f32, f32, f32), wgpu::SurfaceStatus> {
         let ui_start = std::time::Instant::now();
+        let surface_start = std::time::Instant::now();
         let output = self.surface.get_current_texture();
         let surface_texture = match output {
             wgpu::CurrentSurfaceTexture::Success(tex) | wgpu::CurrentSurfaceTexture::Suboptimal(tex) => tex,
@@ -1227,16 +1250,20 @@ impl<'a> VulkanEngine<'a> {
             _ => return Err(wgpu::SurfaceStatus::Lost),
         };
         let view = surface_texture.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let phase_surface_us = surface_start.elapsed().as_micros() as f32;
 
-        let mut fft_shader_time_us = None;
-        let mut fire_shader_time_us = None;
-        if self.query_in_flight {
-            if let Some(read_buffer) = &self.query_read_buffer {
-                let slice = read_buffer.slice(..);
-                let (tx, rx) = std::sync::mpsc::channel();
-                slice.map_async(wgpu::MapMode::Read, move |v| tx.send(v).unwrap());
-                self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
-                if rx.recv().unwrap().is_ok() {
+        let mut fft_shader_time_us = self.cached_fft_us;
+        let mut fire_shader_time_us = self.cached_fire_us;
+        let mut vis_shader_time_us = self.cached_vis_us;
+        
+        // NON-BLOCKING timestamp readback: poll without waiting, check if mapping completed
+        if self.timestamp_mapping_active {
+            // Non-blocking poll to process any completed GPU work
+            let _ = self.device.poll(wgpu::PollType::Poll);
+            
+            if self.timestamp_map_complete.load(Ordering::Acquire) {
+                if let Some(read_buffer) = &self.query_read_buffer {
+                    let slice = read_buffer.slice(..);
                     let data = slice.get_mapped_range();
                     
                     let fft_start: u64 = u64::from_le_bytes(data[0..8].try_into().unwrap());
@@ -1244,6 +1271,7 @@ impl<'a> VulkanEngine<'a> {
                     if fft_end > fft_start {
                         let elapsed_ns = (fft_end - fft_start) as f32 * self.timestamp_period;
                         fft_shader_time_us = Some(elapsed_ns / 1_000.0);
+                        self.cached_fft_us = fft_shader_time_us;
                     }
 
                     let fire_start: u64 = u64::from_le_bytes(data[16..24].try_into().unwrap());
@@ -1251,13 +1279,23 @@ impl<'a> VulkanEngine<'a> {
                     if fire_end > fire_start {
                         let elapsed_ns = (fire_end - fire_start) as f32 * self.timestamp_period;
                         fire_shader_time_us = Some(elapsed_ns / 1_000.0);
+                        self.cached_fire_us = fire_shader_time_us;
+                    }
+
+                    let vis_start: u64 = u64::from_le_bytes(data[32..40].try_into().unwrap());
+                    let vis_end: u64 = u64::from_le_bytes(data[40..48].try_into().unwrap());
+                    if vis_end > vis_start {
+                        let elapsed_ns = (vis_end - vis_start) as f32 * self.timestamp_period;
+                        vis_shader_time_us = Some(elapsed_ns / 1_000.0);
+                        self.cached_vis_us = vis_shader_time_us;
                     }
 
                     drop(data);
                     read_buffer.unmap();
-                    self.query_in_flight = false;
+                    self.timestamp_mapping_active = false;
                 }
             }
+            // If mapping not yet complete, we use cached values from last successful read
         }
 
         // Process egui UI
@@ -1320,28 +1358,39 @@ impl<'a> VulkanEngine<'a> {
                                 .color(egui::Color32::LIGHT_GREEN)
                         );
                         ui.label(
-                            egui::RichText::new(format!("UI: {:.2} ms | Render: {:.2} ms", state.stats.ui_us / 1000.0, state.stats.render_us / 1000.0))
-                                .color(egui::Color32::GRAY)
+                            egui::RichText::new(format!("CPU UI: {:.2} ms | CPU Render: {:.2} ms", state.stats.ui_us / 1000.0, state.stats.render_us / 1000.0))
+                                .color(egui::Color32::WHITE)
                         );
                         if state.gpu_fft {
                             ui.label(
-                                egui::RichText::new(format!("GPU FFT: {:.2} ms | Decode: {:.2} ms", state.stats.gpu_fft_us / 1000.0, state.stats.decode_us / 1000.0))
+                                egui::RichText::new(format!("GPU FFT: {:.2} ms", state.stats.gpu_fft_us / 1000.0))
                                     .color(egui::Color32::LIGHT_BLUE)
+                            );
+                            ui.label(
+                                egui::RichText::new(format!("CPU Decode: {:.2} ms", state.stats.decode_us / 1000.0))
+                                    .color(egui::Color32::WHITE)
                             );
                         } else {
                             ui.label(
-                                egui::RichText::new(format!("CPU FFT: {:.2} ms | Decode: {:.2} ms", state.stats.fft_us / 1000.0, state.stats.decode_us / 1000.0))
-                                    .color(egui::Color32::GRAY)
+                                egui::RichText::new(format!("CPU FFT: {:.2} ms", state.stats.fft_us / 1000.0))
+                                    .color(egui::Color32::WHITE)
+                            );
+                            ui.label(
+                                egui::RichText::new(format!("CPU Decode: {:.2} ms", state.stats.decode_us / 1000.0))
+                                    .color(egui::Color32::WHITE)
                             );
                         }
                         ui.label(
-                            egui::RichText::new(format!("Shader: {:.2} ms", state.stats.shader_us / 1000.0))
-                                .color(egui::Color32::GRAY)
+                            egui::RichText::new(format!("Visualization Shader (GPU): {:.2} ms", state.stats.shader_us / 1000.0))
+                                .color(egui::Color32::LIGHT_BLUE)
                         );
-                        ui.label(
-                            egui::RichText::new("Fire FX: 0.00 ms (GPU Offloaded)")
-                                .color(egui::Color32::GRAY)
-                        );
+                        let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
+                        if vis_def.requires_fire {
+                            ui.label(
+                                egui::RichText::new(format!("Fire Compute (GPU): {:.2} ms", state.stats.fire_us / 1000.0))
+                                    .color(egui::Color32::LIGHT_BLUE)
+                            );
+                        }
                         ui.label(
                             egui::RichText::new(format!("Audio Buffer: {:.1}%", state.stats.audio_buffer_fill_pct))
                                 .color(if state.stats.audio_buffer_fill_pct < 5.0 { egui::Color32::RED } else if state.stats.audio_buffer_fill_pct > 95.0 { egui::Color32::YELLOW } else { egui::Color32::GREEN })
@@ -1353,6 +1402,33 @@ impl<'a> VulkanEngine<'a> {
                             );
                         }
                         ui.separator();
+                        ui.label(
+                            egui::RichText::new("⏱ Frame Phase Breakdown:")
+                                .color(egui::Color32::from_rgb(180, 180, 255))
+                                .strong()
+                        );
+                        let phases = [
+                            ("  Lock+Update", state.stats.phase_lock_update_us),
+                            ("  Snapshot", state.stats.phase_snapshot_us),
+                            ("  Surface Acq", state.stats.phase_surface_us),
+                            ("  Egui Layout", state.stats.phase_egui_layout_us),
+                            ("  GPU Encode", state.stats.phase_encode_us),
+                            ("  Post Write", state.stats.phase_post_us),
+                        ];
+                        let total_phases: f32 = phases.iter().map(|(_, v)| v).sum();
+                        for (name, val) in &phases {
+                            let color = if *val > 2000.0 { egui::Color32::RED }
+                                       else if *val > 1000.0 { egui::Color32::YELLOW } 
+                                       else { egui::Color32::from_rgb(160, 160, 160) };
+                            ui.label(
+                                egui::RichText::new(format!("{}: {:.2} ms", name, val / 1000.0))
+                                    .color(color)
+                            );
+                        }
+                        ui.label(
+                            egui::RichText::new(format!("  Total Phases: {:.2} ms", total_phases / 1000.0))
+                                .color(egui::Color32::from_rgb(180, 180, 255))
+                        );
                         ui.label(
                             egui::RichText::new(format!("Hardware Channels: {} | Source: {}", state.hardware_channels, state.num_channels))
                                 .color(if state.hardware_channels != state.num_channels { egui::Color32::YELLOW } else { egui::Color32::GRAY })
@@ -1421,12 +1497,15 @@ impl<'a> VulkanEngine<'a> {
             }
 
             let mut append = state.append_to_playlist;
-            file_dialog.update_with_right_panel_ui(ctx, &mut |ui, _fd| {
-                ui.add_space(10.0);
-                ui.heading("Options");
-                ui.separator();
-                ui.checkbox(&mut append, "Add to Playlist instead of replacing");
-            });
+            // Only update the file dialog UI when it's actually open to avoid layout overhead
+            if state.is_file_picker_open || *file_dialog.state() != egui_file_dialog::DialogState::Closed {
+                file_dialog.update_with_right_panel_ui(ctx, &mut |ui, _fd| {
+                    ui.add_space(10.0);
+                    ui.heading("Options");
+                    ui.separator();
+                    ui.checkbox(&mut append, "Add to Playlist instead of replacing");
+                });
+            }
             if append != state.append_to_playlist {
                 engine_action = EngineAction::SetAppendToPlaylist(append);
             }
@@ -1863,54 +1942,44 @@ impl<'a> VulkanEngine<'a> {
                                                 let distance = offset.abs() as f32 / (num_rows_to_draw as f32 / 2.0);
                                                 let alpha = (1.0 - distance).max(0.0);
                                                 
-                                                let color = if offset == 0 {
-                                                    egui::Color32::WHITE
-                                                } else {
-                                                    egui::Color32::from_rgba_premultiplied(150, 150, 150, (alpha * 100.0) as u8)
-                                                };
                                                 let font_id = egui::FontId::monospace(12.0);
+                                                // Format once, reuse for all draws
+                                                let formatted = format!("{:02X}  {}", resolved_row, text);
+                                                let pos = egui::pos2(hm_rect.center().x, y);
                                                 
-                                                // Optional: highlight background of active row
                                                 if offset == 0 {
+                                                    // Active row: draw highlight background + bold text (2 calls instead of 4)
                                                     let rect = painter.text(
-                                                        egui::pos2(hm_rect.center().x, y),
+                                                        pos,
                                                         egui::Align2::CENTER_CENTER,
-                                                        format!("{:02X}  {}", resolved_row, text),
+                                                        &formatted,
                                                         font_id.clone(),
-                                                        egui::Color32::TRANSPARENT,
+                                                        egui::Color32::WHITE,
                                                     );
+                                                    // Draw background behind text
                                                     painter.rect_filled(
-                                                        rect.expand2(egui::vec2(10.0, 5.0)), // Taller highlight background
+                                                        rect.expand2(egui::vec2(10.0, 5.0)),
                                                         4.0,
                                                         egui::Color32::from_black_alpha(220)
                                                     );
-                                                    
-                                                    // Draw text with a sub-pixel vertical offset to simulate a taller/bolder weight
-                                                    // without altering the monospace character width/alignment
+                                                    // Redraw text on top of background
                                                     painter.text(
-                                                        egui::pos2(hm_rect.center().x, y - 0.5),
+                                                        pos,
                                                         egui::Align2::CENTER_CENTER,
-                                                        format!("{:02X}  {}", resolved_row, text),
-                                                        font_id.clone(),
-                                                        color
+                                                        &formatted,
+                                                        font_id,
+                                                        egui::Color32::WHITE,
                                                     );
+                                                } else {
+                                                    let color = egui::Color32::from_rgba_premultiplied(150, 150, 150, (alpha * 100.0) as u8);
                                                     painter.text(
-                                                        egui::pos2(hm_rect.center().x, y + 0.5),
+                                                        pos,
                                                         egui::Align2::CENTER_CENTER,
-                                                        format!("{:02X}  {}", resolved_row, text),
-                                                        font_id.clone(),
+                                                        &formatted,
+                                                        font_id,
                                                         color
                                                     );
                                                 }
-
-                                                // Draw text centered horizontally (base text)
-                                                painter.text(
-                                                    egui::pos2(hm_rect.center().x, y),
-                                                    egui::Align2::CENTER_CENTER,
-                                                    format!("{:02X}  {}", resolved_row, text),
-                                                    font_id,
-                                                    color
-                                                );
                                                 
                                                 // Pattern boundary indicator
                                                 if resolved_row == 0 {
@@ -2096,6 +2165,7 @@ impl<'a> VulkanEngine<'a> {
         };
         
         let ui_elapsed = ui_start.elapsed().as_micros() as f32;
+        let phase_egui_layout_us = ui_elapsed - phase_surface_us; // Egui layout = total UI - surface acquisition
         let render_start = std::time::Instant::now();
 
         let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -2210,7 +2280,11 @@ impl<'a> VulkanEngine<'a> {
                     },
                 })],
                 depth_stencil_attachment: None,
-                timestamp_writes: None, // Moved render timing to fire compute (2,3) to avoid overlapping/complex query sets. We don't trace render pass anymore.
+                timestamp_writes: self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites {
+                    query_set: qs,
+                    beginning_of_pass_write_index: Some(4),
+                    end_of_pass_write_index: Some(5),
+                }),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
@@ -2277,7 +2351,33 @@ impl<'a> VulkanEngine<'a> {
                 render_pass.set_viewport(0.0, 0.0, self.config.width as f32, self.config.height as f32, 0.0, 1.0);
                 render_pass.set_pipeline(&self.hud_pipeline);
                 render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-                render_pass.draw(0..3, 0..1);
+                
+                let mut drawn = false;
+                let mut draw_rect = |r: Option<egui::Rect>| {
+                    if let Some(rect) = r {
+                        let x = ((rect.min.x * scale_factor).clamp(0.0, self.config.width as f32)).round() as u32;
+                        let y = ((rect.min.y * scale_factor).clamp(0.0, self.config.height as f32)).round() as u32;
+                        let max_w = (self.config.width as f32 - x as f32).max(1.0);
+                        let w = ((rect.width() * scale_factor).clamp(1.0, max_w)).round() as u32;
+                        let max_h = (self.config.height as f32 - y as f32).max(1.0);
+                        let h = ((rect.height() * scale_factor).clamp(1.0, max_h)).round() as u32;
+                        
+                        if w > 0 && h > 0 {
+                            render_pass.set_scissor_rect(x, y, w, h);
+                            render_pass.draw(0..3, 0..1);
+                            drawn = true;
+                        }
+                    }
+                };
+
+                draw_rect(out_meters_rect);
+                draw_rect(out_heatmap_rect);
+                draw_rect(out_fire_rect);
+
+                if !drawn {
+                    render_pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
+                    render_pass.draw(0..3, 0..1);
+                }
             }
         }
 
@@ -2301,10 +2401,15 @@ impl<'a> VulkanEngine<'a> {
             self.egui_renderer.render(&mut render_pass, &clipped_primitives, &screen_descriptor);
         }
 
-        if let (Some(qs), Some(res_buf), Some(read_buf)) = (&self.query_set, &self.query_resolve_buffer, &self.query_read_buffer) {
-            encoder.resolve_query_set(qs, 0..4, res_buf, 0);
-            encoder.copy_buffer_to_buffer(res_buf, 0, read_buf, 0, 32);
-            self.query_in_flight = true;
+        // Resolve timestamp queries into the resolve buffer, then copy to the read buffer.
+        // ONLY do this when no mapping is pending — wgpu will panic if we copy to a buffer
+        // that has an active or pending map operation.
+        let should_start_mapping = !self.timestamp_mapping_active && self.query_set.is_some();
+        if should_start_mapping {
+            if let (Some(qs), Some(res_buf), Some(read_buf)) = (&self.query_set, &self.query_resolve_buffer, &self.query_read_buffer) {
+                encoder.resolve_query_set(qs, 0..6, res_buf, 0);
+                encoder.copy_buffer_to_buffer(res_buf, 0, read_buf, 0, 48);
+            }
         }
 
         let do_capture = std::env::var("CAPTURE_FRAME").is_ok() && state.current_seconds >= 20.0;
@@ -2326,6 +2431,21 @@ impl<'a> VulkanEngine<'a> {
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
+        
+        // Start async timestamp mapping AFTER submit (non-blocking)
+        if should_start_mapping {
+            if let Some(read_buf) = &self.query_read_buffer {
+                let flag = self.timestamp_map_complete.clone();
+                flag.store(false, Ordering::Release);
+                let slice = read_buf.slice(..);
+                slice.map_async(wgpu::MapMode::Read, move |result| {
+                    if result.is_ok() {
+                        flag.store(true, Ordering::Release);
+                    }
+                });
+                self.timestamp_mapping_active = true;
+            }
+        }
         
         if let Some(rb) = readback_buffer {
             let slice = rb.slice(..);
@@ -2357,8 +2477,10 @@ impl<'a> VulkanEngine<'a> {
             self.egui_renderer.free_texture(id);
         }
         
-        let render_elapsed = render_start.elapsed().as_micros() as f32;
+        let submit_elapsed = render_start.elapsed().as_micros() as f32;
+        let phase_encode_us = submit_elapsed; // entire encode+submit block
 
-        Ok((engine_action, ui_elapsed, render_elapsed, fire_shader_time_us, fft_shader_time_us))
+        Ok((engine_action, ui_elapsed, submit_elapsed, fire_shader_time_us, fft_shader_time_us, vis_shader_time_us,
+             phase_surface_us, phase_egui_layout_us, phase_encode_us, 0.0))
     }
 }
