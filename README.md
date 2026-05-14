@@ -1,14 +1,26 @@
 # RustTracker 🎵
 
-![RustTracker UI](assets/screenshot.png)
+![RustTracker UI](assets/screenshot_ferrofluid.png)
 
 A high-performance, real-time audio visualizer and tracker module player built in Rust. 
 
 RustTracker leverages a **3-Thread DSP Architecture** and **Hardware-Accelerated Compute Shaders** to ensure zero-latency audio playback while simultaneously computing **GPU-accelerated Fast Fourier Transforms (FFT) on each spatial audio channel** to render beautiful, fluid visualizations at 120FPS.
 
+## Visualizations
+
+RustTracker includes a variety of WGPU-accelerated visualizations, combining classic demoscene aesthetics with modern procedural generation.
+
+| Photorealistic Ferrofluid | Multi-Channel 3D Fire |
+| :---: | :---: |
+| ![Ferrofluid](assets/screenshot_ferrofluid.png) | ![3D Fire](assets/screenshot_3dfire.png) |
+
+| CRT Oscilloscope | Frequency Spectrum |
+| :---: | :---: |
+| ![CRT](assets/screenshot_crt.png) | ![Spectrum](assets/screenshot_spectrum.png) |
+
 ## Features
 
-* **Advanced Visualizers:** High-fidelity, cinematic shaders (including a photorealistic Ferrofluid simulator, a dynamic multi-channel 3D Fire simulation, and retro CRT Oscilloscopes) mapped tightly to precise acoustic frequencies.
+* **Advanced Visualizers:** High-fidelity, cinematic shaders mapped tightly to precise acoustic frequencies.
 * **GPU-Accelerated FFT:** Offloads audio-reactive spatial weights directly to the GPU using WGPU compute shaders, mapping individual surround-sound speaker channels to local geometry in real-time.
 * **Cinematic Video Integration & HDR:** Features integrated hardware-accelerated video stream playback, rendering vibrant visual environments with HDR color precision.
 * **Real-time Tracker UI:** Seamlessly decodes and visualizes `.mod` files, rendering a classic piano-roll style pattern editor that aligns perfectly with the audio playback, complete with flawless cross-pattern scrolling and jumping.
