@@ -1,0 +1,9 @@
+[package]
+name = "scratch_bitstream"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+alsa = "0.11.0"
+anyhow = "1.0.102"
+ffmpeg-next = "8.1.0"

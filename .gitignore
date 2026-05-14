@@ -37,3 +37,5 @@ gdb_output.txt
 scratch.*
 test_*
 screenshot.png
+scratch_bitstream/target/
+scratch_bitstream_windows/target/

@@ -1,0 +1,31 @@
+name: Build Bitstream Tester (Windows)
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      
+    steps:
+    - uses: actions/checkout@v5
+    
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@stable
+      
+    - name: Build
+      working-directory: scratch_bitstream_windows
+      run: cargo build --release
+      
+    - name: Package
+      run: |
+        mkdir release
+        copy scratch_bitstream_windows\target\release\scratch_bitstream_windows.exe release\bitstream-tester.exe
+        
+    - name: Upload Artifact
+      uses: actions/upload-artifact@v5
+      with:
+        name: bitstream-tester-windows
+        path: release/bitstream-tester.exe
