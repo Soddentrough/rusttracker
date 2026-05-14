@@ -168,7 +168,7 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
     #[allow(unused_mut)]
     let mut attrs = winit::window::Window::default_attributes()
         .with_title("RustTracker Vulkan Visualizer")
-        .with_inner_size(winit::dpi::PhysicalSize::new(1920, 1080))
+        .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0))
         .with_window_icon(Some(window_icon));
         
     if is_fullscreen {
@@ -218,8 +218,14 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                        std::env::var("XDG_SESSION_DESKTOP").unwrap_or_default().to_lowercase() == "gamescope" ||
                        std::env::var("STEAM_DECK").is_ok();
 
+    #[cfg(windows)]
+    let initial_dir = std::path::PathBuf::from(std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".to_string()));
+    #[cfg(not(windows))]
+    let initial_dir = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".to_string()));
+
     let mut file_dialog = egui_file_dialog::FileDialog::new()
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+        .initial_directory(initial_dir)
         .add_file_filter_extensions("Audio/Video Files", vec!["flac", "wav", "mp3", "ogg", "aac", "m4a", "mp4", "mkv", "avi", "webm", "opus", "mod", "s3m", "xm", "it", "stm", "669", "mtm", "med", "okt", "psm", "dawproject", "aaf"])
         .default_file_filter("Audio/Video Files");
     let mut modifiers = winit::keyboard::ModifiersState::empty();
@@ -409,15 +415,7 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                     }
                 }
 
-                if response.consumed {
-                    return;
-                }
-
-                match event {
-                WindowEvent::CloseRequested => {
-                    elwt.exit();
-                }
-                WindowEvent::DroppedFile(path) => {
+                if let WindowEvent::DroppedFile(path) = &event {
                     let mut state = app_state.lock().unwrap();
                     let path_str = path.to_string_lossy().into_owned();
                     if state.playlist.is_empty() {
@@ -432,6 +430,15 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                         }
                     }
                     state.file_loaded = true;
+                }
+
+                if response.consumed {
+                    return;
+                }
+
+                match event {
+                WindowEvent::CloseRequested => {
+                    elwt.exit();
                 }
                 WindowEvent::Resized(physical_size) => {
                     engine.resize(*physical_size);
