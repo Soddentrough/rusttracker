@@ -1337,21 +1337,18 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
             })
             .collect();
             
-        // Prefer exact channel match, else prefer stereo, then prefer rate match
-        configs.sort_by(|a, b| {
-            let a_ch_match = a.channels() == target_channels;
-            let b_ch_match = b.channels() == target_channels;
-            if a_ch_match != b_ch_match { return b_ch_match.cmp(&a_ch_match); }
+        // Prefer exact channel match, else prefer stereo, then prefer rate match, then prefer most channels
+        configs.sort_by_key(|c| {
+            let ch_match = c.channels() == target_channels;
+            let stereo = c.channels() >= 2;
+            let rate_match = c.min_sample_rate() <= target_rate && c.max_sample_rate() >= target_rate;
             
-            let a_stereo = a.channels() >= 2;
-            let b_stereo = b.channels() >= 2;
-            if a_stereo != b_stereo { return b_stereo.cmp(&a_stereo); }
-            
-            let a_rate_match = a.min_sample_rate() <= target_rate && a.max_sample_rate() >= target_rate;
-            let b_rate_match = b.min_sample_rate() <= target_rate && b.max_sample_rate() >= target_rate;
-            if a_rate_match != b_rate_match { return b_rate_match.cmp(&a_rate_match); }
-            
-            b.channels().cmp(&a.channels())
+            (
+                std::cmp::Reverse(ch_match),
+                std::cmp::Reverse(stereo),
+                std::cmp::Reverse(rate_match),
+                std::cmp::Reverse(c.channels())
+            )
         });
         
         configs.into_iter()
