@@ -1,6 +1,6 @@
 # RustTracker 🎵
 
-![RustTracker UI](assets/screenshot_ferrofluid.png)
+![RustTracker UI](assets/screenshot_spectrum.png)
 
 A high-performance, real-time audio visualizer and tracker module player built in Rust. 
 
@@ -42,23 +42,41 @@ Run with live microphone input:
 cargo run -- --mic
 ```
 
-## Steam Deck Installation
+## Linux Installation
 
-RustTracker provides a fully optimized native AppImage specifically built for SteamOS, featuring out-of-the-box gamepad controls.
+RustTracker provides pre-compiled AppImages, RPM, and DEB packages via the **Releases** page.
 
-1. **Get the AppImage onto your Steam Deck:**
-   - **Browser:** Open Firefox/Chrome on the Deck in Desktop Mode and download `RustTracker-SteamDeck-GamePad.AppImage` directly from the **Releases** page to your `Downloads` folder.
-   - **Network (SSH/SCP):** If SSH is enabled on your Deck (`sudo systemctl start sshd`), copy it from your PC: `scp RustTracker-SteamDeck-GamePad.AppImage deck@<DECK_IP>:/home/deck/Downloads/`
-   - **USB/SD Card:** Copy the file to a USB-C drive or SD card and transfer it via the Deck's file manager (Dolphin).
-2. Switch your Steam Deck to **Desktop Mode** (if you aren't already).
-3. Open your Downloads folder, right-click the AppImage file, and select **Properties** -> **Permissions**. Check the box for **"Is executable"**.
-4. Right-click the file again and select **"Add to Steam"**.
-5. Switch back to **Gaming Mode** and launch RustTracker from your Non-Steam games library.
+### Steam Deck (AppImage)
+1. Download `RustTracker-SteamDeck-GamePad.AppImage` in Desktop Mode.
+2. Mark it as executable (`Properties` -> `Permissions` -> `Is executable`).
+3. Add to Steam and launch in **Gaming Mode** for native Gamepad support.
+*(To force Gamepad Mode in Desktop Mode, hold the **Start (Menu)** button for 3 seconds)*
 
-**Important Note on Controls:** 
-RustTracker expects native Gamepad inputs. Launching it via Gaming Mode ensures Steam Input sends proper gamepad signals (Y, X, A, B, etc.). If you run the AppImage from Desktop Mode without adding it to Steam, Steam Input defaults to its "Desktop Configuration" (which translates your button presses into keyboard keys like `Escape` and `Tab`), rendering the native Gamepad UI features unresponsive. 
+### RPM / DEB Packages
+Install the downloaded packages using your native package manager:
+- **Fedora/RHEL:** `sudo dnf install ./RustTracker-Linux*.rpm`
+- **Ubuntu/Debian:** `sudo dpkg -i ./RustTracker-Linux*.deb`
 
-To force Gamepad Mode while on the desktop, hold the **Start (Menu)** button for 3 seconds!
+### Building Packages from Source
+To build the packages yourself, install the necessary dependencies:
+
+**For RPM (Fedora):**
+```bash
+sudo dnf install -y gcc gcc-c++ binutils pkgconfig alsa-lib-devel wayland-devel libX11-devel libxkbcommon-devel systemd-devel ffmpeg-devel libopenmpt-devel clang clang-devel
+cargo install cargo-generate-rpm
+cargo build --release
+strip target/release/rusttracker
+cargo generate-rpm
+```
+
+**For DEB (Ubuntu/Debian):**
+```bash
+sudo apt-get install -y gcc g++ binutils pkg-config libasound2-dev libwayland-dev libx11-dev libxkbcommon-x11-dev libudev-dev libavcodec-dev libavformat-dev libavutil-dev libavdevice-dev libavfilter-dev libopenmpt-dev clang libclang-dev
+cargo install cargo-deb
+cargo build --release
+strip target/release/rusttracker
+cargo deb
+```
 
 ## Built With
 * `wgpu` & `egui` - Hardware-accelerated UI
