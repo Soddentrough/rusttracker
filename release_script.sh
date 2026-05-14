@@ -23,6 +23,6 @@ if [ "$CONCLUSION" == "success" ]; then
   gh run download -n RustTracker-Linux-RPM --dir ./linux_rpm
   
   echo "Creating GitHub Release..."
-  gh release create "$TAG" ./windows_release/*.exe ./linux_rpm/*.rpm ./linux_deb/*.deb ./RustTracker-SteamDeck-GamePad.AppImage --title "RustTracker $TAG" --notes "Release $TAG"
+  gh release create "$TAG" ./windows_release/*.exe ./linux_rpm/*.rpm ./linux_deb/*.deb ./RustTracker-SteamDeck-$TAG.AppImage --title "RustTracker $TAG" --notes "Release $TAG"
 fi
 echo "Done!"
