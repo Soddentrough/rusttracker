@@ -84,6 +84,7 @@ fn glyph_bitmap(ch: u32) -> u32 {
         case 13u { return 31183u; } // S (same as 5)
         case 14u { return 31204u; } // F: ### #.. ### #.. #..
         case 15u { return 31207u; } // E: ### #.. ### #.. ###
+        case 16u { return 29842u; } // T: ### .#. .#. .#. .#.
         default  { return 0u; }     // space
     }
 }
@@ -317,8 +318,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
         // --- Debug label below speaker ---
         // Labels: L, R, C, LFE, Ls, Rs, Lrs, Rrs, Ltf, Rtf, Ltr, Rtr
-        // Encoded as arrays of glyph indices (10=L,11=R,12=C,13=S,14=F,15=E,16=space)
-        var lbl = array<u32, 3>(16u, 16u, 16u); // default: spaces
+        // Encoded as arrays of glyph indices (10=L,11=R,12=C,13=S,14=F,15=E,16=T,17=space)
+        var lbl = array<u32, 3>(17u, 17u, 17u); // default: spaces
         var lbl_len = 1u;
         switch i {
             case 0u  { lbl[0]=10u; }                                // L
@@ -327,12 +328,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             case 3u  { lbl[0]=10u; lbl[1]=14u; lbl[2]=15u; lbl_len=3u; } // LFE
             case 4u  { lbl[0]=10u; lbl[1]=13u; lbl_len=2u; }       // LS
             case 5u  { lbl[0]=11u; lbl[1]=13u; lbl_len=2u; }       // RS
-            case 6u  { lbl[0]=10u; lbl[1]=11u; lbl[2]=13u; lbl_len=3u; } // LRS (Lrs)
-            case 7u  { lbl[0]=11u; lbl[1]=11u; lbl[2]=13u; lbl_len=3u; } // RRS (Rrs)
-            case 8u  { lbl[0]=10u; lbl[1]=14u; lbl_len=2u; }       // LF (Ltf)
-            case 9u  { lbl[0]=11u; lbl[1]=14u; lbl_len=2u; }       // RF (Rtf)
-            case 10u { lbl[0]=10u; lbl[1]=11u; lbl_len=2u; }       // LR (Ltr)
-            case 11u { lbl[0]=11u; lbl[1]=11u; lbl_len=2u; }       // RR (Rtr)
+            case 6u  { lbl[0]=10u; lbl[1]=11u; lbl[2]=13u; lbl_len=3u; } // LRS
+            case 7u  { lbl[0]=11u; lbl[1]=11u; lbl[2]=13u; lbl_len=3u; } // RRS
+            case 8u  { lbl[0]=10u; lbl[1]=16u; lbl[2]=14u; lbl_len=3u; } // LTF
+            case 9u  { lbl[0]=11u; lbl[1]=16u; lbl[2]=14u; lbl_len=3u; } // RTF
+            case 10u { lbl[0]=10u; lbl[1]=16u; lbl[2]=11u; lbl_len=3u; } // LTR
+            case 11u { lbl[0]=11u; lbl[1]=16u; lbl[2]=11u; lbl_len=3u; } // RTR
             default  { }
         }
 
