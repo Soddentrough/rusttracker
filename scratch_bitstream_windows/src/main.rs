@@ -1,4 +1,4 @@
-use anyhow::{Result, bail};
+use anyhow::Result;
 use std::env;
 
 #[cfg(windows)]
@@ -13,9 +13,9 @@ mod wasapi_bitstream {
     use windows::Win32::Foundation::CloseHandle;
     use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, WAIT_OBJECT_0};
     use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
+    use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
 
     // ─── IEC 61937 WASAPI SubFormat GUIDs ────────────────────────────
-    // Reference: https://learn.microsoft.com/en-us/windows/win32/coreaudio/representing-formats-for-iec-61937-transmissions
 
     const KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_DIGITAL: GUID = GUID {
         data1: 0x00000092, data2: 0x0000, data3: 0x0010,
@@ -53,24 +53,18 @@ mod wasapi_bitstream {
     }
 
     fn detect_codec_profile(codec_name: &str) -> Vec<Iec61937Profile> {
-        // Return a list of profiles to try, in priority order.
-        // The first one accepted by the endpoint wins.
         if codec_name.contains("truehd") {
-            vec![
-                Iec61937Profile {
-                    name: "TrueHD / Dolby Atmos (MAT 2.0 HBR)",
-                    channels: 8, rate: 192000,
-                    sub_format: KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_MAT20,
-                },
-            ]
+            vec![Iec61937Profile {
+                name: "TrueHD / Dolby Atmos (MAT 2.0 HBR)",
+                channels: 8, rate: 192000,
+                sub_format: KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_MAT20,
+            }]
         } else if codec_name.contains("eac3") || codec_name.contains("ec-3") {
-            vec![
-                Iec61937Profile {
-                    name: "E-AC3 / Dolby Digital Plus",
-                    channels: 2, rate: 192000,
-                    sub_format: KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_DIGITAL_PLUS,
-                },
-            ]
+            vec![Iec61937Profile {
+                name: "E-AC3 / Dolby Digital Plus",
+                channels: 2, rate: 192000,
+                sub_format: KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_DIGITAL_PLUS,
+            }]
         } else if codec_name.contains("dts") || codec_name.contains("dca") {
             vec![
                 Iec61937Profile {
@@ -85,21 +79,17 @@ mod wasapi_bitstream {
                 },
             ]
         } else if codec_name.contains("ac3") {
-            vec![
-                Iec61937Profile {
-                    name: "AC3 / Dolby Digital",
-                    channels: 2, rate: 48000,
-                    sub_format: KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_DIGITAL,
-                },
-            ]
+            vec![Iec61937Profile {
+                name: "AC3 / Dolby Digital",
+                channels: 2, rate: 48000,
+                sub_format: KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_DIGITAL,
+            }]
         } else {
-            vec![
-                Iec61937Profile {
-                    name: "Unknown (AC3 fallback)",
-                    channels: 2, rate: 48000,
-                    sub_format: KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_DIGITAL,
-                },
-            ]
+            vec![Iec61937Profile {
+                name: "Unknown (AC3 fallback)",
+                channels: 2, rate: 48000,
+                sub_format: KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_DIGITAL,
+            }]
         }
     }
 
@@ -107,14 +97,13 @@ mod wasapi_bitstream {
         let block_align = profile.channels * 2;
         let avg_bytes = profile.rate * block_align as u32;
         let channel_mask: u32 = match profile.channels {
-            2 => 0x3,       // FL | FR
-            8 => 0x63F,     // FL|FR|FC|LFE|BL|BR|SL|SR
+            2 => 0x3,
+            8 => 0x63F,
             _ => 0x3,
         };
-
         WAVEFORMATEXTENSIBLE {
             Format: WAVEFORMATEX {
-                wFormatTag: 0xFFFE, // WAVE_FORMAT_EXTENSIBLE
+                wFormatTag: 0xFFFE,
                 nChannels: profile.channels,
                 nSamplesPerSec: profile.rate,
                 nAvgBytesPerSec: avg_bytes,
@@ -132,7 +121,7 @@ mod wasapi_bitstream {
 
     pub fn list_devices() -> Result<()> {
         unsafe {
-            CoInitializeEx(None, COINIT_MULTITHREADED)?;
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
 
             let enumerator: IMMDeviceEnumerator =
                 CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
@@ -145,14 +134,18 @@ mod wasapi_bitstream {
                 let id_pwstr = device.GetId()?;
                 let id = id_pwstr.to_string()?;
 
-                let name = match device.OpenPropertyStore(windows::Win32::System::Com::STGM_READ) {
-                    Ok(props) => {
-                        match props.GetValue(&PKEY_Device_FriendlyName) {
-                            Ok(val) => val.to_string(),
-                            Err(_) => format!("(Device {})", i),
+                // Try to get friendly name via property store
+                let name = {
+                    let store: std::result::Result<IPropertyStore, _> = device.OpenPropertyStore(STGM_READ);
+                    match store {
+                        Ok(props) => {
+                            match props.GetValue(&PKEY_Device_FriendlyName) {
+                                Ok(val) => val.to_string(),
+                                Err(_) => format!("(Device {})", i),
+                            }
                         }
+                        Err(_) => format!("(Device {})", i),
                     }
-                    Err(_) => format!("(Device {})", i),
                 };
 
                 println!("  [{}] {}", i, name);
@@ -167,9 +160,7 @@ mod wasapi_bitstream {
     // ─── Main bitstream pump ─────────────────────────────────────────
 
     pub fn run(file_path: &str, device_idx: Option<u32>) -> Result<()> {
-        unsafe {
-            CoInitializeEx(None, COINIT_MULTITHREADED)?;
-        }
+        unsafe { let _ = CoInitializeEx(None, COINIT_MULTITHREADED); }
 
         // ── Probe codec ─────────────────────────────────────────────
         println!("Probing audio stream...");
@@ -190,7 +181,7 @@ mod wasapi_bitstream {
         let profiles = detect_codec_profile(&codec_name);
         println!("Detected codec: {}", codec_name);
         for p in &profiles {
-            println!("  Will try: {} ({}ch × {}Hz)", p.name, p.channels, p.rate);
+            println!("  Will try: {} ({}ch x {}Hz)", p.name, p.channels, p.rate);
         }
 
         // ── Open device ─────────────────────────────────────────────
@@ -224,12 +215,12 @@ mod wasapi_bitstream {
             };
 
             if hr.is_ok() {
-                println!("  ✓ Accepted: {}", profile.name);
+                println!("  OK: {}", profile.name);
                 accepted_profile = Some(profile.clone());
                 accepted_format = Some(format);
                 break;
             } else {
-                println!("  ✗ Rejected: {} (HRESULT: {:?})", profile.name, hr);
+                println!("  REJECTED: {} (HRESULT: {:?})", profile.name, hr);
             }
         }
 
@@ -239,7 +230,7 @@ mod wasapi_bitstream {
 
         // ── Initialize ──────────────────────────────────────────────
         println!("\nInitializing audio client...");
-        let buffer_100ns: i64 = 5_000_000; // 500ms
+        let buffer_100ns: i64 = 5_000_000;
         unsafe {
             audio_client.Initialize(
                 AUDCLNT_SHAREMODE_EXCLUSIVE,
@@ -288,9 +279,9 @@ mod wasapi_bitstream {
 
         // ── Pump loop ───────────────────────────────────────────────
         unsafe { audio_client.Start()?; }
-        println!("\n▶ Bitstreaming: {} → {}ch × {}Hz",
+        println!("\n>> Bitstreaming: {} -> {}ch x {}Hz",
             profile.name, profile.channels, profile.rate);
-        println!("  Press Ctrl+C to stop.\n");
+        println!("   Press Ctrl+C to stop.\n");
 
         let mut total_frames: u64 = 0;
         let mut eof = false;
@@ -298,7 +289,7 @@ mod wasapi_bitstream {
         loop {
             let wait_result = unsafe { WaitForSingleObject(event, 2000) };
             if wait_result != WAIT_OBJECT_0 {
-                eprintln!("WASAPI event timeout — device may have disconnected.");
+                eprintln!("WASAPI event timeout.");
                 break;
             }
 
@@ -329,7 +320,6 @@ mod wasapi_bitstream {
                 }
                 total_frames += available as u64;
 
-                // Progress every ~1 second
                 if total_frames % (format.Format.nSamplesPerSec as u64) < available as u64 {
                     let secs = total_frames as f64 / format.Format.nSamplesPerSec as f64;
                     print!("\r  Streamed: {:.0}s  ", secs);
@@ -339,7 +329,6 @@ mod wasapi_bitstream {
             if eof { break; }
         }
 
-        // ── Cleanup ─────────────────────────────────────────────────
         let stderr_output = {
             let mut stderr = child.stderr.take().unwrap();
             let mut buf = String::new();
@@ -354,7 +343,7 @@ mod wasapi_bitstream {
             CoUninitialize();
         }
 
-        println!("\n\n✓ Playback complete. Total frames: {}", total_frames);
+        println!("\n\nPlayback complete. Total frames: {}", total_frames);
         if !stderr_output.is_empty() {
             println!("\nFFmpeg stderr:\n{}", stderr_output);
         }
@@ -366,9 +355,8 @@ mod wasapi_bitstream {
 fn main() -> Result<()> {
     let args: Vec<String> = env::args().collect();
 
-    println!("╔══════════════════════════════════════════════╗");
-    println!("║  RustTracker Bitstream Passthrough Tester    ║");
-    println!("╚══════════════════════════════════════════════╝\n");
+    println!("RustTracker Bitstream Passthrough Tester");
+    println!("========================================\n");
 
     if args.len() < 2 {
         println!("Usage:");
@@ -395,8 +383,8 @@ fn main() -> Result<()> {
 
     #[cfg(not(windows))]
     {
-        bail!("This tool only runs on Windows (WASAPI Exclusive Mode).\n\
-               For Linux, use the ALSA version in scratch_bitstream/.");
+        eprintln!("This tool only runs on Windows (WASAPI Exclusive Mode).");
+        eprintln!("For Linux, use the ALSA version in scratch_bitstream/.");
     }
 
     Ok(())
