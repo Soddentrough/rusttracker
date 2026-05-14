@@ -417,6 +417,22 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                 WindowEvent::CloseRequested => {
                     elwt.exit();
                 }
+                WindowEvent::DroppedFile(path) => {
+                    let mut state = app_state.lock().unwrap();
+                    let path_str = path.to_string_lossy().into_owned();
+                    if state.playlist.is_empty() {
+                        state.playlist = vec![path_str.clone()];
+                        state.playlist_index = 0;
+                        state.load_request = Some(path_str);
+                    } else {
+                        state.playlist.push(path_str);
+                        if !state.file_loaded {
+                            state.playlist_index = state.playlist.len() - 1;
+                            state.load_request = Some(state.playlist.last().unwrap().clone());
+                        }
+                    }
+                    state.file_loaded = true;
+                }
                 WindowEvent::Resized(physical_size) => {
                     engine.resize(*physical_size);
                 }
@@ -751,10 +767,11 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                             let mut g_type = crate::state::GamepadType::Xbox;
                             for (_id, gamepad) in gilrs.gamepads() {
                                 let name = gamepad.name().to_lowercase();
-                                if name.contains("sony") || name.contains("dualshock") || name.contains("dualsense") || name.contains("ps4") || name.contains("ps5") {
+                                let vendor = gamepad.vendor_id().unwrap_or(0);
+                                if name.contains("sony") || name.contains("dualshock") || name.contains("dualsense") || name.contains("ps4") || name.contains("ps5") || name.contains("wireless controller") || vendor == 0x054C {
                                     g_type = crate::state::GamepadType::PlayStation;
                                     break;
-                                } else if name.contains("nintendo") || name.contains("pro controller") || name.contains("joy-con") {
+                                } else if name.contains("nintendo") || name.contains("pro controller") || name.contains("joy-con") || vendor == 0x057E {
                                     g_type = crate::state::GamepadType::Nintendo;
                                     break;
                                 }

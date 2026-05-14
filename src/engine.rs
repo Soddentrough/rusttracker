@@ -1951,17 +1951,13 @@ impl<'a> VulkanEngine<'a> {
                             let show_gp = state.has_gamepad;
                             
                             if show_kb || show_gp {
-                                let (rect, _) = ui.allocate_exact_size(egui::vec2(1.0, 40.0), egui::Sense::hover());
+                                ui.add_space(40.0);
                                 
-                                egui::Area::new("shortcuts_area".into())
-                                    .fixed_pos(egui::pos2(ui.ctx().content_rect().center().x, rect.bottom()))
-                                    .pivot(egui::Align2::CENTER_TOP)
-                                    .show(ui.ctx(), |ui| {
-                                        egui::Frame::NONE
-                                            .fill(egui::Color32::from_black_alpha(200))
-                                            .corner_radius(10.0)
-                                            .inner_margin(20.0)
-                                            .show(ui, |ui| {
+                                egui::Frame::NONE
+                                    .fill(egui::Color32::from_black_alpha(200))
+                                    .corner_radius(10.0)
+                                    .inner_margin(20.0)
+                                    .show(ui, |ui| {
                                                 ui.vertical(|ui| {
                                             if show_kb {
                                                 ui.vertical(|ui| {
@@ -2047,7 +2043,6 @@ impl<'a> VulkanEngine<'a> {
                                             }
                                         });
                                     });
-                                });
                             }
                         }
                     );
