@@ -1999,32 +1999,62 @@ impl<'a> VulkanEngine<'a> {
                                             }
                                             
                                             if show_gp {
-                                                ui.vertical(|ui| {
-                                                    ui.label(egui::RichText::new("🎮 Gamepad Shortcuts").color(egui::Color32::LIGHT_GRAY).strong().size(18.0));
-                                                    ui.add_space(15.0);
-                                                    
-                                                    egui::Grid::new("gp_shortcuts")
-                                                        .num_columns(2)
-                                                        .spacing([30.0, 8.0])
-                                                        .show(ui, |ui| {
+                                                if is_game_mode {
+                                                    ui.vertical(|ui| {
+                                                        ui.set_max_width(ui.ctx().content_rect().width() * 0.85);
+                                                        ui.horizontal(|ui| {
+                                                            ui.label(egui::RichText::new("🎮 Gamepad Controls").color(egui::Color32::LIGHT_GRAY).strong().size(18.0));
+                                                        });
+                                                        ui.add_space(10.0);
+                                                        ui.horizontal_wrapped(|ui| {
+                                                            ui.spacing_mut().item_spacing = egui::vec2(25.0, 10.0);
                                                             let mut gp_shortcut = |gp: &str, desc: &str| {
-                                                                ui.label(egui::RichText::new(gamepad_icon(state.gamepad_type, gp)).color(egui::Color32::LIGHT_BLUE).size(16.0));
-                                                                ui.label(egui::RichText::new(desc).color(egui::Color32::GRAY));
-                                                                ui.end_row();
+                                                                ui.horizontal(|ui| {
+                                                                    ui.label(egui::RichText::new(gamepad_icon(state.gamepad_type, gp)).color(egui::Color32::LIGHT_BLUE).size(16.0));
+                                                                    ui.label(egui::RichText::new(desc).color(egui::Color32::GRAY));
+                                                                });
                                                             };
                                                             gp_shortcut("Y", "Open File");
                                                             gp_shortcut("A", "Play / Pause");
-                                                            gp_shortcut("X", "Toggle Video Mode");
+                                                            gp_shortcut("X", "Toggle Video");
                                                             gp_shortcut("D-Pad L/R", "Seek Timeline");
                                                             gp_shortcut("L2", "Toggle HUD");
-                                                            gp_shortcut("D-Pad U/D", "Cycle Visualizer");
+                                                            gp_shortcut("D-Pad U/D", "Cycle Vis");
                                                             gp_shortcut("B", "Toggle Stats");
                                                             gp_shortcut("Select", "Quit");
-                                                            gp_shortcut("Start", "Toggle Fullscreen");
-                                                            gp_shortcut("R2", "Toggle GPU FFT");
-                                                            gp_shortcut("L1 / R1", "Prev/Next Track");
+                                                            gp_shortcut("Start", "Fullscreen");
+                                                            gp_shortcut("R2", "GPU FFT");
+                                                            gp_shortcut("L1 / R1", "Prev/Next");
                                                         });
-                                                });
+                                                    });
+                                                } else {
+                                                    ui.vertical(|ui| {
+                                                        ui.label(egui::RichText::new("🎮 Gamepad Shortcuts").color(egui::Color32::LIGHT_GRAY).strong().size(18.0));
+                                                        ui.add_space(15.0);
+                                                        
+                                                        egui::Grid::new("gp_shortcuts")
+                                                            .num_columns(2)
+                                                            .spacing([30.0, 8.0])
+                                                            .show(ui, |ui| {
+                                                                let mut gp_shortcut = |gp: &str, desc: &str| {
+                                                                    ui.label(egui::RichText::new(gamepad_icon(state.gamepad_type, gp)).color(egui::Color32::LIGHT_BLUE).size(16.0));
+                                                                    ui.label(egui::RichText::new(desc).color(egui::Color32::GRAY));
+                                                                    ui.end_row();
+                                                                };
+                                                                gp_shortcut("Y", "Open File");
+                                                                gp_shortcut("A", "Play / Pause");
+                                                                gp_shortcut("X", "Toggle Video Mode");
+                                                                gp_shortcut("D-Pad L/R", "Seek Timeline");
+                                                                gp_shortcut("L2", "Toggle HUD");
+                                                                gp_shortcut("D-Pad U/D", "Cycle Visualizer");
+                                                                gp_shortcut("B", "Toggle Stats");
+                                                                gp_shortcut("Select", "Quit");
+                                                                gp_shortcut("Start", "Toggle Fullscreen");
+                                                                gp_shortcut("R2", "Toggle GPU FFT");
+                                                                gp_shortcut("L1 / R1", "Prev/Next Track");
+                                                            });
+                                                    });
+                                                }
                                             }
                                         });
                                     });
