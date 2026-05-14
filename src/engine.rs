@@ -1822,12 +1822,24 @@ impl<'a> VulkanEngine<'a> {
                         ui.available_size(),
                         egui::Layout::top_down(egui::Align::Center),
                         |ui| {
+                            let is_game_mode = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_lowercase() == "gamescope" || 
+                                               std::env::var("XDG_SESSION_DESKTOP").unwrap_or_default().to_lowercase() == "gamescope" ||
+                                               std::env::var("STEAM_DECK").is_ok();
+                                               
+                            // Scale title to fit smaller screens (like Steam Deck 1280x800)
+                            let avail_width = ui.available_width();
+                            let scale_factor = (avail_width / 1100.0).clamp(0.4, 1.0);
+                            let title_width = 1000.0 * scale_factor;
+                            let title_height = 160.0 * scale_factor;
+                            let font_size = 140.0 * scale_factor;
+                            let gradient_extent = 65.0 * scale_factor;
+
                             // --- Glowing Animated Title ---
-                            let (title_rect, _) = ui.allocate_exact_size(egui::vec2(1000.0, 160.0), egui::Sense::hover());
+                            let (title_rect, _) = ui.allocate_exact_size(egui::vec2(title_width, title_height), egui::Sense::hover());
                             let painter = ui.painter();
                             let text = "RustTracker";
                             
-                            let font_id = egui::FontId::new(140.0, egui::FontFamily::Name("Orbitron".into()));
+                            let font_id = egui::FontId::new(font_size, egui::FontFamily::Name("Orbitron".into()));
                             
                             // 1. Silver Outer Bevel (3px offset)
                             let silver_color = egui::Color32::from_rgb(200, 220, 255);
@@ -1860,8 +1872,8 @@ impl<'a> VulkanEngine<'a> {
                             
                             // 3. Sliced Chrome Gradient Interior
                             let steps = 40;
-                            let top_y = title_rect.center().y - 65.0;
-                            let bottom_y = title_rect.center().y + 65.0;
+                            let top_y = title_rect.center().y - gradient_extent;
+                            let bottom_y = title_rect.center().y + gradient_extent;
                             let height = bottom_y - top_y;
                             
                             for i in 0..steps {
@@ -1906,28 +1918,26 @@ impl<'a> VulkanEngine<'a> {
                             
                             ui.add_space(40.0);
                             
-                            let btn = egui::Button::new(
-                                egui::RichText::new("  OPEN AUDIO FILE  ")
-                                    .size(24.0)
-                                    .color(egui::Color32::WHITE)
-                                    .strong()
-                            )
-                            .fill(egui::Color32::from_rgb(0, 120, 215));
-                            
-                            if ui.add_sized([350.0, 60.0], btn).clicked() {
-                                engine_action = EngineAction::OpenFile;
+                            if !is_game_mode {
+                                let btn = egui::Button::new(
+                                    egui::RichText::new("  OPEN AUDIO FILE  ")
+                                        .size(24.0)
+                                        .color(egui::Color32::WHITE)
+                                        .strong()
+                                )
+                                .fill(egui::Color32::from_rgb(0, 120, 215));
+                                
+                                if ui.add_sized([350.0, 60.0], btn).clicked() {
+                                    engine_action = EngineAction::OpenFile;
+                                }
+                                
+                                ui.add_space(20.0);
                             }
                             
-                            ui.add_space(20.0);
                             let mut force_stereo = state.force_stereo_downmix;
                             if ui.checkbox(&mut force_stereo, "Force Stereo Downmix (Fixes crackling on some devices)").changed() {
                                 engine_action = EngineAction::SetForceStereo(force_stereo);
                             }
-
-                            
-                            let is_game_mode = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_lowercase() == "gamescope" || 
-                                               std::env::var("XDG_SESSION_DESKTOP").unwrap_or_default().to_lowercase() == "gamescope" ||
-                                               std::env::var("STEAM_DECK").is_ok();
                                                
                             let show_kb = !is_game_mode;
                             let show_gp = state.has_gamepad;
