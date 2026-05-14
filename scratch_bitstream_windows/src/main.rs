@@ -11,9 +11,9 @@ mod wasapi_bitstream {
     use windows::Win32::Media::Audio::*;
     use windows::Win32::System::Com::*;
     use windows::Win32::Foundation::CloseHandle;
-    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject, WAIT_OBJECT_0};
-    use windows::Win32::Devices::FunctionDiscovery::PKEY_Device_FriendlyName;
-    use windows::Win32::UI::Shell::PropertiesSystem::IPropertyStore;
+    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+
+    const WAIT_OBJECT_0: u32 = 0;
 
     // ─── IEC 61937 WASAPI SubFormat GUIDs ────────────────────────────
 
@@ -41,8 +41,6 @@ mod wasapi_bitstream {
         data1: 0x0000000b, data2: 0x0cea, data3: 0x0010,
         data4: [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
     };
-
-    // ─── Codec profile ───────────────────────────────────────────────
 
     #[derive(Debug, Clone)]
     struct Iec61937Profile {
@@ -117,43 +115,25 @@ mod wasapi_bitstream {
         }
     }
 
-    // ─── Device listing ──────────────────────────────────────────────
+    // ─── Device listing (simple — just count and ID) ─────────────────
 
     pub fn list_devices() -> Result<()> {
-        unsafe {
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+        unsafe { let _ = CoInitializeEx(None, COINIT_MULTITHREADED); }
 
-            let enumerator: IMMDeviceEnumerator =
-                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-            let collection = enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)?;
-            let count = collection.GetCount()?;
+        let enumerator: IMMDeviceEnumerator =
+            unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
+        let collection = unsafe { enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)? };
+        let count = unsafe { collection.GetCount()? };
 
-            println!("Available audio render endpoints:\n");
-            for i in 0..count {
-                let device = collection.Item(i)?;
-                let id_pwstr = device.GetId()?;
-                let id = id_pwstr.to_string()?;
-
-                // Try to get friendly name via property store
-                let name = {
-                    let store: std::result::Result<IPropertyStore, _> = device.OpenPropertyStore(STGM_READ);
-                    match store {
-                        Ok(props) => {
-                            match props.GetValue(&PKEY_Device_FriendlyName) {
-                                Ok(val) => val.to_string(),
-                                Err(_) => format!("(Device {})", i),
-                            }
-                        }
-                        Err(_) => format!("(Device {})", i),
-                    }
-                };
-
-                println!("  [{}] {}", i, name);
-                println!("      ID: {}\n", id);
-            }
-
-            CoUninitialize();
+        println!("Available audio render endpoints:\n");
+        for i in 0..count {
+            let device = unsafe { collection.Item(i)? };
+            let id = unsafe { device.GetId()?.to_string()? };
+            println!("  [{}] ID: {}", i, id);
         }
+        println!("\nUse --device <N> to select a specific endpoint.");
+
+        unsafe { CoUninitialize(); }
         Ok(())
     }
 
@@ -189,6 +169,7 @@ mod wasapi_bitstream {
             unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
 
         let device = if let Some(idx) = device_idx {
+            println!("Using device index: {}", idx);
             let collection = unsafe { enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)? };
             unsafe { collection.Item(idx)? }
         } else {
@@ -225,7 +206,8 @@ mod wasapi_bitstream {
         }
 
         let profile = accepted_profile
-            .ok_or_else(|| anyhow::anyhow!("No passthrough format accepted by this endpoint."))?;
+            .ok_or_else(|| anyhow::anyhow!("No passthrough format accepted by this endpoint.\n\
+                Ensure your default audio device supports bitstream output (HDMI/SPDIF to AVR)."))?;
         let format = accepted_format.unwrap();
 
         // ── Initialize ──────────────────────────────────────────────
@@ -259,11 +241,9 @@ mod wasapi_bitstream {
             "-i", file_path,
             "-c:a", "copy",
         ];
-
         if codec_name.contains("truehd") {
             ffmpeg_args.extend(["-spdif_flags", "+use_mat"]);
         }
-
         ffmpeg_args.extend(["-f", "spdif", "-"]);
 
         println!("\nSpawning: ffmpeg {}", ffmpeg_args.join(" "));
@@ -288,7 +268,7 @@ mod wasapi_bitstream {
 
         loop {
             let wait_result = unsafe { WaitForSingleObject(event, 2000) };
-            if wait_result != WAIT_OBJECT_0 {
+            if wait_result.0 != WAIT_OBJECT_0 {
                 eprintln!("WASAPI event timeout.");
                 break;
             }
