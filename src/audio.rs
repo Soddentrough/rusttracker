@@ -19,7 +19,6 @@ use midly::{Smf, TrackEventKind, MetaMessage, MidiMessage};
 use crate::state::AppState;
 use crossbeam_channel::{bounded, Sender, Receiver};
 
-const FFT_SIZE: usize = 8192;
 
 struct DspMessage {
     audio_data: Vec<f32>,
@@ -38,29 +37,29 @@ fn spawn_dsp_thread(
     shared_state: Arc<Mutex<AppState>>,
     sample_rate: u32,
     max_frequency: f32,
+    window_size: usize,
 ) {
     std::thread::spawn(move || {
         let mut binned_data = vec![0.0; 1024];
 
         // Pre-compute Hann window coefficients
-        let hann_window: Vec<f32> = (0..FFT_SIZE)
-            .map(|i| 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / (FFT_SIZE - 1) as f32).cos()))
+        let hann_window: Vec<f32> = (0..window_size)
+            .map(|i| 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / (window_size - 1) as f32).cos()))
             .collect();
 
         // Pre-plan FFT (rustfft caches the twiddle factors)
         let mut planner = FftPlanner::<f32>::new();
-        let fft = planner.plan_fft_forward(FFT_SIZE);
-        let mut complex_buf = vec![Complex { re: 0.0f32, im: 0.0f32 }; FFT_SIZE];
-        let mut magnitudes = vec![0.0f32; FFT_SIZE / 2];
+        let fft = planner.plan_fft_forward(window_size);
+        let mut complex_buf = vec![Complex { re: 0.0f32, im: 0.0f32 }; window_size];
+        let mut magnitudes = vec![0.0f32; window_size / 2];
 
         let mut last_waveform_push = Instant::now();
-        let waveform_push_interval = std::time::Duration::from_secs_f64(1.0 / 60.0);
 
         while let Ok(msg) = rx.recv() {
             let fft_start = Instant::now();
 
             // Apply Hann window and prepare complex input
-            for i in 0..FFT_SIZE {
+            for i in 0..window_size {
                 let sample = *msg.audio_data.get(i).unwrap_or(&0.0);
                 complex_buf[i] = Complex { re: sample * hann_window[i], im: 0.0 };
             }
@@ -69,17 +68,17 @@ fn spawn_dsp_thread(
             fft.process(&mut complex_buf);
 
             // Compute magnitudes (only first half — up to Nyquist)
-            let n_sqrt = (FFT_SIZE as f32).sqrt();
-            for i in 0..FFT_SIZE / 2 {
+            let n_sqrt = (window_size as f32).sqrt();
+            for i in 0..window_size / 2 {
                 magnitudes[i] = complex_buf[i].norm() / n_sqrt;
             }
 
             // Logarithmic binning into 1024 display bins
-            let resolution = sample_rate as f32 / FFT_SIZE as f32; // Hz per FFT bin
+            let resolution = sample_rate as f32 / window_size as f32; // Hz per FFT bin
             let min_freq = 20.0f32;
             let max_f = max_frequency.max(min_freq * 2.0);
             let num_bins = 1024;
-            let nyquist = FFT_SIZE / 2;
+            let nyquist = window_size / 2;
 
             binned_data.fill(0.0);
             for i in 0..num_bins {
@@ -124,13 +123,25 @@ fn spawn_dsp_thread(
                 state.raw_audio_channels = msg.channel_audio_data;
                 
                 // --- Waveform extraction (Zero-Crossing Edge Trigger) ---
-                // Scan the first half of the buffer for the steepest positive zero-crossing.
-                // This acts as a heuristic to lock onto the fundamental frequency (bass/kick)
-                // rather than triggering randomly on high-frequency noise ripples.
-                let mut start_idx = 0;
+                let visual_width = state.visual_width.max(128).min(4096) as usize;
+                let target_fps = state.target_fps.max(30).min(500);
+                let waveform_push_interval = std::time::Duration::from_secs_f64(1.0 / target_fps as f64);
+                
+                // Maintain a constant ~23ms time window regardless of sample rate
+                let target_window_samples = (sample_rate as f32 * 0.023).round() as usize;
+                let stride = (target_window_samples as f32 / visual_width as f32).max(1.0);
+                let actual_window_samples = (visual_width as f32 * stride).ceil() as usize;
+                
+                // Restrict search to the last ~33ms to ensure a fresh trigger at >= 30 FPS,
+                // avoiding the visual "freeze" caused by searching the entire history buffer.
+                let search_window = (sample_rate as f32 / 30.0) as usize;
+                let search_start = msg.audio_data.len().saturating_sub(actual_window_samples + search_window);
+                let search_limit = msg.audio_data.len().saturating_sub(actual_window_samples);
+                
+                let mut start_idx = search_start;
                 let mut best_slope = 0.0;
-                let search_limit = msg.audio_data.len().saturating_sub(1024);
-                for i in 0..search_limit {
+                
+                for i in search_start..search_limit {
                     if msg.audio_data[i] <= 0.0 && msg.audio_data[i + 1] > 0.0 {
                         let slope = msg.audio_data[i + 1] - msg.audio_data[i];
                         if slope > best_slope {
@@ -140,19 +151,24 @@ fn spawn_dsp_thread(
                     }
                 }
                 
-                for i in 0..1024 {
-                    state.raw_waveform[i] = msg.audio_data[start_idx + i];
+                if state.raw_waveform.len() != visual_width {
+                    state.raw_waveform.resize(visual_width, 0.0);
+                }
+                
+                for i in 0..visual_width {
+                    let sample_idx = start_idx + (i as f32 * stride) as usize;
+                    state.raw_waveform[i] = msg.audio_data[sample_idx.min(msg.audio_data.len() - 1)];
                 }
                 
                 let now = Instant::now();
                 if now.duration_since(last_waveform_push) >= waveform_push_interval {
-                    state.waveform_history.pop_front();
+                    while state.waveform_history.len() >= 144 {
+                        state.waveform_history.pop_front();
+                    }
                     let wave_clone = state.raw_waveform.clone();
                     state.waveform_history.push_back(wave_clone);
                     last_waveform_push = now;
                 }
-                
-
                 
                 if msg.bpm != 0 { state.bpm = msg.bpm; }
                 if msg.speed != 0 { state.speed = msg.speed; }
@@ -1372,10 +1388,13 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
             state.bpm = 0;
             state.speed = 0;
             state.max_frequency = config.sample_rate as f32 / 2.0;
+            state.current_sample_rate = config.sample_rate as f32;
         }
 
         let max_frequency = { shared_state.lock().unwrap().max_frequency };
-        spawn_dsp_thread(rx, shared_state.clone(), config.sample_rate, max_frequency);
+        let window_size = (((config.sample_rate as f32 * 0.185).round() as usize) / 2) * 2;
+        let window_size = window_size.max(2048).min(65536);
+        spawn_dsp_thread(rx, shared_state.clone(), config.sample_rate, max_frequency, window_size);
 
         let stream = match supported_config.sample_format() {
             cpal::SampleFormat::F32 => run_mic::<f32>(&device, &config, shared_state, tx, config.sample_rate),
@@ -1411,6 +1430,7 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
         state.max_frequency = audio_source.get_intrinsic_sample_rate()
             .map(|r| r as f32 / 2.0)
             .unwrap_or(10000.0);
+        state.current_sample_rate = config.sample_rate as f32;
         state.num_samples = audio_source.get_num_samples();
         state.num_instruments = audio_source.get_num_instruments();
         state.num_patterns = audio_source.get_num_patterns();
@@ -1425,12 +1445,15 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
     }
 
     let max_frequency = { shared_state.lock().unwrap().max_frequency };
-    spawn_dsp_thread(rx, shared_state.clone(), config.sample_rate, max_frequency);
+    let window_size = (((config.sample_rate as f32 * 0.185).round() as usize) / 2) * 2;
+    let window_size = window_size.max(2048).min(65536);
+    
+    spawn_dsp_thread(rx, shared_state.clone(), config.sample_rate, max_frequency, window_size);
 
     let stream = match supported_config.sample_format() {
-        cpal::SampleFormat::F32 => run::<f32>(&device, &config, audio_source, shared_state, tx, config.sample_rate, max_frequency),
-        cpal::SampleFormat::I16 => run::<i16>(&device, &config, audio_source, shared_state, tx, config.sample_rate, max_frequency),
-        cpal::SampleFormat::U16 => run::<u16>(&device, &config, audio_source, shared_state, tx, config.sample_rate, max_frequency),
+        cpal::SampleFormat::F32 => run::<f32>(&device, &config, audio_source, shared_state, tx, config.sample_rate, max_frequency, window_size),
+        cpal::SampleFormat::I16 => run::<i16>(&device, &config, audio_source, shared_state, tx, config.sample_rate, max_frequency, window_size),
+        cpal::SampleFormat::U16 => run::<u16>(&device, &config, audio_source, shared_state, tx, config.sample_rate, max_frequency, window_size),
         _ => return Err(anyhow::anyhow!("Unsupported sample format")),
     }?;
 
@@ -1465,6 +1488,7 @@ fn run<T>(
     tx: Sender<DspMessage>,
     sample_rate: u32,
     _max_frequency: f32,
+    window_size: usize,
 ) -> Result<cpal::Stream>
 where
     T: cpal::Sample + cpal::FromSample<f32> + cpal::SizedSample,
@@ -1723,11 +1747,11 @@ where
     let mut current_chunk: Option<AudioChunk> = None;
     let mut chunk_frame_pos = 0;
     
-    let mut fft_buffer: Vec<f32> = vec![0.0; 8192];
-    let mut channel_fft_buffers: Vec<Vec<f32>> = vec![vec![0.0; 8192]; hardware_channels];
-    let mut windowed_buffer: Vec<f32> = vec![0.0; 8192];
-    let mut windowed_channels: Vec<Vec<f32>> = vec![vec![0.0; 8192]; hardware_channels];
-    let mut spare_channels: Vec<Vec<f32>> = vec![vec![0.0; 8192]; hardware_channels];
+    let mut fft_buffer: Vec<f32> = vec![0.0; window_size];
+    let mut channel_fft_buffers: Vec<Vec<f32>> = vec![vec![0.0; window_size]; hardware_channels];
+    let mut windowed_buffer: Vec<f32> = vec![0.0; window_size];
+    let mut windowed_channels: Vec<Vec<f32>> = vec![vec![0.0; window_size]; hardware_channels];
+    let mut spare_channels: Vec<Vec<f32>> = vec![vec![0.0; window_size]; hardware_channels];
     let mut fft_index = 0;
     
     let mut last_channel_vus = Vec::new();
@@ -1820,7 +1844,7 @@ where
                         mono /= hardware_channels as f32;
                         
                         fft_buffer[fft_index] = mono;
-                        fft_index = (fft_index + 1) % 8192;
+                        fft_index = (fft_index + 1) % window_size;
                     }
                     
                     chunk_frame_pos += to_copy;
@@ -1829,8 +1853,8 @@ where
             }
 
             // Re-use pre-allocated windowed_channels instead of heap-allocating per callback
-            for i in 0..8192 {
-                let idx = (fft_index + i) % 8192;
+            for i in 0..window_size {
+                let idx = (fft_index + i) % window_size;
                 windowed_buffer[i] = fft_buffer[idx];
                 for c in 0..hardware_channels {
                     windowed_channels[c][i] = channel_fft_buffers[c][idx];
@@ -1850,7 +1874,7 @@ where
                 speed: last_speed,
                 current_seconds: last_current_seconds,
                 current_row_string: last_current_row_string.clone(),
-                channel_audio_data: std::mem::replace(&mut spare_channels, vec![vec![0.0; 8192]; hardware_channels]),
+                channel_audio_data: std::mem::replace(&mut spare_channels, vec![vec![0.0; window_size]; hardware_channels]),
             };
             
             let _ = tx.try_send(msg);
@@ -1873,9 +1897,12 @@ where
     T: cpal::Sample + cpal::FromSample<f32> + cpal::SizedSample + Into<f32>,
 {
     let channels = config.channels as usize;
-    let mut fft_buffer: Vec<f32> = vec![0.0; 8192];
-    let mut channel_fft_buffers: Vec<Vec<f32>> = vec![vec![0.0; 8192]; channels];
-    let mut windowed_buffer: Vec<f32> = vec![0.0; 8192];
+    let window_size = (((config.sample_rate as f32 * 0.185).round() as usize) / 2) * 2;
+    let window_size = window_size.max(2048).min(65536);
+
+    let mut fft_buffer: Vec<f32> = vec![0.0; window_size];
+    let mut channel_fft_buffers: Vec<Vec<f32>> = vec![vec![0.0; window_size]; channels];
+    let mut windowed_buffer: Vec<f32> = vec![0.0; window_size];
     let mut fft_index = 0;
     
     let mut was_paused = false;
@@ -1910,12 +1937,12 @@ where
                 for c in 0..channels {
                     channel_fft_buffers[c][fft_index] = if c < frame.len() { frame[c].into() } else { 0.0 };
                 }
-                fft_index = (fft_index + 1) % 8192;
+                fft_index = (fft_index + 1) % window_size;
             }
 
-            let mut windowed_channels = vec![vec![0.0; 8192]; channels];
-            for i in 0..8192 {
-                let idx = (fft_index + i) % 8192;
+            let mut windowed_channels = vec![vec![0.0; window_size]; channels];
+            for i in 0..window_size {
+                let idx = (fft_index + i) % window_size;
                 windowed_buffer[i] = fft_buffer[idx];
                 for c in 0..channels {
                     windowed_channels[c][i] = channel_fft_buffers[c][idx];

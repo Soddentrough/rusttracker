@@ -165,6 +165,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
             Row::new(vec!["BPM".to_string(), state.bpm.to_string()]),
             Row::new(vec!["Speed".to_string(), state.speed.to_string()]),
             Row::new(vec!["Channels".to_string(), state.num_channels.to_string()]),
+            Row::new(vec!["Sample Rate".to_string(), format!("{} Hz", state.current_sample_rate as u32)]),
             Row::new(vec!["Length".to_string(), format!("{:.1}s", state.duration_seconds)]),
         ],
         [Constraint::Percentage(40), Constraint::Percentage(60)].as_ref()

@@ -31,13 +31,17 @@ struct AudioUniforms {
     ui_meters_rect: vec4<f32>,
     ui_heatmap_rect: vec4<f32>,
     ui_fire_rect: vec4<f32>,
+    waveform_resolution: u32,
+    waveform_history_size: u32,
+    _pad0: u32,
+    _pad1: u32,
 };
 
 @group(0) @binding(0)
 var<uniform> audio: AudioUniforms;
 
 @group(0) @binding(1)
-var<storage, read> waveform_history: array<vec4<f32>>;
+var<storage, read> waveform_history: array<f32>;
 
 fn hash21(p: vec2<f32>) -> f32 {
     var p3 = fract(vec3<f32>(p.xyx) * 0.1031);
@@ -47,22 +51,18 @@ fn hash21(p: vec2<f32>) -> f32 {
 
 // Waveforms are pre-smoothed on CPU, so we can read directly
 fn get_waveform(hist_idx: u32, idx: u32) -> f32 {
-    let clamped_idx = clamp(idx, 0u, 1023u);
-    let vec_idx = clamped_idx / 4u;
-    let component_idx = clamped_idx % 4u;
-
-    let spec_vec = waveform_history[hist_idx * 256u + vec_idx];
-    if component_idx == 0u { return spec_vec.x; }
-    else if component_idx == 1u { return spec_vec.y; }
-    else if component_idx == 2u { return spec_vec.z; }
-    else { return spec_vec.w; }
+    let res = max(audio.waveform_resolution, 128u);
+    let clamped_idx = clamp(idx, 0u, res - 1u);
+    // engine.rs places each frame at a 2048 stride
+    return waveform_history[hist_idx * 2048u + clamped_idx];
 }
 
 // Linear interpolation between integer sample indices for sub-pixel accuracy
 fn get_waveform_lerp(hist_idx: u32, x: f32) -> f32 {
-    let float_idx = clamp(x, 0.0, 0.999) * 1023.0;
+    let res = f32(max(audio.waveform_resolution, 128u));
+    let float_idx = clamp(x, 0.0, 0.999) * (res - 1.0);
     let idx0 = u32(float_idx);
-    let idx1 = min(idx0 + 1u, 1023u);
+    let idx1 = min(idx0 + 1u, u32(res) - 1u);
     let frac = fract(float_idx);
     return mix(get_waveform(hist_idx, idx0), get_waveform(hist_idx, idx1), frac);
 }
@@ -75,15 +75,16 @@ fn sdLine(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
 }
 
 fn get_wave_dist(hist_idx: u32, uv: vec2<f32>, aspect: f32) -> f32 {
+    let res = f32(max(audio.waveform_resolution, 128u));
     let clamped_x = clamp(uv.x, 0.0, 0.999);
-    let float_idx = clamped_x * 1023.0;
+    let float_idx = clamped_x * (res - 1.0);
     let idx = u32(float_idx);
 
     var min_dist = 1000.0;
 
     // Check local neighborhood for proper line segment coverage
     let start_idx = max(0i, i32(idx) - 1);
-    let end_idx = min(1022i, i32(idx) + 1);
+    let end_idx = min(i32(res) - 2i, i32(idx) + 1);
 
     let p = vec2<f32>(uv.x * aspect, uv.y);
 
@@ -91,8 +92,8 @@ fn get_wave_dist(hist_idx: u32, uv: vec2<f32>, aspect: f32) -> f32 {
         let u_idx0 = u32(i);
         let u_idx1 = u_idx0 + 1u;
 
-        let x0 = f32(u_idx0) / 1023.0;
-        let x1 = f32(u_idx1) / 1023.0;
+        let x0 = f32(u_idx0) / (res - 1.0);
+        let x1 = f32(u_idx1) / (res - 1.0);
 
         let v0 = get_waveform(hist_idx, u_idx0);
         let v1 = get_waveform(hist_idx, u_idx1);
@@ -129,23 +130,31 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     var wave_intensity = 0.0;
 
-    // Accumulate 8 history frames (packed contiguously: 0=oldest, 7=newest)
-    for (var i = 0u; i < 8u; i = i + 1u) {
+    // Accumulate up to 144 history frames
+    let hist_count = min(audio.waveform_history_size, 144u);
+    // Optimization: If performance drops, we could add a uniform to step > 1
+    // For now, we process all available frames to ensure the 1-second trail.
+    
+    // Only process the most recent ~30 frames heavily, and fade the rest quickly to save GPU
+    // Or just process them all:
+    for (var i = 0u; i < hist_count; i = i + 1u) {
         let true_dist = get_wave_dist(i, final_uv, aspect);
 
         // Exponential phosphor decay (frame 0 is oldest = most faded)
-        let frames_old = 7.0 - f32(i);
-        let age = exp(-frames_old * 0.6);
+        let frames_old = f32(hist_count - 1u - i);
+        // decay scaled for 144 frames (previously 0.6 for 8 frames = ~12% per frame)
+        // 0.05 gives a long 1-second smooth trail.
+        let age = exp(-frames_old * 0.06);
 
-        // Beam thickness with edge defocus
-        let thickness = 0.006 + edge_blur * 0.012;
-        let core = smoothstep(thickness, 0.0, true_dist);
+        // Beam thickness scales down with dynamic resolution to prevent huge blobs
+        let thickness = 0.002 + edge_blur * 0.006;
+        let core = smoothstep(thickness, 0.0, true_dist) * 0.4;
 
         // Tighter bloom (reduced spread and intensity)
-        let bloom = 0.0008 / (true_dist * true_dist + 0.001) * 0.15;
+        let bloom = 0.0002 / (true_dist * true_dist + 0.001) * 0.03;
 
         // Tighter halation (faster falloff)
-        let halation = exp(-true_dist * 40.0) * 0.1;
+        let halation = exp(-true_dist * 80.0) * 0.015;
 
         let frame_intensity = (core + bloom + halation) * age;
 
@@ -165,12 +174,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Smooth CRT bezel fade (radial, no rectangular edges)
     let bezel = smoothstep(1.4, 0.9, r);
 
-    // Analog noise — very subtle, only near the waveform area
-    let noise_val = hash21(in.clip_position.xy + fract(audio.smooth_time) * 100.0);
-    let noise_color = amber * noise_val * 0.012 * bezel * (0.3 + 0.7 * clamp(wave_intensity * 0.5, 0.0, 1.0));
+    // Analog noise / static (like vis_flame)
+    let noise_val = hash21(in.clip_position.xy + fract(audio.smooth_time) * 137.0);
+    let static_noise = noise_val * 0.035 * bezel;
+    
+    // Add extra faint glow from the waveform onto the noise
+    let noise_glow = amber * noise_val * 0.015 * bezel * clamp(wave_intensity * 0.8, 0.0, 1.0);
 
     final_color = final_color * bezel;
-    final_color = final_color + noise_color;
+    final_color = final_color + static_noise + noise_glow;
 
     // Output Linear RGB. WGPU Srgb surface will apply the sRGB gamma curve automatically.
     return vec4<f32>(final_color, 1.0);

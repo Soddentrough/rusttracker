@@ -280,7 +280,14 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                                 _ => {
                                     if !kb_event.repeat {
                                         match keycode {
-                                            WinitKeyCode::Escape | WinitKeyCode::KeyQ => elwt.exit(),
+                                            WinitKeyCode::Escape | WinitKeyCode::KeyQ => {
+                                                let picker_open = app_state.lock().unwrap().show_vis_picker;
+                                                if picker_open {
+                                                    app_state.lock().unwrap().show_vis_picker = false;
+                                                } else {
+                                                    elwt.exit();
+                                                }
+                                            },
                                             WinitKeyCode::BracketLeft => {
                                                 let mut state = app_state.lock().unwrap();
                                                 state.panel_split_ratio = (state.panel_split_ratio - 0.05).clamp(0.15, 0.85);
@@ -317,6 +324,13 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                                                 let mut state = app_state.lock().unwrap();
                                                 state.open_file_request = true;
                                             },
+                                            WinitKeyCode::KeyM => {
+                                                let mut state = app_state.lock().unwrap();
+                                                state.show_vis_picker = !state.show_vis_picker;
+                                                if state.show_vis_picker {
+                                                    state.vis_picker_cursor = state.current_visualizer_idx;
+                                                }
+                                            },
                                             WinitKeyCode::KeyV => {
                                                 let mut state = app_state.lock().unwrap();
                                                 if state.video_frame_rx.is_some() {
@@ -327,7 +341,13 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                                             },
                                             WinitKeyCode::Space => {
                                                 let mut state = app_state.lock().unwrap();
-                                                if state.current_seconds >= state.duration_seconds - 0.1 && state.duration_seconds > 0.0 {
+                                                if state.show_vis_picker {
+                                                    // Toggle enable/disable for highlighted visualizer (idx 0 always enabled)
+                                                    let idx = state.vis_picker_cursor;
+                                                    if idx != 0 {
+                                                        state.vis_enabled[idx] = !state.vis_enabled[idx];
+                                                    }
+                                                } else if state.current_seconds >= state.duration_seconds - 0.1 && state.duration_seconds > 0.0 {
                                                     state.seek_request = Some(0.0);
                                                     state.spectrum_history.clear();
                                                     for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
@@ -336,19 +356,49 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                                                     state.is_paused = !state.is_paused;
                                                 }
                                             },
+                                            WinitKeyCode::Enter => {
+                                                let mut state = app_state.lock().unwrap();
+                                                if state.show_vis_picker {
+                                                    state.current_visualizer_idx = state.vis_picker_cursor;
+                                                    state.visualizer_mode = crate::state::VISUALIZERS[state.vis_picker_cursor].id;
+                                                    state.show_vis_picker = false;
+                                                }
+                                            },
                                             WinitKeyCode::ArrowUp => {
                                                 let mut state = app_state.lock().unwrap();
-                                                state.current_visualizer_idx = (state.current_visualizer_idx + 1) % crate::state::VISUALIZERS.len();
-                                                state.visualizer_mode = crate::state::VISUALIZERS[state.current_visualizer_idx].id;
+                                                if state.show_vis_picker {
+                                                    if state.vis_picker_cursor == 0 {
+                                                        state.vis_picker_cursor = crate::state::VISUALIZERS.len() - 1;
+                                                    } else {
+                                                        state.vis_picker_cursor -= 1;
+                                                    }
+                                                } else {
+                                                    // Cycle to next enabled visualizer
+                                                    let len = crate::state::VISUALIZERS.len();
+                                                    let mut idx = state.current_visualizer_idx;
+                                                    for _ in 0..len {
+                                                        idx = (idx + 1) % len;
+                                                        if state.vis_enabled[idx] { break; }
+                                                    }
+                                                    state.current_visualizer_idx = idx;
+                                                    state.visualizer_mode = crate::state::VISUALIZERS[idx].id;
+                                                }
                                             },
                                             WinitKeyCode::ArrowDown => {
                                                 let mut state = app_state.lock().unwrap();
-                                                if state.current_visualizer_idx == 0 {
-                                                    state.current_visualizer_idx = crate::state::VISUALIZERS.len() - 1;
+                                                if state.show_vis_picker {
+                                                    state.vis_picker_cursor = (state.vis_picker_cursor + 1) % crate::state::VISUALIZERS.len();
                                                 } else {
-                                                    state.current_visualizer_idx -= 1;
+                                                    // Cycle to previous enabled visualizer
+                                                    let len = crate::state::VISUALIZERS.len();
+                                                    let mut idx = state.current_visualizer_idx;
+                                                    for _ in 0..len {
+                                                        idx = if idx == 0 { len - 1 } else { idx - 1 };
+                                                        if state.vis_enabled[idx] { break; }
+                                                    }
+                                                    state.current_visualizer_idx = idx;
+                                                    state.visualizer_mode = crate::state::VISUALIZERS[idx].id;
                                                 }
-                                                state.visualizer_mode = crate::state::VISUALIZERS[state.current_visualizer_idx].id;
                                             },
                                             _ => {}
                                         }
@@ -424,6 +474,7 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                     {
                         let mut state = app_state.lock().unwrap();
                         state.current_fps = state.current_fps * 0.9 + fps * 0.1;
+                        state.visual_width = engine.config.width / 2;
                         
                         if !state.file_loaded {
                             let t = now.elapsed().as_secs_f32();
@@ -608,6 +659,30 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                             EngineAction::SetSplitRatio(val) => {
                                 state.panel_split_ratio = val;
                             }
+                            EngineAction::VisPickerSelect(idx) => {
+                                state.current_visualizer_idx = idx;
+                                state.visualizer_mode = crate::state::VISUALIZERS[idx].id;
+                                state.show_vis_picker = false;
+                            }
+                            EngineAction::VisPickerToggleEnabled(idx) => {
+                                if idx != 0 { // Frequency Spectrum always enabled
+                                    state.vis_enabled[idx] = !state.vis_enabled[idx];
+                                }
+                            }
+                            EngineAction::VisPickerSetCursor(idx) => {
+                                state.vis_picker_cursor = idx;
+                            }
+                            EngineAction::VisPickerEnableAll => {
+                                for i in 0..state.vis_enabled.len() {
+                                    state.vis_enabled[i] = true;
+                                }
+                            }
+                            EngineAction::VisPickerEnableNone => {
+                                for i in 0..state.vis_enabled.len() {
+                                    // Index 0 (Frequency Spectrum) is always enabled
+                                    state.vis_enabled[i] = i == 0;
+                                }
+                            }
                             EngineAction::None => {}
                         }
                         
@@ -788,39 +863,71 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                                 }
                                 gilrs::Button::East => { // 'B' or Circle
                                     let mut state = app_state.lock().unwrap();
-                                    state.show_stats = !state.show_stats;
+                                    if state.show_vis_picker {
+                                        state.show_vis_picker = false;
+                                    } else {
+                                        state.show_stats = !state.show_stats;
+                                    }
                                 }
                                 gilrs::Button::DPadRight => {
                                     let mut state = app_state.lock().unwrap();
-                                    let target = state.current_seconds + 5.0;
-                                    state.seek_request = Some(target);
-                                    state.spectrum_history.clear();
-                                    for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
+                                    if !state.show_vis_picker {
+                                        let target = state.current_seconds + 5.0;
+                                        state.seek_request = Some(target);
+                                        state.spectrum_history.clear();
+                                        for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
+                                    }
                                 }
                                 gilrs::Button::DPadLeft => {
                                     let mut state = app_state.lock().unwrap();
-                                    let target = (state.current_seconds - 5.0).max(0.0);
-                                    state.seek_request = Some(target);
-                                    state.spectrum_history.clear();
-                                    for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
+                                    if !state.show_vis_picker {
+                                        let target = (state.current_seconds - 5.0).max(0.0);
+                                        state.seek_request = Some(target);
+                                        state.spectrum_history.clear();
+                                        for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
+                                    }
                                 }
                                 gilrs::Button::DPadUp => {
                                     let mut state = app_state.lock().unwrap();
-                                    state.current_visualizer_idx = (state.current_visualizer_idx + 1) % crate::state::VISUALIZERS.len();
-                                    state.visualizer_mode = crate::state::VISUALIZERS[state.current_visualizer_idx].id;
+                                    if state.show_vis_picker {
+                                        if state.vis_picker_cursor == 0 {
+                                            state.vis_picker_cursor = crate::state::VISUALIZERS.len() - 1;
+                                        } else {
+                                            state.vis_picker_cursor -= 1;
+                                        }
+                                    } else {
+                                        let len = crate::state::VISUALIZERS.len();
+                                        let mut idx = state.current_visualizer_idx;
+                                        for _ in 0..len {
+                                            idx = (idx + 1) % len;
+                                            if state.vis_enabled[idx] { break; }
+                                        }
+                                        state.current_visualizer_idx = idx;
+                                        state.visualizer_mode = crate::state::VISUALIZERS[idx].id;
+                                    }
                                 }
                                 gilrs::Button::DPadDown => {
                                     let mut state = app_state.lock().unwrap();
-                                    if state.current_visualizer_idx == 0 {
-                                        state.current_visualizer_idx = crate::state::VISUALIZERS.len() - 1;
+                                    if state.show_vis_picker {
+                                        state.vis_picker_cursor = (state.vis_picker_cursor + 1) % crate::state::VISUALIZERS.len();
                                     } else {
-                                        state.current_visualizer_idx -= 1;
+                                        let len = crate::state::VISUALIZERS.len();
+                                        let mut idx = state.current_visualizer_idx;
+                                        for _ in 0..len {
+                                            idx = if idx == 0 { len - 1 } else { idx - 1 };
+                                            if state.vis_enabled[idx] { break; }
+                                        }
+                                        state.current_visualizer_idx = idx;
+                                        state.visualizer_mode = crate::state::VISUALIZERS[idx].id;
                                     }
-                                    state.visualizer_mode = crate::state::VISUALIZERS[state.current_visualizer_idx].id;
                                 }
                                 gilrs::Button::South => {
                                     let mut state = app_state.lock().unwrap();
-                                    if state.current_seconds >= state.duration_seconds - 0.1 && state.duration_seconds > 0.0 {
+                                    if state.show_vis_picker {
+                                        state.current_visualizer_idx = state.vis_picker_cursor;
+                                        state.visualizer_mode = crate::state::VISUALIZERS[state.vis_picker_cursor].id;
+                                        state.show_vis_picker = false;
+                                    } else if state.current_seconds >= state.duration_seconds - 0.1 && state.duration_seconds > 0.0 {
                                         state.seek_request = Some(0.0);
                                         state.spectrum_history.clear();
                                         for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }

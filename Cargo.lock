@@ -3776,7 +3776,7 @@ dependencies = [
 
 [[package]]
 name = "rusttracker"
-version = "0.8.9"
+version = "0.8.10"
 dependencies = [
  "anyhow",
  "bytemuck",

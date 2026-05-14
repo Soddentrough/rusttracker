@@ -3,14 +3,17 @@ struct FFTParams {
     sample_rate: f32,
     min_freq: f32,
     max_freq: f32,
+    num_samples: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
-@group(0) @binding(0) var<storage, read> raw_audio: array<f32>; // [32 * 8192]
+@group(0) @binding(0) var<storage, read> raw_audio: array<f32>; // Dynamic size based on channels * max_samples
 @group(0) @binding(1) var<storage, read_write> spectrum: array<vec2<f32>>; // [32 * 1024]
 @group(0) @binding(2) var<uniform> params: FFTParams;
 
 const NUM_BINS: u32 = 1024u;
-const NUM_SAMPLES: u32 = 8192u;
 const PI: f32 = 3.14159265359;
 
 @compute @workgroup_size(16, 16)
@@ -32,11 +35,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let k = 2.0 * PI * freq / params.sample_rate;
     
     // Direct log-spaced DFT
-    for (var n = 0u; n < NUM_SAMPLES; n = n + 1u) {
-        let sample = raw_audio[ch_idx * NUM_SAMPLES + n];
+    let num_samples = params.num_samples;
+    for (var n = 0u; n < num_samples; n = n + 1u) {
+        let sample = raw_audio[ch_idx * num_samples + n];
         
         // Apply Hann window
-        let window = 0.5 * (1.0 - cos(2.0 * PI * f32(n) / f32(NUM_SAMPLES - 1u)));
+        let window = 0.5 * (1.0 - cos(2.0 * PI * f32(n) / f32(num_samples - 1u)));
         let w_sample = sample * window;
         
         let phase = k * f32(n);
@@ -44,8 +48,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         im -= w_sample * sin(phase);
     }
     
-    let norm_re = re / sqrt(f32(NUM_SAMPLES));
-    let norm_im = im / sqrt(f32(NUM_SAMPLES));
+    let norm_re = re / sqrt(f32(num_samples));
+    let norm_im = im / sqrt(f32(num_samples));
     
     // Write out normalized complex values
     spectrum[ch_idx * NUM_BINS + bin_idx] = vec2<f32>(norm_re, norm_im);

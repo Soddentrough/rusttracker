@@ -73,19 +73,21 @@ pub struct VisualizerDef {
     pub requires_history: bool,
     pub requires_fire: bool,
     pub requires_resynth: bool,
+    pub requires_ferrofluidsim: bool,
 }
 
 pub const VISUALIZERS: &[VisualizerDef] = &[
-    VisualizerDef { id: 0, name: "Frequency Spectrum", filename: "vis_spectrum.wgsl", description: "Standard 2D FFT spectrum analyzer", requires_history: false, requires_fire: false, requires_resynth: false },
-    VisualizerDef { id: 2, name: "CRT Oscilloscope", filename: "vis_oscilloscope.wgsl", description: "2D glowing CRT wave trace", requires_history: true, requires_fire: false, requires_resynth: false },
-    VisualizerDef { id: 7, name: "3D CRT Oscilloscope", filename: "vis_3doscilloscope.wgsl", description: "3D waterfall history of waveform", requires_history: true, requires_fire: false, requires_resynth: false },
-    VisualizerDef { id: 8, name: "3D Freq Oscilloscope", filename: "vis_3doscilloscope_freq.wgsl", description: "3D topographical frequency view", requires_history: false, requires_fire: false, requires_resynth: true },
-    VisualizerDef { id: 1, name: "Retro Fire", filename: "vis_flame.wgsl", description: "Demoscene pixel fire with CRT filter", requires_history: false, requires_fire: true, requires_resynth: false },
-    VisualizerDef { id: 6, name: "Fire Simulation", filename: "vis_firesim.wgsl", description: "Multi-channel procedural fire simulation", requires_history: false, requires_fire: true, requires_resynth: false },
-    VisualizerDef { id: 9, name: "Solar Flare", filename: "vis_solar.wgsl", description: "Audio-reactive raymarched sun", requires_history: true, requires_fire: false, requires_resynth: false },
-    VisualizerDef { id: 3, name: "Spatial Vectors", filename: "vis_spatial.wgsl", description: "Multi-channel spatial audio map", requires_history: false, requires_fire: false, requires_resynth: false },
-    VisualizerDef { id: 4, name: "Chrome Ferrofluid", filename: "vis_ferrofluid.wgsl", description: "Raymarched liquid metal simulation", requires_history: false, requires_fire: false, requires_resynth: false },
-    VisualizerDef { id: 5, name: "Neon Corridor", filename: "vis_neon.wgsl", description: "Raymarched neon sci-fi tunnel", requires_history: false, requires_fire: false, requires_resynth: false },
+    VisualizerDef { id: 0, name: "Frequency Spectrum", filename: "vis_spectrum.wgsl", description: "Standard 2D FFT spectrum analyzer", requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
+    VisualizerDef { id: 2, name: "CRT Oscilloscope", filename: "vis_oscilloscope.wgsl", description: "2D glowing CRT wave trace", requires_history: true, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
+    VisualizerDef { id: 7, name: "3D CRT Oscilloscope", filename: "vis_3doscilloscope.wgsl", description: "3D waterfall history of waveform", requires_history: true, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
+    VisualizerDef { id: 8, name: "3D Freq Oscilloscope", filename: "vis_3doscilloscope_freq.wgsl", description: "3D topographical frequency view", requires_history: false, requires_fire: false, requires_resynth: true, requires_ferrofluidsim: false },
+    VisualizerDef { id: 1, name: "Retro Fire", filename: "vis_flame.wgsl", description: "Demoscene pixel fire with CRT filter", requires_history: false, requires_fire: true, requires_resynth: false, requires_ferrofluidsim: false },
+    VisualizerDef { id: 6, name: "Fire Simulation", filename: "vis_firesim.wgsl", description: "Multi-channel procedural fire simulation", requires_history: false, requires_fire: true, requires_resynth: false, requires_ferrofluidsim: false },
+    VisualizerDef { id: 9, name: "Solar Flare", filename: "vis_solar.wgsl", description: "Audio-reactive raymarched sun", requires_history: true, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
+    VisualizerDef { id: 3, name: "Spatial Vectors", filename: "vis_spatial.wgsl", description: "Multi-channel spatial audio map", requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
+    VisualizerDef { id: 4, name: "Chrome Ferrofluid", filename: "vis_ferrofluid.wgsl", description: "Raymarched liquid metal simulation", requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
+    VisualizerDef { id: 10, name: "Ferrofluid Particle Sim", filename: "vis_ferrofluidsim.wgsl", description: "Compute physics droplet simulation", requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: true },
+    VisualizerDef { id: 5, name: "Neon Corridor", filename: "vis_neon.wgsl", description: "Raymarched neon sci-fi tunnel", requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
 ];
 
 #[derive(Debug, Clone)]
@@ -133,10 +135,13 @@ pub struct AppState {
     pub show_help: bool,
     pub stats: PerformanceStats,
     pub current_fps: f32,
+    pub current_sample_rate: f32,
     pub playlist: Vec<String>,
     pub playlist_index: usize,
     pub track_ended: bool,
     pub visualizer_mode: u32,
+    pub visual_width: u32,
+    pub target_fps: u32,
     pub current_visualizer_idx: usize,
     pub video_frame_rx: Option<crossbeam_channel::Receiver<VideoFrame>>,
     pub free_video_frame_tx: Option<crossbeam_channel::Sender<VideoFrame>>,
@@ -148,6 +153,10 @@ pub struct AppState {
     pub panel_split_ratio: f32,
     pub gamepad_type: GamepadType,
     pub has_gamepad: bool,
+    // Visualizer Picker
+    pub show_vis_picker: bool,
+    pub vis_picker_cursor: usize,
+    pub vis_enabled: Vec<bool>,
 }
 
 impl AppState {
@@ -210,10 +219,13 @@ impl AppState {
             show_help: false,
             stats: PerformanceStats::default(),
             current_fps: 0.0,
+            current_sample_rate: 44100.0,
             playlist: Vec::new(),
             playlist_index: 0,
             track_ended: false,
             visualizer_mode: VISUALIZERS[0].id,
+            visual_width: 1024,
+            target_fps: 144,
             current_visualizer_idx: 0,
             video_frame_rx: None,
             free_video_frame_tx: None,
@@ -226,6 +238,9 @@ impl AppState {
             panel_split_ratio: 0.5,
             gamepad_type: if is_steam_deck { GamepadType::SteamDeck } else { GamepadType::Xbox },
             has_gamepad: is_steam_deck,
+            show_vis_picker: false,
+            vis_picker_cursor: 0,
+            vis_enabled: vec![true; VISUALIZERS.len()],
         }
     }
     
@@ -242,6 +257,8 @@ impl AppState {
             seek_request: None,
             seek_epoch: self.seek_epoch,
             is_paused: self.is_paused,
+            visual_width: self.visual_width,
+            target_fps: self.target_fps,
             bpm: self.bpm,
             speed: self.speed,
             num_channels: self.num_channels,
@@ -284,6 +301,7 @@ impl AppState {
             show_help: self.show_help,
             stats: self.stats.clone(),
             current_fps: self.current_fps,
+            current_sample_rate: self.current_sample_rate,
             playlist: self.playlist.clone(),
             playlist_index: self.playlist_index,
             track_ended: self.track_ended,
@@ -299,6 +317,9 @@ impl AppState {
             panel_split_ratio: self.panel_split_ratio,
             gamepad_type: self.gamepad_type,
             has_gamepad: self.has_gamepad,
+            show_vis_picker: self.show_vis_picker,
+            vis_picker_cursor: self.vis_picker_cursor,
+            vis_enabled: self.vis_enabled.clone(),
         }
     }
 }

@@ -31,13 +31,17 @@ struct AudioUniforms {
     ui_meters_rect: vec4<f32>,
     ui_heatmap_rect: vec4<f32>,
     ui_fire_rect: vec4<f32>,
+    waveform_resolution: u32,
+    waveform_history_size: u32,
+    _pad0: u32,
+    _pad1: u32,
 };
 
 @group(0) @binding(0)
 var<uniform> audio: AudioUniforms;
 
 @group(0) @binding(1)
-var<storage, read> waveform_history: array<vec4<f32>>;
+var<storage, read> waveform_history: array<f32>;
 
 // Hash function for analog noise
 fn hash12(p: vec2<f32>) -> f32 {
@@ -48,12 +52,10 @@ fn hash12(p: vec2<f32>) -> f32 {
 
 // Waveforms are pre-smoothed on CPU, so we can read directly
 fn get_waveform(hist_idx: u32, idx: u32) -> f32 {
-    let clamped_idx = clamp(idx, 0u, 1023u);
-    let vec_idx = clamped_idx / 4u;
-    let component_idx = clamped_idx % 4u;
-
-    let spec_vec = waveform_history[hist_idx * 256u + vec_idx];
-    return spec_vec[component_idx];
+    let res = max(audio.waveform_resolution, 128u);
+    let clamped_idx = clamp(idx, 0u, res - 1u);
+    let clamped_hist = clamp(hist_idx, 0u, max(1u, audio.waveform_history_size) - 1u);
+    return waveform_history[clamped_hist * 2048u + clamped_idx];
 }
 
 fn sd_segment(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
@@ -106,12 +108,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let amber_lo = vec3<f32>(0.6, 0.18, 0.02);
     let amber_hi = vec3<f32>(1.0, 0.55, 0.08);
 
-    let num_lines = 48u;
-    let num_points = 1024u; // Increased resolution for wider lines
+    let num_lines = min(max(1u, audio.waveform_history_size), 144u);
+    let res = f32(max(audio.waveform_resolution, 128u));
     
     for (var i = 0u; i < num_lines; i = i + 1u) {
-        // Z layout: back to front. i=0 is back (oldest), i=47 is front (newest).
-        // Maintain same 0.24 spacing: 47 * 0.24 = 11.28 span. Front remains -1.8, back becomes 9.48.
+        // Z layout: back to front. i=0 is back (oldest), i=num_lines-1 is front (newest).
         let y_line = mix(9.48, -1.8, f32(i) / f32(num_lines - 1u));
         let hist_idx = i;
         
@@ -124,17 +125,20 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 continue;
             }
             
-            // Map X from -9.6 to 9.6
-            let float_idx = (hit_x + 9.6) / 19.2 * 1023.0;
+            // Map X from -9.6 to 9.6 to dynamic resolution
+            let float_idx = (hit_x + 9.6) / 19.2 * (res - 1.0);
             let idx = i32(round(float_idx));
             
-            let start_idx = max(0, idx - 2);
-            let end_idx = min(1022, idx + 2);
+            // Search radius proportional to distance to avoid aliasing/dropout on distant lines
+            // Scale down slightly since we have 3x more lines now
+            let search_radius = clamp(i32(t * 0.4), 1, 6);
+            let start_idx = max(0, idx - search_radius);
+            let end_idx = min(i32(res) - 1i, idx + search_radius);
             
             var min_dist = 1000.0;
             
             var j_u = u32(start_idx);
-            var x_prev = -9.6 + f32(j_u) * 0.01876832844;
+            var x_prev = -9.6 + f32(j_u) / (res - 1.0) * 19.2;
             var mask_prev = smoothstep(9.6, 6.6, abs(x_prev));
             var v_prev = get_waveform(hist_idx, j_u);
             var p_prev = abs(v_prev) * mask_prev * 6.0;
@@ -143,7 +147,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             
             for (var j = start_idx; j <= end_idx; j = j + 1) {
                 j_u = u32(j + 1);
-                let x_curr = -9.6 + f32(j_u) * 0.01876832844;
+                let x_curr = -9.6 + f32(j_u) / (res - 1.0) * 19.2;
                 let mask_curr = smoothstep(9.6, 6.6, abs(x_curr));
                 let v_curr = get_waveform(hist_idx, j_u);
                 let p_curr = abs(v_curr) * mask_curr * 6.0;
@@ -161,10 +165,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let r = length(crt_uv);
             let edge_blur = smoothstep(0.3, 1.2, r);
             
-            let thickness = 0.002 + edge_blur * 0.004;
+            // Distance-based thickness to prevent sub-pixel wireframe flickering
+            let depth_thickness = t * 0.0004;
+            let thickness = 0.002 + edge_blur * 0.004 + depth_thickness;
             let core = smoothstep(thickness, 0.0, min_dist);
-            // High bloom for that glowing CRT look
-            let bloom = 0.0004 / (min_dist * min_dist + 0.0001) * 0.15;
+            // High bloom for that glowing CRT look, scaling bloom spread with depth
+            let bloom = 0.0004 / (min_dist * min_dist + 0.0001 + t * 0.00005) * 0.15;
             
             // Depth fade (lines further back are slightly darker)
             let depth_fade = exp(-t * 0.20);
@@ -173,7 +179,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let age_fade = mix(0.05, 1.0, f32(i) / f32(num_lines - 1u));
             
             // Sample waveform height at hit point for color grading
-            let hit_wave_idx = u32(clamp((hit_x + 9.6) / 19.2 * 1023.0, 0.0, 1023.0));
+            let hit_wave_idx = u32(clamp((hit_x + 9.6) / 19.2 * (res - 1.0), 0.0, res - 1.0));
             let wave_height = clamp(abs(get_waveform(hist_idx, hit_wave_idx)) * 2.0, 0.0, 1.0);
             let line_amber = mix(amber_lo, amber_hi, wave_height);
             

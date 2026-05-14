@@ -52,6 +52,11 @@ pub enum EngineAction {
     SetForceStereo(bool),
     SetSplitRatio(f32),
     SetAppendToPlaylist(bool),
+    VisPickerSelect(usize),
+    VisPickerToggleEnabled(usize),
+    VisPickerSetCursor(usize),
+    VisPickerEnableAll,
+    VisPickerEnableNone,
 }
 
 #[repr(C)]
@@ -74,13 +79,13 @@ pub struct AudioUniforms {
     pub ui_meters_rect: [f32; 4],
     pub ui_heatmap_rect: [f32; 4],
     pub ui_fire_rect: [f32; 4],
+    pub waveform_resolution: u32,
+    pub waveform_history_size: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
 }
 
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct WaveformHistoryStorage {
-    pub waveforms: [[f32; 1024]; 60],
-}
+
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -108,6 +113,10 @@ pub struct FFTParams {
     pub sample_rate: f32,
     pub min_freq: f32,
     pub max_freq: f32,
+    pub num_samples: u32,
+    pub _pad0: u32,
+    pub _pad1: u32,
+    pub _pad2: u32,
 }
 
 #[repr(C)]
@@ -180,6 +189,9 @@ pub struct VulkanEngine<'a> {
     pub heatmap_row: u32,
     heatmap_compute_pipeline: wgpu::ComputePipeline,
     heatmap_bind_group: wgpu::BindGroup,
+    ferrofluidsim_compute_pipeline: wgpu::ComputePipeline,
+    ferrofluidsim_clear_pipeline: wgpu::ComputePipeline,
+    ferrofluidsim_bind_group: wgpu::BindGroup,
     pub start_time: std::time::Instant,
 
     // GPU FFT
@@ -193,7 +205,7 @@ pub struct VulkanEngine<'a> {
     
     // Pre-allocated buffers to avoid per-frame heap allocations
     flat_raw_audio: Vec<f32>,
-    waveform_history_storage: WaveformHistoryStorage,
+    waveform_history_flat: Vec<f32>,
     
     // Video
     video_bind_group_layout: wgpu::BindGroupLayout,
@@ -280,8 +292,8 @@ impl<'a> VulkanEngine<'a> {
             mapped_at_creation: false,
         });
         let waveform_storage_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Waveform History Storage Buffer"),
-            size: std::mem::size_of::<WaveformHistoryStorage>() as u64,
+            label: Some("Waveform History Storage"),
+            size: (2048 * 144 * 4) as u64,
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -309,6 +321,19 @@ impl<'a> VulkanEngine<'a> {
             view_formats: &[],
         });
         let fire_grid_view = fire_grid_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let ferrofluidsim_particles = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Ferrofluid Particles"),
+            size: (100_000 * 32) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let ferrofluidsim_grid = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Ferrofluid Grid"),
+            size: (512 * 512 * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             entries: &[
@@ -361,6 +386,16 @@ impl<'a> VulkanEngine<'a> {
                         min_binding_size: None,
                     },
                     count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
                 }
             ],
             label: Some("audio_bind_group_layout"),
@@ -388,6 +423,10 @@ impl<'a> VulkanEngine<'a> {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: gpu_spectrum_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: ferrofluidsim_grid.as_entire_binding(),
                 }
             ],
             label: Some("audio_bind_group"),
@@ -411,6 +450,7 @@ impl<'a> VulkanEngine<'a> {
                 7 => include_str!("shaders/vis_3doscilloscope.wgsl"),
                 8 => include_str!("shaders/vis_3doscilloscope_freq.wgsl"),
                 9 => include_str!("shaders/vis_solar.wgsl"),
+                10 => include_str!("shaders/vis_ferrofluidsim.wgsl"),
                 _ => include_str!("shaders/vis_spectrum.wgsl"),
             }
         };
@@ -766,6 +806,36 @@ impl<'a> VulkanEngine<'a> {
             cache: None,
         });
 
+        let ferrofluidsim_compute_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("ferrofluidsim_compute_layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+            ],
+        });
+
+        let ferrofluidsim_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("ferrofluidsim_bg"), layout: &ferrofluidsim_compute_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: uniform_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 1, resource: ferrofluidsim_particles.as_entire_binding() },
+                wgpu::BindGroupEntry { binding: 2, resource: ferrofluidsim_grid.as_entire_binding() },
+            ],
+        });
+
+        let ferrofluidsim_compute_shader = device.create_shader_module(wgpu::include_wgsl!("shaders/ferrofluidsim_compute.wgsl"));
+        let ferrofluidsim_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("ferrofluidsim_layout"), bind_group_layouts: &[Some(&ferrofluidsim_compute_layout)], immediate_size: 0,
+        });
+        
+        let ferrofluidsim_compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Ferrofluid Compute"), layout: Some(&ferrofluidsim_pipeline_layout), module: &ferrofluidsim_compute_shader, entry_point: Some("main"), compilation_options: Default::default(), cache: None,
+        });
+        let ferrofluidsim_clear_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Ferrofluid Clear"), layout: Some(&ferrofluidsim_pipeline_layout), module: &ferrofluidsim_compute_shader, entry_point: Some("clear"), compilation_options: Default::default(), cache: None,
+        });
+
         let mut query_set = None;
         let mut query_resolve_buffer = None;
         let mut query_read_buffer = None;
@@ -796,7 +866,7 @@ impl<'a> VulkanEngine<'a> {
         // --- GPU FFT INIT ---
         let raw_audio_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("GPU FFT Raw Audio Buffer"),
-            size: 32 * 8192 * 4,
+            size: 32 * 65536 * 4, // Increased capacity for high sample rates (up to ~350kHz at 185ms)
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -930,6 +1000,9 @@ impl<'a> VulkanEngine<'a> {
             heatmap_row: 0,
             heatmap_compute_pipeline,
             heatmap_bind_group,
+            ferrofluidsim_compute_pipeline,
+            ferrofluidsim_clear_pipeline,
+            ferrofluidsim_bind_group,
             start_time: std::time::Instant::now(),
             fft_compute_pipeline,
             fft_bind_group,
@@ -938,8 +1011,8 @@ impl<'a> VulkanEngine<'a> {
             raw_audio_buffer,
             _gpu_spectrum_buffer: gpu_spectrum_buffer,
             fft_params_buffer,
-            flat_raw_audio: vec![0.0f32; 32 * 8192],
-            waveform_history_storage: WaveformHistoryStorage { waveforms: [[0.0; 1024]; 60] },
+            flat_raw_audio: vec![0.0f32; 32 * 65536],
+            waveform_history_flat: vec![0.0; 2048 * 144],
             video_bind_group_layout,
             video_pipeline,
             video_state: None,
@@ -979,6 +1052,10 @@ impl<'a> VulkanEngine<'a> {
             ui_meters_rect: self.meters_uv_rect,
             ui_heatmap_rect: self.heatmap_uv_rect,
             ui_fire_rect: self.fire_uv_rect,
+            waveform_resolution: 1024,
+            waveform_history_size: 144,
+            _pad0: 0,
+            _pad1: 0,
         };
 
         uniforms.spectrum.copy_from_slice(&state.spectrum_data);
@@ -1019,30 +1096,42 @@ impl<'a> VulkanEngine<'a> {
                 uniforms.spatial_channels[i] = state.channel_vus[src_idx];
             }
         }
+        
+        let vis_width = state.visual_width.max(128).min(2048) as u32;
+        uniforms.waveform_resolution = vis_width;
+        uniforms.waveform_history_size = state.waveform_history.len().min(144) as u32;
+        uniforms._pad0 = 0;
+        uniforms._pad1 = 0;
 
         self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
         // Only upload waveform history when the active visualizer requires it
         let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
         if vis_def.requires_history {
-            // Re-use persistent storage to avoid 240KB stack allocation per frame
-            // Upload only the 60 most recent frames
+            // Upload up to 144 most recent frames
             let hist_len = state.waveform_history.len();
-            let start = hist_len.saturating_sub(60);
-            for (slot, wave) in state.waveform_history.iter().skip(start).enumerate().take(60) {
-                // Pre-smooth with [1,2,1] triangle kernel
-                self.waveform_history_storage.waveforms[slot][0] = (wave[0] * 3.0 + wave[1]) / 4.0;
-                for j in 1..1023 {
-                    self.waveform_history_storage.waveforms[slot][j] = (wave[j - 1] + wave[j] * 2.0 + wave[j + 1]) / 4.0;
+            let start = hist_len.saturating_sub(144);
+            let visual_width_usize = vis_width as usize;
+            
+            for (slot, wave) in state.waveform_history.iter().skip(start).enumerate().take(144) {
+                let wave_len = wave.len().min(visual_width_usize);
+                if wave_len > 0 {
+                    let offset = slot * 2048; // Max width is 2048
+                    self.waveform_history_flat[offset..offset + wave_len].copy_from_slice(&wave[..wave_len]);
+                    
+                    // Simple pre-smoothing inline
+                    if wave_len > 2 {
+                        let mut prev = self.waveform_history_flat[offset];
+                        for j in 1..wave_len - 1 {
+                            let curr = self.waveform_history_flat[offset + j];
+                            let next = self.waveform_history_flat[offset + j + 1];
+                            self.waveform_history_flat[offset + j] = (prev + curr * 2.0 + next) / 4.0;
+                            prev = curr;
+                        }
+                    }
                 }
-                self.waveform_history_storage.waveforms[slot][1023] = (wave[1022] + wave[1023] * 3.0) / 4.0;
             }
-            // Zero out unused slots
-            let used_slots = state.waveform_history.len().min(60);
-            for slot in used_slots..60 {
-                self.waveform_history_storage.waveforms[slot] = [0.0; 1024];
-            }
-            self.queue.write_buffer(&self.waveform_storage_buffer, 0, bytemuck::cast_slice(&[self.waveform_history_storage]));
+            self.queue.write_buffer(&self.waveform_storage_buffer, 0, bytemuck::cast_slice(&self.waveform_history_flat));
         }
         
         if vis_def.requires_fire {
@@ -1088,21 +1177,28 @@ impl<'a> VulkanEngine<'a> {
 
         if state.gpu_fft {
             let num_channels = state.raw_audio_channels.len().min(32);
+            let num_samples = state.raw_audio_channels.get(0).map_or(8192, |ch| ch.len()).min(65536);
+            
             // Re-use pre-allocated buffer; only zero and fill active channels
             self.flat_raw_audio.fill(0.0);
             for (c, channel_data) in state.raw_audio_channels.iter().take(num_channels).enumerate() {
-                let len = channel_data.len().min(8192);
-                self.flat_raw_audio[(c * 8192)..(c * 8192 + len)].copy_from_slice(&channel_data[..len]);
+                let len = channel_data.len().min(num_samples);
+                self.flat_raw_audio[(c * num_samples)..(c * num_samples + len)].copy_from_slice(&channel_data[..len]);
             }
             // Only upload the active channels' data instead of the full 32-channel buffer
-            let upload_size = num_channels.max(1) * 8192;
+            let upload_size = num_channels.max(1) * num_samples;
             self.queue.write_buffer(&self.raw_audio_buffer, 0, bytemuck::cast_slice(&self.flat_raw_audio[..upload_size]));
 
+            let min_safe_freq = 2.5 * state.current_sample_rate / (num_samples as f32);
             let fft_params = FFTParams {
                 num_channels: num_channels as u32,
-                sample_rate: 44100.0, // TODO: Use actual sample rate if available
-                min_freq: 20.0,
+                sample_rate: state.current_sample_rate, // Reverted to accurate sample rate
+                min_freq: 20.0f32.max(min_safe_freq),
                 max_freq: state.max_frequency,
+                num_samples: num_samples as u32,
+                _pad0: 0,
+                _pad1: 0,
+                _pad2: 0,
             };
             self.queue.write_buffer(&self.fft_params_buffer, 0, bytemuck::cast_slice(&[fft_params]));
         }
@@ -1481,15 +1577,163 @@ impl<'a> VulkanEngine<'a> {
                                 shortcut(ui, "o", Some("Y"), "Open File");
                                 shortcut(ui, "space", Some("A"), "Play / Pause");
                                 shortcut(ui, "v", Some("X"), "Toggle Video");
+                                shortcut(ui, "m", None, "Visualizer Modules");
                                 shortcut(ui, "left/right", Some("D-Pad L/R"), "Seek Timeline");
                                 shortcut(ui, "tab", Some("L1"), "Toggle HUD");
-                                shortcut(ui, "up/down", Some("D-Pad U/D"), "Change Visualizer");
+                                shortcut(ui, "up/down", Some("D-Pad U/D"), "Cycle Visualizer");
                                 shortcut(ui, "s", Some("B"), "Toggle Stats");
                                 shortcut(ui, "h", None, "Toggle Help");
                                 shortcut(ui, "q / esc", Some("Select"), "Quit");
                                 shortcut(ui, "f", Some("Start"), "Toggle Fullscreen");
                                 shortcut(ui, "g", Some("R1"), "Toggle GPU FFT");
                                 shortcut(ui, "[ / ]", None, "Scale Panels");
+                            });
+                    });
+            }
+
+            if state.show_vis_picker {
+                egui::Window::new("Visualizer Modules")
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .title_bar(false)
+                    .resizable(false)
+                    .collapsible(false)
+                    .fixed_size([540.0, 500.0])
+                    .frame(egui::Frame::window(&ctx.global_style())
+                        .fill(egui::Color32::from_black_alpha(230))
+                        .corner_radius(12.0)
+                        .inner_margin(20.0))
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("🎨 Visualization Modules")
+                                    .color(egui::Color32::WHITE)
+                                    .strong()
+                                    .size(20.0)
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.link("None").clicked() {
+                                    engine_action = EngineAction::VisPickerEnableNone;
+                                }
+                                ui.label(egui::RichText::new("•").color(egui::Color32::from_gray(100)));
+                                if ui.link("All").clicked() {
+                                    engine_action = EngineAction::VisPickerEnableAll;
+                                }
+                                ui.label(egui::RichText::new("Rotation:").color(egui::Color32::from_gray(150)).size(13.0));
+                            });
+                        });
+                        ui.add_space(2.0);
+                        ui.label(
+                            egui::RichText::new("Enter to select  •  Space to toggle rotation  •  Esc to close")
+                                .color(egui::Color32::from_gray(130))
+                                .size(11.0)
+                        );
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+
+                        egui::ScrollArea::vertical()
+                            .max_height(420.0)
+                            .show(ui, |ui| {
+                                for (i, vis) in crate::state::VISUALIZERS.iter().enumerate() {
+                                    let is_cursor = i == state.vis_picker_cursor;
+                                    let is_active = i == state.current_visualizer_idx;
+                                    let is_enabled = state.vis_enabled.get(i).copied().unwrap_or(true);
+
+                                    let bg = if is_cursor {
+                                        egui::Color32::from_rgba_unmultiplied(50, 110, 220, 100)
+                                    } else if is_active {
+                                        egui::Color32::from_rgba_unmultiplied(30, 90, 30, 80)
+                                    } else {
+                                        egui::Color32::TRANSPARENT
+                                    };
+
+                                    let row_frame = egui::Frame::NONE
+                                        .fill(bg)
+                                        .corner_radius(6.0)
+                                        .inner_margin(egui::Margin::symmetric(10, 6));
+
+                                    let row_resp = row_frame.show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            // Enable/disable toggle indicator
+                                            let toggle_text = if is_enabled { "✅" } else { "⬜" };
+                                            let toggle_color = if i == 0 {
+                                                egui::Color32::from_gray(80) // Locked on
+                                            } else if is_enabled {
+                                                egui::Color32::WHITE
+                                            } else {
+                                                egui::Color32::from_gray(60)
+                                            };
+                                            let toggle_resp = ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(toggle_text)
+                                                        .size(14.0)
+                                                        .color(toggle_color)
+                                                ).sense(egui::Sense::click())
+                                            );
+                                            if toggle_resp.clicked() && i != 0 {
+                                                engine_action = EngineAction::VisPickerToggleEnabled(i);
+                                            }
+
+                                            ui.add_space(6.0);
+
+                                            // Name
+                                            let name_color = if !is_enabled {
+                                                egui::Color32::from_gray(90)
+                                            } else if is_active {
+                                                egui::Color32::from_rgb(80, 255, 80)
+                                            } else {
+                                                egui::Color32::WHITE
+                                            };
+                                            ui.label(
+                                                egui::RichText::new(vis.name)
+                                                    .color(name_color)
+                                                    .strong()
+                                                    .size(15.0)
+                                            );
+
+                                            // Active indicator
+                                            if is_active {
+                                                ui.label(
+                                                    egui::RichText::new("▶")
+                                                        .color(egui::Color32::from_rgb(80, 255, 80))
+                                                        .size(13.0)
+                                                );
+                                            }
+
+                                            // Description (right-aligned)
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    let desc_color = if !is_enabled {
+                                                        egui::Color32::from_gray(60)
+                                                    } else {
+                                                        egui::Color32::from_gray(120)
+                                                    };
+                                                    ui.label(
+                                                        egui::RichText::new(vis.description)
+                                                            .color(desc_color)
+                                                            .size(11.5)
+                                                    );
+                                                }
+                                            );
+                                        });
+                                    });
+
+                                    // Hover moves cursor to this row
+                                    if row_resp.response.hovered() && !is_cursor {
+                                        engine_action = EngineAction::VisPickerSetCursor(i);
+                                    }
+
+                                    // Click row to select visualizer
+                                    if row_resp.response.interact(egui::Sense::click()).clicked() {
+                                        engine_action = EngineAction::VisPickerSelect(i);
+                                    }
+
+                                    // Ensure cursor row is scrolled into view (for keyboard/gamepad navigation)
+                                    if is_cursor {
+                                        row_resp.response.scroll_to_me(Some(egui::Align::Center));
+                                    }
+                                }
                             });
                     });
             }
@@ -1718,9 +1962,10 @@ impl<'a> VulkanEngine<'a> {
                                                             kb_shortcut("o", "Open File");
                                                             kb_shortcut("space", "Play / Pause");
                                                             kb_shortcut("v", "Toggle Video");
+                                                            kb_shortcut("m", "Visualizer Modules");
                                                             kb_shortcut("left/right", "Seek Timeline");
                                                             kb_shortcut("tab", "Toggle HUD");
-                                                            kb_shortcut("up/down", "Change Visualizer");
+                                                            kb_shortcut("up/down", "Cycle Visualizer");
                                                             kb_shortcut("s", "Toggle Stats");
                                                             kb_shortcut("q / esc", "Quit");
                                                             kb_shortcut("f", "Toggle Fullscreen");
@@ -1762,7 +2007,7 @@ impl<'a> VulkanEngine<'a> {
                                                             gp_shortcut("X", "Toggle Video Mode");
                                                             gp_shortcut("D-Pad L/R", "Seek Timeline");
                                                             gp_shortcut("L2", "Toggle HUD");
-                                                            gp_shortcut("D-Pad U/D", "Change Visualizer");
+                                                            gp_shortcut("D-Pad U/D", "Cycle Visualizer");
                                                             gp_shortcut("B", "Toggle Stats");
                                                             gp_shortcut("Select", "Quit");
                                                             gp_shortcut("Start", "Toggle Fullscreen");
@@ -2058,6 +2303,7 @@ impl<'a> VulkanEngine<'a> {
                             if state.num_patterns > 0 { columns[2].horizontal(|ui| { ui.label("Patterns"); ui.label(format!("{}", state.num_patterns)); }); }
                             if state.num_instruments > 0 { columns[2].horizontal(|ui| { ui.label("Instruments"); ui.label(format!("{}", state.num_instruments)); }); }
                             if state.num_samples > 0 { columns[2].horizontal(|ui| { ui.label("Samples"); ui.label(format!("{}", state.num_samples)); }); }
+                            columns[2].horizontal(|ui| { ui.label("Sample Rate"); ui.label(format!("{} Hz", state.current_sample_rate as u32)); });
                             columns[2].horizontal(|ui| { 
                                 if let Some(tc) = state.tracker_channels {
                                     ui.label("Tracker Channels");
@@ -2275,6 +2521,19 @@ impl<'a> VulkanEngine<'a> {
             self.fire_ping = !self.fire_ping;
         }
 
+        if vis_def.requires_ferrofluidsim {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Ferrofluid Sim Compute"),
+                timestamp_writes: None,
+            });
+            compute_pass.set_pipeline(&self.ferrofluidsim_clear_pipeline);
+            compute_pass.set_bind_group(0, Some(&self.ferrofluidsim_bind_group), &[]);
+            compute_pass.dispatch_workgroups(1024, 1, 1);
+            
+            compute_pass.set_pipeline(&self.ferrofluidsim_compute_pipeline);
+            compute_pass.dispatch_workgroups(391, 1, 1);
+        }
+
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Main Render Pass"),
@@ -2425,7 +2684,7 @@ impl<'a> VulkanEngine<'a> {
             }
         }
 
-        let do_capture = std::env::var("CAPTURE_FRAME").is_ok() && state.current_seconds >= 20.0;
+        let do_capture = std::env::var("CAPTURE_FRAME").is_ok() && state.current_seconds >= 2.0;
         let mut readback_buffer = None;
         if do_capture {
             let bpr = (self.config.width * 4 + 255) & !255;
