@@ -190,6 +190,7 @@ mod wasapi_bitstream {
 
         // ── Probe codec via ffmpeg-next ─────────────────────────────
         println!("Probing audio stream via ffmpeg-next...");
+        ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Quiet);
         ffmpeg_next::init().context("Failed to initialize ffmpeg-next")?;
         
         let mut ictx = ffmpeg_next::format::input(&file_path)
@@ -381,24 +382,12 @@ mod wasapi_bitstream {
             let ost_time_base = octx.stream(ost_index).unwrap().time_base();
 
             let mut pkts_written = 0;
-            let mut dts_counter = 0;
             for (stream, mut packet) in ictx.packets() {
                 if stream.index() == best_audio_index {
                     packet.rescale_ts(stream.time_base(), ost_time_base);
                     packet.set_stream(ost_index);
                     
-                    let duration = packet.duration().max(160);
-                    packet.set_pts(Some(dts_counter));
-                    packet.set_dts(Some(dts_counter));
-                    dts_counter += duration;
-
-                    if pkts_written < 10 {
-                        println!("[ffmpeg] Writing packet {} ({} bytes)...", pkts_written, packet.size());
-                    }
-                    let res = packet.write(&mut octx);
-                    if pkts_written < 10 {
-                        println!("[ffmpeg] Packet {} written: {:?}", pkts_written, res);
-                    }
+                    let _ = packet.write(&mut octx);
                     pkts_written += 1;
                 }
             }
