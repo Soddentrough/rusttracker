@@ -50,6 +50,7 @@ pub enum EngineAction {
     LoadFiles(Vec<String>, bool),
     Seek(f32),
     SetForceStereo(bool),
+    #[allow(dead_code)]
     SetPassthrough(bool),
     SetSplitRatio(f32),
     SetAppendToPlaylist(bool),

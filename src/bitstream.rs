@@ -16,8 +16,7 @@ pub fn start_bitstream_thread(
     Err(anyhow::anyhow!("Bitstreaming is only supported on Windows."))
 }
 
-use anyhow::Result;
-use std::env;
+
 
 #[cfg(windows)]
 mod wasapi_bitstream {

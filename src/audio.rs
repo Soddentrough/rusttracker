@@ -19,6 +19,7 @@ use midly::{Smf, TrackEventKind, MetaMessage, MidiMessage};
 use crate::state::AppState;
 use crossbeam_channel::{bounded, Sender, Receiver};
 
+#[allow(dead_code)]
 pub enum PlaybackHandle {
     Cpal(cpal::Stream),
     Bitstream(std::thread::JoinHandle<()>),
