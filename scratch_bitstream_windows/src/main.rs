@@ -142,21 +142,24 @@ mod wasapi_bitstream {
     pub fn run(file_path: &str, device_idx: Option<u32>) -> Result<()> {
         unsafe { let _ = CoInitializeEx(None, COINIT_MULTITHREADED); }
 
-        // ── Probe codec ─────────────────────────────────────────────
-        println!("Probing audio stream...");
-        let probe = Command::new("ffprobe")
-            .args(["-v", "error", "-select_streams", "a:0",
-                   "-show_entries", "stream=codec_name",
-                   "-of", "default=noprint_wrappers=1:nokey=1",
-                   file_path])
-            .output()
-            .context("ffprobe failed. Ensure ffmpeg is in PATH.")?;
-
-        let codec_name = String::from_utf8_lossy(&probe.stdout).trim().to_string();
-        if codec_name.is_empty() {
-            bail!("Could not detect audio codec. ffprobe stderr:\n{}",
-                  String::from_utf8_lossy(&probe.stderr));
-        }
+        // ── Probe codec via ffmpeg-next ─────────────────────────────
+        println!("Probing audio stream via ffmpeg-next...");
+        ffmpeg_next::init().context("Failed to initialize ffmpeg-next")?;
+        
+        let mut ictx = ffmpeg_next::format::input(&file_path)
+            .context("Failed to open input file")?;
+            
+        let best_audio = ictx.streams().best(ffmpeg_next::media::Type::Audio)
+            .ok_or_else(|| anyhow::anyhow!("No audio stream found"))?;
+            
+        let codec_id = best_audio.parameters().id();
+        let codec_name = match codec_id {
+            ffmpeg_next::codec::Id::TRUEHD => "truehd",
+            ffmpeg_next::codec::Id::EAC3 => "eac3",
+            ffmpeg_next::codec::Id::DTS => "dts",
+            ffmpeg_next::codec::Id::AC3 => "ac3",
+            _ => "unknown",
+        }.to_string();
 
         let profiles = detect_codec_profile(&codec_name);
         println!("Detected codec: {}", codec_name);
@@ -235,27 +238,64 @@ mod wasapi_bitstream {
             buffer_frames,
             buffer_frames as f64 / format.Format.nSamplesPerSec as f64 * 1000.0);
 
-        // ── Spawn FFmpeg ────────────────────────────────────────────
-        let mut ffmpeg_args = vec![
-            "-v", "error",
-            "-i", file_path,
-            "-c:a", "copy",
-        ];
-        if codec_name.contains("truehd") {
-            ffmpeg_args.extend(["-spdif_flags", "+use_mat"]);
+        // ── Start FFmpeg spdif Muxer Pipe ───────────────────────────
+        use windows::Win32::System::Pipes::{CreateNamedPipeA, ConnectNamedPipe, PIPE_ACCESS_INBOUND, PIPE_TYPE_BYTE, PIPE_READMODE_BYTE, PIPE_WAIT};
+        
+        let pipe_name = format!("\\\\.\\pipe\\rusttracker_bitstream_{}", std::process::id());
+        let pipe_name_nul = format!("{}\0", pipe_name);
+
+        let pipe_handle = unsafe {
+            CreateNamedPipeA(
+                windows::core::PCSTR::from_raw(pipe_name_nul.as_ptr()),
+                PIPE_ACCESS_INBOUND,
+                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                1,
+                65536,
+                65536,
+                0,
+                None,
+            )?
+        };
+
+        let pipe_name_clone = pipe_name.clone();
+        let best_audio_index = best_audio.index();
+        let parameters = best_audio.parameters();
+
+        let ffmpeg_thread = std::thread::spawn(move || {
+            // Wait slightly for server to block on ConnectNamedPipe
+            std::thread::sleep(std::time::Duration::from_millis(50));
+
+            let mut octx = match ffmpeg_next::format::output_as(&pipe_name_clone, "spdif") {
+                Ok(c) => c,
+                Err(e) => { eprintln!("FFmpeg output error: {:?}", e); return; }
+            };
+
+            let mut ost = octx.add_stream(ffmpeg_next::codec::Id::None).unwrap();
+            ost.set_parameters(parameters);
+            
+            let mut dict = ffmpeg_next::dict::Dictionary::new();
+            if codec_name.contains("truehd") {
+                dict.set("spdif_flags", "+use_mat");
+            }
+            
+            octx.write_header_with(&dict).unwrap();
+
+            for (stream, mut packet) in ictx.packets() {
+                if stream.index() == best_audio_index {
+                    packet.rescale_ts(stream.time_base(), ost.time_base());
+                    packet.set_stream(ost.index());
+                    let _ = packet.write_interleaved(&mut octx);
+                }
+            }
+            let _ = octx.write_trailer();
+        });
+
+        unsafe {
+            let _ = ConnectNamedPipe(pipe_handle, None);
         }
-        ffmpeg_args.extend(["-f", "spdif", "-"]);
 
-        println!("\nSpawning: ffmpeg {}", ffmpeg_args.join(" "));
-
-        let mut child = Command::new("ffmpeg")
-            .args(&ffmpeg_args)
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .context("Failed to spawn ffmpeg. Ensure ffmpeg.exe is in PATH.")?;
-
-        let mut stdout = child.stdout.take().unwrap();
+        use std::os::windows::io::FromRawHandle;
+        let mut stdout = unsafe { std::fs::File::from_raw_handle(pipe_handle.0 as _) };
 
         // ── Pump loop ───────────────────────────────────────────────
         unsafe { audio_client.Start()?; }
@@ -309,24 +349,16 @@ mod wasapi_bitstream {
             if eof { break; }
         }
 
-        let stderr_output = {
-            let mut stderr = child.stderr.take().unwrap();
-            let mut buf = String::new();
-            let _ = stderr.read_to_string(&mut buf);
-            buf
-        };
-        let _ = child.wait();
+        let _ = ffmpeg_thread.join();
 
         unsafe {
             let _ = audio_client.Stop();
             let _ = CloseHandle(event);
+            let _ = windows::Win32::Foundation::CloseHandle(pipe_handle);
             CoUninitialize();
         }
 
         println!("\n\nPlayback complete. Total frames: {}", total_frames);
-        if !stderr_output.is_empty() {
-            println!("\nFFmpeg stderr:\n{}", stderr_output);
-        }
 
         Ok(())
     }
