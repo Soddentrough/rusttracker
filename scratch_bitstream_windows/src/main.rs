@@ -226,7 +226,7 @@ mod wasapi_bitstream {
             unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia)? }
         };
 
-        let audio_client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
+        let mut audio_client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
 
         // ── Negotiate format ────────────────────────────────────────
         println!("\nNegotiating WASAPI Exclusive Mode format...");
@@ -261,16 +261,62 @@ mod wasapi_bitstream {
 
         // ── Initialize ──────────────────────────────────────────────
         println!("\nInitializing audio client...");
-        let buffer_100ns: i64 = 5_000_000;
+        
+        let mut default_period = 0;
+        let mut min_period = 0;
         unsafe {
+            audio_client.GetDevicePeriod(Some(&mut default_period), Some(&mut min_period))?;
+        }
+        
+        println!("  Device Periods: Default = {}ns, Min = {}ns", default_period * 100, min_period * 100);
+
+        let mut buffer_duration = min_period;
+
+        let mut hr = unsafe {
             audio_client.Initialize(
                 AUDCLNT_SHAREMODE_EXCLUSIVE,
                 AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                buffer_100ns,
-                buffer_100ns,
+                buffer_duration,
+                buffer_duration,
                 format.as_ptr() as *const _,
                 None,
-            )?;
+            )
+        };
+
+        if hr == windows::core::HRESULT(0x88890019u32 as i32) || hr == windows::core::HRESULT(0x80070057u32 as i32) {
+            // AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED or E_INVALIDARG
+            println!("  Initialize rejected duration {} (HRESULT: {:?}). Attempting to align...", buffer_duration, hr);
+            
+            // If it failed with E_INVALIDARG, we might need a new client, but let's try querying buffer size first
+            let aligned_frames = unsafe { audio_client.GetBufferSize().unwrap_or(0) };
+            if aligned_frames > 0 {
+                // formula: duration = frames * 10_000_000 / sample_rate
+                buffer_duration = (aligned_frames as i64 * 10_000_000) / profile.rate as i64;
+                println!("  Aligned buffer duration: {}ns ({} frames)", buffer_duration * 100, aligned_frames);
+                
+                // We actually must get a new audio_client instance if Initialize failed
+                let audio_client_new: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
+                hr = unsafe {
+                    audio_client_new.Initialize(
+                        AUDCLNT_SHAREMODE_EXCLUSIVE,
+                        AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                        buffer_duration,
+                        buffer_duration,
+                        format.as_ptr() as *const _,
+                        None,
+                    )
+                };
+                
+                if hr.is_ok() {
+                    audio_client = audio_client_new;
+                } else {
+                    hr.ok()?;
+                }
+            } else {
+                hr.ok()?;
+            }
+        } else {
+            hr.ok()?;
         }
 
         let event = unsafe { CreateEventW(None, false, false, None)? };
