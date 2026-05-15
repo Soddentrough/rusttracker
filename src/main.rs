@@ -348,9 +348,9 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                                             .pick_files();
                                                         if let Some(paths) = result {
                                                             let strings: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
-                                                            if !strings.is_empty() {
-                                                                let _ = tx.send(strings);
-                                                            }
+                                                            let _ = tx.send(strings);
+                                                        } else {
+                                                            let _ = tx.send(vec![]);
                                                         }
                                                     });
                                                 }
@@ -700,9 +700,9 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                             .pick_files();
                                         if let Some(paths) = result {
                                             let strings: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
-                                            if !strings.is_empty() {
-                                                let _ = tx.send(strings);
-                                            }
+                                            let _ = tx.send(strings);
+                                        } else {
+                                            let _ = tx.send(vec![]);
                                         }
                                     });
                                 }
@@ -775,16 +775,18 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                         // Poll native file picker results
                         if let Ok(paths) = rfd_rx.try_recv() {
                             rfd_pending = false;
-                            let append = state.append_to_playlist;
-                            if append && !state.playlist.is_empty() {
-                                state.playlist.extend(paths);
-                            } else if !paths.is_empty() {
-                                state.playlist = paths;
-                                state.playlist_index = 0;
-                                state.load_request = Some(state.playlist[0].clone());
+                            if !paths.is_empty() {
+                                let append = state.append_to_playlist;
+                                if append && !state.playlist.is_empty() {
+                                    state.playlist.extend(paths);
+                                } else {
+                                    state.playlist = paths;
+                                    state.playlist_index = 0;
+                                    state.load_request = Some(state.playlist[0].clone());
+                                }
+                                state.file_loaded = true;
+                                state.is_file_picker_open = false;
                             }
-                            state.file_loaded = true;
-                            state.is_file_picker_open = false;
                         }
                     }
                     

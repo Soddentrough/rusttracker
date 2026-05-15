@@ -1,4 +1,5 @@
 #!/bin/bash
+set -e
 echo "-----------------------------------------------------"
 echo "DO NOT RUN UNLESS YOU KNOW THE CODE COMPILES CLEANLY"
 echo "THIS CAN TAKE 15 MINUTES TO COMPLETE"
@@ -19,6 +20,9 @@ done
 if [ "$CONCLUSION" == "success" ]; then
   echo "CI pipeline completed successfully."
    
+  echo "Cleaning old artifact directories..."
+  rm -rf ./linux_rpm ./linux_deb ./windows_release ./macos_release
+  
   echo "Downloading artifacts..."
   gh run download -n RustTracker-Linux-RPM --dir ./linux_rpm
   gh run download -n RustTracker-Linux-DEB --dir ./linux_deb

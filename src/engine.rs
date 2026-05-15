@@ -1838,25 +1838,128 @@ impl<'a> VulkanEngine<'a> {
                 }
                 // --- End Retro Grid ---
                 
+                let is_game_mode = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_lowercase() == "gamescope" || 
+                                   std::env::var("XDG_SESSION_DESKTOP").unwrap_or_default().to_lowercase() == "gamescope" ||
+                                   std::env::var("STEAM_DECK").is_ok();
+                                   
+                let show_kb = !is_game_mode;
+                let show_gp = state.has_gamepad;
+
+                if show_kb || show_gp {
+                    egui::Panel::bottom("splash_bottom")
+                        .frame(egui::Frame::NONE.fill(egui::Color32::from_rgba_unmultiplied(10, 10, 15, 180)).inner_margin(40.0))
+                        .show_inside(ctx, |ui| {
+                            ui.vertical_centered(|ui| {
+                                egui::Frame::NONE
+                                    .fill(egui::Color32::from_black_alpha(200))
+                                    .corner_radius(10.0)
+                                    .inner_margin(20.0)
+                                    .show(ui, |ui| {
+                                        ui.horizontal_centered(|ui| {
+                                            let pairs_per_row = if show_kb && show_gp { 2 } else { 3 };
+                                            
+                                            if show_kb {
+                                                ui.vertical(|ui| {
+                                                    ui.label(egui::RichText::new("🖮 Keyboard Shortcuts").color(egui::Color32::LIGHT_GRAY).strong().size(18.0));
+                                                    ui.add_space(10.0);
+                                                    
+                                                    egui::Grid::new("kb_shortcuts")
+                                                        .num_columns(pairs_per_row * 2)
+                                                        .spacing([25.0, 12.0])
+                                                        .show(ui, |ui| {
+                                                            let mut col = 0;
+                                                            let mut kb_shortcut = |key: &str, desc: &str| {
+                                                                ui.label(egui::RichText::new(key).color(egui::Color32::WHITE).strong());
+                                                                ui.label(egui::RichText::new(desc).color(egui::Color32::GRAY));
+                                                                col += 1;
+                                                                if col == pairs_per_row {
+                                                                    ui.end_row();
+                                                                    col = 0;
+                                                                }
+                                                            };
+                                                            kb_shortcut("o", "Open File");
+                                                            kb_shortcut("space", "Play / Pause");
+                                                            kb_shortcut("v", "Toggle Video");
+                                                            kb_shortcut("m", "Visualizer Modules");
+                                                            kb_shortcut("left/right", "Seek Timeline");
+                                                            kb_shortcut("tab", "Toggle HUD");
+                                                            kb_shortcut("up/down", "Cycle Vis");
+                                                            kb_shortcut("s", "Toggle Stats");
+                                                            kb_shortcut("q / esc", "Quit");
+                                                            kb_shortcut("f", "Fullscreen");
+                                                            kb_shortcut("g", "GPU FFT");
+                                                            let ctrl_mod = if std::env::consts::OS == "macos" { "⌘" } else { "ctrl+" };
+                                                            kb_shortcut(&format!("{}L/R", ctrl_mod), "Prev/Next");
+                                                            kb_shortcut("[ / ]", "Scale Panels");
+                                                            kb_shortcut("h", "Toggle Help");
+                                                        });
+                                                });
+                                            }
+                                            
+                                            if show_kb && show_gp {
+                                                ui.add_space(20.0);
+                                                let (rect, _) = ui.allocate_exact_size(egui::vec2(1.0, 180.0), egui::Sense::hover());
+                                                ui.painter().line_segment(
+                                                    [rect.center_top(), rect.center_bottom()],
+                                                    (1.0, egui::Color32::from_gray(60))
+                                                );
+                                                ui.add_space(20.0);
+                                            }
+                                            
+                                            if show_gp {
+                                                ui.vertical(|ui| {
+                                                    ui.horizontal(|ui| {
+                                                        ui.label(egui::RichText::new("🎮 Gamepad Controls").color(egui::Color32::LIGHT_GRAY).strong().size(18.0));
+                                                    });
+                                                    ui.add_space(10.0);
+                                                    egui::Grid::new("gp_shortcuts_wide")
+                                                        .num_columns(pairs_per_row * 2)
+                                                        .spacing([25.0, 12.0])
+                                                        .show(ui, |ui| {
+                                                            let mut col = 0;
+                                                            let mut gp_shortcut = |gp: &str, desc: &str| {
+                                                                ui.label(egui::RichText::new(gamepad_icon(state.gamepad_type, gp)).color(egui::Color32::LIGHT_BLUE).size(16.0));
+                                                                ui.label(egui::RichText::new(desc).color(egui::Color32::GRAY));
+                                                                col += 1;
+                                                                if col == pairs_per_row {
+                                                                    ui.end_row();
+                                                                    col = 0;
+                                                                }
+                                                            };
+                                                            gp_shortcut("Y", "Open File");
+                                                            gp_shortcut("A", "Play / Pause");
+                                                            gp_shortcut("X", "Toggle Video");
+                                                            gp_shortcut("D-Pad L/R", "Seek Timeline");
+                                                            gp_shortcut("L2", "Toggle HUD");
+                                                            gp_shortcut("D-Pad U/D", "Cycle Vis");
+                                                            gp_shortcut("B", "Toggle Stats");
+                                                            gp_shortcut("Select", "Quit");
+                                                            gp_shortcut("Start", "Fullscreen");
+                                                            gp_shortcut("R2", "GPU FFT");
+                                                            gp_shortcut("L1 / R1", "Prev/Next");
+                                                        });
+                                                });
+                                            }
+                                        });
+                                    });
+                            });
+                        });
+                }
+
                 let frame = egui::Frame::NONE
                     .fill(egui::Color32::from_rgba_unmultiplied(10, 10, 15, 180)) // Translucent to show grid
                     .inner_margin(40.0);
                     
                 egui::CentralPanel::default().frame(frame).show_inside(ctx, |ui| {
-                    let avail_height = ui.available_height();
-                    let space = avail_height * 0.03;
-                    if space > 0.0 {
-                        ui.add_space(space);
-                    }
-                    
                     ui.allocate_ui_with_layout(
                         ui.available_size(),
                         egui::Layout::top_down(egui::Align::Center),
                         |ui| {
-                            let is_game_mode = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_lowercase() == "gamescope" || 
-                                               std::env::var("XDG_SESSION_DESKTOP").unwrap_or_default().to_lowercase() == "gamescope" ||
-                                               std::env::var("STEAM_DECK").is_ok();
-                                               
+                            let avail_height = ui.available_height();
+                            let space = avail_height * 0.15;
+                            if space > 0.0 {
+                                ui.add_space(space);
+                            }
                             // Scale title to fit smaller screens (like Steam Deck 1280x800)
                             let avail_width = ui.available_width();
                             let scale_factor = (avail_width / 1100.0).clamp(0.4, 1.0);
@@ -1948,19 +2051,25 @@ impl<'a> VulkanEngine<'a> {
                             ui.add_space(20.0);
                             
                             if !is_game_mode {
-                                let btn = egui::Button::new(
-                                    egui::RichText::new("  OPEN AUDIO FILE  ")
-                                        .size(24.0)
-                                        .color(egui::Color32::WHITE)
-                                        .strong()
-                                )
-                                .fill(egui::Color32::from_rgb(0, 120, 215));
+                                egui::Frame::NONE
+                                    .shadow(egui::Shadow { offset: [0, 4], blur: 12, spread: 0, color: egui::Color32::from_black_alpha(200) })
+                                    .corner_radius(6.0)
+                                    .show(ui, |ui| {
+                                        let btn = egui::Button::new(
+                                            egui::RichText::new("  OPEN AUDIO FILE  ")
+                                                .size(24.0)
+                                                .color(egui::Color32::WHITE)
+                                                .strong()
+                                        )
+                                        .fill(egui::Color32::from_rgb(0, 100, 200))
+                                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 180, 255)));
+                                        
+                                        if ui.add_sized([350.0, 60.0], btn).clicked() {
+                                            engine_action = EngineAction::OpenFile;
+                                        }
+                                    });
                                 
-                                if ui.add_sized([350.0, 60.0], btn).clicked() {
-                                    engine_action = EngineAction::OpenFile;
-                                }
-                                
-                                ui.add_space(20.0);
+                                ui.add_space(30.0);
                             }
                             
                             let mut force_stereo = state.force_stereo_downmix;
@@ -1980,108 +2089,7 @@ impl<'a> VulkanEngine<'a> {
                                     engine_action = EngineAction::SetPassthrough(passthrough);
                                 }
                             }
-                                               
-                            let show_kb = !is_game_mode;
-                            let show_gp = state.has_gamepad;
-                            
-                            if show_kb || show_gp {
-                                ui.add_space(20.0);
-                                
-                                egui::Frame::NONE
-                                    .fill(egui::Color32::from_black_alpha(200))
-                                    .corner_radius(10.0)
-                                    .inner_margin(20.0)
-                                    .show(ui, |ui| {
-                                        ui.with_layout(egui::Layout::top_down(egui::Align::Center), |ui| {
-                                            ui.horizontal(|ui| {
-                                                let pairs_per_row = if show_kb && show_gp { 2 } else { 3 };
-                                                
-                                                if show_kb {
-                                                    ui.vertical(|ui| {
-                                                        ui.label(egui::RichText::new("🖮 Keyboard Shortcuts").color(egui::Color32::LIGHT_GRAY).strong().size(18.0));
-                                                        ui.add_space(10.0);
-                                                        
-                                                        egui::Grid::new("kb_shortcuts")
-                                                            .num_columns(pairs_per_row * 2)
-                                                            .spacing([25.0, 12.0])
-                                                            .show(ui, |ui| {
-                                                                let mut col = 0;
-                                                                let mut kb_shortcut = |key: &str, desc: &str| {
-                                                                    ui.label(egui::RichText::new(key).color(egui::Color32::WHITE).strong());
-                                                                    ui.label(egui::RichText::new(desc).color(egui::Color32::GRAY));
-                                                                    col += 1;
-                                                                    if col == pairs_per_row {
-                                                                        ui.end_row();
-                                                                        col = 0;
-                                                                    }
-                                                                };
-                                                                kb_shortcut("o", "Open File");
-                                                                kb_shortcut("space", "Play / Pause");
-                                                                kb_shortcut("v", "Toggle Video");
-                                                                kb_shortcut("m", "Visualizer Modules");
-                                                                kb_shortcut("left/right", "Seek Timeline");
-                                                                kb_shortcut("tab", "Toggle HUD");
-                                                                kb_shortcut("up/down", "Cycle Vis");
-                                                                kb_shortcut("s", "Toggle Stats");
-                                                                kb_shortcut("q / esc", "Quit");
-                                                                kb_shortcut("f", "Fullscreen");
-                                                                kb_shortcut("g", "GPU FFT");
-                                                                let ctrl_mod = if std::env::consts::OS == "macos" { "⌘" } else { "ctrl+" };
-                                                                kb_shortcut(&format!("{}L/R", ctrl_mod), "Prev/Next");
-                                                                kb_shortcut("[ / ]", "Scale Panels");
-                                                                kb_shortcut("h", "Toggle Help");
-                                                            });
-                                                    });
-                                                }
-                                                
-                                                if show_kb && show_gp {
-                                                    ui.add_space(20.0);
-                                                    let (rect, _) = ui.allocate_exact_size(egui::vec2(1.0, 180.0), egui::Sense::hover());
-                                                    ui.painter().line_segment(
-                                                        [rect.center_top(), rect.center_bottom()],
-                                                        (1.0, egui::Color32::from_gray(60))
-                                                    );
-                                                    ui.add_space(20.0);
-                                                }
-                                                
-                                                if show_gp {
-                                                    ui.vertical(|ui| {
-                                                        ui.horizontal(|ui| {
-                                                            ui.label(egui::RichText::new("🎮 Gamepad Controls").color(egui::Color32::LIGHT_GRAY).strong().size(18.0));
-                                                        });
-                                                        ui.add_space(10.0);
-                                                        egui::Grid::new("gp_shortcuts_wide")
-                                                            .num_columns(pairs_per_row * 2)
-                                                            .spacing([25.0, 12.0])
-                                                            .show(ui, |ui| {
-                                                                let mut col = 0;
-                                                                let mut gp_shortcut = |gp: &str, desc: &str| {
-                                                                    ui.label(egui::RichText::new(gamepad_icon(state.gamepad_type, gp)).color(egui::Color32::LIGHT_BLUE).size(16.0));
-                                                                    ui.label(egui::RichText::new(desc).color(egui::Color32::GRAY));
-                                                                    col += 1;
-                                                                    if col == pairs_per_row {
-                                                                        ui.end_row();
-                                                                        col = 0;
-                                                                    }
-                                                                };
-                                                                gp_shortcut("Y", "Open File");
-                                                                gp_shortcut("A", "Play / Pause");
-                                                                gp_shortcut("X", "Toggle Video");
-                                                                gp_shortcut("D-Pad L/R", "Seek Timeline");
-                                                                gp_shortcut("L2", "Toggle HUD");
-                                                                gp_shortcut("D-Pad U/D", "Cycle Vis");
-                                                                gp_shortcut("B", "Toggle Stats");
-                                                                gp_shortcut("Select", "Quit");
-                                                                gp_shortcut("Start", "Fullscreen");
-                                                                gp_shortcut("R2", "GPU FFT");
-                                                                gp_shortcut("L1 / R1", "Prev/Next");
-                                                            });
-                                                    });
-                                                }
-                                            });
-                                        });
-                                    });
-                            }
+                            // The shortcuts are now rendered in the TopBottomPanel
                         }
                     );
                 });
