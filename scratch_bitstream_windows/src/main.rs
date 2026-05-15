@@ -270,8 +270,11 @@ mod wasapi_bitstream {
                 Err(e) => { eprintln!("FFmpeg output error: {:?}", e); return; }
             };
 
-            let mut ost = octx.add_stream(ffmpeg_next::codec::Id::None).unwrap();
-            ost.set_parameters(parameters);
+            let ost_index = {
+                let mut ost = octx.add_stream(ffmpeg_next::codec::Id::None).unwrap();
+                ost.set_parameters(parameters);
+                ost.index()
+            };
             
             let mut dict = ffmpeg_next::Dictionary::new();
             if codec_name.contains("truehd") {
@@ -280,10 +283,13 @@ mod wasapi_bitstream {
             
             octx.write_header_with(dict).unwrap();
 
+            // Time base might be updated by write_header
+            let ost_time_base = octx.stream(ost_index).unwrap().time_base();
+
             for (stream, mut packet) in ictx.packets() {
                 if stream.index() == best_audio_index {
-                    packet.rescale_ts(stream.time_base(), ost.time_base());
-                    packet.set_stream(ost.index());
+                    packet.rescale_ts(stream.time_base(), ost_time_base);
+                    packet.set_stream(ost_index);
                     let _ = packet.write_interleaved(&mut octx);
                 }
             }
