@@ -14,6 +14,9 @@ AppDir/
 target_appimage/
 extracted_deb/
 rusttracker.png
+macos_release/
+release_artifacts/
+release_artifacts_*/
 
 # Tracker Modules
 *.mod
@@ -35,7 +38,12 @@ gdb_output.txt
 
 # Scratch / Temp files
 scratch.*
-test_*
+test_*.rs
+test_*.c
+test_*.sh
+test_load
+test_sort
 screenshot.png
+scratch/
 scratch_bitstream/target/
 scratch_bitstream_windows/target/

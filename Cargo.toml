@@ -22,7 +22,7 @@ assets = [
 extended-description = "A high-performance, real-time audio visualizer and tracker module player."
 
 [dependencies]
-anyhow = "1.0.101"
+anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive"] }
 cpal = "0.17.3"
 crossbeam-channel = "0.5.15"
