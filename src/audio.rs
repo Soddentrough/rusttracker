@@ -1329,11 +1329,21 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
         if passthrough {
             let (tx, rx) = bounded::<DspMessage>(32);
             let stop_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            if let Ok((handle, decoder_rate)) = crate::bitstream::start_bitstream_thread(file_path, shared_state.clone(), tx.clone(), stop_token.clone()) {
+            if let Ok((handle, decoder_rate, codec_name, has_video)) = crate::bitstream::start_bitstream_thread(file_path, shared_state.clone(), tx.clone(), stop_token.clone()) {
                 let max_frequency = shared_state.lock().unwrap().max_frequency;
                 let sample_rate = decoder_rate;
                 let window_size = (((sample_rate as f32 * 0.185).round() as usize) / 2) * 2;
                 let window_size = window_size.max(2048).min(65536);
+                
+                let display_name = match codec_name.as_str() {
+                    "truehd" => "TrueHD / Dolby Atmos",
+                    "eac3" => "E-AC3 / Dolby Digital Plus",
+                    "dts" => "DTS",
+                    "ac3" => "AC3 / Dolby Digital",
+                    _ => &codec_name,
+                }.to_string();
+                
+                let video_suffix = if has_video { " (Video stream available)" } else { "" };
                 
                 {
                     let mut state = shared_state.lock().unwrap();
@@ -1346,7 +1356,7 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
                     state.hardware_channels = 8;
                     state.channel_vus = vec![0.0; 8];
                     state.peak_vus = vec![0.0; 8];
-                    state.video_info = Some("TrueHD/Atmos".to_string());
+                    state.video_info = Some(format!("{}{}", display_name, video_suffix));
                 }
                 
                 spawn_dsp_thread(rx, shared_state.clone(), sample_rate, max_frequency, window_size);

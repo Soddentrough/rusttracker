@@ -4,7 +4,7 @@ pub fn start_bitstream_thread(
     _shared_state: std::sync::Arc<std::sync::Mutex<crate::state::AppState>>,
     tx: crossbeam_channel::Sender<crate::audio::DspMessage>,
     stop_token: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> anyhow::Result<(std::thread::JoinHandle<()>, u32)> {
+) -> anyhow::Result<(std::thread::JoinHandle<()>, u32, String, bool)> {
     use anyhow::Context;
 
     println!("[bitstream] Probing codec via ffmpeg-next on Linux...");
@@ -28,6 +28,8 @@ pub fn start_bitstream_thread(
         ffmpeg_next::codec::Id::AC3 => "ac3",
         _ => return Err(anyhow::anyhow!("Unsupported codec for bitstreaming: {:?}", codec_id)),
     }.to_string();
+
+    let has_video = ictx.streams().best(ffmpeg_next::media::Type::Video).is_some();
 
     let parameters = best_audio.parameters();
     let best_audio_index = best_audio.index();
@@ -193,7 +195,7 @@ pub fn start_bitstream_thread(
         println!("[bitstream] FFmpeg thread finished on Linux.");
     });
 
-    Ok((ffmpeg_thread, decoder_sample_rate as u32))
+    Ok((ffmpeg_thread, decoder_sample_rate as u32, codec_name, has_video))
 }
 
 #[cfg(not(any(target_os = "windows", target_os = "linux")))]
@@ -202,7 +204,7 @@ pub fn start_bitstream_thread(
     _shared_state: std::sync::Arc<std::sync::Mutex<crate::state::AppState>>,
     _tx: crossbeam_channel::Sender<crate::audio::DspMessage>,
     _stop_token: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> anyhow::Result<(std::thread::JoinHandle<()>, u32)> {
+) -> anyhow::Result<(std::thread::JoinHandle<()>, u32, String, bool)> {
     Err(anyhow::anyhow!("Bitstream passthrough is not supported on this platform."))
 }
 #[cfg(windows)]
@@ -397,7 +399,7 @@ mod wasapi_bitstream {
 
     // ─── Main bitstream pump ─────────────────────────────────────────
 
-    pub fn start_bitstream_thread(file_path: &str, _shared_state: Arc<Mutex<AppState>>, tx: Sender<DspMessage>, stop_token: Arc<AtomicBool>) -> Result<(std::thread::JoinHandle<()>, u32)> {
+    pub fn start_bitstream_thread(file_path: &str, _shared_state: Arc<Mutex<AppState>>, tx: Sender<DspMessage>, stop_token: Arc<AtomicBool>) -> Result<(std::thread::JoinHandle<()>, u32, String, bool)> {
         unsafe { let _ = CoInitializeEx(None, COINIT_MULTITHREADED); }
 
         // ── Probe codec via ffmpeg-next ─────────────────────────────
@@ -420,8 +422,10 @@ mod wasapi_bitstream {
             ffmpeg_next::codec::Id::EAC3 => "eac3",
             ffmpeg_next::codec::Id::DTS => "dts",
             ffmpeg_next::codec::Id::AC3 => "ac3",
-            _ => "unknown",
+            _ => return Err(anyhow::anyhow!("Unsupported codec for bitstreaming: {:?}", codec_id)),
         }.to_string();
+
+        let has_video = ictx.streams().best(ffmpeg_next::media::Type::Video).is_some();
 
         let profiles = detect_codec_profile(&codec_name);
         println!("Detected codec: {}", codec_name);
@@ -779,7 +783,7 @@ mod wasapi_bitstream {
             println!("Bitstream thread finished.");
         });
 
-        Ok((handle, decoder_sample_rate))
+        Ok((handle, decoder_sample_rate, profile.name.to_string(), has_video))
     }
 }
 
