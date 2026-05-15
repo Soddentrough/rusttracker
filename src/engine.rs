@@ -2077,12 +2077,13 @@ impl<'a> VulkanEngine<'a> {
                                 engine_action = EngineAction::SetForceStereo(force_stereo);
                             }
                             
+                            #[cfg(any(target_os = "windows", target_os = "linux"))]
                             {
                                 let mut passthrough = state.passthrough_enabled;
                                 
                                 #[cfg(target_os = "windows")]
                                 let label = "Enable Bitstream Passthrough (WASAPI Exclusive)";
-                                #[cfg(not(target_os = "windows"))]
+                                #[cfg(target_os = "linux")]
                                 let label = "Enable Bitstream Passthrough (PipeWire)";
                                 
                                 if ui.checkbox(&mut passthrough, label).changed() {

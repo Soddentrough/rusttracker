@@ -1,4 +1,4 @@
-#[cfg(not(target_os = "windows"))]
+#[cfg(target_os = "linux")]
 pub fn start_bitstream_thread(
     file_path: &str,
     _shared_state: std::sync::Arc<std::sync::Mutex<crate::state::AppState>>,
@@ -196,8 +196,15 @@ pub fn start_bitstream_thread(
     Ok((ffmpeg_thread, decoder_sample_rate as u32))
 }
 
-
-
+#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+pub fn start_bitstream_thread(
+    _file_path: &str,
+    _shared_state: std::sync::Arc<std::sync::Mutex<crate::state::AppState>>,
+    _tx: crossbeam_channel::Sender<crate::audio::DspMessage>,
+    _stop_token: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> anyhow::Result<(std::thread::JoinHandle<()>, u32)> {
+    Err(anyhow::anyhow!("Bitstream passthrough is not supported on this platform."))
+}
 #[cfg(windows)]
 pub use wasapi_bitstream::start_bitstream_thread;
 
