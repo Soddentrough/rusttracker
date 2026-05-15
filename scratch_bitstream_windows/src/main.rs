@@ -5,7 +5,6 @@ use std::env;
 mod wasapi_bitstream {
     use anyhow::{Context, Result, bail};
     use std::io::Read;
-    use std::process::{Command, Stdio};
     use std::ptr;
     use windows::core::GUID;
     use windows::Win32::Media::Audio::*;
@@ -279,7 +278,7 @@ mod wasapi_bitstream {
                 dict.set("spdif_flags", "+use_mat");
             }
             
-            octx.write_header_with(&dict).unwrap();
+            octx.write_header_with(dict).unwrap();
 
             for (stream, mut packet) in ictx.packets() {
                 if stream.index() == best_audio_index {
