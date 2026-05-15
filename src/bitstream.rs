@@ -444,25 +444,30 @@ mod wasapi_bitstream {
                                 for p in 0..planes {
                                     let data = resampled.plane::<f32>(p);
                                     accumulator[p].extend_from_slice(data);
+                                    let excess = accumulator[p].len().saturating_sub(window_size);
+                                    if excess > 0 {
+                                        accumulator[p].drain(0..excess);
+                                    }
                                 }
                                 
-                                while accumulator.get(0).map(|a| a.len()).unwrap_or(0) >= window_size {
+                                if accumulator.get(0).map(|a| a.len()).unwrap_or(0) == window_size {
                                     let mut channel_audio_data = Vec::with_capacity(planes);
                                     let mut channel_vus = Vec::with_capacity(planes);
                                     
                                     for p in 0..planes {
-                                        let window: Vec<f32> = accumulator[p].drain(0..window_size).collect();
+                                        let window = accumulator[p].clone();
                                         
-                                        // Calculate simple RMS for VU
+                                        // Calculate simple RMS for VU using only the fresh samples from this frame
                                         let mut sum_sq = 0.0;
-                                        for &s in &window { sum_sq += s * s; }
-                                        let rms = (sum_sq / window.len() as f32).sqrt();
+                                        let fresh_data = resampled.plane::<f32>(p);
+                                        for &s in fresh_data { sum_sq += s * s; }
+                                        let rms = (sum_sq / fresh_data.len().max(1) as f32).sqrt();
                                         channel_vus.push(rms);
                                         
                                         channel_audio_data.push(window);
                                     }
                                     
-                                    let _ = tx.send(DspMessage {
+                                    let _ = tx.try_send(DspMessage {
                                         audio_data: channel_audio_data[0].clone(),
                                         channel_vus,
                                         current_order: 0,
