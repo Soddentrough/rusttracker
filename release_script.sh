@@ -21,14 +21,15 @@ if [ "$CONCLUSION" == "success" ]; then
   echo "CI pipeline completed successfully."
    
   echo "Cleaning old artifact directories..."
-  rm -rf ./linux_rpm ./linux_deb ./windows_release
+  rm -rf ./linux_rpm ./linux_deb ./windows_release ./macos_release
   
   echo "Downloading artifacts..."
   gh run download -n RustTracker-Linux-RPM --dir ./linux_rpm || true
   gh run download -n RustTracker-Linux-DEB --dir ./linux_deb || true
   gh run download -n RustTracker-Windows --dir ./windows_release || true
+  gh run download -n RustTracker-MacOS --dir ./macos_release || true
   
   echo "Creating GitHub Release..."
-  gh release create "$TAG" ./windows_release/*.exe ./linux_rpm/*.rpm ./linux_deb/*.deb ./RustTracker-SteamDeck-$TAG.AppImage --title "RustTracker $TAG" --notes "Release $TAG"
+  gh release create "$TAG" ./windows_release/*.exe ./linux_rpm/*.rpm ./linux_deb/*.deb ./macos_release/*.dmg ./RustTracker-SteamDeck-$TAG.AppImage --title "RustTracker $TAG" --notes "Release $TAG"
 fi
 echo "Done!"
