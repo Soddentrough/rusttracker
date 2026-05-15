@@ -496,6 +496,7 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                             let mut state = app_state.lock().unwrap();
                             state.video_frame_rx = None;
                             state.free_video_frame_tx = None;
+                            state.video_mode = 0;
                         }
                         
                         // We rely entirely on DSP thread messages to update tracker string state
