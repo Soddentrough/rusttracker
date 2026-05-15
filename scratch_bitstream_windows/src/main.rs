@@ -90,7 +90,15 @@ mod wasapi_bitstream {
         }
     }
 
-    fn build_format(profile: &Iec61937Profile) -> WAVEFORMATEXTENSIBLE {
+    #[repr(C, packed)]
+    struct WAVEFORMATEXTENSIBLE_IEC61937 {
+        format_ext: WAVEFORMATEXTENSIBLE,
+        dw_encoded_samples_per_sec: u32,
+        dw_encoded_channel_count: u32,
+        dw_average_bytes_per_sec: u32,
+    }
+
+    fn build_format(profile: &Iec61937Profile) -> Vec<u8> {
         let block_align = profile.channels * 2;
         let avg_bytes = profile.rate * block_align as u32;
         let channel_mask: u32 = match profile.channels {
@@ -98,19 +106,46 @@ mod wasapi_bitstream {
             8 => 0x63F,
             _ => 0x3,
         };
-        WAVEFORMATEXTENSIBLE {
+
+        let is_hbr = profile.rate > 48000;
+
+        let format_ext = WAVEFORMATEXTENSIBLE {
             Format: WAVEFORMATEX {
-                wFormatTag: 0xFFFE,
+                wFormatTag: 0xFFFE, // WAVE_FORMAT_EXTENSIBLE
                 nChannels: profile.channels,
                 nSamplesPerSec: profile.rate,
                 nAvgBytesPerSec: avg_bytes,
                 nBlockAlign: block_align,
                 wBitsPerSample: 16,
-                cbSize: 22,
+                cbSize: if is_hbr { 34 } else { 22 },
             },
             Samples: WAVEFORMATEXTENSIBLE_0 { wValidBitsPerSample: 16 },
             dwChannelMask: channel_mask,
             SubFormat: profile.sub_format,
+        };
+
+        if is_hbr {
+            let iec = WAVEFORMATEXTENSIBLE_IEC61937 {
+                format_ext,
+                dw_encoded_samples_per_sec: profile.rate,
+                dw_encoded_channel_count: profile.channels as u32,
+                dw_average_bytes_per_sec: avg_bytes,
+            };
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    &iec as *const _ as *const u8,
+                    std::mem::size_of::<WAVEFORMATEXTENSIBLE_IEC61937>(),
+                )
+            };
+            bytes.to_vec()
+        } else {
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    &format_ext as *const _ as *const u8,
+                    std::mem::size_of::<WAVEFORMATEXTENSIBLE>(),
+                )
+            };
+            bytes.to_vec()
         }
     }
 
@@ -192,7 +227,7 @@ mod wasapi_bitstream {
             let hr = unsafe {
                 audio_client.IsFormatSupported(
                     AUDCLNT_SHAREMODE_EXCLUSIVE,
-                    &format.Format as *const _,
+                    format.as_ptr() as *const _,
                     None,
                 )
             };
@@ -221,7 +256,7 @@ mod wasapi_bitstream {
                 AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
                 buffer_100ns,
                 buffer_100ns,
-                &format.Format as *const _,
+                format.as_ptr() as *const _,
                 None,
             )?;
         }
@@ -230,12 +265,12 @@ mod wasapi_bitstream {
         unsafe { audio_client.SetEventHandle(event)?; }
 
         let buffer_frames = unsafe { audio_client.GetBufferSize()? };
-        let frame_bytes = format.Format.nBlockAlign as u32;
+        let frame_bytes = (profile.channels * 2) as u32;
         let render_client: IAudioRenderClient = unsafe { audio_client.GetService()? };
 
         println!("Buffer: {} frames ({:.1} ms)",
             buffer_frames,
-            buffer_frames as f64 / format.Format.nSamplesPerSec as f64 * 1000.0);
+            buffer_frames as f64 / profile.rate as f64 * 1000.0);
 
         // ── Start FFmpeg spdif Muxer Pipe ───────────────────────────
         use windows::Win32::System::Pipes::{CreateNamedPipeA, ConnectNamedPipe, NAMED_PIPE_MODE};
@@ -346,8 +381,8 @@ mod wasapi_bitstream {
                 }
                 total_frames += available as u64;
 
-                if total_frames % (format.Format.nSamplesPerSec as u64) < available as u64 {
-                    let secs = total_frames as f64 / format.Format.nSamplesPerSec as f64;
+                if total_frames % (profile.rate as u64) < available as u64 {
+                    let secs = total_frames as f64 / profile.rate as f64;
                     print!("\r  Streamed: {:.0}s  ", secs);
                 }
             }
