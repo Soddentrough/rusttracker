@@ -359,10 +359,11 @@ mod wasapi_bitstream {
         let ffmpeg_thread = std::thread::spawn(move || {
             // Wait slightly for server to block on ConnectNamedPipe
             std::thread::sleep(std::time::Duration::from_millis(50));
+            println!("[ffmpeg] Thread started, opening output...");
 
             let mut octx = match ffmpeg_next::format::output_as(&pipe_name_clone, "spdif") {
                 Ok(c) => c,
-                Err(e) => { eprintln!("FFmpeg output error: {:?}", e); return; }
+                Err(e) => { eprintln!("[ffmpeg] Output error: {:?}", e); return; }
             };
 
             let ost_index = {
@@ -371,27 +372,46 @@ mod wasapi_bitstream {
                 ost.index()
             };
             
-            let dict = ffmpeg_next::Dictionary::new();
-            
+            let mut dict = ffmpeg_next::Dictionary::new();
+            dict.set("flush_packets", "1");
+            println!("[ffmpeg] Writing header...");
             octx.write_header_with(dict).unwrap();
+            println!("[ffmpeg] Header written!");
 
-            // Time base might be updated by write_header
             let ost_time_base = octx.stream(ost_index).unwrap().time_base();
 
+            let mut pkts_written = 0;
             let mut dts_counter = 0;
             for (stream, mut packet) in ictx.packets() {
                 if stream.index() == best_audio_index {
                     packet.rescale_ts(stream.time_base(), ost_time_base);
                     packet.set_stream(ost_index);
-                    let _ = packet.write(&mut octx);
+                    
+                    let duration = packet.duration().max(160);
+                    packet.set_pts(Some(dts_counter));
+                    packet.set_dts(Some(dts_counter));
+                    dts_counter += duration;
+
+                    if pkts_written < 10 {
+                        println!("[ffmpeg] Writing packet {} ({} bytes)...", pkts_written, packet.size());
+                    }
+                    let res = packet.write(&mut octx);
+                    if pkts_written < 10 {
+                        println!("[ffmpeg] Packet {} written: {:?}", pkts_written, res);
+                    }
+                    pkts_written += 1;
                 }
             }
+            println!("[ffmpeg] Finished writing {} packets. Writing trailer...", pkts_written);
             let _ = octx.write_trailer();
+            println!("[ffmpeg] Thread exiting.");
         });
 
+        println!("[main] Connecting named pipe...");
         unsafe {
             let _ = ConnectNamedPipe(pipe_handle, None);
         }
+        println!("[main] Named pipe connected!");
 
         use std::os::windows::io::FromRawHandle;
         let mut stdout = unsafe { std::fs::File::from_raw_handle(pipe_handle.0 as _) };
@@ -422,11 +442,24 @@ mod wasapi_bitstream {
             let mut chunk = vec![0u8; bytes_needed];
             let mut filled = 0;
 
+            if !started {
+                println!("[main] Reading first buffer: need {} bytes", bytes_needed);
+            }
+
             while filled < bytes_needed && !eof {
                 match stdout.read(&mut chunk[filled..]) {
-                    Ok(0) => { eof = true; }
-                    Ok(n) => { filled += n; }
-                    Err(_) => { eof = true; }
+                    Ok(0) => { 
+                        if !started { println!("[main] EOF reached on first read!"); }
+                        eof = true; 
+                    }
+                    Ok(n) => { 
+                        if !started { println!("[main] Read {} bytes from pipe", n); }
+                        filled += n; 
+                    }
+                    Err(e) => { 
+                        eprintln!("[main] Pipe read error: {}", e);
+                        eof = true; 
+                    }
                 }
             }
 
@@ -455,6 +488,7 @@ mod wasapi_bitstream {
             }
             
             if !started && filled > 0 {
+                println!("[main] Starting WASAPI audio client!");
                 unsafe { audio_client.Start()?; }
                 started = true;
             }
