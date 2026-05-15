@@ -154,8 +154,6 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
         state.gpu_fft = true;
     }
 
-    let (stream_tx, stream_rx) = crossbeam_channel::unbounded::<Option<audio::PlaybackHandle>>();
-
     let event_loop = EventLoop::new().unwrap();
     
     let (icon_rgba, icon_width, icon_height) = {
@@ -230,7 +228,9 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .initial_directory(initial_dir)
         .add_file_filter_extensions("Audio/Video Files", vec!["flac", "wav", "mp3", "ogg", "aac", "m4a", "mp4", "mkv", "avi", "webm", "opus", "mod", "s3m", "xm", "it", "stm", "669", "mtm", "med", "okt", "psm", "dawproject", "aaf"])
-        .default_file_filter("Audio/Video Files");
+        .default_file_filter("Audio/Video Files")
+        .show_devices(false)
+        .show_removable_devices(false);
     let mut modifiers = winit::keyboard::ModifiersState::empty();
 
     #[allow(deprecated)]
@@ -451,12 +451,6 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                         is_first_frame = false;
                         app_state.lock().unwrap().is_paused = false;
                     }
-                    
-                    while let Ok(stream_opt) = stream_rx.try_recv() {
-                        if let Some(stream) = stream_opt {
-                            active_stream = Some(stream);
-                        }
-                    }
                     let load_path = {
                         let mut state = app_state.lock().unwrap();
                         
@@ -483,22 +477,16 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                         }
                         
                         // We rely entirely on DSP thread messages to update tracker string state
-                        let tx = stream_tx.clone();
-                        let state_clone = app_state.clone();
-                        let path_clone = path.clone();
-                        std::thread::spawn(move || {
-                            if let Ok(stream) = audio::start_audio_thread(&path_clone, false, Arc::clone(&state_clone)) {
-                                let mut state = state_clone.lock().unwrap();
-                                state.file_loaded = true;
-                                state.song_title = path_clone;
-                                let _ = tx.send(Some(stream));
-                            } else {
-                                state_clone.lock().unwrap().file_loaded = false;
-                                let mut state = state_clone.lock().unwrap();
-                                state.artist = "Load Failed".to_string();
-                                let _ = tx.send(None);
-                            }
-                        });
+                        if let Ok(stream) = audio::start_audio_thread(&path, false, Arc::clone(&app_state)) {
+                            let mut state = app_state.lock().unwrap();
+                            state.file_loaded = true;
+                            state.song_title = path.clone();
+                            active_stream = Some(stream);
+                        } else {
+                            app_state.lock().unwrap().file_loaded = false;
+                            let mut state = app_state.lock().unwrap();
+                            state.artist = "Load Failed".to_string();
+                        }
                     }
 
                     let now = Instant::now();

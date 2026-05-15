@@ -409,10 +409,21 @@ mod wasapi_bitstream {
                 decoder.channel_layout(), decoder.rate(),
             ).unwrap();
 
+            let decoder_rate = decoder.rate() as f32;
+            let window_size = (((decoder_rate * 0.185).round() as usize) / 2) * 2;
+            let window_size = window_size.max(2048).min(65536);
+            let mut accumulator: Vec<Vec<f32>> = Vec::new();
+
             let mut pkts_written = 0;
+            let mut current_seconds = 0.0;
+            
             for (stream, mut packet) in ictx.packets() {
                 if stream.index() == best_audio_index {
                     let vis_packet = packet.clone();
+
+                    if let Some(pts) = packet.pts() {
+                        current_seconds = pts as f64 * f64::from(stream.time_base());
+                    }
 
                     packet.rescale_ts(stream.time_base(), ost_time_base);
                     packet.set_stream(ost_index);
@@ -425,29 +436,44 @@ mod wasapi_bitstream {
                             let mut resampled = ffmpeg_next::frame::Audio::empty();
                             if resampler.run(&frame, &mut resampled).is_ok() {
                                 let planes = resampled.channels() as usize;
-                                let mut channel_audio_data = Vec::with_capacity(planes);
-                                let mut channel_vus = Vec::with_capacity(planes);
+                                
+                                if accumulator.len() != planes {
+                                    accumulator = vec![Vec::new(); planes];
+                                }
+                                
                                 for p in 0..planes {
                                     let data = resampled.plane::<f32>(p);
-                                    channel_audio_data.push(data.to_vec());
-                                    
-                                    // Calculate simple RMS for VU
-                                    let mut sum_sq = 0.0;
-                                    for &s in data { sum_sq += s * s; }
-                                    let rms = (sum_sq / data.len() as f32).sqrt();
-                                    channel_vus.push(rms);
+                                    accumulator[p].extend_from_slice(data);
                                 }
-                                let _ = tx.send(DspMessage {
-                                    audio_data: channel_audio_data[0].clone(),
-                                    channel_vus,
-                                    current_order: 0,
-                                    current_row: 0,
-                                    bpm: 0,
-                                    speed: 0,
-                                    current_seconds: 0.0,
-                                    current_row_string: "".to_string(),
-                                    channel_audio_data,
-                                });
+                                
+                                while accumulator.get(0).map(|a| a.len()).unwrap_or(0) >= window_size {
+                                    let mut channel_audio_data = Vec::with_capacity(planes);
+                                    let mut channel_vus = Vec::with_capacity(planes);
+                                    
+                                    for p in 0..planes {
+                                        let window: Vec<f32> = accumulator[p].drain(0..window_size).collect();
+                                        
+                                        // Calculate simple RMS for VU
+                                        let mut sum_sq = 0.0;
+                                        for &s in &window { sum_sq += s * s; }
+                                        let rms = (sum_sq / window.len() as f32).sqrt();
+                                        channel_vus.push(rms);
+                                        
+                                        channel_audio_data.push(window);
+                                    }
+                                    
+                                    let _ = tx.send(DspMessage {
+                                        audio_data: channel_audio_data[0].clone(),
+                                        channel_vus,
+                                        current_order: 0,
+                                        current_row: 0,
+                                        bpm: 0,
+                                        speed: 0,
+                                        current_seconds,
+                                        current_row_string: "".to_string(),
+                                        channel_audio_data,
+                                    });
+                                }
                             }
                         }
                     }
