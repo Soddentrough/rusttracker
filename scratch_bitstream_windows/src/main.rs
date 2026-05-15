@@ -383,13 +383,6 @@ mod wasapi_bitstream {
                 if stream.index() == best_audio_index {
                     packet.rescale_ts(stream.time_base(), ost_time_base);
                     packet.set_stream(ost_index);
-                    
-                    // Ensure strictly monotonically increasing DTS to prevent spdif muxer warnings
-                    let duration = packet.duration().max(1);
-                    packet.set_pts(Some(dts_counter));
-                    packet.set_dts(Some(dts_counter));
-                    dts_counter += duration;
-
                     let _ = packet.write(&mut octx);
                 }
             }
@@ -404,19 +397,21 @@ mod wasapi_bitstream {
         let mut stdout = unsafe { std::fs::File::from_raw_handle(pipe_handle.0 as _) };
 
         // ── Pump loop ───────────────────────────────────────────────
-        unsafe { audio_client.Start()?; }
         println!("\n>> Bitstreaming: {} -> {}ch x {}Hz",
             profile.name, profile.channels, profile.rate);
         println!("   Press Ctrl+C to stop.\n");
 
         let mut total_frames: u64 = 0;
         let mut eof = false;
+        let mut started = false;
 
         loop {
-            let wait_result = unsafe { WaitForSingleObject(event, 2000) };
-            if wait_result.0 != WAIT_OBJECT_0 {
-                eprintln!("WASAPI event timeout.");
-                break;
+            if started {
+                let wait_result = unsafe { WaitForSingleObject(event, 2000) };
+                if wait_result.0 != WAIT_OBJECT_0 {
+                    eprintln!("WASAPI event timeout.");
+                    break;
+                }
             }
 
             let padding = unsafe { audio_client.GetCurrentPadding().unwrap_or(0) };
@@ -435,6 +430,11 @@ mod wasapi_bitstream {
                 }
             }
 
+            if eof && filled == 0 {
+                println!("\nEnd of stream reached.");
+                break;
+            }
+
             if filled > 0 {
                 unsafe {
                     let buf = render_client.GetBuffer(available)?;
@@ -448,11 +448,16 @@ mod wasapi_bitstream {
 
                 if total_frames % (profile.rate as u64) < available as u64 {
                     let secs = total_frames as f64 / profile.rate as f64;
+                    use std::io::Write;
                     print!("\r  Streamed: {:.0}s  ", secs);
+                    let _ = std::io::stdout().flush();
                 }
             }
-
-            if eof { break; }
+            
+            if !started && filled > 0 {
+                unsafe { audio_client.Start()?; }
+                started = true;
+            }
         }
 
         let _ = ffmpeg_thread.join();
