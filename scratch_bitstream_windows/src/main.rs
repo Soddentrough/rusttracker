@@ -378,11 +378,19 @@ mod wasapi_bitstream {
             // Time base might be updated by write_header
             let ost_time_base = octx.stream(ost_index).unwrap().time_base();
 
+            let mut dts_counter = 0;
             for (stream, mut packet) in ictx.packets() {
                 if stream.index() == best_audio_index {
                     packet.rescale_ts(stream.time_base(), ost_time_base);
                     packet.set_stream(ost_index);
-                    let _ = packet.write_interleaved(&mut octx);
+                    
+                    // Ensure strictly monotonically increasing DTS to prevent spdif muxer warnings
+                    let duration = packet.duration().max(1);
+                    packet.set_pts(Some(dts_counter));
+                    packet.set_dts(Some(dts_counter));
+                    dts_counter += duration;
+
+                    let _ = packet.write(&mut octx);
                 }
             }
             let _ = octx.write_trailer();
