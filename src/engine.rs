@@ -1844,7 +1844,7 @@ impl<'a> VulkanEngine<'a> {
                     
                 egui::CentralPanel::default().frame(frame).show_inside(ctx, |ui| {
                     let avail_height = ui.available_height();
-                    let space = avail_height * 0.10;
+                    let space = avail_height * 0.03;
                     if space > 0.0 {
                         ui.add_space(space);
                     }
@@ -1945,9 +1945,7 @@ impl<'a> VulkanEngine<'a> {
                                     color,
                                 );
                             }
-                            ui.add_space(10.0);
-                            
-                            ui.add_space(40.0);
+                            ui.add_space(20.0);
                             
                             if !is_game_mode {
                                 let btn = egui::Button::new(
@@ -1987,7 +1985,7 @@ impl<'a> VulkanEngine<'a> {
                             let show_gp = state.has_gamepad;
                             
                             if show_kb || show_gp {
-                                ui.add_space(40.0);
+                                ui.add_space(20.0);
                                 
                                 egui::Frame::NONE
                                     .fill(egui::Color32::from_black_alpha(200))
