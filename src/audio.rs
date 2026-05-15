@@ -127,8 +127,10 @@ pub fn spawn_dsp_thread(
                 // Decay/smooth the execution stats for readability
                 state.stats.fft_us = state.stats.fft_us * 0.9 + fft_elapsed * 0.1;
                 
-                if let Some(cap) = rx.capacity() {
-                    state.stats.audio_buffer_fill_pct = (rx.len() as f32 / cap as f32) * 100.0;
+                if state.stats.bitstream_active {
+                    if let Some(cap) = rx.capacity() {
+                        state.stats.audio_buffer_fill_pct = (rx.len() as f32 / cap as f32) * 100.0;
+                    }
                 }
                 
                 state.raw_channel_vus.clear();

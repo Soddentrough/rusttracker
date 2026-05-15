@@ -1797,24 +1797,150 @@ impl<'a> VulkanEngine<'a> {
                 // --- Background Retro Grid (Demoscene Vibe) ---
                 let bg_painter = ctx.layer_painter(egui::LayerId::background());
                 let rect = ctx.content_rect();
-                let horizon_y = rect.top() + rect.height() * 0.20;
+                let horizon_y = rect.top() + rect.height() * 0.55;
                 let center_x = rect.center().x;
                 
-                // Color cycle the grid slightly
-                let grid_hue = (time * 0.02).fract();
-                let grid_color: egui::Color32 = egui::ecolor::Hsva::new(grid_hue, 0.8, 1.0, 0.4).into();
+                // 1. Sky gradient
+                let sky_steps = 40;
+                let sky_height = horizon_y - rect.top();
+                for i in 0..sky_steps {
+                    let t = i as f32 / sky_steps as f32;
+                    let next_t = (i + 1) as f32 / sky_steps as f32;
+                    let color = if t < 0.6 {
+                        let st = t / 0.6;
+                        egui::Color32::from_rgb(
+                            (43.0 * (1.0 - st) + 150.0 * st) as u8,
+                            (16.0 * (1.0 - st) + 20.0 * st) as u8,
+                            (85.0 * (1.0 - st) + 120.0 * st) as u8,
+                        )
+                    } else {
+                        let st = (t - 0.6) / 0.4;
+                        egui::Color32::from_rgb(
+                            (150.0 * (1.0 - st) + 255.0 * st) as u8,
+                            (20.0 * (1.0 - st) + 126.0 * st) as u8,
+                            (120.0 * (1.0 - st) + 103.0 * st) as u8,
+                        )
+                    };
+                    bg_painter.rect_filled(
+                        egui::Rect::from_min_max(
+                            egui::pos2(rect.left(), rect.top() + t * sky_height),
+                            egui::pos2(rect.right(), rect.top() + next_t * sky_height),
+                        ),
+                        0.0,
+                        color,
+                    );
+                }
+
+                // 2. Stars
+                let pseudo_rand = |seed: u32| -> f32 {
+                    let mut x = seed.wrapping_mul(136453);
+                    x ^= x << 13;
+                    x ^= x >> 17;
+                    x ^= x << 5;
+                    (x % 1000) as f32 / 1000.0
+                };
                 
-                // Draw horizon line
-                bg_painter.line_segment(
-                    [egui::pos2(rect.left(), horizon_y), egui::pos2(rect.right(), horizon_y)],
-                    egui::Stroke::new(2.0, grid_color)
+                for i in 0..50 {
+                    let rx = pseudo_rand(i * 31);
+                    let ry = pseudo_rand(i * 31 + 1);
+                    let rr = pseudo_rand(i * 31 + 2);
+                    let rt = pseudo_rand(i * 31 + 3);
+                    
+                    let x = rect.left() + rx * rect.width();
+                    let y = rect.top() + ry * sky_height * 0.7; // Stars in upper 70%
+                    let radius = rr * 1.5 + 0.5;
+                    let twinkle = ((time * (1.0 + rt * 2.0) + rx * 100.0).sin() * 0.5 + 0.5) * 200.0 + 55.0;
+                    
+                    bg_painter.circle_filled(
+                        egui::pos2(x, y),
+                        radius,
+                        egui::Color32::from_white_alpha(twinkle as u8),
+                    );
+                }
+
+                // 3. Retro Sliced Sun
+                let sun_radius = rect.width().min(rect.height()) * 0.25;
+                let sun_center = egui::pos2(center_x, horizon_y - sun_radius * 0.3);
+                
+                let sun_steps = 40;
+                for i in 0..sun_steps {
+                    let t = i as f32 / sun_steps as f32;
+                    let next_t = (i + 1) as f32 / sun_steps as f32;
+                    
+                    if t > 0.45 {
+                        let slice_t = (t - 0.45) / 0.55;
+                        let slice_val = (slice_t * 15.0).fract();
+                        let gap_threshold = 0.2 + slice_t * 0.6; 
+                        if slice_val < gap_threshold {
+                            continue;
+                        }
+                    }
+                    
+                    let y_min = sun_center.y - sun_radius + t * sun_radius * 2.0;
+                    let y_max = sun_center.y - sun_radius + next_t * sun_radius * 2.0;
+                    
+                    let r = 255;
+                    let g = (204.0 * (1.0 - t) + 80.0 * t) as u8;
+                    let b = (0.0 * (1.0 - t) + 100.0 * t) as u8;
+                    let color = egui::Color32::from_rgb(r, g, b);
+                    
+                    bg_painter.with_clip_rect(egui::Rect::from_min_max(
+                        egui::pos2(rect.left(), y_min),
+                        egui::pos2(rect.right(), y_max),
+                    )).circle_filled(
+                        sun_center,
+                        sun_radius,
+                        color,
+                    );
+                }
+
+                // 4. Wireframe Mountains
+                for i in 0..25 {
+                    let h1 = pseudo_rand(i * 17);
+                    let h2 = pseudo_rand(i * 17 + 1);
+                    let h3 = pseudo_rand(i * 17 + 2);
+                    
+                    let cx = rect.left() + h1 * rect.width();
+                    let cy = horizon_y;
+                    let width = rect.width() * (0.1 + h2 * 0.25);
+                    let height = rect.height() * (0.05 + h3 * 0.25);
+                    
+                    let p1 = egui::pos2(cx - width, cy);
+                    let p2 = egui::pos2(cx + width, cy);
+                    let p3 = egui::pos2(cx, cy - height);
+                    
+                    bg_painter.add(egui::Shape::convex_polygon(
+                        vec![p1, p2, p3],
+                        egui::Color32::from_rgb(27, 27, 58),
+                        egui::Stroke::new(1.0, egui::Color32::from_rgb(91, 50, 212)),
+                    ));
+                    
+                    // Center ridge
+                    let ridge_offset = (pseudo_rand(i * 17 + 3) - 0.5) * 0.4;
+                    bg_painter.line_segment(
+                        [p3, egui::pos2(cx + width * ridge_offset, cy)],
+                        egui::Stroke::new(1.0, egui::Color32::from_rgb(91, 50, 212))
+                    );
+                }
+
+                // 5. Floor Grid
+                bg_painter.rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(rect.left(), horizon_y),
+                        egui::pos2(rect.right(), rect.bottom())
+                    ),
+                    0.0,
+                    egui::Color32::from_rgb(36, 21, 84)
                 );
+
+                let grid_color = egui::Color32::from_rgb(212, 34, 161);
                 
                 // Vertical radiating lines
                 let num_v_lines = 40;
                 for i in 0..=num_v_lines {
                     let t = i as f32 / num_v_lines as f32;
                     let bottom_x = rect.left() + (t - 0.5) * rect.width() * 8.0;
+                    
                     bg_painter.line_segment(
                         [egui::pos2(center_x, horizon_y), egui::pos2(bottom_x, rect.bottom())],
                         egui::Stroke::new(1.0, grid_color)
@@ -1827,13 +1953,11 @@ impl<'a> VulkanEngine<'a> {
                     let offset = (i as f32 - (time * 1.5).fract()) / num_h_lines as f32;
                     if offset <= 0.0 { continue; }
                     let y = horizon_y + (rect.bottom() - horizon_y) * offset.powf(3.0);
-                    let thickness = 1.0 + offset * 3.0;
-                    let fade = (offset * 3.0).min(1.0); // Fade in near horizon
-                    let line_color: egui::Color32 = egui::ecolor::Hsva::new(grid_hue, 0.8, 1.0, 0.4 * fade).into();
+                    let thickness = 1.0 + offset * 2.0;
                     
                     bg_painter.line_segment(
                         [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-                        egui::Stroke::new(thickness, line_color)
+                        egui::Stroke::new(thickness, grid_color)
                     );
                 }
                 // --- End Retro Grid ---
@@ -1849,13 +1973,20 @@ impl<'a> VulkanEngine<'a> {
                     egui::Panel::bottom("splash_bottom")
                         .frame(egui::Frame::NONE.fill(egui::Color32::from_rgba_unmultiplied(10, 10, 15, 180)).inner_margin(40.0))
                         .show_inside(ctx, |ui| {
-                            ui.vertical_centered(|ui| {
-                                egui::Frame::NONE
-                                    .fill(egui::Color32::from_black_alpha(200))
-                                    .corner_radius(10.0)
-                                    .inner_margin(20.0)
-                                    .show(ui, |ui| {
-                                        ui.horizontal_centered(|ui| {
+                            let height = if show_kb && show_gp { 170.0 } else { 140.0 };
+                            ui.add_space(height);
+                        });
+                        
+                    egui::Area::new(egui::Id::new("splash_shortcuts_area"))
+                        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -40.0))
+                        .order(egui::Order::Foreground)
+                        .show(ctx, |ui| {
+                            egui::Frame::NONE
+                                .fill(egui::Color32::from_black_alpha(200))
+                                .corner_radius(10.0)
+                                .inner_margin(20.0)
+                                .show(ui, |ui| {
+                                    ui.horizontal_centered(|ui| {
                                             let pairs_per_row = if show_kb && show_gp { 2 } else { 3 };
                                             
                                             if show_kb {
@@ -1941,8 +2072,7 @@ impl<'a> VulkanEngine<'a> {
                                                 });
                                             }
                                         });
-                                    });
-                            });
+                                });
                         });
                 }
 
@@ -1951,18 +2081,19 @@ impl<'a> VulkanEngine<'a> {
                     .inner_margin(40.0);
                     
                 egui::CentralPanel::default().frame(frame).show_inside(ctx, |ui| {
-                    ui.allocate_ui_with_layout(
-                        ui.available_size(),
-                        egui::Layout::top_down(egui::Align::Center),
-                        |ui| {
-                            let avail_height = ui.available_height();
-                            let space = avail_height * 0.15;
+                    let real_avail_height = ui.available_height();
+                    let real_avail_width = ui.available_width();
+                    
+                    egui::ScrollArea::vertical().show(ui, |ui| {
+                        ui.vertical_centered(|ui| {
+                            let space = real_avail_height * 0.15;
                             if space > 0.0 {
                                 ui.add_space(space);
                             }
                             // Scale title to fit smaller screens (like Steam Deck 1280x800)
-                            let avail_width = ui.available_width();
-                            let scale_factor = (avail_width / 1100.0).clamp(0.4, 1.0);
+                            let width_scale = (real_avail_width / 1100.0).clamp(0.4, 1.0);
+                            let height_scale = (real_avail_height / 500.0).clamp(0.4, 1.0);
+                            let scale_factor = width_scale.min(height_scale);
                             let title_width = 1000.0 * scale_factor;
                             let title_height = 160.0 * scale_factor;
                             let font_size = 140.0 * scale_factor;
@@ -2005,7 +2136,7 @@ impl<'a> VulkanEngine<'a> {
                             }
                             
                             // 3. Sliced Chrome Gradient Interior
-                            let steps = 40;
+                            let steps = 20;
                             let top_y = title_rect.center().y - gradient_extent;
                             let bottom_y = title_rect.center().y + gradient_extent;
                             let height = bottom_y - top_y;
@@ -2091,8 +2222,8 @@ impl<'a> VulkanEngine<'a> {
                                 }
                             }
                             // The shortcuts are now rendered in the TopBottomPanel
-                        }
-                    );
+                        });
+                    });
                 });
                 return;
             }
