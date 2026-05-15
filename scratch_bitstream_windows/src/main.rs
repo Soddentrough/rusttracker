@@ -239,7 +239,8 @@ mod wasapi_bitstream {
             buffer_frames as f64 / format.Format.nSamplesPerSec as f64 * 1000.0);
 
         // ── Start FFmpeg spdif Muxer Pipe ───────────────────────────
-        use windows::Win32::System::Pipes::{CreateNamedPipeA, ConnectNamedPipe, PIPE_ACCESS_INBOUND, PIPE_TYPE_BYTE, PIPE_READMODE_BYTE, PIPE_WAIT};
+        use windows::Win32::System::Pipes::{CreateNamedPipeA, ConnectNamedPipe, NAMED_PIPE_MODE};
+        use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
         
         let pipe_name = format!("\\\\.\\pipe\\rusttracker_bitstream_{}", std::process::id());
         let pipe_name_nul = format!("{}\0", pipe_name);
@@ -247,8 +248,8 @@ mod wasapi_bitstream {
         let pipe_handle = unsafe {
             CreateNamedPipeA(
                 windows::core::PCSTR::from_raw(pipe_name_nul.as_ptr()),
-                PIPE_ACCESS_INBOUND,
-                PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                FILE_FLAGS_AND_ATTRIBUTES(1), // PIPE_ACCESS_INBOUND
+                NAMED_PIPE_MODE(0), // PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT
                 1,
                 65536,
                 65536,
@@ -273,7 +274,7 @@ mod wasapi_bitstream {
             let mut ost = octx.add_stream(ffmpeg_next::codec::Id::None).unwrap();
             ost.set_parameters(parameters);
             
-            let mut dict = ffmpeg_next::dict::Dictionary::new();
+            let mut dict = ffmpeg_next::Dictionary::new();
             if codec_name.contains("truehd") {
                 dict.set("spdif_flags", "+use_mat");
             }
