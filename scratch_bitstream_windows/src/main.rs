@@ -41,6 +41,11 @@ mod wasapi_bitstream {
         data4: [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
     };
 
+    const KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_MLP: GUID = GUID {
+        data1: 0x0000000c, data2: 0x0cea, data3: 0x0010,
+        data4: [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
+    };
+
     #[derive(Debug, Clone)]
     struct Iec61937Profile {
         name: &'static str,
@@ -51,11 +56,18 @@ mod wasapi_bitstream {
 
     fn detect_codec_profile(codec_name: &str) -> Vec<Iec61937Profile> {
         if codec_name.contains("truehd") {
-            vec![Iec61937Profile {
-                name: "TrueHD / Dolby Atmos (MAT 2.0 HBR)",
-                channels: 8, rate: 192000,
-                sub_format: KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_MAT20,
-            }]
+            vec![
+                Iec61937Profile {
+                    name: "TrueHD / Dolby Atmos (MAT 2.0 HBR)",
+                    channels: 8, rate: 192000,
+                    sub_format: KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_MAT20,
+                },
+                Iec61937Profile {
+                    name: "TrueHD / Dolby Atmos (MLP HBR)",
+                    channels: 8, rate: 192000,
+                    sub_format: KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_MLP,
+                }
+            ]
         } else if codec_name.contains("eac3") || codec_name.contains("ec-3") {
             vec![Iec61937Profile {
                 name: "E-AC3 / Dolby Digital Plus",
