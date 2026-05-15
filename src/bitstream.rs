@@ -471,7 +471,19 @@ mod wasapi_bitstream {
         let mut eof = false;
         let mut started = false;
 
+        struct SendWrapper<T>(pub T);
+        unsafe impl<T> Send for SendWrapper<T> {}
+
+        let safe_event = SendWrapper(event);
+        let safe_pipe = SendWrapper(pipe_handle);
+        let safe_audio_client = SendWrapper(audio_client);
+        let safe_render_client = SendWrapper(render_client);
+
         let handle = std::thread::spawn(move || {
+            let event = safe_event.0;
+            let pipe_handle = safe_pipe.0;
+            let audio_client = safe_audio_client.0;
+            let render_client = safe_render_client.0;
             loop {
                 if started {
                     let wait_result = unsafe { WaitForSingleObject(event, 2000) };
