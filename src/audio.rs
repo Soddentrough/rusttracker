@@ -119,6 +119,10 @@ pub fn spawn_dsp_thread(
                 // Decay/smooth the execution stats for readability
                 state.stats.fft_us = state.stats.fft_us * 0.9 + fft_elapsed * 0.1;
                 
+                if let Some(cap) = rx.capacity() {
+                    state.stats.audio_buffer_fill_pct = (rx.len() as f32 / cap as f32) * 100.0;
+                }
+                
                 state.raw_channel_vus.clear();
                 for vu in msg.channel_vus {
                     state.raw_channel_vus.push(vu);
@@ -1092,7 +1096,10 @@ impl AudioSource for VideoOnlySource {
 
 fn try_ffmpeg(file_path: &str) -> Result<Box<dyn AudioSource>> {
     let _ = ffmpeg_next::init();
-    let ictx = ffmpeg_next::format::input(&file_path).context("Failed to open file via libavformat")?;
+    let mut dict = ffmpeg_next::Dictionary::new();
+    dict.set("probesize", "5000000");
+    dict.set("analyzeduration", "5000000");
+    let ictx = ffmpeg_next::format::input_with_dictionary(&file_path, dict).context("Failed to open file via libavformat")?;
     
     let duration = ictx.duration() as f64 / ffmpeg_next::ffi::AV_TIME_BASE as f64;
     let ext = std::path::Path::new(file_path)
@@ -1325,6 +1332,7 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
                     state.current_sample_rate = sample_rate as f32;
                     state.duration_seconds = 0.0;
                     state.num_channels = 8;
+                    state.hardware_channels = 8;
                     state.channel_vus = vec![0.0; 8];
                     state.peak_vus = vec![0.0; 8];
                     state.video_info = Some("TrueHD/Atmos".to_string());

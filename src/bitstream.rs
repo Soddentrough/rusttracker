@@ -217,7 +217,10 @@ mod wasapi_bitstream {
         ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Quiet);
         ffmpeg_next::init().context("Failed to initialize ffmpeg-next")?;
         
-        let mut ictx = ffmpeg_next::format::input(&file_path)
+        let mut dict = ffmpeg_next::Dictionary::new();
+        dict.set("probesize", "5000000");
+        dict.set("analyzeduration", "5000000");
+        let mut ictx = ffmpeg_next::format::input_with_dictionary(&file_path, dict)
             .context("Failed to open input file")?;
             
         let best_audio = ictx.streams().best(ffmpeg_next::media::Type::Audio)
