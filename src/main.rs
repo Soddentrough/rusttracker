@@ -226,9 +226,15 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
 
     let mut file_dialog = egui_file_dialog::FileDialog::new()
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-        .initial_directory(initial_dir)
+        .initial_directory(initial_dir.clone())
         .add_file_filter_extensions("Audio/Video Files", vec!["flac", "wav", "mp3", "ogg", "aac", "m4a", "mp4", "mkv", "avi", "webm", "opus", "mod", "s3m", "xm", "it", "stm", "669", "mtm", "med", "okt", "psm", "dawproject", "aaf"])
         .default_file_filter("Audio/Video Files");
+
+    // Native file picker channel (used on non-SteamDeck systems to bypass
+    // egui-file-dialog's synchronous sysinfo disk enumeration)
+    let (rfd_tx, rfd_rx) = crossbeam_channel::unbounded::<Vec<String>>();
+    let mut rfd_pending = false;
+
     let mut modifiers = winit::keyboard::ModifiersState::empty();
 
     #[allow(deprecated)]
@@ -328,8 +334,26 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                                 state.show_help = !state.show_help;
                                             },
                                             WinitKeyCode::KeyO => {
-                                                let mut state = app_state.lock().unwrap();
-                                                state.open_file_request = true;
+                                                if is_game_mode {
+                                                    let mut state = app_state.lock().unwrap();
+                                                    state.open_file_request = true;
+                                                } else if !rfd_pending {
+                                                    rfd_pending = true;
+                                                    let tx = rfd_tx.clone();
+                                                    let dir = initial_dir.clone();
+                                                    std::thread::spawn(move || {
+                                                        let result = rfd::FileDialog::new()
+                                                            .set_directory(&dir)
+                                                            .add_filter("Audio/Video Files", &["flac", "wav", "mp3", "ogg", "aac", "m4a", "mp4", "mkv", "avi", "webm", "opus", "mod", "s3m", "xm", "it", "stm", "669", "mtm", "med", "okt", "psm", "dawproject", "aaf"])
+                                                            .pick_files();
+                                                        if let Some(paths) = result {
+                                                            let strings: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+                                                            if !strings.is_empty() {
+                                                                let _ = tx.send(strings);
+                                                            }
+                                                        }
+                                                    });
+                                                }
                                             },
                                             WinitKeyCode::KeyM => {
                                                 let mut state = app_state.lock().unwrap();
@@ -661,7 +685,27 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                 for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
                             }
                             EngineAction::OpenFile => {
-                                state.open_file_request = true;
+                                if is_game_mode {
+                                    // SteamDeck: use egui-file-dialog (gamepad-navigable)
+                                    state.open_file_request = true;
+                                } else if !rfd_pending {
+                                    // Desktop: use native OS file picker via rfd
+                                    rfd_pending = true;
+                                    let tx = rfd_tx.clone();
+                                    let dir = initial_dir.clone();
+                                    std::thread::spawn(move || {
+                                        let result = rfd::FileDialog::new()
+                                            .set_directory(&dir)
+                                            .add_filter("Audio/Video Files", &["flac", "wav", "mp3", "ogg", "aac", "m4a", "mp4", "mkv", "avi", "webm", "opus", "mod", "s3m", "xm", "it", "stm", "669", "mtm", "med", "okt", "psm", "dawproject", "aaf"])
+                                            .pick_files();
+                                        if let Some(paths) = result {
+                                            let strings: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+                                            if !strings.is_empty() {
+                                                let _ = tx.send(strings);
+                                            }
+                                        }
+                                    });
+                                }
                             }
                             EngineAction::LoadFiles(paths, append) => {
                                 if append && !state.playlist.is_empty() {
@@ -728,6 +772,20 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                         state.stats.phase_egui_layout_us = state.stats.phase_egui_layout_us * 0.9 + phase_egui_us * 0.1;
                         state.stats.phase_encode_us = state.stats.phase_encode_us * 0.9 + phase_encode_us * 0.1;
                         state.stats.phase_post_us = state.stats.phase_post_us * 0.9 + post_timer.elapsed().as_micros() as f32 * 0.1;
+                        // Poll native file picker results
+                        if let Ok(paths) = rfd_rx.try_recv() {
+                            rfd_pending = false;
+                            let append = state.append_to_playlist;
+                            if append && !state.playlist.is_empty() {
+                                state.playlist.extend(paths);
+                            } else if !paths.is_empty() {
+                                state.playlist = paths;
+                                state.playlist_index = 0;
+                                state.load_request = Some(state.playlist[0].clone());
+                            }
+                            state.file_loaded = true;
+                            state.is_file_picker_open = false;
+                        }
                     }
                     
                     if trigger_picker {

@@ -1318,9 +1318,9 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
         let passthrough = shared_state.lock().unwrap().passthrough_enabled;
         if passthrough {
             let (tx, rx) = bounded::<DspMessage>(32);
-            if let Ok(handle) = crate::bitstream::start_bitstream_thread(file_path, shared_state.clone(), tx.clone()) {
+            if let Ok((handle, decoder_rate)) = crate::bitstream::start_bitstream_thread(file_path, shared_state.clone(), tx.clone()) {
                 let max_frequency = shared_state.lock().unwrap().max_frequency;
-                let sample_rate = 192000;
+                let sample_rate = decoder_rate;
                 let window_size = (((sample_rate as f32 * 0.185).round() as usize) / 2) * 2;
                 let window_size = window_size.max(2048).min(65536);
                 

@@ -12,7 +12,7 @@ pub fn start_bitstream_thread(
     _file_path: &str,
     _shared_state: std::sync::Arc<std::sync::Mutex<crate::state::AppState>>,
     _tx: crossbeam_channel::Sender<crate::audio::DspMessage>,
-) -> anyhow::Result<std::thread::JoinHandle<()>> {
+) -> anyhow::Result<(std::thread::JoinHandle<()>, u32)> {
     Err(anyhow::anyhow!("Bitstreaming is only supported on Windows."))
 }
 
@@ -209,7 +209,7 @@ mod wasapi_bitstream {
 
     // ─── Main bitstream pump ─────────────────────────────────────────
 
-    pub fn start_bitstream_thread(file_path: &str, shared_state: Arc<Mutex<AppState>>, tx: Sender<DspMessage>) -> Result<std::thread::JoinHandle<()>> {
+    pub fn start_bitstream_thread(file_path: &str, shared_state: Arc<Mutex<AppState>>, tx: Sender<DspMessage>) -> Result<(std::thread::JoinHandle<()>, u32)> {
         unsafe { let _ = CoInitializeEx(None, COINIT_MULTITHREADED); }
 
         // ── Probe codec via ffmpeg-next ─────────────────────────────
@@ -384,6 +384,14 @@ mod wasapi_bitstream {
         let best_audio_index = best_audio.index();
         let parameters = best_audio.parameters();
 
+        // Probe the decoder sample rate before spawning threads
+        let probe_ctx = ffmpeg_next::codec::context::Context::from_parameters(parameters.clone())
+            .context("Failed to create probe context")?;
+        let probe_decoder = probe_ctx.decoder().audio()
+            .context("Failed to create probe decoder")?;
+        let decoder_sample_rate = probe_decoder.rate();
+        println!("  Decoder sample rate: {} Hz", decoder_sample_rate);
+
         let ffmpeg_thread = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(50));
             println!("[bitstream] FFmpeg thread started.");
@@ -444,30 +452,29 @@ mod wasapi_bitstream {
                                 for p in 0..planes {
                                     let data = resampled.plane::<f32>(p);
                                     accumulator[p].extend_from_slice(data);
-                                    let excess = accumulator[p].len().saturating_sub(window_size);
-                                    if excess > 0 {
-                                        accumulator[p].drain(0..excess);
-                                    }
                                 }
                                 
-                                if accumulator.get(0).map(|a| a.len()).unwrap_or(0) == window_size {
+                                // Drain-based accumulator: send one DspMessage per
+                                // full window, matching the PCM path's ~5 msg/sec.
+                                // The main loop's temporal smoothing bridges this to
+                                // any display rate (60–240 Hz).
+                                while accumulator.get(0).map(|a| a.len()).unwrap_or(0) >= window_size {
                                     let mut channel_audio_data = Vec::with_capacity(planes);
                                     let mut channel_vus = Vec::with_capacity(planes);
                                     
                                     for p in 0..planes {
-                                        let window = accumulator[p].clone();
+                                        let window: Vec<f32> = accumulator[p].drain(0..window_size).collect();
                                         
-                                        // Calculate simple RMS for VU using only the fresh samples from this frame
+                                        // Calculate RMS for VU from the drained window
                                         let mut sum_sq = 0.0;
-                                        let fresh_data = resampled.plane::<f32>(p);
-                                        for &s in fresh_data { sum_sq += s * s; }
-                                        let rms = (sum_sq / fresh_data.len().max(1) as f32).sqrt();
+                                        for &s in &window { sum_sq += s * s; }
+                                        let rms = (sum_sq / window.len() as f32).sqrt();
                                         channel_vus.push(rms);
                                         
                                         channel_audio_data.push(window);
                                     }
                                     
-                                    let _ = tx.try_send(DspMessage {
+                                    let _ = tx.send(DspMessage {
                                         audio_data: channel_audio_data[0].clone(),
                                         channel_vus,
                                         current_order: 0,
@@ -568,7 +575,7 @@ mod wasapi_bitstream {
             println!("Bitstream thread finished.");
         });
 
-        Ok(handle)
+        Ok((handle, decoder_sample_rate))
     }
 }
 
