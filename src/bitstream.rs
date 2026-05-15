@@ -9,11 +9,200 @@ use crate::audio::DspMessage;
 
 #[cfg(not(target_os = "windows"))]
 pub fn start_bitstream_thread(
-    _file_path: &str,
+    file_path: &str,
     _shared_state: std::sync::Arc<std::sync::Mutex<crate::state::AppState>>,
-    _tx: crossbeam_channel::Sender<crate::audio::DspMessage>,
+    tx: crossbeam_channel::Sender<crate::audio::DspMessage>,
+    stop_token: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<(std::thread::JoinHandle<()>, u32)> {
-    Err(anyhow::anyhow!("Bitstreaming is only supported on Windows."))
+    use anyhow::Context;
+
+    println!("[bitstream] Probing codec via ffmpeg-next on Linux...");
+    ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Quiet);
+    ffmpeg_next::init().context("Failed to initialize ffmpeg-next")?;
+    
+    let mut dict = ffmpeg_next::Dictionary::new();
+    dict.set("probesize", "5000000");
+    dict.set("analyzeduration", "5000000");
+    let mut ictx = ffmpeg_next::format::input_with_dictionary(&file_path, dict)
+        .context("Failed to open input file")?;
+        
+    let best_audio = ictx.streams().best(ffmpeg_next::media::Type::Audio)
+        .ok_or_else(|| anyhow::anyhow!("No audio stream found"))?;
+        
+    let codec_id = best_audio.parameters().id();
+    let codec_name = match codec_id {
+        ffmpeg_next::codec::Id::TRUEHD => "truehd",
+        ffmpeg_next::codec::Id::EAC3 => "eac3",
+        ffmpeg_next::codec::Id::DTS => "dts",
+        ffmpeg_next::codec::Id::AC3 => "ac3",
+        _ => return Err(anyhow::anyhow!("Unsupported codec for bitstreaming: {:?}", codec_id)),
+    }.to_string();
+
+    let parameters = best_audio.parameters();
+    let best_audio_index = best_audio.index();
+
+    let probe_ctx = ffmpeg_next::codec::context::Context::from_parameters(parameters.clone())
+        .context("Failed to create probe context")?;
+    let probe_decoder = probe_ctx.decoder().audio()
+        .context("Failed to create probe decoder")?;
+    let decoder_sample_rate = probe_decoder.rate();
+    
+    let pw_rate = if codec_name == "truehd" || codec_name == "dts" { 192000 } else { 48000 };
+    println!("[bitstream] Codec: {}, Decoder Rate: {}, Output Rate: {}", codec_name, decoder_sample_rate, pw_rate);
+
+    let pipe_path = format!("/tmp/rusttracker_bitstream_{}", std::process::id());
+    let _ = std::fs::remove_file(&pipe_path);
+    
+    let mkfifo_out = std::process::Command::new("mkfifo")
+        .arg(&pipe_path)
+        .output()
+        .context("Failed to run mkfifo command")?;
+    
+    if !mkfifo_out.status.success() {
+        return Err(anyhow::anyhow!("mkfifo failed: {}", String::from_utf8_lossy(&mkfifo_out.stderr)));
+    }
+
+    let mut child = std::process::Command::new("pw-play")
+        .arg("--properties=node.passthrough=true")
+        .arg("-f").arg("s16")
+        .arg("-r").arg(pw_rate.to_string())
+        .arg("-c").arg("2")
+        .arg("--raw")
+        .arg(&pipe_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| {
+            let _ = std::fs::remove_file(&pipe_path);
+            anyhow::anyhow!("Failed to spawn pw-play. Is pipewire installed? {}", e)
+        })?;
+
+    // Check if pw-play fails immediately
+    std::thread::sleep(std::time::Duration::from_millis(150));
+    if let Ok(Some(status)) = child.try_wait() {
+        let _ = std::fs::remove_file(&pipe_path);
+        return Err(anyhow::anyhow!("pw-play exited immediately with status: {}", status));
+    }
+
+    let pipe_path_clone = pipe_path.clone();
+
+    let ffmpeg_thread = std::thread::spawn(move || {
+        println!("[bitstream] FFmpeg thread started on Linux.");
+        
+        let mut octx = ffmpeg_next::format::output_as(&pipe_path_clone, "spdif").unwrap();
+        let ost_index = {
+            let mut ost = octx.add_stream(ffmpeg_next::codec::Id::None).unwrap();
+            ost.set_parameters(parameters.clone());
+            ost.index()
+        };
+        
+        let mut dict = ffmpeg_next::Dictionary::new();
+        dict.set("flush_packets", "1");
+        if octx.write_header_with(dict).is_err() {
+            println!("[bitstream] Failed to write header to pipe");
+            let _ = child.kill();
+            let _ = std::fs::remove_file(&pipe_path_clone);
+            return;
+        }
+        let ost_time_base = octx.stream(ost_index).unwrap().time_base();
+
+        let decoder_context = ffmpeg_next::codec::context::Context::from_parameters(parameters.clone()).unwrap();
+        let mut decoder = decoder_context.decoder().audio().unwrap();
+        let mut resampler = ffmpeg_next::software::resampling::context::Context::get(
+            decoder.format(), decoder.channel_layout(), decoder.rate(),
+            ffmpeg_next::format::sample::Sample::F32(ffmpeg_next::format::sample::Type::Planar),
+            decoder.channel_layout(), decoder.rate(),
+        ).unwrap();
+
+        let decoder_rate = decoder.rate() as f32;
+        let window_size = (((decoder_rate * 0.185).round() as usize) / 2) * 2;
+        let window_size = window_size.max(2048).min(65536);
+        let update_interval = (decoder_rate / 240.0).ceil() as usize;
+        let mut accumulator: Vec<Vec<f32>> = Vec::new();
+        let mut samples_since_last_send = 0;
+
+        let mut current_seconds = 0.0;
+        
+        for (stream, mut packet) in ictx.packets() {
+            if stop_token.load(std::sync::atomic::Ordering::Relaxed) {
+                println!("[bitstream] Stop token received, stopping bitstream.");
+                break;
+            }
+            if stream.index() == best_audio_index {
+                let vis_packet = packet.clone();
+
+                if let Some(pts) = packet.pts() {
+                    current_seconds = pts as f64 * f64::from(stream.time_base());
+                }
+
+                packet.rescale_ts(stream.time_base(), ost_time_base);
+                packet.set_stream(ost_index);
+                if packet.write(&mut octx).is_err() {
+                    break; // Pipe broken
+                }
+
+                if decoder.send_packet(&vis_packet).is_ok() {
+                    let mut frame = ffmpeg_next::frame::Audio::empty();
+                    while decoder.receive_frame(&mut frame).is_ok() {
+                        let mut resampled = ffmpeg_next::frame::Audio::empty();
+                        if resampler.run(&frame, &mut resampled).is_ok() {
+                            let planes = resampled.channels() as usize;
+                            if accumulator.len() != planes {
+                                accumulator = vec![Vec::new(); planes];
+                            }
+                            
+                            let mut fresh_samples = 0;
+                            for p in 0..planes {
+                                let data = resampled.plane::<f32>(p);
+                                if p == 0 { fresh_samples = data.len(); }
+                                accumulator[p].extend_from_slice(data);
+                                let excess = accumulator[p].len().saturating_sub(window_size);
+                                if excess > 0 {
+                                    accumulator[p].drain(0..excess);
+                                }
+                            }
+                            
+                            samples_since_last_send += fresh_samples;
+                            
+                            if accumulator.get(0).map(|a| a.len()).unwrap_or(0) == window_size && samples_since_last_send >= update_interval {
+                                samples_since_last_send = 0;
+                                let mut channel_audio_data = Vec::with_capacity(planes);
+                                let mut channel_vus = Vec::with_capacity(planes);
+                                
+                                for p in 0..planes {
+                                    let window = accumulator[p].clone();
+                                    let mut sum_sq = 0.0;
+                                    for &s in &window { sum_sq += s * s; }
+                                    let rms = (sum_sq / window.len() as f32).sqrt();
+                                    channel_vus.push(rms);
+                                    channel_audio_data.push(window);
+                                }
+                                
+                                let _ = tx.try_send(crate::audio::DspMessage {
+                                    audio_data: channel_audio_data[0].clone(),
+                                    channel_vus,
+                                    current_order: 0,
+                                    current_row: 0,
+                                    bpm: 0,
+                                    speed: 0,
+                                    current_seconds,
+                                    current_row_string: "".to_string(),
+                                    channel_audio_data,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let _ = octx.write_trailer();
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = std::fs::remove_file(&pipe_path_clone);
+        println!("[bitstream] FFmpeg thread finished on Linux.");
+    });
+
+    Ok((ffmpeg_thread, decoder_sample_rate as u32))
 }
 
 
@@ -23,7 +212,7 @@ pub use wasapi_bitstream::start_bitstream_thread;
 
 #[cfg(windows)]
 mod wasapi_bitstream {
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, atomic::AtomicBool};
     use crossbeam_channel::Sender;
     use crate::state::AppState;
     use crate::audio::DspMessage;
@@ -209,7 +398,7 @@ mod wasapi_bitstream {
 
     // ─── Main bitstream pump ─────────────────────────────────────────
 
-    pub fn start_bitstream_thread(file_path: &str, shared_state: Arc<Mutex<AppState>>, tx: Sender<DspMessage>) -> Result<(std::thread::JoinHandle<()>, u32)> {
+    pub fn start_bitstream_thread(file_path: &str, shared_state: Arc<Mutex<AppState>>, tx: Sender<DspMessage>, stop_token: Arc<AtomicBool>) -> Result<(std::thread::JoinHandle<()>, u32)> {
         unsafe { let _ = CoInitializeEx(None, COINIT_MULTITHREADED); }
 
         // ── Probe codec via ffmpeg-next ─────────────────────────────
@@ -383,6 +572,7 @@ mod wasapi_bitstream {
         let pipe_name_clone = pipe_name.clone();
         let best_audio_index = best_audio.index();
         let parameters = best_audio.parameters();
+        let stop_token_ffmpeg = stop_token.clone();
 
         // Probe the decoder sample rate before spawning threads
         let probe_ctx = ffmpeg_next::codec::context::Context::from_parameters(parameters.clone())
@@ -428,6 +618,9 @@ mod wasapi_bitstream {
             let mut current_seconds = 0.0;
             
             for (stream, mut packet) in ictx.packets() {
+                if stop_token_ffmpeg.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
                 if stream.index() == best_audio_index {
                     let vis_packet = packet.clone();
 
@@ -516,7 +709,6 @@ mod wasapi_bitstream {
             profile.name, profile.channels, profile.rate);
         println!("   Press Ctrl+C to stop.\n");
 
-        let mut total_frames: u64 = 0;
         let mut eof = false;
         let mut started = false;
 
@@ -528,6 +720,7 @@ mod wasapi_bitstream {
         let safe_pipe = SendWrapper(pipe_handle);
         let safe_audio_client = SendWrapper(audio_client);
         let safe_render_client = SendWrapper(render_client);
+        let stop_token_pump = stop_token.clone();
 
         let handle = std::thread::spawn(move || {
             let event = safe_event.into_inner();
@@ -535,6 +728,10 @@ mod wasapi_bitstream {
             let audio_client = safe_audio_client.into_inner();
             let render_client = safe_render_client.into_inner();
             loop {
+                if stop_token_pump.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+
                 if started {
                     let wait_result = unsafe { WaitForSingleObject(event, 2000) };
                     if wait_result.0 != WAIT_OBJECT_0 { break; }

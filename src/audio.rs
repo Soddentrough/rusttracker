@@ -22,7 +22,15 @@ use crossbeam_channel::{bounded, Sender, Receiver};
 #[allow(dead_code)]
 pub enum PlaybackHandle {
     Cpal(cpal::Stream),
-    Bitstream(std::thread::JoinHandle<()>),
+    Bitstream(std::thread::JoinHandle<()>, Arc<std::sync::atomic::AtomicBool>),
+}
+
+impl Drop for PlaybackHandle {
+    fn drop(&mut self) {
+        if let PlaybackHandle::Bitstream(_, stop_token) = self {
+            stop_token.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
 }
 
 pub struct DspMessage {
@@ -1318,7 +1326,8 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
         let passthrough = shared_state.lock().unwrap().passthrough_enabled;
         if passthrough {
             let (tx, rx) = bounded::<DspMessage>(32);
-            if let Ok((handle, decoder_rate)) = crate::bitstream::start_bitstream_thread(file_path, shared_state.clone(), tx.clone()) {
+            let stop_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            if let Ok((handle, decoder_rate)) = crate::bitstream::start_bitstream_thread(file_path, shared_state.clone(), tx.clone(), stop_token.clone()) {
                 let max_frequency = shared_state.lock().unwrap().max_frequency;
                 let sample_rate = decoder_rate;
                 let window_size = (((sample_rate as f32 * 0.185).round() as usize) / 2) * 2;
@@ -1339,7 +1348,7 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
                 }
                 
                 spawn_dsp_thread(rx, shared_state.clone(), sample_rate, max_frequency, window_size);
-                return Ok(PlaybackHandle::Bitstream(handle));
+                return Ok(PlaybackHandle::Bitstream(handle, stop_token));
             }
         }
     }
