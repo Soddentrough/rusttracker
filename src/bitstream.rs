@@ -1,12 +1,3 @@
-#[cfg(target_os = "windows")]
-use std::sync::{Arc, Mutex};
-#[cfg(target_os = "windows")]
-use crossbeam_channel::Sender;
-#[cfg(target_os = "windows")]
-use crate::state::AppState;
-#[cfg(target_os = "windows")]
-use crate::audio::DspMessage;
-
 #[cfg(not(target_os = "windows"))]
 pub fn start_bitstream_thread(
     file_path: &str,
@@ -376,6 +367,7 @@ mod wasapi_bitstream {
 
     // ─── Device listing (simple — just count and ID) ─────────────────
 
+    #[allow(dead_code)]
     pub fn list_devices() -> Result<()> {
         unsafe { let _ = CoInitializeEx(None, COINIT_MULTITHREADED); }
 
@@ -398,7 +390,7 @@ mod wasapi_bitstream {
 
     // ─── Main bitstream pump ─────────────────────────────────────────
 
-    pub fn start_bitstream_thread(file_path: &str, shared_state: Arc<Mutex<AppState>>, tx: Sender<DspMessage>, stop_token: Arc<AtomicBool>) -> Result<(std::thread::JoinHandle<()>, u32)> {
+    pub fn start_bitstream_thread(file_path: &str, _shared_state: Arc<Mutex<AppState>>, tx: Sender<DspMessage>, stop_token: Arc<AtomicBool>) -> Result<(std::thread::JoinHandle<()>, u32)> {
         unsafe { let _ = CoInitializeEx(None, COINIT_MULTITHREADED); }
 
         // ── Probe codec via ffmpeg-next ─────────────────────────────
@@ -614,7 +606,7 @@ mod wasapi_bitstream {
             let mut accumulator: Vec<Vec<f32>> = Vec::new();
             let mut samples_since_last_send = 0;
 
-            let mut pkts_written = 0;
+            // let mut pkts_written = 0;
             let mut current_seconds = 0.0;
             
             for (stream, mut packet) in ictx.packets() {
@@ -631,7 +623,7 @@ mod wasapi_bitstream {
                     packet.rescale_ts(stream.time_base(), ost_time_base);
                     packet.set_stream(ost_index);
                     let _ = packet.write(&mut octx);
-                    pkts_written += 1;
+                    // pkts_written += 1;
 
                     if decoder.send_packet(&vis_packet).is_ok() {
                         let mut frame = ffmpeg_next::frame::Audio::empty();

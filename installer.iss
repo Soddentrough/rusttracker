@@ -2,8 +2,8 @@
 AppName=RustTracker
 AppVersion={#MyAppVersion}
 DefaultDirName={autopf}\RustTracker
-ArchitecturesAllowed=x64
-ArchitecturesInstallIn64BitMode=x64
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
 DefaultGroupName=RustTracker
 OutputBaseFilename=RustTracker-Setup
 Compression=lzma2
