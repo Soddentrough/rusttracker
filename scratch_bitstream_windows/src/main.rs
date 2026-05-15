@@ -129,20 +129,36 @@ mod wasapi_bitstream {
                 nAvgBytesPerSec: avg_bytes,
                 nBlockAlign: block_align,
                 wBitsPerSample: 16,
-                cbSize: 22,
+                cbSize: if is_hbr { 34 } else { 22 },
             },
             Samples: WAVEFORMATEXTENSIBLE_0 { wValidBitsPerSample: 16 },
             dwChannelMask: channel_mask,
             SubFormat: profile.sub_format,
         };
 
-        let bytes = unsafe {
-            std::slice::from_raw_parts(
-                &format_ext as *const _ as *const u8,
-                std::mem::size_of::<WAVEFORMATEXTENSIBLE>(),
-            )
-        };
-        bytes.to_vec()
+        if is_hbr {
+            let iec = WAVEFORMATEXTENSIBLE_IEC61937 {
+                format_ext,
+                dw_encoded_samples_per_sec: profile.rate,
+                dw_encoded_channel_count: profile.channels as u32,
+                dw_average_bytes_per_sec: avg_bytes,
+            };
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    &iec as *const _ as *const u8,
+                    std::mem::size_of::<WAVEFORMATEXTENSIBLE_IEC61937>(),
+                )
+            };
+            bytes.to_vec()
+        } else {
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    &format_ext as *const _ as *const u8,
+                    std::mem::size_of::<WAVEFORMATEXTENSIBLE>(),
+                )
+            };
+            bytes.to_vec()
+        }
     }
 
     // ─── Device listing (simple — just count and ID) ─────────────────
@@ -368,9 +384,8 @@ mod wasapi_bitstream {
             let mut pkts_written = 0;
             for (stream, mut packet) in ictx.packets() {
                 if stream.index() == best_audio_index {
+                    packet.rescale_ts(stream.time_base(), ost_time_base);
                     packet.set_stream(ost_index);
-                    packet.set_pts(Some(0));
-                    packet.set_dts(Some(0));
                     
                     let _ = packet.write(&mut octx);
                     pkts_written += 1;
