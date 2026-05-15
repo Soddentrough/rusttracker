@@ -420,7 +420,9 @@ mod wasapi_bitstream {
             let decoder_rate = decoder.rate() as f32;
             let window_size = (((decoder_rate * 0.185).round() as usize) / 2) * 2;
             let window_size = window_size.max(2048).min(65536);
+            let update_interval = (decoder_rate / 240.0).ceil() as usize;
             let mut accumulator: Vec<Vec<f32>> = Vec::new();
+            let mut samples_since_last_send = 0;
 
             let mut pkts_written = 0;
             let mut current_seconds = 0.0;
@@ -449,23 +451,29 @@ mod wasapi_bitstream {
                                     accumulator = vec![Vec::new(); planes];
                                 }
                                 
+                                let mut fresh_samples = 0;
                                 for p in 0..planes {
                                     let data = resampled.plane::<f32>(p);
+                                    if p == 0 { fresh_samples = data.len(); }
                                     accumulator[p].extend_from_slice(data);
+                                    let excess = accumulator[p].len().saturating_sub(window_size);
+                                    if excess > 0 {
+                                        accumulator[p].drain(0..excess);
+                                    }
                                 }
                                 
-                                // Drain-based accumulator: send one DspMessage per
-                                // full window, matching the PCM path's ~5 msg/sec.
-                                // The main loop's temporal smoothing bridges this to
-                                // any display rate (60–240 Hz).
-                                while accumulator.get(0).map(|a| a.len()).unwrap_or(0) >= window_size {
+                                samples_since_last_send += fresh_samples;
+                                
+                                // Sliding window with 240Hz update limiter
+                                if accumulator.get(0).map(|a| a.len()).unwrap_or(0) == window_size && samples_since_last_send >= update_interval {
+                                    samples_since_last_send = 0;
                                     let mut channel_audio_data = Vec::with_capacity(planes);
                                     let mut channel_vus = Vec::with_capacity(planes);
                                     
                                     for p in 0..planes {
-                                        let window: Vec<f32> = accumulator[p].drain(0..window_size).collect();
+                                        let window = accumulator[p].clone();
                                         
-                                        // Calculate RMS for VU from the drained window
+                                        // Calculate RMS for VU from the window
                                         let mut sum_sq = 0.0;
                                         for &s in &window { sum_sq += s * s; }
                                         let rms = (sum_sq / window.len() as f32).sqrt();
@@ -474,7 +482,7 @@ mod wasapi_bitstream {
                                         channel_audio_data.push(window);
                                     }
                                     
-                                    let _ = tx.send(DspMessage {
+                                    let _ = tx.try_send(DspMessage {
                                         audio_data: channel_audio_data[0].clone(),
                                         channel_vus,
                                         current_order: 0,
