@@ -19,8 +19,15 @@ pub fn start_bitstream_thread(
 
 
 #[cfg(windows)]
+pub use wasapi_bitstream::start_bitstream_thread;
+
+#[cfg(windows)]
 mod wasapi_bitstream {
-    use anyhow::{Context, Result, bail};
+    use std::sync::{Arc, Mutex};
+    use crossbeam_channel::Sender;
+    use crate::state::AppState;
+    use crate::audio::DspMessage;
+    use anyhow::{Context, Result};
     use std::io::Read;
     use std::ptr;
     use windows::core::GUID;
@@ -391,7 +398,8 @@ mod wasapi_bitstream {
             let ost_time_base = octx.stream(ost_index).unwrap().time_base();
 
             // Setup Visualizer Decoder
-            let mut decoder = ictx.streams().best(ffmpeg_next::media::Type::Audio).unwrap().codec().decoder().audio().unwrap();
+            let decoder_context = ffmpeg_next::codec::context::Context::from_parameters(parameters.clone()).unwrap();
+            let mut decoder = decoder_context.decoder().audio().unwrap();
             let mut resampler = ffmpeg_next::software::resampling::context::Context::get(
                 decoder.format(), decoder.channel_layout(), decoder.rate(),
                 ffmpeg_next::format::sample::Sample::F32(ffmpeg_next::format::sample::Type::Planar),
