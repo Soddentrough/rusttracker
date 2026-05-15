@@ -283,40 +283,42 @@ mod wasapi_bitstream {
             )
         };
 
-        if hr == windows::core::HRESULT(0x88890019u32 as i32) || hr == windows::core::HRESULT(0x80070057u32 as i32) {
-            // AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED or E_INVALIDARG
-            println!("  Initialize rejected duration {} (HRESULT: {:?}). Attempting to align...", buffer_duration, hr);
-            
-            // If it failed with E_INVALIDARG, we might need a new client, but let's try querying buffer size first
-            let aligned_frames = unsafe { audio_client.GetBufferSize().unwrap_or(0) };
-            if aligned_frames > 0 {
-                // formula: duration = frames * 10_000_000 / sample_rate
-                buffer_duration = (aligned_frames as i64 * 10_000_000) / profile.rate as i64;
-                println!("  Aligned buffer duration: {}ns ({} frames)", buffer_duration * 100, aligned_frames);
+        if let Err(e) = &hr {
+            if e.code() == windows::core::HRESULT(0x88890019u32 as i32) || e.code() == windows::core::HRESULT(0x80070057u32 as i32) {
+                // AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED or E_INVALIDARG
+                println!("  Initialize rejected duration {} (HRESULT: {:?}). Attempting to align...", buffer_duration, e.code());
                 
-                // We actually must get a new audio_client instance if Initialize failed
-                let audio_client_new: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
-                hr = unsafe {
-                    audio_client_new.Initialize(
-                        AUDCLNT_SHAREMODE_EXCLUSIVE,
-                        AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                        buffer_duration,
-                        buffer_duration,
-                        format.as_ptr() as *const _,
-                        None,
-                    )
-                };
-                
-                if hr.is_ok() {
-                    audio_client = audio_client_new;
+                // If it failed with E_INVALIDARG, we might need a new client, but let's try querying buffer size first
+                let aligned_frames = unsafe { audio_client.GetBufferSize().unwrap_or(0) };
+                if aligned_frames > 0 {
+                    // formula: duration = frames * 10_000_000 / sample_rate
+                    buffer_duration = (aligned_frames as i64 * 10_000_000) / profile.rate as i64;
+                    println!("  Aligned buffer duration: {}ns ({} frames)", buffer_duration * 100, aligned_frames);
+                    
+                    // We actually must get a new audio_client instance if Initialize failed
+                    let audio_client_new: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
+                    hr = unsafe {
+                        audio_client_new.Initialize(
+                            AUDCLNT_SHAREMODE_EXCLUSIVE,
+                            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                            buffer_duration,
+                            buffer_duration,
+                            format.as_ptr() as *const _,
+                            None,
+                        )
+                    };
+                    
+                    if hr.is_ok() {
+                        audio_client = audio_client_new;
+                    } else {
+                        hr.map_err(|e| anyhow::anyhow!(e))?;
+                    }
                 } else {
-                    hr.ok()?;
+                    hr.map_err(|e| anyhow::anyhow!(e))?;
                 }
             } else {
-                hr.ok()?;
+                hr.map_err(|e| anyhow::anyhow!(e))?;
             }
-        } else {
-            hr.ok()?;
         }
 
         let event = unsafe { CreateEventW(None, false, false, None)? };
