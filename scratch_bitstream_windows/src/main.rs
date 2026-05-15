@@ -371,10 +371,7 @@ mod wasapi_bitstream {
                 ost.index()
             };
             
-            let mut dict = ffmpeg_next::Dictionary::new();
-            if codec_name.contains("truehd") {
-                dict.set("spdif_flags", "+use_mat");
-            }
+            let dict = ffmpeg_next::Dictionary::new();
             
             octx.write_header_with(dict).unwrap();
 
