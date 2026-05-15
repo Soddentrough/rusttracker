@@ -19,20 +19,24 @@ use midly::{Smf, TrackEventKind, MetaMessage, MidiMessage};
 use crate::state::AppState;
 use crossbeam_channel::{bounded, Sender, Receiver};
 
-
-struct DspMessage {
-    audio_data: Vec<f32>,
-    channel_vus: Vec<f32>,
-    current_order: i32,
-    current_row: i32,
-    bpm: i32,
-    speed: i32,
-    current_seconds: f64,
-    current_row_string: String,
-    channel_audio_data: Vec<Vec<f32>>,
+pub enum PlaybackHandle {
+    Cpal(cpal::Stream),
+    Bitstream(std::thread::JoinHandle<()>),
 }
 
-fn spawn_dsp_thread(
+pub struct DspMessage {
+    pub audio_data: Vec<f32>,
+    pub channel_vus: Vec<f32>,
+    pub current_order: i32,
+    pub current_row: i32,
+    pub bpm: i32,
+    pub speed: i32,
+    pub current_seconds: f64,
+    pub current_row_string: String,
+    pub channel_audio_data: Vec<Vec<f32>>,
+}
+
+pub fn spawn_dsp_thread(
     rx: Receiver<DspMessage>,
     shared_state: Arc<Mutex<AppState>>,
     sample_rate: u32,
@@ -1301,7 +1305,36 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
     ffmpeg_result
 }
 
-pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<AppState>>) -> Result<cpal::Stream> {
+pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<AppState>>) -> Result<PlaybackHandle> {
+    if !mic {
+        let passthrough = shared_state.lock().unwrap().passthrough_enabled;
+        if passthrough {
+            let (tx, rx) = bounded::<DspMessage>(32);
+            if let Ok(handle) = crate::bitstream::start_bitstream_thread(file_path, shared_state.clone(), tx.clone()) {
+                let max_frequency = shared_state.lock().unwrap().max_frequency;
+                let sample_rate = 192000;
+                let window_size = (((sample_rate as f32 * 0.185).round() as usize) / 2) * 2;
+                let window_size = window_size.max(2048).min(65536);
+                
+                {
+                    let mut state = shared_state.lock().unwrap();
+                    state.artist = "Bitstream Active".to_string();
+                    state.module_type = "Hardware Passthrough".to_string();
+                    state.stats.bitstream_active = true;
+                    state.current_sample_rate = sample_rate as f32;
+                    state.duration_seconds = 0.0;
+                    state.num_channels = 8;
+                    state.channel_vus = vec![0.0; 8];
+                    state.peak_vus = vec![0.0; 8];
+                    state.video_info = Some("TrueHD/Atmos".to_string());
+                }
+                
+                spawn_dsp_thread(rx, shared_state.clone(), sample_rate, max_frequency, window_size);
+                return Ok(PlaybackHandle::Bitstream(handle));
+            }
+        }
+    }
+
     let host = cpal::default_host();
     let mut audio_source_opt = if mic { None } else { Some(load_audio_source(file_path)?) };
     let rate = audio_source_opt.as_mut().and_then(|a| a.get_intrinsic_sample_rate()).unwrap_or(48000);
@@ -1399,7 +1432,7 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
             cpal::SampleFormat::U16 => run_mic::<u16>(&device, &config, shared_state, tx, config.sample_rate),
             _ => return Err(anyhow::anyhow!("Unsupported sample format")),
         }?;
-        return Ok(stream);
+        return Ok(PlaybackHandle::Cpal(stream));
     }
 
     let config: cpal::StreamConfig = supported_config.clone().into();
@@ -1456,7 +1489,7 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
 
     stream.play().context("Failed to play stream")?;
 
-    Ok(stream)
+    Ok(PlaybackHandle::Cpal(stream))
 }
 
 

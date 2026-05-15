@@ -19,9 +19,10 @@ use winit::platform::wayland::WindowAttributesExtWayland;
 use winit::platform::x11::WindowAttributesExtX11;
 
 mod audio;
+mod engine;
 mod state;
 mod ui;
-mod engine;
+pub mod bitstream;
 
 use crate::state::AppState;
 use crate::engine::{VulkanEngine, EngineAction};
@@ -147,7 +148,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 }
 
 #[allow(unused_variables, unused_assignments)]
-async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal::Stream>, is_fullscreen: bool, use_gpu_fft: bool) {
+async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audio::PlaybackHandle>, is_fullscreen: bool, use_gpu_fft: bool) {
     if use_gpu_fft {
         let mut state = app_state.lock().unwrap();
         state.gpu_fft = true;
@@ -678,6 +679,9 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<cpal
                             }
                             EngineAction::SetForceStereo(val) => {
                                 state.force_stereo_downmix = val;
+                            }
+                            EngineAction::SetPassthrough(val) => {
+                                state.passthrough_enabled = val;
                             }
                             EngineAction::SetSplitRatio(val) => {
                                 state.panel_split_ratio = val;

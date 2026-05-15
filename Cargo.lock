@@ -3800,6 +3800,7 @@ dependencies = [
  "rustysynth",
  "symphonia",
  "wgpu",
+ "windows",
  "winit",
  "winres",
 ]

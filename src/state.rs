@@ -20,6 +20,8 @@ pub struct PerformanceStats {
     pub audio_buffer_fill_pct: f32,
     pub video_buffer_fill_pct: f32,
     pub clipping_events: u32,
+    pub bitstream_active: bool,
+    pub bitstream_format: String,
     
     // Fine-grained frame phase timings (microseconds)
     pub phase_lock_update_us: f32,   // Main loop: lock + smoothing + engine.update()
@@ -129,6 +131,9 @@ pub struct AppState {
     pub tracker_channels: Option<i32>,
     pub load_request: Option<String>,
     pub video_mode: u32,
+    pub playlist: Vec<String>,
+    pub playlist_index: usize,
+    pub passthrough_enabled: bool,
     pub file_loaded: bool,
     pub video_info: Option<String>,
     pub show_stats: bool,
@@ -136,8 +141,6 @@ pub struct AppState {
     pub stats: PerformanceStats,
     pub current_fps: f32,
     pub current_sample_rate: f32,
-    pub playlist: Vec<String>,
-    pub playlist_index: usize,
     pub track_ended: bool,
     pub visualizer_mode: u32,
     pub visual_width: u32,
@@ -176,6 +179,7 @@ impl AppState {
             .unwrap_or(false);
 
         AppState {
+            passthrough_enabled: true,
             file_loaded: false,
             song_title: title,
             artist: "Unknown".to_string(),
@@ -249,6 +253,7 @@ impl AppState {
     /// This saves ~1.3 MB of deep copies per frame vs a full .clone().
     pub fn render_snapshot(&self) -> Self {
         AppState {
+            passthrough_enabled: self.passthrough_enabled,
             song_title: self.song_title.clone(),
             artist: self.artist.clone(),
             module_type: self.module_type.clone(),

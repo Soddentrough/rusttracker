@@ -50,6 +50,7 @@ pub enum EngineAction {
     LoadFiles(Vec<String>, bool),
     Seek(f32),
     SetForceStereo(bool),
+    SetPassthrough(bool),
     SetSplitRatio(f32),
     SetAppendToPlaylist(bool),
     VisPickerSelect(usize),
@@ -1444,6 +1445,27 @@ impl<'a> VulkanEngine<'a> {
                                 .color(egui::Color32::YELLOW)
                         );
                         ui.separator();
+                        
+                        if state.stats.bitstream_active {
+                            ui.label(
+                                egui::RichText::new("Bitstream Passthrough: ACTIVE")
+                                    .color(egui::Color32::from_rgb(0, 255, 128))
+                                    .strong()
+                            );
+                            if let Some(info) = &state.video_info {
+                                ui.label(
+                                    egui::RichText::new(format!("Format: {}", info))
+                                        .color(egui::Color32::LIGHT_GREEN)
+                                );
+                            }
+                            ui.separator();
+                        } else if state.passthrough_enabled {
+                            ui.label(
+                                egui::RichText::new("Bitstream Passthrough: Inactive")
+                                    .color(egui::Color32::GRAY)
+                            );
+                            ui.separator();
+                        }
                         ui.label(
                             egui::RichText::new(format!("FPS: {:.1}", state.current_fps))
                                 .color(egui::Color32::GREEN)
@@ -1945,6 +1967,14 @@ impl<'a> VulkanEngine<'a> {
                             let mut force_stereo = state.force_stereo_downmix;
                             if ui.checkbox(&mut force_stereo, "Force Stereo Downmix (Fixes crackling on some devices)").changed() {
                                 engine_action = EngineAction::SetForceStereo(force_stereo);
+                            }
+                            
+                            #[cfg(target_os = "windows")]
+                            {
+                                let mut passthrough = state.passthrough_enabled;
+                                if ui.checkbox(&mut passthrough, "Enable Bitstream Passthrough (WASAPI Exclusive)").changed() {
+                                    engine_action = EngineAction::SetPassthrough(passthrough);
+                                }
                             }
                                                
                             let show_kb = !is_game_mode;
