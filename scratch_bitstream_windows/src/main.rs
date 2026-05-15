@@ -434,9 +434,8 @@ mod wasapi_bitstream {
                 }
             }
 
-            let padding = unsafe { audio_client.GetCurrentPadding().unwrap_or(0) };
-            let available = buffer_frames - padding;
-            if available == 0 { continue; }
+            // In Exclusive Event-Driven mode, we must always provide a full buffer
+            let available = buffer_frames;
 
             let bytes_needed = (available * frame_bytes) as usize;
             let mut chunk = vec![0u8; bytes_needed];
