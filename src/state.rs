@@ -50,6 +50,7 @@ pub struct VideoFrame {
     pub bit_depth: u8,
     pub color_space: u32,
     pub color_range: u32,
+    pub color_trc: u32,
 }
 
 impl std::fmt::Debug for VideoFrame {

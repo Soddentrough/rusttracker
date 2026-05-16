@@ -34,13 +34,16 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     
     let k = 2.0 * PI * freq / params.sample_rate;
     
-    // Direct log-spaced DFT
-    let num_samples = params.num_samples;
-    for (var n = 0u; n < num_samples; n = n + 1u) {
-        let sample = raw_audio[ch_idx * num_samples + n];
+    // Adaptive sample count: lower bins need full temporal resolution for
+    // precise frequency discrimination; upper bins can use fewer samples
+    // since treble frequencies resolve in shorter windows.
+    let bin_scale = max(1u, (bin_idx + 64u) / 128u);
+    let adaptive_samples = max(512u, params.num_samples / bin_scale);
+    for (var n = 0u; n < adaptive_samples; n = n + 1u) {
+        let sample = raw_audio[ch_idx * params.num_samples + n];
         
-        // Apply Hann window
-        let window = 0.5 * (1.0 - cos(2.0 * PI * f32(n) / f32(num_samples - 1u)));
+        // Apply Hann window (scaled to adaptive length)
+        let window = 0.5 * (1.0 - cos(2.0 * PI * f32(n) / f32(adaptive_samples - 1u)));
         let w_sample = sample * window;
         
         let phase = k * f32(n);
@@ -48,8 +51,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         im -= w_sample * sin(phase);
     }
     
-    let norm_re = re / sqrt(f32(num_samples));
-    let norm_im = im / sqrt(f32(num_samples));
+    let norm_re = re / sqrt(f32(adaptive_samples));
+    let norm_im = im / sqrt(f32(adaptive_samples));
     
     // Write out normalized complex values
     spectrum[ch_idx * NUM_BINS + bin_idx] = vec2<f32>(norm_re, norm_im);

@@ -1,40 +1,8 @@
-struct VertexOutput {
-    @builtin(position) clip_position: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-};
-
-@vertex
-fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
-    var out: VertexOutput;
-    let u = f32((in_vertex_index << 1u) & 2u);
-    let v = f32(in_vertex_index & 2u);
-    out.clip_position = vec4<f32>(u * 2.0 - 1.0, -(v * 2.0 - 1.0), 0.0, 1.0);
-    out.uv = vec2<f32>(u, v);
-    return out;
-}
-
-struct AudioUniforms {
-    spectrum: array<vec4<f32>, 256>,
-    fire_heat: array<vec4<f32>, 256>,
-    channels: array<vec4<f32>, 8>,
-    channel_peaks: array<vec4<f32>, 8>,
-    spatial_channels: array<vec4<f32>, 4>,
-    display_order: array<vec4<u32>, 4>,
-    num_channels: u32,
-    mode: u32,
-    time: f32,
-    duration: f32,
-    smooth_time: f32,
-    heatmap_row: u32,
-    fft_channels: u32,
-    num_spatial_channels: u32,
-    ui_meters_rect: vec4<f32>,
-    ui_heatmap_rect: vec4<f32>,
-    ui_fire_rect: vec4<f32>,
-};
+// INCLUDE: common
 
 @group(0) @binding(0)
 var<uniform> audio: AudioUniforms;
+
 
 fn rotate2d(v: vec2<f32>, a: f32) -> vec2<f32> {
     let c = cos(a);
@@ -63,40 +31,7 @@ fn project_3d(p3: vec3<f32>, ro: vec3<f32>, cu: vec3<f32>, cv: vec3<f32>, cw: ve
     return vec3<f32>(proj_x, -proj_y, dist_w);
 }
 
-// --- 3x5 bitmap font for debug labels ---
-fn glyph_bitmap(ch: u32) -> u32 {
-    // 3x5 pixel font. 15 bits per glyph, MSB = top-left.
-    // Index: 0-9=digits, 10=L, 11=R, 12=C, 13=S, 14=F, 15=E, 16=space
-    switch ch {
-        case 0u  { return 31599u; } // 0
-        case 1u  { return 11415u; } // 1
-        case 2u  { return 29671u; } // 2
-        case 3u  { return 29647u; } // 3
-        case 4u  { return 23497u; } // 4
-        case 5u  { return 31183u; } // 5
-        case 6u  { return 31215u; } // 6
-        case 7u  { return 29330u; } // 7
-        case 8u  { return 31727u; } // 8
-        case 9u  { return 31695u; } // 9
-        case 10u { return 18727u; } // L: #.. #.. #.. #.. ###
-        case 11u { return 31733u; } // R: ### #.# ### ##. #.#
-        case 12u { return 31015u; } // C: ### #.. #.. #.. ###
-        case 13u { return 31183u; } // S (same as 5)
-        case 14u { return 31204u; } // F: ### #.. ### #.. #..
-        case 15u { return 31207u; } // E: ### #.. ### #.. ###
-        case 16u { return 29842u; } // T: ### .#. .#. .#. .#.
-        default  { return 0u; }     // space
-    }
-}
-
-fn draw_label_char(ch: u32, frag: vec2<f32>, origin: vec2<f32>, px: f32) -> f32 {
-    let local = frag - origin;
-    if local.x < 0.0 || local.x >= px * 3.0 || local.y < 0.0 || local.y >= px * 5.0 { return 0.0; }
-    let col = u32(floor(local.x / px));
-    let row = u32(floor(local.y / px));
-    let bit = (4u - row) * 3u + (2u - col);
-    return f32((glyph_bitmap(ch) >> bit) & 1u);
-}
+// INCLUDE: glyph_font
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {

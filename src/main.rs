@@ -506,8 +506,8 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                             state.song_title = path.clone();
                             active_stream = Some(stream);
                         } else {
-                            app_state.lock().unwrap().file_loaded = false;
                             let mut state = app_state.lock().unwrap();
+                            state.file_loaded = false;
                             state.artist = "Load Failed".to_string();
                         }
                     }
@@ -1135,14 +1135,14 @@ where std::io::Error: From<<B as Backend>::Error>
                         let target = (state.current_seconds + 5.0).min(state.duration_seconds);
                         state.seek_request = Some(target);
                         state.spectrum_history.clear();
-                        for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 128]); }
+                        for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
                     }
                     KeyCode::Left => {
                         let mut state = app_state.lock().unwrap();
                         let target = (state.current_seconds - 5.0).max(0.0);
                         state.seek_request = Some(target);
                         state.spectrum_history.clear();
-                        for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 128]); }
+                        for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
                     }
                     _ => {}
                 }

@@ -13,43 +13,11 @@ const HDR_WHITE: f32 = 5.0;         // Blown-out white that tonemaps to ~1.0
 const SPEC_POWER: f32 = 24.0;
 const MAX_MARCH_DIST: f32 = 30.0;
 
-struct VertexOutput {
-    @builtin(position) clip_position: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-};
-
-@vertex
-fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
-    var out: VertexOutput;
-    let u = f32((in_vertex_index << 1u) & 2u);
-    let v = f32(in_vertex_index & 2u);
-    out.clip_position = vec4<f32>(u * 2.0 - 1.0, -(v * 2.0 - 1.0), 0.0, 1.0);
-    out.uv = vec2<f32>(u, v);
-    return out;
-}
-
-struct AudioUniforms {
-    spectrum: array<vec4<f32>, 256>,
-    fire_heat: array<vec4<f32>, 256>,
-    channels: array<vec4<f32>, 8>,
-    channel_peaks: array<vec4<f32>, 8>,
-    spatial_channels: array<vec4<f32>, 4>,
-    display_order: array<vec4<u32>, 4>,
-    num_channels: u32,
-    mode: u32,
-    time: f32,
-    duration: f32,
-    smooth_time: f32,
-    heatmap_row: u32,
-    fft_channels: u32,
-    num_spatial_channels: u32,
-    ui_meters_rect: vec4<f32>,
-    ui_heatmap_rect: vec4<f32>,
-    ui_fire_rect: vec4<f32>,
-};
+// INCLUDE: common
 
 @group(0) @binding(0)
 var<uniform> audio: AudioUniforms;
+
 
 // --- Utility Functions ---
 
@@ -184,49 +152,31 @@ struct MapData {
 }
 
 fn map(p: vec3<f32>) -> MapData {
+    // Delegate to the canonical SDF — single source of truth for the distance field.
+    let d = map_dist(p);
+
+    // Glow computation (cosmetic only — uses channel alignment but does NOT
+    // affect the SDF value, so the distance can never diverge from map_dist).
     let dist_xz = length(p.xz);
-
-    // Base infinite plane thickness
-    var fluid_h = 0.0;
-    var glow = vec3<f32>(0.0);
-
-    let num_ch = min(audio.num_channels, 12u);
-    var total_displacement = 0.0;
-
     let p_xz_norm = p.xz / max(dist_xz, 0.0001);
+    let num_ch = min(audio.num_channels, 12u);
+    var glow = vec3<f32>(0.0);
 
     for (var i = 0u; i < num_ch; i++) {
         let vu = clamp(get_vu(i), 0.0, 1.0);
-
         var alignment = 1.0;
         var spike_pos_r = 1.5;
-
-        if i == 3u {
-            alignment = 1.0;
-            spike_pos_r = 0.0;
-        } else {
+        if i == 3u { alignment = 1.0; spike_pos_r = 0.0; }
+        else {
             let dir2d = normalize(get_speaker_dir(i).xz);
             alignment = max(0.0, dot(p_xz_norm, dir2d));
-            spike_pos_r = 1.5;
         }
-        
-        // Removed the continue statement here because skipping smax introduces radial tears.
-
         let dist_to_spike = abs(dist_xz - spike_pos_r);
         let spatial_falloff = exp(-dist_to_spike * 3.0);
-
         var lobe = pow(alignment, 8.0) * vu * 1.5 * spatial_falloff;
-        
-        // Attenuate directional lobes at the center to prevent radial crease artifacts
-        if i != 3u {
-            lobe *= smoothstep(0.1, 0.5, dist_xz);
-        }
-        
-        total_displacement = smax(total_displacement, lobe, 0.3);
+        if i != 3u { lobe *= smoothstep(0.1, 0.5, dist_xz); }
 
-        // Inner glow for active spikes
         if lobe > 0.1 {
-            // Warm tones for front channels, cool for surround, red for LFE
             var ch_color = vec3<f32>(0.2, 0.6, 1.0);
             if i < 3u { ch_color = vec3<f32>(1.0, 0.4, 0.1); }
             if i == 3u { ch_color = vec3<f32>(1.0, 0.1, 0.2); }
@@ -234,19 +184,7 @@ fn map(p: vec3<f32>) -> MapData {
         }
     }
 
-    // Subtle ripples from spectrum bass
-    let bass = clamp(audio.spectrum[0].x + audio.spectrum[1].x, 0.0, 2.0);
-    let ripple = sin(dist_xz * 12.0 - audio.time * 8.0) * 0.015 * bass * smoothstep(PUDDLE_RADIUS, 0.0, dist_xz);
-
-    // Organic surface perturbation (smooth magnetic domain noise)
-    let noise_p = p * 4.0 + vec3<f32>(audio.time * 0.5, 0.0, audio.time * 0.3);
-    let surface_noise = (hash3_smooth(noise_p) - 0.5) * 0.05;
-
-    fluid_h += total_displacement + ripple + surface_noise;
-
-    let d = p.y + 0.5 - fluid_h;
-
-    return MapData(d * STEP_SCALE, 1, glow);
+    return MapData(d, 1, glow);
 }
 
 // 4-sample tetrahedron normal

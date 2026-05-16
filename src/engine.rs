@@ -127,7 +127,7 @@ pub struct VideoParams {
     pub color_space: u32,
     pub color_range: u32,
     pub bit_depth: u32,
-    pub _pad: u32,
+    pub color_trc: u32,
     pub viewport_width: f32,
     pub viewport_height: f32,
     pub video_width: f32,
@@ -145,6 +145,7 @@ pub struct VideoState {
     pub color_space: u32,
     pub color_range: u32,
     pub bit_depth: u32,
+    pub color_trc: u32,
 }
 
 pub struct VulkanEngine<'a> {
@@ -440,6 +441,17 @@ impl<'a> VulkanEngine<'a> {
             immediate_size: 0,
         });
 
+        // Shared shader headers — included at compile time, resolved via simple string replacement.
+        // This is the single source of truth for AudioUniforms layout and glyph font.
+        const SHADER_COMMON: &str = include_str!("shaders/_common.wgsl");
+        const SHADER_GLYPH_FONT: &str = include_str!("shaders/_glyph_font.wgsl");
+
+        let resolve_shader_includes = |source: &str| -> String {
+            source
+                .replace("// INCLUDE: common", SHADER_COMMON)
+                .replace("// INCLUDE: glyph_font", SHADER_GLYPH_FONT)
+        };
+
         let get_shader_source = |id: u32| -> &'static str {
             match id {
                 0 => include_str!("shaders/vis_spectrum.wgsl"),
@@ -457,14 +469,14 @@ impl<'a> VulkanEngine<'a> {
             }
         };
 
-        let shader_sources: Vec<&'static str> = crate::state::VISUALIZERS.iter().map(|v| get_shader_source(v.id)).collect();
+        let shader_sources: Vec<String> = crate::state::VISUALIZERS.iter().map(|v| resolve_shader_includes(get_shader_source(v.id))).collect();
 
         let mut render_pipelines = Vec::new();
         
         let scope_fallback = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let fallback_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Fallback Shader"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(shader_sources[0])),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&shader_sources[0])),
         });
         
         let fallback_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -511,7 +523,7 @@ impl<'a> VulkanEngine<'a> {
             
             let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some(&format!("Shader {}", i)),
-                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(source)),
+                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(source.as_str())),
             });
             
             let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -657,7 +669,11 @@ impl<'a> VulkanEngine<'a> {
             cache: None,
         });
 
-        let hud_shader = device.create_shader_module(wgpu::include_wgsl!("shaders/hud.wgsl"));
+        let hud_source = resolve_shader_includes(include_str!("shaders/hud.wgsl"));
+        let hud_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("HUD Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&hud_source)),
+        });
         let hud_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("HUD Pipeline"),
             layout: Some(&render_pipeline_layout),
@@ -740,7 +756,11 @@ impl<'a> VulkanEngine<'a> {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&history_view) },
             ],
         });
-        let heatmap_compute_shader = device.create_shader_module(wgpu::include_wgsl!("shaders/heatmap_compute.wgsl"));
+        let heatmap_source = resolve_shader_includes(include_str!("shaders/heatmap_compute.wgsl"));
+        let heatmap_compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Heatmap Compute Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&heatmap_source)),
+        });
         let heatmap_compute_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("heatmap_compute_layout"), bind_group_layouts: &[Some(&heatmap_compute_layout)], immediate_size: 0,
         });
@@ -826,7 +846,11 @@ impl<'a> VulkanEngine<'a> {
             ],
         });
 
-        let ferrofluidsim_compute_shader = device.create_shader_module(wgpu::include_wgsl!("shaders/ferrofluidsim_compute.wgsl"));
+        let ferrofluidsim_source = resolve_shader_includes(include_str!("shaders/ferrofluidsim_compute.wgsl"));
+        let ferrofluidsim_compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Ferrofluid Sim Compute Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&ferrofluidsim_source)),
+        });
         let ferrofluidsim_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("ferrofluidsim_layout"), bind_group_layouts: &[Some(&ferrofluidsim_compute_layout)], immediate_size: 0,
         });
@@ -1281,11 +1305,13 @@ impl<'a> VulkanEngine<'a> {
                         color_space: frame.color_space,
                         color_range: frame.color_range,
                         bit_depth: frame.bit_depth as u32,
+                        color_trc: frame.color_trc,
                     });
                 } else if let Some(vs) = &mut self.video_state {
                     vs.color_space = frame.color_space;
                     vs.color_range = frame.color_range;
                     vs.bit_depth = frame.bit_depth as u32;
+                    vs.color_trc = frame.color_trc;
                 }
                 
                 if let Some(vs) = &self.video_state {
@@ -1312,7 +1338,7 @@ impl<'a> VulkanEngine<'a> {
                         color_space: frame.color_space,
                         color_range: frame.color_range,
                         bit_depth: frame.bit_depth as u32,
-                        _pad: 0,
+                        color_trc: frame.color_trc,
                         viewport_width: 1920.0,
                         viewport_height: 1080.0,
                         video_width: frame.width as f32,
@@ -2808,7 +2834,7 @@ impl<'a> VulkanEngine<'a> {
                         color_space: vs.color_space,
                         color_range: vs.color_range,
                         bit_depth: vs.bit_depth,
-                        _pad: 0,
+                        color_trc: vs.color_trc,
                         viewport_width: v_vp_w,
                         viewport_height: v_vp_h,
                         video_width: vs.width as f32,

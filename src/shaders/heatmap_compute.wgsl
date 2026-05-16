@@ -1,22 +1,4 @@
-struct AudioUniforms {
-    spectrum: array<vec4<f32>, 256>,
-    fire_heat: array<vec4<f32>, 256>,
-    channels: array<vec4<f32>, 8>,
-    channel_peaks: array<vec4<f32>, 8>,
-    spatial_channels: array<vec4<f32>, 4>,
-    display_order: array<vec4<u32>, 4>,
-    num_channels: u32,
-    mode: u32,
-    time: f32,
-    duration: f32,
-    smooth_time: f32,
-    heatmap_row: u32,
-    fft_channels: u32,
-    num_spatial_channels: u32,
-    ui_meters_rect: vec4<f32>,
-    ui_heatmap_rect: vec4<f32>,
-    ui_fire_rect: vec4<f32>,
-};
+// INCLUDE: common
 
 @group(0) @binding(0) var<uniform> uniforms: AudioUniforms;
 @group(0) @binding(1) var heatmap_tex: texture_storage_2d<r32float, write>;

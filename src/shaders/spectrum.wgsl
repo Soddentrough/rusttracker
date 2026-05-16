@@ -1,43 +1,10 @@
-struct VertexOutput {
-    @builtin(position) clip_position: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-};
-
-@vertex
-fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
-    var out: VertexOutput;
-    let u = f32((in_vertex_index << 1u) & 2u);
-    let v = f32(in_vertex_index & 2u);
-    out.clip_position = vec4<f32>(u * 2.0 - 1.0, -(v * 2.0 - 1.0), 0.0, 1.0);
-    out.uv = vec2<f32>(u, v);
-    return out;
-}
-
-struct AudioUniforms {
-    spectrum: array<vec4<f32>, 256>,
-    fire_heat: array<vec4<f32>, 256>,
-    channels: array<vec4<f32>, 8>,
-    channel_peaks: array<vec4<f32>, 8>,
-    spatial_channels: array<vec4<f32>, 4>,
-    display_order: array<vec4<u32>, 4>,
-    num_channels: u32,
-    mode: u32,
-    time: f32,
-    duration: f32,
-    smooth_time: f32,
-    heatmap_row: u32,
-    fft_channels: u32,
-    num_spatial_channels: u32,
-    ui_meters_rect: vec4<f32>,
-    ui_heatmap_rect: vec4<f32>,
-    ui_fire_rect: vec4<f32>,
-};
+// INCLUDE: common
 
 @group(0) @binding(0)
 var<uniform> audio: AudioUniforms;
 
 @group(0) @binding(1)
-var<storage, read> waveform_history: array<vec4<f32>>;
+var<storage, read> waveform_history: array<f32>;
 
 fn val_to_color(val: f32) -> vec3<f32> {
     let v = clamp(val, 0.0, 100.0);
@@ -114,14 +81,7 @@ fn get_fire_heat(x: f32) -> f32 {
 
 fn get_waveform_raw(hist_idx: u32, idx: u32) -> f32 {
     let clamped_idx = clamp(idx, 0u, 511u);
-    let vec_idx = clamped_idx / 4u;
-    let component_idx = clamped_idx % 4u;
-    
-    let spec_vec = waveform_history[hist_idx * 128u + vec_idx];
-    if component_idx == 0u { return spec_vec.x; }
-    else if component_idx == 1u { return spec_vec.y; }
-    else if component_idx == 2u { return spec_vec.z; }
-    else { return spec_vec.w; }
+    return waveform_history[hist_idx * 2048u + clamped_idx];
 }
 
 fn get_waveform_interpolated(hist_idx: u32, x: f32) -> f32 {

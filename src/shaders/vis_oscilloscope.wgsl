@@ -1,44 +1,8 @@
-struct VertexOutput {
-    @builtin(position) clip_position: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-};
-
-@vertex
-fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
-    var out: VertexOutput;
-    let u = f32((in_vertex_index << 1u) & 2u);
-    let v = f32(in_vertex_index & 2u);
-    out.clip_position = vec4<f32>(u * 2.0 - 1.0, -(v * 2.0 - 1.0), 0.0, 1.0);
-    out.uv = vec2<f32>(u, v);
-    return out;
-}
-
-struct AudioUniforms {
-    spectrum: array<vec4<f32>, 256>,
-    fire_heat: array<vec4<f32>, 256>,
-    channels: array<vec4<f32>, 8>,
-    channel_peaks: array<vec4<f32>, 8>,
-    spatial_channels: array<vec4<f32>, 4>,
-    display_order: array<vec4<u32>, 4>,
-    num_channels: u32,
-    mode: u32,
-    time: f32,
-    duration: f32,
-    smooth_time: f32,
-    heatmap_row: u32,
-    fft_channels: u32,
-    num_spatial_channels: u32,
-    ui_meters_rect: vec4<f32>,
-    ui_heatmap_rect: vec4<f32>,
-    ui_fire_rect: vec4<f32>,
-    waveform_resolution: u32,
-    waveform_history_size: u32,
-    _pad0: u32,
-    _pad1: u32,
-};
+// INCLUDE: common
 
 @group(0) @binding(0)
 var<uniform> audio: AudioUniforms;
+
 
 @group(0) @binding(1)
 var<storage, read> waveform_history: array<f32>;
@@ -130,14 +94,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     var wave_intensity = 0.0;
 
-    // Accumulate up to 144 history frames
+    // Performance: skip every other history frame when count exceeds 72,
+    // compensating with doubled contribution to maintain total brightness.
     let hist_count = min(audio.waveform_history_size, 144u);
-    // Optimization: If performance drops, we could add a uniform to step > 1
-    // For now, we process all available frames to ensure the 1-second trail.
-    
-    // Only process the most recent ~30 frames heavily, and fade the rest quickly to save GPU
-    // Or just process them all:
-    for (var i = 0u; i < hist_count; i = i + 1u) {
+    let step = select(1u, 2u, hist_count > 72u);
+    let step_scale = f32(step);
+
+    for (var i = 0u; i < hist_count; i = i + step) {
         let true_dist = get_wave_dist(i, final_uv, aspect);
 
         // Exponential phosphor decay (frame 0 is oldest = most faded)
@@ -156,7 +119,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Tighter halation (faster falloff)
         let halation = exp(-true_dist * 80.0) * 0.015;
 
-        let frame_intensity = (core + bloom + halation) * age;
+        let frame_intensity = (core + bloom + halation) * age * step_scale;
 
         wave_intensity = wave_intensity + frame_intensity;
     }

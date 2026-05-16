@@ -19,44 +19,13 @@ var<private> g_flare_loop_height: array<f32, 12>;
 var<private> g_flare_loop_thick: array<f32, 12>;
 var<private> g_flare_ex1: array<f32, 12>;
 var<private> g_flare_ex2: array<f32, 12>;
+var<private> g_last_flare_dist: f32;
 
-struct VertexOutput {
-    @builtin(position) clip_position: vec4<f32>,
-    @location(0) uv: vec2<f32>,
-};
-
-@vertex
-fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
-    var out: VertexOutput;
-    let u = f32((in_vertex_index << 1u) & 2u);
-    let v = f32(in_vertex_index & 2u);
-    out.clip_position = vec4<f32>(u * 2.0 - 1.0, -(v * 2.0 - 1.0), 0.0, 1.0);
-    out.uv = vec2<f32>(u, v);
-    return out;
-}
-
-struct AudioUniforms {
-    spectrum: array<vec4<f32>, 256>,
-    fire_heat: array<vec4<f32>, 256>,
-    channels: array<vec4<f32>, 8>,
-    channel_peaks: array<vec4<f32>, 8>,
-    spatial_channels: array<vec4<f32>, 4>,
-    display_order: array<vec4<u32>, 4>,
-    num_channels: u32,
-    mode: u32,
-    time: f32,
-    duration: f32,
-    smooth_time: f32,
-    heatmap_row: u32,
-    fft_channels: u32,
-    num_spatial_channels: u32,
-    ui_meters_rect: vec4<f32>,
-    ui_heatmap_rect: vec4<f32>,
-    ui_fire_rect: vec4<f32>,
-};
+// INCLUDE: common
 
 @group(0) @binding(0)
 var<uniform> audio: AudioUniforms;
+
 
 fn hash(n: f32) -> f32 { return fract(sin(n) * 43758.5453123); }
 
@@ -198,6 +167,7 @@ fn map(p: vec3<f32>, full_detail: bool) -> f32 {
     }
     
     let flare_d = get_flare_dist(p, full_detail);
+    g_last_flare_dist = flare_d;
     
     return smin(d_sphere, flare_d, 0.04);
 }
@@ -268,7 +238,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if hit {
         let n = calcNormal(final_p);
         let r = length(final_p);
-        let f_dist = get_flare_dist(final_p, true);
+        let f_dist = g_last_flare_dist;
         
         // Base surface colors to match reference
         let dark_red = vec3<f32>(0.3, 0.02, 0.0);
