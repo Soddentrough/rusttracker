@@ -111,7 +111,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             var x_prev = -9.6 + f32(j_u) / (res - 1.0) * 19.2;
             var mask_prev = smoothstep(9.6, 6.6, abs(x_prev));
             var v_prev = get_waveform(hist_idx, j_u);
-            var p_prev = abs(v_prev) * mask_prev * 6.0;
+            var p_prev = v_prev * mask_prev * 1.2;
             var p3_prev = vec3<f32>(x_prev, y_line, p_prev);
             var proj_prev = project_3d(p3_prev, ro, u, v_cam, w);
             
@@ -120,7 +120,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 let x_curr = -9.6 + f32(j_u) / (res - 1.0) * 19.2;
                 let mask_curr = smoothstep(9.6, 6.6, abs(x_curr));
                 let v_curr = get_waveform(hist_idx, j_u);
-                let p_curr = abs(v_curr) * mask_curr * 6.0;
+                let p_curr = v_curr * mask_curr * 1.2;
                 let p3_curr = vec3<f32>(x_curr, y_line, p_curr);
                 let proj_curr = project_3d(p3_curr, ro, u, v_cam, w);
                 

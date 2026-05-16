@@ -114,7 +114,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             }
         }
 
-        let coal_target = min(params.bass * 0.25 + activity * 2.5, 1.0);
+        // Use exponential soft-clipping for AGC (Automatic Gain Control)
+        // This ensures quiet tracks still generate nice flames, while brickwalled tracks smoothly approach 1.0 without hard clipping.
+        let coal_target = 1.0 - exp(-(params.bass * 0.5 + activity * 3.0));
         let current = coal_bed[x];
         if (coal_target > current) {
             coal_bed[x] = current + (coal_target - current) * 0.18;
@@ -122,7 +124,8 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             coal_bed[x] = current + (coal_target - current) * 0.008;
         }
         
-        let jitter = (perlin_noise(vec2<f32>(f32(x) * 0.5, params.time * 10.0)) + 1.0) * 0.5;
+        // Use lower frequency noise to create wide, organic hotspots rather than single-pixel static
+        let jitter = (perlin_noise(vec2<f32>(f32(x) * 0.05, params.time * 10.0)) + 1.0) * 0.5;
         output_grid[idx] = min(coal_bed[x] * (0.7 + 0.3 * jitter), 1.0);
         return;
     }
@@ -130,7 +133,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     // === Hearth rows: inject coal heat ===
     if (y >= bottom - 2u) {
         let coal_heat = min(coal_bed[x], 1.0);
-        let jitter = (perlin_noise(vec2<f32>(f32(x) * 0.5, params.time * 10.0)) + 1.0) * 0.5;
+        let jitter = (perlin_noise(vec2<f32>(f32(x) * 0.05, params.time * 10.0)) + 1.0) * 0.5;
         
         if (y == bottom - 1u) {
             output_grid[idx] = coal_heat * (0.85 + 0.15 * jitter);
@@ -152,16 +155,31 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     // Global wind swaying the fire
     let wind = i32(sin(params.time * 1.5 + f32(x) * 0.003) * params.highs * 2.0);
     
-    // Cellular Automaton: read from exactly one pixel in the row below
+    // Classic DOS fire averaging: blend adjacent pixels to allow heat to diffuse into organic shapes
     let src_x = clamp(i32(x) + spread + wind, 0i, i32(w) - 1);
-    let heat = input_grid[(y + 1u) * w + u32(src_x)];
+    let xl = max(src_x - 1, 0i);
+    let xr = min(src_x + 1, i32(w) - 1);
+    
+    let h1 = input_grid[(y + 1u) * w + u32(xl)];
+    let h2 = input_grid[(y + 1u) * w + u32(src_x)];
+    let h3 = input_grid[(y + 1u) * w + u32(xr)];
+    
+    // Weighted horizontal blur favors the center pixel
+    let heat = (h1 + h2 * 2.0 + h3) / 4.0;
 
     // Cooling varies spatially to create uneven tips and licks
-    let cool_noise = perlin_noise(p1 * 3.0 - vec2<f32>(params.time * 2.0, 0.0));
-    let base_cooling = 0.001 + (cool_noise + 1.0) * 0.0008;
+    // Stretch the noise vertically and move it upwards to simulate rising flame tongues
+    let p_cool = vec2<f32>(f32(x) * 0.015, f32(y) * 0.03);
+    let cool_noise = perlin_noise(p_cool + vec2<f32>(0.0, params.time * 6.0));
+    
+    // Higher variance in cooling forces the flame to tear into distinct licks
+    let base_cooling = 0.0015 + (cool_noise + 1.0) * 0.0015;
     
     // Occasional sparks (holes in the flame) for realism, clumped by noise
     let spark = select(0.0, 0.06, cool_noise > 0.8 && y > 100u);
 
-    output_grid[idx] = max(heat - base_cooling * params.cooling_factor - spark, 0.0);
+    // Normalize the cooling factor so heavily compressed tracks don't turn off cooling entirely
+    let dynamic_cooling = mix(0.6, 1.0, params.cooling_factor);
+
+    output_grid[idx] = max(heat - base_cooling * dynamic_cooling - spark, 0.0);
 }

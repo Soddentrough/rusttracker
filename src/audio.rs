@@ -1780,12 +1780,14 @@ where
             for i in 0..frames_read {
                 let l_val = chunk.samples[i * hardware_channels];
                 left_peak = left_peak.max(l_val.abs());
-                if l_val.abs() >= 1.0 { clips += 1; }
+                // Use a small epsilon above 1.0 to prevent 0dBFS peaks in losslessly 
+                // mastered tracks from falsely triggering clipping events
+                if l_val.abs() > 1.0001 { clips += 1; }
                 
                 if hardware_channels > 1 {
                     let r_val = chunk.samples[i * hardware_channels + 1];
                     right_peak = right_peak.max(r_val.abs());
-                    if r_val.abs() >= 1.0 { clips += 1; }
+                    if r_val.abs() > 1.0001 { clips += 1; }
                 } else {
                     right_peak = left_peak;
                 }

@@ -47,8 +47,10 @@ fn get_wave_dist(hist_idx: u32, uv: vec2<f32>, aspect: f32) -> f32 {
     var min_dist = 1000.0;
 
     // Check local neighborhood for proper line segment coverage
-    let start_idx = max(0i, i32(idx) - 1);
-    let end_idx = min(i32(res) - 2i, i32(idx) + 1);
+    // Since lines are thin, a small search radius is sufficient to prevent horizontal clipping
+    let search_radius = clamp(i32(res * 0.003), 2, 8);
+    let start_idx = max(0i, i32(idx) - search_radius);
+    let end_idx = min(i32(res) - 2i, i32(idx) + search_radius);
 
     let p = vec2<f32>(uv.x * aspect, uv.y);
 
@@ -109,15 +111,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // 0.05 gives a long 1-second smooth trail.
         let age = exp(-frames_old * 0.06);
 
-        // Beam thickness scales down with dynamic resolution to prevent huge blobs
-        let thickness = 0.002 + edge_blur * 0.006;
-        let core = smoothstep(thickness, 0.0, true_dist) * 0.4;
+        // Much thinner beam for crisp, high-resolution lines instead of thick noodles
+        let thickness = 0.0005 + edge_blur * 0.0015;
+        let core = smoothstep(thickness, 0.0, true_dist) * 0.6;
 
         // Tighter bloom (reduced spread and intensity)
-        let bloom = 0.0002 / (true_dist * true_dist + 0.001) * 0.03;
+        let bloom = 0.00005 / (true_dist * true_dist + 0.0002) * 0.02;
 
         // Tighter halation (faster falloff)
-        let halation = exp(-true_dist * 80.0) * 0.015;
+        let halation = exp(-true_dist * 120.0) * 0.01;
 
         let frame_intensity = (core + bloom + halation) * age * step_scale;
 

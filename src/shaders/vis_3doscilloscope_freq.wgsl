@@ -114,8 +114,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 let v1 = get_resynthesized_wave(i, x_norm1);
                 
                 // Allow true negative waveforms, just apply mask
-                let p0 = v0 * mask0 * 4.0;
-                let p1 = v1 * mask1 * 4.0;
+                let p0 = v0 * mask0 * 1.2;
+                let p1 = v1 * mask1 * 1.2;
                 
                 let p3_0 = vec3<f32>(x0, y_line, p0);
                 let p3_1 = vec3<f32>(x1, y_line, p1);
