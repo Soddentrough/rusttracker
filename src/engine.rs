@@ -2162,8 +2162,8 @@ impl<'a> VulkanEngine<'a> {
                                 }
                             }
                             
-                            // 3. Sliced Chrome Gradient Interior
-                            let steps = 20;
+                            // 3. Sliced Chrome Scrolling Palette Interior
+                            let steps = 40; // More steps for cooler copper bar effect
                             let top_y = title_rect.center().y - gradient_extent;
                             let bottom_y = title_rect.center().y + gradient_extent;
                             let height = bottom_y - top_y;
@@ -2179,19 +2179,24 @@ impl<'a> VulkanEngine<'a> {
                                     egui::pos2(title_rect.right(), max_y),
                                 );
                                 
-                                let color = if t < 0.48 {
+                                // Palette cycling calculation
+                                let scroll_speed = 0.1;
+                                let mut color_t = (t + time * scroll_speed).fract();
+                                if color_t < 0.0 { color_t += 1.0; }
+                                
+                                let color = if color_t < 0.48 {
                                     // Sky: Cyan to Dark Blue
-                                    let sky_t = t / 0.48;
+                                    let sky_t = color_t / 0.48;
                                     let r = (0.0 * (1.0 - sky_t) + 10.0 * sky_t) as u8;
                                     let g = (220.0 * (1.0 - sky_t) + 30.0 * sky_t) as u8;
                                     let b = (255.0 * (1.0 - sky_t) + 120.0 * sky_t) as u8;
                                     egui::Color32::from_rgb(r, g, b)
-                                } else if t < 0.52 {
+                                } else if color_t < 0.52 {
                                     // Chrome Horizon Reflection
                                     egui::Color32::WHITE
                                 } else {
                                     // Ground Reflection: Dark Brown to Orange/Tan
-                                    let ground_t = (t - 0.52) / 0.48;
+                                    let ground_t = (color_t - 0.52) / 0.48;
                                     let r = (50.0 * (1.0 - ground_t) + 255.0 * ground_t) as u8;
                                     let g = (15.0 * (1.0 - ground_t) + 160.0 * ground_t) as u8;
                                     let b = (0.0 * (1.0 - ground_t) + 50.0 * ground_t) as u8;

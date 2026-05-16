@@ -182,6 +182,17 @@ impl AppState {
             .map(|s| s.trim().to_lowercase().contains("valve"))
             .unwrap_or(false);
 
+        let mut vis_enabled = vec![true; VISUALIZERS.len()];
+        if is_steam_deck {
+            vis_enabled[1] = false; // CRT Oscilloscope
+            vis_enabled[2] = false; // 3D CRT Oscilloscope
+            vis_enabled[3] = false; // 3D Freq Oscilloscope
+            vis_enabled[6] = false; // Solar Flare
+            vis_enabled[8] = false; // Chrome Ferrofluid
+            vis_enabled[9] = false; // Ferrofluid Particle Sim
+            vis_enabled[10] = false; // Neon Corridor
+        }
+
         AppState {
             passthrough_enabled: true,
             file_loaded: false,
@@ -248,7 +259,7 @@ impl AppState {
             has_gamepad: is_steam_deck,
             show_vis_picker: false,
             vis_picker_cursor: 0,
-            vis_enabled: vec![true; VISUALIZERS.len()],
+            vis_enabled,
             osd_text: None,
             osd_timer: 0.0,
             cumulative_scrub: 0.0,
