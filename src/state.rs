@@ -161,6 +161,9 @@ pub struct AppState {
     pub show_vis_picker: bool,
     pub vis_picker_cursor: usize,
     pub vis_enabled: Vec<bool>,
+    pub osd_text: Option<String>,
+    pub osd_timer: f32,
+    pub cumulative_scrub: f64,
 }
 
 impl AppState {
@@ -246,6 +249,9 @@ impl AppState {
             show_vis_picker: false,
             vis_picker_cursor: 0,
             vis_enabled: vec![true; VISUALIZERS.len()],
+            osd_text: None,
+            osd_timer: 0.0,
+            cumulative_scrub: 0.0,
         }
     }
     
@@ -326,6 +332,9 @@ impl AppState {
             show_vis_picker: self.show_vis_picker,
             vis_picker_cursor: self.vis_picker_cursor,
             vis_enabled: self.vis_enabled.clone(),
+            osd_text: self.osd_text.clone(),
+            osd_timer: self.osd_timer,
+            cumulative_scrub: self.cumulative_scrub,
         }
     }
 }

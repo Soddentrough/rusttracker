@@ -260,35 +260,34 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                     if kb_event.state == ElementState::Pressed {
                         if let PhysicalKey::Code(keycode) = kb_event.physical_key {
                             match keycode {
-                                WinitKeyCode::ArrowRight => {
+                                WinitKeyCode::ArrowRight | WinitKeyCode::ArrowLeft | WinitKeyCode::Comma | WinitKeyCode::Period => {
                                     let mut state = app_state.lock().unwrap();
-                                    if modifiers.control_key() {
-                                        if !kb_event.repeat {
-                                            state.track_ended = true;
-                                        }
-                                    } else {
-                                        let target = state.current_seconds + 5.0;
-                                        state.seek_request = Some(target);
-                                        state.spectrum_history.clear();
-                                        for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
+                                    let duration = state.duration_seconds.max(0.1);
+                                    let mut delta = 0.0;
+                                    match keycode {
+                                        WinitKeyCode::ArrowRight => {
+                                            delta = if modifiers.control_key() { duration * 0.01 } else { duration * 0.001 };
+                                        },
+                                        WinitKeyCode::ArrowLeft => {
+                                            delta = if modifiers.control_key() { -(duration * 0.01) } else { -(duration * 0.001) };
+                                        },
+                                        WinitKeyCode::Comma => delta = -1.0 / 60.0, // ~1 frame at 60fps
+                                        WinitKeyCode::Period => delta = 1.0 / 60.0,
+                                        _ => {}
                                     }
-                                },
-                                WinitKeyCode::ArrowLeft => {
-                                    let mut state = app_state.lock().unwrap();
-                                    if modifiers.control_key() {
-                                        if !kb_event.repeat {
-                                            if state.playlist_index > 0 {
-                                                state.playlist_index -= 1;
-                                                state.load_request = Some(state.playlist[state.playlist_index].clone());
-                                                state.track_ended = false;
-                                            }
-                                        }
+                                    
+                                    let target = (state.current_seconds + delta).clamp(0.0, state.duration_seconds);
+                                    state.seek_request = Some(target);
+                                    state.spectrum_history.clear();
+                                    for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
+                                    
+                                    let sign = if delta >= 0.0 { "+" } else { "" };
+                                    if delta.abs() < 0.1 {
+                                        state.osd_text = Some(format!("{}1 Frame", if delta > 0.0 { "+" } else { "-" }));
                                     } else {
-                                        let target = (state.current_seconds - 5.0).max(0.0);
-                                        state.seek_request = Some(target);
-                                        state.spectrum_history.clear();
-                                        for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
+                                        state.osd_text = Some(format!("{}{:.2}s", sign, delta));
                                     }
+                                    state.osd_timer = 2.0;
                                 },
                                 _ => {
                                     if !kb_event.repeat {
@@ -604,12 +603,35 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                             }
                         }
 
-                        // Gamepad analog panel scaling (Stage 2)
+                        // Gamepad analog panel scaling and scrubbing
                         for (_id, gamepad) in gilrs.gamepads() {
                             let right_y = gamepad.value(gilrs::Axis::RightStickY);
                             if right_y.abs() > 0.1 {
                                 let scaled_delta = right_y * dt * 1.0; // Subtract moving UP (positive Y stick)
                                 state.panel_split_ratio = (state.panel_split_ratio - scaled_delta).clamp(0.15, 0.85);
+                            }
+                            
+                            // Analog trigger scrubbing
+                            let lt = gamepad.button_data(gilrs::Button::LeftTrigger2).map(|d| d.value()).unwrap_or(0.0);
+                            let rt = gamepad.button_data(gilrs::Button::RightTrigger2).map(|d| d.value()).unwrap_or(0.0);
+                            let scrub_delta = rt - lt;
+                            if scrub_delta.abs() > 0.05 {
+                                let scrub_amount = (scrub_delta * dt) as f64 * (state.duration_seconds * 0.1).clamp(2.0, 30.0);
+                                let target = (state.current_seconds + scrub_amount).clamp(0.0, state.duration_seconds);
+                                state.seek_request = Some(target);
+                                state.spectrum_history.clear();
+                                for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
+                                
+                                let sign = if scrub_delta > 0.0 { "+" } else { "" };
+                                state.osd_text = Some(format!("Scrubbing {}{:.1}x", sign, scrub_delta * 10.0));
+                                state.osd_timer = 0.5;
+                            }
+                        }
+                        
+                        if state.osd_timer > 0.0 {
+                            state.osd_timer = (state.osd_timer - dt).max(0.0);
+                            if state.osd_timer == 0.0 {
+                                state.osd_text = None;
                             }
                         }
 
@@ -684,6 +706,22 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                 state.seek_request = Some(target);
                                 state.spectrum_history.clear();
                                 for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
+                            }
+                            EngineAction::SeekWithScrub(pct, delta) => {
+                                let target = (state.duration_seconds * pct as f64).clamp(0.0, state.duration_seconds);
+                                state.seek_request = Some(target);
+                                state.spectrum_history.clear();
+                                for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
+                                
+                                if state.osd_timer > 0.0 && state.osd_text.as_ref().map_or(false, |s| s.starts_with("Scrubbing")) {
+                                    state.cumulative_scrub += delta;
+                                } else {
+                                    state.cumulative_scrub = delta;
+                                }
+                                
+                                let sign = if state.cumulative_scrub > 0.0 { "+" } else { "-" };
+                                state.osd_text = Some(format!("Scrubbing {}{:.1}s", sign, state.cumulative_scrub.abs()));
+                                state.osd_timer = 0.5;
                             }
                             EngineAction::OpenFile => {
                                 if is_game_mode {
@@ -866,17 +904,21 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                             match button {
                                 gilrs::Button::DPadRight => {
                                     let mut state = app_state.lock().unwrap();
-                                    let target = state.current_seconds + 5.0;
+                                    let target = (state.current_seconds + 10.0).clamp(0.0, state.duration_seconds);
                                     state.seek_request = Some(target);
                                     state.spectrum_history.clear();
                                     for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
+                                    state.osd_text = Some("+10.0s".to_string());
+                                    state.osd_timer = 2.0;
                                 }
                                 gilrs::Button::DPadLeft => {
                                     let mut state = app_state.lock().unwrap();
-                                    let target = (state.current_seconds - 5.0).max(0.0);
+                                    let target = (state.current_seconds - 10.0).max(0.0);
                                     state.seek_request = Some(target);
                                     state.spectrum_history.clear();
                                     for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
+                                    state.osd_text = Some("-10.0s".to_string());
+                                    state.osd_timer = 2.0;
                                 }
                                 _ => {}
                             }
@@ -920,23 +962,21 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                             match button {
                                 gilrs::Button::LeftTrigger => { // L1 Bumper
                                     let mut state = app_state.lock().unwrap();
-                                    if state.playlist_index > 0 {
-                                        state.playlist_index -= 1;
-                                        state.load_request = Some(state.playlist[state.playlist_index].clone());
-                                        state.track_ended = false;
-                                    }
+                                    let target = (state.current_seconds - 60.0).max(0.0);
+                                    state.seek_request = Some(target);
+                                    state.spectrum_history.clear();
+                                    for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
+                                    state.osd_text = Some("-60.0s".to_string());
+                                    state.osd_timer = 2.0;
                                 }
                                 gilrs::Button::RightTrigger => { // R1 Bumper
                                     let mut state = app_state.lock().unwrap();
-                                    state.track_ended = true;
-                                }
-                                gilrs::Button::LeftTrigger2 => { // L2
-                                    let mut state = app_state.lock().unwrap();
-                                    state.show_hud = !state.show_hud;
-                                }
-                                gilrs::Button::RightTrigger2 => { // R2
-                                    let mut state = app_state.lock().unwrap();
-                                    state.gpu_fft = !state.gpu_fft;
+                                    let target = (state.current_seconds + 60.0).clamp(0.0, state.duration_seconds);
+                                    state.seek_request = Some(target);
+                                    state.spectrum_history.clear();
+                                    for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
+                                    state.osd_text = Some("+60.0s".to_string());
+                                    state.osd_timer = 2.0;
                                 }
                                 gilrs::Button::North => { // 'Y' or Triangle
                                     let mut state = app_state.lock().unwrap();
@@ -961,19 +1001,23 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                 gilrs::Button::DPadRight => {
                                     let mut state = app_state.lock().unwrap();
                                     if !state.show_vis_picker {
-                                        let target = state.current_seconds + 5.0;
+                                        let target = (state.current_seconds + 10.0).clamp(0.0, state.duration_seconds);
                                         state.seek_request = Some(target);
                                         state.spectrum_history.clear();
                                         for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
+                                        state.osd_text = Some("+10.0s".to_string());
+                                        state.osd_timer = 2.0;
                                     }
                                 }
                                 gilrs::Button::DPadLeft => {
                                     let mut state = app_state.lock().unwrap();
                                     if !state.show_vis_picker {
-                                        let target = (state.current_seconds - 5.0).max(0.0);
+                                        let target = (state.current_seconds - 10.0).max(0.0);
                                         state.seek_request = Some(target);
                                         state.spectrum_history.clear();
                                         for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
+                                        state.osd_text = Some("-10.0s".to_string());
+                                        state.osd_timer = 2.0;
                                     }
                                 }
                                 gilrs::Button::DPadUp => {

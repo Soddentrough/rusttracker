@@ -58,6 +58,7 @@ pub enum EngineAction {
     VisPickerToggleEnabled(usize),
     VisPickerSetCursor(usize),
     VisPickerEnableAll,
+    SeekWithScrub(f32, f64),
     VisPickerEnableNone,
 }
 
@@ -2586,6 +2587,33 @@ impl<'a> VulkanEngine<'a> {
             egui::CentralPanel::default().frame(frame).show_inside(ctx, |ui| {
                 let rect = ui.available_rect_before_wrap();
                 central_rect = rect;
+                
+                // Mouse drag scrubbing using global input to avoid interception by other transparent areas
+                #[allow(deprecated)]
+                let wants_pointer = ui.ctx().wants_pointer_input();
+                if ui.input(|i| i.pointer.primary_down()) && !wants_pointer && state.duration_seconds > 0.0 {
+                    let delta_x = ui.input(|i| i.pointer.delta().x);
+                    if delta_x.abs() > 0.0 {
+                        let scrub_amount = delta_x * 0.1; // 0.1s per pixel
+                        let new_time = (state.current_seconds + scrub_amount as f64).clamp(0.0, state.duration_seconds);
+                        engine_action = EngineAction::SeekWithScrub((new_time / state.duration_seconds) as f32, scrub_amount as f64);
+                    }
+                }
+                
+                // Draw OSD text from keyboard/gamepad actions
+                if let Some(osd) = &state.osd_text {
+                    if state.osd_timer > 0.0 {
+                        let painter = ui.painter();
+                        let alpha = (state.osd_timer.min(0.5) * 2.0 * 255.0) as u8;
+                        painter.text(
+                            rect.center(),
+                            egui::Align2::CENTER_CENTER,
+                            osd,
+                            egui::FontId::proportional(32.0),
+                            egui::Color32::from_rgba_premultiplied(255, 255, 255, alpha),
+                        );
+                    }
+                }
                 
                 if state.visualizer_mode == 0 && state.show_hud && state.video_mode != 3 {
                     let painter = ui.painter();
