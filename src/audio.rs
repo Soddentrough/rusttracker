@@ -155,17 +155,20 @@ pub fn spawn_dsp_thread(
                 // avoiding the visual "freeze" caused by searching the entire history buffer.
                 let search_window = (sample_rate as f32 / 30.0) as usize;
                 let search_start = msg.audio_data.len().saturating_sub(actual_window_samples + search_window);
-                let search_limit = msg.audio_data.len().saturating_sub(actual_window_samples);
+                // Ensure i+1 stays in bounds during zero-crossing search
+                let search_limit = msg.audio_data.len().saturating_sub(actual_window_samples).min(msg.audio_data.len().saturating_sub(1));
                 
                 let mut start_idx = search_start;
                 let mut best_slope = 0.0;
                 
-                for i in search_start..search_limit {
-                    if msg.audio_data[i] <= 0.0 && msg.audio_data[i + 1] > 0.0 {
-                        let slope = msg.audio_data[i + 1] - msg.audio_data[i];
-                        if slope > best_slope {
-                            best_slope = slope;
-                            start_idx = i;
+                if msg.audio_data.len() >= 2 {
+                    for i in search_start..search_limit {
+                        if msg.audio_data[i] <= 0.0 && msg.audio_data[i + 1] > 0.0 {
+                            let slope = msg.audio_data[i + 1] - msg.audio_data[i];
+                            if slope > best_slope {
+                                best_slope = slope;
+                                start_idx = i;
+                            }
                         }
                     }
                 }
@@ -174,9 +177,11 @@ pub fn spawn_dsp_thread(
                     state.raw_waveform.resize(visual_width, 0.0);
                 }
                 
+                if !msg.audio_data.is_empty() {
                 for i in 0..visual_width {
                     let sample_idx = start_idx + (i as f32 * stride) as usize;
                     state.raw_waveform[i] = msg.audio_data[sample_idx.min(msg.audio_data.len() - 1)];
+                }
                 }
                 
                 let now = Instant::now();
@@ -239,7 +244,7 @@ pub trait AudioSource: Send {
     fn pre_format_tracker_data(&mut self) -> Vec<Vec<String>> { Vec::new() }
     fn get_current_row_string(&mut self) -> String { String::new() }
     fn get_video_info(&mut self) -> Option<String> { None }
-    fn attach_video_queue(&mut self, _tx: crossbeam_channel::Sender<ffmpeg_next::Packet>) {}
+    fn attach_video_queue(&mut self, _tx: crossbeam_channel::Sender<(u64, ffmpeg_next::Packet)>) {}
     fn take_video_parameters(&mut self) -> Option<(ffmpeg_next::codec::Parameters, ffmpeg_next::Rational)> { None }
 }
 
@@ -810,7 +815,8 @@ struct FfmpegSource {
     video_info: Option<String>,
     channel_vus: Vec<f32>,
     video_stream_index: Option<usize>,
-    video_tx: Option<crossbeam_channel::Sender<ffmpeg_next::Packet>>,
+    video_tx: Option<crossbeam_channel::Sender<(u64, ffmpeg_next::Packet)>>,
+    video_epoch: u64,
     video_params: Option<ffmpeg_next::codec::Parameters>,
     video_time_base: Option<ffmpeg_next::Rational>,
 }
@@ -853,7 +859,7 @@ impl FfmpegSource {
         for (stream, packet) in self.ictx.packets() {
             if Some(stream.index()) == self.video_stream_index {
                 if let Some(tx) = &self.video_tx {
-                    let _ = tx.try_send(packet.clone());
+                    let _ = tx.try_send((self.video_epoch, packet.clone()));
                 }
             } else if stream.index() == self.stream_index {
                 // Send the packet to the decoder
@@ -988,6 +994,7 @@ impl AudioSource for FfmpegSource {
         self.decoder.flush();
         self.buf_pos = self.sample_buf.len();
         self.current_time = pos;
+        self.video_epoch += 1;
     }
     
     fn get_num_channels(&mut self) -> i32 { self.channels as i32 }
@@ -1005,7 +1012,7 @@ impl AudioSource for FfmpegSource {
 
     fn get_video_info(&mut self) -> Option<String> { self.video_info.clone() }
     
-    fn attach_video_queue(&mut self, tx: crossbeam_channel::Sender<ffmpeg_next::Packet>) {
+    fn attach_video_queue(&mut self, tx: crossbeam_channel::Sender<(u64, ffmpeg_next::Packet)>) {
         self.video_tx = Some(tx);
     }
     
@@ -1024,7 +1031,8 @@ impl AudioSource for FfmpegSource {
 struct VideoOnlySource {
     ictx: ffmpeg_next::format::context::Input,
     video_stream_index: usize,
-    video_tx: Option<crossbeam_channel::Sender<ffmpeg_next::Packet>>,
+    video_tx: Option<crossbeam_channel::Sender<(u64, ffmpeg_next::Packet)>>,
+    video_epoch: u64,
     video_params: Option<ffmpeg_next::codec::Parameters>,
     video_time_base: Option<ffmpeg_next::Rational>,
     current_time: f64,
@@ -1045,7 +1053,7 @@ impl AudioSource for VideoOnlySource {
             if let Some((stream, packet)) = self.ictx.packets().next() {
                 if stream.index() == self.video_stream_index {
                     if let Some(tx) = &self.video_tx {
-                        let _ = tx.try_send(packet.clone());
+                        let _ = tx.try_send((self.video_epoch, packet.clone()));
                     }
                 }
                 packets_read += 1;
@@ -1075,6 +1083,7 @@ impl AudioSource for VideoOnlySource {
             }
         }
         self.current_time = pos;
+        self.video_epoch += 1;
     }
     
     fn get_num_channels(&mut self) -> i32 { 2 }
@@ -1091,7 +1100,7 @@ impl AudioSource for VideoOnlySource {
     fn get_current_row(&mut self) -> i32 { 0 }
     fn get_video_info(&mut self) -> Option<String> { self.video_info.clone() }
     
-    fn attach_video_queue(&mut self, tx: crossbeam_channel::Sender<ffmpeg_next::Packet>) {
+    fn attach_video_queue(&mut self, tx: crossbeam_channel::Sender<(u64, ffmpeg_next::Packet)>) {
         self.video_tx = Some(tx);
     }
     
@@ -1145,6 +1154,7 @@ fn try_ffmpeg(file_path: &str) -> Result<Box<dyn AudioSource>> {
                 ictx,
                 video_stream_index: v_idx,
                 video_tx: None,
+                video_epoch: 0,
                 video_params,
                 video_time_base: video_tb,
                 current_time: 0.0,
@@ -1195,6 +1205,7 @@ fn try_ffmpeg(file_path: &str) -> Result<Box<dyn AudioSource>> {
         channel_vus: vec![0.0; channels as usize],
         video_stream_index,
         video_tx: None,
+        video_epoch: 0,
         video_params,
         video_time_base: video_tb,
     }))
@@ -1495,9 +1506,6 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
         state.num_instruments = audio_source.get_num_instruments();
         state.num_patterns = audio_source.get_num_patterns();
         
-        let _intrinsic = audio_source.get_num_channels();
-        let _intrinsic = audio_source.get_num_channels();
-        
         if !mic {
             state.tracker_channels = tracker_channels;
             state.tracker_patterns_by_order = audio_source.pre_format_tracker_data();
@@ -1561,7 +1569,7 @@ where
     let (ready_tx, ready_rx) = crossbeam_channel::bounded::<AudioChunk>(pool_size);
     let (free_tx, free_rx) = crossbeam_channel::bounded::<AudioChunk>(pool_size);
     
-    let (video_packet_tx, video_packet_rx) = crossbeam_channel::bounded::<ffmpeg_next::Packet>(4096);
+    let (video_packet_tx, video_packet_rx) = crossbeam_channel::bounded::<(u64, ffmpeg_next::Packet)>(4096);
     audio_source.attach_video_queue(video_packet_tx);
     
     if let Some((params, time_base)) = audio_source.take_video_parameters() {
@@ -1582,6 +1590,7 @@ where
                 bit_depth: 8,
                 color_space: 0,
                 color_range: 0,
+                color_trc: 0,
             });
         }
         
@@ -1599,14 +1608,18 @@ where
                     let mut local_epoch = 0;
                     let mut fallback_pts_seconds = 0.0;
                     
-                    while let Ok(packet) = video_packet_rx_for_video.recv() {
-                        let mut track_ended = false;
-                        if let Ok(state) = state_for_video.try_lock() {
-                            track_ended = state.track_ended;
+                    while let Ok((packet_epoch, packet)) = video_packet_rx_for_video.recv() {
+                        let mut track_ended = {
+                            let state = state_for_video.lock().unwrap();
                             if state.seek_epoch > local_epoch {
                                 decoder.flush();
                                 local_epoch = state.seek_epoch;
                             }
+                            state.track_ended
+                        };
+                        
+                        if packet_epoch < local_epoch {
+                            continue;
                         }
                         
                         if track_ended { return; }
@@ -1625,17 +1638,21 @@ where
                                     fallback_pts_seconds = pts + (1.0 / 30.0);
                                 }
                                 
+                                let mut skip_push = false;
                                 loop {
                                     let (cached_seconds, current_epoch) = {
-                                        if let Ok(state) = state_for_video.try_lock() {
-                                            track_ended = state.track_ended;
-                                            (state.current_seconds, state.seek_epoch)
-                                        } else {
-                                            continue;
-                                        }
+                                        let state = state_for_video.lock().unwrap();
+                                        track_ended = state.track_ended;
+                                        (state.current_seconds, state.seek_epoch)
                                     };
                                     
                                     if track_ended || current_epoch > local_epoch {
+                                        skip_push = true;
+                                        break;
+                                    }
+                                    
+                                    if pts < cached_seconds - 0.05 {
+                                        skip_push = true;
                                         break;
                                     }
                                     
@@ -1643,6 +1660,10 @@ where
                                         break;
                                     }
                                     std::thread::sleep(std::time::Duration::from_millis(2));
+                                }
+                                
+                                if skip_push {
+                                    continue;
                                 }
                                 
                                 if let Ok(mut frame) = free_video_frame_rx.recv() {
@@ -1654,6 +1675,7 @@ where
                                     frame.bit_depth = if format_name.contains("10LE") { 10 } else if format_name.contains("12LE") { 12 } else { 8 };
                                     frame.color_space = decoded.color_space() as u32;
                                     frame.color_range = decoded.color_range() as u32;
+                                    frame.color_trc = decoded.color_transfer_characteristic() as u32;
                                     
                                     frame.y_stride = decoded.stride(0);
                                     frame.u_stride = decoded.stride(1);
@@ -1723,6 +1745,7 @@ where
             if let Ok(mut state) = state_for_decoder.try_lock() {
                 if let Some(pos) = state.seek_request.take() {
                     audio_source.set_position_seconds(pos);
+                    state.current_seconds = pos;
                     state.seek_epoch += 1;
                     while let Ok(chunk) = ready_rx_for_decoder.try_recv() {
                         let _ = free_tx_for_decoder.try_send(chunk);
@@ -1789,7 +1812,7 @@ where
                 state.stats.decode_us = state.stats.decode_us * 0.9 + decode_elapsed * 0.1;
                 let fill_pct = (ready_rx_for_decoder.len() as f32 / pool_size as f32) * 100.0;
                 state.stats.audio_buffer_fill_pct = fill_pct;
-                let video_pct = (video_rx_for_decoder.len() as f32 / 256.0) * 100.0;
+                let video_pct = (video_rx_for_decoder.len() as f32 / 4096.0) * 100.0;
                 state.stats.video_buffer_fill_pct = video_pct;
                 state.stats.clipping_events += clips;
             }
@@ -1963,6 +1986,8 @@ where
     let mut fft_buffer: Vec<f32> = vec![0.0; window_size];
     let mut channel_fft_buffers: Vec<Vec<f32>> = vec![vec![0.0; window_size]; channels];
     let mut windowed_buffer: Vec<f32> = vec![0.0; window_size];
+    let mut windowed_channels: Vec<Vec<f32>> = vec![vec![0.0; window_size]; channels];
+    let mut spare_channels: Vec<Vec<f32>> = vec![vec![0.0; window_size]; channels];
     let mut fft_index = 0;
     
     let mut was_paused = false;
@@ -2000,7 +2025,6 @@ where
                 fft_index = (fft_index + 1) % window_size;
             }
 
-            let mut windowed_channels = vec![vec![0.0; window_size]; channels];
             for i in 0..window_size {
                 let idx = (fft_index + i) % window_size;
                 windowed_buffer[i] = fft_buffer[idx];
@@ -2009,6 +2033,9 @@ where
                 }
             }
             
+            // Swap filled buffers with spare set — zero allocations in the hot path
+            std::mem::swap(&mut windowed_channels, &mut spare_channels);
+
             let mut channel_vus = Vec::new();
             if channels >= 1 { channel_vus.push(left_peak); }
             if channels >= 2 { channel_vus.push(right_peak); }
@@ -2022,7 +2049,7 @@ where
                 speed: 0,
                 current_seconds: 0.0,
                 current_row_string: String::new(),
-                channel_audio_data: windowed_channels,
+                channel_audio_data: std::mem::replace(&mut spare_channels, vec![vec![0.0; window_size]; channels]),
             };
             
             let _ = tx.try_send(msg);
