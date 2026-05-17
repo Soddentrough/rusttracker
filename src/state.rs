@@ -183,11 +183,12 @@ impl AppState {
             .unwrap_or(false);
 
         let mut vis_enabled = vec![true; VISUALIZERS.len()];
+        vis_enabled[6] = false; // Solar Flare: disabled on all systems due to computational cost and visual quality
+
         if is_steam_deck {
             vis_enabled[1] = false; // CRT Oscilloscope
             vis_enabled[2] = false; // 3D CRT Oscilloscope
             vis_enabled[3] = false; // 3D Freq Oscilloscope
-            vis_enabled[6] = false; // Solar Flare
             vis_enabled[8] = false; // Chrome Ferrofluid
             vis_enabled[9] = false; // Ferrofluid Particle Sim
             vis_enabled[10] = false; // Neon Corridor
