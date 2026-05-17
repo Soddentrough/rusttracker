@@ -43,7 +43,7 @@ test_*.c
 test_*.sh
 test_load
 test_sort
-screenshot.png
+screenshot*
 scratch/
 scratch_bitstream/target/
 scratch_bitstream_windows/target/

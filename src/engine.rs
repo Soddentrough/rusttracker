@@ -466,6 +466,10 @@ impl<'a> VulkanEngine<'a> {
                 8 => include_str!("shaders/vis_3doscilloscope_freq.wgsl"),
                 9 => include_str!("shaders/vis_solar.wgsl"),
                 10 => include_str!("shaders/vis_ferrofluidsim.wgsl"),
+                11 => include_str!("shaders/vis_lissajous.wgsl"),
+                12 => include_str!("shaders/vis_synthwave.wgsl"),
+                13 => include_str!("shaders/vis_starfield.wgsl"),
+                14 => include_str!("shaders/vis_rain.wgsl"),
                 _ => include_str!("shaders/vis_spectrum.wgsl"),
             }
         };
@@ -1115,12 +1119,16 @@ impl<'a> VulkanEngine<'a> {
         }
         
         // 2. Populate Raw Spatial Channels (strict spatial mapping without UI reordering)
-        let spatial_offset = state.tracker_channels.unwrap_or(0) as usize;
-        let spatial_count = state.channel_vus.len().saturating_sub(spatial_offset);
-        for i in 0..spatial_count {
-            let src_idx = spatial_offset + i;
-            if src_idx < state.channel_vus.len() && i < 16 {
-                uniforms.spatial_channels[i] = state.channel_vus[src_idx];
+        if state.tracker_channels.is_some() {
+            // For tracker files, channel_vus is [L_Peak, Track1..N, R_Peak]
+            if state.channel_vus.len() >= 2 {
+                uniforms.spatial_channels[0] = state.channel_vus[0];
+                uniforms.spatial_channels[1] = state.channel_vus[state.channel_vus.len() - 1];
+            }
+        } else {
+            let spatial_count = state.channel_vus.len().min(16);
+            for i in 0..spatial_count {
+                uniforms.spatial_channels[i] = state.channel_vus[i];
             }
         }
         

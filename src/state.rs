@@ -91,6 +91,10 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
     VisualizerDef { id: 4, name: "Chrome Ferrofluid", filename: "vis_ferrofluid.wgsl", description: "Raymarched liquid metal simulation", requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 10, name: "Ferrofluid Particle Sim", filename: "vis_ferrofluidsim.wgsl", description: "Compute physics droplet simulation", requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: true },
     VisualizerDef { id: 5, name: "Neon Corridor", filename: "vis_neon.wgsl", description: "Raymarched neon sci-fi tunnel", requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
+    VisualizerDef { id: 11, name: "Lissajous Laser", filename: "vis_lissajous.wgsl", description: "Analog laser projector simulation", requires_history: true, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
+    VisualizerDef { id: 12, name: "Synthwave Terrain", filename: "vis_synthwave.wgsl", description: "Retro 80s wireframe landscape", requires_history: true, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
+    VisualizerDef { id: 13, name: "Starfield Constellation", filename: "vis_starfield.wgsl", description: "Audio-reactive galaxy and starfield", requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
+    VisualizerDef { id: 14, name: "Midnight Storm", filename: "vis_rain.wgsl", description: "Nighttime rain and audio-reactive lightning", requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
 ];
 
 #[derive(Debug, Clone)]
