@@ -24,7 +24,7 @@ fn fbm(p: vec2<f32>) -> f32 {
     var a = 0.5;
     var pp = p;
     let rot = mat2x2<f32>(0.87758, 0.47942, -0.47942, 0.87758);
-    for (var i = 0; i < 5; i = i + 1) {
+    for (var i = 0; i < 3; i = i + 1) { // Reduced to 3 octaves for performance
         v = v + a * noise(pp);
         pp = rot * pp * 2.0 + vec2<f32>(100.0, 100.0);
         a = a * 0.5;
@@ -58,7 +58,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             
             // Determine which channel we are in based on x
             let ch_f = (uv.x - meters_rect_min.x) / meter_width_uv;
-            let ch_idx = u32(ch_f);
+            let ch_idx = min(u32(ch_f), num_ch - 1u);
             
             if (ch_idx < num_ch) {
                 // Determine position within the specific meter
@@ -249,7 +249,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             if (fire_color.a > 0.0) {
                 out_color = vec4<f32>(
                     mix(out_color.rgb, fire_color.rgb, fire_color.a),
-                    max(out_color.a, fire_color.a)
+                    min(out_color.a + fire_color.a, 1.0f)
                 );
             }
         }
@@ -265,7 +265,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 let ember_color = vec4<f32>(1.0, 0.25 * brightness, 0.0, brightness);
                 out_color = vec4<f32>(
                     mix(out_color.rgb, ember_color.rgb, ember_color.a),
-                    max(out_color.a, ember_color.a)
+                    min(out_color.a + ember_color.a, 1.0f)
                 );
             }
         }
