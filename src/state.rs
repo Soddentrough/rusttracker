@@ -169,7 +169,9 @@ pub struct AppState {
     pub is_file_picker_open: bool,
     pub open_file_request: bool,
     pub is_url_dialog_open: bool,
+    pub focus_url_input: bool,
     pub url_input_text: String,
+    pub url_history: Vec<(String, String)>,
     pub egui_gamepad_events: Vec<egui::Event>,
     pub force_stereo_downmix: bool,
     pub append_to_playlist: bool,
@@ -183,6 +185,18 @@ pub struct AppState {
     pub osd_text: Option<String>,
     pub osd_timer: f32,
     pub cumulative_scrub: f64,
+}
+
+pub fn get_history_file_path() -> std::path::PathBuf {
+    if let Some(proj_dirs) = directories::ProjectDirs::from("com", "RustTracker", "RustTracker") {
+        let dir = proj_dirs.data_dir();
+        if !dir.exists() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        dir.join("url_history.txt")
+    } else {
+        std::path::PathBuf::from("url_history.txt")
+    }
 }
 
 impl AppState {
@@ -211,6 +225,17 @@ impl AppState {
             vis_enabled[8] = false; // Chrome Ferrofluid
             vis_enabled[9] = false; // Ferrofluid Particle Sim
             vis_enabled[10] = false; // Neon Corridor
+        }
+        
+        let mut url_history = Vec::new();
+        if let Ok(data) = std::fs::read_to_string(get_history_file_path()) {
+            for line in data.lines() {
+                if let Some((url, title)) = line.split_once('|') {
+                    if !url_history.iter().any(|(u, _)| u == url) {
+                        url_history.push((url.to_string(), title.to_string()));
+                    }
+                }
+            }
         }
 
         AppState {
@@ -265,14 +290,16 @@ impl AppState {
             visualizer_mode: VISUALIZERS[0].id,
             visual_width: 1024,
             target_fps: 144,
-            current_visualizer_idx: 11,
+            current_visualizer_idx: 0,
             video_frame_rx: None,
             free_video_frame_tx: None,
             video_mode: 0,
             is_file_picker_open: false,
             open_file_request: false,
             is_url_dialog_open: false,
+            focus_url_input: false,
             url_input_text: String::new(),
+            url_history,
             egui_gamepad_events: Vec::new(),
             force_stereo_downmix: is_steam_deck,
             append_to_playlist: false,
@@ -357,7 +384,9 @@ impl AppState {
             is_file_picker_open: self.is_file_picker_open,
             open_file_request: false,
             is_url_dialog_open: self.is_url_dialog_open,
+            focus_url_input: self.focus_url_input,
             url_input_text: self.url_input_text.clone(),
+            url_history: self.url_history.clone(),
             egui_gamepad_events: Vec::new(),
             force_stereo_downmix: self.force_stereo_downmix,
             append_to_playlist: self.append_to_playlist,

@@ -64,6 +64,8 @@ pub enum EngineAction {
     CloseUrlDialog,
     SetUrlInput(String),
     LoadUrl(String),
+    EditUrl(String),
+    ClearFocusUrlInput,
 }
 
 #[repr(C)]
@@ -1812,27 +1814,56 @@ impl<'a> VulkanEngine<'a> {
                 egui::Window::new("Open Network Stream")
                     .collapsible(false)
                     .resizable(false)
+                    .default_width(600.0)
                     .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                     .show(ctx, |ui| {
                         ui.label("Enter Stream URL (e.g. .pls, .m3u, or direct stream link):");
+                        ui.add_space(4.0);
                         let mut url_text = state.url_input_text.clone();
-                        let text_resp = ui.add_sized([400.0, 30.0], egui::TextEdit::singleline(&mut url_text));
+                        let text_resp = ui.add(
+                            egui::TextEdit::singleline(&mut url_text)
+                                .desired_width(f32::INFINITY)
+                                .min_size(egui::vec2(0.0, 30.0))
+                        );
+                        if state.focus_url_input {
+                            text_resp.request_focus();
+                            engine_action = EngineAction::ClearFocusUrlInput;
+                        }
                         if text_resp.changed() {
                             engine_action = EngineAction::SetUrlInput(url_text.clone());
                         }
                         ui.add_space(10.0);
                         ui.horizontal(|ui| {
-                            ui.allocate_ui_with_layout(ui.available_size(), egui::Layout::centered_and_justified(egui::Direction::LeftToRight), |ui| {
-                                if ui.button("Cancel").clicked() {
-                                    engine_action = EngineAction::CloseUrlDialog;
-                                }
-                                if ui.button("Open").clicked() || (text_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.add_sized([80.0, 30.0], egui::Button::new("Open")).clicked() || (text_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
                                     if !url_text.is_empty() {
                                         engine_action = EngineAction::LoadUrl(url_text);
                                     }
                                 }
+                                if ui.add_sized([80.0, 30.0], egui::Button::new("Cancel")).clicked() {
+                                    engine_action = EngineAction::CloseUrlDialog;
+                                }
                             });
                         });
+                        
+                        if !state.url_history.is_empty() {
+                            ui.separator();
+                            ui.label(egui::RichText::new("Recent Streams:").strong());
+                            egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
+                                for (url, title) in state.url_history.iter().rev() {
+                                    ui.horizontal(|ui| {
+                                        let width = ui.available_width() - 38.0;
+                                        let btn = egui::Button::new(format!("{} ({})", title, url)).truncate();
+                                        if ui.add_sized([width.max(0.0), 30.0], btn).clicked() {
+                                            engine_action = EngineAction::LoadUrl(url.clone());
+                                        }
+                                        if ui.add_sized([30.0, 30.0], egui::Button::new("📝")).clicked() {
+                                            engine_action = EngineAction::EditUrl(url.clone());
+                                        }
+                                    });
+                                }
+                            });
+                        }
                     });
             }
 
@@ -2179,15 +2210,13 @@ impl<'a> VulkanEngine<'a> {
             }
 
             let mut append = state.append_to_playlist;
-            // Only update the file dialog UI when it's actually open to avoid layout overhead
-            if state.is_file_picker_open || *file_dialog.state() != egui_file_dialog::DialogState::Closed {
-                file_dialog.update_with_right_panel_ui(ctx, &mut |ui, _fd| {
-                    ui.add_space(10.0);
-                    ui.heading("Options");
-                    ui.separator();
-                    ui.checkbox(&mut append, "Add to Playlist instead of replacing");
-                });
-            }
+            file_dialog.update_with_right_panel_ui(ctx, &mut |ui, _fd| {
+                ui.add_space(10.0);
+                ui.heading("Options");
+                ui.separator();
+                ui.checkbox(&mut append, "Add to Playlist instead of replacing");
+            });
+            
             if append != state.append_to_playlist {
                 engine_action = EngineAction::SetAppendToPlaylist(append);
             }
@@ -2388,7 +2417,6 @@ impl<'a> VulkanEngine<'a> {
                         
                     egui::Area::new(egui::Id::new("splash_shortcuts_area"))
                         .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -40.0))
-                        .order(egui::Order::Foreground)
                         .show(ctx, |ui| {
                             egui::Frame::NONE
                                 .fill(egui::Color32::from_black_alpha(200))
@@ -2595,13 +2623,12 @@ impl<'a> VulkanEngine<'a> {
                             }
                             ui.add_space(20.0);
                             
-                            if !is_game_mode {
                                 egui::Frame::NONE
                                     .shadow(egui::Shadow { offset: [0, 4], blur: 12, spread: 0, color: egui::Color32::from_black_alpha(200) })
                                     .corner_radius(6.0)
                                     .show(ui, |ui| {
                                         ui.horizontal(|ui| {
-                                            let total_width = 300.0 + 20.0 + 250.0;
+                                            let total_width = 300.0 + 20.0 + 300.0;
                                             ui.add_space((ui.available_width() - total_width) / 2.0);
                                             
                                             let btn = egui::Button::new(
@@ -2613,7 +2640,11 @@ impl<'a> VulkanEngine<'a> {
                                             .fill(egui::Color32::from_rgb(0, 100, 200))
                                             .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 180, 255)));
                                             
-                                            if ui.add_sized([300.0, 60.0], btn).clicked() {
+                                            let resp1 = ui.add_sized([300.0, 60.0], btn);
+                                            if resp1.has_focus() {
+                                                ui.painter().rect(resp1.rect.expand(2.0), 6.0, egui::Color32::TRANSPARENT, egui::Stroke::new(3.0, egui::Color32::YELLOW), egui::StrokeKind::Outside);
+                                            }
+                                            if resp1.clicked() {
                                                 engine_action = EngineAction::OpenFile;
                                             }
                                             
@@ -2628,14 +2659,17 @@ impl<'a> VulkanEngine<'a> {
                                             .fill(egui::Color32::from_rgb(100, 50, 150))
                                             .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 80, 255)));
                                             
-                                            if ui.add_sized([250.0, 60.0], url_btn).clicked() {
+                                            let resp2 = ui.add_sized([300.0, 60.0], url_btn);
+                                            if resp2.has_focus() {
+                                                ui.painter().rect(resp2.rect.expand(2.0), 6.0, egui::Color32::TRANSPARENT, egui::Stroke::new(3.0, egui::Color32::YELLOW), egui::StrokeKind::Outside);
+                                            }
+                                            if resp2.clicked() {
                                                 engine_action = EngineAction::OpenUrlDialog;
                                             }
                                         });
                                     });
                                 
                                 ui.add_space(30.0);
-                            }
                             
                             let mut force_stereo = state.force_stereo_downmix;
                             if ui.checkbox(&mut force_stereo, "Force Stereo Downmix (Fixes crackling on some devices)").changed() {
@@ -2745,10 +2779,16 @@ impl<'a> VulkanEngine<'a> {
                                 format!("{:02}:{:02}.{}", m, s, f)
                             };
                             
+                            let time_text = if state.duration_seconds <= 0.0 {
+                                format!("{} / LIVE", format_time(state.current_seconds))
+                            } else {
+                                format!("{} / {}", format_time(state.current_seconds), format_time(state.duration_seconds))
+                            };
+                            
                             painter.text(
                                 rect.center(),
                                 egui::Align2::CENTER_CENTER,
-                                format!("{} / {}", format_time(state.current_seconds), format_time(state.duration_seconds)),
+                                time_text,
                                 egui::FontId::proportional(11.0),
                                 egui::Color32::WHITE,
                             );
@@ -2900,7 +2940,7 @@ impl<'a> VulkanEngine<'a> {
                             let title_path = std::path::Path::new(&state.song_title);
                             let file_name = title_path.file_name().unwrap_or_default().to_string_lossy().to_string();
                             let file_dir = title_path.parent().unwrap_or(std::path::Path::new("")).to_string_lossy().to_string();
-                            columns[2].horizontal(|ui| { ui.label("File"); ui.label(&file_name); });
+                            columns[2].horizontal(|ui| { ui.label("File/Title"); ui.label(&file_name); });
                             columns[2].horizontal(|ui| { ui.label("Artist"); ui.label(&state.artist); });
                             columns[2].horizontal(|ui| { ui.label("Path"); ui.label(&file_dir); });
                             if state.playlist.len() > 1 {
@@ -2954,7 +2994,14 @@ impl<'a> VulkanEngine<'a> {
                                 }
                             });
                             
-                            columns[2].horizontal(|ui| { ui.label("Length"); ui.label(format!("{:.1}s", state.duration_seconds)); });
+                            columns[2].horizontal(|ui| { 
+                                ui.label("Length"); 
+                                if state.duration_seconds <= 0.0 {
+                                    ui.label("LIVE");
+                                } else {
+                                    ui.label(format!("{:.1}s", state.duration_seconds)); 
+                                }
+                            });
                             out_track_info_rect = Some(columns[2].min_rect());
                         }
                     });

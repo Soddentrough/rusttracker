@@ -999,7 +999,19 @@ impl AudioSource for FfmpegSource {
     
     fn get_num_channels(&mut self) -> i32 { self.channels as i32 }
     fn get_current_channel_vu_mono(&mut self, channel: i32) -> f32 { self.channel_vus.get(channel as usize).cloned().unwrap_or(0.0) }
-    fn get_artist(&mut self) -> String { self.artist.clone() }
+    fn get_artist(&mut self) -> String {
+        if let Some(stream_title) = self.ictx.metadata().get("StreamTitle") {
+            if !stream_title.is_empty() {
+                return stream_title.to_string();
+            }
+        }
+        if let Some(icy_name) = self.ictx.metadata().get("icy-name") {
+            if !icy_name.is_empty() {
+                return icy_name.to_string();
+            }
+        }
+        self.artist.clone()
+    }
     fn get_type(&mut self) -> String { self.ext_type.clone() }
     fn get_tempo(&mut self) -> i32 { 0 }
     fn get_speed(&mut self) -> i32 { 0 }
@@ -1191,6 +1203,8 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
         decoder.rate(),
     ).context("Failed to create resampler")?;
 
+    let initial_artist = ictx.metadata().get("artist").map(|s| s.to_string()).unwrap_or_else(|| "Unknown".to_string());
+
     Ok(Box::new(FfmpegSource {
         ictx,
         decoder,
@@ -1202,7 +1216,7 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
         time_base: tb,
         current_time: 0.0,
         duration,
-        artist: "Unknown".to_string(),
+        artist: initial_artist,
         ext_type: ext,
         intrinsic_sample_rate: sample_rate,
         video_info,
@@ -1852,7 +1866,18 @@ where
             chunk.channel_vus.clear();
             chunk.channel_vus.extend_from_slice(&channel_vus);
             
+            let current_artist = audio_source.get_artist();
             if let Ok(mut state) = state_for_decoder.try_lock() {
+                if current_artist != "Unknown" && !current_artist.is_empty() {
+                    if let Some((artist_part, title_part)) = current_artist.split_once(" - ") {
+                        if state.artist != artist_part || state.song_title != title_part {
+                            state.artist = artist_part.to_string();
+                            state.song_title = title_part.to_string();
+                        }
+                    } else if state.artist != current_artist {
+                        state.artist = current_artist.clone();
+                    }
+                }
                 state.stats.decode_us = state.stats.decode_us * 0.9 + decode_elapsed * 0.1;
                 let fill_pct = (ready_rx_for_decoder.len() as f32 / pool_size as f32) * 100.0;
                 state.stats.audio_buffer_fill_pct = fill_pct;

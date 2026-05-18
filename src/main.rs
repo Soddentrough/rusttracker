@@ -104,6 +104,23 @@ fn main() -> Result<(), Box<dyn Error>> {
         state.playlist = args.file.clone();
         state.playlist_index = 0;
         
+        let mut history_changed = false;
+        for path in &args.file {
+            if path.starts_with("http") {
+                if !state.url_history.iter().any(|(u, _)| u == path) {
+                    state.url_history.push((path.clone(), "Network Stream".to_string()));
+                    history_changed = true;
+                }
+            }
+        }
+        if history_changed {
+            let mut out = String::new();
+            for (u, t) in &state.url_history {
+                out.push_str(&format!("{}|{}\n", u, t));
+            }
+            let _ = std::fs::write(crate::state::get_history_file_path(), out);
+        }
+        
         if let Some(vis) = &args.vis {
             let vis_lower = vis.to_lowercase();
             if let Some(idx) = crate::state::VISUALIZERS.iter().position(|v| v.filename.to_lowercase().contains(&vis_lower) || v.name.to_lowercase().contains(&vis_lower)) {
@@ -256,9 +273,12 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                     modifiers = m.state();
                 }
 
-                // Process global hotkeys regardless of egui consuming them
-                if let WindowEvent::KeyboardInput { event: kb_event, .. } = &event {
-                    if kb_event.state == ElementState::Pressed {
+                let wants_keyboard = egui_ctx.wants_keyboard_input();
+
+                // Process global hotkeys only if egui doesn't want keyboard input (e.g. typing in a text box)
+                if !wants_keyboard {
+                    if let WindowEvent::KeyboardInput { event: kb_event, .. } = &event {
+                        if kb_event.state == ElementState::Pressed {
                         if let PhysicalKey::Code(keycode) = kb_event.physical_key {
                             match keycode {
                                 WinitKeyCode::ArrowRight | WinitKeyCode::ArrowLeft | WinitKeyCode::Comma | WinitKeyCode::Period => {
@@ -436,6 +456,7 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                     }
                                 }
                             }
+                        }
                         }
                     }
                 }
@@ -796,20 +817,49 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                             }
                             EngineAction::OpenUrlDialog => {
                                 state.is_url_dialog_open = true;
+                                state.focus_url_input = true;
+                                window.set_ime_allowed(true); // Hint to Wayland/SteamOS to show the virtual keyboard
+                            }
+                            EngineAction::ClearFocusUrlInput => {
+                                state.focus_url_input = false;
                             }
                             EngineAction::CloseUrlDialog => {
                                 state.is_url_dialog_open = false;
+                                window.set_ime_allowed(false);
                             }
                             EngineAction::SetUrlInput(url) => {
                                 state.url_input_text = url;
                             }
+                            EngineAction::EditUrl(url) => {
+                                state.url_input_text = url;
+                                state.focus_url_input = true;
+                                window.set_ime_allowed(true);
+                            }
                             EngineAction::LoadUrl(url) => {
+                                let mut final_url = url.clone();
+                                if !final_url.starts_with("http://") && !final_url.starts_with("https://") {
+                                    final_url = format!("https://{}", final_url);
+                                }
                                 state.is_url_dialog_open = false;
+                                window.set_ime_allowed(false);
                                 state.url_input_text.clear();
-                                state.playlist = vec![url.clone()];
+                                state.playlist = vec![final_url.clone()];
                                 state.playlist_index = 0;
-                                state.load_request = Some(url);
+                                state.load_request = Some(final_url.clone());
                                 state.file_loaded = true;
+                                
+                                if let Some(idx) = state.url_history.iter().position(|(u, _)| u == &final_url) {
+                                    let item = state.url_history.remove(idx);
+                                    state.url_history.push(item);
+                                } else {
+                                    state.url_history.push((final_url.clone(), "Network Stream".to_string()));
+                                }
+                                
+                                let mut out = String::new();
+                                for (u, t) in &state.url_history {
+                                    out.push_str(&format!("{}|{}\n", u, t));
+                                }
+                                let _ = std::fs::write(crate::state::get_history_file_path(), out);
                             }
                             EngineAction::None => {}
                         }
@@ -880,7 +930,10 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                 }
             },
             Event::AboutToWait => {
-                    let is_dialog_open = *file_dialog.state() != egui_file_dialog::DialogState::Closed;
+                    let is_dialog_open = *file_dialog.state() != egui_file_dialog::DialogState::Closed || {
+                        let state = app_state.lock().unwrap();
+                        state.is_url_dialog_open
+                    };
                     
                     {
                         let mut state = app_state.lock().unwrap();
@@ -962,18 +1015,68 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
 
                             if is_dialog_open {
                                 let mut state = app_state.lock().unwrap();
+                                let is_url_open = state.is_url_dialog_open;
                                 let mut push_key = |key: egui::Key| {
                                     state.egui_gamepad_events.push(egui::Event::Key { key, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE });
                                     state.egui_gamepad_events.push(egui::Event::Key { key, physical_key: None, pressed: false, repeat: false, modifiers: egui::Modifiers::NONE });
                                 };
                                 match button {
-                                    gilrs::Button::DPadUp => { push_key(egui::Key::ArrowUp); continue; }
-                                    gilrs::Button::DPadDown => { push_key(egui::Key::ArrowDown); continue; }
+                                    gilrs::Button::DPadUp => {
+                                        if is_url_open {
+                                            state.egui_gamepad_events.push(egui::Event::Key { key: egui::Key::Tab, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::SHIFT });
+                                            state.egui_gamepad_events.push(egui::Event::Key { key: egui::Key::Tab, physical_key: None, pressed: false, repeat: false, modifiers: egui::Modifiers::SHIFT });
+                                        } else {
+                                            push_key(egui::Key::ArrowUp);
+                                        }
+                                        continue;
+                                    }
+                                    gilrs::Button::DPadDown => {
+                                        if is_url_open {
+                                            state.egui_gamepad_events.push(egui::Event::Key { key: egui::Key::Tab, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE });
+                                            state.egui_gamepad_events.push(egui::Event::Key { key: egui::Key::Tab, physical_key: None, pressed: false, repeat: false, modifiers: egui::Modifiers::NONE });
+                                        } else {
+                                            push_key(egui::Key::ArrowDown);
+                                        }
+                                        continue;
+                                    }
                                     gilrs::Button::DPadLeft => { push_key(egui::Key::ArrowLeft); continue; }
                                     gilrs::Button::DPadRight => { push_key(egui::Key::ArrowRight); continue; }
                                     gilrs::Button::South => { push_key(egui::Key::Enter); continue; }
                                     gilrs::Button::East => { push_key(egui::Key::Escape); continue; }
+                                    gilrs::Button::RightTrigger => {
+                                        state.egui_gamepad_events.push(egui::Event::Key { key: egui::Key::Tab, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE });
+                                        state.egui_gamepad_events.push(egui::Event::Key { key: egui::Key::Tab, physical_key: None, pressed: false, repeat: false, modifiers: egui::Modifiers::NONE });
+                                        continue;
+                                    }
+                                    gilrs::Button::LeftTrigger => {
+                                        state.egui_gamepad_events.push(egui::Event::Key { key: egui::Key::Tab, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::SHIFT });
+                                        state.egui_gamepad_events.push(egui::Event::Key { key: egui::Key::Tab, physical_key: None, pressed: false, repeat: false, modifiers: egui::Modifiers::SHIFT });
+                                        continue;
+                                    }
                                     _ => {}
+                                }
+                            } else {
+                                let is_splash = {
+                                    let state = app_state.lock().unwrap();
+                                    !state.file_loaded
+                                };
+                                if is_splash {
+                                    let mut state = app_state.lock().unwrap();
+                                    let mut push_tab = |shift: bool| {
+                                        let modifiers = if shift { egui::Modifiers::SHIFT } else { egui::Modifiers::NONE };
+                                        state.egui_gamepad_events.push(egui::Event::Key { key: egui::Key::Tab, physical_key: None, pressed: true, repeat: false, modifiers });
+                                        state.egui_gamepad_events.push(egui::Event::Key { key: egui::Key::Tab, physical_key: None, pressed: false, repeat: false, modifiers });
+                                    };
+                                    match button {
+                                        gilrs::Button::DPadLeft => { push_tab(true); continue; }
+                                        gilrs::Button::DPadRight => { push_tab(false); continue; }
+                                        gilrs::Button::South => {
+                                            state.egui_gamepad_events.push(egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: true, repeat: false, modifiers: egui::Modifiers::NONE });
+                                            state.egui_gamepad_events.push(egui::Event::Key { key: egui::Key::Enter, physical_key: None, pressed: false, repeat: false, modifiers: egui::Modifiers::NONE });
+                                            continue;
+                                        }
+                                        _ => {}
+                                    }
                                 }
                             }
                             
