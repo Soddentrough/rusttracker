@@ -37,44 +37,96 @@ fn project_3d(p3: vec3<f32>, ro: vec3<f32>, u: vec3<f32>, v_cam: vec3<f32>, w: v
     return vec3<f32>(proj_x, proj_y, dist_w);
 }
 
-fn draw_3d_lightning_bolt(ro: vec3<f32>, u: vec3<f32>, v_cam: vec3<f32>, w: vec3<f32>, p: vec2<f32>, seed: f32, intensity: f32, origin: vec3<f32>) -> f32 {
+fn draw_3d_segment(p: vec2<f32>, ro: vec3<f32>, u: vec3<f32>, v_cam: vec3<f32>, w: vec3<f32>, start_pos: vec3<f32>, end_pos: vec3<f32>, thickness_base: f32, intensity: f32, is_branch: bool) -> f32 {
+    var pA = project_3d(start_pos, ro, u, v_cam, w);
+    var pB = project_3d(end_pos, ro, u, v_cam, w);
+    
+    if (pA.z <= 0.0 && pB.z <= 0.0) { return 0.0; }
+    
+    if (pA.z <= 0.0 && pB.z > 0.0) {
+        let t = clamp(-pA.z / (pB.z - pA.z), 0.0, 1.0);
+        let front_pos = start_pos + (end_pos - start_pos) * t;
+        pA = project_3d(front_pos, ro, u, v_cam, w);
+    } else if (pB.z <= 0.0 && pA.z > 0.0) {
+        let t = clamp(-pA.z / (pB.z - pA.z), 0.0, 1.0);
+        let front_pos = start_pos + (end_pos - start_pos) * t;
+        pB = project_3d(front_pos, ro, u, v_cam, w);
+    }
+    
+    if (pA.z > 0.0 || pB.z > 0.0) {
+        let d = sd_segment(p, pA.xy, pB.xy);
+        let depth = max(0.4, max(pA.z, pB.z));
+        let thickness = thickness_base / depth;
+        let core = smoothstep(thickness * 0.5, 0.0, d);
+        let glow_radius = select(60.0, 120.0, is_branch); // Branches have a tighter, less intense glow
+        let glow_mult = select(0.7, 0.3, is_branch);
+        let glow = exp(-d * glow_radius) * glow_mult;
+        return (core + glow) * intensity;
+    }
+    return 0.0;
+}
+
+fn draw_3d_lightning_bolt(ro: vec3<f32>, u: vec3<f32>, v_cam: vec3<f32>, w: vec3<f32>, p: vec2<f32>, seed: f32, intensity: f32, origin: vec3<f32>, plane_z: f32) -> f32 {
     if (intensity < 0.01) { return 0.0; }
 
     var bolt = 0.0;
     var current_pos = origin;
-    let segments = 12;
-    let seg_h = 8.0 / f32(segments); // Bolt is 8 units tall
+    let segments = 15;
+    let frustum_height = plane_z - ro.z;
+    let bolt_height = frustum_height * 2.4; // Ensure it reaches ground
+    let seg_h = bolt_height / f32(segments);
+    let j_scale = plane_z * 0.15; // Scale jitter with distance
 
-    // Fast bounds check in 3D: if origin is way off screen, skip
-    let origin_proj = project_3d(origin + vec3<f32>(0.0, -4.0, 0.0), ro, u, v_cam, w);
-    if (origin_proj.z > 0.0 && length(origin_proj.xy - p) > (2.0 / origin_proj.z) + 0.5) {
-        // Approximate far glow
-        let d = length(origin_proj.xy - p);
-        return intensity * 0.01 / (d + 0.01);
-    }
+    // Simulate dart leaders and return stroke pulsing via high-frequency flicker
+    let flicker = 0.6 + 0.4 * sin(audio.smooth_time * 60.0 + seed);
+    let main_intensity = intensity * flicker;
+    let branch_intensity = intensity * 0.4; // Stepped leaders are much dimmer
 
     for (var i = 0; i < segments; i = i + 1) {
-        let x_jitter = (hash11(seed + f32(i) * 7.13) - 0.5) * 1.5;
-        let z_jitter = (hash11(seed + f32(i) * 13.7) - 0.5) * 1.5;
-        
+        let f_i = f32(i);
+        let x_jitter = (hash11(seed + f_i * 7.13) - 0.5) * j_scale * 2.5;
+        let z_jitter = (hash11(seed + f_i * 13.7) - 0.5) * j_scale * 2.5;
         let next_pos = current_pos + vec3<f32>(x_jitter, -seg_h, z_jitter);
 
-        let pA = project_3d(current_pos, ro, u, v_cam, w);
-        let pB = project_3d(next_pos, ro, u, v_cam, w);
-        
-        if (pA.z > 0.0 || pB.z > 0.0) {
-            let d = sd_segment(p, pA.xy, pB.xy);
-            let depth = max(0.5, (pA.z + pB.z) * 0.5);
-            let thickness = 0.01 / depth;
+        // 1. Main Return Stroke Channel
+        let thickness = 0.012 + main_intensity * 0.015;
+        bolt += draw_3d_segment(p, ro, u, v_cam, w, current_pos, next_pos, thickness, main_intensity, false);
 
-            bolt += smoothstep(thickness, 0.0, d) * 2.0;
-            bolt += (0.003 / depth) / (d + 0.002);
+        // 2. Stepped Leaders (Primary Branches)
+        // Spawn branches from most nodes to simulate the searching fractal nature
+        if (hash11(seed + f_i * 3.1) > 0.25) {
+            let bx = (hash11(seed + f_i * 8.2) - 0.5) * j_scale * 4.0;
+            let bz = (hash11(seed + f_i * 9.3) - 0.5) * j_scale * 4.0;
+            let branch_pos = current_pos + vec3<f32>(bx, -seg_h * 1.5, bz);
+            
+            bolt += draw_3d_segment(p, ro, u, v_cam, w, current_pos, branch_pos, 0.005, branch_intensity, true);
+            
+            // 3. Sub-branches (Secondary splits from the stepped leaders)
+            if (hash11(seed + f_i * 2.4) > 0.35) {
+                let bx2 = (hash11(seed + f_i * 1.2) - 0.5) * j_scale * 3.0;
+                let bz2 = (hash11(seed + f_i * 4.3) - 0.5) * j_scale * 3.0;
+                let branch_pos2 = branch_pos + vec3<f32>(bx2, -seg_h * 1.2, bz2);
+                bolt += draw_3d_segment(p, ro, u, v_cam, w, branch_pos, branch_pos2, 0.003, branch_intensity * 0.6, true);
+            }
+        }
+        
+        // 4. Major splits (connecting leaders that travel alongside the main channel)
+        if (i == 3 || i == 8) {
+            var split_pos = current_pos;
+            for (var j = 0; j < 4; j = j + 1) {
+                let f_j = f32(j);
+                let sx = (hash11(seed + f_i * 5.0 + f_j) - 0.5) * j_scale * 3.0;
+                let sz = (hash11(seed + f_i * 6.0 + f_j) - 0.5) * j_scale * 3.0;
+                let next_split = split_pos + vec3<f32>(sx, -seg_h * 1.1, sz);
+                bolt += draw_3d_segment(p, ro, u, v_cam, w, split_pos, next_split, 0.007, branch_intensity * 1.5, true);
+                split_pos = next_split;
+            }
         }
 
         current_pos = next_pos;
     }
 
-    return bolt * intensity;
+    return bolt;
 }
 
 @fragment
@@ -83,7 +135,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let dx = dpdx(in.uv.x);
     let dy = dpdy(in.uv.y);
     let aspect = dy / max(dx, 0.00001);
-    let safe_aspect = select(1.0, aspect, aspect > 0.0001 || aspect < -0.0001);
+    let safe_aspect = select(1.0, aspect, abs(aspect) > 0.0001);
     let p = vec2<f32>(uv.x * safe_aspect, -uv.y); // p.y is +1 at top, -1 at bottom
 
     let bass = max(audio.spectrum[0].x, audio.spectrum[1].x);
@@ -102,6 +154,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let rd = normalize(w + p.x * u + p.y * v_cam);
 
     var color = vec3<f32>(0.0);
+    var total_flash = 0.0;
 
     // Sky background
     let sky_t = clamp(rd.y * 0.5 + 0.5, 0.0, 1.0); 
@@ -111,7 +164,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     color = mix(sky_dark, mix(sky_mid, sky_top, sky_t), sky_t);
 
     // Three 3D planes for rain and lightning
-    let z_layers = array<f32, 3>(16.0, 10.0, 4.0); // Far (Bass), Mid, Near (Treble)
+    let z_layers = array<f32, 3>(18.0, 11.0, 6.5); // Far (Bass), Mid, Near (Treble)
     let layer_colors = array<vec3<f32>, 3>(
         vec3<f32>(0.4, 0.5, 1.0),  // Deep blue
         vec3<f32>(0.7, 0.4, 1.0),  // Purple
@@ -122,25 +175,43 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         smoothstep(0.5, 1.0, mid),
         smoothstep(0.4, 0.9, treble)
     );
+    let layer_speeds = array<f32, 3>(8.0, 11.0, 15.0);
+    let layer_scales = array<f32, 3>(6.0, 3.5, 2.0);
+    let layer_base_brightness = array<f32, 3>(0.05, 0.25, 0.6);
 
-    for (var i = 0; i < 3; i++) {
+    for (var i = 0; i < 3; i = i + 1) {
         let plane_z = z_layers[i];
         let layer_col = layer_colors[i];
         let intensity = layer_intensities[i];
         
         // Render 3D Lightning for this layer
-        if (intensity > 0.05) {
-            let bolt_seed = floor(audio.smooth_time * 5.0) + f32(i) * 13.37;
-            let origin_x = (hash11(bolt_seed) - 0.5) * 15.0; // Spread horizontally
-            let origin = vec3<f32>(origin_x, 8.0, plane_z); // Start high up
+        // Lock lightning to discrete time windows so the geometry is stable during an audio transient.
+        let interval = 0.35; // 350ms strike window
+        let time_window = floor(audio.smooth_time / interval);
+        let strike_chance = hash11(time_window + f32(i) * 17.3);
+        
+        // Far layer (i=0) strikes more often. Near layer (i=2) needs higher chance.
+        let chance_threshold = 0.25 + f32(i) * 0.2; 
+        
+        if (strike_chance > chance_threshold && intensity > 0.05) {
+            let bolt_seed = time_window + f32(i) * 13.37;
+            let frustum_height = plane_z - ro.z;
+            let frustum_width = safe_aspect * frustum_height * 2.0;
+            let origin_x = (hash11(bolt_seed) - 0.5) * frustum_width * 1.5; // Spread horizontally
+            let origin_y = ro.y + frustum_height * 1.2;
+            let origin = vec3<f32>(origin_x, origin_y, plane_z); // Start above top of screen
             
-            let bolt = draw_3d_lightning_bolt(ro, u, v_cam, w, p, bolt_seed, intensity, origin);
-            color += layer_col * bolt;
+            let bolt = draw_3d_lightning_bolt(ro, u, v_cam, w, p, bolt_seed, intensity, origin, plane_z);
+            color += vec3<f32>(1.0) * bolt * (0.65 + intensity * 0.4);
+            total_flash += bolt * 0.45;
             
-            if (intensity > 0.4) {
-                let origin2 = origin + vec3<f32>((hash11(bolt_seed + 100.0) - 0.5) * 4.0, -1.0, 0.0);
-                let bolt2 = draw_3d_lightning_bolt(ro, u, v_cam, w, p, bolt_seed + 50.0, intensity * 0.4, origin2);
-                color += layer_col * bolt2;
+            // Secondary parallel strike (rare)
+            if (intensity > 0.4 && hash11(bolt_seed + 7.7) > 0.6) {
+                let origin2_x = origin_x + (hash11(bolt_seed + 100.0) - 0.5) * frustum_width * 0.3;
+                let origin2 = vec3<f32>(origin2_x, origin_y, plane_z);
+                let bolt2 = draw_3d_lightning_bolt(ro, u, v_cam, w, p, bolt_seed + 50.0, intensity * 0.38, origin2, plane_z);
+                color += vec3<f32>(1.0) * bolt2 * 0.28;
+                total_flash += bolt2 * 0.18;
             }
         }
 
@@ -151,14 +222,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let pos = ro + rd * t;
             // pos.xy is the 2D coordinate on the rain plane
             
-            let scale_x = 3.0;
-            let scale_y = 1.0;
-            let speed = 10.0;
-            let wind_slant = 0.05;
-            let wind_sway = sin(audio.smooth_time * 0.3) * 1.5;
+            let scale_x = layer_scales[i];
+            let scale_y = 1.0 + f32(i) * 0.18;
+            let speed = layer_speeds[i];
+            let wind_slant = 0.08 + f32(i) * 0.03;
+            let wind_sway = sin(audio.smooth_time * (0.25 + f32(i) * 0.08) + f32(i) * 1.7) * 1.8;
             
             var rain_uv = vec2<f32>(
-                pos.x * scale_x + f32(i) * 13.7 + pos.y * wind_slant * scale_x + wind_sway,
+                pos.x * scale_x + f32(i) * 10.2 + pos.y * wind_slant * scale_x + wind_sway,
                 pos.y * scale_y + audio.smooth_time * speed
             );
             
@@ -169,25 +240,27 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             
             let rnd = hash22(cell_id + f32(i) * 100.0);
             let drop_x = (rnd.x - 0.5) * 0.6;
-            let visible = step(0.45, rnd.y); 
+            let visible = step(0.45, rnd.y);
             
             let dx_drop = abs(cell_uv.x - drop_x);
-            let streak_width = 0.02;
+            let streak_width = 0.02 + f32(i) * 0.003;
             let streak = smoothstep(streak_width, 0.0, dx_drop);
             
-            let drop_length = 0.3 + rnd.x * 0.15;
-            let head = smoothstep(-drop_length, -drop_length + 0.05, cell_uv.y);
-            let tail = smoothstep(drop_length, -drop_length, cell_uv.y);
+            let drop_line = cell_uv.y + cell_uv.x * 0.35;
+            let drop_length = 0.25 + rnd.x * 0.24 + f32(i) * 0.08;
+            let head = smoothstep(-0.05, 0.0, drop_line);
+            let tail = smoothstep(drop_length, -0.08, drop_line);
             let vert = head * tail;
             
-            // Fade out based on distance and Y height
-            let fog = exp(-t * 0.05);
-            let drop = streak * vert * visible * fog;
-            
-            let rain_brightness = 0.25 + intensity * 0.4;
+            let drop = streak * vert * visible;
+            let rain_brightness = layer_base_brightness[i] + intensity * 0.55;
             color += layer_col * drop * rain_brightness;
+            color += vec3<f32>(1.0) * drop * intensity * 0.08;
         }
     }
+
+    let flash = clamp(total_flash, 0.0, 1.0);
+    color += vec3<f32>(0.85, 0.9, 1.0) * flash * 0.28;
 
     // Film grain
     let grain = (hash12(in.clip_position.xy + fract(audio.smooth_time) * 137.0) - 0.5) * 0.03;

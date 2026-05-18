@@ -45,7 +45,7 @@ fn terrain_h(wx: f32, wz: f32) -> f32 {
     
     // Scale height based on distance from camera to create a vanishing point
     // This prevents tall peaks from abruptly popping in at the raymarch distance limit
-    let cam_z = audio.time * 15.0;
+    let cam_z = audio.smooth_time * 15.0;
     let dist_z = max(wz - cam_z, 0.0);
     let horizon_fade = smoothstep(220.0, 60.0, dist_z);
     
@@ -97,7 +97,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let sun_dist = length(p - sun_pos);
     let sun_radius = 0.35;
     if (sun_dist < sun_radius && p.y > -0.05) {
-        let cut = fract((p.y - sun_pos.y) * 20.0 - audio.time * 0.8);
+        let cut = fract((p.y - sun_pos.y) * 20.0 - audio.smooth_time * 0.8);
         let cut_threshold = mix(0.3, 0.9, clamp((p.y - sun_pos.y + 0.2) * 2.5, 0.0, 1.0));
         if (cut > cut_threshold || p.y > sun_pos.y + 0.05) {
             let sun_t = clamp((p.y - sun_pos.y + 0.2) * 2.0, 0.0, 1.0);
@@ -108,7 +108,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // --- Clouds ---
     if (p.y > 0.0 && p.y < 0.8) {
-        let cu = vec2<f32>(p.x * 2.0 + audio.time * 0.015, (p.y - 0.05) * 4.0);
+        let cu = vec2<f32>(p.x * 2.0 + audio.smooth_time * 0.015, (p.y - 0.05) * 4.0);
         let cloud = noise2d(cu * 2.5) * 0.6 + noise2d(cu * 5.0 + vec2<f32>(3.7, 1.2)) * 0.4;
         let alt_mask = smoothstep(0.0, 0.15, p.y) * smoothstep(0.7, 0.2, p.y);
         let cloud_alpha = smoothstep(0.4, 0.6, cloud) * alt_mask * 0.55;
@@ -118,7 +118,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // --- 3D Terrain raymarcher ---
     let cam_y = 1.5;
-    let cam_fwd = audio.time * 15.0;
+    let cam_fwd = audio.smooth_time * 15.0;
     let ro = vec3<f32>(0.0, cam_y, cam_fwd);
     let rd = normalize(vec3<f32>(p.x * 1.5, p.y - 0.3, 1.0));
     let sun_dir = normalize(vec3<f32>(0.0, 0.6, -1.0)); // Sun light direction
@@ -138,7 +138,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let road_half = 4.0;
 
     // Coarse raymarcher: find interval where ray crosses terrain
-    for (var i = 0; i < 350; i = i + 1) {
+    for (var i = 0; i < 450; i = i + 1) {
         let pos = ro + rd * t_ray;
         let th = terrain_h(pos.x, pos.z);
 
@@ -168,8 +168,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
         prev_t = t_ray;
         let margin = pos.y - th;
-        // Tighter stepping to prevent shooting through high-frequency jagged peaks
-        t_ray += max(0.03, min(margin * 0.15, t_ray * 0.015));
+        // Relaxed stepping to prevent over-iteration while avoiding thin peaks
+        t_ray += max(0.04, margin * 0.35) + t_ray * 0.01;
         if (t_ray > 250.0) { break; }
     }
 
