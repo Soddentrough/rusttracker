@@ -8,132 +8,160 @@
 //   - Use wider bloom to compensate for fewer segments
 //   - Total: 3 frames × 64 segments = 192 sdLine calls per pixel (vs 12,288 before)
 
-@group(0) @binding(0)
-var<uniform> audio: AudioUniforms;
 
-@group(0) @binding(1)
-var<storage, read> waveform_history: array<f32>;
+@group(0) @binding(0) var<uniform> audio: AudioUniforms;
+@group(0) @binding(2) var history_tex: texture_2d<f32>;
+@group(2) @binding(0) var<uniform> camera: CameraUniforms;
 
-fn get_waveform(hist_idx: u32, idx: u32) -> f32 {
-    let res = max(audio.waveform_resolution, 128u);
-    let clamped_idx = clamp(idx % res, 0u, res - 1u);
-    return waveform_history[hist_idx * 2048u + clamped_idx];
+struct CameraUniforms {
+    view_matrix: mat4x4<f32>,
+    proj_matrix: mat4x4<f32>,
 }
 
-// Linearly interpolated waveform read for smoother curves
-fn get_waveform_lerp(hist_idx: u32, t: f32, res: u32) -> f32 {
-    let fi = t * f32(res - 1u);
-    let i0 = u32(fi);
-    let i1 = min(i0 + 1u, res - 1u);
-    let frac = fract(fi);
-    return mix(get_waveform(hist_idx, i0), get_waveform(hist_idx, i1), frac);
+struct VertexInput {
+    @location(0) position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) tex_coords: vec2<f32>,
 }
 
-fn sdLine(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
-    let pa = p - a;
-    let ba = b - a;
-    let h = clamp(dot(pa, ba) / dot(ba, ba), 0.0, 1.0);
-    return length(pa - ba * h);
+struct VertexOutput3D {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) uv: vec2<f32>,
+    @location(1) world_pos: vec3<f32>,
+    @location(2) normal: vec3<f32>,
+    @location(3) audio_hit: f32,
 }
 
-fn hash21(p: vec2<f32>) -> f32 {
-    var p3 = fract(vec3<f32>(p.xyx) * 0.1031);
-    p3 = p3 + dot(p3, p3.yzx + 33.33);
-    return fract((p3.x + p3.y) * p3.z);
+fn get_knot_path(t: f32) -> vec3<f32> {
+    let p = 3.0; // Number of loops around the axis of rotational symmetry
+    let q = 7.0; // Number of loops through the hole of the torus
+    
+    // Animate the knot structure subtly
+    let time = audio.smooth_time * 0.5;
+    let r1 = 3.0 + sin(time * 0.7) * 0.5;
+    let r2 = 1.2 + cos(time * 0.9) * 0.3;
+    
+    let phi = p * t + time;
+    let theta = q * t;
+    
+    let r = r1 + r2 * cos(theta);
+    let x = r * cos(phi);
+    let z = r * sin(phi);
+    let y = r2 * sin(theta);
+    
+    return vec3<f32>(x, y, z);
+}
+
+@vertex
+fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
+    var out: VertexOutput3D;
+    
+    let u = in.tex_coords.x; // 0 to 1 along the knot
+    let v = in.tex_coords.y; // 0 to 1 around the tube
+    
+    let t = u * 3.14159265 * 2.0;
+    let theta = v * 3.14159265 * 2.0;
+    
+    // Sample audio history based on position along the knot
+    let history_depth = u32(fract(u * 3.0) * 119.0); // wrap history 3 times around knot
+    let tex_y = (audio.heatmap_row + 120u - history_depth) % 120u;
+    
+    // Sample a low-mid frequency bin for the pulse
+    let hit_val = textureLoad(history_tex, vec2<i32>(5, i32(tex_y)), 0).x;
+    let clamped_hit = clamp(hit_val, 0.0, 1.5);
+    
+    // Tube radius pulses with the music safely
+    let radius = 0.15 + clamped_hit * 0.4;
+    
+    // Calculate tangent, normal, binormal for tube extrusion
+    let e = 0.01;
+    let p0 = get_knot_path(t);
+    let p1 = get_knot_path(t + e);
+    let tangent = normalize(p1 - p0);
+    
+    var up = vec3<f32>(0.0, 1.0, 0.0);
+    if (abs(tangent.y) > 0.99) {
+        up = vec3<f32>(1.0, 0.0, 0.0);
+    }
+    
+    let normal_dir = normalize(cross(tangent, up));
+    let binormal = cross(normal_dir, tangent);
+    
+    let tube_offset = (normal_dir * cos(theta) + binormal * sin(theta));
+    let final_pos = p0 + tube_offset * radius;
+    
+    out.world_pos = final_pos;
+    out.normal = normalize(tube_offset);
+    out.uv = in.tex_coords;
+    out.audio_hit = hit_val;
+    
+    // Rotate the whole knot in front of the camera
+    let rot_time = audio.smooth_time * 0.1;
+    let c = cos(rot_time);
+    let s = sin(rot_time);
+    let rot_mat = mat3x3<f32>(
+        c, 0.0, s,
+        0.0, 1.0, 0.0,
+        -s, 0.0, c
+    );
+    
+    // Push the knot into the view space
+    let world_pos = rot_mat * final_pos + vec3<f32>(0.0, 1.5, -6.0); // Center in front of camera
+    
+    out.clip_position = camera.proj_matrix * camera.view_matrix * vec4<f32>(world_pos, 1.0);
+    return out;
 }
 
 @fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    // CRT barrel distortion
-    let crt_uv = in.uv * 2.0 - 1.0;
-    let r2 = dot(crt_uv, crt_uv);
-    let distorted = crt_uv * (1.0 + r2 * 0.04);
-    let final_uv = distorted * 0.5 + 0.5;
-
-    let dx = dpdx(in.uv.x);
-    let dy = dpdy(in.uv.y);
-    let aspect = dy / max(dx, 0.00001);
-    let safe_aspect = select(1.0, aspect, aspect > 0.0001 || aspect < -0.0001);
-
-    let p = vec2<f32>((final_uv.x * 2.0 - 1.0) * safe_aspect, -(final_uv.y * 2.0 - 1.0));
-
-    let res = max(audio.waveform_resolution, 128u);
-
-    // --- Fixed 64 output segments regardless of waveform resolution ---
-    let num_segments = 64u;
-    let sample_step = f32(res) / f32(num_segments);
-
-    // Phase offset: quarter-wave with slow evolution for interesting patterns
-    let phase_frac = 0.25 + 0.1 * sin(audio.time * 0.2);
-
-    // Cheap adaptive gain: estimate RMS from 16 evenly-spaced samples of current frame
-    // This runs once per pixel but only does 16 reads (negligible vs the 192 in the main loop)
-    var rms_sum = 0.0;
-    for (var s = 0u; s < 16u; s = s + 1u) {
-        let v = get_waveform(0u, s * (res / 16u));
-        rms_sum += v * v;
-    }
-    let rms = sqrt(rms_sum / 16.0);
-    // Scale up quiet signals, limit loud ones — target ~0.6 screen coverage
-    let gain = clamp(0.55 / max(rms, 0.02), 0.4, 6.0);
-
-    var color = vec3<f32>(0.0);
-
-    // --- Only 3 trail frames: current + 2 fading ---
-    let trail_count = min(audio.waveform_history_size, 3u);
-
-    for (var frame = 0u; frame < trail_count; frame = frame + 1u) {
-        // Phosphor decay: current frame bright, older frames fade fast
-        let age = exp(-f32(frame) * 1.2);
-
-        var min_dist = 100.0;
-
-        for (var seg = 0u; seg < num_segments; seg = seg + 1u) {
-            let t0 = f32(seg) / f32(num_segments);
-            let t1 = f32(seg + 1u) / f32(num_segments);
-
-            // X from phase-shifted waveform, Y from direct waveform
-            let phase_off = phase_frac;
-            let x0 = get_waveform_lerp(frame, fract(t0 + phase_off), res) * gain;
-            let y0 = get_waveform_lerp(frame, t0, res) * gain;
-            let x1 = get_waveform_lerp(frame, fract(t1 + phase_off), res) * gain;
-            let y1 = get_waveform_lerp(frame, t1, res) * gain;
-
-            let a = vec2<f32>(x0 * safe_aspect, y0);
-            let b = vec2<f32>(x1 * safe_aspect, y1);
-
-            let d = sdLine(p, a, b);
-            min_dist = min(min_dist, d);
-        }
-
-        // Thin bright core + wide bloom
-        let core = smoothstep(0.008, 0.0, min_dist) * 1.5;
-        let bloom = 0.0003 / (min_dist * min_dist + 0.0003);
-        let halation = exp(-min_dist * 30.0) * 0.08;
-
-        let frame_intensity = (core + bloom + halation) * age;
-
-        // Green laser phosphor, older frames shift slightly dimmer/cooler
-        let phosphor = mix(vec3<f32>(0.15, 1.0, 0.3), vec3<f32>(0.05, 0.6, 0.2), f32(frame) * 0.3);
-        color += phosphor * frame_intensity;
-    }
-
-    // --- CRT scanlines ---
-    let scanline = 0.9 + 0.1 * cos(in.clip_position.y * 3.14159);
-    color *= scanline;
-
-    // --- CRT bezel vignette ---
-    let r = length(crt_uv);
-    let bezel = smoothstep(1.4, 0.85, r);
-    color *= bezel;
-
-    // --- Faint analog static ---
-    let noise_val = hash21(in.clip_position.xy + fract(audio.smooth_time) * 137.0);
-    color += vec3<f32>(0.03, 0.06, 0.03) * noise_val * 0.015 * bezel;
-
-    // ACES tonemapping
-    var final_col = (color * (2.51 * color + 0.03)) / (color * (2.43 * color + 0.59) + 0.14);
-    final_col = max(final_col, vec3<f32>(0.0));
-
-    return vec4<f32>(final_col, 1.0);
+fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
+    // Laser oscilloscope aesthetic
+    let n = normalize(in.normal);
+    let cam_eye = vec3<f32>(0.0, 1.5, -2.0);
+    let view_dir = normalize(cam_eye - in.world_pos);
+    
+    // Lighting
+    let l1 = normalize(vec3<f32>(1.0, 1.0, 1.0));
+    let l2 = normalize(vec3<f32>(-1.0, -0.5, 0.5));
+    
+    let diff1 = max(dot(n, l1), 0.0);
+    let diff2 = max(dot(n, l2), 0.0);
+    
+    let half1 = normalize(l1 + view_dir);
+    let spec1 = pow(max(dot(n, half1), 0.0), 64.0);
+    
+    // Fresnel edge glow
+    let fresnel = pow(1.0 - max(dot(n, view_dir), 0.0), 3.0);
+    
+    // Laser wireframe grid
+    let u_lines = smoothstep(0.3, 0.5, abs(fract(in.uv.x * 50.0) - 0.5));
+    let v_lines = smoothstep(0.3, 0.5, abs(fract(in.uv.y * 12.0) - 0.5));
+    let grid = max(u_lines, v_lines);
+    
+    let base_color = vec3<f32>(0.01, 0.05, 0.02);
+    let laser_color = vec3<f32>(0.1, 1.0, 0.3); // Bright neon green
+    let hot_color = vec3<f32>(1.0, 1.0, 0.8);   // White hot peaks
+    
+    let safe_hit = clamp(in.audio_hit, 0.0, 1.0);
+    let hit_color = mix(laser_color, hot_color, safe_hit);
+    
+    // Combine surface colors
+    var color = mix(base_color, hit_color, grid * 0.8);
+    
+    // Add specular highlights and rim lighting
+    color += hit_color * spec1 * 2.0;
+    color += hit_color * fresnel * (0.5 + safe_hit);
+    
+    // Inner pulse
+    let pulse = smoothstep(0.8, 1.0, sin(in.uv.x * 100.0 - audio.smooth_time * 10.0));
+    color += laser_color * pulse * 2.0;
+    
+    // Distance fog (relative to camera eye)
+    let dist = length(in.world_pos - cam_eye);
+    let fog = smoothstep(3.0, 12.0, dist);
+    color = mix(color, vec3<f32>(0.0, 0.0, 0.0), fog);
+    
+    // Tonemapping for bloom-like oversaturation
+    color = (color * (2.51 * color + 0.03)) / (color * (2.43 * color + 0.59) + 0.14);
+    
+    return vec4<f32>(color, 1.0);
 }

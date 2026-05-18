@@ -142,11 +142,13 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
         let sun_dist = length(p - sun_pos);
         let sun_radius = 0.35;
         
-        // Sun glow
-        color += vec3<f32>(0.4, 0.1, 0.2) * exp(-sun_dist * 2.5) * 0.25;
+        // Sun glow (pulses with mid-frequency energy)
+        let mid_energy = clamp(audio.spectrum[20].x * 0.8, 0.0, 1.0);
+        color += vec3<f32>(0.4, 0.1, 0.2) * exp(-sun_dist * 2.5) * (0.25 + mid_energy * 0.35);
         
         if (sun_dist < sun_radius && p.y > -0.05) {
-            let cut = fract((p.y - sun_pos.y) * 20.0 - audio.smooth_time * 0.8);
+            let bass_pulse = clamp(audio.spectrum[2].x, 0.0, 1.0);
+            let cut = fract((p.y - sun_pos.y) * 20.0 - audio.smooth_time * (0.8 + bass_pulse * 1.5));
             let cut_width = 0.3 + (p.y - sun_pos.y) * 0.5;
             if (cut > cut_width) {
                 let glow = exp(-(cut - cut_width) * 10.0) * vec3<f32>(1.0, 0.5, 0.0);
@@ -176,11 +178,12 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
         let grid = max(grid_x, grid_z);
         let speed_stripe = smoothstep(0.9, 1.0, fract(in.world_pos.z * 0.1));
         let base_c = vec3<f32>(0.02, 0.0, 0.05);
-        let line_c = mix(vec3<f32>(0.0, 0.5, 1.0), vec3<f32>(1.0, 0.0, 0.8), speed_stripe);
+        let road_pulse = clamp(audio.spectrum[4].x * 0.5, 0.0, 1.0);
+        let line_c = mix(vec3<f32>(0.0, 0.5, 1.0), vec3<f32>(1.0, 0.0, 0.8), speed_stripe) * (0.7 + road_pulse * 0.6);
         color = mix(base_c, line_c, grid);
         
         let edge = smoothstep(road_half - 0.5, road_half + 0.5, abs(in.world_pos.x));
-        color += vec3<f32>(1.0, 0.2, 0.8) * edge * 2.0;
+        color += vec3<f32>(1.0, 0.2, 0.8) * edge * (1.5 + road_pulse * 1.0);
     } else {
         let n = in.world_normal;
         let l = normalize(vec3<f32>(-0.5, 0.8, -0.3));

@@ -1113,14 +1113,18 @@ impl AudioSource for VideoOnlySource {
     }
 }
 
-fn try_ffmpeg(file_path: &str) -> Result<Box<dyn AudioSource>> {
+fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>> {
     let _ = ffmpeg_next::init();
     let mut dict = ffmpeg_next::Dictionary::new();
     dict.set("probesize", "5000000");
     dict.set("analyzeduration", "5000000");
     let ictx = ffmpeg_next::format::input_with_dictionary(&file_path, dict).context("Failed to open file via libavformat")?;
     
-    let duration = ictx.duration() as f64 / ffmpeg_next::ffi::AV_TIME_BASE as f64;
+    let mut duration = ictx.duration() as f64 / ffmpeg_next::ffi::AV_TIME_BASE as f64;
+    if is_network || duration < 0.0 {
+        duration = 0.0;
+    }
+    
     let ext = std::path::Path::new(file_path)
         .extension()
         .and_then(|s| s.to_str())
@@ -1261,6 +1265,44 @@ fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(file: R, probe_e
 }
 
 pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
+    let _ = ffmpeg_next::format::network::init();
+
+    let mut actual_path = file_path.to_string();
+    if actual_path.starts_with("http") {
+        if let Ok(mut resp) = ureq::get(&actual_path).call() {
+            let content_type = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_lowercase();
+            if content_type.contains("audio/x-scpls") || actual_path.ends_with(".pls") {
+                let mut body = String::new();
+                use std::io::Read;
+                if resp.body_mut().as_reader().read_to_string(&mut body).is_ok() {
+                    for line in body.lines() {
+                        if line.starts_with("File1=") {
+                            actual_path = line.trim_start_matches("File1=").to_string();
+                            break;
+                        }
+                    }
+                }
+            } else if content_type.contains("mpegurl") || actual_path.ends_with(".m3u") || actual_path.ends_with(".m3u8") {
+                 let mut body = String::new();
+                 use std::io::Read;
+                 if resp.body_mut().as_reader().read_to_string(&mut body).is_ok() {
+                     for line in body.lines() {
+                         if !line.starts_with('#') && line.trim().starts_with("http") {
+                             actual_path = line.trim().to_string();
+                             break;
+                         }
+                     }
+                 }
+            }
+        }
+        
+        let ffmpeg_result = try_ffmpeg(&actual_path, true);
+        if let Ok(source) = ffmpeg_result {
+            return Ok(source);
+        }
+        return Err(anyhow::anyhow!("Failed to open network stream"));
+    }
+
     let ext = std::path::Path::new(file_path)
         .extension()
         .and_then(|s| s.to_str())
@@ -1272,7 +1314,7 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
     // 1. Prioritize FFmpeg for video containers (MKV, MP4) to ensure video streams are processed.
     // Symphonia might successfully parse the audio in these containers but would ignore the video.
     if ext == "mkv" || ext == "mp4" {
-        if let Ok(source) = try_ffmpeg(file_path) {
+        if let Ok(source) = try_ffmpeg(file_path, false) {
             return Ok(source);
         }
         // Fallback to Symphonia if FFmpeg fails
@@ -1325,7 +1367,7 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
     }
 
     // 4. Try FFmpeg native bindings
-    let ffmpeg_result = try_ffmpeg(file_path);
+    let ffmpeg_result = try_ffmpeg(file_path, false);
     if let Ok(source) = ffmpeg_result {
         return Ok(source);
     }

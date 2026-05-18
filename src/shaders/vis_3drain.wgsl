@@ -226,7 +226,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let scale_y = 1.0 + f32(i) * 0.18;
             let speed = layer_speeds[i];
             let wind_slant = 0.08 + f32(i) * 0.03;
-            let wind_sway = sin(audio.smooth_time * (0.25 + f32(i) * 0.08) + f32(i) * 1.7) * 1.8;
+            let wind_sway = sin(audio.smooth_time * (0.25 + f32(i) * 0.08) + f32(i) * 1.7) * (1.8 + bass * 2.0);
             
             var rain_uv = vec2<f32>(
                 pos.x * scale_x + f32(i) * 10.2 + pos.y * wind_slant * scale_x + wind_sway,

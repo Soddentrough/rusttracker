@@ -60,6 +60,10 @@ pub enum EngineAction {
     VisPickerEnableAll,
     SeekWithScrub(f32, f64),
     VisPickerEnableNone,
+    OpenUrlDialog,
+    CloseUrlDialog,
+    SetUrlInput(String),
+    LoadUrl(String),
 }
 
 #[repr(C)]
@@ -1804,6 +1808,35 @@ impl<'a> VulkanEngine<'a> {
         }
         
         let full_output = egui_ctx.run_ui(raw_input, |ctx| {
+            if state.is_url_dialog_open {
+                egui::Window::new("Open Network Stream")
+                    .collapsible(false)
+                    .resizable(false)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.label("Enter Stream URL (e.g. .pls, .m3u, or direct stream link):");
+                        let mut url_text = state.url_input_text.clone();
+                        let text_resp = ui.add_sized([400.0, 30.0], egui::TextEdit::singleline(&mut url_text));
+                        if text_resp.changed() {
+                            engine_action = EngineAction::SetUrlInput(url_text.clone());
+                        }
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            ui.allocate_ui_with_layout(ui.available_size(), egui::Layout::centered_and_justified(egui::Direction::LeftToRight), |ui| {
+                                if ui.button("Cancel").clicked() {
+                                    engine_action = EngineAction::CloseUrlDialog;
+                                }
+                                if ui.button("Open").clicked() || (text_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                                    if !url_text.is_empty() {
+                                        engine_action = EngineAction::LoadUrl(url_text);
+                                    }
+                                }
+                            });
+                        });
+                    });
+            }
+
+
             if state.show_stats {
                 egui::Window::new("Stats")
                     .anchor(egui::Align2::RIGHT_TOP, [-10.0, 10.0])
@@ -2567,18 +2600,38 @@ impl<'a> VulkanEngine<'a> {
                                     .shadow(egui::Shadow { offset: [0, 4], blur: 12, spread: 0, color: egui::Color32::from_black_alpha(200) })
                                     .corner_radius(6.0)
                                     .show(ui, |ui| {
-                                        let btn = egui::Button::new(
-                                            egui::RichText::new("  OPEN AUDIO FILE  ")
-                                                .size(24.0)
-                                                .color(egui::Color32::WHITE)
-                                                .strong()
-                                        )
-                                        .fill(egui::Color32::from_rgb(0, 100, 200))
-                                        .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 180, 255)));
-                                        
-                                        if ui.add_sized([350.0, 60.0], btn).clicked() {
-                                            engine_action = EngineAction::OpenFile;
-                                        }
+                                        ui.horizontal(|ui| {
+                                            let total_width = 300.0 + 20.0 + 250.0;
+                                            ui.add_space((ui.available_width() - total_width) / 2.0);
+                                            
+                                            let btn = egui::Button::new(
+                                                egui::RichText::new("  OPEN AUDIO FILE  ")
+                                                    .size(24.0)
+                                                    .color(egui::Color32::WHITE)
+                                                    .strong()
+                                            )
+                                            .fill(egui::Color32::from_rgb(0, 100, 200))
+                                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 180, 255)));
+                                            
+                                            if ui.add_sized([300.0, 60.0], btn).clicked() {
+                                                engine_action = EngineAction::OpenFile;
+                                            }
+                                            
+                                            ui.add_space(20.0);
+                                            
+                                            let url_btn = egui::Button::new(
+                                                egui::RichText::new("  OPEN URL  ")
+                                                    .size(24.0)
+                                                    .color(egui::Color32::WHITE)
+                                                    .strong()
+                                            )
+                                            .fill(egui::Color32::from_rgb(100, 50, 150))
+                                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 80, 255)));
+                                            
+                                            if ui.add_sized([250.0, 60.0], url_btn).clicked() {
+                                                engine_action = EngineAction::OpenUrlDialog;
+                                            }
+                                        });
                                     });
                                 
                                 ui.add_space(30.0);
@@ -2997,6 +3050,7 @@ impl<'a> VulkanEngine<'a> {
                     }
                 }
             });
+
         });
 
         let scale = window.scale_factor() as f32;

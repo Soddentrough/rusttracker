@@ -794,6 +794,23 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                     state.vis_enabled[i] = i == 0;
                                 }
                             }
+                            EngineAction::OpenUrlDialog => {
+                                state.is_url_dialog_open = true;
+                            }
+                            EngineAction::CloseUrlDialog => {
+                                state.is_url_dialog_open = false;
+                            }
+                            EngineAction::SetUrlInput(url) => {
+                                state.url_input_text = url;
+                            }
+                            EngineAction::LoadUrl(url) => {
+                                state.is_url_dialog_open = false;
+                                state.url_input_text.clear();
+                                state.playlist = vec![url.clone()];
+                                state.playlist_index = 0;
+                                state.load_request = Some(url);
+                                state.file_loaded = true;
+                            }
                             EngineAction::None => {}
                         }
                         
