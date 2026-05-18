@@ -149,6 +149,34 @@ pub struct VideoState {
     pub color_trc: u32,
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct CameraUniforms {
+    pub view_matrix: [[f32; 4]; 4],
+    pub proj_matrix: [[f32; 4]; 4],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Vertex {
+    pub position: [f32; 3],
+    pub normal: [f32; 3],
+    pub tex_coords: [f32; 2],
+}
+
+impl Vertex {
+    pub const ATTRIBUTES: [wgpu::VertexAttribute; 3] =
+        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2];
+
+    pub fn desc<'a>() -> wgpu::VertexBufferLayout<'a> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBUTES,
+        }
+    }
+}
+
 pub struct VulkanEngine<'a> {
     surface: wgpu::Surface<'a>,
     device: wgpu::Device,
@@ -223,6 +251,13 @@ pub struct VulkanEngine<'a> {
     video_bind_group_layout: wgpu::BindGroupLayout,
     video_pipeline: wgpu::RenderPipeline,
     video_state: Option<VideoState>,
+    
+    // 3D Engine Extensions
+    camera_uniform_buffer: wgpu::Buffer,
+    camera_bind_group: wgpu::BindGroup,
+    grid_vertex_buffer: wgpu::Buffer,
+    grid_index_buffer: wgpu::Buffer,
+    grid_index_count: u32,
 }
 
 impl<'a> VulkanEngine<'a> {
@@ -356,7 +391,7 @@ impl<'a> VulkanEngine<'a> {
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
@@ -376,7 +411,7 @@ impl<'a> VulkanEngine<'a> {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         sample_type: wgpu::TextureSampleType::Float { filterable: false },
                         view_dimension: wgpu::TextureViewDimension::D2,
@@ -471,9 +506,29 @@ impl<'a> VulkanEngine<'a> {
             ],
         });
 
+        let camera_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Camera Bind Group Layout"),
+            entries: &[wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
         let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Render Pipeline Layout"),
             bind_group_layouts: &[Some(&bind_group_layout), Some(&smoke_render_layout)],
+            immediate_size: 0,
+        });
+
+        let render_pipeline_layout_3d = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("3D Render Pipeline Layout"),
+            bind_group_layouts: &[Some(&bind_group_layout), Some(&smoke_render_layout), Some(&camera_bind_group_layout)],
             immediate_size: 0,
         });
 
@@ -566,6 +621,7 @@ impl<'a> VulkanEngine<'a> {
         let _ = scope_fallback.pop().await;
 
         for (i, source) in shader_sources.iter().enumerate() {
+            let vis_def = &crate::state::VISUALIZERS[i];
             let scope_main = device.push_error_scope(wgpu::ErrorFilter::Validation);
             
             let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -573,13 +629,44 @@ impl<'a> VulkanEngine<'a> {
                 source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(source.as_str())),
             });
             
+            let (layout, vertex_buffers, primitive, vs_entry) = match vis_def.pipeline_type {
+                crate::state::PipelineType::FullscreenQuad => (
+                    &render_pipeline_layout,
+                    Vec::new(),
+                    wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        strip_index_format: None,
+                        front_face: wgpu::FrontFace::Ccw,
+                        cull_mode: None,
+                        polygon_mode: wgpu::PolygonMode::Fill,
+                        unclipped_depth: false,
+                        conservative: false,
+                    },
+                    "vs_main"
+                ),
+                crate::state::PipelineType::Mesh3D(_) => (
+                    &render_pipeline_layout_3d,
+                    vec![Vertex::desc()],
+                    wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        strip_index_format: None,
+                        front_face: wgpu::FrontFace::Ccw,
+                        cull_mode: None,
+                        polygon_mode: wgpu::PolygonMode::Fill,
+                        unclipped_depth: false,
+                        conservative: false,
+                    },
+                    "vs_main_3d"
+                ),
+            };
+            
             let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(&format!("Render Pipeline {}", i)),
-                layout: Some(&render_pipeline_layout),
+                layout: Some(layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
-                    entry_point: Some("vs_main"),
-                    buffers: &[],
+                    entry_point: Some(vs_entry),
+                    buffers: &vertex_buffers,
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
@@ -592,15 +679,7 @@ impl<'a> VulkanEngine<'a> {
                     })],
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                 }),
-                primitive: wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: None,
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    unclipped_depth: false,
-                    conservative: false,
-                },
+                primitive,
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: wgpu::TextureFormat::Depth32Float,
                     depth_write_enabled: Some(true),
@@ -1166,7 +1245,67 @@ impl<'a> VulkanEngine<'a> {
         let resynth_compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("Resynth Compute Pipeline"), layout: Some(&resynth_compute_pipeline_layout), module: &resynth_compute_shader, entry_point: Some("main"), compilation_options: wgpu::PipelineCompilationOptions::default(), cache: None,
         });
-        // --- END GPU FFT INIT ---
+        // --- 3D Engine Extensions Init ---
+        let mut vertices = Vec::new();
+        let mut indices: Vec<u32> = Vec::new();
+        let grid_width = 200;
+        let grid_depth = 200;
+        for z in 0..=grid_depth {
+            for x in 0..=grid_width {
+                let px = x as f32 - (grid_width as f32) / 2.0;
+                let pz = z as f32 - (grid_depth as f32) / 2.0;
+                vertices.push(Vertex {
+                    position: [px, 0.0, pz],
+                    normal: [0.0, 1.0, 0.0],
+                    tex_coords: [x as f32 / grid_width as f32, z as f32 / grid_depth as f32],
+                });
+            }
+        }
+        for z in 0..grid_depth {
+            for x in 0..grid_width {
+                let start = z * (grid_width + 1) + x;
+                indices.push(start);
+                indices.push(start + 1);
+                indices.push(start + grid_width + 1);
+                indices.push(start + 1);
+                indices.push(start + grid_width + 2);
+                indices.push(start + grid_width + 1);
+            }
+        }
+
+        let grid_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Grid Vertex Buffer"),
+            size: (vertices.len() * std::mem::size_of::<Vertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&grid_vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+
+        let grid_index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Grid Index Buffer"),
+            size: (indices.len() * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&grid_index_buffer, 0, bytemuck::cast_slice(&indices));
+        let grid_index_count = indices.len() as u32;
+
+        let camera_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Camera Uniforms"),
+            size: std::mem::size_of::<CameraUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Camera Bind Group"),
+            layout: &camera_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_uniform_buffer.as_entire_binding(),
+            }],
+        });
+        // --- END 3D Engine Extensions Init ---
 
         Self {
             surface,
@@ -1230,6 +1369,12 @@ impl<'a> VulkanEngine<'a> {
             video_bind_group_layout,
             video_pipeline,
             video_state: None,
+            
+            camera_uniform_buffer,
+            camera_bind_group,
+            grid_vertex_buffer,
+            grid_index_buffer,
+            grid_index_count,
         }
     }
 
@@ -1556,6 +1701,7 @@ impl<'a> VulkanEngine<'a> {
                 }
             }
         }
+        
     }
 
     pub fn render(
@@ -3081,16 +3227,41 @@ impl<'a> VulkanEngine<'a> {
             let max_h = (self.config.height as f32 - vp_y).max(1.0);
             let vp_h = ((central_rect.height() * scale_factor).clamp(1.0, max_h)).round();
             
+            // --- 3D Engine Camera Math ---
+            let aspect = vp_w / vp_h.max(1.0);
+            let proj = glam::Mat4::perspective_rh_gl(std::f32::consts::PI / 3.0, aspect, 0.1, 1000.0);
+            let view = glam::Mat4::look_at_rh(
+                glam::Vec3::new(0.0, 1.5, -2.0),
+                glam::Vec3::new(0.0, 1.5, 0.0),
+                glam::Vec3::new(0.0, 1.0, 0.0),
+            );
+            let camera_uniforms = CameraUniforms {
+                view_matrix: view.to_cols_array_2d(),
+                proj_matrix: proj.to_cols_array_2d(),
+            };
+            self.queue.write_buffer(&self.camera_uniform_buffer, 0, bytemuck::cast_slice(&[camera_uniforms]));
+            
             render_pass.set_viewport(vp_x, vp_y, vp_w, vp_h, 0.0, 1.0);
 
             let mode_idx = state.current_visualizer_idx.min(self.render_pipelines.len() - 1);
+            let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
 
             
             render_pass.set_pipeline(&self.render_pipelines[mode_idx]);
             render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
             render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
             
-            render_pass.draw(0..3, 0..1);
+            match vis_def.pipeline_type {
+                crate::state::PipelineType::FullscreenQuad => {
+                    render_pass.draw(0..3, 0..1);
+                },
+                crate::state::PipelineType::Mesh3D(_) => {
+                    render_pass.set_bind_group(2, &self.camera_bind_group, &[]);
+                    render_pass.set_vertex_buffer(0, self.grid_vertex_buffer.slice(..));
+                    render_pass.set_index_buffer(self.grid_index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    render_pass.draw_indexed(0..self.grid_index_count, 0, 0..1);
+                }
+            }
             
             if state.video_mode > 0 && self.video_state.is_some() {
                 let mut v_vp_x = 0.0;
