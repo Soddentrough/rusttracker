@@ -117,7 +117,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Fade in in the distance, fade out as they pass the camera
         // Randomize the fade thresholds per-star so whole layers don't vanish uniformly
         let fade_offset = (rnd.x - 0.5) * 0.15;
-        let z_fade = smoothstep(0.0, 0.1 + fade_offset, z) * smoothstep(1.0, 0.8 + fade_offset, z);
+        let z_fade = smoothstep(0.0, 0.1 + fade_offset, z) * (1.0 - smoothstep(0.8 + fade_offset, 1.0, z));
         
         // Position within the cell (kept away from edges to prevent clipping)
         let star_pos = (rnd - 0.5) * 0.5;
@@ -163,7 +163,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let size = clamp(base_size * pulse, 0.0, 0.1); // Ensure size never exceeds cell bounds!
         
         // Core and subtle glow
-        let core = smoothstep(size, size * 0.1, dist);
+        let core = 1.0 - smoothstep(size * 0.1, size, dist);
         
         // Base glow + bright flash when channel plays
         let base_glow = 0.0001 / (dist * dist + 0.0005);
@@ -171,7 +171,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let glow = base_glow + flash_glow;
         
         // Fade the glow out completely before hitting the cell boundary to eliminate hard square edges
-        let cell_mask = smoothstep(0.5, 0.25, abs(gv.x)) * smoothstep(0.5, 0.25, abs(gv.y));
+        let cell_mask = (1.0 - smoothstep(0.25, 0.5, abs(gv.x))) * (1.0 - smoothstep(0.25, 0.5, abs(gv.y)));
         
         let star_col = get_star_color(hash21(id + 30.0));
         

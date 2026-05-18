@@ -5,9 +5,22 @@ fn main() {
     let full_source = source.replace("// INCLUDE: common", common);
     let mut frontend = naga::front::wgsl::Frontend::new();
     match frontend.parse(&full_source) {
-        Ok(_) => println!("WGSL Parsed Successfully"),
+        Ok(module) => {
+            let mut validator = naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            );
+            match validator.validate(&module) {
+                Ok(_) => println!("WGSL Validated Successfully"),
+                Err(e) => {
+                    eprintln!("Validation error: {:?}", e);
+                    std::process::exit(1);
+                }
+            }
+        },
         Err(e) => {
-            e.emit_to_stderr_with_path(&full_source, "vis_starfield.wgsl");
+            let err_str = e.emit_to_string_with_path(&full_source, "vis_starfield.wgsl");
+            eprintln!("{}", err_str);
             std::process::exit(1);
         }
     }
