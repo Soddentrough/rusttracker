@@ -200,7 +200,8 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     }
     
     // Depth fog
-    let dist = length(in.world_pos - vec3<f32>(0.0, 1.5, 0.0));
+    let cam_z = audio.smooth_time * 20.0;
+    let dist = length(in.world_pos - vec3<f32>(0.0, 1.5, cam_z - 2.0));
     let fog_f = smoothstep(40.0, 200.0, dist);
     let fog_c = vec3<f32>(0.02, 0.0, 0.05);
     color = mix(color, fog_c, fog_f);
