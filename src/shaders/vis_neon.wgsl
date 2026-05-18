@@ -23,6 +23,11 @@ var<private> g_num_frames: u32;
 @group(0) @binding(0)
 var<uniform> audio: AudioUniforms;
 
+@group(1) @binding(0)
+var smoke_tex: texture_3d<f32>;
+@group(1) @binding(1)
+var smoke_samp: sampler;
+
 
 // --- Utility ---
 
@@ -48,18 +53,6 @@ fn noise(x: vec3<f32>) -> f32 {
         mix(mix(hash(n + 113.0), hash(n + 114.0), f2.x),
             mix(hash(n + 170.0), hash(n + 171.0), f2.x), f2.y), f2.z
     );
-}
-
-fn fbm(p_in: vec3<f32>) -> f32 {
-    var p = p_in;
-    var f = 0.0;
-    var amp = 0.5;
-    for(var i=0; i<4; i++) {  // Restore to 4 octaves for smoke detail
-        f += amp * noise(p);
-        p *= 2.1;
-        amp *= 0.5;
-    }
-    return f;
 }
 
 // --- Channel color palette (up to 12 channels, neon-saturated) ---
@@ -143,11 +136,16 @@ fn get_smoke_density(p: vec3<f32>, time: f32, audio_activity: f32) -> f32 {
 
     if (mask < 0.01) { return 0.0; }
 
-    let np = p * 1.5 - vec3<f32>(0.0, time * 0.2, time * 0.1);
-    let n = fbm(np);
+    // Map p to uvw in the bounding box: x in [-6, 6], y in [-1, 4], z in [-4, 8]
+    let uvw = vec3<f32>(
+        (p.x - (-6.0)) / (6.0 - (-6.0)),
+        (p.y - (-1.0)) / (4.0 - (-1.0)),
+        (p.z - (-4.0)) / (8.0 - (-4.0))
+    );
 
-    // Higher threshold (0.45) to create distinct wispy chunks
-    var dens = (n - 0.45) * (2.5 + audio_activity * 3.0);
+    let n = textureSampleLevel(smoke_tex, smoke_samp, uvw, 0.0).r;
+
+    var dens = n * (2.5 + audio_activity * 3.0);
     return max(dens, 0.0) * mask;
 }
 

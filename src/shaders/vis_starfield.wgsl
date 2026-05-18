@@ -73,7 +73,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let mid = (audio.spectrum[10].x + audio.spectrum[20].x + audio.spectrum[30].x) * 0.33;
 
     // Flight speed is a smooth continuous forward motion (no judder)
-    let speed = audio.time * 0.15;
+    let speed = audio.smooth_time * 0.15;
 
     var color = vec3<f32>(0.0);
 
@@ -83,7 +83,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // --- Nebula clouds ---
     // Slow drifting nebula in the background with static, consistent colors
-    let neb_uv = p * 1.2 + vec2<f32>(audio.time * 0.01, audio.time * 0.015);
+    let neb_uv = p * 1.2 + vec2<f32>(audio.smooth_time * 0.01, audio.smooth_time * 0.015);
     let nebula_shape = fbm(neb_uv * 2.5);
     let neb_mask = smoothstep(0.3, 0.65, nebula_shape);
 
@@ -94,7 +94,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // --- 3D Flight Starfield ---
     // Rotate the camera slowly
-    let p_rot = rotate2d(p, audio.time * 0.05);
+    let p_rot = rotate2d(p, audio.smooth_time * 0.05);
     
     let num_layers = 25.0;
     for (var i = 0.0; i < 1.0; i += 1.0 / num_layers) {

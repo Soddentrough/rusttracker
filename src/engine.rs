@@ -207,6 +207,14 @@ pub struct VulkanEngine<'a> {
     _gpu_spectrum_buffer: wgpu::Buffer,
     fft_params_buffer: wgpu::Buffer,
     
+    // Neon Smoke Cache
+    smoke_compute_pipeline: wgpu::ComputePipeline,
+    smoke_compute_bind_group: wgpu::BindGroup,
+    smoke_render_bind_group: wgpu::BindGroup,
+    smoke_params_buffer: wgpu::Buffer,
+    
+    depth_texture_view: wgpu::TextureView,
+    
     // Pre-allocated buffers to avoid per-frame heap allocations
     flat_raw_audio: Vec<f32>,
     waveform_history_flat: Vec<f32>,
@@ -240,7 +248,7 @@ impl<'a> VulkanEngine<'a> {
             },
         ).await.unwrap();
 
-        let mut required_features = wgpu::Features::empty();
+        let mut required_features = wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
         let supports_timestamps = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
         if supports_timestamps {
             required_features |= wgpu::Features::TIMESTAMP_QUERY;
@@ -258,6 +266,11 @@ impl<'a> VulkanEngine<'a> {
                 ..Default::default()
             },
         ).await.unwrap();
+
+        device.on_uncaptured_error(std::sync::Arc::new(|e: wgpu::Error| {
+            println!("WGPU VALIDATION ERROR: {:?}", e);
+            std::process::exit(1);
+        }));
 
         let surface_caps = surface.get_capabilities(&adapter);
         let surface_format = surface_caps.formats.iter()
@@ -436,9 +449,31 @@ impl<'a> VulkanEngine<'a> {
             label: Some("audio_bind_group"),
         });
 
+        let smoke_render_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Smoke Render Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
         let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Render Pipeline Layout"),
-            bind_group_layouts: &[Some(&bind_group_layout)],
+            bind_group_layouts: &[Some(&bind_group_layout), Some(&smoke_render_layout)],
             immediate_size: 0,
         });
 
@@ -512,7 +547,13 @@ impl<'a> VulkanEngine<'a> {
                 unclipped_depth: false,
                 conservative: false,
             },
-            depth_stencil: None,
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
             multisample: wgpu::MultisampleState {
                 count: 1,
                 mask: !0,
@@ -559,7 +600,13 @@ impl<'a> VulkanEngine<'a> {
                     unclipped_depth: false,
                     conservative: false,
                 },
-                depth_stencil: None,
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
                 multisample: wgpu::MultisampleState {
                     count: 1,
                     mask: !0,
@@ -668,7 +715,13 @@ impl<'a> VulkanEngine<'a> {
                 unclipped_depth: false,
                 conservative: false,
             },
-            depth_stencil: None,
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
             cache: None,
@@ -707,7 +760,13 @@ impl<'a> VulkanEngine<'a> {
                 unclipped_depth: false,
                 conservative: false,
             },
-            depth_stencil: None,
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
             multisample: wgpu::MultisampleState {
                 count: 1,
                 mask: !0,
@@ -717,7 +776,122 @@ impl<'a> VulkanEngine<'a> {
             cache: None,
         });
 
-        let egui_renderer = egui_wgpu::Renderer::new(&device, config.format, egui_wgpu::RendererOptions::default());
+        // ------------------------------------------------------------------
+        // Neon Smoke Cache Compute Pipeline
+        // ------------------------------------------------------------------
+        let smoke_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Neon Smoke Texture"),
+            size: wgpu::Extent3d { width: 64, height: 64, depth_or_array_layers: 64 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::Rgba16Float,
+            usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        
+        let smoke_texture_view = smoke_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        
+        let smoke_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Neon Smoke Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            mipmap_filter: wgpu::MipmapFilterMode::Linear,
+            ..Default::default()
+        });
+        
+        let smoke_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Smoke Params Buffer"),
+            size: 16,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let smoke_compute_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Smoke Compute Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::StorageTexture {
+                        access: wgpu::StorageTextureAccess::WriteOnly,
+                        format: wgpu::TextureFormat::Rgba16Float,
+                        view_dimension: wgpu::TextureViewDimension::D3,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let smoke_compute_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Smoke Compute Bind Group"),
+            layout: &smoke_compute_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&smoke_texture_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: smoke_params_buffer.as_entire_binding() },
+            ],
+        });
+
+        // smoke_render_layout is defined earlier
+
+        let smoke_render_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Smoke Render Bind Group"),
+            layout: &smoke_render_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&smoke_texture_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&smoke_sampler) },
+            ],
+        });
+
+        let smoke_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Neon Smoke Compute Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!("shaders/vis_neon_smoke_cs.wgsl"))),
+        });
+
+        let smoke_compute_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Smoke Compute Pipeline Layout"),
+            bind_group_layouts: &[Some(&smoke_compute_layout)],
+            immediate_size: 0,
+        });
+
+        let smoke_compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Smoke Compute Pipeline"),
+            layout: Some(&smoke_compute_pipeline_layout),
+            module: &smoke_shader,
+            entry_point: Some("cs_main"),
+            compilation_options: wgpu::PipelineCompilationOptions::default(),
+            cache: None,
+        });
+
+        let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Depth Texture"),
+            size: wgpu::Extent3d { width: config.width, height: config.height, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let depth_texture_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let egui_renderer = egui_wgpu::Renderer::new(&device, config.format, egui_wgpu::RendererOptions {
+            depth_stencil_format: None,
+            ..Default::default()
+        });
 
         // --- Fire Compute Pipeline ---
         let fire_grid_size = 1024 * 576 * 4; // 1024 × 576 × f32
@@ -1042,6 +1216,14 @@ impl<'a> VulkanEngine<'a> {
             raw_audio_buffer,
             _gpu_spectrum_buffer: gpu_spectrum_buffer,
             fft_params_buffer,
+            
+            smoke_compute_pipeline,
+            smoke_compute_bind_group,
+            smoke_render_bind_group,
+            smoke_params_buffer,
+            
+            depth_texture_view,
+            
             flat_raw_audio: vec![0.0f32; 32 * 65536],
             waveform_history_flat: vec![0.0; 2048 * 144],
             video_bind_group_layout,
@@ -1056,6 +1238,18 @@ impl<'a> VulkanEngine<'a> {
             self.config.width = new_size.width;
             self.config.height = new_size.height;
             self.surface.configure(&self.device, &self.config);
+            
+            let depth_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Depth Texture"),
+                size: wgpu::Extent3d { width: self.config.width, height: self.config.height, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Depth32Float,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            self.depth_texture_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
         }
     }
 
@@ -2745,6 +2939,18 @@ impl<'a> VulkanEngine<'a> {
                 compute_pass.set_bind_group(0, Some(&self.resynth_bind_group), &[]);
                 compute_pass.dispatch_workgroups(32, 2, 1); // 512/16=32, 32/16=2
             }
+        } else {
+            // Write dummy timestamps to satisfy Vulkan validation
+            if let Some(qs) = &self.query_set {
+                encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Dummy FFT Pass"),
+                    timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                        query_set: qs,
+                        beginning_of_pass_write_index: Some(0),
+                        end_of_pass_write_index: Some(1),
+                    }),
+                });
+            }
         }
 
         // GPU fire compute: dispatch simulation + copy result to texture
@@ -2788,6 +2994,40 @@ impl<'a> VulkanEngine<'a> {
                 wgpu::Extent3d { width: 1024, height: 576, depth_or_array_layers: 1 },
             );
             self.fire_ping = !self.fire_ping;
+        } else {
+            // Write dummy timestamps to satisfy Vulkan validation
+            if let Some(qs) = &self.query_set {
+                encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Dummy Fire Pass"),
+                    timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                        query_set: qs,
+                        beginning_of_pass_write_index: Some(2),
+                        end_of_pass_write_index: Some(3),
+                    }),
+                });
+            }
+        }
+
+        if vis_def.id == 5 { // Neon Corridor
+            // Update params
+            let mut act = 0.0;
+            let count = state.channel_vus.len().min(8);
+            for i in 0..count {
+                act += state.channel_vus[i];
+            }
+            if count > 0 { act /= count as f32; }
+            self.queue.write_buffer(&self.smoke_params_buffer, 0, bytemuck::cast_slice(&[
+                state.current_seconds as f32,
+                act, 0.0, 0.0 // padding
+            ]));
+
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Neon Smoke Compute Pass"),
+                timestamp_writes: None,
+            });
+            compute_pass.set_pipeline(&self.smoke_compute_pipeline);
+            compute_pass.set_bind_group(0, Some(&self.smoke_compute_bind_group), &[]);
+            compute_pass.dispatch_workgroups(16, 16, 16); // 64 / 4
         }
 
         if vis_def.requires_ferrofluidsim {
@@ -2811,16 +3051,18 @@ impl<'a> VulkanEngine<'a> {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.1,
-                            g: 0.1,
-                            b: 0.1,
-                            a: 1.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.1, g: 0.1, b: 0.1, a: 1.0 }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None,
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_texture_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
                 timestamp_writes: self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites {
                     query_set: qs,
                     beginning_of_pass_write_index: Some(4),
@@ -2841,8 +3083,12 @@ impl<'a> VulkanEngine<'a> {
             render_pass.set_viewport(vp_x, vp_y, vp_w, vp_h, 0.0, 1.0);
 
             let mode_idx = state.current_visualizer_idx.min(self.render_pipelines.len() - 1);
+
+            
             render_pass.set_pipeline(&self.render_pipelines[mode_idx]);
             render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+            render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
+            
             render_pass.draw(0..3, 0..1);
             
             if state.video_mode > 0 && self.video_state.is_some() {
@@ -2892,6 +3138,7 @@ impl<'a> VulkanEngine<'a> {
                 render_pass.set_viewport(0.0, 0.0, self.config.width as f32, self.config.height as f32, 0.0, 1.0);
                 render_pass.set_pipeline(&self.hud_pipeline);
                 render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
                 
                 let mut drawn = false;
                 let mut draw_rect = |r: Option<egui::Rect>| {
@@ -2953,7 +3200,7 @@ impl<'a> VulkanEngine<'a> {
             }
         }
 
-        let do_capture = std::env::var("CAPTURE_FRAME").is_ok() && state.current_seconds >= 2.0;
+        let do_capture = std::env::var("CAPTURE_FRAME").is_ok();
         let mut readback_buffer = None;
         if do_capture {
             let bpr = (self.config.width * 4 + 255) & !255;
@@ -2973,6 +3220,7 @@ impl<'a> VulkanEngine<'a> {
 
         self.queue.submit(std::iter::once(encoder.finish()));
         
+
         // Start async timestamp mapping AFTER submit (non-blocking)
         if should_start_mapping {
             if let Some(read_buf) = &self.query_read_buffer {

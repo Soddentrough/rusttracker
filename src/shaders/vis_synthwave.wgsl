@@ -27,17 +27,31 @@ fn ridge(p: vec2<f32>) -> f32 {
 
 // Procedural terrain: flat road in center, jagged mountains on sides
 fn terrain_h(wx: f32, wz: f32) -> f32 {
-    let road_half = 2.0;
+    let road_half = 4.0;
     let dx = max(abs(wx) - road_half, 0.0);
-    let slope = dx * 1.2;
+    let slope = dx * 0.7;
     let q = vec2<f32>(wx, wz);
     // Ridge noise for sharp peaks + detail octaves
     let r1 = ridge(q * 0.04) * 1.0;
     let r2 = ridge(q * 0.1) * 0.45;
-    let n3 = noise2d(q * 0.25) * 0.2;
-    let n4 = noise2d(q * 0.6) * 0.08;
-    let h = r1 + r2 + n3 + n4;
-    return slope * h * 0.5 - 0.5;
+    
+    // Add craggy details only to the peaks
+    let detail_mask = smoothstep(0.2, 1.0, r1 + r2);
+    let n3 = noise2d(q * 0.25) * 0.3 * detail_mask;
+    let n4 = noise2d(q * 0.6) * 0.15 * detail_mask;
+    let n5 = noise2d(q * 1.5) * 0.08 * detail_mask;
+    let n6 = noise2d(q * 3.2) * 0.03 * detail_mask;
+    let h = r1 + r2 + n3 + n4 + n5 + n6;
+    
+    // Scale height based on distance from camera to create a vanishing point
+    // This prevents tall peaks from abruptly popping in at the raymarch distance limit
+    let cam_z = audio.time * 15.0;
+    let dist_z = max(wz - cam_z, 0.0);
+    let horizon_fade = smoothstep(220.0, 60.0, dist_z);
+    
+    // Base road height is -0.5. Mountains rise above it.
+    let mtn_height = slope * h * 0.5 * horizon_fade;
+    return mtn_height - 0.5;
 }
 
 // Surface normal via central differences
@@ -64,8 +78,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // --- Sky gradient ---
     let sky_t = clamp(p.y * 0.8 + 0.3, 0.0, 1.0);
-    var color = mix(vec3<f32>(0.01, 0.0, 0.04),
-                    mix(vec3<f32>(0.08, 0.0, 0.15), vec3<f32>(0.15, 0.02, 0.12), sky_t), sky_t);
+    var color = mix(vec3<f32>(0.01, 0.0, 0.02),
+                    mix(vec3<f32>(0.03, 0.0, 0.06), vec3<f32>(0.08, 0.01, 0.06), sky_t), sky_t);
 
     // Sun glow halo
     let sun_pos = vec2<f32>(0.0, 0.35);
@@ -109,6 +123,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let rd = normalize(vec3<f32>(p.x * 1.5, p.y - 0.3, 1.0));
     let sun_dir = normalize(vec3<f32>(0.0, 0.6, -1.0)); // Sun light direction
 
+    // --- Horizon glow in 3D (Skybox layer) ---
+    // rd.y represents the view angle. rd.y == 0 is the true 3D horizon.
+    let horizon_glow = exp(-abs(rd.y) * 30.0) * (0.4 + bass * 0.5);
+    color += vec3<f32>(0.8, 0.1, 0.5) * horizon_glow;
+
     var t_ray = 0.1;
     var prev_t = 0.0;
     var hit = false;
@@ -116,10 +135,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var hit_p = vec3<f32>(0.0);
     var hit_t = 0.0;
     var hit_road = false;
-    let road_half = 2.0;
+    let road_half = 4.0;
 
     // Coarse raymarcher: find interval where ray crosses terrain
-    for (var i = 0; i < 96; i = i + 1) {
+    for (var i = 0; i < 350; i = i + 1) {
         let pos = ro + rd * t_ray;
         let th = terrain_h(pos.x, pos.z);
 
@@ -149,15 +168,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
         prev_t = t_ray;
         let margin = pos.y - th;
-        // Very conservative stepping to eliminate horizon gaps
-        t_ray += max(0.08, min(margin * 0.25, t_ray * 0.02));
-        if (t_ray > 80.0) { break; }
+        // Tighter stepping to prevent shooting through high-frequency jagged peaks
+        t_ray += max(0.03, min(margin * 0.15, t_ray * 0.015));
+        if (t_ray > 250.0) { break; }
     }
 
     // Flat ground fallback
     if (!hit && rd.y < -0.001) {
         let ground_t = (ro.y + 0.5) / (-rd.y);
-        if (ground_t > 0.0 && ground_t < 80.0) {
+        if (ground_t > 0.0 && ground_t < 250.0) {
             let gp = ro + rd * ground_t;
             hit = true;
             hit_t = ground_t;
@@ -171,14 +190,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     if (hit) {
-        let z_fade = exp(-hit_t * 0.015);
+        let z_fade = exp(-hit_t * 0.01);
         let fog = 1.0 - z_fade;
         let fog_col = vec3<f32>(0.04, 0.0, 0.08);
 
         if (hit_road) {
             // --- Neon wireframe grid (road) ---
-            let gx = smoothstep(0.08, 0.0, abs(fract(hit_p.x) - 0.5));
-            let gz = smoothstep(0.08, 0.0, abs(fract(hit_p.z) - 0.5));
+            let gx = smoothstep(0.08, 0.0, abs(fract(hit_p.x * 2.0) - 0.5));
+            let gz = smoothstep(0.08, 0.0, abs(fract(hit_p.z * 2.0) - 0.5));
             let grid = max(gx, gz);
             let audio_i = clamp(hit_val * 0.08, 0.0, 1.0);
             let grid_col = mix(vec3<f32>(0.8, 0.0, 0.8), vec3<f32>(0.0, 1.0, 1.0), audio_i)
@@ -206,8 +225,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let rim_col = vec3<f32>(0.6, 0.05, 0.4) * rim * 0.5;
 
             // Wireframe grid on mountain surface
-            let mgx = smoothstep(0.06, 0.0, abs(fract(hit_p.x * 0.5) - 0.5));
-            let mgz = smoothstep(0.06, 0.0, abs(fract(hit_p.z * 0.5) - 0.5));
+            let mgx = smoothstep(0.06, 0.0, abs(fract(hit_p.x * 2.0) - 0.5));
+            let mgz = smoothstep(0.06, 0.0, abs(fract(hit_p.z * 2.0) - 0.5));
             let mtn_grid = max(mgx, mgz);
             let wire_col = vec3<f32>(0.4, 0.0, 0.4) * (1.0 + bass * 0.8) * z_fade;
 
@@ -215,10 +234,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             color = mix(mtn_col, fog_col, fog);
         }
     }
-
-    // --- Horizon glow line ---
-    let horizon_dist = abs(p.y + 0.05);
-    color += vec3<f32>(0.6, 0.1, 0.4) * exp(-horizon_dist * 15.0) * (0.3 + bass * 0.4);
 
     // ACES tonemapping
     var fc = (color * (2.51 * color + 0.03)) / (color * (2.43 * color + 0.59) + 0.14);

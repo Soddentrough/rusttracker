@@ -76,6 +76,7 @@ impl Drop for Tui {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    env_logger::init();
     std::panic::set_hook(Box::new(|info| {
         let backtrace = std::backtrace::Backtrace::force_capture();
         let msg = match info.payload().downcast_ref::<&'static str>() {

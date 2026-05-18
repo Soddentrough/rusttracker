@@ -25,6 +25,20 @@ fn hash22(p: vec2<f32>) -> vec2<f32> {
 fn lightning_bolt(uv: vec2<f32>, seed: f32, intensity: f32) -> f32 {
     if (intensity < 0.01) { return 0.0; }
 
+    // Blend between accurate multi-segment SDF and fast approximation
+    let dy = max(0.0, abs(uv.y) - 1.0);
+    let dx = abs(uv.x);
+    let dist_to_box = length(vec2<f32>(max(0.0, dx - 0.3), dy));
+    let d_line = length(vec2<f32>(dx, dy));
+    let approx = 0.02 / (d_line + 0.005);
+
+    // Smoothly transition over a distance to avoid any visible borders
+    let blend = smoothstep(0.1, 0.4, dist_to_box);
+    
+    if (blend >= 1.0) {
+        return approx * intensity;
+    }
+
     var bolt = 0.0;
     // Main bolt
     var x_off = 0.0;
@@ -52,7 +66,7 @@ fn lightning_bolt(uv: vec2<f32>, seed: f32, intensity: f32) -> f32 {
         bolt += 0.003 / (d + 0.005);
     }
 
-    return bolt * intensity;
+    return mix(bolt, approx, blend) * intensity;
 }
 
 @fragment
@@ -82,7 +96,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var color = mix(sky_dark, mix(sky_mid, sky_top, sky_t), sky_t);
 
     // Subtle cloud-like variation
-    let cloud_noise = hash12(p * 3.0 + vec2<f32>(audio.time * 0.02, 0.0));
+    let cloud_noise = hash12(p * 3.0 + vec2<f32>(audio.smooth_time * 0.02, 0.0));
     let cloud_band = smoothstep(0.3, 0.7, sky_t) * smoothstep(1.0, 0.7, sky_t);
     color += vec3<f32>(0.01, 0.012, 0.02) * cloud_noise * cloud_band;
 
@@ -133,11 +147,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let speed = 8.0 + f_layer * 3.0;          // faster = closer
         let opacity = 1.0 / (1.0 + f_layer * 0.6); // closer layers are brighter
 
-        // Rain falls straight down with slight wind offset
-        let wind = sin(audio.time * 0.3) * 0.15;
+        // Rain falls with a constant slant, while wind gently sways the entire field horizontally
+        let wind_slant = 0.05;
+        let wind_sway = sin(audio.smooth_time * 0.3) * 1.5;
         var rain_uv = vec2<f32>(
-            p.x * scale_x + f_layer * 13.7 + p.y * wind * scale_x,
-            p.y * scale_y + audio.time * speed
+            p.x * scale_x + f_layer * 13.7 + p.y * wind_slant * scale_x + wind_sway,
+            p.y * scale_y + audio.smooth_time * speed
         );
 
         // Stagger columns to prevent horizontal banding
@@ -156,9 +171,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let streak_width = 0.02 + 0.01 * (1.0 - f_layer * 0.1);
         let streak = smoothstep(streak_width, 0.0, dx_drop);
 
-        // Vertical falloff — elongated teardrop
+        // Teardrop shape: sharp bright head at the bottom, fading trail extending upwards
         let drop_length = 0.3 + rnd.x * 0.15;
-        let vert = smoothstep(drop_length, 0.0, abs(cell_uv.y)) * smoothstep(-0.5, -0.2, cell_uv.y);
+        let head = smoothstep(-drop_length, -drop_length + 0.05, cell_uv.y);
+        let tail = smoothstep(drop_length, -drop_length, cell_uv.y);
+        let vert = head * tail;
 
         let drop = streak * vert * visible * opacity;
 
