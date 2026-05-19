@@ -409,6 +409,14 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                                     state.spectrum_history.clear();
                                                     for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
                                                     state.is_paused = false;
+                                                } else if state.playlist_index >= state.playlist.len() && !state.playlist.is_empty() {
+                                                    if state.duration_seconds == 0.0 {
+                                                        state.playlist_index = state.playlist.len() - 1;
+                                                    } else {
+                                                        state.playlist_index = 0;
+                                                    }
+                                                    state.load_request = Some(state.playlist[state.playlist_index].clone());
+                                                    state.is_paused = false;
                                                 } else {
                                                     state.is_paused = !state.is_paused;
                                                 }
@@ -1194,6 +1202,14 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                         state.spectrum_history.clear();
                                         for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
                                         state.is_paused = false;
+                                    } else if state.playlist_index >= state.playlist.len() && !state.playlist.is_empty() {
+                                        if state.duration_seconds == 0.0 {
+                                            state.playlist_index = state.playlist.len() - 1;
+                                        } else {
+                                            state.playlist_index = 0;
+                                        }
+                                        state.load_request = Some(state.playlist[state.playlist_index].clone());
+                                        state.is_paused = false;
                                     } else {
                                         state.is_paused = !state.is_paused;
                                     }
@@ -1301,7 +1317,22 @@ where std::io::Error: From<<B as Backend>::Error>
                     }
                     KeyCode::Char(' ') => {
                         let mut state = app_state.lock().unwrap();
-                        state.is_paused = !state.is_paused;
+                        if state.current_seconds >= state.duration_seconds - 0.1 && state.duration_seconds > 0.0 {
+                            state.seek_request = Some(0.0);
+                            state.spectrum_history.clear();
+                            for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
+                            state.is_paused = false;
+                        } else if state.playlist_index >= state.playlist.len() && !state.playlist.is_empty() {
+                            if state.duration_seconds == 0.0 {
+                                state.playlist_index = state.playlist.len() - 1;
+                            } else {
+                                state.playlist_index = 0;
+                            }
+                            state.load_request = Some(state.playlist[state.playlist_index].clone());
+                            state.is_paused = false;
+                        } else {
+                            state.is_paused = !state.is_paused;
+                        }
                     }
                     KeyCode::Right => {
                         let mut state = app_state.lock().unwrap();
