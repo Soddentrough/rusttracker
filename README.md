@@ -1,14 +1,16 @@
-# RustTracker 🎵
+# RustTracker 🎵🦀
 
 ![RustTracker UI](assets/screenshot_spectrum.png)
 
-A high-performance, real-time audio visualizer and tracker module player built in Rust. 
+A high-performance, real-time audio visualizer and tracker module player built in Rust. Because your eyes deserve to hear the music too, and because I wanted an excuse to do something in Rust.
 
-RustTracker leverages a **3-Thread DSP Architecture** and **Hardware-Accelerated Compute Shaders** to ensure zero-latency audio playback while simultaneously computing **GPU-accelerated Fast Fourier Transforms (FFT) on each spatial audio channel** to render beautiful, fluid visualizations at 120FPS.
+RustTracker leverages a **3-Thread DSP Architecture** and **Hardware-Accelerated Compute Shaders** to ensure zero-latency audio playback while simultaneously computing **GPU-accelerated Fast Fourier Transforms (FFT) on each spatial audio channel**. It renders beautiful, fluid visualizations at a buttery-smooth high framerates.
+
+Supported formats include all the best ones; .MOD, .S3M, .IT, and .XM!. Lossless formats such as FLAC, WAV. And of course, your everyday MP3. It even supports video files and bitstreaming/passthrough for proprietary formats like Dolby Atmos, DTS-HD, etc. 
 
 ## Visualizations
 
-RustTracker includes a variety of WGPU-accelerated visualizations, combining classic demoscene aesthetics with modern procedural generation.
+RustTracker includes an array of WGPU-accelerated visualizations. It's like the 90s, but with way more teraflops.
 
 | Photorealistic Ferrofluid | Multi-Channel 3D Fire |
 | :---: | :---: |
@@ -20,37 +22,41 @@ RustTracker includes a variety of WGPU-accelerated visualizations, combining cla
 
 ## Features
 
-* **Advanced Visualizers:** High-fidelity, cinematic shaders mapped tightly to precise acoustic frequencies.
-* **GPU-Accelerated FFT:** Offloads audio-reactive spatial weights directly to the GPU using WGPU compute shaders, mapping individual surround-sound speaker channels to local geometry in real-time.
+* **Advanced Visualizers:** High-fidelity, cinematic shaders mapped tightly to precise acoustic frequencies. Prepare to be mesmerized.
+* **GPU-Accelerated FFT:** We offload audio-reactive spatial weights directly to the GPU using WGPU compute shaders because your CPU is busy enough.
 * **Cinematic Video Integration & HDR:** Features integrated hardware-accelerated video stream playback, rendering vibrant visual environments with HDR color precision.
-* **Real-time Tracker UI:** Seamlessly decodes and visualizes `.mod` files, rendering a classic piano-roll style pattern editor that aligns perfectly with the audio playback, complete with flawless cross-pattern scrolling and jumping.
-* **Graceful Degradation:** Supports playing standard audio/video files (`.mp3`, `.flac`, `.mp4`, `.mkv`, etc.) or capturing live microphone input (`--mic`), instantly adapting the UI to remove tracker elements and focus on acoustic analysis.
-* **Zero-Latency Architecture:**
-  * **Audio Thread (`cpal`):** A lock-free, ultra-high-priority thread dedicated solely to IO, preventing stuttering and audio underruns.
-  * **DSP Thread:** A background worker that computes windowing and frequency history data without blocking the audio stream.
-  * **GPU Render Pipeline (`wgpu` + `egui`):** Low-overhead, high-performance hardware rendering.
+* **Real-time Tracker UI:** Seamlessly decodes and visualizes `.mod` files, rendering a classic piano-roll style pattern editor. It aligns perfectly with the audio playback, complete with flawless cross-pattern scrolling and jumping.
+* **Graceful Degradation:** Supports playing standard audio/video files (`.mp3`, `.flac`, `.mp4`, `.mkv`, etc.) or capturing live microphone input (`--mic`). It instantly adapts the UI to remove tracker elements and focus on acoustic analysis. It's smart like that.
+
+## Performance & Architecture
+
+RustTracker is designed to be blazingly fast and utterly relentless when it comes to performance. 
+
+* **Audio Thread (`cpal`):** A lock-free, ultra-high-priority thread dedicated solely to IO. It pushes audio buffers like its life depends on it, preventing stuttering and audio underruns.
+* **DSP Thread:** A background worker that computes windowing and frequency history data. It does the heavy mathematical lifting without ever daring to block the audio stream.
+* **GPU Render Pipeline (`wgpu` + `egui`):** Low-overhead, high-performance hardware rendering that talks directly to your graphics card, bypassing the slow lane.
 
 ## Quick Start
 
-Run a tracker module:
+Run a tracker module (and prepare to groove):
 ```bash
 cargo run -- path/to/your_file.mod
 ```
 
-Run with live microphone input:
+Run with live microphone input (try whistling):
 ```bash
 cargo run -- --mic
 ```
 
 ## Linux Installation
 
-RustTracker provides pre-compiled AppImages, RPM, and DEB packages via the **Releases** page.
+RustTracker provides pre-compiled AppImages, RPM, and DEB packages via the **Releases** page, because we know compiling from source isn't everyone's idea of a fun Friday night.
 
 ### Steam Deck (AppImage)
 1. Download `RustTracker-SteamDeck-GamePad.AppImage` in Desktop Mode.
 2. Mark it as executable (`Properties` -> `Permissions` -> `Is executable`).
 3. Add to Steam and launch in **Gaming Mode** for native Gamepad support.
-*(To force Gamepad Mode in Desktop Mode, hold the **Start (Menu)** button for 3 seconds)*
+*(To force Gamepad Mode in Desktop Mode, hold the **Start (Menu)** button for 3 seconds. It's a secret to everybody.)*
 
 ### RPM / DEB Packages
 Install the downloaded packages using your native package manager:
@@ -58,7 +64,7 @@ Install the downloaded packages using your native package manager:
 - **Ubuntu/Debian:** `sudo dpkg -i ./RustTracker-Linux*.deb`
 
 ### Building Packages from Source
-To build the packages yourself, install the necessary dependencies:
+If compiling from source *is* your idea of a fun Friday night, install the necessary dependencies and go wild:
 
 **For RPM (Fedora):**
 ```bash
@@ -78,9 +84,9 @@ strip target/release/rusttracker
 cargo deb
 ```
 
-## Built With
-* `wgpu` & `egui` - Hardware-accelerated UI
-* `cpal` - Cross-platform Audio I/O
-* `spectrum-analyzer` - Fast Fourier Transforms
-* `crossbeam-channel` - Lock-free concurrency
-* `openmpt` - Tracker module decoding
+## Built With (The Shoulders of Giants)
+* `wgpu` & `egui` - Hardware-accelerated UI that makes things pretty
+* `cpal` - Cross-platform Audio I/O that makes things loud
+* `spectrum-analyzer` - Fast Fourier Transforms that make the pretty things react to the loud things
+* `crossbeam-channel` - Lock-free concurrency because threads should get along
+* `openmpt` - Tracker module decoding for that sweet, sweet nostalgia
