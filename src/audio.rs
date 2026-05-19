@@ -1025,6 +1025,21 @@ impl AudioSource for FfmpegSource {
 
     fn get_video_info(&mut self) -> Option<String> { self.video_info.clone() }
     
+    fn get_bitrate(&mut self) -> Option<u32> {
+        if let Some(icy_br) = self.ictx.metadata().get("icy-br") {
+            if let Ok(br) = icy_br.parse::<u32>() {
+                return Some(br);
+            }
+        }
+        
+        let br = self.ictx.bit_rate();
+        if br > 0 {
+            return Some((br / 1000) as u32);
+        }
+        
+        None
+    }
+    
     fn attach_video_queue(&mut self, tx: crossbeam_channel::Sender<(u64, ffmpeg_next::Packet)>) {
         self.video_tx = Some(tx);
     }
@@ -1113,15 +1128,7 @@ impl AudioSource for VideoOnlySource {
     fn get_current_row(&mut self) -> i32 { 0 }
     fn get_video_info(&mut self) -> Option<String> { self.video_info.clone() }
 
-    fn get_bitrate(&mut self) -> Option<u32> {
-        let br = self.ictx.bit_rate();
-        if br > 0 {
-            Some((br / 1000) as u32)
-        } else {
-            None
-        }
-    }
-    
+
     fn attach_video_queue(&mut self, tx: crossbeam_channel::Sender<(u64, ffmpeg_next::Packet)>) {
         self.video_tx = Some(tx);
     }

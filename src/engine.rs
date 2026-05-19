@@ -1948,8 +1948,9 @@ impl<'a> VulkanEngine<'a> {
                             egui::RichText::new(format!("Visualization Shader (GPU): {:.2} ms", total_vis_us / 1000.0))
                                 .color(egui::Color32::LIGHT_BLUE)
                         );
+                        let buffer_label = if state.duration_seconds <= 0.0 { "Network Buffer" } else { "Audio Buffer" };
                         ui.label(
-                            egui::RichText::new(format!("Audio Buffer: {:.1}%", state.stats.audio_buffer_fill_pct))
+                            egui::RichText::new(format!("{}: {:.1}%", buffer_label, state.stats.audio_buffer_fill_pct))
                                 .color(if state.stats.audio_buffer_fill_pct < 5.0 { egui::Color32::RED } else if state.stats.audio_buffer_fill_pct > 95.0 { egui::Color32::YELLOW } else { egui::Color32::GREEN })
                         );
                         if state.video_frame_rx.is_some() {
@@ -2937,12 +2938,27 @@ impl<'a> VulkanEngine<'a> {
                                 columns[2].style_mut().visuals.override_text_color = Some(egui::Color32::from_gray(235)); // Slightly lighter for contrast
                                 columns[2].heading("Track Info");
                                 columns[2].separator();
-                            let title_path = std::path::Path::new(&state.song_title);
-                            let file_name = title_path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                            let file_dir = title_path.parent().unwrap_or(std::path::Path::new("")).to_string_lossy().to_string();
+                            let current_path_str = if state.playlist_index < state.playlist.len() {
+                                state.playlist[state.playlist_index].clone()
+                            } else {
+                                state.song_title.clone()
+                            };
+                            
+                            let is_network = current_path_str.starts_with("http://") || current_path_str.starts_with("https://");
+                            let file_name = if is_network {
+                                state.song_title.clone()
+                            } else {
+                                std::path::Path::new(&state.song_title).file_name().unwrap_or_default().to_string_lossy().to_string()
+                            };
+                            let file_dir = if is_network {
+                                current_path_str
+                            } else {
+                                std::path::Path::new(&current_path_str).parent().unwrap_or(std::path::Path::new("")).to_string_lossy().to_string()
+                            };
+                            
                             columns[2].horizontal(|ui| { ui.label("File/Title"); ui.label(&file_name); });
                             columns[2].horizontal(|ui| { ui.label("Artist"); ui.label(&state.artist); });
-                            columns[2].horizontal(|ui| { ui.label("Path"); ui.label(&file_dir); });
+                            columns[2].horizontal(|ui| { ui.label(if is_network { "URL" } else { "Path" }); ui.label(&file_dir); });
                             if state.playlist.len() > 1 {
                                 columns[2].horizontal(|ui| { ui.label("Playlist"); ui.label(format!("{} / {}", state.playlist_index + 1, state.playlist.len())); });
                             }

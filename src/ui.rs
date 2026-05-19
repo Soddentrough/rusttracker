@@ -157,8 +157,17 @@ pub fn draw(f: &mut Frame, state: &AppState) {
 
 
     // 3. Metadata
+    let current_path_str = if state.playlist_index < state.playlist.len() {
+        state.playlist[state.playlist_index].clone()
+    } else {
+        state.song_title.clone()
+    };
+    let is_network = current_path_str.starts_with("http://") || current_path_str.starts_with("https://");
+    let path_label = if is_network { "URL".to_string() } else { "Path".to_string() };
+    
     let meta_table = Table::new(
         vec![
+            Row::new(vec![path_label, current_path_str]),
             Row::new(vec!["Title".to_string(), state.song_title.clone()]),
             Row::new(vec!["Artist".to_string(), state.artist.clone()]),
             Row::new(vec!["Type".to_string(), state.module_type.clone()]),
