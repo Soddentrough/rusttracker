@@ -228,7 +228,11 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
 
     let mut last_mouse_move = Instant::now();
     let mut is_cursor_visible = true;
-    let mut is_fullscreen = false;
+    let mut is_fullscreen = is_fullscreen; // Use the argument value instead of hardcoding false
+    let mut keep_awake: Option<keepawake::KeepAwake> = None;
+    if is_fullscreen {
+        keep_awake = keepawake::Builder::default().display(true).idle(true).create().ok();
+    }
     let mut is_first_frame = true;
 
     let mut gilrs = gilrs::Gilrs::new().unwrap_or_else(|_| gilrs::GilrsBuilder::new().build().unwrap());
@@ -337,8 +341,10 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                                 is_fullscreen = !is_fullscreen;
                                                 if is_fullscreen {
                                                     window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+                                                    keep_awake = keepawake::Builder::default().display(true).idle(true).create().ok();
                                                 } else {
                                                     window.set_fullscreen(None);
+                                                    keep_awake = None;
                                                 }
                                             },
                                             WinitKeyCode::KeyG => {
@@ -1005,8 +1011,10 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                     is_fullscreen = !is_fullscreen;
                                     if is_fullscreen {
                                         window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+                                        keep_awake = keepawake::Builder::default().display(true).idle(true).create().ok();
                                     } else {
                                         window.set_fullscreen(None);
+                                        keep_awake = None;
                                     }
                                     continue;
                                 }

@@ -166,9 +166,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Three 3D planes for rain and lightning
     let z_layers = array<f32, 3>(18.0, 11.0, 6.5); // Far (Bass), Mid, Near (Treble)
     let layer_colors = array<vec3<f32>, 3>(
-        vec3<f32>(0.4, 0.5, 1.0),  // Deep blue
-        vec3<f32>(0.7, 0.4, 1.0),  // Purple
-        vec3<f32>(0.4, 1.0, 0.8)   // Cyan
+        vec3<f32>(1.0, 1.0, 1.0),  // White (Far)
+        vec3<f32>(1.0, 1.0, 1.0),  // White (Mid)
+        vec3<f32>(1.0, 1.0, 1.0)   // White (Near)
     );
     let layer_intensities = array<f32, 3>(
         smoothstep(0.6, 1.2, bass),
@@ -226,20 +226,24 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let scale_y = 1.0 + f32(i) * 0.18;
             let speed = layer_speeds[i];
             let wind_slant = 0.08 + f32(i) * 0.03;
-            let wind_sway = sin(audio.smooth_time * (0.25 + f32(i) * 0.08) + f32(i) * 1.7) * (1.8 + bass * 2.0);
+            
+            let rain_x = pos.x * scale_x + f32(i) * 10.2 + pos.y * wind_slant * scale_x;
+            let col_id = floor(rain_x);
+            let col_speed = 1.0 + (hash11(col_id) - 0.5) * 0.3;
             
             var rain_uv = vec2<f32>(
-                pos.x * scale_x + f32(i) * 10.2 + pos.y * wind_slant * scale_x + wind_sway,
-                pos.y * scale_y + audio.smooth_time * speed
+                rain_x,
+                pos.y * scale_y + audio.smooth_time * speed * col_speed
             );
             
-            rain_uv.y += hash11(floor(rain_uv.x)) * 3.14159;
+            rain_uv.y += hash11(col_id) * 3.14159;
             
             let cell_id = floor(rain_uv);
             let cell_uv = fract(rain_uv) - 0.5;
             
             let rnd = hash22(cell_id + f32(i) * 100.0);
-            let drop_x = (rnd.x - 0.5) * 0.6;
+            let drop_sway = sin(audio.smooth_time * (2.0 + rnd.y * 2.0) + rnd.x * 6.28) * 0.15;
+            let drop_x = (rnd.x - 0.5) * 0.6 + drop_sway;
             let visible = step(0.45, rnd.y);
             
             let dx_drop = abs(cell_uv.x - drop_x);

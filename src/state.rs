@@ -218,6 +218,7 @@ impl AppState {
 
         let mut vis_enabled = vec![true; VISUALIZERS.len()];
         vis_enabled[6] = false; // Solar Flare: disabled on all systems due to computational cost and visual quality
+        vis_enabled[11] = false; // Lissajous Laser: disabled because the effect isn't working
 
         if is_steam_deck {
             vis_enabled[1] = false; // CRT Oscilloscope
