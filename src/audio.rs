@@ -246,6 +246,7 @@ pub trait AudioSource: Send {
     fn get_video_info(&mut self) -> Option<String> { None }
     fn attach_video_queue(&mut self, _tx: crossbeam_channel::Sender<(u64, ffmpeg_next::Packet)>) {}
     fn take_video_parameters(&mut self) -> Option<(ffmpeg_next::codec::Parameters, ffmpeg_next::Rational)> { None }
+    fn get_bitrate(&mut self) -> Option<u32> { None }
 }
 
 // ---------------------------------------------------------
@@ -1111,6 +1112,15 @@ impl AudioSource for VideoOnlySource {
     fn get_current_order(&mut self) -> i32 { 0 }
     fn get_current_row(&mut self) -> i32 { 0 }
     fn get_video_info(&mut self) -> Option<String> { self.video_info.clone() }
+
+    fn get_bitrate(&mut self) -> Option<u32> {
+        let br = self.ictx.bit_rate();
+        if br > 0 {
+            Some((br / 1000) as u32)
+        } else {
+            None
+        }
+    }
     
     fn attach_video_queue(&mut self, tx: crossbeam_channel::Sender<(u64, ffmpeg_next::Packet)>) {
         self.video_tx = Some(tx);
@@ -1561,6 +1571,7 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
         state.num_samples = audio_source.get_num_samples();
         state.num_instruments = audio_source.get_num_instruments();
         state.num_patterns = audio_source.get_num_patterns();
+        state.bitrate = audio_source.get_bitrate();
         
         if !mic {
             state.tracker_channels = tracker_channels;

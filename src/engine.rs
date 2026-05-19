@@ -2980,6 +2980,7 @@ impl<'a> VulkanEngine<'a> {
                             if state.num_instruments > 0 { columns[2].horizontal(|ui| { ui.label("Instruments"); ui.label(format!("{}", state.num_instruments)); }); }
                             if state.num_samples > 0 { columns[2].horizontal(|ui| { ui.label("Samples"); ui.label(format!("{}", state.num_samples)); }); }
                             columns[2].horizontal(|ui| { ui.label("Sample Rate"); ui.label(format!("{} Hz", state.current_sample_rate as u32)); });
+                            columns[2].horizontal(|ui| { ui.label("Bitrate"); ui.label(state.bitrate.map(|b| format!("{} kbps", b)).unwrap_or_else(|| "Unknown".to_string())); });
                             columns[2].horizontal(|ui| { 
                                 if let Some(tc) = state.tracker_channels {
                                     ui.label("Tracker Channels");

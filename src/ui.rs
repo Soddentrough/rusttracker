@@ -166,6 +166,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
             Row::new(vec!["Speed".to_string(), state.speed.to_string()]),
             Row::new(vec!["Channels".to_string(), state.num_channels.to_string()]),
             Row::new(vec!["Sample Rate".to_string(), format!("{} Hz", state.current_sample_rate as u32)]),
+            Row::new(vec!["Bitrate".to_string(), state.bitrate.map(|b| format!("{} kbps", b)).unwrap_or_else(|| "Unknown".to_string())]),
             Row::new(vec!["Length".to_string(), if state.duration_seconds <= 0.0 { "LIVE".to_string() } else { format!("{:.1}s", state.duration_seconds) }]),
         ],
         [Constraint::Percentage(40), Constraint::Percentage(60)].as_ref()
