@@ -108,6 +108,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
     VisualizerDef { id: 13, name: "Starfield Constellation", filename: "vis_starfield.wgsl", description: "Audio-reactive galaxy and starfield", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 14, name: "Midnight Storm", filename: "vis_rain.wgsl", description: "Nighttime rain and audio-reactive lightning", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 15, name: "3D Midnight Storm", filename: "vis_3drain.wgsl", description: "3D rain and lightning across audio frequencies", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
+    VisualizerDef { id: 16, name: "Synthwave Racer", filename: "vis_synthwaveracer.wgsl", description: "Retro 80s synthwave racer visualizer", pipeline_type: PipelineType::FullscreenQuad, requires_history: true, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
 ];
 
 #[derive(Debug, Clone)]
