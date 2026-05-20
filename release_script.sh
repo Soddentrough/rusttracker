@@ -9,15 +9,18 @@ TAG="v$VERSION"
 
 echo "Waiting for Github Actions to complete for branch $TAG..."
 while true; do
-  STATUS=$(gh run list --branch "$TAG" --json status,conclusion -q '.[0].status')
-  CONCLUSION=$(gh run list --branch "$TAG" --json status,conclusion -q '.[0].conclusion')
-  if [ "$STATUS" == "completed" ]; then
+  ACTIVE_RUNS=$(gh run list --branch "$TAG" --json status -q 'map(select(.status != "completed")) | length')
+  if [ "$ACTIVE_RUNS" -eq 0 ]; then
     break
   fi
+  echo "Still running: $ACTIVE_RUNS workflows active..."
   sleep 10
 done
 
-if [ "$CONCLUSION" == "success" ]; then
+TOTAL_RUNS=$(gh run list --branch "$TAG" --json conclusion -q 'length')
+SUCCESS_RUNS=$(gh run list --branch "$TAG" --json conclusion -q 'map(select(.conclusion == "success")) | length')
+
+if [ "$SUCCESS_RUNS" -eq "$TOTAL_RUNS" ] && [ "$TOTAL_RUNS" -gt 0 ]; then
   echo "CI pipeline completed successfully."
    
   echo "Cleaning old artifact directories..."
