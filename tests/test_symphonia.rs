@@ -6,11 +6,17 @@ use std::fs::File;
 
 #[test]
 fn test_symphonia() {
-    let file_path = "/home/naoki/Downloads/Love.Death.and.Robots.S04E01.1080p.WEB.h264-ETHEL[EZTVx.to].mkv";
-    let file = File::open(file_path).unwrap();
+    let file_path = "audio_tests/FLAC 5.1.flac";
+    let file = match File::open(file_path) {
+        Ok(f) => f,
+        Err(e) => {
+            println!("Failed to open {}: {}", file_path, e);
+            return;
+        }
+    };
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
-    hint.with_extension("mkv");
+    hint.with_extension("flac");
 
     let probed = match symphonia::default::get_probe()
         .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default()) {
@@ -29,3 +35,4 @@ fn test_symphonia() {
                   
     println!("Found track: {:?}", track.is_some());
 }
+

@@ -160,8 +160,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let y_f = (uv.y - hm_rect_min.y) / (hm_rect_max.y - hm_rect_min.y);
         let y_idx = u32(clamp(y_f * 120.0, 0.0, 119.99));
         
-        // y_idx 0 is newest (bottom of UI). y_idx 119 is oldest (top of UI).
-        let physical_row = (uniforms.heatmap_row + 120u - y_idx) % 120u;
+        let physical_row = (uniforms.heatmap_row + 1024u - y_idx) % 1024u;
         let val = textureLoad(heatmap_tex, vec2<i32>(i32(x_idx), i32(physical_row)), 0).r;
         
         if (val > 5.0) {

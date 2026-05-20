@@ -3065,7 +3065,9 @@ version = "0.3.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e1eebcea8b0dbff5f7c8504f3107c68fc061a3eb44932051c8cf8a68d969c3b2"
 dependencies = [
+ "block2 0.6.2",
  "dispatch2",
+ "libc",
  "objc2 0.6.4",
  "objc2-core-audio-types",
  "objc2-core-foundation",
@@ -4252,7 +4254,7 @@ dependencies = [
 
 [[package]]
 name = "rusttracker"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -4273,6 +4275,8 @@ dependencies = [
  "keepawake",
  "midly",
  "naga",
+ "objc2 0.6.4",
+ "objc2-core-audio",
  "openmpt",
  "pollster",
  "ratatui",

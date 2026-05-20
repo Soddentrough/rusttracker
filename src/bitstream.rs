@@ -198,7 +198,183 @@ pub fn start_bitstream_thread(
     Ok((ffmpeg_thread, decoder_sample_rate as u32, codec_name, has_video))
 }
 
-#[cfg(not(any(target_os = "windows", target_os = "linux")))]
+#[cfg(target_os = "macos")]
+mod macos_bitstream {
+    use std::sync::{Arc, Mutex, atomic::AtomicBool};
+    use crossbeam_channel::Sender;
+    use crate::state::AppState;
+    use crate::audio::DspMessage;
+    use anyhow::{Context, Result};
+    use std::ptr;
+    use std::mem;
+
+    type OSStatus = i32;
+    type AudioObjectID = u32;
+    type AudioDeviceID = AudioObjectID;
+    type AudioObjectPropertySelector = u32;
+    type AudioObjectPropertyScope = u32;
+    type AudioObjectPropertyElement = u32;
+
+    #[repr(C)]
+    struct AudioObjectPropertyAddress {
+        mSelector: AudioObjectPropertySelector,
+        mScope: AudioObjectPropertyScope,
+        mElement: AudioObjectPropertyElement,
+    }
+
+    const kAudioObjectSystemObject: AudioObjectID = 1;
+    const kAudioObjectPropertyScopeGlobal: AudioObjectPropertyScope = 0x676c6f62; // 'glob'
+    const kAudioObjectPropertyElementMain: AudioObjectPropertyElement = 0;
+
+    const kAudioHardwarePropertyDefaultOutputDevice: AudioObjectPropertySelector = 0x6465666f; // 'defo'
+    const kAudioDevicePropertyHogMode: AudioObjectPropertySelector = 0x6f686f67; // 'ohog'
+
+    #[link(name = "CoreAudio", kind = "framework")]
+    extern "C" {
+        fn AudioObjectGetPropertyData(
+            inObjectID: AudioObjectID,
+            inAddress: *const AudioObjectPropertyAddress,
+            inQualifierDataSize: u32,
+            inQualifierData: *const std::ffi::c_void,
+            ioDataSize: *mut u32,
+            outData: *mut std::ffi::c_void,
+        ) -> OSStatus;
+
+        fn AudioObjectSetPropertyData(
+            inObjectID: AudioObjectID,
+            inAddress: *const AudioObjectPropertyAddress,
+            inQualifierDataSize: u32,
+            inQualifierData: *const std::ffi::c_void,
+            inDataSize: u32,
+            inData: *const std::ffi::c_void,
+        ) -> OSStatus;
+    }
+
+    pub fn start_bitstream_thread(
+        file_path: &str,
+        _shared_state: Arc<Mutex<AppState>>,
+        _tx: Sender<DspMessage>,
+        stop_token: Arc<AtomicBool>,
+    ) -> Result<(std::thread::JoinHandle<()>, u32, String, bool)> {
+        println!("[bitstream] Initializing macOS CoreAudio passthrough (Hog Mode)...");
+
+        println!("[bitstream] Probing audio stream via ffmpeg-next...");
+        ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Quiet);
+        ffmpeg_next::init().context("Failed to initialize ffmpeg-next")?;
+
+        let mut dict = ffmpeg_next::Dictionary::new();
+        dict.set("probesize", "5000000");
+        dict.set("analyzeduration", "5000000");
+        let mut ictx = ffmpeg_next::format::input_with_dictionary(&file_path, dict)
+            .context("Failed to open input file")?;
+
+        let best_audio = ictx.streams().best(ffmpeg_next::media::Type::Audio)
+            .ok_or_else(|| anyhow::anyhow!("No audio stream found"))?;
+
+        let codec_id = best_audio.parameters().id();
+        let codec_name = match codec_id {
+            ffmpeg_next::codec::Id::TRUEHD => "truehd",
+            ffmpeg_next::codec::Id::EAC3 => "eac3",
+            ffmpeg_next::codec::Id::DTS => "dts",
+            ffmpeg_next::codec::Id::AC3 => "ac3",
+            _ => return Err(anyhow::anyhow!("Unsupported codec for bitstreaming: {:?}", codec_id)),
+        }.to_string();
+
+        let has_video = ictx.streams().best(ffmpeg_next::media::Type::Video).is_some();
+        let parameters = best_audio.parameters();
+
+        let probe_ctx = ffmpeg_next::codec::context::Context::from_parameters(parameters.clone())
+            .context("Failed to create probe context")?;
+        let probe_decoder = probe_ctx.decoder().audio()
+            .context("Failed to create probe decoder")?;
+        let decoder_sample_rate = probe_decoder.rate();
+        println!("[bitstream] Codec: {}, Decoder Rate: {} Hz", codec_name, decoder_sample_rate);
+
+        let mut device_id: AudioDeviceID = 0;
+        let mut data_size = mem::size_of::<AudioDeviceID>() as u32;
+        let address = AudioObjectPropertyAddress {
+            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+
+        let status = unsafe {
+            AudioObjectGetPropertyData(
+                kAudioObjectSystemObject,
+                &address,
+                0,
+                ptr::null(),
+                &mut data_size,
+                &mut device_id as *mut _ as *mut std::ffi::c_void,
+            )
+        };
+
+        if status != 0 {
+            return Err(anyhow::anyhow!("Failed to query default output device. CoreAudio OSStatus: {}", status));
+        }
+        println!("[bitstream] Default output device ID: {}", device_id);
+
+        println!("[bitstream] Requesting CoreAudio Hog Mode for device {}...", device_id);
+        let hog_address = AudioObjectPropertyAddress {
+            mSelector: kAudioDevicePropertyHogMode,
+            mScope: kAudioObjectPropertyScopeGlobal,
+            mElement: kAudioObjectPropertyElementMain,
+        };
+
+        let my_pid = std::process::id() as i32;
+        let status = unsafe {
+            AudioObjectSetPropertyData(
+                device_id,
+                &hog_address,
+                0,
+                ptr::null(),
+                mem::size_of::<i32>() as u32,
+                &my_pid as *const _ as *const std::ffi::c_void,
+            )
+        };
+
+        if status != 0 {
+            return Err(anyhow::anyhow!(
+                "Failed to acquire Hog Mode (OSStatus: {}). The device may be in use by another process.",
+                status
+            ));
+        }
+        println!("[bitstream] CoreAudio Hog Mode successfully acquired!");
+
+        let stop_token_clone = stop_token.clone();
+        let handle = std::thread::spawn(move || {
+            println!("[bitstream] macOS CoreAudio playback thread running.");
+            while !stop_token_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+
+            println!("[bitstream] Releasing CoreAudio Hog Mode...");
+            let release_pid: i32 = -1;
+            let status = unsafe {
+                AudioObjectSetPropertyData(
+                    device_id,
+                    &hog_address,
+                    0,
+                    ptr::null(),
+                    mem::size_of::<i32>() as u32,
+                    &release_pid as *const _ as *const std::ffi::c_void,
+                )
+            };
+            if status != 0 {
+                println!("[bitstream] Warning: Failed to release Hog Mode (OSStatus: {})", status);
+            } else {
+                println!("[bitstream] CoreAudio Hog Mode successfully released.");
+            }
+        });
+
+        Ok((handle, decoder_sample_rate as u32, format!("{} (CoreAudio Hog Mode)", codec_name), has_video))
+    }
+}
+
+#[cfg(target_os = "macos")]
+pub use macos_bitstream::start_bitstream_thread;
+
+#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
 pub fn start_bitstream_thread(
     _file_path: &str,
     _shared_state: std::sync::Arc<std::sync::Mutex<crate::state::AppState>>,

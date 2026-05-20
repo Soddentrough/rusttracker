@@ -1,27 +1,69 @@
+use std::path::Path;
+
 fn main() {
-    let source = std::fs::read_to_string("src/shaders/vis_3drain.wgsl").unwrap();
-    // we need to include common
-    let common = "struct VertexOutput { @builtin(position) clip_position: vec4<f32>, @location(0) uv: vec2<f32>, }; @vertex fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput { var out: VertexOutput; return out; } struct AudioUniforms { spectrum: array<vec4<f32>, 256>, fire_heat: array<vec4<f32>, 256>, channels: array<vec4<f32>, 8>, channel_peaks: array<vec4<f32>, 8>, spatial_channels: array<vec4<f32>, 4>, display_order: array<vec4<u32>, 4>, num_channels: u32, mode: u32, time: f32, duration: f32, smooth_time: f32, heatmap_row: u32, fft_channels: u32, num_spatial_channels: u32, ui_meters_rect: vec4<f32>, ui_heatmap_rect: vec4<f32>, ui_fire_rect: vec4<f32>, waveform_resolution: u32, waveform_history_size: u32, _pad0: u32, _pad1: u32, };";
-    let full_source = source.replace("// INCLUDE: common", common);
-    let mut frontend = naga::front::wgsl::Frontend::new();
-    match frontend.parse(&full_source) {
-        Ok(module) => {
-            let mut validator = naga::valid::Validator::new(
-                naga::valid::ValidationFlags::all(),
-                naga::valid::Capabilities::all(),
-            );
-            match validator.validate(&module) {
-                Ok(_) => println!("WGSL Validated Successfully"),
-                Err(e) => {
-                    eprintln!("Validation error: {:?}", e);
-                    std::process::exit(1);
+    let common = std::fs::read_to_string("src/shaders/_common.wgsl")
+        .expect("Failed to read _common.wgsl");
+    let glyph_font = std::fs::read_to_string("src/shaders/_glyph_font.wgsl")
+        .expect("Failed to read _glyph_font.wgsl");
+
+    let shader_dir = Path::new("src/shaders");
+    let entries = std::fs::read_dir(shader_dir).expect("Failed to read src/shaders directory");
+
+    let mut failed = false;
+    let mut validated_count = 0;
+
+    for entry in entries {
+        let entry = entry.expect("Failed to read entry");
+        let path = entry.path();
+        if path.is_file() {
+            if let Some(ext) = path.extension() {
+                if ext == "wgsl" {
+                    let filename = path.file_name().unwrap().to_string_lossy().into_owned();
+                    // Skip the helper header files themselves as they are incomplete standalone WGSL
+                    if filename.starts_with('_') {
+                        continue;
+                    }
+
+                    let source = std::fs::read_to_string(&path)
+                        .unwrap_or_else(|_| panic!("Failed to read shader {:?}", path));
+                    
+                    let full_source = source
+                        .replace("// INCLUDE: common", &common)
+                        .replace("// INCLUDE: glyph_font", &glyph_font);
+
+                    let mut frontend = naga::front::wgsl::Frontend::new();
+                    match frontend.parse(&full_source) {
+                        Ok(module) => {
+                            let mut validator = naga::valid::Validator::new(
+                                naga::valid::ValidationFlags::all(),
+                                naga::valid::Capabilities::all(),
+                            );
+                            match validator.validate(&module) {
+                                Ok(_) => {
+                                    println!("Successfully validated: {}", filename);
+                                    validated_count += 1;
+                                }
+                                Err(e) => {
+                                    eprintln!("Validation error in {}: {:?}", filename, e);
+                                    failed = true;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let err_str = e.emit_to_string_with_path(&full_source, &filename);
+                            eprintln!("Parse error in {}:\n{}", filename, err_str);
+                            failed = true;
+                        }
+                    }
                 }
             }
-        },
-        Err(e) => {
-            let err_str = e.emit_to_string_with_path(&full_source, "vis_3drain.wgsl");
-            eprintln!("{}", err_str);
-            std::process::exit(1);
         }
+    }
+
+    if failed {
+        eprintln!("\nSome shaders failed validation.");
+        std::process::exit(1);
+    } else {
+        println!("\nAll {} shaders validated successfully!", validated_count);
     }
 }

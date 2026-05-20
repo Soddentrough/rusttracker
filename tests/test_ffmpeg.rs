@@ -3,11 +3,11 @@ use ffmpeg_next as ffmpeg;
 #[test]
 fn test_ffmpeg() {
     let _ = ffmpeg::init();
-    let file_path = "/home/naoki/Downloads/Love.Death.and.Robots.S04E01.1080p.WEB.h264-ETHEL[EZTVx.to].mkv";
-    let mut ictx = match ffmpeg::format::input(&file_path) {
+    let file_path = "audio_tests/AAC 5.1.mp4";
+    let ictx = match ffmpeg::format::input(&file_path) {
         Ok(ictx) => ictx,
         Err(e) => {
-            println!("Failed to open: {}", e);
+            println!("Failed to open {}: {}", file_path, e);
             return;
         }
     };
@@ -17,3 +17,4 @@ fn test_ffmpeg() {
     let audio_stream = ictx.streams().best(ffmpeg::media::Type::Audio);
     println!("Audio stream: {}", audio_stream.is_some());
 }
+

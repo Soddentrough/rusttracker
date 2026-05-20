@@ -69,13 +69,23 @@ jobs:
               <string>APPL</string>
               <key>LSMinimumSystemVersion</key>
               <string>10.15</string>
+              <key>NSHighResolutionCapable</key>
+              <true/>
+              <key>LSApplicationCategoryType</key>
+              <string>public.app-category.music</string>
+              <key>NSMicrophoneUsageDescription</key>
+              <string>RustTracker needs microphone access to visualize live audio input.</string>
           </dict>
           </plist>
           EOF
           
-          # Copy binary and bundle libraries
+          # Copy binary, soundfont asset, and bundle libraries
           cp target/release/rusttracker RustTracker.app/Contents/MacOS/
+          cp assets/soundfont.sf2 RustTracker.app/Contents/Resources/
           dylibbundler -od -b -x RustTracker.app/Contents/MacOS/rusttracker -d RustTracker.app/Contents/Frameworks/ -p @executable_path/../Frameworks/
+          
+          # Ad-hoc codesign the entire bundle recursively to satisfy security requirements (especially Apple Silicon)
+          codesign --force --deep --sign - RustTracker.app
           
       - name: Create DMG
         run: |

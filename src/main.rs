@@ -671,7 +671,7 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                             }
                         }
 
-                        engine.update(&state);
+                        engine.update(&state, dt);
                     }
                     let phase_lock_update_us = phase_timer.elapsed().as_micros() as f32;
 

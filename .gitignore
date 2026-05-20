@@ -48,3 +48,5 @@ scratch/
 scratch_bitstream/target/
 scratch_bitstream_windows/target/
 check_shader
+/test.rs
+/test_*

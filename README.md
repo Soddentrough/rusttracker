@@ -90,3 +90,7 @@ cargo deb
 * `spectrum-analyzer` - Fast Fourier Transforms that make the pretty things react to the loud things
 * `crossbeam-channel` - Lock-free concurrency because threads should get along
 * `openmpt` - Tracker module decoding for that sweet, sweet nostalgia
+
+## License
+
+This project is licensed under the [GNU General Public License v3.0](LICENSE) (GPLv3).

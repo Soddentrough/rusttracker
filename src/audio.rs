@@ -1384,16 +1384,39 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
 
     // 3. Try MIDI
     if ext == "mid" || ext == "midi" {
-        // Look for soundfont in project dir, then fallback
-        let sf_path = if std::path::Path::new("assets/soundfont.sf2").exists() {
-            "assets/soundfont.sf2"
-        } else {
-            "soundfont.sf2" // User must provide it in the working dir if not in assets
-        };
-        if let Ok(source) = MidiSource::new(file_path, sf_path, 48000) {
+        // Look for soundfont in project dir, then fallback to executable-relative paths and macOS Resources bundle
+        let mut sf_path = "assets/soundfont.sf2".to_string();
+        if !std::path::Path::new(&sf_path).exists() {
+            if std::path::Path::new("soundfont.sf2").exists() {
+                sf_path = "soundfont.sf2".to_string();
+            } else if let Ok(exe_path) = std::env::current_exe() {
+                if let Some(exe_dir) = exe_path.parent() {
+                    let test_path = exe_dir.join("assets/soundfont.sf2");
+                    if test_path.exists() {
+                        sf_path = test_path.to_string_lossy().into_owned();
+                    } else {
+                        let test_path = exe_dir.join("soundfont.sf2");
+                        if test_path.exists() {
+                            sf_path = test_path.to_string_lossy().into_owned();
+                        } else {
+                            let test_path = exe_dir.join("../Resources/soundfont.sf2");
+                            if test_path.exists() {
+                                sf_path = test_path.to_string_lossy().into_owned();
+                            } else {
+                                let test_path = exe_dir.join("../Resources/assets/soundfont.sf2");
+                                if test_path.exists() {
+                                    sf_path = test_path.to_string_lossy().into_owned();
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Ok(source) = MidiSource::new(file_path, &sf_path, 48000) {
             return Ok(Box::new(source));
         } else {
-            return Err(anyhow::anyhow!("Failed to parse MIDI or missing SoundFont ({}). Please place a SoundFont in assets/soundfont.sf2", sf_path));
+            return Err(anyhow::anyhow!("Failed to parse MIDI or missing SoundFont ({}). Please place a SoundFont in assets/soundfont.sf2 or bundled resources", sf_path));
         }
     }
 

@@ -39,6 +39,10 @@ struct AudioUniforms {
     ui_fire_rect: vec4<f32>,
     waveform_resolution: u32,
     waveform_history_size: u32,
-    _pad0: u32,
-    _pad1: u32,
+    frame_count: u32,
+    step_fraction: f32,
+    steps_to_fill: u32,
+    pad1: u32,
+    pad2: u32,
+    pad3: u32,
 };

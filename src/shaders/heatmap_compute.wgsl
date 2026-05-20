@@ -20,7 +20,15 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     max_val = max(max_val, spec_vec.z);
     max_val = max(max_val, spec_vec.w);
 
-    // Write to the current row
-    let y = uniforms.heatmap_row;
-    textureStore(heatmap_tex, vec2<i32>(i32(x), i32(y)), vec4<f32>(max_val, 0.0, 0.0, 0.0));
+    let y = i32(uniforms.heatmap_row);
+    let steps = i32(uniforms.steps_to_fill);
+    
+    // Write the spectrum data to the current row, any skipped intermediate rows,
+    // and the next row (future row) to prevent stale history sampling.
+    // Limit steps to 16 to avoid GPU timeout in extreme lag cases.
+    let fill_steps = clamp(steps, 0, 16);
+    for (var i = -fill_steps; i <= 1; i++) {
+        let target_y = u32((y + i + 1024) % 1024);
+        textureStore(heatmap_tex, vec2<i32>(i32(x), i32(target_y)), vec4<f32>(max_val, 0.0, 0.0, 0.0));
+    }
 }
