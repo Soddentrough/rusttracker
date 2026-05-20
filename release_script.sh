@@ -7,9 +7,21 @@ echo "-----------------------------------------------------"
 VERSION=$(grep -m 1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
 TAG="v$VERSION"
 
-echo "Waiting for Github Actions to complete for branch $TAG..."
+SHA=$(git rev-parse "$TAG")
+
+echo "Waiting for Github Actions to register runs for commit $SHA ($TAG)..."
 while true; do
-  ACTIVE_RUNS=$(gh run list --branch "$TAG" --json status -q 'map(select(.status != "completed")) | length')
+  TOTAL_RUNS=$(gh run list --commit "$SHA" --json status -q 'length')
+  if [ "$TOTAL_RUNS" -gt 0 ]; then
+    break
+  fi
+  echo "Waiting for runs to start..."
+  sleep 5
+done
+
+echo "Waiting for Github Actions to complete for commit $SHA..."
+while true; do
+  ACTIVE_RUNS=$(gh run list --commit "$SHA" --json status -q 'map(select(.status != "completed")) | length')
   if [ "$ACTIVE_RUNS" -eq 0 ]; then
     break
   fi
@@ -17,8 +29,8 @@ while true; do
   sleep 10
 done
 
-TOTAL_RUNS=$(gh run list --branch "$TAG" --json conclusion -q 'length')
-SUCCESS_RUNS=$(gh run list --branch "$TAG" --json conclusion -q 'map(select(.conclusion == "success")) | length')
+TOTAL_RUNS=$(gh run list --commit "$SHA" --json conclusion -q 'length')
+SUCCESS_RUNS=$(gh run list --commit "$SHA" --json conclusion -q 'map(select(.conclusion == "success")) | length')
 
 if [ "$SUCCESS_RUNS" -eq "$TOTAL_RUNS" ] && [ "$TOTAL_RUNS" -gt 0 ]; then
   echo "CI pipeline completed successfully."
