@@ -230,7 +230,7 @@ mod macos_bitstream {
     const kAudioDevicePropertyHogMode: AudioObjectPropertySelector = 0x6f686f67; // 'ohog'
 
     #[link(name = "CoreAudio", kind = "framework")]
-    extern "C" {
+    unsafe extern "C" {
         fn AudioObjectGetPropertyData(
             inObjectID: AudioObjectID,
             inAddress: *const AudioObjectPropertyAddress,
