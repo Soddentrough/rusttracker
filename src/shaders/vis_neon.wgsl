@@ -116,12 +116,18 @@ fn map_scene(p: vec3<f32>) -> vec2<f32> {
 }
 
 fn calc_normal(p: vec3<f32>) -> vec3<f32> {
-    let e = vec2<f32>(0.01, 0.0);
-    return normalize(vec3<f32>(
-        map_scene(p + e.xyy).x - map_scene(p - e.xyy).x,
-        map_scene(p + e.yxy).x - map_scene(p - e.yxy).x,
-        map_scene(p + e.yyx).x - map_scene(p - e.yyx).x
-    ));
+    let d_floor = p.y + 1.0;
+    let d_wall = 10.0 - p.z;
+    let d_ceil = 5.0 - p.y;
+    let d_left = p.x + 8.0;
+    let d_right = 8.0 - p.x;
+    
+    let min_d = min(d_floor, min(d_wall, min(d_ceil, min(d_left, d_right))));
+    if (min_d == d_floor) { return vec3<f32>(0.0, 1.0, 0.0); }
+    if (min_d == d_ceil)  { return vec3<f32>(0.0, -1.0, 0.0); }
+    if (min_d == d_left)  { return vec3<f32>(1.0, 0.0, 0.0); }
+    if (min_d == d_right) { return vec3<f32>(-1.0, 0.0, 0.0); }
+    return vec3<f32>(0.0, 0.0, -1.0);
 }
 
 fn get_smoke_density(p: vec3<f32>, time: f32, audio_activity: f32) -> f32 {

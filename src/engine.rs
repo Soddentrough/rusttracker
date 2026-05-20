@@ -278,7 +278,7 @@ pub struct VulkanEngine<'a> {
     smooth_dt: f64,
 }
 
-fn generate_lamp_mesh() -> (Vec<Vertex>, Vec<u32>) {
+pub(crate) fn generate_lamp_mesh() -> (Vec<Vertex>, Vec<u32>) {
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
     

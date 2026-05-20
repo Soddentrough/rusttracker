@@ -37,45 +37,54 @@ fn project_3d(p3: vec3<f32>, ro: vec3<f32>, u: vec3<f32>, v_cam: vec3<f32>, w: v
     return vec3<f32>(proj_x, proj_y, dist_w);
 }
 
-fn draw_3d_segment(p: vec2<f32>, ro: vec3<f32>, u: vec3<f32>, v_cam: vec3<f32>, w: vec3<f32>, start_pos: vec3<f32>, end_pos: vec3<f32>, thickness_base: f32, intensity: f32, is_branch: bool) -> f32 {
-    var pA = project_3d(start_pos, ro, u, v_cam, w);
-    var pB = project_3d(end_pos, ro, u, v_cam, w);
-    
-    if (pA.z <= 0.0 && pB.z <= 0.0) { return 0.0; }
-    
-    if (pA.z <= 0.0 && pB.z > 0.0) {
-        let t = clamp(-pA.z / (pB.z - pA.z), 0.0, 1.0);
-        let front_pos = start_pos + (end_pos - start_pos) * t;
-        pA = project_3d(front_pos, ro, u, v_cam, w);
-    } else if (pB.z <= 0.0 && pA.z > 0.0) {
-        let t = clamp(-pA.z / (pB.z - pA.z), 0.0, 1.0);
-        let front_pos = start_pos + (end_pos - start_pos) * t;
-        pB = project_3d(front_pos, ro, u, v_cam, w);
+fn draw_projected_segment(p: vec2<f32>, pA: vec3<f32>, pB: vec3<f32>, thickness_base: f32, intensity: f32, is_branch: bool) -> f32 {
+    if (pA.z <= 0.1 || pB.z <= 0.1) {
+        return 0.0;
     }
     
-    if (pA.z > 0.0 || pB.z > 0.0) {
-        let d = sd_segment(p, pA.xy, pB.xy);
-        let depth = max(0.4, max(pA.z, pB.z));
-        let thickness = thickness_base / depth;
-        let core = smoothstep(thickness * 0.5, 0.0, d);
-        let glow_radius = select(60.0, 120.0, is_branch); // Branches have a tighter, less intense glow
-        let glow_mult = select(0.7, 0.3, is_branch);
-        let glow = exp(-d * glow_radius) * glow_mult;
-        return (core + glow) * intensity;
+    let margin = select(0.08, 0.04, is_branch);
+    let min_x = min(pA.x, pB.x) - margin;
+    let max_x = max(pA.x, pB.x) + margin;
+    let min_y = min(pA.y, pB.y) - margin;
+    let max_y = max(pA.y, pB.y) + margin;
+    
+    if (p.x < min_x || p.x > max_x || p.y < min_y || p.y > max_y) {
+        return 0.0;
     }
-    return 0.0;
+    
+    let d = sd_segment(p, pA.xy, pB.xy);
+    let depth = max(0.4, max(pA.z, pB.z));
+    let thickness = thickness_base / depth;
+    let core = smoothstep(thickness * 0.5, 0.0, d);
+    let glow_radius = select(60.0, 120.0, is_branch); // Branches have a tighter, less intense glow
+    let glow_mult = select(0.7, 0.3, is_branch);
+    let glow = exp(-d * glow_radius) * glow_mult;
+    return (core + glow) * intensity;
 }
 
 fn draw_3d_lightning_bolt(ro: vec3<f32>, u: vec3<f32>, v_cam: vec3<f32>, w: vec3<f32>, p: vec2<f32>, seed: f32, intensity: f32, origin: vec3<f32>, plane_z: f32) -> f32 {
     if (intensity < 0.01) { return 0.0; }
 
-    var bolt = 0.0;
-    var current_pos = origin;
     let segments = 15;
     let frustum_height = plane_z - ro.z;
     let bolt_height = frustum_height * 2.4; // Ensure it reaches ground
     let seg_h = bolt_height / f32(segments);
     let j_scale = plane_z * 0.15; // Scale jitter with distance
+
+    // Bounding box check in screen space (Fast Pruning)
+    let max_dev_3d = 6.5 * j_scale;
+    let p_top = project_3d(origin, ro, u, v_cam, w);
+    let p_bot = project_3d(origin - vec3<f32>(0.0, bolt_height, 0.0), ro, u, v_cam, w);
+    
+    let depth_min = max(0.1, plane_z - max_dev_3d - ro.z);
+    let margin = max_dev_3d / depth_min + 0.15;
+    
+    let d_line = sd_segment(p, p_top.xy, p_bot.xy);
+    if (d_line > margin) { return 0.0; }
+
+    var bolt = 0.0;
+    var current_pos = origin;
+    var p_curr_proj = p_top;
 
     // Simulate dart leaders and return stroke pulsing via high-frequency flicker
     let flicker = 0.6 + 0.4 * sin(audio.smooth_time * 60.0 + seed);
@@ -87,43 +96,51 @@ fn draw_3d_lightning_bolt(ro: vec3<f32>, u: vec3<f32>, v_cam: vec3<f32>, w: vec3
         let x_jitter = (hash11(seed + f_i * 7.13) - 0.5) * j_scale * 2.5;
         let z_jitter = (hash11(seed + f_i * 13.7) - 0.5) * j_scale * 2.5;
         let next_pos = current_pos + vec3<f32>(x_jitter, -seg_h, z_jitter);
+        let p_next_proj = project_3d(next_pos, ro, u, v_cam, w);
 
         // 1. Main Return Stroke Channel
         let thickness = 0.012 + main_intensity * 0.015;
-        bolt += draw_3d_segment(p, ro, u, v_cam, w, current_pos, next_pos, thickness, main_intensity, false);
+        bolt += draw_projected_segment(p, p_curr_proj, p_next_proj, thickness, main_intensity, false);
 
         // 2. Stepped Leaders (Primary Branches)
-        // Spawn branches from most nodes to simulate the searching fractal nature
         if (hash11(seed + f_i * 3.1) > 0.25) {
             let bx = (hash11(seed + f_i * 8.2) - 0.5) * j_scale * 4.0;
             let bz = (hash11(seed + f_i * 9.3) - 0.5) * j_scale * 4.0;
             let branch_pos = current_pos + vec3<f32>(bx, -seg_h * 1.5, bz);
+            let p_branch_proj = project_3d(branch_pos, ro, u, v_cam, w);
             
-            bolt += draw_3d_segment(p, ro, u, v_cam, w, current_pos, branch_pos, 0.005, branch_intensity, true);
+            bolt += draw_projected_segment(p, p_curr_proj, p_branch_proj, 0.005, branch_intensity, true);
             
             // 3. Sub-branches (Secondary splits from the stepped leaders)
             if (hash11(seed + f_i * 2.4) > 0.35) {
                 let bx2 = (hash11(seed + f_i * 1.2) - 0.5) * j_scale * 3.0;
                 let bz2 = (hash11(seed + f_i * 4.3) - 0.5) * j_scale * 3.0;
                 let branch_pos2 = branch_pos + vec3<f32>(bx2, -seg_h * 1.2, bz2);
-                bolt += draw_3d_segment(p, ro, u, v_cam, w, branch_pos, branch_pos2, 0.003, branch_intensity * 0.6, true);
+                let p_branch2_proj = project_3d(branch_pos2, ro, u, v_cam, w);
+                
+                bolt += draw_projected_segment(p, p_branch_proj, p_branch2_proj, 0.003, branch_intensity * 0.6, true);
             }
         }
         
         // 4. Major splits (connecting leaders that travel alongside the main channel)
         if (i == 3 || i == 8) {
             var split_pos = current_pos;
+            var p_split_proj = p_curr_proj;
             for (var j = 0; j < 4; j = j + 1) {
                 let f_j = f32(j);
                 let sx = (hash11(seed + f_i * 5.0 + f_j) - 0.5) * j_scale * 3.0;
                 let sz = (hash11(seed + f_i * 6.0 + f_j) - 0.5) * j_scale * 3.0;
                 let next_split = split_pos + vec3<f32>(sx, -seg_h * 1.1, sz);
-                bolt += draw_3d_segment(p, ro, u, v_cam, w, split_pos, next_split, 0.007, branch_intensity * 1.5, true);
+                let p_next_split_proj = project_3d(next_split, ro, u, v_cam, w);
+                
+                bolt += draw_projected_segment(p, p_split_proj, p_next_split_proj, 0.007, branch_intensity * 1.5, true);
                 split_pos = next_split;
+                p_split_proj = p_next_split_proj;
             }
         }
 
         current_pos = next_pos;
+        p_curr_proj = p_next_proj;
     }
 
     return bolt;

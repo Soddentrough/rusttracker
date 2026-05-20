@@ -51,23 +51,32 @@ fn get_density(p: vec2<f32>) -> f32 {
     let fx = fract(px);
     let fz = fract(pz);
     
+    var w_x: array<f32, 5>;
+    for (var i = 0; i < 5; i++) {
+        let dx = f32(i - 2) - fx;
+        w_x[i] = exp(-dx * dx * 0.12);
+    }
+    
+    var w_z: array<f32, 5>;
+    for (var j = 0; j < 5; j++) {
+        let dz = f32(j - 2) - fz;
+        w_z[j] = exp(-dz * dz * 0.12);
+    }
+    
     var sum = 0.0;
     var w_sum = 0.0;
     
     // 5×5 Gaussian kernel at stride 1 — no aliasing artifacts
     // Wide sigma blends the 5×5 compute splat into smooth, continuous mounds
     for (var i = -2; i <= 2; i++) {
+        let cx = ix + i;
+        let wx = w_x[i + 2];
         for (var j = -2; j <= 2; j++) {
-            let cx = ix + i;
+            let cx_coord = cx;
             let cz = iz + j;
-            let val = get_density_raw(cx, cz);
+            let val = get_density_raw(cx_coord, cz);
             
-            let dx = f32(i) - fx;
-            let dy = f32(j) - fz;
-            let dist_sq = dx*dx + dy*dy;
-            
-            // Wide Gaussian for smooth blending
-            let w = exp(-dist_sq * 0.12);
+            let w = wx * w_z[j + 2];
             sum += val * w;
             w_sum += w;
         }
@@ -81,11 +90,15 @@ fn get_density(p: vec2<f32>) -> f32 {
 }
 
 fn map(p: vec3<f32>) -> f32 {
+    let dist_from_center = length(p.xz);
+    if (dist_from_center > PUDDLE_RADIUS + 0.5) {
+        return (p.y + 0.5) * LIPSCHITZ;
+    }
+
     let particle_h = get_density(p.xz);
     
     // Base puddle: thin continuous fluid layer that prevents holes
     // Simulates surface tension — ferrofluid never has gaps in its surface
-    let dist_from_center = length(p.xz);
     let base_h = BASE_HEIGHT * smoothstep(PUDDLE_RADIUS, PUDDLE_RADIUS * 0.5, dist_from_center);
     
     let h = max(particle_h, base_h);

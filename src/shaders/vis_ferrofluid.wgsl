@@ -62,6 +62,21 @@ fn smax(a: f32, b: f32, k: f32) -> f32 {
 }
 
 // --- Speaker Layout (up to 7.1.4) ---
+const SPEAKER_DIR_2D = array<vec2<f32>, 12>(
+    vec2<f32>(-0.5, -0.866),
+    vec2<f32>(0.5, -0.866),
+    vec2<f32>(0.0, -1.0),
+    vec2<f32>(0.0, 0.0), // LFE (unused directionally)
+    vec2<f32>(-0.94, 0.34),
+    vec2<f32>(0.94, 0.34),
+    vec2<f32>(-0.5, 0.866),
+    vec2<f32>(0.5, 0.866),
+    vec2<f32>(-0.70710678, -0.70710678),
+    vec2<f32>(0.70710678, -0.70710678),
+    vec2<f32>(-0.70710678, 0.70710678),
+    vec2<f32>(0.70710678, 0.70710678)
+);
+
 // Note: This shader maps channels[] (instrument/track data) to speaker positions.
 // For surround content where spatial_channels[] carries the speaker mix,
 // swap get_vu(i) for a spatial accessor if needed.
@@ -106,7 +121,7 @@ fn map_dist(p: vec3<f32>) -> f32 {
             alignment = 1.0;
             spike_pos_r = 0.0;
         } else {
-            let dir2d = normalize(get_speaker_dir(i).xz);
+            let dir2d = SPEAKER_DIR_2D[i];
             alignment = max(0.0, dot(p_xz_norm, dir2d));
             spike_pos_r = 1.5;
         }
@@ -152,29 +167,45 @@ struct MapData {
 }
 
 fn map(p: vec3<f32>) -> MapData {
-    // Delegate to the canonical SDF — single source of truth for the distance field.
-    let d = map_dist(p);
-
-    // Glow computation (cosmetic only — uses channel alignment but does NOT
-    // affect the SDF value, so the distance can never diverge from map_dist).
     let dist_xz = length(p.xz);
-    let p_xz_norm = p.xz / max(dist_xz, 0.0001);
+
+    // Base infinite plane thickness
+    var fluid_h = 0.0;
+
     let num_ch = min(audio.num_channels, 12u);
+    var total_displacement = 0.0;
+
+    // Normalized xz for angle alignment
+    let p_xz_norm = p.xz / max(dist_xz, 0.0001);
     var glow = vec3<f32>(0.0);
 
     for (var i = 0u; i < num_ch; i++) {
         let vu = clamp(get_vu(i), 0.0, 1.0);
+
         var alignment = 1.0;
         var spike_pos_r = 1.5;
-        if i == 3u { alignment = 1.0; spike_pos_r = 0.0; }
-        else {
-            let dir2d = normalize(get_speaker_dir(i).xz);
+
+        if i == 3u { // LFE channel — center blob
+            alignment = 1.0;
+            spike_pos_r = 0.0;
+        } else {
+            let dir2d = SPEAKER_DIR_2D[i];
             alignment = max(0.0, dot(p_xz_norm, dir2d));
+            spike_pos_r = 1.5;
         }
+        
         let dist_to_spike = abs(dist_xz - spike_pos_r);
         let spatial_falloff = exp(-dist_to_spike * 3.0);
+
+        // Soften spike shape (pow 8) to keep SDF slopes within Lipschitz bound
         var lobe = pow(alignment, 8.0) * vu * 1.5 * spatial_falloff;
-        if i != 3u { lobe *= smoothstep(0.1, 0.5, dist_xz); }
+        
+        // Attenuate directional lobes at the center to prevent radial crease artifacts
+        if i != 3u {
+            lobe *= smoothstep(0.1, 0.5, dist_xz);
+        }
+        
+        total_displacement = smax(total_displacement, lobe, 0.3);
 
         if lobe > 0.1 {
             var ch_color = vec3<f32>(0.2, 0.6, 1.0);
@@ -183,6 +214,18 @@ fn map(p: vec3<f32>) -> MapData {
             glow += ch_color * pow(lobe, 2.0) * 2.0;
         }
     }
+
+    // Subtle ripples from spectrum bass
+    let bass = clamp(audio.spectrum[0].x + audio.spectrum[1].x, 0.0, 2.0);
+    let ripple = sin(dist_xz * 12.0 - audio.time * 8.0) * 0.015 * bass * smoothstep(PUDDLE_RADIUS, 0.0, dist_xz);
+
+    // Organic surface perturbation (smooth magnetic domain noise)
+    let noise_p = p * 4.0 + vec3<f32>(audio.time * 0.5, 0.0, audio.time * 0.3);
+    let surface_noise = (hash3_smooth(noise_p) - 0.5) * 0.05;
+
+    fluid_h += total_displacement + ripple + surface_noise;
+
+    let d = (p.y + 0.5 - fluid_h) * STEP_SCALE;
 
     return MapData(d, 1, glow);
 }
