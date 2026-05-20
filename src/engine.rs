@@ -3194,14 +3194,56 @@ impl<'a> VulkanEngine<'a> {
                                 out_track_info_rect = Some(rect);
                             } else {
                                 columns[2].style_mut().visuals.override_text_color = Some(egui::Color32::from_gray(235)); // Slightly lighter for contrast
-                                columns[2].heading("Track Info");
+                                let heading_text = if state.playlist.len() > 1 {
+                                    format!("Track Info ({}/{})", state.playlist_index + 1, state.playlist.len())
+                                } else {
+                                    "Track Info".to_string()
+                                };
+                                columns[2].heading(heading_text);
                                 columns[2].separator();
+                            
+                                let render_smooth_marquee = |ui: &mut egui::Ui, text: &str, size: f32, is_title: bool| {
+                                 let available_width = ui.available_width();
+                                 let font_id = egui::FontId::proportional(size);
+                                 let color = ui.style().visuals.override_text_color.unwrap_or(egui::Color32::from_gray(235));
+                                 let text_color = if is_title { egui::Color32::WHITE } else { color };
+                                 
+                                 let galley = ui.painter().layout_no_wrap(text.to_string(), font_id, text_color);
+                                 let text_width = galley.rect.width();
+                                 let height = galley.rect.height();
+                                 
+                                 let (rect, _response) = ui.allocate_exact_size(egui::vec2(available_width, height), egui::Sense::hover());
+                                 let painter = ui.painter().with_clip_rect(rect);
+                                 
+                                 if text_width > available_width {
+                                     let max_scroll = text_width - available_width;
+                                     let scroll_duration = max_scroll / 35.0; // 35 pixels per second
+                                     let total_period = 2.0 + scroll_duration + 2.0 + scroll_duration;
+                                     let t = (state.current_seconds as f32) % total_period;
+                                     
+                                     let offset = if t < 2.0 {
+                                         0.0
+                                     } else if t < 2.0 + scroll_duration {
+                                         let progress = (t - 2.0) / scroll_duration;
+                                         progress * max_scroll
+                                     } else if t < 2.0 + scroll_duration + 2.0 {
+                                         max_scroll
+                                     } else {
+                                         let progress = (t - (2.0 + scroll_duration + 2.0)) / scroll_duration;
+                                         max_scroll - (progress * max_scroll)
+                                     };
+                                     
+                                     painter.galley(rect.min + egui::vec2(-offset, 0.0), galley, text_color);
+                                 } else {
+                                     painter.galley(rect.min, galley, text_color);
+                                 }
+                             };
+
                             let current_path_str = if state.playlist_index < state.playlist.len() {
                                 state.playlist[state.playlist_index].clone()
                             } else {
                                 state.song_title.clone()
                             };
-                            
                             let is_network = current_path_str.starts_with("http://") || current_path_str.starts_with("https://");
                             let file_name = if is_network {
                                 state.song_title.clone()
@@ -3211,36 +3253,48 @@ impl<'a> VulkanEngine<'a> {
                             let file_dir = if is_network {
                                 current_path_str
                             } else {
-                                std::path::Path::new(&current_path_str).parent().unwrap_or(std::path::Path::new("")).to_string_lossy().to_string()
-                            };
-                            
-                            columns[2].horizontal(|ui| { ui.label("File/Title"); ui.label(&file_name); });
-                            columns[2].horizontal(|ui| { ui.label("Artist"); ui.label(&state.artist); });
-                            columns[2].horizontal(|ui| { ui.label(if is_network { "URL" } else { "Path" }); ui.label(&file_dir); });
-                            if state.playlist.len() > 1 {
-                                columns[2].horizontal(|ui| { ui.label("Playlist"); ui.label(format!("{} / {}", state.playlist_index + 1, state.playlist.len())); });
-                            }
-                            if state.playlist_index + 1 < state.playlist.len() {
-                                let next_path = std::path::Path::new(&state.playlist[state.playlist_index + 1]);
-                                let next_song = next_path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                                let max_len = 30;
-                                let display_str = if next_song.chars().count() > max_len {
-                                    let chars_count = next_song.chars().count();
-                                    let offset = (state.current_seconds * 4.0) as usize % (chars_count + 10);
-                                    if offset < chars_count {
-                                        let mut padded = next_song.clone();
-                                        padded.push_str("          ");
-                                        padded.push_str(&next_song);
-                                        padded.chars().skip(offset).take(max_len).collect::<String>()
+                                let abs_path = if std::path::Path::new(&current_path_str).is_absolute() {
+                                    std::path::PathBuf::from(&current_path_str)
+                                } else if let Ok(cwd) = std::env::current_dir() {
+                                    cwd.join(&current_path_str)
+                                } else {
+                                    std::path::PathBuf::from(&current_path_str)
+                                };
+                                let path_str = abs_path.to_string_lossy().to_string();
+                                if let Ok(home) = std::env::var("HOME") {
+                                    if path_str.starts_with(&home) {
+                                        path_str.replacen(&home, "~", 1)
                                     } else {
-                                        next_song.chars().take(max_len).collect::<String>()
+                                        path_str
+                                    }
+                                } else if let Ok(home) = std::env::var("USERPROFILE") {
+                                    if path_str.starts_with(&home) {
+                                        path_str.replacen(&home, "%USERPROFILE%", 1)
+                                    } else {
+                                        path_str
                                     }
                                 } else {
-                                    next_song
-                                };
-                                columns[2].horizontal(|ui| { ui.label("Next Song:"); ui.label(display_str); });
-                            }
+                                    path_str
+                                }
+                            };
+                            
+                            // 1. Title/File Name (Prominent at top, smooth marquee if long)
+                            render_smooth_marquee(&mut columns[2], &file_name, 15.0, true);
+                            
+                            // 2. Artist
+                            columns[2].horizontal(|ui| { ui.label("Artist"); ui.label(&state.artist); });
+                            
+                            // 3. Path / URL (Smooth marquee if long, stretches to the right edge)
+                            let path_label = if is_network { "URL" } else { "Path" };
+                            columns[2].horizontal(|ui| { 
+                                ui.label(path_label); 
+                                render_smooth_marquee(ui, &file_dir, 14.0, false); 
+                            });
+                            
+                            // 4. Type
                             columns[2].horizontal(|ui| { ui.label("Type"); ui.label(&state.module_type); });
+                            
+                            // 5. Video
                             if let Some(video) = &state.video_info {
                                 if video == "Unsupported Codec" {
                                     columns[2].horizontal(|ui| { ui.label("Video"); ui.label(video); });
@@ -3248,11 +3302,15 @@ impl<'a> VulkanEngine<'a> {
                                     columns[2].horizontal(|ui| { ui.label("Video"); ui.label(format!("{} (Video stream available)", video)); });
                                 }
                             }
+                            
+                            // 6. Track layout parameters
                             if state.bpm > 0 { columns[2].horizontal(|ui| { ui.label("BPM"); ui.label(format!("{}", state.bpm)); }); }
                             if state.speed > 0 { columns[2].horizontal(|ui| { ui.label("Speed"); ui.label(format!("{}", state.speed)); }); }
                             if state.num_patterns > 0 { columns[2].horizontal(|ui| { ui.label("Patterns"); ui.label(format!("{}", state.num_patterns)); }); }
                             if state.num_instruments > 0 { columns[2].horizontal(|ui| { ui.label("Instruments"); ui.label(format!("{}", state.num_instruments)); }); }
                             if state.num_samples > 0 { columns[2].horizontal(|ui| { ui.label("Samples"); ui.label(format!("{}", state.num_samples)); }); }
+                            
+                            // 7. Audio technical parameters
                             columns[2].horizontal(|ui| { ui.label("Sample Rate"); ui.label(format!("{} Hz", state.current_sample_rate as u32)); });
                             columns[2].horizontal(|ui| { ui.label("Bitrate"); ui.label(state.bitrate.map(|b| format!("{} kbps", b)).unwrap_or_else(|| "Unknown".to_string())); });
                             columns[2].horizontal(|ui| { 
@@ -3277,6 +3335,17 @@ impl<'a> VulkanEngine<'a> {
                                     ui.label(format!("{:.1}s", state.duration_seconds)); 
                                 }
                             });
+                            
+                            // 8. Next Song (placed at the bottom, smooth marquee if long)
+                            if state.playlist_index + 1 < state.playlist.len() {
+                                let next_path = std::path::Path::new(&state.playlist[state.playlist_index + 1]);
+                                let next_song = next_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                                columns[2].horizontal(|ui| { 
+                                    ui.label("Next Song:"); 
+                                    render_smooth_marquee(ui, &next_song, 14.0, false); 
+                                });
+                            }
+                            
                             out_track_info_rect = Some(columns[2].min_rect());
                         }
                     });

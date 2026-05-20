@@ -155,7 +155,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }));
 
         let mut tui = Tui::new()?;
-        if let Err(err) = run_tui(&mut tui.terminal, app_state) {
+        if let Err(err) = run_tui(&mut tui.terminal, app_state, initial_stream) {
             eprintln!("App error: {:?}", err);
         }
     } else {
@@ -421,6 +421,26 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                                     state.is_paused = !state.is_paused;
                                                 }
                                             },
+                                            WinitKeyCode::KeyN => {
+                                                let mut state = app_state.lock().unwrap();
+                                                if !state.playlist.is_empty() && state.playlist_index + 1 < state.playlist.len() {
+                                                    state.playlist_index += 1;
+                                                    state.load_request = Some(state.playlist[state.playlist_index].clone());
+                                                    state.is_paused = false;
+                                                    state.osd_text = Some("Next Track".to_string());
+                                                    state.osd_timer = 2.0;
+                                                }
+                                            },
+                                            WinitKeyCode::KeyP => {
+                                                let mut state = app_state.lock().unwrap();
+                                                if !state.playlist.is_empty() && state.playlist_index > 0 {
+                                                    state.playlist_index -= 1;
+                                                    state.load_request = Some(state.playlist[state.playlist_index].clone());
+                                                    state.is_paused = false;
+                                                    state.osd_text = Some("Previous Track".to_string());
+                                                    state.osd_timer = 2.0;
+                                                }
+                                            },
                                             WinitKeyCode::Enter => {
                                                 let mut state = app_state.lock().unwrap();
                                                 if state.show_vis_picker {
@@ -513,9 +533,11 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                         
                         if state.track_ended {
                             state.track_ended = false;
-                            state.playlist_index += 1;
-                            if state.playlist_index < state.playlist.len() {
-                                state.load_request = Some(state.playlist[state.playlist_index].clone());
+                            if state.load_request.is_none() {
+                                state.playlist_index += 1;
+                                if state.playlist_index < state.playlist.len() {
+                                    state.load_request = Some(state.playlist[state.playlist_index].clone());
+                                }
                             }
                         }
                         
@@ -523,27 +545,74 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                     };
                     
                     if let Some(path) = load_path {
-                        active_stream = None; // DROP OLD STREAM FIRST to release WASAPI lock!
-                        
-                        // Cleanup old video state completely before loading the next file
-                        engine.clear_video_state();
-                        {
-                            let mut state = app_state.lock().unwrap();
-                            state.video_frame_rx = None;
-                            state.free_video_frame_tx = None;
-                            state.video_mode = 0;
-                        }
-                        
-                        // We rely entirely on DSP thread messages to update tracker string state
-                        if let Ok(stream) = audio::start_audio_thread(&path, false, Arc::clone(&app_state)) {
-                            let mut state = app_state.lock().unwrap();
-                            state.file_loaded = true;
-                            state.song_title = path.clone();
-                            active_stream = Some(stream);
+                        // Check if the path exists first!
+                        let path_exists = if path.starts_with("http") {
+                            true
                         } else {
+                            std::path::Path::new(&path).exists()
+                        };
+
+                        if !path_exists {
                             let mut state = app_state.lock().unwrap();
-                            state.file_loaded = false;
-                            state.artist = "Load Failed".to_string();
+                            state.osd_text = Some(format!("File Not Found: {}", std::path::Path::new(&path).file_name().unwrap_or_default().to_string_lossy()));
+                            state.osd_timer = 3.0;
+                            
+                            state.playlist_index += 1;
+                            if state.playlist_index < state.playlist.len() {
+                                state.load_request = Some(state.playlist[state.playlist_index].clone());
+                            } else {
+                                if state.file_loaded {
+                                    if let Some(idx) = state.playlist.iter().position(|p| p == &state.song_title) {
+                                        state.playlist_index = idx;
+                                    } else {
+                                        state.playlist_index = state.playlist_index.saturating_sub(1);
+                                    }
+                                } else {
+                                    state.file_loaded = false;
+                                    state.artist = "Load Failed".to_string();
+                                }
+                            }
+                        } else {
+                            active_stream = None; // DROP OLD STREAM FIRST to release WASAPI lock!
+                            
+                            // Cleanup old video state completely before loading the next file
+                            engine.clear_video_state();
+                            {
+                                let mut state = app_state.lock().unwrap();
+                                state.video_frame_rx = None;
+                                state.free_video_frame_tx = None;
+                                state.video_mode = 0;
+                            }
+                            
+                            // We rely entirely on DSP thread messages to update tracker string state
+                            let mut loaded_stream = None;
+                            for _ in 0..5 {
+                                if let Ok(stream) = audio::start_audio_thread(&path, false, Arc::clone(&app_state)) {
+                                    loaded_stream = Some(stream);
+                                    break;
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(50));
+                            }
+
+                            if let Some(stream) = loaded_stream {
+                                let mut state = app_state.lock().unwrap();
+                                state.file_loaded = true;
+                                state.song_title = path.clone();
+                                state.track_ended = false;
+                                active_stream = Some(stream);
+                            } else {
+                                let mut state = app_state.lock().unwrap();
+                                state.osd_text = Some(format!("Load Failed: {}", std::path::Path::new(&path).file_name().unwrap_or_default().to_string_lossy()));
+                                state.osd_timer = 3.0;
+                                
+                                state.playlist_index += 1;
+                                if state.playlist_index < state.playlist.len() {
+                                    state.load_request = Some(state.playlist[state.playlist_index].clone());
+                                } else {
+                                    state.file_loaded = false;
+                                    state.artist = "Load Failed".to_string();
+                                }
+                            }
                         }
                     }
 
@@ -1099,21 +1168,37 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                             match button {
                                 gilrs::Button::LeftTrigger => { // L1 Bumper
                                     let mut state = app_state.lock().unwrap();
-                                    let target = (state.current_seconds - 60.0).max(0.0);
-                                    state.seek_request = Some(target);
-                                    state.spectrum_history.clear();
-                                    for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
-                                    state.osd_text = Some("-60.0s".to_string());
-                                    state.osd_timer = 2.0;
+                                    if !state.playlist.is_empty() && state.playlist.len() > 1 && state.playlist_index > 0 {
+                                        state.playlist_index -= 1;
+                                        state.load_request = Some(state.playlist[state.playlist_index].clone());
+                                        state.is_paused = false;
+                                        state.osd_text = Some("Previous Track".to_string());
+                                        state.osd_timer = 2.0;
+                                    } else {
+                                        let target = (state.current_seconds - 60.0).max(0.0);
+                                        state.seek_request = Some(target);
+                                        state.spectrum_history.clear();
+                                        for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
+                                        state.osd_text = Some("-60.0s".to_string());
+                                        state.osd_timer = 2.0;
+                                    }
                                 }
                                 gilrs::Button::RightTrigger => { // R1 Bumper
                                     let mut state = app_state.lock().unwrap();
-                                    let target = (state.current_seconds + 60.0).clamp(0.0, state.duration_seconds);
-                                    state.seek_request = Some(target);
-                                    state.spectrum_history.clear();
-                                    for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
-                                    state.osd_text = Some("+60.0s".to_string());
-                                    state.osd_timer = 2.0;
+                                    if !state.playlist.is_empty() && state.playlist.len() > 1 && state.playlist_index + 1 < state.playlist.len() {
+                                        state.playlist_index += 1;
+                                        state.load_request = Some(state.playlist[state.playlist_index].clone());
+                                        state.is_paused = false;
+                                        state.osd_text = Some("Next Track".to_string());
+                                        state.osd_timer = 2.0;
+                                    } else {
+                                        let target = (state.current_seconds + 60.0).clamp(0.0, state.duration_seconds);
+                                        state.seek_request = Some(target);
+                                        state.spectrum_history.clear();
+                                        for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
+                                        state.osd_text = Some("+60.0s".to_string());
+                                        state.osd_timer = 2.0;
+                                    }
                                 }
                                 gilrs::Button::North => { // 'Y' or Triangle
                                     let mut state = app_state.lock().unwrap();
@@ -1236,7 +1321,12 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
     });
 }
 
-fn run_tui<B: Backend>(terminal: &mut Terminal<B>, app_state: Arc<Mutex<AppState>>) -> io::Result<()> 
+#[allow(unused_variables, unused_assignments)]
+fn run_tui<B: Backend>(
+    terminal: &mut Terminal<B>,
+    app_state: Arc<Mutex<AppState>>,
+    mut active_stream: Option<audio::PlaybackHandle>,
+) -> io::Result<()> 
 where std::io::Error: From<<B as Backend>::Error>
 {
     let tick_rate = Duration::from_millis(16); // ~60fps
@@ -1247,6 +1337,78 @@ where std::io::Error: From<<B as Backend>::Error>
         if is_first_frame {
             is_first_frame = false;
             app_state.lock().unwrap().is_paused = false;
+        }
+
+        let load_path = {
+            let mut state = app_state.lock().unwrap();
+            
+            if state.track_ended {
+                state.track_ended = false;
+                if state.load_request.is_none() {
+                    state.playlist_index += 1;
+                    if state.playlist_index < state.playlist.len() {
+                        state.load_request = Some(state.playlist[state.playlist_index].clone());
+                    }
+                }
+            }
+            
+            state.load_request.take()
+        };
+        
+        if let Some(path) = load_path {
+            // Check if the path exists first!
+            let path_exists = if path.starts_with("http") {
+                true
+            } else {
+                std::path::Path::new(&path).exists()
+            };
+
+            if !path_exists {
+                let mut state = app_state.lock().unwrap();
+                state.playlist_index += 1;
+                if state.playlist_index < state.playlist.len() {
+                    state.load_request = Some(state.playlist[state.playlist_index].clone());
+                } else {
+                    if state.file_loaded {
+                        if let Some(idx) = state.playlist.iter().position(|p| p == &state.song_title) {
+                            state.playlist_index = idx;
+                        } else {
+                            state.playlist_index = state.playlist_index.saturating_sub(1);
+                        }
+                    } else {
+                        state.file_loaded = false;
+                        state.artist = "Load Failed".to_string();
+                    }
+                }
+            } else {
+                active_stream = None; // DROP OLD STREAM FIRST
+                
+                let mut loaded_stream = None;
+                for _ in 0..5 {
+                    if let Ok(stream) = audio::start_audio_thread(&path, false, Arc::clone(&app_state)) {
+                        loaded_stream = Some(stream);
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+
+                if let Some(stream) = loaded_stream {
+                    let mut state = app_state.lock().unwrap();
+                    state.file_loaded = true;
+                    state.song_title = path.clone();
+                    state.track_ended = false;
+                    active_stream = Some(stream);
+                } else {
+                    let mut state = app_state.lock().unwrap();
+                    state.playlist_index += 1;
+                    if state.playlist_index < state.playlist.len() {
+                        state.load_request = Some(state.playlist[state.playlist_index].clone());
+                    } else {
+                        state.file_loaded = false;
+                        state.artist = "Load Failed".to_string();
+                    }
+                }
+            }
         }
         {
             let mut state = app_state.lock().unwrap();
@@ -1314,6 +1476,22 @@ where std::io::Error: From<<B as Backend>::Error>
                 match key.code {
                     KeyCode::Char('q') => {
                         return Ok(());
+                    }
+                    KeyCode::Char('n') => {
+                        let mut state = app_state.lock().unwrap();
+                        if !state.playlist.is_empty() && state.playlist_index + 1 < state.playlist.len() {
+                            state.playlist_index += 1;
+                            state.load_request = Some(state.playlist[state.playlist_index].clone());
+                            state.is_paused = false;
+                        }
+                    }
+                    KeyCode::Char('p') => {
+                        let mut state = app_state.lock().unwrap();
+                        if !state.playlist.is_empty() && state.playlist_index > 0 {
+                            state.playlist_index -= 1;
+                            state.load_request = Some(state.playlist[state.playlist_index].clone());
+                            state.is_paused = false;
+                        }
                     }
                     KeyCode::Char(' ') => {
                         let mut state = app_state.lock().unwrap();

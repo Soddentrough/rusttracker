@@ -2,7 +2,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Table, Row},
+    widgets::{Block, Borders, Paragraph},
     Frame,
 };
 
@@ -163,25 +163,155 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         state.song_title.clone()
     };
     let is_network = current_path_str.starts_with("http://") || current_path_str.starts_with("https://");
-    let path_label = if is_network { "URL".to_string() } else { "Path".to_string() };
     
-    let meta_table = Table::new(
-        vec![
-            Row::new(vec![path_label, current_path_str]),
-            Row::new(vec!["Title".to_string(), state.song_title.clone()]),
-            Row::new(vec!["Artist".to_string(), state.artist.clone()]),
-            Row::new(vec!["Type".to_string(), state.module_type.clone()]),
-            Row::new(vec!["BPM".to_string(), state.bpm.to_string()]),
-            Row::new(vec!["Speed".to_string(), state.speed.to_string()]),
-            Row::new(vec!["Channels".to_string(), state.num_channels.to_string()]),
-            Row::new(vec!["Sample Rate".to_string(), format!("{} Hz", state.current_sample_rate as u32)]),
-            Row::new(vec!["Bitrate".to_string(), state.bitrate.map(|b| format!("{} kbps", b)).unwrap_or_else(|| "Unknown".to_string())]),
-            Row::new(vec!["Length".to_string(), if state.duration_seconds <= 0.0 { "LIVE".to_string() } else { format!("{:.1}s", state.duration_seconds) }]),
-        ],
-        [Constraint::Percentage(40), Constraint::Percentage(60)].as_ref()
-    ).block(Block::default().title("Track Info").borders(Borders::ALL));
+    let scroll_text = |text: &str, max_len: usize| -> String {
+        let char_count = text.chars().count();
+        if char_count > max_len {
+            let max_scroll = char_count - max_len;
+            let scroll_duration = max_scroll as f32 / 3.0; // 3 characters per second
+            let total_period = 2.0 + scroll_duration + 2.0 + scroll_duration;
+            let t = (state.current_seconds as f32) % total_period;
+            
+            let offset = if t < 2.0 {
+                0
+            } else if t < 2.0 + scroll_duration {
+                let progress = (t - 2.0) / scroll_duration;
+                (progress * max_scroll as f32) as usize
+            } else if t < 2.0 + scroll_duration + 2.0 {
+                max_scroll
+            } else {
+                let progress = (t - (2.0 + scroll_duration + 2.0)) / scroll_duration;
+                max_scroll.saturating_sub((progress * max_scroll as f32) as usize)
+            };
+            
+            let offset = offset.clamp(0, max_scroll);
+            text.chars().skip(offset).take(max_len).collect()
+        } else {
+            text.to_string()
+        }
+    };
 
-    f.render_widget(meta_table, top_chunks[2]);
+    let file_name = if is_network {
+        state.song_title.clone()
+    } else {
+        std::path::Path::new(&state.song_title).file_name().unwrap_or_default().to_string_lossy().to_string()
+    };
+    let file_dir = if is_network {
+        current_path_str.clone()
+    } else {
+        let abs_path = if std::path::Path::new(&current_path_str).is_absolute() {
+            std::path::PathBuf::from(&current_path_str)
+        } else if let Ok(cwd) = std::env::current_dir() {
+            cwd.join(&current_path_str)
+        } else {
+            std::path::PathBuf::from(&current_path_str)
+        };
+        let path_str = abs_path.to_string_lossy().to_string();
+        if let Ok(home) = std::env::var("HOME") {
+            if path_str.starts_with(&home) {
+                path_str.replacen(&home, "~", 1)
+            } else {
+                path_str
+            }
+        } else if let Ok(home) = std::env::var("USERPROFILE") {
+            if path_str.starts_with(&home) {
+                path_str.replacen(&home, "%USERPROFILE%", 1)
+            } else {
+                path_str
+            }
+        } else {
+            path_str
+        }
+    };
+
+    let width = top_chunks[2].width.saturating_sub(2) as usize; // inside block width
+    
+    let mut lines = Vec::new();
+    
+    // 1. File Name / Title (bold, styled)
+    lines.push(Line::from(vec![
+        Span::styled(scroll_text(&file_name, width), Style::default().add_modifier(Modifier::BOLD))
+    ]));
+
+    // 2. Artist
+    lines.push(Line::from(vec![
+        Span::raw("Artist: "),
+        Span::raw(&state.artist)
+    ]));
+
+    // 3. Path / URL (scrollable)
+    let path_label = if is_network { "URL:    " } else { "Path:   " };
+    lines.push(Line::from(vec![
+        Span::raw(path_label),
+        Span::raw(scroll_text(&file_dir, width.saturating_sub(8)))
+    ]));
+
+    // 4. Type
+    lines.push(Line::from(vec![
+        Span::raw("Type:   "),
+        Span::raw(&state.module_type)
+    ]));
+
+    // 5. BPM (if available)
+    if state.bpm > 0 {
+        lines.push(Line::from(vec![
+            Span::raw("BPM:    "),
+            Span::raw(state.bpm.to_string())
+        ]));
+    }
+
+    // 6. Speed (if available)
+    if state.speed > 0 {
+        lines.push(Line::from(vec![
+            Span::raw("Speed:  "),
+            Span::raw(state.speed.to_string())
+        ]));
+    }
+
+    // 7. Channels
+    lines.push(Line::from(vec![
+        Span::raw("Chans:  "),
+        Span::raw(state.num_channels.to_string())
+    ]));
+
+    // 8. Sample Rate
+    lines.push(Line::from(vec![
+        Span::raw("Rate:   "),
+        Span::raw(format!("{} Hz", state.current_sample_rate as u32))
+    ]));
+
+    // 9. Bitrate
+    lines.push(Line::from(vec![
+        Span::raw("Bitr:   "),
+        Span::raw(state.bitrate.map(|b| format!("{} kbps", b)).unwrap_or_else(|| "Unknown".to_string()))
+    ]));
+
+    // 10. Length
+    lines.push(Line::from(vec![
+        Span::raw("Length: "),
+        Span::raw(if state.duration_seconds <= 0.0 { "LIVE".to_string() } else { format!("{:.1}s", state.duration_seconds) })
+    ]));
+
+    // 11. Next Song (at the bottom, scrollable)
+    if state.playlist_index + 1 < state.playlist.len() {
+        let next_path = std::path::Path::new(&state.playlist[state.playlist_index + 1]);
+        let next_song = next_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        lines.push(Line::from(vec![
+            Span::styled("Next:   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(scroll_text(&next_song, width.saturating_sub(8)), Style::default().fg(Color::DarkGray))
+        ]));
+    }
+
+    let title_text = if state.playlist.len() > 1 {
+        format!("Track Info ({}/{})", state.playlist_index + 1, state.playlist.len())
+    } else {
+        "Track Info".to_string()
+    };
+
+    let meta_paragraph = Paragraph::new(lines)
+        .block(Block::default().title(title_text).borders(Borders::ALL));
+
+    f.render_widget(meta_paragraph, top_chunks[2]);
 
 
     // 4. HUGE Spectrum Analyzer

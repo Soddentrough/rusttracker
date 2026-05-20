@@ -1454,6 +1454,7 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
                 
                 {
                     let mut state = shared_state.lock().unwrap();
+                    state.track_ended = false;
                     state.artist = "Bitstream Active".to_string();
                     state.module_type = "Hardware Passthrough".to_string();
                     state.stats.bitstream_active = true;
@@ -1579,6 +1580,7 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
     
     {
         let mut state = shared_state.lock().unwrap();
+        state.track_ended = false;
         state.artist = audio_source.get_artist();
         state.module_type = audio_source.get_type();
         state.duration_seconds = audio_source.get_duration_seconds();
