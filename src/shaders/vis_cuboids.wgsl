@@ -49,14 +49,14 @@ fn map_scene(p: vec3<f32>) -> SceneResult {
             let ix = ix_center + dx;
             let iz = iz_center + dz;
             
-            if (ix < -4 || ix > 4 || iz < -4 || iz > 4) { continue; }
+            if (ix < -15 || ix > 15 || iz < -20 || iz > 6) { continue; }
             
             let cx = f32(ix) * x_spacing;
             let cz = f32(iz) * z_spacing;
             
             let dist_from_center = length(vec2<f32>(f32(ix), f32(iz)));
-            let bin = clamp(u32(dist_from_center * 22.0) + 4u, 0u, 255u);
-            let steps_ago = u32(dist_from_center * 5.0);
+            let bin = clamp(u32(dist_from_center * 10.0) + 4u, 0u, 255u);
+            let steps_ago = u32(dist_from_center * 3.0);
             let amp = get_history_amplitude(bin, steps_ago);
             let shift = clamp(amp / 100.0, 0.0, 1.0) * 1.5;
             
@@ -109,19 +109,22 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if (dx > 0.0001 && dy > 0.0001) { aspect = dy / dx; }
     let p = vec2<f32>(distorted_uv.x * aspect, -distorted_uv.y);
     
-    // 3. Camera Orbit & Motion
-    let angle = audio.time * 0.12;
-    let cos_a = cos(angle);
-    let sin_a = sin(angle);
-    
-    let r_cam = 7.2;
-    let ro = vec3<f32>(r_cam * sin_a, 0.4 + sin(audio.time * 0.25) * 0.4, r_cam * cos_a);
+    // 3. Camera (Fixed, motionless)
+    let ro = vec3<f32>(0.0, 0.0, 7.2);
     let look_at = vec3<f32>(0.0, 0.0, 0.0);
     
     let cw = normalize(look_at - ro);
     let cu = normalize(cross(vec3<f32>(0.0, 1.0, 0.0), cw));
     let cv = normalize(cross(cw, cu));
     let rd = normalize(p.x * cu + p.y * cv + 1.5 * cw);
+    
+    // Audio Reactivity Calculations
+    let bass = clamp(audio.spectrum[0].x + audio.spectrum[1].x + audio.spectrum[2].x, 0.0, 1.0);
+    let mid_high = clamp((audio.spectrum[10].x + audio.spectrum[30].x + audio.spectrum[50].x) * 0.33, 0.0, 1.0);
+    
+    // Brightness shifts from green to white on bass hits
+    let base_green = vec3<f32>(0.02, 1.0, 0.38);
+    let neon_green = mix(base_green, vec3<f32>(1.0, 1.0, 1.0), clamp(bass * 0.45, 0.0, 1.0));
     
     // 4. Raymarching
     var t = 0.02;
@@ -130,7 +133,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var hit_amp = 0.0;
     var hit_type = 0;
     
-    for (var i = 0; i < 75; i = i + 1) {
+    for (var i = 0; i < 90; i = i + 1) {
         let p_hit = ro + rd * t;
         let res = map_scene(p_hit);
         
@@ -145,11 +148,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
         
         t = t + res.d * 0.85;
-        if (t > 15.5) { break; }
+        if (t > 30.0) { break; }
     }
     
     var final_color = vec3<f32>(0.0);
-    let neon_green = vec3<f32>(0.02, 1.0, 0.38);
     
     if (hit) {
         // Bright phosphor core
@@ -158,7 +160,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
     
     // Add accumulated neon glow
-    final_color = final_color + neon_green * glow * 0.015;
+    let glow_intensity = 0.015 + clamp(bass * 0.015, 0.0, 0.02);
+    final_color = final_color + neon_green * glow * glow_intensity;
     
     // 5. Floor & Ceiling Grid planes
     var t_floor = -1.0;
@@ -169,25 +172,26 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let x_spacing = 1.35;
     
     var grid_intensity = 0.0;
-    if (t_floor > 0.0 && (!hit || t_floor < t)) {
+    if (t_floor > 0.0 && t_floor < 25.0 && (!hit || t_floor < t)) {
         let p_floor = ro + rd * t_floor;
         // Compute anti-aliased grid lines on the plane
         let grid_uv = fract(p_floor.xz / x_spacing - 0.5) - 0.5;
         let dist_to_line = min(abs(grid_uv.x), abs(grid_uv.y));
         let line_w = 0.02 * (1.0 + t_floor * 0.05);
         let grid_line = smoothstep(line_w, 0.0, dist_to_line);
-        grid_intensity = grid_intensity + grid_line * exp(-t_floor * 0.15);
+        let fade = smoothstep(25.0, 4.0, t_floor);
+        grid_intensity = grid_intensity + grid_line * fade;
     }
-    if (t_ceil > 0.0 && (!hit || t_ceil < t)) {
+    if (t_ceil > 0.0 && t_ceil < 25.0 && (!hit || t_ceil < t)) {
         let p_ceil = ro + rd * t_ceil;
         let grid_uv = fract(p_ceil.xz / x_spacing - 0.5) - 0.5;
         let dist_to_line = min(abs(grid_uv.x), abs(grid_uv.y));
         let line_w = 0.02 * (1.0 + t_ceil * 0.05);
         let grid_line = smoothstep(line_w, 0.0, dist_to_line);
-        grid_intensity = grid_intensity + grid_line * exp(-t_ceil * 0.15);
+        let fade = smoothstep(25.0, 4.0, t_ceil);
+        grid_intensity = grid_intensity + grid_line * fade;
     }
     final_color = final_color + neon_green * grid_intensity * 0.35;
-    
     // 6. Phosphor background glow wash
     let center_dist = length(distorted_uv);
     let bg_glow = vec3<f32>(0.005, 0.038, 0.016) * (1.0 - center_dist * 0.55);

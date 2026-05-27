@@ -17,7 +17,7 @@ use rustysynth::{MidiFile, MidiFileSequencer, SoundFont, Synthesizer, Synthesize
 use midly::{Smf, TrackEventKind, MetaMessage, MidiMessage};
 
 use crate::state::AppState;
-use crossbeam_channel::{bounded, Sender, Receiver};
+use crossbeam_channel::{bounded, unbounded, Sender, Receiver};
 
 #[allow(dead_code)]
 pub enum PlaybackHandle {
@@ -979,18 +979,14 @@ impl AudioSource for FfmpegSource {
     fn get_position_seconds(&mut self) -> f64 { self.current_time }
     
     fn set_position_seconds(&mut self, pos: f64) {
-        if let Some(stream) = self.ictx.stream(self.stream_index) {
-            let tb = stream.time_base();
-            let pts = (pos / (tb.numerator() as f64 / tb.denominator() as f64)) as i64;
-            
-            unsafe {
-                ffmpeg_next::ffi::av_seek_frame(
-                    self.ictx.as_mut_ptr(),
-                    self.stream_index as i32,
-                    pts,
-                    ffmpeg_next::ffi::AVSEEK_FLAG_BACKWARD
-                );
-            }
+        let pts = (pos * ffmpeg_next::ffi::AV_TIME_BASE as f64) as i64;
+        unsafe {
+            ffmpeg_next::ffi::av_seek_frame(
+                self.ictx.as_mut_ptr(),
+                -1,
+                pts,
+                ffmpeg_next::ffi::AVSEEK_FLAG_BACKWARD
+            );
         }
         self.decoder.flush();
         self.buf_pos = self.sample_buf.len();
@@ -1098,17 +1094,14 @@ impl AudioSource for VideoOnlySource {
     fn get_position_seconds(&mut self) -> f64 { self.current_time }
     
     fn set_position_seconds(&mut self, pos: f64) {
-        if let Some(stream) = self.ictx.stream(self.video_stream_index) {
-            let tb = stream.time_base();
-            let pts = (pos / (tb.numerator() as f64 / tb.denominator() as f64)) as i64;
-            unsafe {
-                ffmpeg_next::ffi::av_seek_frame(
-                    self.ictx.as_mut_ptr(),
-                    self.video_stream_index as i32,
-                    pts,
-                    ffmpeg_next::ffi::AVSEEK_FLAG_BACKWARD
-                );
-            }
+        let pts = (pos * ffmpeg_next::ffi::AV_TIME_BASE as f64) as i64;
+        unsafe {
+            ffmpeg_next::ffi::av_seek_frame(
+                self.ictx.as_mut_ptr(),
+                -1,
+                pts,
+                ffmpeg_next::ffi::AVSEEK_FLAG_BACKWARD
+            );
         }
         self.current_time = pos;
         self.video_epoch += 1;
@@ -1665,15 +1658,15 @@ where
     let chunk_frames = 1024;
     let pool_size = 64; 
     
-    let (ready_tx, ready_rx) = crossbeam_channel::bounded::<AudioChunk>(pool_size);
-    let (free_tx, free_rx) = crossbeam_channel::bounded::<AudioChunk>(pool_size);
+    let (ready_tx, ready_rx) = bounded::<AudioChunk>(pool_size);
+    let (free_tx, free_rx) = unbounded::<AudioChunk>();
     
-    let (video_packet_tx, video_packet_rx) = crossbeam_channel::bounded::<(u64, ffmpeg_next::Packet)>(4096);
+    let (video_packet_tx, video_packet_rx) = bounded::<(u64, ffmpeg_next::Packet)>(4096);
     audio_source.attach_video_queue(video_packet_tx);
     
     if let Some((params, time_base)) = audio_source.take_video_parameters() {
-        let (video_frame_tx, video_frame_rx) = crossbeam_channel::bounded::<crate::state::VideoFrame>(16);
-        let (free_video_frame_tx, free_video_frame_rx) = crossbeam_channel::bounded::<crate::state::VideoFrame>(16);
+        let (video_frame_tx, video_frame_rx) = bounded::<crate::state::VideoFrame>(16);
+        let (free_video_frame_tx, free_video_frame_rx) = unbounded::<crate::state::VideoFrame>();
         
         for _ in 0..16 {
             let _ = free_video_frame_tx.try_send(crate::state::VideoFrame {
@@ -1706,22 +1699,21 @@ where
                     let tb = time_base.numerator() as f64 / time_base.denominator() as f64;
                     let mut local_epoch = 0;
                     let mut fallback_pts_seconds = 0.0;
+                    let mut is_first_frame_after_seek = false;
                     
                     while let Ok((packet_epoch, packet)) = video_packet_rx_for_video.recv() {
-                        let mut track_ended = {
+                        {
                             let state = state_for_video.lock().unwrap();
                             if state.seek_epoch > local_epoch {
                                 decoder.flush();
                                 local_epoch = state.seek_epoch;
+                                is_first_frame_after_seek = true;
                             }
-                            state.track_ended
-                        };
+                        }
                         
                         if packet_epoch < local_epoch {
                             continue;
                         }
-                        
-                        if track_ended { return; }
                         
                         if decoder.send_packet(&packet).is_ok() {
                             let mut decoded = ffmpeg_next::frame::Video::empty();
@@ -1738,34 +1730,74 @@ where
                                 }
                                 
                                 let mut skip_push = false;
-                                loop {
-                                    let (cached_seconds, current_epoch) = {
-                                        let state = state_for_video.lock().unwrap();
-                                        track_ended = state.track_ended;
-                                        (state.current_seconds, state.seek_epoch)
-                                    };
-                                    
-                                    if track_ended || current_epoch > local_epoch {
-                                        skip_push = true;
-                                        break;
+                                if is_first_frame_after_seek {
+                                    is_first_frame_after_seek = false;
+                                } else {
+                                    let sync_start = std::time::Instant::now();
+                                    loop {
+                                        let (cached_seconds, current_epoch, is_paused, track_ended) = {
+                                            let state = state_for_video.lock().unwrap();
+                                            (state.current_seconds, state.seek_epoch, state.is_paused, state.track_ended)
+                                        };
+                                        
+                                        if track_ended || current_epoch > local_epoch {
+                                            skip_push = true;
+                                            break;
+                                        }
+                                        
+                                        if pts < cached_seconds - 0.05 {
+                                            skip_push = true;
+                                            break;
+                                        }
+                                        
+                                        if pts <= cached_seconds + 0.05 {
+                                            break;
+                                        }
+                                        
+                                        if sync_start.elapsed() > std::time::Duration::from_millis(500) {
+                                            skip_push = true;
+                                            break;
+                                        }
+                                        
+                                        let sleep_dur = if is_paused { 50 } else { 5 };
+                                        std::thread::sleep(std::time::Duration::from_millis(sleep_dur));
                                     }
-                                    
-                                    if pts < cached_seconds - 0.05 {
-                                        skip_push = true;
-                                        break;
-                                    }
-                                    
-                                    if pts <= cached_seconds + 0.05 {
-                                        break;
-                                    }
-                                    std::thread::sleep(std::time::Duration::from_millis(2));
                                 }
                                 
                                 if skip_push {
                                     continue;
                                 }
                                 
-                                if let Ok(mut frame) = free_video_frame_rx.recv() {
+                                let mut frame_opt = None;
+                                loop {
+                                    let (current_epoch, is_paused, track_ended) = {
+                                        let state = state_for_video.lock().unwrap();
+                                        (state.seek_epoch, state.is_paused, state.track_ended)
+                                    };
+                                    if track_ended || current_epoch > local_epoch {
+                                        skip_push = true;
+                                        break;
+                                    }
+                                    match free_video_frame_rx.recv_timeout(std::time::Duration::from_millis(10)) {
+                                        Ok(f) => {
+                                            frame_opt = Some(f);
+                                            break;
+                                        }
+                                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                                            let sleep_dur = if is_paused { 50 } else { 5 };
+                                            std::thread::sleep(std::time::Duration::from_millis(sleep_dur));
+                                        }
+                                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                                            return;
+                                        }
+                                    }
+                                }
+                                
+                                if skip_push {
+                                    continue;
+                                }
+                                
+                                if let Some(mut frame) = frame_opt {
                                     frame.pts = pts;
                                     frame.width = decoded.width();
                                     frame.height = decoded.height();
@@ -1841,20 +1873,23 @@ where
     
     std::thread::spawn(move || {
         loop {
-            if let Ok(mut state) = state_for_decoder.try_lock() {
-                if let Some(pos) = state.seek_request.take() {
-                    audio_source.set_position_seconds(pos);
-                    state.current_seconds = pos;
-                    state.seek_epoch += 1;
-                    while let Ok(chunk) = ready_rx_for_decoder.try_recv() {
-                        let _ = free_tx_for_decoder.try_send(chunk);
+            let mut chunk = loop {
+                if let Ok(mut state) = state_for_decoder.try_lock() {
+                    if let Some(pos) = state.seek_request.take() {
+                        audio_source.set_position_seconds(pos);
+                        state.current_seconds = pos;
+                        state.seek_epoch += 1;
+                        while let Ok(c) = ready_rx_for_decoder.try_recv() {
+                            let _ = free_tx_for_decoder.try_send(c);
+                        }
+                        while let Ok(_) = video_rx_for_decoder.try_recv() {}
                     }
                 }
-            }
-            
-            let mut chunk = match free_rx.recv() {
-                Ok(c) => c,
-                Err(_) => break, // CPAL died
+                match free_rx.recv_timeout(std::time::Duration::from_millis(10)) {
+                    Ok(c) => break c,
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+                }
             };
             
             let decode_start = Instant::now();
@@ -1929,8 +1964,34 @@ where
                 state.stats.clipping_events += clips;
             }
             
-            if ready_tx.send(chunk).is_err() {
-                break;
+            let mut chunk_to_send = chunk;
+            loop {
+                let mut seeked = false;
+                if let Ok(mut state) = state_for_decoder.try_lock() {
+                    if let Some(pos) = state.seek_request.take() {
+                        audio_source.set_position_seconds(pos);
+                        state.current_seconds = pos;
+                        state.seek_epoch += 1;
+                        while let Ok(c) = ready_rx_for_decoder.try_recv() {
+                            let _ = free_tx_for_decoder.try_send(c);
+                        }
+                        while let Ok(_) = video_rx_for_decoder.try_recv() {}
+                        seeked = true;
+                    }
+                }
+                if seeked {
+                    let _ = free_tx_for_decoder.try_send(chunk_to_send);
+                    break;
+                }
+                match ready_tx.send_timeout(chunk_to_send, std::time::Duration::from_millis(10)) {
+                    Ok(_) => break,
+                    Err(crossbeam_channel::SendTimeoutError::Timeout(c)) => {
+                        chunk_to_send = c;
+                    }
+                    Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
+                        return;
+                    }
+                }
             }
             
             if frames_read == 0 {

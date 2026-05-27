@@ -666,6 +666,7 @@ impl<'a> VulkanEngine<'a> {
                 14 => include_str!("shaders/vis_rain.wgsl"),
                 15 => include_str!("shaders/vis_3drain.wgsl"),
                 16 => include_str!("shaders/vis_synthwaveracer.wgsl"),
+                17 => include_str!("shaders/vis_cuboids.wgsl"),
                 _ => include_str!("shaders/vis_spectrum.wgsl"),
             }
         };
