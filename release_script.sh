@@ -7,7 +7,7 @@ echo "-----------------------------------------------------"
 VERSION=$(grep -m 1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
 TAG="v$VERSION"
 
-SHA=$(git rev-parse "$TAG")
+SHA=$(git rev-parse "$TAG^{commit}")
 
 echo "Waiting for Github Actions to register runs for commit $SHA ($TAG)..."
 while true; do
