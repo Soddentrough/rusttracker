@@ -63,3 +63,9 @@ windows = { version = "0.62.2", features = ["Win32_System_Com", "Win32_Media_Aud
 [target."cfg(target_os = \"macos\")".dependencies]
 objc2 = "0.6.4"
 objc2-core-audio = "0.3.2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
