@@ -69,82 +69,103 @@ fn evaluate_cell(p: vec3<f32>, ix: i32, iz: i32, res_in: SceneResult) -> SceneRe
     return res;
 }
 
+fn sd_grid_bbox(p: vec3<f32>) -> f32 {
+    let grid_center = vec3<f32>(0.0, 0.0, -9.45);
+    let grid_half = vec3<f32>(20.486, 3.766, 17.786);
+    let q = abs(p - grid_center) - grid_half;
+    return max(max(q.x, q.y), q.z);
+}
+
+fn sd_cell_bbox(p: vec3<f32>, cx: f32, cz: f32) -> f32 {
+    let dx = abs(p.x - cx) - 0.236;
+    let dy = abs(p.y) - 3.766;
+    let dz = abs(p.z - cz) - 0.236;
+    return max(max(dx, dy), dz);
+}
+
 fn map_scene(p: vec3<f32>) -> SceneResult {
-    let x_spacing = 1.35;
-    let z_spacing = 1.35;
-    
-    let ix_center = i32(round(p.x / x_spacing));
-    let iz_center = i32(round(p.z / z_spacing));
-    
     var res: SceneResult;
     res.d = 1e10;
     res.hit_type = 0;
     res.amp = 0.0;
-    
-    // Early return if completely out of bounds of the grid
-    if (ix_center < -16 || ix_center > 16 || iz_center < -21 || iz_center > 7) {
+
+    // 1. Fast check against the bounding box of the entire grid
+    let d_grid = sd_grid_bbox(p);
+    if (d_grid > 0.0) {
+        res.d = 1e10;
         return res;
     }
-    
-    let cx_center = f32(ix_center) * x_spacing;
-    let cz_center = f32(iz_center) * z_spacing;
-    
-    // 1. Evaluate center cell first to establish a tight bound
-    if (ix_center >= -15 && ix_center <= 15 && iz_center >= -20 && iz_center <= 6) {
-        res = evaluate_cell(p, ix_center, iz_center, res);
+
+    // 2. Find the closest cell in XZ
+    let x_spacing = 1.35;
+    let z_spacing = 1.35;
+    let ix_center = i32(round(p.x / x_spacing));
+    let iz_center = i32(round(p.z / z_spacing));
+
+    let ix_clamp = clamp(ix_center, -15, 15);
+    let iz_clamp = clamp(iz_center, -20, 6);
+
+    let cx_center = f32(ix_clamp) * x_spacing;
+    let cz_center = f32(iz_clamp) * z_spacing;
+
+    // 3. Compute lower bound distance to the center cell's bounding box
+    let d_bbox_center = sd_cell_bbox(p, cx_center, cz_center);
+
+    // If the lower bound is large, we can skip the exact evaluation and neighbor checks
+    if (d_bbox_center >= 0.20) {
+        res.d = d_bbox_center;
+        return res;
     }
-    
-    // 2. Early return if the current best distance is closer than any neighbor cell could possibly be.
-    // The closest horizontal distance to any box in a neighbor is at least 1.13 - distance_to_center_cell.
-    let dx_center_dist = abs(p.x - cx_center);
-    let dz_center_dist = abs(p.z - cz_center);
-    let d_neighbor_min = min(1.13 - dx_center_dist, 1.13 - dz_center_dist);
+
+    // 4. We are close to the center cell. Evaluate it exactly.
+    res = evaluate_cell(p, ix_clamp, iz_clamp, res);
+
+    // 5. Check if any neighbor cell could possibly be closer than our current best distance res.d.
+    let dx_dist = abs(p.x - cx_center);
+    let dz_dist = abs(p.z - cz_center);
+    let d_neighbor_min = min(1.35 - dx_dist - 0.236, 1.35 - dz_dist - 0.236);
+
     if (res.d < d_neighbor_min) {
         return res;
     }
-    
-    // 3. Evaluate neighbor cells only if they are within the dynamic bounds and closer.
-    // If res.d <= 1.13, we can skip neighbors on the opposite side of the center cell.
+
+    // 6. Evaluate neighbors only if needed
     var dx_start = -1;
     var dx_end = 1;
-    if (res.d <= 1.13) {
-        if (p.x >= cx_center) {
-            dx_start = 0;
-        } else {
-            dx_end = 0;
-        }
+    if (p.x >= cx_center) {
+        dx_start = 0;
+    } else {
+        dx_end = 0;
     }
-    
+
     var dz_start = -1;
     var dz_end = 1;
-    if (res.d <= 1.13) {
-        if (p.z >= cz_center) {
-            dz_start = 0;
-        } else {
-            dz_end = 0;
-        }
+    if (p.z >= cz_center) {
+        dz_start = 0;
+    } else {
+        dz_end = 0;
     }
-    
+
     for (var dx = dx_start; dx <= dx_end; dx = dx + 1) {
         for (var dz = dz_start; dz <= dz_end; dz = dz + 1) {
             if (dx == 0 && dz == 0) { continue; }
-            
-            let ix = ix_center + dx;
-            let iz = iz_center + dz;
-            
+
+            let ix = ix_clamp + dx;
+            let iz = iz_clamp + dz;
+
             if (ix < -15 || ix > 15 || iz < -20 || iz > 6) { continue; }
-            
+
             let cx = f32(ix) * x_spacing;
             let cz = f32(iz) * z_spacing;
-            
-            // Strict mathematical lower bound check: distance to cell boundary
-            let d_horizontal = max(abs(p.x - cx) - 0.22, abs(p.z - cz) - 0.22);
-            if (d_horizontal >= res.d) { continue; }
-            
+
+            // Check if the neighbor's bounding box distance is smaller than res.d
+            let d_bbox_neigh = sd_cell_bbox(p, cx, cz);
+            if (d_bbox_neigh >= res.d) { continue; }
+
             res = evaluate_cell(p, ix, iz, res);
         }
     }
-    
+
     return res;
 }
 
@@ -173,12 +194,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     
     // 3. Camera (Fixed, motionless)
     let ro = vec3<f32>(0.0, 0.0, 7.2);
-    let look_at = vec3<f32>(0.0, 0.0, 0.0);
-    
-    let cw = normalize(look_at - ro);
-    let cu = normalize(cross(vec3<f32>(0.0, 1.0, 0.0), cw));
-    let cv = normalize(cross(cw, cu));
-    let rd = normalize(p.x * cu + p.y * cv + 1.5 * cw);
+    let rd = normalize(vec3<f32>(-p.x, p.y, -1.5));
     
     // Audio Reactivity Calculations
     let bass = clamp(audio.spectrum[0].x + audio.spectrum[1].x + audio.spectrum[2].x, 0.0, 1.0);
@@ -195,7 +211,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var hit_amp = 0.0;
     var hit_type = 0;
     
-    for (var i = 0; i < 90; i = i + 1) {
+    for (var i = 0; i < 80; i = i + 1) {
         let p_hit = ro + rd * t;
         let res = map_scene(p_hit);
         
@@ -227,9 +243,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     
     // 5. Floor & Ceiling Grid planes
     var t_floor = -1.0;
-    if (rd.y < -0.001) { t_floor = (-3.2 - ro.y) / rd.y; }
+    if (rd.y < -0.001) { t_floor = -3.2 / rd.y; }
     var t_ceil = -1.0;
-    if (rd.y > 0.001) { t_ceil = (3.2 - ro.y) / rd.y; }
+    if (rd.y > 0.001) { t_ceil = 3.2 / rd.y; }
     
     let x_spacing = 1.35;
     
