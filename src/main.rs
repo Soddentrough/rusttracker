@@ -46,6 +46,9 @@ struct Args {
 
     #[arg(long, default_value_t = false)]
     gpu_fft: bool,
+
+    #[arg(long)]
+    bench: Option<u32>,
 }
 
 struct Tui {
@@ -159,14 +162,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             eprintln!("App error: {:?}", err);
         }
     } else {
-        pollster::block_on(run_gui(app_state, initial_stream, args.fullscreen, args.gpu_fft));
+        pollster::block_on(run_gui(app_state, initial_stream, args.fullscreen, args.gpu_fft, args.bench));
     }
 
     Ok(())
 }
 
 #[allow(unused_variables, unused_assignments)]
-async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audio::PlaybackHandle>, is_fullscreen: bool, use_gpu_fft: bool) {
+async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audio::PlaybackHandle>, is_fullscreen: bool, use_gpu_fft: bool, bench: Option<u32>) {
     if use_gpu_fft {
         let mut state = app_state.lock().unwrap();
         state.gpu_fft = true;
@@ -258,6 +261,7 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
     let mut rfd_pending = false;
 
     let mut modifiers = winit::keyboard::ModifiersState::empty();
+    let mut frame_count = 0u32;
 
     #[allow(deprecated)]
     let _ = event_loop.run(move |event, elwt| {
@@ -801,6 +805,19 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                             }
                             if let Some(ft) = fft_time {
                                 state.stats.gpu_fft_us = state.stats.gpu_fft_us * 0.9 + ft * 0.1;
+                            }
+                        }
+
+                        if let Some(bench_frames) = bench {
+                            frame_count += 1;
+                            if frame_count >= bench_frames {
+                                let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
+                                println!("BENCHMARK_RESULT_VISUALIZER: {}", vis_def.name);
+                                println!("BENCHMARK_RESULT_FPS: {:.2}", state.current_fps);
+                                println!("BENCHMARK_RESULT_SHADER_US: {:.2}", state.stats.shader_us);
+                                println!("BENCHMARK_RESULT_RENDER_US: {:.2}", state.stats.render_us);
+                                elwt.exit();
+                                return;
                             }
                         }
                         

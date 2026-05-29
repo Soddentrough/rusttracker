@@ -33,8 +33,9 @@ fn project_3d(p3: vec3<f32>, ro: vec3<f32>, u: vec3<f32>, v_cam: vec3<f32>, w: v
     let dir = p3 - ro;
     let dist_w = dot(dir, w);
     if dist_w <= 0.001 { return vec3<f32>(999.0, 999.0, dist_w); }
-    let proj_x = dot(dir, u) / dist_w;
-    let proj_y = dot(dir, v_cam) / dist_w;
+    let inv_dist_w = 1.0 / dist_w;
+    let proj_x = dot(dir, u) * inv_dist_w;
+    let proj_y = dot(dir, v_cam) * inv_dist_w;
     // Negate proj_y so +Z (up) maps to -Y (top of screen in our coords)
     return vec3<f32>(proj_x, -proj_y, dist_w);
 }
@@ -74,20 +75,25 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     let num_lines = min(max(1u, audio.waveform_history_size), 144u);
     let res = f32(max(audio.waveform_resolution, 128u));
+    let inv_res_minus_1 = 19.2 / (res - 1.0);
     
-    for (var i = 0u; i < num_lines; i = i + 1u) {
-        // Z layout: back to front. i=0 is back (oldest), i=num_lines-1 is front (newest).
-        let y_line = mix(9.48, -1.8, f32(i) / f32(num_lines - 1u));
-        let hist_idx = i;
-        
-        let t = (y_line - ro.y) / rd.y;
-        if t <= 0.0 {
-            // Lines are iterated back-to-front (decreasing Y). When rd.y > 0,
-            // once t goes negative all remaining lines are also behind the camera.
-            if rd.y > 0.0 { break; }
-            continue;
-        }
-        {
+    if rd.y > 0.0 {
+        let t_min = max(0.0, (ro.z - 1.5) / max(0.2 - rd.z, 0.00001));
+        let t_max = (ro.z + 1.5) / max(-0.2 - rd.z, 0.00001);
+
+        for (var i = 0u; i < num_lines; i = i + 1u) {
+            // Z layout: back to front. i=0 is back (oldest), i=num_lines-1 is front (newest).
+            let y_line = mix(9.48, -1.8, f32(i) / f32(num_lines - 1u));
+            let hist_idx = i;
+            
+            let t = (y_line - ro.y) / rd.y;
+            if t < t_min {
+                break;
+            }
+            if t > t_max {
+                continue;
+            }
+            
             let hit_x = ro.x + rd.x * t;
             
             let edge_fade = smoothstep(9.6, 6.6, abs(hit_x));
@@ -103,23 +109,25 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             // Scale down slightly since we have 3x more lines now
             let search_radius = clamp(i32(t * 0.4), 1, 6);
             let start_idx = max(0, idx - search_radius);
-            let end_idx = min(i32(res) - 1i, idx + search_radius);
+            let end_idx = min(i32(res) - 2, idx + search_radius);
             
             var min_dist = 1000.0;
             
+            let hist_offset = clamp(hist_idx, 0u, max(1u, audio.waveform_history_size) - 1u) * 2048u;
+            
             var j_u = u32(start_idx);
-            var x_prev = -9.6 + f32(j_u) / (res - 1.0) * 19.2;
+            var x_prev = -9.6 + f32(j_u) * inv_res_minus_1;
             var mask_prev = smoothstep(9.6, 6.6, abs(x_prev));
-            var v_prev = get_waveform(hist_idx, j_u);
+            var v_prev = waveform_history[hist_offset + j_u];
             var p_prev = v_prev * mask_prev * 1.2;
             var p3_prev = vec3<f32>(x_prev, y_line, p_prev);
             var proj_prev = project_3d(p3_prev, ro, u, v_cam, w);
             
             for (var j = start_idx; j <= end_idx; j = j + 1) {
                 j_u = u32(j + 1);
-                let x_curr = -9.6 + f32(j_u) / (res - 1.0) * 19.2;
+                let x_curr = -9.6 + f32(j_u) * inv_res_minus_1;
                 let mask_curr = smoothstep(9.6, 6.6, abs(x_curr));
-                let v_curr = get_waveform(hist_idx, j_u);
+                let v_curr = waveform_history[hist_offset + j_u];
                 let p_curr = v_curr * mask_curr * 1.2;
                 let p3_curr = vec3<f32>(x_curr, y_line, p_curr);
                 let proj_curr = project_3d(p3_curr, ro, u, v_cam, w);
@@ -150,7 +158,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             
             // Sample waveform height at hit point for color grading
             let hit_wave_idx = u32(clamp((hit_x + 9.6) / 19.2 * (res - 1.0), 0.0, res - 1.0));
-            let wave_height = clamp(abs(get_waveform(hist_idx, hit_wave_idx)) * 2.0, 0.0, 1.0);
+            let wave_height = clamp(abs(waveform_history[hist_offset + hit_wave_idx]) * 2.0, 0.0, 1.0);
             let line_amber = mix(amber_lo, amber_hi, wave_height);
             
             accumulated_color += line_amber * (core + bloom) * depth_fade * edge_fade * age_fade;

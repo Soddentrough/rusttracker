@@ -21,9 +21,8 @@ fn sdWireframeBox(p: vec3<f32>, b: vec3<f32>, e: f32) -> f32 {
 }
 
 fn get_history_amplitude(bin: u32, steps_ago: u32) -> f32 {
-    let row = (audio.heatmap_row + 1024u - (steps_ago % 1024u)) % 1024u;
-    let clamped_bin = clamp(bin, 0u, 255u);
-    return textureLoad(history_tex, vec2<i32>(i32(clamped_bin), i32(row)), 0).x;
+    let row = (audio.heatmap_row + 1024u - (steps_ago & 1023u)) & 1023u;
+    return textureLoad(history_tex, vec2<i32>(i32(bin), i32(row)), 0).x;
 }
 
 struct SceneResult {
@@ -31,6 +30,44 @@ struct SceneResult {
     hit_type: i32,
     amp: f32,
 };
+
+fn evaluate_cell(p: vec3<f32>, ix: i32, iz: i32, res_in: SceneResult) -> SceneResult {
+    var res = res_in;
+    let x_spacing = 1.35;
+    let z_spacing = 1.35;
+    let cx = f32(ix) * x_spacing;
+    let cz = f32(iz) * z_spacing;
+    
+    let dist_from_center = sqrt(f32(ix * ix + iz * iz));
+    let bin = clamp(u32(dist_from_center * 10.0) + 4u, 0u, 255u);
+    let steps_ago = u32(dist_from_center * 3.0);
+    let amp = get_history_amplitude(bin, steps_ago);
+    let shift = clamp(amp / 100.0, 0.0, 1.0) * 1.5;
+    
+    let thick = 0.009 + clamp(amp / 100.0, 0.0, 1.0) * 0.007;
+    let b = vec3<f32>(0.22, 0.85, 0.22);
+    
+    // Mathematically proven: Only the box on the same side of y=0.0 as p.y can possibly be the closest.
+    if (p.y < 0.0) {
+        let y_center_b = -2.9 + shift;
+        let d_b = sdWireframeBox(p - vec3<f32>(cx, y_center_b, cz), b, thick);
+        if (d_b < res.d) {
+            res.d = d_b;
+            res.hit_type = 1;
+            res.amp = amp;
+        }
+    } else {
+        let y_center_t = 2.9 - shift;
+        let d_t = sdWireframeBox(p - vec3<f32>(cx, y_center_t, cz), b, thick);
+        if (d_t < res.d) {
+            res.d = d_t;
+            res.hit_type = 2;
+            res.amp = amp;
+        }
+    }
+    
+    return res;
+}
 
 fn map_scene(p: vec3<f32>) -> SceneResult {
     let x_spacing = 1.35;
@@ -44,8 +81,54 @@ fn map_scene(p: vec3<f32>) -> SceneResult {
     res.hit_type = 0;
     res.amp = 0.0;
     
-    for (var dx = -1; dx <= 1; dx = dx + 1) {
-        for (var dz = -1; dz <= 1; dz = dz + 1) {
+    // Early return if completely out of bounds of the grid
+    if (ix_center < -16 || ix_center > 16 || iz_center < -21 || iz_center > 7) {
+        return res;
+    }
+    
+    let cx_center = f32(ix_center) * x_spacing;
+    let cz_center = f32(iz_center) * z_spacing;
+    
+    // 1. Evaluate center cell first to establish a tight bound
+    if (ix_center >= -15 && ix_center <= 15 && iz_center >= -20 && iz_center <= 6) {
+        res = evaluate_cell(p, ix_center, iz_center, res);
+    }
+    
+    // 2. Early return if the current best distance is closer than any neighbor cell could possibly be.
+    // The closest horizontal distance to any box in a neighbor is at least 1.13 - distance_to_center_cell.
+    let dx_center_dist = abs(p.x - cx_center);
+    let dz_center_dist = abs(p.z - cz_center);
+    let d_neighbor_min = min(1.13 - dx_center_dist, 1.13 - dz_center_dist);
+    if (res.d < d_neighbor_min) {
+        return res;
+    }
+    
+    // 3. Evaluate neighbor cells only if they are within the dynamic bounds and closer.
+    // If res.d <= 1.13, we can skip neighbors on the opposite side of the center cell.
+    var dx_start = -1;
+    var dx_end = 1;
+    if (res.d <= 1.13) {
+        if (p.x >= cx_center) {
+            dx_start = 0;
+        } else {
+            dx_end = 0;
+        }
+    }
+    
+    var dz_start = -1;
+    var dz_end = 1;
+    if (res.d <= 1.13) {
+        if (p.z >= cz_center) {
+            dz_start = 0;
+        } else {
+            dz_end = 0;
+        }
+    }
+    
+    for (var dx = dx_start; dx <= dx_end; dx = dx + 1) {
+        for (var dz = dz_start; dz <= dz_end; dz = dz + 1) {
+            if (dx == 0 && dz == 0) { continue; }
+            
             let ix = ix_center + dx;
             let iz = iz_center + dz;
             
@@ -54,32 +137,11 @@ fn map_scene(p: vec3<f32>) -> SceneResult {
             let cx = f32(ix) * x_spacing;
             let cz = f32(iz) * z_spacing;
             
-            let dist_from_center = length(vec2<f32>(f32(ix), f32(iz)));
-            let bin = clamp(u32(dist_from_center * 10.0) + 4u, 0u, 255u);
-            let steps_ago = u32(dist_from_center * 3.0);
-            let amp = get_history_amplitude(bin, steps_ago);
-            let shift = clamp(amp / 100.0, 0.0, 1.0) * 1.5;
+            // Strict mathematical lower bound check: distance to cell boundary
+            let d_horizontal = max(abs(p.x - cx) - 0.22, abs(p.z - cz) - 0.22);
+            if (d_horizontal >= res.d) { continue; }
             
-            let thick = 0.009 + clamp(amp / 100.0, 0.0, 1.0) * 0.007;
-            let b = vec3<f32>(0.22, 0.85, 0.22);
-            
-            // Bottom Box
-            let y_center_b = -2.9 + shift;
-            let d_b = sdWireframeBox(p - vec3<f32>(cx, y_center_b, cz), b, thick);
-            if (d_b < res.d) {
-                res.d = d_b;
-                res.hit_type = 1;
-                res.amp = amp;
-            }
-            
-            // Top Box
-            let y_center_t = 2.9 - shift;
-            let d_t = sdWireframeBox(p - vec3<f32>(cx, y_center_t, cz), b, thick);
-            if (d_t < res.d) {
-                res.d = d_t;
-                res.hit_type = 2;
-                res.amp = amp;
-            }
+            res = evaluate_cell(p, ix, iz, res);
         }
     }
     
