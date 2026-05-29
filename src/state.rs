@@ -66,15 +66,19 @@ impl std::fmt::Debug for VideoFrame {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Geometry {
     Grid { width: u32, depth: u32 },
+    UnitBox,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PipelineType {
     FullscreenQuad,
-    Mesh3D(Geometry),
+    Mesh3D {
+        geometry: Geometry,
+        instances: u32,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -103,13 +107,13 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
     VisualizerDef { id: 4, name: "Chrome Ferrofluid", filename: "vis_ferrofluid.wgsl", description: "Raymarched liquid metal simulation", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 10, name: "Ferrofluid Particle Sim", filename: "vis_ferrofluidsim.wgsl", description: "Compute physics droplet simulation", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: true },
     VisualizerDef { id: 5, name: "Neon Corridor", filename: "vis_neon.wgsl", description: "Raymarched neon sci-fi tunnel", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
-    VisualizerDef { id: 11, name: "Lissajous Laser", filename: "vis_lissajous.wgsl", description: "Analog laser projector simulation", pipeline_type: PipelineType::Mesh3D(Geometry::Grid { width: 200, depth: 200 }), requires_history: true, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
-    VisualizerDef { id: 12, name: "Synthwave Terrain", filename: "vis_synthwave.wgsl", description: "Retro 80s wireframe landscape", pipeline_type: PipelineType::Mesh3D(Geometry::Grid { width: 200, depth: 200 }), requires_history: true, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
+    VisualizerDef { id: 11, name: "Lissajous Laser", filename: "vis_lissajous.wgsl", description: "Analog laser projector simulation", pipeline_type: PipelineType::Mesh3D { geometry: Geometry::Grid { width: 200, depth: 200 }, instances: 1 }, requires_history: true, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
+    VisualizerDef { id: 12, name: "Synthwave Terrain", filename: "vis_synthwave.wgsl", description: "Retro 80s wireframe landscape", pipeline_type: PipelineType::Mesh3D { geometry: Geometry::Grid { width: 200, depth: 200 }, instances: 1 }, requires_history: true, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 13, name: "Starfield Constellation", filename: "vis_starfield.wgsl", description: "Audio-reactive galaxy and starfield", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 14, name: "Midnight Storm", filename: "vis_rain.wgsl", description: "Nighttime rain and audio-reactive lightning", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 15, name: "3D Midnight Storm", filename: "vis_3drain.wgsl", description: "3D rain and lightning across audio frequencies", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 16, name: "Synthwave Racer", filename: "vis_synthwaveracer.wgsl", description: "Retro 80s synthwave racer visualizer", pipeline_type: PipelineType::FullscreenQuad, requires_history: true, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
-    VisualizerDef { id: 17, name: "Neon Cuboids", filename: "vis_cuboids.wgsl", description: "3D neon wireframe cuboids reacting to audio", pipeline_type: PipelineType::FullscreenQuad, requires_history: true, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
+    VisualizerDef { id: 17, name: "Neon Cuboids", filename: "vis_cuboids.wgsl", description: "3D neon wireframe cuboids reacting to audio", pipeline_type: PipelineType::Mesh3D { geometry: Geometry::UnitBox, instances: 1674 }, requires_history: true, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
 ];
 
 #[derive(Debug, Clone)]

@@ -185,6 +185,12 @@ impl Vertex {
     }
 }
 
+struct MeshBuffers {
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    index_count: u32,
+}
+
 pub struct VulkanEngine<'a> {
     surface: wgpu::Surface<'a>,
     device: wgpu::Device,
@@ -261,13 +267,12 @@ pub struct VulkanEngine<'a> {
     video_pipeline: wgpu::RenderPipeline,
     video_state: Option<VideoState>,
     clear_black_pipeline: wgpu::RenderPipeline,
+    crt_background_pipeline: wgpu::RenderPipeline,
     
     // 3D Engine Extensions
     camera_uniform_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
-    grid_vertex_buffer: wgpu::Buffer,
-    grid_index_buffer: wgpu::Buffer,
-    grid_index_count: u32,
+    mesh_registry: std::collections::HashMap<crate::state::Geometry, MeshBuffers>,
     lamp_vertex_buffer: wgpu::Buffer,
     lamp_index_buffer: wgpu::Buffer,
     lamp_index_count: u32,
@@ -752,7 +757,7 @@ impl<'a> VulkanEngine<'a> {
                     },
                     "vs_main"
                 ),
-                crate::state::PipelineType::Mesh3D(_) => (
+                crate::state::PipelineType::Mesh3D { .. } => (
                     &render_pipeline_layout_3d,
                     vec![Vertex::desc()],
                     wgpu::PrimitiveState {
@@ -768,6 +773,12 @@ impl<'a> VulkanEngine<'a> {
                 ),
             };
             
+            let blend_state = if vis_def.id == 17 {
+                Some(wgpu::BlendState::ALPHA_BLENDING)
+            } else {
+                Some(wgpu::BlendState::REPLACE)
+            };
+
             let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(&format!("Render Pipeline {}", i)),
                 layout: Some(layout),
@@ -782,7 +793,7 @@ impl<'a> VulkanEngine<'a> {
                     entry_point: Some("fs_main"),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: config.format,
-                        blend: Some(wgpu::BlendState::REPLACE),
+                        blend: blend_state,
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -790,7 +801,7 @@ impl<'a> VulkanEngine<'a> {
                 primitive,
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: Some(true),
+                    depth_write_enabled: Some(vis_def.id != 17),
                     depth_compare: Some(wgpu::CompareFunction::LessEqual),
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
@@ -1048,6 +1059,155 @@ impl<'a> VulkanEngine<'a> {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &solid_black_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let crt_background_shader_src = resolve_shader_includes(r#"
+            // INCLUDE: common
+
+            @group(0) @binding(0) var<uniform> audio: AudioUniforms;
+
+            struct VertexOutput {
+                @builtin(position) clip_position: vec4<f32>,
+                @location(0) uv: vec2<f32>,
+            };
+
+            @vertex
+            fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
+                var out: VertexOutput;
+                let u = f32((in_vertex_index << 1u) & 2u);
+                let v = f32(in_vertex_index & 2u);
+                out.clip_position = vec4<f32>(u * 2.0 - 1.0, -(v * 2.0 - 1.0), 0.0, 1.0);
+                out.uv = vec2<f32>(u, v);
+                return out;
+            }
+
+            fn hash21(p: vec2<f32>) -> f32 {
+                var p3 = fract(vec3<f32>(p.xyx) * 0.1031);
+                p3 = p3 + dot(p3, p3.yzx + 33.33);
+                return fract((p3.x + p3.y) * p3.z);
+            }
+
+            @fragment
+            fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+                let crt_uv = in.uv * 2.0 - 1.0;
+                let r2 = dot(crt_uv, crt_uv);
+                let distorted_uv = crt_uv * (1.0 + r2 * 0.055);
+                
+                if (abs(distorted_uv.x) > 1.0 || abs(distorted_uv.y) > 1.0) {
+                    return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+                }
+                
+                let border_dist = min(1.0 - abs(distorted_uv.x), 1.0 - abs(distorted_uv.y));
+                let bezel_mask = smoothstep(0.0, 0.03, border_dist);
+                
+                var aspect = 1.7777;
+                let dy = abs(dpdy(in.uv.y));
+                let dx = abs(dpdx(in.uv.x));
+                if (dx > 0.0001 && dy > 0.0001) { aspect = dy / dx; }
+                let p = vec2<f32>(distorted_uv.x * aspect, -distorted_uv.y);
+                
+                let ro = vec3<f32>(0.0, 0.0, 7.2);
+                let rd = normalize(vec3<f32>(-p.x, p.y, -1.5));
+                
+                let bass = clamp(audio.spectrum[0].x + audio.spectrum[1].x + audio.spectrum[2].x, 0.0, 1.0);
+                let base_green = vec3<f32>(0.02, 1.0, 0.38);
+                let neon_green = mix(base_green, vec3<f32>(1.0, 1.0, 1.0), clamp(bass * 0.45, 0.0, 1.0));
+                
+                var t_floor = -1.0;
+                if (rd.y < -0.001) { t_floor = -3.2 / rd.y; }
+                var t_ceil = -1.0;
+                if (rd.y > 0.001) { t_ceil = 3.2 / rd.y; }
+                
+                let x_spacing = 1.35;
+                
+                var grid_intensity = 0.0;
+                if (t_floor > 0.0 && t_floor < 25.0) {
+                    let p_floor = ro + rd * t_floor;
+                    let grid_uv = fract(p_floor.xz / x_spacing - 0.5) - 0.5;
+                    let dist_to_line = min(abs(grid_uv.x), abs(grid_uv.y));
+                    let line_w = 0.02 * (1.0 + t_floor * 0.05);
+                    let grid_line = smoothstep(line_w, 0.0, dist_to_line);
+                    let fade = smoothstep(25.0, 4.0, t_floor);
+                    grid_intensity = grid_intensity + grid_line * fade;
+                }
+                if (t_ceil > 0.0 && t_ceil < 25.0) {
+                    let p_ceil = ro + rd * t_ceil;
+                    let grid_uv = fract(p_ceil.xz / x_spacing - 0.5) - 0.5;
+                    let dist_to_line = min(abs(grid_uv.x), abs(grid_uv.y));
+                    let line_w = 0.02 * (1.0 + t_ceil * 0.05);
+                    let grid_line = smoothstep(line_w, 0.0, dist_to_line);
+                    let fade = smoothstep(25.0, 4.0, t_ceil);
+                    grid_intensity = grid_intensity + grid_line * fade;
+                }
+                
+                var final_color = neon_green * grid_intensity * 0.35;
+                
+                let center_dist = length(distorted_uv);
+                let bg_glow = vec3<f32>(0.005, 0.038, 0.016) * (1.0 - center_dist * 0.55);
+                final_color = final_color + bg_glow;
+                
+                final_color = final_color * bezel_mask;
+                
+                let scanline = 0.86 + 0.14 * cos(in.clip_position.y * 3.14159);
+                final_color = final_color * scanline;
+                
+                let flicker = 0.98 + 0.02 * sin(audio.time * 115.0);
+                final_color = final_color * flicker;
+                
+                let noise_val = hash21(in.clip_position.xy + fract(audio.smooth_time) * 149.0);
+                let static_noise = noise_val * 0.022 * bezel_mask;
+                final_color = final_color + vec3<f32>(static_noise);
+                
+                var final_col = (final_color * (2.51 * final_color + 0.03)) / (final_color * (2.43 * final_color + 0.59) + 0.14);
+                final_col = max(final_col, vec3<f32>(0.0));
+                
+                return vec4<f32>(final_col, 1.0);
+            }
+        "#);
+
+        let crt_background_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("CRT Background Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(crt_background_shader_src)),
+        });
+
+        let crt_background_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("CRT Background Pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &crt_background_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &crt_background_shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: config.format,
@@ -1469,49 +1629,140 @@ impl<'a> VulkanEngine<'a> {
             label: Some("Resynth Compute Pipeline"), layout: Some(&resynth_compute_pipeline_layout), module: &resynth_compute_shader, entry_point: Some("main"), compilation_options: wgpu::PipelineCompilationOptions::default(), cache: None,
         });
         // --- 3D Engine Extensions Init ---
-        let mut vertices = Vec::new();
-        let mut indices: Vec<u32> = Vec::new();
-        let grid_width = 200;
-        let grid_depth = 200;
-        for z in 0..=grid_depth {
-            for x in 0..=grid_width {
-                let px = x as f32 - (grid_width as f32) / 2.0;
-                let pz = z as f32 - (grid_depth as f32) / 2.0;
-                vertices.push(Vertex {
-                    position: [px, 0.0, pz],
-                    normal: [0.0, 1.0, 0.0],
-                    tex_coords: [x as f32 / grid_width as f32, z as f32 / grid_depth as f32],
-                });
+        let mut mesh_registry = std::collections::HashMap::new();
+        let mut unique_geometries = std::collections::HashSet::new();
+        for vis in crate::state::VISUALIZERS {
+            if let crate::state::PipelineType::Mesh3D { geometry, .. } = &vis.pipeline_type {
+                unique_geometries.insert(geometry.clone());
             }
         }
-        for z in 0..grid_depth {
-            for x in 0..grid_width {
-                let start = z * (grid_width + 1) + x;
-                indices.push(start);
-                indices.push(start + 1);
-                indices.push(start + grid_width + 1);
-                indices.push(start + 1);
-                indices.push(start + grid_width + 2);
-                indices.push(start + grid_width + 1);
-            }
+        
+        for geom in unique_geometries {
+            let (vertices, indices) = match &geom {
+                crate::state::Geometry::Grid { width, depth } => {
+                    let mut vertices = Vec::new();
+                    let mut indices = Vec::new();
+                    let grid_width = *width;
+                    let grid_depth = *depth;
+                    for z in 0..=grid_depth {
+                        for x in 0..=grid_width {
+                            let px = x as f32 - (grid_width as f32) / 2.0;
+                            let pz = z as f32 - (grid_depth as f32) / 2.0;
+                            vertices.push(Vertex {
+                                position: [px, 0.0, pz],
+                                normal: [0.0, 1.0, 0.0],
+                                tex_coords: [x as f32 / grid_width as f32, z as f32 / grid_depth as f32],
+                            });
+                        }
+                    }
+                    for z in 0..grid_depth {
+                        for x in 0..grid_width {
+                            let start = z * (grid_width + 1) + x;
+                            indices.push(start);
+                            indices.push(start + 1);
+                            indices.push(start + grid_width + 1);
+                            indices.push(start + 1);
+                            indices.push(start + grid_width + 2);
+                            indices.push(start + grid_width + 1);
+                        }
+                    }
+                    (vertices, indices)
+                }
+                crate::state::Geometry::UnitBox => {
+                    let mut vertices = Vec::new();
+                    let mut indices = Vec::new();
+                    
+                    let mut add_face = |p0: [f32; 3], p1: [f32; 3], p2: [f32; 3], p3: [f32; 3], normal: [f32; 3]| {
+                        let start_idx = vertices.len() as u32;
+                        vertices.push(Vertex { position: p0, normal, tex_coords: [0.0, 0.0] });
+                        vertices.push(Vertex { position: p1, normal, tex_coords: [1.0, 0.0] });
+                        vertices.push(Vertex { position: p2, normal, tex_coords: [1.0, 1.0] });
+                        vertices.push(Vertex { position: p3, normal, tex_coords: [0.0, 1.0] });
+                        
+                        indices.push(start_idx);
+                        indices.push(start_idx + 1);
+                        indices.push(start_idx + 2);
+                        indices.push(start_idx);
+                        indices.push(start_idx + 2);
+                        indices.push(start_idx + 3);
+                    };
+                    
+                    // Front face (z = +0.5)
+                    add_face(
+                        [-0.5, -0.5,  0.5],
+                        [ 0.5, -0.5,  0.5],
+                        [ 0.5,  0.5,  0.5],
+                        [-0.5,  0.5,  0.5],
+                        [0.0, 0.0, 1.0],
+                    );
+                    // Back face (z = -0.5)
+                    add_face(
+                        [ 0.5, -0.5, -0.5],
+                        [-0.5, -0.5, -0.5],
+                        [-0.5,  0.5, -0.5],
+                        [ 0.5,  0.5, -0.5],
+                        [0.0, 0.0, -1.0],
+                    );
+                    // Left face (x = -0.5)
+                    add_face(
+                        [-0.5, -0.5, -0.5],
+                        [-0.5, -0.5,  0.5],
+                        [-0.5,  0.5,  0.5],
+                        [-0.5,  0.5, -0.5],
+                        [-1.0, 0.0, 0.0],
+                    );
+                    // Right face (x = +0.5)
+                    add_face(
+                        [ 0.5, -0.5,  0.5],
+                        [ 0.5, -0.5, -0.5],
+                        [ 0.5,  0.5, -0.5],
+                        [ 0.5,  0.5,  0.5],
+                        [1.0, 0.0, 0.0],
+                    );
+                    // Top face (y = +0.5)
+                    add_face(
+                        [-0.5,  0.5,  0.5],
+                        [ 0.5,  0.5,  0.5],
+                        [ 0.5,  0.5, -0.5],
+                        [-0.5,  0.5, -0.5],
+                        [0.0, 1.0, 0.0],
+                    );
+                    // Bottom face (y = -0.5)
+                    add_face(
+                        [-0.5, -0.5, -0.5],
+                        [ 0.5, -0.5, -0.5],
+                        [ 0.5, -0.5,  0.5],
+                        [-0.5, -0.5,  0.5],
+                        [0.0, -1.0, 0.0],
+                    );
+                    
+                    (vertices, indices)
+                }
+            };
+            
+            let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("Mesh Vertex Buffer {:?}", geom)),
+                size: (vertices.len() * std::mem::size_of::<Vertex>()) as u64,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+
+            let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("Mesh Index Buffer {:?}", geom)),
+                size: (indices.len() * std::mem::size_of::<u32>()) as u64,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            queue.write_buffer(&index_buffer, 0, bytemuck::cast_slice(&indices));
+            let index_count = indices.len() as u32;
+            
+            mesh_registry.insert(geom, MeshBuffers {
+                vertex_buffer,
+                index_buffer,
+                index_count,
+            });
         }
-
-        let grid_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Grid Vertex Buffer"),
-            size: (vertices.len() * std::mem::size_of::<Vertex>()) as u64,
-            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        queue.write_buffer(&grid_vertex_buffer, 0, bytemuck::cast_slice(&vertices));
-
-        let grid_index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("Grid Index Buffer"),
-            size: (indices.len() * std::mem::size_of::<u32>()) as u64,
-            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-        queue.write_buffer(&grid_index_buffer, 0, bytemuck::cast_slice(&indices));
-        let grid_index_count = indices.len() as u32;
 
         let camera_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Camera Uniforms"),
@@ -1610,12 +1861,11 @@ impl<'a> VulkanEngine<'a> {
             video_pipeline,
             video_state: None,
             clear_black_pipeline,
+            crt_background_pipeline,
             
             camera_uniform_buffer,
             camera_bind_group,
-            grid_vertex_buffer,
-            grid_index_buffer,
-            grid_index_count,
+            mesh_registry,
             lamp_vertex_buffer,
             lamp_index_buffer,
             lamp_index_count,
@@ -3696,21 +3946,28 @@ impl<'a> VulkanEngine<'a> {
             if vis_def.id == 11 {
                 render_pass.set_pipeline(&self.clear_black_pipeline);
                 render_pass.draw(0..3, 0..1);
+            } else if vis_def.id == 17 {
+                render_pass.set_pipeline(&self.crt_background_pipeline);
+                render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
+                render_pass.draw(0..3, 0..1);
             }
             
             render_pass.set_pipeline(&self.render_pipelines[mode_idx]);
             render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
             render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
             
-            match vis_def.pipeline_type {
+            match &vis_def.pipeline_type {
                 crate::state::PipelineType::FullscreenQuad => {
                     render_pass.draw(0..3, 0..1);
                 },
-                crate::state::PipelineType::Mesh3D(_) => {
+                crate::state::PipelineType::Mesh3D { geometry, instances } => {
                     render_pass.set_bind_group(2, &self.camera_bind_group, &[]);
-                    render_pass.set_vertex_buffer(0, self.grid_vertex_buffer.slice(..));
-                    render_pass.set_index_buffer(self.grid_index_buffer.slice(..), wgpu::IndexFormat::Uint32);
-                    render_pass.draw_indexed(0..self.grid_index_count, 0, 0..1);
+                    if let Some(mesh) = self.mesh_registry.get(geometry) {
+                        render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                        render_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                        render_pass.draw_indexed(0..mesh.index_count, 0, 0..*instances);
+                    }
                     
                     if vis_def.id == 12 {
                         render_pass.set_pipeline(&self.lamp_pipeline);
