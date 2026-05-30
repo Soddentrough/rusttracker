@@ -45,6 +45,9 @@ struct Args {
     vis: Option<String>,
 
     #[arg(long, default_value_t = false)]
+    list_vis: bool,
+
+    #[arg(long, default_value_t = false)]
     gpu_fft: bool,
 
     #[arg(long)]
@@ -94,6 +97,20 @@ fn main() -> Result<(), Box<dyn Error>> {
     }));
 
     let args = Args::parse();
+    if args.list_vis {
+        println!("{:<4} {:<24} {:<28} {}", "ID", "Short Name", "Name", "Description");
+        println!("{}", "-".repeat(90));
+        for v in crate::state::VISUALIZERS {
+            let short_name = v.filename
+                .strip_prefix("vis_")
+                .unwrap_or(v.filename)
+                .strip_suffix(".wgsl")
+                .unwrap_or(v.filename);
+            println!("{:<4} {:<24} {:<28} {}", v.id, short_name, v.name, v.description);
+        }
+        return Ok(());
+    }
+
     let title = if args.mic {
         "Microphone Input".to_string()
     } else {
@@ -126,9 +143,23 @@ fn main() -> Result<(), Box<dyn Error>> {
         
         if let Some(vis) = &args.vis {
             let vis_lower = vis.to_lowercase();
-            if let Some(idx) = crate::state::VISUALIZERS.iter().position(|v| v.filename.to_lowercase().contains(&vis_lower) || v.name.to_lowercase().contains(&vis_lower)) {
+            let matched_idx = crate::state::VISUALIZERS.iter().position(|v| {
+                let short_name = v.filename
+                    .strip_prefix("vis_")
+                    .unwrap_or(v.filename)
+                    .strip_suffix(".wgsl")
+                    .unwrap_or(v.filename)
+                    .to_lowercase();
+                v.id.to_string() == vis_lower
+                    || v.name.to_lowercase() == vis_lower
+                    || short_name == vis_lower
+            });
+
+            if let Some(idx) = matched_idx {
                 state.current_visualizer_idx = idx;
                 state.visualizer_mode = crate::state::VISUALIZERS[idx].id;
+            } else {
+                eprintln!("Warning: Visualizer '{}' not found. Launching with default visualizer.", vis);
             }
         }
     }

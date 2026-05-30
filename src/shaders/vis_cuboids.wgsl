@@ -18,8 +18,9 @@ struct VertexInput {
 struct VertexOutput3D {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) local_pos: vec3<f32>,
-    @location(1) ndc: vec2<f32>,
+    @location(1) @interpolate(linear) ndc: vec2<f32>,
     @location(2) amp: f32,
+    @location(3) depth: f32,
 }
 
 @vertex
@@ -53,9 +54,9 @@ fn vs_main_3d(in: VertexInput, @builtin(instance_index) inst_idx: u32) -> Vertex
     
     let y_center = select(-1.4 + shift, 4.4 - shift, is_top);
     
-    // Scale unit box to match raymarching size b = (0.22, 0.85, 0.22)
+    // Scale unit box to match spacing exactly (eliminating gaps)
     // UnitBox is [-0.5, 0.5]
-    let scaled = in.position * vec3<f32>(0.44, 1.7, 0.44);
+    let scaled = in.position * vec3<f32>(x_spacing, 1.7, x_spacing);
     let world_pos = scaled + vec3<f32>(world_x, y_center, world_z);
     
     // Store local position for face edge detection
@@ -65,12 +66,28 @@ fn vs_main_3d(in: VertexInput, @builtin(instance_index) inst_idx: u32) -> Vertex
     // Project position
     var clip_pos = camera.proj_matrix * camera.view_matrix * vec4<f32>(world_pos, 1.0);
     
-    // Apply barrel distortion in clip space (NDC)
-    let ndc = clip_pos.xy / clip_pos.w;
-    let r2 = dot(ndc, ndc);
-    let distorted_ndc = ndc * (1.0 + r2 * 0.055);
+    out.depth = clip_pos.w;
     
-    clip_pos = vec4<f32>(distorted_ndc * clip_pos.w, clip_pos.z, clip_pos.w);
+    // Project instance center to evaluate culling
+    let inst_center = vec3<f32>(world_x, y_center, world_z);
+    let center_clip = camera.proj_matrix * camera.view_matrix * vec4<f32>(inst_center, 1.0);
+    
+    var should_cull = center_clip.w < 1.0;
+    if (!should_cull) {
+        let center_ndc = center_clip.xy / center_clip.w;
+        should_cull = abs(center_ndc.x) > 2.2 || abs(center_ndc.y) > 2.2;
+    }
+    
+    var distorted_ndc = vec2<f32>(0.0);
+    if (should_cull) {
+        clip_pos = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    } else {
+        // Apply barrel distortion in clip space (NDC)
+        let ndc = clamp(clip_pos.xy / clip_pos.w, vec2<f32>(-2.0), vec2<f32>(2.0));
+        let r2 = min(2.0, dot(ndc, ndc));
+        distorted_ndc = ndc * (1.0 + r2 * 0.055);
+        clip_pos = vec4<f32>(distorted_ndc * clip_pos.w, clip_pos.z, clip_pos.w);
+    }
     
     out.clip_position = clip_pos;
     out.ndc = distorted_ndc;
@@ -95,65 +112,64 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     let bezel_mask = smoothstep(0.0, 0.03, border_dist);
     
     // 2. Wireframe / Edge Detection on the Box Face
-    let box_half = vec3<f32>(0.22, 0.85, 0.22);
+    let box_half = vec3<f32>(0.675, 0.85, 0.675);
     let d = box_half - abs(in.local_pos);
     
-    // Find the second smallest element of d (distance to nearest edge on this face)
-    let dist_to_edge = min(max(d.x, d.y), max(min(d.x, d.y), d.z));
+    // Compute distance to nearest edge in pixels using screen-space derivatives
+    let fw = fwidth(in.local_pos);
+    var dist_pixels = vec3<f32>(1e6, 1e6, 1e6);
+    if (fw.x > 1e-5) { dist_pixels.x = d.x / fw.x; }
+    if (fw.y > 1e-5) { dist_pixels.y = d.y / fw.y; }
+    if (fw.z > 1e-5) { dist_pixels.z = d.z / fw.z; }
+    let pixel_dist = min(min(dist_pixels.x, dist_pixels.y), dist_pixels.z);
     
-    let thick = 0.009 + clamp(in.amp / 100.0, 0.0, 1.0) * 0.007;
-    // Wide glow boundary for rich visual aesthetics
-    let glow_width = 0.09 + clamp(in.amp / 100.0, 0.0, 1.0) * 0.04;
+    // 3. Core and bloom/glow calculations (reacting to audio amplitude)
+    let amp_factor = 1.0 + clamp(in.amp / 30.0, 0.0, 3.0);
     
-    if (dist_to_edge > glow_width) {
-        discard;
-    }
+    let line_width = 1.5; // 1.5 pixels wide core
+    let core_glow = smoothstep(line_width + 1.0, line_width - 1.0, pixel_dist);
     
-    // 3. Color & Alpha calculation
+    // Exponential bloom/glow falloffs
+    let bloom_glow = exp(-pixel_dist * 0.15) * amp_factor; // neon green glow
+    let wide_bloom = exp(-pixel_dist * 0.05) * 0.4 * amp_factor; // wide faint bloom
+    
+    // 4. Color calculation: Emissive bright core -> neon green glow -> deep solid green base fill
     let bass = clamp(audio.spectrum[0].x + audio.spectrum[1].x + audio.spectrum[2].x, 0.0, 1.0);
     
-    let base_green = vec3<f32>(0.02, 1.0, 0.38);
-    let neon_green = mix(base_green, vec3<f32>(1.0, 1.0, 1.0), clamp(bass * 0.45, 0.0, 1.0));
+    let core_col = vec3<f32>(0.8, 1.0, 0.9); // bright green-white core
+    let neon_green = vec3<f32>(0.0, 1.0, 0.4); // vibrant neon green
+    let deep_green = vec3<f32>(0.0, 0.08, 0.03); // deep solid green base fill
     
-    var final_color = vec3<f32>(0.0);
-    var alpha = 0.0;
+    let base_fill = deep_green * (0.6 + 0.8 * bass);
     
-    if (dist_to_edge < thick) {
-        // Bright phosphor core
-        let core_intensity = 1.3 + clamp(in.amp / 100.0, 0.0, 1.0) * 0.7;
-        final_color = vec3<f32>(0.7, 1.0, 0.88) * core_intensity;
-        alpha = 1.0;
-    } else {
-        // Outer glow
-        let glow_factor = smoothstep(glow_width, thick, dist_to_edge);
-        let glow_intensity = 0.35 + clamp(bass * 0.35, 0.0, 0.6);
-        final_color = neon_green * glow_factor * glow_intensity;
-        alpha = 0.85 * glow_factor;
-    }
+    var final_color = base_fill + neon_green * (bloom_glow * 1.5 + wide_bloom * 0.8) + core_col * (core_glow * 2.0);
     
-    // 4. CRT Filter: Scanlines (applied to color & alpha so background shows through gaps)
+    // 5. Distance fade out (depth fog)
+    let depth = in.depth;
+    // Fade out to black between depth 8.0 and 32.0
+    let fade = clamp((32.0 - depth) / (32.0 - 8.0), 0.0, 1.0);
+    let fade_smooth = smoothstep(0.0, 1.0, fade);
+    final_color = final_color * fade_smooth;
+    
+    // 6. CRT Filter: Scanlines
     let scanline = 0.86 + 0.14 * cos(in.clip_position.y * 3.14159);
     final_color = final_color * scanline;
-    alpha = alpha * scanline;
     
-    // 5. CRT Filter: Flicker
+    // 7. CRT Filter: Flicker
     let flicker = 0.98 + 0.02 * sin(audio.time * 115.0);
     final_color = final_color * flicker;
-    alpha = alpha * flicker;
     
-    // 6. CRT Filter: Analog static noise
+    // 8. CRT Filter: Analog static noise
     let noise_val = hash21(in.clip_position.xy + fract(audio.smooth_time) * 149.0);
     let static_noise = noise_val * 0.022 * bezel_mask;
     final_color = final_color + vec3<f32>(static_noise);
-    alpha = clamp(alpha + static_noise * 0.5, 0.0, 1.0);
     
     // Apply bezel mask
     final_color = final_color * bezel_mask;
-    alpha = alpha * bezel_mask;
     
-    // 7. Fitted ACES Tonemap
+    // 9. Fitted ACES Tonemap
     var final_col = (final_color * (2.51 * final_color + 0.03)) / (final_color * (2.43 * final_color + 0.59) + 0.14);
     final_col = max(final_col, vec3<f32>(0.0));
     
-    return vec4<f32>(final_col, alpha);
+    return vec4<f32>(final_col, 1.0);
 }

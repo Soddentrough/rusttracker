@@ -34,6 +34,9 @@ jobs:
     - name: Build RustTracker
       env:
         BINDGEN_EXTRA_CLANG_ARGS: "-target x86_64-pc-windows-gnu"
+        CARGO_PROFILE_RELEASE_LTO: "true"
+        CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
+        CARGO_PROFILE_RELEASE_STRIP: "true"
       run: |
         cargo build --release
         

@@ -773,12 +773,6 @@ impl<'a> VulkanEngine<'a> {
                 ),
             };
             
-            let blend_state = if vis_def.id == 17 {
-                Some(wgpu::BlendState::ALPHA_BLENDING)
-            } else {
-                Some(wgpu::BlendState::REPLACE)
-            };
-
             let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(&format!("Render Pipeline {}", i)),
                 layout: Some(layout),
@@ -793,7 +787,7 @@ impl<'a> VulkanEngine<'a> {
                     entry_point: Some("fs_main"),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: config.format,
-                        blend: blend_state,
+                        blend: Some(wgpu::BlendState::REPLACE),
                         write_mask: wgpu::ColorWrites::ALL,
                     })],
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
@@ -801,7 +795,7 @@ impl<'a> VulkanEngine<'a> {
                 primitive,
                 depth_stencil: Some(wgpu::DepthStencilState {
                     format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: Some(vis_def.id != 17),
+                    depth_write_enabled: Some(true),
                     depth_compare: Some(wgpu::CompareFunction::LessEqual),
                     stencil: wgpu::StencilState::default(),
                     bias: wgpu::DepthBiasState::default(),
@@ -1093,17 +1087,12 @@ impl<'a> VulkanEngine<'a> {
 
             @group(0) @binding(0) var<uniform> audio: AudioUniforms;
 
-            struct VertexOutput {
-                @builtin(position) clip_position: vec4<f32>,
-                @location(0) uv: vec2<f32>,
-            };
-
             @vertex
-            fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
+            fn vs_background(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
                 var out: VertexOutput;
                 let u = f32((in_vertex_index << 1u) & 2u);
                 let v = f32(in_vertex_index & 2u);
-                out.clip_position = vec4<f32>(u * 2.0 - 1.0, -(v * 2.0 - 1.0), 0.0, 1.0);
+                out.clip_position = vec4<f32>(u * 2.0 - 1.0, -(v * 2.0 - 1.0), 1.0, 1.0);
                 out.uv = vec2<f32>(u, v);
                 return out;
             }
@@ -1202,7 +1191,7 @@ impl<'a> VulkanEngine<'a> {
             layout: Some(&render_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &crt_background_shader,
-                entry_point: Some("vs_main"),
+                entry_point: Some("vs_background"),
                 buffers: &[],
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
             },

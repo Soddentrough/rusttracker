@@ -22,6 +22,9 @@ jobs:
           CPATH: /opt/homebrew/include
           PKG_CONFIG_PATH: /opt/homebrew/lib/pkgconfig:/opt/homebrew/share/pkgconfig
           BINDGEN_EXTRA_CLANG_ARGS: "-I/opt/homebrew/include"
+          CARGO_PROFILE_RELEASE_LTO: "true"
+          CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
+          CARGO_PROFILE_RELEASE_STRIP: "true"
         run: cargo build --release
         
       - name: Package Application
