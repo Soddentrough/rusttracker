@@ -154,13 +154,19 @@ fn setup_flares() {
 }
 
 fn map(p: vec3<f32>, full_detail: bool) -> f32 {
+    let r = length(p);
+    // Bounding sphere check: sun + flares are contained within a radius of 5.85
+    if r > 6.0 {
+        return r - 5.85;
+    }
+
     let t_rot = audio.time * 0.02;
     let s = sin(t_rot);
     let c = cos(t_rot);
     let rot_p = vec3<f32>(p.x * c - p.z * s, p.y, p.x * s + p.z * c);
 
     // Fine-grained Plasma displacement (only when full_detail)
-    var d_sphere = length(p) - BASE_RADIUS;
+    var d_sphere = r - BASE_RADIUS;
     if full_detail && d_sphere < 0.2 {
         let surface_noise = fbm(rot_p * 8.0 + vec3<f32>(audio.time * 0.1, 0.0, 0.0)) * 0.05;
         d_sphere -= surface_noise;
@@ -171,6 +177,7 @@ fn map(p: vec3<f32>, full_detail: bool) -> f32 {
     
     return smin(d_sphere, flare_d, 0.04);
 }
+
 
 fn calcNormal(p: vec3<f32>) -> vec3<f32> {
     let h = NORMAL_EPS;

@@ -51,32 +51,31 @@ fn get_density(p: vec2<f32>) -> f32 {
     let fx = fract(px);
     let fz = fract(pz);
     
-    var w_x: array<f32, 5>;
-    for (var i = 0; i < 5; i++) {
-        let dx = f32(i - 2) - fx;
-        w_x[i] = exp(-dx * dx * 0.12);
+    var w_x: array<f32, 3>;
+    for (var i = 0; i < 3; i++) {
+        let dx = f32(i - 1) - fx;
+        w_x[i] = exp(-dx * dx * 0.2);
     }
     
-    var w_z: array<f32, 5>;
-    for (var j = 0; j < 5; j++) {
-        let dz = f32(j - 2) - fz;
-        w_z[j] = exp(-dz * dz * 0.12);
+    var w_z: array<f32, 3>;
+    for (var j = 0; j < 3; j++) {
+        let dz = f32(j - 1) - fz;
+        w_z[j] = exp(-dz * dz * 0.2);
     }
     
     var sum = 0.0;
     var w_sum = 0.0;
     
-    // 5×5 Gaussian kernel at stride 1 — no aliasing artifacts
-    // Wide sigma blends the 5×5 compute splat into smooth, continuous mounds
-    for (var i = -2; i <= 2; i++) {
+    // 3×3 Gaussian kernel at stride 1 — optimized for speed
+    for (var i = -1; i <= 1; i++) {
         let cx = ix + i;
-        let wx = w_x[i + 2];
-        for (var j = -2; j <= 2; j++) {
+        let wx = w_x[i + 1];
+        for (var j = -1; j <= 1; j++) {
             let cx_coord = cx;
             let cz = iz + j;
             let val = get_density_raw(cx_coord, cz);
             
-            let w = wx * w_z[j + 2];
+            let w = wx * w_z[j + 1];
             sum += val * w;
             w_sum += w;
         }
@@ -87,6 +86,7 @@ fn get_density(p: vec2<f32>) -> f32 {
     let h = log(1.0 + raw_density * DENSITY_SCALE) * HEIGHT_SCALE;
     // Smoothstep near the cap to round off spike tips
     return min(h, MAX_HEIGHT) * smoothstep(MAX_HEIGHT + 0.5, MAX_HEIGHT - 0.3, h);
+
 }
 
 fn map(p: vec3<f32>) -> f32 {

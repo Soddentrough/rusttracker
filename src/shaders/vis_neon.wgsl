@@ -102,8 +102,9 @@ fn map_scene(p: vec3<f32>) -> vec2<f32> {
     var best_mat = 0.0;
     if (d_room == d_floor) { best_mat = -1.0; }
 
-    // Test all active frames
-    for (var i = 0u; i < g_num_frames; i++) {
+    // Test all active frames (unrolled loop)
+    for (var i = 0u; i < 5u; i++) {
+        if i >= g_num_frames { break; }
         let d_f = sdFrame(p - g_frame_pos[i], g_frame_w, FRAME_HALF_HEIGHT, FRAME_THICKNESS);
         g_frame_dist[i] = d_f;
         if (d_f < best_d) {
@@ -293,8 +294,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let res = map_scene(p_hit);
         let d = res.x;
 
-        // Accumulate bloom from all neon frames (smooth, no Voronoi seams)
-        for (var f = 0u; f < g_num_frames; f++) {
+        // Accumulate bloom from all neon frames (unrolled)
+        for (var f = 0u; f < 5u; f++) {
+            if f >= g_num_frames { break; }
             let d_f = g_frame_dist[f];
             neon_glow += g_frame_light[f] * 0.03 / (1.0 + d_f * d_f * 20.0);
         }
@@ -311,9 +313,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 // Hit room geometry (floor or wall/ceiling)
                 let n = calc_normal(p_hit);
 
-                // Accumulate diffuse lighting from all frames
+                // Accumulate diffuse lighting from all frames (unrolled)
                 var room_light = vec3<f32>(0.002);
-                for (var f = 0u; f < g_num_frames; f++) {
+                for (var f = 0u; f < 5u; f++) {
+                    if f >= g_num_frames { break; }
                     let dir = g_frame_pos[f] - p_hit;
                     let dist = length(dir);
                     let diff = max(dot(n, dir/dist), 0.0) / (dist * dist * 1.5 + 1.0);
@@ -342,14 +345,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                     var rt = 0.05;
 
                     // Track minimum distance to each frame for smooth reflection bleed
-                    var min_d: array<f32, 5>;
-                    for (var f = 0u; f < g_num_frames; f++) { min_d[f] = 100.0; }
+                    var min_d = array<f32, 5>(100.0, 100.0, 100.0, 100.0, 100.0);
 
                     for(var j=0; j<15; j++) {
                         let rp = p_hit + r_rd_b * rt;
                         var d_min_all = 100.0;
 
-                        for (var f = 0u; f < g_num_frames; f++) {
+                        for (var f = 0u; f < 5u; f++) {
+                            if f >= g_num_frames { break; }
                             let d_f = sdFrame(rp - g_frame_pos[f], g_frame_w, FRAME_HALF_HEIGHT, FRAME_THICKNESS);
                             min_d[f] = min(min_d[f], d_f);
                             d_min_all = min(d_min_all, d_f);
@@ -360,8 +363,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                         if (rt > 12.0 || rp.y > 4.0) { break; }
                     }
 
-                    // Smooth glowing reflection bleed from each frame
-                    for (var f = 0u; f < g_num_frames; f++) {
+                    // Smooth glowing reflection bleed from each frame (unrolled)
+                    for (var f = 0u; f < 5u; f++) {
+                        if f >= g_num_frames { break; }
                         ref_col += g_frame_light[f] * 0.8 / (1.0 + min_d[f] * min_d[f] * 15.0);
                         if (min_d[f] < 0.01) {
                             ref_col += vec3<f32>(2.0) + g_frame_light[f];
@@ -384,9 +388,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         if (smoke_bounding < 0.0 && T > 0.01) {
             let dens = get_smoke_density(p_hit, audio.time, act);
             if (dens > 0.0) {
-                // Accumulate lighting from all frames
+                // Accumulate lighting from all frames (unrolled)
                 var smoke_light = vec3<f32>(0.0);
-                for (var f = 0u; f < g_num_frames; f++) {
+                for (var f = 0u; f < 5u; f++) {
+                    if f >= g_num_frames { break; }
                     let d_l = length(p_hit - g_frame_pos[f]);
                     smoke_light += g_frame_light[f] * exp(-d_l * 0.7);
                 }

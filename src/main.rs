@@ -205,6 +205,13 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
         let mut state = app_state.lock().unwrap();
         state.gpu_fft = true;
     }
+    if let Some(bf) = bench {
+        unsafe {
+            std::env::set_var("BENCH_FRAMES", bf.to_string());
+        }
+    }
+
+
 
     let event_loop = EventLoop::new().unwrap();
     

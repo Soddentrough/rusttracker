@@ -4075,7 +4075,13 @@ impl<'a> VulkanEngine<'a> {
             }
         }
 
-        let do_capture = std::env::var("CAPTURE_FRAME").is_ok() && self.frame_count >= 180;
+        let capture_frame = if let Ok(bf_str) = std::env::var("BENCH_FRAMES") {
+            bf_str.parse::<u32>().unwrap_or(180).saturating_sub(1)
+        } else {
+            180
+        };
+        let do_capture = std::env::var("CAPTURE_FRAME").is_ok() && self.frame_count == capture_frame;
+
         let mut readback_buffer = None;
         if do_capture {
             let bpr = (self.config.width * 4 + 255) & !255;
@@ -4130,9 +4136,13 @@ impl<'a> VulkanEngine<'a> {
                         img.put_pixel(x, y, image::Rgba([r, g, b, 255])); // Ignore A to force fully opaque screenshot
                     }
                 }
-                img.save("screenshot.png").unwrap();
+                let capture_path = std::env::var("CAPTURE_PATH").unwrap_or_else(|_| "screenshot.png".to_string());
+                img.save(&capture_path).unwrap();
+                println!("Screenshot saved to {}", capture_path);
             }
-            std::process::exit(0);
+            if std::env::var("BENCH_FRAMES").is_err() {
+                std::process::exit(0);
+            }
         }
         
         surface_texture.present();

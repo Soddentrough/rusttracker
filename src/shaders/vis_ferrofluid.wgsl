@@ -111,7 +111,8 @@ fn map_dist(p: vec3<f32>) -> f32 {
     // Normalized xz for angle alignment
     let p_xz_norm = p.xz / max(dist_xz, 0.0001);
 
-    for (var i = 0u; i < num_ch; i++) {
+    for (var i = 0u; i < 12u; i++) {
+        if i >= num_ch { break; }
         let vu = clamp(get_vu(i), 0.0, 1.0);
 
         var alignment = 1.0;
@@ -147,10 +148,15 @@ fn map_dist(p: vec3<f32>) -> f32 {
     let ripple = sin(dist_xz * 12.0 - audio.time * 8.0) * 0.015 * bass * smoothstep(PUDDLE_RADIUS, 0.0, dist_xz);
 
     // Organic surface perturbation (smooth magnetic domain noise)
-    let noise_p = p * 4.0 + vec3<f32>(audio.time * 0.5, 0.0, audio.time * 0.3);
-    let surface_noise = (hash3_smooth(noise_p) - 0.5) * 0.05;
+    var surface_noise = 0.0;
+    let d_base = p.y + 0.5 - (total_displacement + ripple);
+    if abs(d_base) < 0.2 {
+        let noise_p = p * 4.0 + vec3<f32>(audio.time * 0.5, 0.0, audio.time * 0.3);
+        surface_noise = (hash3_smooth(noise_p) - 0.5) * 0.05;
+    }
 
     fluid_h += total_displacement + ripple + surface_noise;
+
 
     let d = p.y + 0.5 - fluid_h;
 
@@ -179,7 +185,8 @@ fn map(p: vec3<f32>) -> MapData {
     let p_xz_norm = p.xz / max(dist_xz, 0.0001);
     var glow = vec3<f32>(0.0);
 
-    for (var i = 0u; i < num_ch; i++) {
+    for (var i = 0u; i < 12u; i++) {
+        if i >= num_ch { break; }
         let vu = clamp(get_vu(i), 0.0, 1.0);
 
         var alignment = 1.0;
@@ -220,8 +227,12 @@ fn map(p: vec3<f32>) -> MapData {
     let ripple = sin(dist_xz * 12.0 - audio.time * 8.0) * 0.015 * bass * smoothstep(PUDDLE_RADIUS, 0.0, dist_xz);
 
     // Organic surface perturbation (smooth magnetic domain noise)
-    let noise_p = p * 4.0 + vec3<f32>(audio.time * 0.5, 0.0, audio.time * 0.3);
-    let surface_noise = (hash3_smooth(noise_p) - 0.5) * 0.05;
+    var surface_noise = 0.0;
+    let d_base = p.y + 0.5 - (total_displacement + ripple);
+    if abs(d_base) < 0.2 {
+        let noise_p = p * 4.0 + vec3<f32>(audio.time * 0.5, 0.0, audio.time * 0.3);
+        surface_noise = (hash3_smooth(noise_p) - 0.5) * 0.05;
+    }
 
     fluid_h += total_displacement + ripple + surface_noise;
 
