@@ -2019,6 +2019,7 @@ where
     let mut last_current_row_string = String::new();
     let mut was_paused = false;
 
+    let shared_state_err = shared_state.clone();
     let stream = device.build_output_stream(
         config,
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
@@ -2135,7 +2136,12 @@ where
             
             let _ = tx.try_send(msg);
         },
-        |err| eprintln!("an error occurred on stream: {}", err),
+        move |err| {
+            eprintln!("an error occurred on stream: {}", err);
+            if let Ok(mut state) = shared_state_err.try_lock() {
+                state.audio_device_lost = true;
+            }
+        },
         None,
     )?;
 
@@ -2165,6 +2171,7 @@ where
     
     let mut was_paused = false;
 
+    let shared_state_err = shared_state.clone();
     let stream = device.build_input_stream(
         config,
         move |data: &[T], _: &cpal::InputCallbackInfo| {
@@ -2227,7 +2234,12 @@ where
             
             let _ = tx.try_send(msg);
         },
-        |err| eprintln!("an error occurred on input stream: {}", err),
+        move |err| {
+            eprintln!("an error occurred on input stream: {}", err);
+            if let Ok(mut state) = shared_state_err.try_lock() {
+                state.audio_device_lost = true;
+            }
+        },
         None,
     )?;
 

@@ -43,7 +43,10 @@ pub fn start_bitstream_thread(
     let pw_rate = if codec_name == "truehd" || codec_name == "dts" { 192000 } else { 48000 };
     println!("[bitstream] Codec: {}, Decoder Rate: {}, Output Rate: {}", codec_name, decoder_sample_rate, pw_rate);
 
-    let pipe_path = format!("/tmp/rusttracker_bitstream_{}", std::process::id());
+    let pipe_path = std::env::temp_dir()
+        .join(format!("rusttracker_bitstream_{}", std::process::id()))
+        .to_string_lossy()
+        .into_owned();
     let _ = std::fs::remove_file(&pipe_path);
     
     let mkfifo_out = std::process::Command::new("mkfifo")

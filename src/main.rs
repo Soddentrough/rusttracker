@@ -189,18 +189,18 @@ fn main() -> Result<(), Box<dyn Error>> {
         }));
 
         let mut tui = Tui::new()?;
-        if let Err(err) = run_tui(&mut tui.terminal, app_state, initial_stream) {
+        if let Err(err) = run_tui(&mut tui.terminal, app_state, initial_stream, args.mic) {
             eprintln!("App error: {:?}", err);
         }
     } else {
-        pollster::block_on(run_gui(app_state, initial_stream, args.fullscreen, args.gpu_fft, args.bench));
+        pollster::block_on(run_gui(app_state, initial_stream, args.fullscreen, args.gpu_fft, args.bench, args.mic));
     }
 
     Ok(())
 }
 
 #[allow(unused_variables, unused_assignments)]
-async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audio::PlaybackHandle>, is_fullscreen: bool, use_gpu_fft: bool, bench: Option<u32>) {
+async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audio::PlaybackHandle>, is_fullscreen: bool, use_gpu_fft: bool, bench: Option<u32>, is_mic_launch: bool) {
     if use_gpu_fft {
         let mut state = app_state.lock().unwrap();
         state.gpu_fft = true;
@@ -566,6 +566,23 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                     let load_path = {
                         let mut state = app_state.lock().unwrap();
                         
+                        if state.audio_device_lost {
+                            state.audio_device_lost = false;
+                            let reload_path = if is_mic_launch {
+                                "".to_string()
+                            } else if state.playlist_index < state.playlist.len() {
+                                state.playlist[state.playlist_index].clone()
+                            } else {
+                                state.song_title.clone()
+                            };
+                            
+                            if !reload_path.is_empty() || is_mic_launch {
+                                state.load_request = Some(reload_path);
+                                state.osd_text = Some("Audio Device Reconnected".to_string());
+                                state.osd_timer = 3.0;
+                            }
+                        }
+                        
                         if state.track_ended {
                             state.track_ended = false;
                             if state.load_request.is_none() {
@@ -580,8 +597,9 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                     };
                     
                     if let Some(path) = load_path {
+                        let is_mic = is_mic_launch && path.is_empty();
                         // Check if the path exists first!
-                        let path_exists = if path.starts_with("http") {
+                        let path_exists = if path.starts_with("http") || is_mic {
                             true
                         } else {
                             std::path::Path::new(&path).exists()
@@ -621,10 +639,16 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                             
                             // We rely entirely on DSP thread messages to update tracker string state
                             let mut loaded_stream = None;
+                            let mut last_err = None;
                             for _ in 0..5 {
-                                if let Ok(stream) = audio::start_audio_thread(&path, false, Arc::clone(&app_state)) {
-                                    loaded_stream = Some(stream);
-                                    break;
+                                match audio::start_audio_thread(&path, is_mic, Arc::clone(&app_state)) {
+                                    Ok(stream) => {
+                                        loaded_stream = Some(stream);
+                                        break;
+                                    }
+                                    Err(e) => {
+                                        last_err = Some(e);
+                                    }
                                 }
                                 std::thread::sleep(std::time::Duration::from_millis(50));
                             }
@@ -632,20 +656,27 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                             if let Some(stream) = loaded_stream {
                                 let mut state = app_state.lock().unwrap();
                                 state.file_loaded = true;
-                                state.song_title = path.clone();
+                                state.song_title = if is_mic { "Microphone Input".to_string() } else { path.clone() };
                                 state.track_ended = false;
                                 active_stream = Some(stream);
                             } else {
                                 let mut state = app_state.lock().unwrap();
-                                state.osd_text = Some(format!("Load Failed: {}", std::path::Path::new(&path).file_name().unwrap_or_default().to_string_lossy()));
-                                state.osd_timer = 3.0;
+                                let err_msg = last_err.map(|e| format!("{:?}", e)).unwrap_or_else(|| "Unknown error".to_string());
+                                let file_name = if is_mic { "Microphone".to_string() } else { std::path::Path::new(&path).file_name().unwrap_or_default().to_string_lossy().into_owned() };
+                                state.osd_text = Some(format!("Load Failed: {}\n{}", file_name, err_msg));
+                                state.osd_timer = 5.0;
                                 
-                                state.playlist_index += 1;
-                                if state.playlist_index < state.playlist.len() {
-                                    state.load_request = Some(state.playlist[state.playlist_index].clone());
+                                if !is_mic {
+                                    state.playlist_index += 1;
+                                    if state.playlist_index < state.playlist.len() {
+                                        state.load_request = Some(state.playlist[state.playlist_index].clone());
+                                    } else {
+                                        state.file_loaded = false;
+                                        state.artist = "Load Failed".to_string();
+                                    }
                                 } else {
                                     state.file_loaded = false;
-                                    state.artist = "Load Failed".to_string();
+                                    state.artist = "Mic Failed".to_string();
                                 }
                             }
                         }
@@ -1374,6 +1405,7 @@ fn run_tui<B: Backend>(
     terminal: &mut Terminal<B>,
     app_state: Arc<Mutex<AppState>>,
     mut active_stream: Option<audio::PlaybackHandle>,
+    is_mic_launch: bool,
 ) -> io::Result<()> 
 where std::io::Error: From<<B as Backend>::Error>
 {
@@ -1390,6 +1422,23 @@ where std::io::Error: From<<B as Backend>::Error>
         let load_path = {
             let mut state = app_state.lock().unwrap();
             
+            if state.audio_device_lost {
+                state.audio_device_lost = false;
+                let reload_path = if is_mic_launch {
+                    "".to_string()
+                } else if state.playlist_index < state.playlist.len() {
+                    state.playlist[state.playlist_index].clone()
+                } else {
+                    state.song_title.clone()
+                };
+                
+                if !reload_path.is_empty() || is_mic_launch {
+                    state.load_request = Some(reload_path);
+                    state.osd_text = Some("Audio Device Reconnected".to_string());
+                    state.osd_timer = 3.0;
+                }
+            }
+            
             if state.track_ended {
                 state.track_ended = false;
                 if state.load_request.is_none() {
@@ -1404,8 +1453,9 @@ where std::io::Error: From<<B as Backend>::Error>
         };
         
         if let Some(path) = load_path {
+            let is_mic = is_mic_launch && path.is_empty();
             // Check if the path exists first!
-            let path_exists = if path.starts_with("http") {
+            let path_exists = if path.starts_with("http") || is_mic {
                 true
             } else {
                 std::path::Path::new(&path).exists()
@@ -1432,10 +1482,16 @@ where std::io::Error: From<<B as Backend>::Error>
                 active_stream = None; // DROP OLD STREAM FIRST
                 
                 let mut loaded_stream = None;
+                let mut last_err = None;
                 for _ in 0..5 {
-                    if let Ok(stream) = audio::start_audio_thread(&path, false, Arc::clone(&app_state)) {
-                        loaded_stream = Some(stream);
-                        break;
+                    match audio::start_audio_thread(&path, is_mic, Arc::clone(&app_state)) {
+                        Ok(stream) => {
+                            loaded_stream = Some(stream);
+                            break;
+                        }
+                        Err(e) => {
+                            last_err = Some(e);
+                        }
                     }
                     std::thread::sleep(std::time::Duration::from_millis(50));
                 }
@@ -1443,17 +1499,27 @@ where std::io::Error: From<<B as Backend>::Error>
                 if let Some(stream) = loaded_stream {
                     let mut state = app_state.lock().unwrap();
                     state.file_loaded = true;
-                    state.song_title = path.clone();
+                    state.song_title = if is_mic { "Microphone Input".to_string() } else { path.clone() };
                     state.track_ended = false;
                     active_stream = Some(stream);
                 } else {
                     let mut state = app_state.lock().unwrap();
-                    state.playlist_index += 1;
-                    if state.playlist_index < state.playlist.len() {
-                        state.load_request = Some(state.playlist[state.playlist_index].clone());
+                    let err_msg = last_err.map(|e| format!("{:?}", e)).unwrap_or_else(|| "Unknown error".to_string());
+                    let file_name = if is_mic { "Microphone".to_string() } else { std::path::Path::new(&path).file_name().unwrap_or_default().to_string_lossy().into_owned() };
+                    state.osd_text = Some(format!("Load Failed: {}\n{}", file_name, err_msg));
+                    state.osd_timer = 5.0;
+                    
+                    if !is_mic {
+                        state.playlist_index += 1;
+                        if state.playlist_index < state.playlist.len() {
+                            state.load_request = Some(state.playlist[state.playlist_index].clone());
+                        } else {
+                            state.file_loaded = false;
+                            state.artist = format!("Load Failed: {}", err_msg);
+                        }
                     } else {
                         state.file_loaded = false;
-                        state.artist = "Load Failed".to_string();
+                        state.artist = format!("Mic Failed: {}", err_msg);
                     }
                 }
             }

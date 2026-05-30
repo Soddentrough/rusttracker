@@ -412,8 +412,7 @@ impl<'a> VulkanEngine<'a> {
         ).await.unwrap();
 
         device.on_uncaptured_error(std::sync::Arc::new(|e: wgpu::Error| {
-            println!("WGPU VALIDATION ERROR: {:?}", e);
-            std::process::exit(1);
+            eprintln!("WGPU VALIDATION ERROR: {:?}", e);
         }));
 
         let surface_caps = surface.get_capabilities(&adapter);
