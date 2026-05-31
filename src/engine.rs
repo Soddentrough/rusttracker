@@ -281,6 +281,8 @@ pub struct VulkanEngine<'a> {
     last_history_cam_z: f64,
     smooth_time: f64,
     smooth_dt: f64,
+    vu_needle_angles: Vec<f32>,
+    vu_needle_velocities: Vec<f32>,
 }
 
 pub(crate) fn generate_lamp_mesh() -> (Vec<Vertex>, Vec<u32>) {
@@ -671,6 +673,7 @@ impl<'a> VulkanEngine<'a> {
                 15 => include_str!("shaders/vis_3drain.wgsl"),
                 16 => include_str!("shaders/vis_synthwaveracer.wgsl"),
                 17 => include_str!("shaders/vis_cuboids.wgsl"),
+                18 => include_str!("shaders/vis_vumeters.wgsl"),
                 _ => include_str!("shaders/vis_spectrum.wgsl"),
             }
         };
@@ -1862,6 +1865,8 @@ impl<'a> VulkanEngine<'a> {
             last_history_cam_z: 0.0f64,
             smooth_time: 0.0f64,
             smooth_dt: 1.0f64 / 60.0f64,
+            vu_needle_angles: vec![0.0; 32],
+            vu_needle_velocities: vec![0.0; 32],
         }
     }
 
@@ -1935,7 +1940,51 @@ impl<'a> VulkanEngine<'a> {
 
         uniforms.spectrum.copy_from_slice(&state.spectrum_data);
         uniforms.fire_heat.copy_from_slice(&state.fire_heat);
-        
+
+        // Update needle physics for 3D retro VU meters
+        let ch_count = state.channel_vus.len().max(2);
+        if self.vu_needle_angles.len() < ch_count {
+            self.vu_needle_angles.resize(ch_count, 0.0);
+            self.vu_needle_velocities.resize(ch_count, 0.0);
+        }
+
+        let rise_time_secs = 0.30;
+        let damping_ratio = 0.85;
+        let omega_n = 4.8 / rise_time_secs;
+        let spring = omega_n * omega_n;
+        let damping = 2.0 * damping_ratio * omega_n;
+
+        let dt_clamped = dt.min(0.05);
+        for i in 0..ch_count {
+            let target = if i < state.raw_channel_vus.len() {
+                state.raw_channel_vus[i]
+            } else if !state.file_loaded {
+                // Sway gently if no file is loaded
+                let t = self.smooth_time as f32;
+                let offset = if i == 0 { 0.0 } else { 1.5 };
+                (0.12 * (t * 2.0 + offset).sin() + 0.15 * (t * 3.7 - offset).cos() + 0.2).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let angle = self.vu_needle_angles[i];
+            let vel = self.vu_needle_velocities[i];
+
+            let acceleration = spring * (target - angle) - damping * vel;
+            let new_vel = vel + acceleration * dt_clamped;
+            let mut new_angle = angle + new_vel * dt_clamped;
+
+            if new_angle < -0.05 {
+                new_angle = -0.05;
+                self.vu_needle_velocities[i] = 0.0;
+            } else if new_angle > 1.1 {
+                new_angle = 1.1;
+                self.vu_needle_velocities[i] = -new_vel * 0.2; // pin bounce
+            } else {
+                self.vu_needle_velocities[i] = new_vel;
+            }
+            self.vu_needle_angles[i] = new_angle;
+        }
+
         let ch_len = state.channel_vus.len().min(32);
         
         // 1. Populate UI Display Channels (may be visually remapped)
@@ -1976,6 +2025,20 @@ impl<'a> VulkanEngine<'a> {
             }
         }
         
+        if state.visualizer_mode == 18 {
+            let actual_ch = state.channel_vus.len().max(2);
+            uniforms.num_channels = actual_ch as u32;
+            for i in 0..actual_ch {
+                if i < 32 {
+                    uniforms.channels[i] = if i < self.vu_needle_angles.len() {
+                        self.vu_needle_angles[i]
+                    } else {
+                        0.0
+                    };
+                }
+            }
+        }
+
         let vis_width = state.visual_width.max(128).min(2048) as u32;
         uniforms.waveform_resolution = vis_width;
         uniforms.waveform_history_size = state.waveform_history.len().min(144) as u32;
