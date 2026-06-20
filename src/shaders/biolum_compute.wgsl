@@ -129,7 +129,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 vel.y += bass * 4.0 * rnd_impulse.z;
                 vel.x += (rnd_impulse.x - 0.5) * bass * 2.0;
                 vel.z += (rnd_impulse.y - 0.5) * bass * 2.0;
-                energy = max(energy, bass * 2.0);
+                energy = clamp(max(energy, bass * 2.0), 0.0, 1.5);
             }
             
             // Glow when near wave crests due to high shear stress

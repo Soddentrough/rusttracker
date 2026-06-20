@@ -278,6 +278,7 @@ pub struct VulkanEngine<'a> {
     video_state: Option<VideoState>,
     clear_black_pipeline: wgpu::RenderPipeline,
     crt_background_pipeline: wgpu::RenderPipeline,
+    biolum_bg_pipeline: wgpu::RenderPipeline,
     
     // 3D Engine Extensions
     camera_uniform_buffer: wgpu::Buffer,
@@ -1110,6 +1111,67 @@ impl<'a> VulkanEngine<'a> {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &solid_black_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let solid_biolum_bg_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Solid Biolum BG Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(r#"
+                struct VertexOutput {
+                    @builtin(position) clip_position: vec4<f32>,
+                }
+                @vertex
+                fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
+                    var out: VertexOutput;
+                    let x = f32((in_vertex_index << 1u) & 2u) * 2.0 - 1.0;
+                    let y = f32(in_vertex_index & 2u) * 2.0 - 1.0;
+                    out.clip_position = vec4<f32>(x, y, 1.0, 1.0);
+                    return out;
+                }
+                @fragment
+                fn fs_main() -> @location(0) vec4<f32> {
+                    return vec4<f32>(0.001, 0.003, 0.008, 1.0);
+                }
+            "#)),
+        });
+
+        let biolum_bg_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Biolum BG Pipeline"),
+            layout: Some(&clear_black_layout),
+            vertex: wgpu::VertexState {
+                module: &solid_biolum_bg_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &solid_biolum_bg_shader,
                 entry_point: Some("fs_main"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: config.format,
@@ -1998,6 +2060,7 @@ impl<'a> VulkanEngine<'a> {
             video_state: None,
             clear_black_pipeline,
             crt_background_pipeline,
+            biolum_bg_pipeline,
             
             camera_uniform_buffer,
             camera_bind_group,
@@ -4101,11 +4164,7 @@ impl<'a> VulkanEngine<'a> {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(if vis_def.id == 19 {
-                            wgpu::Color { r: 0.001, g: 0.003, b: 0.008, a: 1.0 }
-                        } else {
-                            wgpu::Color { r: 0.1, g: 0.1, b: 0.1, a: 1.0 }
-                        }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.1, g: 0.1, b: 0.1, a: 1.0 }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -4156,6 +4215,9 @@ impl<'a> VulkanEngine<'a> {
 
             if vis_def.id == 11 {
                 render_pass.set_pipeline(&self.clear_black_pipeline);
+                render_pass.draw(0..3, 0..1);
+            } else if vis_def.id == 19 {
+                render_pass.set_pipeline(&self.biolum_bg_pipeline);
                 render_pass.draw(0..3, 0..1);
             } else if vis_def.id == 17 {
                 render_pass.set_pipeline(&self.crt_background_pipeline);

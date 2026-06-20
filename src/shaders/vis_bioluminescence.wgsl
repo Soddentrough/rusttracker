@@ -44,15 +44,27 @@ fn vs_main_3d(in: VertexInput, @builtin(instance_index) inst_idx: u32) -> Vertex
         return out;
     }
     
-    // Scale particle based on energy (pulsing effect)
-    let size = 0.035 + p.vel.w * 0.09;
+    // Scale particle based on energy (pulsing effect) and clamp to prevent excessive blowouts
+    let size = 0.035 + clamp(p.vel.w, 0.0, 1.5) * 0.09;
     let local_pos = in.position * size;
     let world_pos = local_pos + p.pos.xyz;
     
-    out.clip_position = camera.proj_matrix * camera.view_matrix * vec4<f32>(world_pos, 1.0);
+    let view_pos = camera.view_matrix * vec4<f32>(world_pos, 1.0);
+    let depth = -view_pos.z;
+    
+    // Discard/hide particle if it is behind or too close to the camera to prevent huge screen-filling discs
+    if (depth < 1.2) {
+        out.clip_position = vec4<f32>(0.0, 0.0, -10.0, 1.0); // behind the camera
+        out.uv = vec2<f32>(0.0);
+        out.energy = 0.0;
+        out.depth = 0.0;
+        return out;
+    }
+    
+    out.clip_position = camera.proj_matrix * view_pos;
     out.uv = in.tex_coords;
     out.energy = p.vel.w;
-    out.depth = out.clip_position.w;
+    out.depth = depth;
     
     return out;
 }
