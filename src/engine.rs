@@ -238,6 +238,16 @@ pub struct VulkanEngine<'a> {
     ferrofluidsim_compute_pipeline: wgpu::ComputePipeline,
     ferrofluidsim_clear_pipeline: wgpu::ComputePipeline,
     ferrofluidsim_bind_group: wgpu::BindGroup,
+    
+    // GPU compute bioluminescent waves simulation
+    #[allow(dead_code)]
+    biolum_particles_buffer: wgpu::Buffer,
+    biolum_compute_pipeline: wgpu::ComputePipeline,
+    biolum_compute_bind_group: wgpu::BindGroup,
+    biolum_render_bind_group: wgpu::BindGroup,
+    #[allow(dead_code)]
+    biolum_render_pipeline_layout: wgpu::PipelineLayout,
+
     #[allow(dead_code)]
     pub start_time: std::time::Instant,
 
@@ -642,6 +652,33 @@ impl<'a> VulkanEngine<'a> {
             immediate_size: 0,
         });
 
+        let biolum_render_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Biolum Render Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let biolum_render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Biolum Render Pipeline Layout"),
+            bind_group_layouts: &[
+                Some(&bind_group_layout),
+                Some(&smoke_render_layout),
+                Some(&camera_bind_group_layout),
+                Some(&biolum_render_bind_group_layout),
+            ],
+            immediate_size: 0,
+        });
+
         // Shared shader headers — included at compile time, resolved via simple string replacement.
         // This is the single source of truth for AudioUniforms layout and glyph font.
         const SHADER_COMMON: &str = include_str!("shaders/_common.wgsl");
@@ -674,6 +711,7 @@ impl<'a> VulkanEngine<'a> {
                 16 => include_str!("shaders/vis_synthwaveracer.wgsl"),
                 17 => include_str!("shaders/vis_cuboids.wgsl"),
                 18 => include_str!("shaders/vis_vumeters.wgsl"),
+                19 => include_str!("shaders/vis_bioluminescence.wgsl"),
                 _ => include_str!("shaders/vis_spectrum.wgsl"),
             }
         };
@@ -744,23 +782,9 @@ impl<'a> VulkanEngine<'a> {
                 source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(source.as_str())),
             });
             
-            let (layout, vertex_buffers, primitive, vs_entry) = match vis_def.pipeline_type {
-                crate::state::PipelineType::FullscreenQuad => (
-                    &render_pipeline_layout,
-                    Vec::new(),
-                    wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::TriangleList,
-                        strip_index_format: None,
-                        front_face: wgpu::FrontFace::Ccw,
-                        cull_mode: None,
-                        polygon_mode: wgpu::PolygonMode::Fill,
-                        unclipped_depth: false,
-                        conservative: false,
-                    },
-                    "vs_main"
-                ),
-                crate::state::PipelineType::Mesh3D { .. } => (
-                    &render_pipeline_layout_3d,
+            let (layout, vertex_buffers, primitive, vs_entry) = if vis_def.id == 19 {
+                (
+                    &biolum_render_pipeline_layout,
                     vec![Vertex::desc()],
                     wgpu::PrimitiveState {
                         topology: wgpu::PrimitiveTopology::TriangleList,
@@ -772,7 +796,38 @@ impl<'a> VulkanEngine<'a> {
                         conservative: false,
                     },
                     "vs_main_3d"
-                ),
+                )
+            } else {
+                match vis_def.pipeline_type {
+                    crate::state::PipelineType::FullscreenQuad => (
+                        &render_pipeline_layout,
+                        Vec::new(),
+                        wgpu::PrimitiveState {
+                            topology: wgpu::PrimitiveTopology::TriangleList,
+                            strip_index_format: None,
+                            front_face: wgpu::FrontFace::Ccw,
+                            cull_mode: None,
+                            polygon_mode: wgpu::PolygonMode::Fill,
+                            unclipped_depth: false,
+                            conservative: false,
+                        },
+                        "vs_main"
+                    ),
+                    crate::state::PipelineType::Mesh3D { .. } => (
+                        &render_pipeline_layout_3d,
+                        vec![Vertex::desc()],
+                        wgpu::PrimitiveState {
+                            topology: wgpu::PrimitiveTopology::TriangleList,
+                            strip_index_format: None,
+                            front_face: wgpu::FrontFace::Ccw,
+                            cull_mode: None,
+                            polygon_mode: wgpu::PolygonMode::Fill,
+                            unclipped_depth: false,
+                            conservative: false,
+                        },
+                        "vs_main_3d"
+                    ),
+                }
             };
             
             let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -1495,6 +1550,89 @@ impl<'a> VulkanEngine<'a> {
             label: Some("Ferrofluid Clear"), layout: Some(&ferrofluidsim_pipeline_layout), module: &ferrofluidsim_compute_shader, entry_point: Some("clear"), compilation_options: Default::default(), cache: None,
         });
 
+        // --- Bioluminescent Waves Compute & Render Setup ---
+        let biolum_particles_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Bioluminescent Particles"),
+            size: (65536 * 32) as u64, // 65,536 particles * 32 bytes/particle
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&biolum_particles_buffer, 0, &vec![0u8; 65536 * 32]);
+
+        let biolum_compute_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("Biolum Compute Layout"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let biolum_compute_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Biolum Compute Bind Group"),
+            layout: &biolum_compute_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: biolum_particles_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let biolum_compute_source = resolve_shader_includes(include_str!("shaders/biolum_compute.wgsl"));
+        let biolum_compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Biolum Compute Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&biolum_compute_source)),
+        });
+
+        let biolum_compute_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Biolum Compute Pipeline Layout"),
+            bind_group_layouts: &[Some(&biolum_compute_layout)],
+            immediate_size: 0,
+        });
+
+        let biolum_compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("Biolum Compute Pipeline"),
+            layout: Some(&biolum_compute_pipeline_layout),
+            module: &biolum_compute_shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let biolum_render_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Biolum Render Bind Group"),
+            layout: &biolum_render_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: biolum_particles_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        // --- End Bioluminescent Waves Setup ---
+
         let mut query_set = None;
         let mut query_resolve_buffer = None;
         let mut query_read_buffer = None;
@@ -1830,6 +1968,13 @@ impl<'a> VulkanEngine<'a> {
             ferrofluidsim_compute_pipeline,
             ferrofluidsim_clear_pipeline,
             ferrofluidsim_bind_group,
+
+            biolum_particles_buffer,
+            biolum_compute_pipeline,
+            biolum_compute_bind_group,
+            biolum_render_bind_group,
+            biolum_render_pipeline_layout,
+
             start_time: std::time::Instant::now(),
             fft_compute_pipeline,
             fft_bind_group,
@@ -3937,6 +4082,17 @@ impl<'a> VulkanEngine<'a> {
             compute_pass.dispatch_workgroups(391, 1, 1);
         }
 
+        if vis_def.id == 19 {
+            println!("DEBUG: Bioluminescence Waves Sim Compute Dispatching!");
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Bioluminescence Waves Sim Compute"),
+                timestamp_writes: None,
+            });
+            compute_pass.set_pipeline(&self.biolum_compute_pipeline);
+            compute_pass.set_bind_group(0, Some(&self.biolum_compute_bind_group), &[]);
+            compute_pass.dispatch_workgroups(256, 1, 1);
+        }
+
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("Main Render Pass"),
@@ -3945,7 +4101,11 @@ impl<'a> VulkanEngine<'a> {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.1, g: 0.1, b: 0.1, a: 1.0 }),
+                        load: wgpu::LoadOp::Clear(if vis_def.id == 19 {
+                            wgpu::Color { r: 0.001, g: 0.003, b: 0.008, a: 1.0 }
+                        } else {
+                            wgpu::Color { r: 0.1, g: 0.1, b: 0.1, a: 1.0 }
+                        }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -4014,6 +4174,9 @@ impl<'a> VulkanEngine<'a> {
                 },
                 crate::state::PipelineType::Mesh3D { geometry, instances } => {
                     render_pass.set_bind_group(2, &self.camera_bind_group, &[]);
+                    if vis_def.id == 19 {
+                        render_pass.set_bind_group(3, &self.biolum_render_bind_group, &[]);
+                    }
                     if let Some(mesh) = self.mesh_registry.get(geometry) {
                         render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
                         render_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
