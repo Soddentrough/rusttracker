@@ -122,7 +122,7 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     
     // Brightness profile
     let intensity = (0.2 + in.energy * 2.5) * (1.0 - smoothstep(0.0, 0.5, dist));
-    
+
     // Add distance fog to match the deep ocean depth feel
     let fog_factor = smoothstep(5.0, 35.0, in.depth);
     var final_color = mix(color * intensity, vec3<f32>(0.001, 0.003, 0.008), fog_factor);

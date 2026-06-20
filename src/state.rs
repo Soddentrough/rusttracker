@@ -195,6 +195,7 @@ pub struct AppState {
     pub osd_timer: f32,
     pub cumulative_scrub: f64,
     pub audio_device_lost: bool,
+    pub biolum_top_down: bool,
 }
 
 pub fn get_history_file_path() -> std::path::PathBuf {
@@ -325,6 +326,7 @@ impl AppState {
             osd_timer: 0.0,
             cumulative_scrub: 0.0,
             audio_device_lost: false,
+            biolum_top_down: false,
         }
     }
     
@@ -414,6 +416,7 @@ impl AppState {
             osd_timer: self.osd_timer,
             cumulative_scrub: self.cumulative_scrub,
             audio_device_lost: self.audio_device_lost,
+            biolum_top_down: self.biolum_top_down,
         }
     }
 }

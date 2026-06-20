@@ -393,6 +393,14 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                                 let mut state = app_state.lock().unwrap();
                                                 state.gpu_fft = !state.gpu_fft;
                                             },
+                                            WinitKeyCode::KeyC => {
+                                                let mut state = app_state.lock().unwrap();
+                                                if state.visualizer_mode == 19 {
+                                                    state.biolum_top_down = !state.biolum_top_down;
+                                                    state.osd_text = Some(format!("Camera: {}", if state.biolum_top_down { "Top-down" } else { "Perspective" }));
+                                                    state.osd_timer = 2.0;
+                                                }
+                                            },
                                             WinitKeyCode::KeyS => {
                                                 let mut state = app_state.lock().unwrap();
                                                 state.show_stats = !state.show_stats;

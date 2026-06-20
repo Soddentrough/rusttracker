@@ -2840,6 +2840,9 @@ impl<'a> VulkanEngine<'a> {
                                 shortcut(ui, "f", Some("Start"), "Toggle Fullscreen");
                                 shortcut(ui, "g", Some("R1"), "Toggle GPU FFT");
                                 shortcut(ui, "[ / ]", None, "Scale Panels");
+                                if state.visualizer_mode == 19 {
+                                    shortcut(ui, "c", None, "Toggle Camera Mode");
+                                }
                             });
                     });
             }
@@ -4159,7 +4162,6 @@ impl<'a> VulkanEngine<'a> {
         }
 
         if vis_def.id == 19 {
-            println!("DEBUG: Bioluminescence Waves Sim Compute Dispatching!");
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Bioluminescence Waves Sim Compute"),
                 timestamp_writes: None,
@@ -4210,11 +4212,19 @@ impl<'a> VulkanEngine<'a> {
             let aspect = vp_w / vp_h.max(1.0);
 
             let proj = glam::Mat4::perspective_rh_gl(std::f32::consts::PI / 3.0, aspect, 0.1, 1000.0);
-            let view = glam::Mat4::look_at_rh(
-                glam::Vec3::new(0.0, 1.5, -2.0),
-                glam::Vec3::new(0.0, 1.5, 0.0),
-                glam::Vec3::new(0.0, 1.0, 0.0),
-            );
+            let view = if state.visualizer_mode == 19 && state.biolum_top_down {
+                glam::Mat4::look_at_rh(
+                    glam::Vec3::new(0.0, 14.0, 0.0),
+                    glam::Vec3::new(0.0, 0.0, 0.0),
+                    glam::Vec3::new(0.0, 0.0, 1.0),
+                )
+            } else {
+                glam::Mat4::look_at_rh(
+                    glam::Vec3::new(0.0, 1.5, -2.0),
+                    glam::Vec3::new(0.0, 1.5, 0.0),
+                    glam::Vec3::new(0.0, 1.0, 0.0),
+                )
+            };
             let camera_uniforms = CameraUniforms {
                 view_matrix: view.to_cols_array_2d(),
                 proj_matrix: proj.to_cols_array_2d(),
