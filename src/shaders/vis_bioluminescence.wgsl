@@ -27,6 +27,7 @@ struct VertexOutput3D {
     @location(0) uv: vec2<f32>,
     @location(1) energy: f32,
     @location(2) depth: f32,
+    @location(3) @interpolate(linear) ndc: vec2<f32>,
 }
 
 @vertex
@@ -41,6 +42,7 @@ fn vs_main_3d(in: VertexInput, @builtin(instance_index) inst_idx: u32) -> Vertex
         out.uv = vec2<f32>(0.0);
         out.energy = 0.0;
         out.depth = 0.0;
+        out.ndc = vec2<f32>(0.0);
         return out;
     }
     
@@ -58,20 +60,44 @@ fn vs_main_3d(in: VertexInput, @builtin(instance_index) inst_idx: u32) -> Vertex
         out.uv = vec2<f32>(0.0);
         out.energy = 0.0;
         out.depth = 0.0;
+        out.ndc = vec2<f32>(0.0);
         return out;
     }
     
-    out.clip_position = camera.proj_matrix * view_pos;
+    var clip_pos = camera.proj_matrix * view_pos;
+    
+    // Apply barrel distortion in clip space (NDC)
+    let ndc = clamp(clip_pos.xy / clip_pos.w, vec2<f32>(-2.0), vec2<f32>(2.0));
+    let r2 = min(2.0, dot(ndc, ndc));
+    let distorted_ndc = ndc * (1.0 + r2 * 0.055);
+    clip_pos = vec4<f32>(distorted_ndc * clip_pos.w, clip_pos.z, clip_pos.w);
+    
+    out.clip_position = clip_pos;
     out.uv = in.tex_coords;
     out.energy = p.vel.w;
     out.depth = depth;
+    out.ndc = distorted_ndc;
     
     return out;
 }
 
+fn hash21(p: vec2<f32>) -> f32 {
+    var p3 = fract(vec3<f32>(p.xyx) * 0.1031);
+    p3 = p3 + dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
 @fragment
 fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
-    // Circle clip on each face using UV coordinate distance from center
+    // 1. Bezel boundary check
+    if (abs(in.ndc.x) > 1.0 || abs(in.ndc.y) > 1.0) {
+        discard;
+    }
+    
+    let border_dist = min(1.0 - abs(in.ndc.x), 1.0 - abs(in.ndc.y));
+    let bezel_mask = smoothstep(0.0, 0.03, border_dist);
+
+    // 2. Circle clip on each face using UV coordinate distance from center
     let dist = length(in.uv - vec2<f32>(0.5, 0.5));
     if (dist > 0.5) {
         discard;
@@ -96,7 +122,23 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     
     // Add distance fog to match the deep ocean depth feel
     let fog_factor = smoothstep(5.0, 35.0, in.depth);
-    let final_color = mix(color * intensity, vec3<f32>(0.001, 0.003, 0.008), fog_factor);
+    var final_color = mix(color * intensity, vec3<f32>(0.001, 0.003, 0.008), fog_factor);
+    
+    // Apply bezel vignette mask
+    final_color = final_color * bezel_mask;
+    
+    // CRT Filter: Scanlines
+    let scanline = 0.86 + 0.14 * cos(in.clip_position.y * 3.14159);
+    final_color = final_color * scanline;
+    
+    // CRT Filter: Flicker
+    let flicker = 0.98 + 0.02 * sin(audio.time * 115.0);
+    final_color = final_color * flicker;
+    
+    // CRT Filter: Analog static noise
+    let noise_val = hash21(in.clip_position.xy + fract(audio.smooth_time) * 149.0);
+    let static_noise = noise_val * 0.022 * bezel_mask;
+    final_color = final_color + vec3<f32>(static_noise);
     
     return vec4<f32>(final_color, 1.0);
 }

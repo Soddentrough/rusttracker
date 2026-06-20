@@ -1145,18 +1145,31 @@ impl<'a> VulkanEngine<'a> {
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(r#"
                 struct VertexOutput {
                     @builtin(position) clip_position: vec4<f32>,
+                    @location(0) ndc: vec2<f32>,
                 }
                 @vertex
                 fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
                     var out: VertexOutput;
                     let x = f32((in_vertex_index << 1u) & 2u) * 2.0 - 1.0;
                     let y = f32(in_vertex_index & 2u) * 2.0 - 1.0;
-                    out.clip_position = vec4<f32>(x, y, 1.0, 1.0);
+                    
+                    let ndc = vec2<f32>(x, y);
+                    let r2 = dot(ndc, ndc);
+                    let distorted_ndc = ndc * (1.0 + r2 * 0.055);
+                    
+                    out.clip_position = vec4<f32>(distorted_ndc, 1.0, 1.0);
+                    out.ndc = distorted_ndc;
                     return out;
                 }
                 @fragment
-                fn fs_main() -> @location(0) vec4<f32> {
-                    return vec4<f32>(0.001, 0.003, 0.008, 1.0);
+                fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+                    if (abs(in.ndc.x) > 1.0 || abs(in.ndc.y) > 1.0) {
+                        discard;
+                    }
+                    let border_dist = min(1.0 - abs(in.ndc.x), 1.0 - abs(in.ndc.y));
+                    let bezel_mask = smoothstep(0.0, 0.03, border_dist);
+                    
+                    return vec4<f32>(vec3<f32>(0.001, 0.003, 0.008) * bezel_mask, 1.0);
                 }
             "#)),
         });
