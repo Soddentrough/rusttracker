@@ -36,8 +36,9 @@ fn vs_main_3d(in: VertexInput, @builtin(instance_index) inst_idx: u32) -> Vertex
     
     let p = particles[inst_idx];
     
-    // Discard/hide particle if life is finished or energy is extremely low
-    if (p.pos.w <= 0.0 || p.vel.w < 0.001) {
+    // Discard/hide particle if life is finished, energy is extremely low,
+    // or if this is not the front face of the cube (to render as a single billboarded quad)
+    if (p.pos.w <= 0.0 || p.vel.w < 0.001 || in.normal.z < 0.9) {
         out.clip_position = vec4<f32>(0.0, 0.0, -10.0, 1.0); // behind the camera
         out.uv = vec2<f32>(0.0);
         out.energy = 0.0;
@@ -48,10 +49,12 @@ fn vs_main_3d(in: VertexInput, @builtin(instance_index) inst_idx: u32) -> Vertex
     
     // Scale particle based on energy (pulsing effect) and clamp to prevent excessive blowouts
     let size = 0.035 + clamp(p.vel.w, 0.0, 1.5) * 0.09;
-    let local_pos = in.position * size;
-    let world_pos = local_pos + p.pos.xyz;
     
-    let view_pos = camera.view_matrix * vec4<f32>(world_pos, 1.0);
+    // Billboard the vertex: offset particle center in view space
+    var view_pos = camera.view_matrix * vec4<f32>(p.pos.xyz, 1.0);
+    view_pos.x += in.position.x * size;
+    view_pos.y += in.position.y * size;
+    
     let depth = -view_pos.z;
     
     // Discard/hide particle if it is behind or too close to the camera to prevent huge screen-filling discs
