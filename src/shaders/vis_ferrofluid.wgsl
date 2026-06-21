@@ -6,7 +6,7 @@
 // --- Tuning Constants ---
 const PUDDLE_RADIUS: f32 = 4.0;
 const STEP_SCALE: f32 = 0.45;       // Lipschitz correction for pow-8 lobes + smax(k=0.3)
-const MAX_MARCH_STEPS: i32 = 120;   // Safe ceiling with corrected step scale
+const MAX_MARCH_STEPS: i32 = 80;   // Safe ceiling with corrected step scale
 const HIT_THRESHOLD: f32 = 0.005;
 const NORMAL_EPS: f32 = 0.015;      // Increased epsilon for smoother, anti-aliased normals
 const HDR_WHITE: f32 = 5.0;         // Blown-out white that tonemaps to ~1.0
@@ -99,7 +99,7 @@ fn get_speaker_dir(i: u32) -> vec3<f32> {
 
 // --- SDF: Distance-only (used by calcNormal — no glow computation) ---
 
-fn map_dist(p: vec3<f32>) -> f32 {
+fn map_dist(p: vec3<f32>, full_detail: bool) -> f32 {
     let dist_xz = length(p.xz);
 
     // Base infinite plane thickness
@@ -150,7 +150,7 @@ fn map_dist(p: vec3<f32>) -> f32 {
     // Organic surface perturbation (smooth magnetic domain noise)
     var surface_noise = 0.0;
     let d_base = p.y + 0.5 - (total_displacement + ripple);
-    if abs(d_base) < 0.2 {
+    if full_detail && abs(d_base) < 0.2 {
         let noise_p = p * 4.0 + vec3<f32>(audio.time * 0.5, 0.0, audio.time * 0.3);
         surface_noise = (hash3_smooth(noise_p) - 0.5) * 0.05;
     }
@@ -172,7 +172,7 @@ struct MapData {
     glow: vec3<f32>,
 }
 
-fn map(p: vec3<f32>) -> MapData {
+fn map(p: vec3<f32>, full_detail: bool) -> MapData {
     let dist_xz = length(p.xz);
 
     // Base infinite plane thickness
@@ -229,7 +229,7 @@ fn map(p: vec3<f32>) -> MapData {
     // Organic surface perturbation (smooth magnetic domain noise)
     var surface_noise = 0.0;
     let d_base = p.y + 0.5 - (total_displacement + ripple);
-    if abs(d_base) < 0.2 {
+    if full_detail && abs(d_base) < 0.2 {
         let noise_p = p * 4.0 + vec3<f32>(audio.time * 0.5, 0.0, audio.time * 0.3);
         surface_noise = (hash3_smooth(noise_p) - 0.5) * 0.05;
     }
@@ -246,10 +246,10 @@ fn calcNormal(p: vec3<f32>) -> vec3<f32> {
     let h = NORMAL_EPS;
     let k = vec2<f32>(1.0, -1.0);
     return normalize(
-        k.xyy * map_dist(p + k.xyy * h) + 
-        k.yyx * map_dist(p + k.yyx * h) + 
-        k.yxy * map_dist(p + k.yxy * h) + 
-        k.xxx * map_dist(p + k.xxx * h)
+        k.xyy * map_dist(p + k.xyy * h, false) + 
+        k.yyx * map_dist(p + k.yyx * h, false) + 
+        k.yxy * map_dist(p + k.yxy * h, false) + 
+        k.xxx * map_dist(p + k.xxx * h, false)
     );
 }
 
@@ -284,7 +284,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     for (var i = 0; i < MAX_MARCH_STEPS; i++) {
         let p_current = ro + rd * t;
-        let map_data = map(p_current);
+        let map_data = map(p_current, true);
         let d = map_data.d;
 
         // Accumulate glow with distance attenuation to prevent oversaturation on long rays

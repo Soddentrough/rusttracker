@@ -66,6 +66,7 @@ pub enum EngineAction {
     LoadUrl(String),
     EditUrl(String),
     ClearFocusUrlInput,
+    SetAudioDevice(String),
 }
 
 #[repr(C)]
@@ -291,7 +292,10 @@ pub struct VulkanEngine<'a> {
     frame_count: u32,
     last_history_cam_z: f64,
     smooth_time: f64,
+    play_time: f64,
     smooth_dt: f64,
+    last_history_push_count: u64,
+    time_since_last_push: f64,
     vu_needle_angles: Vec<f32>,
     vu_needle_velocities: Vec<f32>,
 }
@@ -522,7 +526,7 @@ impl<'a> VulkanEngine<'a> {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false,
@@ -713,6 +717,7 @@ impl<'a> VulkanEngine<'a> {
                 17 => include_str!("shaders/vis_cuboids.wgsl"),
                 18 => include_str!("shaders/vis_vumeters.wgsl"),
                 19 => include_str!("shaders/vis_bioluminescence.wgsl"),
+                20 => include_str!("shaders/vis_3doscilloscope_raster.wgsl"),
                 _ => include_str!("shaders/vis_spectrum.wgsl"),
             }
         };
@@ -2085,7 +2090,10 @@ impl<'a> VulkanEngine<'a> {
             frame_count: 0,
             last_history_cam_z: 0.0f64,
             smooth_time: 0.0f64,
+            play_time: 0.0f64,
             smooth_dt: 1.0f64 / 60.0f64,
+            last_history_push_count: 0,
+            time_since_last_push: 0.0,
             vu_needle_angles: vec![0.0; 32],
             vu_needle_velocities: vec![0.0; 32],
         }
@@ -2124,15 +2132,36 @@ impl<'a> VulkanEngine<'a> {
         self.smooth_dt = self.smooth_dt * (1.0 - alpha) + (dt as f64).clamp(0.001, 0.1) * alpha;
         self.smooth_time += self.smooth_dt;
 
-        let cam_z = self.smooth_time * 25.0;
-        let dist_moved = cam_z - self.last_history_cam_z;
-        let mut steps = 0;
-        if dist_moved >= 0.5 {
-            steps = (dist_moved / 0.5) as u32;
-            self.heatmap_row = (self.heatmap_row + steps) % 1024;
-            self.last_history_cam_z += steps as f64 * 0.5;
+        // Track pushes to synchronize scrolling phase with physical buffer updates
+        if state.waveform_history_push_count < self.last_history_push_count {
+            self.last_history_push_count = state.waveform_history_push_count;
+            self.time_since_last_push = 0.0;
         }
-        let step_fraction = ((cam_z - self.last_history_cam_z) / 0.5) as f32;
+
+        let mut steps = 0;
+        if state.waveform_history_push_count != self.last_history_push_count {
+            let diff = state.waveform_history_push_count.saturating_sub(self.last_history_push_count);
+            steps = diff as u32;
+            self.heatmap_row = (self.heatmap_row + steps) % 1024;
+            self.time_since_last_push = 0.0;
+            self.last_history_push_count = state.waveform_history_push_count;
+        } else if !state.is_paused && state.file_loaded && !state.track_ended {
+            self.time_since_last_push += self.smooth_dt;
+        }
+
+        // Target interval between pushes
+        let push_interval = if state.target_fps > 0 {
+            1.0 / state.target_fps as f64
+        } else {
+            1.0 / 60.0
+        };
+
+        // Smoothly interpolate within the current frame push window
+        let step_fraction = (self.time_since_last_push / push_interval).clamp(0.0, 1.0) as f32;
+
+        // Re-construct smooth play time monotonic timeline
+        self.play_time = (self.last_history_push_count as f64 + step_fraction as f64) * 0.02;
+        self.last_history_cam_z = self.last_history_push_count as f64 * 0.5;
         let mut uniforms = AudioUniforms {
             spectrum: [0.0; 1024],
             fire_heat: [0.0; 1024],
@@ -2144,7 +2173,7 @@ impl<'a> VulkanEngine<'a> {
             mode: state.visualizer_mode,
             time: state.current_seconds as f32,
             duration: state.duration_seconds as f32,
-            smooth_time: self.smooth_time as f32,
+            smooth_time: self.play_time as f32,
             heatmap_row: self.heatmap_row,
             fft_channels: state.raw_audio_channels.len() as u32,
             num_spatial_channels: state.channel_vus.len().saturating_sub(state.tracker_channels.unwrap_or(0) as usize) as u32,
@@ -2314,7 +2343,7 @@ impl<'a> VulkanEngine<'a> {
                 bass,
                 mids,
                 highs,
-                time: self.smooth_time as f32,
+                time: self.play_time as f32,
                 cooling_factor: 1.0 - mids * 0.5,
                 turb_spread_f: 1.0 + highs * 3.0,
                 width: 1024,
@@ -2737,7 +2766,7 @@ impl<'a> VulkanEngine<'a> {
                         if state.video_frame_rx.is_some() {
                             ui.label(
                                 egui::RichText::new(format!("Video Buffer: {:.1}%", state.stats.video_buffer_fill_pct))
-                                    .color(if state.stats.video_buffer_fill_pct < 1.0 { egui::Color32::RED } else if state.stats.video_buffer_fill_pct > 95.0 { egui::Color32::YELLOW } else { egui::Color32::GREEN })
+                                    .color(if state.stats.video_buffer_fill_pct < 1.0 { egui::Color32::RED } else { egui::Color32::YELLOW })
                             );
                         }
                         ui.separator();
@@ -3825,7 +3854,7 @@ impl<'a> VulkanEngine<'a> {
                                 if video == "Unsupported Codec" {
                                     columns[2].horizontal(|ui| { ui.label("Video"); ui.label(video); });
                                 } else {
-                                    columns[2].horizontal(|ui| { ui.label("Video"); ui.label(format!("{} (Video stream available)", video)); });
+                                    columns[2].horizontal(|ui| { ui.label("Video"); ui.label(format!("{} (Video available: 'v' to view)", video)); });
                                 }
                             }
                             
@@ -3859,6 +3888,25 @@ impl<'a> VulkanEngine<'a> {
                                     ui.label("LIVE");
                                 } else {
                                     ui.label(format!("{:.1}s", state.duration_seconds)); 
+                                }
+                            });
+                            
+                            columns[2].horizontal(|ui| {
+                                ui.label("Device");
+                                let mut current_device = state.selected_audio_device.clone().unwrap_or_else(|| "Default Device".to_string());
+                                let prev_device = current_device.clone();
+                                
+                                egui::ComboBox::from_id_salt("audio_device_combo")
+                                    .selected_text(&current_device)
+                                    .width(ui.available_width().max(80.0))
+                                    .show_ui(ui, |ui| {
+                                        for dev in &state.available_audio_devices {
+                                            ui.selectable_value(&mut current_device, dev.clone(), dev);
+                                        }
+                                    });
+                                
+                                if current_device != prev_device {
+                                    engine_action = EngineAction::SetAudioDevice(current_device);
                                 }
                             });
                             
@@ -4236,7 +4284,7 @@ impl<'a> VulkanEngine<'a> {
             let mode_idx = state.current_visualizer_idx.min(self.render_pipelines.len() - 1);
             let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
 
-            if vis_def.id == 11 {
+            if vis_def.id == 11 || vis_def.id == 20 {
                 render_pass.set_pipeline(&self.clear_black_pipeline);
                 render_pass.draw(0..3, 0..1);
             } else if vis_def.id == 19 {

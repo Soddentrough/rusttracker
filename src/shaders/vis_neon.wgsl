@@ -284,7 +284,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     act /= f32(max(num_ch, 1u));
 
     // --- Raymarching ---
-    var t = 0.0;
+    let jitter = hash(in.clip_position.x + in.clip_position.y * 57.0 + fract(audio.smooth_time)) * 0.2;
+    var t = jitter;
     var T = 1.0;  // smoke transmittance
     var color = vec3<f32>(0.0);
     var neon_glow = vec3<f32>(0.0);
@@ -347,7 +348,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                     // Track minimum distance to each frame for smooth reflection bleed
                     var min_d = array<f32, 5>(100.0, 100.0, 100.0, 100.0, 100.0);
 
-                    for(var j=0; j<15; j++) {
+                    for(var j=0; j<8; j++) {
                         let rp = p_hit + r_rd_b * rt;
                         var d_min_all = 100.0;
 
@@ -402,7 +403,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 }
                 smoke_light *= 2.5;
 
-                let step_len = 0.1;
+                let step_len = 0.2;
                 let alpha = 1.0 - exp(-dens * step_len * 4.0);
 
                 color += T * alpha * smoke_light;
@@ -414,7 +415,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
         var step_size = d;
         if (smoke_bounding < 0.0 && T > 0.01) {
-            step_size = min(step_size, 0.1);
+            step_size = min(step_size, 0.2);
         } else {
             step_size = min(step_size, smoke_bounding + 0.05);
         }

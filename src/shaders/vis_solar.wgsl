@@ -3,7 +3,7 @@
 // Raymarched sun with audio-reactive plasma and flares
 // =====================================================
 
-const MAX_MARCH_STEPS: i32 = 100;
+const MAX_MARCH_STEPS: i32 = 64;
 const MAX_MARCH_DIST: f32 = 20.0;
 const HIT_THRESHOLD: f32 = 0.01;
 const NORMAL_EPS: f32 = 0.01;
@@ -103,7 +103,7 @@ fn get_flare_dist(p: vec3<f32>, full_detail: bool) -> f32 {
         // BOUNDING VOLUME: Only evaluate expensive 3D noise if the ray is close to the flare
         var t_dist = sdTorus(lp, vec2<f32>(loop_height, loop_thick));
         if full_detail && t_dist < 0.2 {
-            let plasma_noise = fbm(lp * 15.0 - vec3<f32>(audio.time * 4.0, audio.time * 2.0, 0.0));
+            let plasma_noise = snoise3(lp * 15.0 - vec3<f32>(audio.time * 4.0, audio.time * 2.0, 0.0));
             t_dist -= plasma_noise * 0.035;
         }
         
@@ -168,7 +168,7 @@ fn map(p: vec3<f32>, full_detail: bool) -> f32 {
     // Fine-grained Plasma displacement (only when full_detail)
     var d_sphere = r - BASE_RADIUS;
     if full_detail && d_sphere < 0.2 {
-        let surface_noise = fbm(rot_p * 8.0 + vec3<f32>(audio.time * 0.1, 0.0, 0.0)) * 0.05;
+        let surface_noise = snoise3(rot_p * 8.0 + vec3<f32>(audio.time * 0.1, 0.0, 0.0)) * 0.05;
         d_sphere -= surface_noise;
     }
     
@@ -238,7 +238,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             break;
         }
 
-        t += d * 0.7;
+        t += d * 0.95;
         if t > MAX_MARCH_DIST { break; }
     }
 

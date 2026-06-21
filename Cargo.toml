@@ -1,6 +1,6 @@
 [package]
 name = "rusttracker"
-version = "0.9.7"
+version = "0.9.8"
 edition = "2024"
 default-run = "rusttracker"
 description = "High-Performance Vulkan Tracker Module Visualizer"
@@ -66,6 +66,6 @@ objc2-core-audio = "0.3.2"
 
 [profile.release]
 opt-level = 3
-lto = false
-codegen-units = 16
-strip = false
+lto = true
+codegen-units = 1
+strip = "symbols"

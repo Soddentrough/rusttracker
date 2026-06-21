@@ -45,6 +45,67 @@ pub struct DspMessage {
     pub channel_audio_data: Vec<Vec<f32>>,
 }
 
+fn is_relevant_audio_device(name: &str) -> bool {
+    let name_lower = name.to_lowercase();
+    // Filter out dummy/silent devices
+    if name_lower == "null" {
+        return false;
+    }
+    // Filter out virtual multi-channel surround setups (not suitable for normal stereo playback/recording)
+    if name_lower.contains("surround") {
+        return false;
+    }
+    // Filter out internal mixer and snooping plugins
+    if name_lower.starts_with("dmix") || name_lower.starts_with("dsnoop") {
+        return false;
+    }
+    // Filter out legacy or internal virtual interfaces/plugins
+    if name_lower.starts_with("adsp") {
+        return false;
+    }
+    if name_lower.starts_with("speex") || name_lower.contains("speexrate") {
+        return false;
+    }
+    if name_lower.contains("upmix") || name_lower.contains("vdownmix") {
+        return false;
+    }
+    if name_lower.contains("samplerate") || name_lower.contains("lavrate") {
+        return false;
+    }
+    true
+}
+
+pub fn get_available_audio_devices(mic: bool) -> Vec<String> {
+    let host = cpal::default_host();
+    let devices = if mic {
+        host.input_devices()
+    } else {
+        host.output_devices()
+    };
+    
+    let mut names = Vec::new();
+    if let Ok(devices) = devices {
+        for d in devices {
+            if let Ok(name) = d.name() {
+                if is_relevant_audio_device(&name) {
+                    names.push(name);
+                }
+            }
+        }
+    }
+    names
+}
+
+pub fn get_default_audio_device_name(mic: bool) -> Option<String> {
+    let host = cpal::default_host();
+    let default_device = if mic {
+        host.default_input_device()
+    } else {
+        host.default_output_device()
+    };
+    default_device.and_then(|d| d.name().ok())
+}
+
 pub fn spawn_dsp_thread(
     rx: Receiver<DspMessage>,
     shared_state: Arc<Mutex<AppState>>,
@@ -191,6 +252,7 @@ pub fn spawn_dsp_thread(
                     }
                     let wave_clone = state.raw_waveform.clone();
                     state.waveform_history.push_back(wave_clone);
+                    state.waveform_history_push_count += 1;
                     last_waveform_push = now;
                 }
                 
@@ -380,7 +442,8 @@ struct MidiEvent {
 }
 
 struct MidiSource {
-    sequencer: MidiFileSequencer,
+    sequencer: Option<MidiFileSequencer>,
+    pos_silent: f64,
     events: Vec<MidiEvent>,
     event_idx: usize,
     channel_vus: Vec<f32>,
@@ -398,17 +461,34 @@ unsafe impl Send for MidiSource {}
 
 impl MidiSource {
     pub fn new(file_path: &str, soundfont_path: &str, sample_rate: i32) -> anyhow::Result<Self> {
-        let mut sf2_file = File::open(soundfont_path)?;
-        let sf2 = Arc::new(SoundFont::new(&mut sf2_file).map_err(|e| anyhow::anyhow!("SoundFont error: {:?}", e))?);
-        let settings = SynthesizerSettings::new(sample_rate);
-        let synth = Synthesizer::new(&sf2, &settings).map_err(|e| anyhow::anyhow!("Synth error: {:?}", e))?;
-        let mut sequencer = MidiFileSequencer::new(synth);
+        let mut artist_suffix = "";
+        let sf2_file_opt = File::open(soundfont_path).ok();
+        let mut sequencer = if let Some(mut sf2_file) = sf2_file_opt {
+            if let Ok(sf2) = SoundFont::new(&mut sf2_file) {
+                let sf2 = Arc::new(sf2);
+                let settings = SynthesizerSettings::new(sample_rate);
+                if let Ok(synth) = Synthesizer::new(&sf2, &settings) {
+                    Some(MidiFileSequencer::new(synth))
+                } else {
+                    artist_suffix = " (No SoundFont)";
+                    None
+                }
+            } else {
+                artist_suffix = " (No SoundFont)";
+                None
+            }
+        } else {
+            artist_suffix = " (No SoundFont)";
+            None
+        };
         
         let mut midi_file = File::open(file_path)?;
         let midi = Arc::new(MidiFile::new(&mut midi_file).map_err(|e| anyhow::anyhow!("Midi parse error: {:?}", e))?);
         
         let duration = midi.get_length();
-        sequencer.play(&midi, false);
+        if let Some(seq) = &mut sequencer {
+            seq.play(&midi, false);
+        }
         
         let data = std::fs::read(file_path)?;
         let smf = Smf::parse(&data).map_err(|e| anyhow::anyhow!("Midly parse error: {:?}", e))?;
@@ -508,9 +588,13 @@ impl MidiSource {
         if artist.is_empty() {
             artist = "Unknown MIDI".to_string();
         }
+        if !artist_suffix.is_empty() {
+            artist.push_str(artist_suffix);
+        }
         
         Ok(Self {
             sequencer,
+            pos_silent: 0.0,
             events: parsed_events,
             event_idx: 0,
             channel_vus: vec![0.0; 16],
@@ -530,18 +614,34 @@ impl AudioSource for MidiSource {
     fn read_frames(&mut self, hardware_channels: usize, _sample_rate: u32, output: &mut [f32]) -> usize {
         let frames_to_render = output.len() / hardware_channels;
         
-        if self.left_buf.len() < frames_to_render {
-            self.left_buf.resize(frames_to_render, 0.0);
-            self.right_buf.resize(frames_to_render, 0.0);
-        }
-        
-        self.sequencer.render(&mut self.left_buf[..frames_to_render], &mut self.right_buf[..frames_to_render]);
+        let pos = if let Some(ref mut seq) = self.sequencer {
+            if self.left_buf.len() < frames_to_render {
+                self.left_buf.resize(frames_to_render, 0.0);
+                self.right_buf.resize(frames_to_render, 0.0);
+            }
+            seq.render(&mut self.left_buf[..frames_to_render], &mut self.right_buf[..frames_to_render]);
+            for i in 0..frames_to_render {
+                let l = self.left_buf[i];
+                let r = self.right_buf[i];
+                output[i * hardware_channels] = l;
+                if hardware_channels > 1 {
+                    output[i * hardware_channels + 1] = r;
+                    for j in 2..hardware_channels {
+                        output[i * hardware_channels + j] = 0.0;
+                    }
+                }
+            }
+            seq.get_position()
+        } else {
+            output.fill(0.0);
+            self.pos_silent = (self.pos_silent + frames_to_render as f64 / _sample_rate as f64).min(self.duration);
+            self.pos_silent
+        };
         
         for c in 0..16 {
             self.channel_vus[c] = (self.channel_vus[c] - 0.02).max(0.0);
         }
         
-        let pos = self.sequencer.get_position();
         while self.event_idx < self.events.len() && self.events[self.event_idx].time_sec <= pos {
             let ev = &self.events[self.event_idx];
             if ev.is_note_on {
@@ -553,20 +653,13 @@ impl AudioSource for MidiSource {
             self.event_idx += 1;
         }
         
-        for i in 0..frames_to_render {
-            let l = self.left_buf[i];
-            let r = self.right_buf[i];
-            
-            output[i * hardware_channels] = l;
-            if hardware_channels > 1 {
-                output[i * hardware_channels + 1] = r;
-                for j in 2..hardware_channels {
-                    output[i * hardware_channels + j] = 0.0;
-                }
-            }
-        }
+        let is_end = if let Some(ref seq) = self.sequencer {
+            seq.end_of_sequence()
+        } else {
+            pos >= self.duration
+        };
         
-        if self.sequencer.end_of_sequence() {
+        if is_end {
             0
         } else {
             frames_to_render
@@ -574,17 +667,27 @@ impl AudioSource for MidiSource {
     }
     
     fn get_duration_seconds(&mut self) -> f64 { self.duration }
-    fn get_position_seconds(&mut self) -> f64 { self.sequencer.get_position() }
+    fn get_position_seconds(&mut self) -> f64 {
+        if let Some(ref seq) = self.sequencer {
+            seq.get_position()
+        } else {
+            self.pos_silent
+        }
+    }
     
     fn set_position_seconds(&mut self, pos: f64) {
-        if pos < self.get_position_seconds() {
-            self.sequencer.play(&self.midi_file, false);
-        }
-        
-        let mut trash_left = vec![0.0; 8192];
-        let mut trash_right = vec![0.0; 8192];
-        while self.sequencer.get_position() < pos && !self.sequencer.end_of_sequence() {
-            self.sequencer.render(&mut trash_left, &mut trash_right);
+        if let Some(ref mut seq) = self.sequencer {
+            if pos < seq.get_position() {
+                seq.play(&self.midi_file, false);
+            }
+            
+            let mut trash_left = vec![0.0; 8192];
+            let mut trash_right = vec![0.0; 8192];
+            while seq.get_position() < pos && !seq.end_of_sequence() {
+                seq.render(&mut trash_left, &mut trash_right);
+            }
+        } else {
+            self.pos_silent = pos.clamp(0.0, self.duration);
         }
         
         self.event_idx = 0;
@@ -621,7 +724,7 @@ impl AudioSource for MidiSource {
     
     fn get_current_order(&mut self) -> i32 { 0 }
     fn get_current_row(&mut self) -> i32 {
-        (self.sequencer.get_position() * (self.tempo as f64 / 60.0) * 4.0) as i32
+        (self.get_position_seconds() * (self.tempo as f64 / 60.0) * 4.0) as i32
     }
     
     fn get_tracker_channels(&mut self) -> Option<i32> { Some(16) }
@@ -1443,7 +1546,7 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
                     _ => &codec_name,
                 }.to_string();
                 
-                let video_suffix = if has_video { " (Video stream available)" } else { "" };
+                let video_suffix = if has_video { " (Video available: 'v' to view)" } else { "" };
                 
                 {
                     let mut state = shared_state.lock().unwrap();
@@ -1476,8 +1579,52 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
         target_channels = 2;
     }
 
+    let selected_device_name = {
+        let state = shared_state.lock().unwrap();
+        state.selected_audio_device.clone()
+    };
+
+    let device = if mic {
+        let mut dev = None;
+        if let Some(ref name) = selected_device_name {
+            if let Ok(devices) = host.input_devices() {
+                for d in devices {
+                    if let Ok(d_name) = d.name() {
+                        if &d_name == name {
+                            dev = Some(d);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(d) = dev {
+            d
+        } else {
+            host.default_input_device().context("No input device available")?
+        }
+    } else {
+        let mut dev = None;
+        if let Some(ref name) = selected_device_name {
+            if let Ok(devices) = host.output_devices() {
+                for d in devices {
+                    if let Ok(d_name) = d.name() {
+                        if &d_name == name {
+                            dev = Some(d);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if let Some(d) = dev {
+            d
+        } else {
+            host.default_output_device().context("No output device available")?
+        }
+    };
+
     let supported_config = if mic {
-        let device = host.default_input_device().context("No input device available")?;
         let supported_configs_range = device.supported_input_configs().context("error while querying input configs")?;
         supported_configs_range
             .into_iter()
@@ -1492,9 +1639,7 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
             .or_else(|| device.default_input_config().ok())
             .context("No supported config?!")?
     } else {
-        let device = host.default_output_device().context("No output device available")?;
         let supported_configs_range = device.supported_output_configs().context("error while querying output configs")?;
-        
         let mut configs: Vec<_> = supported_configs_range
             .filter(|c| {
                 c.sample_format() == cpal::SampleFormat::F32 || c.sample_format() == cpal::SampleFormat::I16
@@ -1527,12 +1672,6 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
             })
             .or_else(|| device.default_output_config().ok())
             .context("No supported config?!")?
-    };
-
-    let device = if mic {
-        host.default_input_device().context("No input device available")?
-    } else {
-        host.default_output_device().context("No output device available")?
     };
 
     let config: cpal::StreamConfig = supported_config.clone().into();

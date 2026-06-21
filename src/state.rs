@@ -99,6 +99,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
     VisualizerDef { id: 0, name: "Frequency Spectrum", filename: "vis_spectrum.wgsl", description: "Standard 2D FFT spectrum analyzer", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 2, name: "CRT Oscilloscope", filename: "vis_oscilloscope.wgsl", description: "2D glowing CRT wave trace", pipeline_type: PipelineType::FullscreenQuad, requires_history: true, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 7, name: "3D CRT Oscilloscope", filename: "vis_3doscilloscope.wgsl", description: "3D waterfall history of waveform", pipeline_type: PipelineType::FullscreenQuad, requires_history: true, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
+    VisualizerDef { id: 20, name: "3D Oscilloscope (Raster)", filename: "vis_3doscilloscope_raster.wgsl", description: "Rasterized 3D waterfall grid of waveform history", pipeline_type: PipelineType::Mesh3D { geometry: Geometry::Grid { width: 1024, depth: 144 }, instances: 1 }, requires_history: true, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 8, name: "3D Freq Oscilloscope", filename: "vis_3doscilloscope_freq.wgsl", description: "3D topographical frequency view", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: false, requires_resynth: true, requires_ferrofluidsim: false },
     VisualizerDef { id: 1, name: "Retro Fire", filename: "vis_flame.wgsl", description: "Demoscene pixel fire with CRT filter", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: true, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 6, name: "Fire Simulation", filename: "vis_firesim.wgsl", description: "Multi-channel procedural fire simulation", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: true, requires_resynth: false, requires_ferrofluidsim: false },
@@ -141,6 +142,7 @@ pub struct AppState {
     pub spectrum_peaks: Vec<f32>,
     pub spectrum_history: VecDeque<Vec<f32>>,
     pub waveform_history: VecDeque<Vec<f32>>,
+    pub waveform_history_push_count: u64,
     pub raw_waveform: Vec<f32>,
     pub raw_audio_channels: Vec<Vec<f32>>,
     pub fire_heat: Vec<f32>,
@@ -196,6 +198,9 @@ pub struct AppState {
     pub cumulative_scrub: f64,
     pub audio_device_lost: bool,
     pub biolum_top_down: bool,
+    pub selected_audio_device: Option<String>,
+    pub available_audio_devices: Vec<String>,
+    pub audio_device_change_request: Option<String>,
 }
 
 pub fn get_history_file_path() -> std::path::PathBuf {
@@ -212,6 +217,10 @@ pub fn get_history_file_path() -> std::path::PathBuf {
 
 impl AppState {
     pub fn new(title: String) -> Self {
+        let is_mic = title == "Microphone Input";
+        let default_audio_device = crate::audio::get_default_audio_device_name(is_mic);
+        let available_audio_devices = crate::audio::get_available_audio_devices(is_mic);
+
         let mut history = VecDeque::new();
         for _ in 0..120 {
             history.push_back(vec![0.0; 1024]);
@@ -227,16 +236,29 @@ impl AppState {
             .unwrap_or(false);
 
         let mut vis_enabled = vec![true; VISUALIZERS.len()];
-        vis_enabled[6] = false; // Solar Flare: disabled on all systems due to computational cost and visual quality
+        
+        // Solar Flare (ID 9): disabled on all systems due to computational cost and visual quality
+        if let Some(idx) = VISUALIZERS.iter().position(|v| v.id == 9) {
+            vis_enabled[idx] = false;
+        }
+
         // Lissajous Laser is now working and fully optimized, so it remains enabled by default.
 
         if is_steam_deck {
-            vis_enabled[1] = false; // CRT Oscilloscope
-            vis_enabled[2] = false; // 3D CRT Oscilloscope
-            vis_enabled[3] = false; // 3D Freq Oscilloscope
-            vis_enabled[8] = false; // Chrome Ferrofluid
-            vis_enabled[9] = false; // Ferrofluid Particle Sim
-            vis_enabled[10] = false; // Neon Corridor
+            // Disabled heavy shaders on Steam Deck to ensure smooth performance
+            let steam_deck_disabled_ids = [
+                2,  // CRT Oscilloscope
+                7,  // 3D CRT Oscilloscope
+                8,  // 3D Freq Oscilloscope
+                4,  // Chrome Ferrofluid
+                10, // Ferrofluid Particle Sim
+                5,  // Neon Corridor
+            ];
+            for id in steam_deck_disabled_ids {
+                if let Some(idx) = VISUALIZERS.iter().position(|v| v.id == id) {
+                    vis_enabled[idx] = false;
+                }
+            }
         }
         
         let mut url_history = Vec::new();
@@ -274,6 +296,7 @@ impl AppState {
             spectrum_peaks: vec![0.0; 1024],
             spectrum_history: history,
             waveform_history: wave_history,
+            waveform_history_push_count: 0,
             raw_waveform: vec![0.0; 1024],
             raw_audio_channels: Vec::new(),
             fire_heat: vec![0.0; 1024],
@@ -326,7 +349,10 @@ impl AppState {
             osd_timer: 0.0,
             cumulative_scrub: 0.0,
             audio_device_lost: false,
-            biolum_top_down: false,
+            biolum_top_down: true,
+            selected_audio_device: default_audio_device,
+            available_audio_devices,
+            audio_device_change_request: None,
         }
     }
     
@@ -366,6 +392,7 @@ impl AppState {
                 sh
             },
             waveform_history: VecDeque::new(),     // Only used in engine.update() (under lock)
+            waveform_history_push_count: 0,
             raw_waveform: Vec::new(),              // Only used in main.rs smoothing (under lock)
             raw_audio_channels: Vec::new(),        // ~1 MB, only used in engine.update()
             fire_heat: Vec::new(),                 // Only used in engine.update() (under lock)
@@ -417,6 +444,9 @@ impl AppState {
             cumulative_scrub: self.cumulative_scrub,
             audio_device_lost: self.audio_device_lost,
             biolum_top_down: self.biolum_top_down,
+            selected_audio_device: self.selected_audio_device.clone(),
+            available_audio_devices: self.available_audio_devices.clone(),
+            audio_device_change_request: self.audio_device_change_request.clone(),
         }
     }
 }

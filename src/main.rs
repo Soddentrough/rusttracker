@@ -18,7 +18,7 @@ use winit::platform::wayland::WindowAttributesExtWayland;
 #[cfg(target_os = "linux")]
 use winit::platform::x11::WindowAttributesExtX11;
 
-mod audio;
+pub mod audio;
 mod engine;
 mod state;
 mod ui;
@@ -299,7 +299,8 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
     let mut rfd_pending = false;
 
     let mut modifiers = winit::keyboard::ModifiersState::empty();
-    let mut frame_count = 0u32;
+    let frame_count = 0u32;
+    let mut bench_start: Option<std::time::Instant> = None;
 
     #[allow(deprecated)]
     let _ = event_loop.run(move |event, elwt| {
@@ -577,6 +578,9 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                     if is_first_frame {
                         is_first_frame = false;
                         app_state.lock().unwrap().is_paused = false;
+                        if bench.is_some() {
+                            bench_start = Some(std::time::Instant::now());
+                        }
                     }
                     let load_path = {
                         let mut state = app_state.lock().unwrap();
@@ -594,6 +598,23 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                             if !reload_path.is_empty() || is_mic_launch {
                                 state.load_request = Some(reload_path);
                                 state.osd_text = Some("Audio Device Reconnected".to_string());
+                                state.osd_timer = 3.0;
+                            }
+                        }
+                        
+                        let device_change = state.audio_device_change_request.take();
+                        if let Some(new_device) = device_change {
+                            let reload_path = if is_mic_launch {
+                                "".to_string()
+                            } else if state.playlist_index < state.playlist.len() {
+                                state.playlist[state.playlist_index].clone()
+                            } else {
+                                state.song_title.clone()
+                            };
+                            
+                            if !reload_path.is_empty() || is_mic_launch {
+                                state.load_request = Some(reload_path);
+                                state.osd_text = Some(format!("Audio Output: {}", new_device));
                                 state.osd_timer = 3.0;
                             }
                         }
@@ -885,16 +906,22 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                             }
                         }
 
-                        if let Some(bench_frames) = bench {
-                            frame_count += 1;
-                            if frame_count >= bench_frames {
-                                let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
-                                println!("BENCHMARK_RESULT_VISUALIZER: {}", vis_def.name);
-                                println!("BENCHMARK_RESULT_FPS: {:.2}", state.current_fps);
-                                println!("BENCHMARK_RESULT_SHADER_US: {:.2}", state.stats.shader_us);
-                                println!("BENCHMARK_RESULT_RENDER_US: {:.2}", state.stats.render_us);
-                                elwt.exit();
-                                return;
+                        if let Some(bench_seconds) = bench {
+                            if let Some(start) = bench_start {
+                                if start.elapsed().as_secs_f32() >= bench_seconds as f32 {
+                                    let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
+                                    println!("BENCHMARK_RESULT_VISUALIZER: {}", vis_def.name);
+                                    println!("BENCHMARK_RESULT_FPS: {:.2}", state.current_fps);
+                                    println!("BENCHMARK_RESULT_SHADER_US: {:.2}", state.stats.shader_us);
+                                    println!("BENCHMARK_RESULT_RENDER_US: {:.2}", state.stats.render_us);
+                                    println!("BENCHMARK_RESULT_UI_US: {:.2}", state.stats.ui_us);
+                                    println!("BENCHMARK_RESULT_DECODE_US: {:.2}", state.stats.decode_us);
+                                    println!("BENCHMARK_RESULT_FFT_US: {:.2}", state.stats.fft_us);
+                                    println!("BENCHMARK_RESULT_GPU_FFT_US: {:.2}", state.stats.gpu_fft_us);
+                                    println!("BENCHMARK_RESULT_FIRE_US: {:.2}", state.stats.fire_us);
+                                    elwt.exit();
+                                    return;
+                                }
                             }
                         }
                         
@@ -967,6 +994,10 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                             }
                             EngineAction::SetSplitRatio(val) => {
                                 state.panel_split_ratio = val;
+                            }
+                            EngineAction::SetAudioDevice(device_name) => {
+                                state.selected_audio_device = Some(device_name.clone());
+                                state.audio_device_change_request = Some(device_name);
                             }
                             EngineAction::VisPickerSelect(idx) => {
                                 state.current_visualizer_idx = idx;
