@@ -147,7 +147,9 @@ jobs:
           xcrun stapler staple RustTracker-MacOS-Installer.dmg
             
       - name: Clean up Keychain
-        if: always() && secrets.MACOS_CERTIFICATE != ''
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+        if: always() && env.MACOS_CERTIFICATE != ''
         run: |
           KEYCHAIN_PATH=$RUNNER_TEMP/app-signing.keychain-db
           if [ -f "$KEYCHAIN_PATH" ]; then
