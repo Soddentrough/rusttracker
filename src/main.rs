@@ -291,7 +291,6 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .initial_directory(initial_dir.clone())
         .add_file_filter_extensions("Audio/Video Files", vec!["flac", "wav", "mp3", "ogg", "aac", "m4a", "mp4", "mkv", "avi", "webm", "opus", "mod", "s3m", "xm", "it", "stm", "669", "mtm", "med", "okt", "psm", "dawproject", "aaf", "mid", "midi"])
-        .add_file_filter_extensions("MIDI Files", vec!["mid", "midi"])
         .show_all_files_filter(true)
         .default_file_filter("Audio/Video Files");
 
@@ -424,7 +423,6 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                                         let result = rfd::FileDialog::new()
                                                             .set_directory(&dir)
                                                             .add_filter("Audio/Video Files", &["flac", "wav", "mp3", "ogg", "aac", "m4a", "mp4", "mkv", "avi", "webm", "opus", "mod", "s3m", "xm", "it", "stm", "669", "mtm", "med", "okt", "psm", "dawproject", "aaf", "mid", "midi"])
-                                                            .add_filter("MIDI Files", &["mid", "midi"])
                                                             .add_filter("All Files", &["*"])
                                                             .pick_files();
                                                         if let Some(paths) = result {
@@ -966,7 +964,6 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                         let result = rfd::FileDialog::new()
                                             .set_directory(&dir)
                                              .add_filter("Audio/Video Files", &["flac", "wav", "mp3", "ogg", "aac", "m4a", "mp4", "mkv", "avi", "webm", "opus", "mod", "s3m", "xm", "it", "stm", "669", "mtm", "med", "okt", "psm", "dawproject", "aaf", "mid", "midi"])
-                                             .add_filter("MIDI Files", &["mid", "midi"])
                                              .add_filter("All Files", &["*"])
                                             .pick_files();
                                         if let Some(paths) = result {
