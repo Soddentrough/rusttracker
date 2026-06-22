@@ -86,7 +86,8 @@ pub fn get_available_audio_devices(mic: bool) -> Vec<String> {
     let mut names = Vec::new();
     if let Ok(devices) = devices {
         for d in devices {
-            if let Ok(name) = d.name() {
+            if let Ok(desc) = d.description() {
+                let name = desc.name().to_string();
                 if is_relevant_audio_device(&name) {
                     names.push(name);
                 }
@@ -103,7 +104,7 @@ pub fn get_default_audio_device_name(mic: bool) -> Option<String> {
     } else {
         host.default_output_device()
     };
-    default_device.and_then(|d| d.name().ok())
+    default_device.and_then(|d| d.description().ok().map(|desc| desc.name().to_string()))
 }
 
 pub fn spawn_dsp_thread(
@@ -1589,8 +1590,9 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
         if let Some(ref name) = selected_device_name {
             if let Ok(devices) = host.input_devices() {
                 for d in devices {
-                    if let Ok(d_name) = d.name() {
-                        if &d_name == name {
+                    if let Ok(desc) = d.description() {
+                        let d_name = desc.name();
+                        if d_name == name {
                             dev = Some(d);
                             break;
                         }
@@ -1608,8 +1610,9 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
         if let Some(ref name) = selected_device_name {
             if let Ok(devices) = host.output_devices() {
                 for d in devices {
-                    if let Ok(d_name) = d.name() {
-                        if &d_name == name {
+                    if let Ok(desc) = d.description() {
+                        let d_name = desc.name();
+                        if d_name == name {
                             dev = Some(d);
                             break;
                         }
