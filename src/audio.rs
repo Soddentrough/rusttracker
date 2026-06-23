@@ -1442,8 +1442,11 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
     // 1. Prioritize FFmpeg for video containers (MKV, MP4) to ensure video streams are processed.
     // Symphonia might successfully parse the audio in these containers but would ignore the video.
     if ext == "mkv" || ext == "mp4" {
-        if let Ok(source) = try_ffmpeg(file_path, false) {
-            return Ok(source);
+        match try_ffmpeg(file_path, false) {
+            Ok(source) => return Ok(source),
+            Err(err) => {
+                eprintln!("FFmpeg load failed for {}: {:?}", file_path, err);
+            }
         }
         // Fallback to Symphonia if FFmpeg fails
         if let Ok(file) = File::open(file_path) {
@@ -1531,6 +1534,8 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
     let ffmpeg_result = try_ffmpeg(file_path, false);
     if let Ok(source) = ffmpeg_result {
         return Ok(source);
+    } else if let Err(ref err) = ffmpeg_result {
+        eprintln!("FFmpeg fallback load failed for {}: {:?}", file_path, err);
     }
 
     // If all failed, return the ffmpeg error since it's the most descriptive for standard media
