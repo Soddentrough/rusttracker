@@ -10,14 +10,16 @@ license = "GPL-3.0-or-later"
 assets = [
     { source = "target/release/rusttracker", dest = "/usr/bin/rusttracker", mode = "755" },
     { source = "rusttracker.desktop", dest = "/usr/share/applications/rusttracker.desktop", mode = "644" },
-    { source = "icon.png", dest = "/usr/share/icons/hicolor/256x256/apps/rusttracker.png", mode = "644" }
+    { source = "icon.png", dest = "/usr/share/icons/hicolor/256x256/apps/rusttracker.png", mode = "644" },
+    { source = "assets/soundfont.sf2", dest = "/usr/share/rusttracker/assets/soundfont.sf2", mode = "644" }
 ]
 
 [package.metadata.deb]
 assets = [
     ["target/release/rusttracker", "usr/bin/", "755"],
     ["rusttracker.desktop", "usr/share/applications/", "644"],
-    ["icon.png", "usr/share/icons/hicolor/256x256/apps/rusttracker.png", "644"]
+    ["icon.png", "usr/share/icons/hicolor/256x256/apps/rusttracker.png", "644"],
+    ["assets/soundfont.sf2", "usr/share/rusttracker/assets/", "644"]
 ]
 extended-description = "A high-performance, real-time audio visualizer and tracker module player."
 

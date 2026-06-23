@@ -44,6 +44,8 @@ jobs:
       run: |
         mkdir release
         cp target/release/rusttracker.exe release/rusttracker.exe
+        mkdir -p release/assets
+        cp assets/soundfont.sf2 release/assets/soundfont.sf2
         # Automatically resolve and copy all required MSYS2 DLLs (including FFmpeg transitive dependencies)
         ldd target/release/rusttracker.exe | grep -i '/mingw64' | awk '{print $3}' | xargs -I '{}' cp '{}' release/
         

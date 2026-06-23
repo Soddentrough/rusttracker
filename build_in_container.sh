@@ -46,6 +46,10 @@ rm -f AppDir/AppRun
 cp AppRun.template AppDir/AppRun
 chmod +x AppDir/AppRun
 
+echo 'Injecting SoundFont asset into AppDir...'
+mkdir -p AppDir/usr/share/rusttracker/assets
+cp assets/soundfont.sf2 AppDir/usr/share/rusttracker/assets/
+
 echo 'Building final AppImage...'
 VERSION=$(grep -m 1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
 TAG="v$VERSION"

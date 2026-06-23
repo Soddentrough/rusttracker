@@ -1496,13 +1496,23 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
                         if test_path.exists() {
                             sf_path = test_path.to_string_lossy().into_owned();
                         } else {
-                            let test_path = exe_dir.join("../Resources/soundfont.sf2");
+                            let test_path = exe_dir.join("../share/rusttracker/assets/soundfont.sf2");
                             if test_path.exists() {
                                 sf_path = test_path.to_string_lossy().into_owned();
                             } else {
-                                let test_path = exe_dir.join("../Resources/assets/soundfont.sf2");
+                                let test_path = exe_dir.join("../share/rusttracker/soundfont.sf2");
                                 if test_path.exists() {
                                     sf_path = test_path.to_string_lossy().into_owned();
+                                } else {
+                                    let test_path = exe_dir.join("../Resources/soundfont.sf2");
+                                    if test_path.exists() {
+                                        sf_path = test_path.to_string_lossy().into_owned();
+                                    } else {
+                                        let test_path = exe_dir.join("../Resources/assets/soundfont.sf2");
+                                        if test_path.exists() {
+                                            sf_path = test_path.to_string_lossy().into_owned();
+                                        }
+                                    }
                                 }
                             }
                         }
