@@ -3511,10 +3511,13 @@ impl<'a> VulkanEngine<'a> {
             }
 
             if state.show_hud && state.video_mode != 3 {
+                let total_h = ctx.viewport_rect().height();
+                let min_h = 220.0f32;
+                let top_h = (total_h * state.panel_split_ratio).clamp(min_h, (total_h - min_h).max(min_h));
                 let panel_resp = egui::Panel::top("top_panel")
                     .resizable(false)
                     .frame(egui::Frame::NONE.fill(egui::Color32::TRANSPARENT))
-                    .exact_size(ctx.content_rect().height() * state.panel_split_ratio)
+                    .exact_size(top_h)
                     .show_inside(ctx, |ui| {
                         if state.video_mode == 2 {
                             // Do nothing
@@ -3833,92 +3836,108 @@ impl<'a> VulkanEngine<'a> {
                                 }
                             };
                             
-                            // 1. Title/File Name (Prominent at top, smooth marquee if long)
-                            render_smooth_marquee(&mut columns[2], &file_name, 15.0, true);
-                            
-                            // 2. Artist
-                            columns[2].horizontal(|ui| { ui.label("Artist"); ui.label(&state.artist); });
-                            
-                            // 3. Path / URL (Smooth marquee if long, stretches to the right edge)
-                            let path_label = if is_network { "URL" } else { "Path" };
-                            columns[2].horizontal(|ui| { 
-                                ui.label(path_label); 
-                                render_smooth_marquee(ui, &file_dir, 14.0, false); 
-                            });
-                            
-                            // 4. Type
-                            columns[2].horizontal(|ui| { ui.label("Type"); ui.label(&state.module_type); });
-                            
-                            // 5. Video
-                            if let Some(video) = &state.video_info {
-                                if video == "Unsupported Codec" {
-                                    columns[2].horizontal(|ui| { ui.label("Video"); ui.label(video); });
-                                } else {
-                                    columns[2].horizontal(|ui| { ui.label("Video"); ui.label(format!("{} (Video available: 'v' to view)", video)); });
-                                }
-                            }
-                            
-                            // 6. Track layout parameters
-                            if state.bpm > 0 { columns[2].horizontal(|ui| { ui.label("BPM"); ui.label(format!("{}", state.bpm)); }); }
-                            if state.speed > 0 { columns[2].horizontal(|ui| { ui.label("Speed"); ui.label(format!("{}", state.speed)); }); }
-                            if state.num_patterns > 0 { columns[2].horizontal(|ui| { ui.label("Patterns"); ui.label(format!("{}", state.num_patterns)); }); }
-                            if state.num_instruments > 0 { columns[2].horizontal(|ui| { ui.label("Instruments"); ui.label(format!("{}", state.num_instruments)); }); }
-                            if state.num_samples > 0 { columns[2].horizontal(|ui| { ui.label("Samples"); ui.label(format!("{}", state.num_samples)); }); }
-                            
-                            // 7. Audio technical parameters
-                            columns[2].horizontal(|ui| { ui.label("Sample Rate"); ui.label(format!("{} Hz", state.current_sample_rate as u32)); });
-                            columns[2].horizontal(|ui| { ui.label("Bitrate"); ui.label(state.bitrate.map(|b| format!("{} kbps", b)).unwrap_or_else(|| "Unknown".to_string())); });
-                            columns[2].horizontal(|ui| { 
-                                if let Some(tc) = state.tracker_channels {
-                                    ui.label("Tracker Channels");
-                                    ui.label(format!("{}", tc));
-                                } else {
-                                    ui.label("Channels"); 
-                                    if state.num_channels > state.hardware_channels && state.hardware_channels > 0 {
-                                        ui.label(format!("{} (Downmixed to {})", state.num_channels, state.hardware_channels));
-                                    } else {
-                                        ui.label(format!("{}", state.num_channels));
+                            egui::ScrollArea::vertical()
+                                .id_salt("track_info_scroll")
+                                .show(&mut columns[2], |ui| {
+                                    ui.spacing_mut().item_spacing.y = 4.0;
+                                    
+                                    // 1. Title/File Name (Prominent at top, smooth marquee if long)
+                                    render_smooth_marquee(ui, &file_name, 15.0, true);
+                                    
+                                    // 2. Artist
+                                    ui.horizontal(|ui| { ui.label("Artist"); ui.label(&state.artist); });
+                                    
+                                    // 3. Path / URL (Smooth marquee if long, stretches to the right edge)
+                                    let path_label = if is_network { "URL" } else { "Path" };
+                                    ui.horizontal(|ui| { 
+                                        ui.label(path_label); 
+                                        render_smooth_marquee(ui, &file_dir, 14.0, false); 
+                                    });
+                                    
+                                    // 4. Type
+                                    ui.horizontal(|ui| { ui.label("Type"); ui.label(&state.module_type); });
+                                    
+                                    // 5. Video
+                                    if let Some(video) = &state.video_info {
+                                        if video == "Unsupported Codec" {
+                                            ui.horizontal(|ui| { ui.label("Video"); ui.label(video); });
+                                        } else {
+                                            let msg = if state.has_gamepad {
+                                                let button_name = match state.gamepad_type {
+                                                    crate::state::GamepadType::PlayStation => "Square",
+                                                    crate::state::GamepadType::Nintendo => "Y",
+                                                     _ => "X",
+                                                };
+                                                format!("{} (Video available: 'v' or '{}' to view)", video, button_name)
+                                            } else {
+                                                format!("{} (Video available: 'v' to view)", video)
+                                            };
+                                            ui.horizontal(|ui| { ui.label("Video"); ui.label(msg); });
+                                        }
                                     }
-                                }
-                            });
-                            
-                            columns[2].horizontal(|ui| { 
-                                ui.label("Length"); 
-                                if state.duration_seconds <= 0.0 {
-                                    ui.label("LIVE");
-                                } else {
-                                    ui.label(format!("{:.1}s", state.duration_seconds)); 
-                                }
-                            });
-                            
-                            columns[2].horizontal(|ui| {
-                                ui.label("Device");
-                                let mut current_device = state.selected_audio_device.clone().unwrap_or_else(|| "Default Device".to_string());
-                                let prev_device = current_device.clone();
-                                
-                                egui::ComboBox::from_id_salt("audio_device_combo")
-                                    .selected_text(&current_device)
-                                    .width(ui.available_width().max(80.0))
-                                    .show_ui(ui, |ui| {
-                                        for dev in &state.available_audio_devices {
-                                            ui.selectable_value(&mut current_device, dev.clone(), dev);
+                                    
+                                    // 6. Track layout parameters
+                                    if state.bpm > 0 { ui.horizontal(|ui| { ui.label("BPM"); ui.label(format!("{}", state.bpm)); }); }
+                                    if state.speed > 0 { ui.horizontal(|ui| { ui.label("Speed"); ui.label(format!("{}", state.speed)); }); }
+                                    if state.num_patterns > 0 { ui.horizontal(|ui| { ui.label("Patterns"); ui.label(format!("{}", state.num_patterns)); }); }
+                                    if state.num_instruments > 0 { ui.horizontal(|ui| { ui.label("Instruments"); ui.label(format!("{}", state.num_instruments)); }); }
+                                    if state.num_samples > 0 { ui.horizontal(|ui| { ui.label("Samples"); ui.label(format!("{}", state.num_samples)); }); }
+                                    
+                                    // 7. Audio technical parameters
+                                    ui.horizontal(|ui| { ui.label("Sample Rate"); ui.label(format!("{} Hz", state.current_sample_rate as u32)); });
+                                    ui.horizontal(|ui| { ui.label("Bitrate"); ui.label(state.bitrate.map(|b| format!("{} kbps", b)).unwrap_or_else(|| "Unknown".to_string())); });
+                                    ui.horizontal(|ui| { 
+                                        if let Some(tc) = state.tracker_channels {
+                                            ui.label("Tracker Channels");
+                                            ui.label(format!("{}", tc));
+                                        } else {
+                                            ui.label("Channels"); 
+                                            if state.num_channels > state.hardware_channels && state.hardware_channels > 0 {
+                                                ui.label(format!("{} (Downmixed to {})", state.num_channels, state.hardware_channels));
+                                            } else {
+                                                ui.label(format!("{}", state.num_channels));
+                                            }
                                         }
                                     });
-                                
-                                if current_device != prev_device {
-                                    engine_action = EngineAction::SetAudioDevice(current_device);
-                                }
-                            });
-                            
-                            // 8. Next Song (placed at the bottom, smooth marquee if long)
-                            if state.playlist_index + 1 < state.playlist.len() {
-                                let next_path = std::path::Path::new(&state.playlist[state.playlist_index + 1]);
-                                let next_song = next_path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                                columns[2].horizontal(|ui| { 
-                                    ui.label("Next Song:"); 
-                                    render_smooth_marquee(ui, &next_song, 14.0, false); 
+                                    
+                                    ui.horizontal(|ui| { 
+                                        ui.label("Length"); 
+                                        if state.duration_seconds <= 0.0 {
+                                            ui.label("LIVE");
+                                        } else {
+                                            ui.label(format!("{:.1}s", state.duration_seconds)); 
+                                        }
+                                    });
+                                    
+                                    ui.horizontal(|ui| {
+                                        ui.label("Device");
+                                        let mut current_device = state.selected_audio_device.clone().unwrap_or_else(|| "Default Device".to_string());
+                                        let prev_device = current_device.clone();
+                                        
+                                        egui::ComboBox::from_id_salt("audio_device_combo")
+                                            .selected_text(&current_device)
+                                            .width(ui.available_width().max(80.0))
+                                            .show_ui(ui, |ui| {
+                                                for dev in &state.available_audio_devices {
+                                                    ui.selectable_value(&mut current_device, dev.clone(), dev);
+                                                }
+                                            });
+                                        
+                                        if current_device != prev_device {
+                                            engine_action = EngineAction::SetAudioDevice(current_device);
+                                        }
+                                    });
+                                    
+                                    // 8. Next Song (placed at the bottom, smooth marquee if long)
+                                    if state.playlist_index + 1 < state.playlist.len() {
+                                        let next_path = std::path::Path::new(&state.playlist[state.playlist_index + 1]);
+                                        let next_song = next_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                                        ui.horizontal(|ui| { 
+                                            ui.label("Next Song:"); 
+                                            render_smooth_marquee(ui, &next_song, 14.0, false); 
+                                        });
+                                    }
                                 });
-                            }
                             
                             out_track_info_rect = Some(columns[2].min_rect());
                         }
@@ -3948,8 +3967,11 @@ impl<'a> VulkanEngine<'a> {
                     }
                     if response.dragged() {
                         if let Some(mouse_pos) = response.interact_pointer_pos() {
+                            let min_h = 220.0f32;
+                            let min_r = min_h / total_height;
+                            let max_r = (total_height - min_h) / total_height;
                             let new_ratio = mouse_pos.y / total_height;
-                            engine_action = EngineAction::SetSplitRatio(new_ratio.clamp(0.15, 0.85));
+                            engine_action = EngineAction::SetSplitRatio(new_ratio.clamp(min_r.min(max_r), min_r.max(max_r)));
                         }
                     }
                 });

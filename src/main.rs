@@ -300,7 +300,7 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
     let mut rfd_pending = false;
 
     let mut modifiers = winit::keyboard::ModifiersState::empty();
-    let frame_count = 0u32;
+    let mut bench_frame_count = 0u32;
     let mut bench_start: Option<std::time::Instant> = None;
 
     #[allow(deprecated)]
@@ -844,6 +844,15 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                             }
                         }
 
+                        // Clamp panel split ratio to ensure both top and bottom panels have at least 220px height
+                        let total_h = engine.config.height as f32 / window.scale_factor() as f32;
+                        if total_h > 0.0 {
+                            let min_h = 220.0f32;
+                            let min_r = (min_h / total_h).clamp(0.0, 1.0);
+                            let max_r = ((total_h - min_h) / total_h).clamp(0.0, 1.0);
+                            state.panel_split_ratio = state.panel_split_ratio.clamp(min_r.min(max_r), min_r.max(max_r));
+                        }
+
                         engine.update(&state, dt);
                     }
                     let phase_lock_update_us = phase_timer.elapsed().as_micros() as f32;
@@ -908,22 +917,21 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                             }
                         }
 
-                        if let Some(bench_seconds) = bench {
-                            if let Some(start) = bench_start {
-                                if start.elapsed().as_secs_f32() >= bench_seconds as f32 {
-                                    let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
-                                    println!("BENCHMARK_RESULT_VISUALIZER: {}", vis_def.name);
-                                    println!("BENCHMARK_RESULT_FPS: {:.2}", state.current_fps);
-                                    println!("BENCHMARK_RESULT_SHADER_US: {:.2}", state.stats.shader_us);
-                                    println!("BENCHMARK_RESULT_RENDER_US: {:.2}", state.stats.render_us);
-                                    println!("BENCHMARK_RESULT_UI_US: {:.2}", state.stats.ui_us);
-                                    println!("BENCHMARK_RESULT_DECODE_US: {:.2}", state.stats.decode_us);
-                                    println!("BENCHMARK_RESULT_FFT_US: {:.2}", state.stats.fft_us);
-                                    println!("BENCHMARK_RESULT_GPU_FFT_US: {:.2}", state.stats.gpu_fft_us);
-                                    println!("BENCHMARK_RESULT_FIRE_US: {:.2}", state.stats.fire_us);
-                                    elwt.exit();
-                                    return;
-                                }
+                        if let Some(bench_frames) = bench {
+                            bench_frame_count += 1;
+                            if bench_frame_count >= bench_frames {
+                                let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
+                                println!("BENCHMARK_RESULT_VISUALIZER: {}", vis_def.name);
+                                println!("BENCHMARK_RESULT_FPS: {:.2}", state.current_fps);
+                                println!("BENCHMARK_RESULT_SHADER_US: {:.2}", state.stats.shader_us);
+                                println!("BENCHMARK_RESULT_RENDER_US: {:.2}", state.stats.render_us);
+                                println!("BENCHMARK_RESULT_UI_US: {:.2}", state.stats.ui_us);
+                                println!("BENCHMARK_RESULT_DECODE_US: {:.2}", state.stats.decode_us);
+                                println!("BENCHMARK_RESULT_FFT_US: {:.2}", state.stats.fft_us);
+                                println!("BENCHMARK_RESULT_GPU_FFT_US: {:.2}", state.stats.gpu_fft_us);
+                                println!("BENCHMARK_RESULT_FIRE_US: {:.2}", state.stats.fire_us);
+                                elwt.exit();
+                                return;
                             }
                         }
                         
@@ -1076,7 +1084,16 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                         }
                         
                         // File picker state
-                        state.is_file_picker_open = *file_dialog.state() != egui_file_dialog::DialogState::Closed;
+                        let fd_state = file_dialog.state();
+                        state.is_file_picker_open = *fd_state == egui_file_dialog::DialogState::Open;
+                        if *fd_state == egui_file_dialog::DialogState::Cancelled {
+                            file_dialog = egui_file_dialog::FileDialog::new()
+                                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                                .initial_directory(initial_dir.clone())
+                                .add_file_filter_extensions("Audio/Video Files", vec!["flac", "wav", "mp3", "ogg", "aac", "m4a", "mp4", "mkv", "avi", "webm", "opus", "mod", "s3m", "xm", "it", "stm", "669", "mtm", "med", "okt", "psm", "dawproject", "aaf", "mid", "midi"])
+                                .show_all_files_filter(true)
+                                .default_file_filter("Audio/Video Files");
+                        }
                         if state.open_file_request && !state.is_file_picker_open {
                             state.open_file_request = false;
                             state.is_file_picker_open = true;
@@ -1141,7 +1158,7 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                 }
             },
             Event::AboutToWait => {
-                    let is_dialog_open = *file_dialog.state() != egui_file_dialog::DialogState::Closed || {
+                    let is_dialog_open = *file_dialog.state() == egui_file_dialog::DialogState::Open || {
                         let state = app_state.lock().unwrap();
                         state.is_url_dialog_open
                     };
