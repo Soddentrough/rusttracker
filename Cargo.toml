@@ -71,18 +71,4 @@ opt-level = 3
 lto = "thin"
 strip = true
 
-[[bin]]
-name = "alsa_test2"
-path = "src/bin/alsa_test2.rs"
 
-[[bin]]
-name = "alsa_test3"
-path = "src/bin/alsa_test3.rs"
-
-[[bin]]
-name = "alsa_ffmpeg_test"
-path = "src/bin/alsa_ffmpeg_test.rs"
-
-[[bin]]
-name = "alsa_test4"
-path = "src/bin/alsa_test4.rs"
