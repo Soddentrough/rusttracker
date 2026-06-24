@@ -128,6 +128,7 @@ pub struct AppState {
     pub bitrate: Option<u32>,
     pub current_seconds: f64,
     pub seek_request: Option<f64>,
+    pub scrub_target_seconds: Option<f64>,
     pub seek_epoch: u64,
     pub is_paused: bool,
     pub bpm: i32,
@@ -282,6 +283,7 @@ impl AppState {
             bitrate: None,
             current_seconds: 0.0,
             seek_request: None,
+            scrub_target_seconds: None,
             seek_epoch: 0,
             is_paused: true, // Start paused to prevent audio playback before UI is ready
             bpm: 0,
@@ -369,6 +371,7 @@ impl AppState {
             bitrate: self.bitrate,
             current_seconds: self.current_seconds,
             seek_request: None,
+            scrub_target_seconds: self.scrub_target_seconds,
             seek_epoch: self.seek_epoch,
             is_paused: self.is_paused,
             visual_width: self.visual_width,

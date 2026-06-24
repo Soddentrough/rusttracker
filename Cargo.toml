@@ -1,6 +1,6 @@
 [package]
 name = "rusttracker"
-version = "0.9.8"
+version = "0.9.9"
 edition = "2024"
 default-run = "rusttracker"
 description = "High-Performance Vulkan Tracker Module Visualizer"
@@ -67,7 +67,22 @@ objc2 = "0.6.4"
 objc2-core-audio = "0.3.2"
 
 [profile.release]
-opt-level = "z"
-lto = true
-codegen-units = 1
+opt-level = 3
+lto = "thin"
 strip = true
+
+[[bin]]
+name = "alsa_test2"
+path = "src/bin/alsa_test2.rs"
+
+[[bin]]
+name = "alsa_test3"
+path = "src/bin/alsa_test3.rs"
+
+[[bin]]
+name = "alsa_ffmpeg_test"
+path = "src/bin/alsa_ffmpeg_test.rs"
+
+[[bin]]
+name = "alsa_test4"
+path = "src/bin/alsa_test4.rs"

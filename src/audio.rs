@@ -21,17 +21,23 @@ use crossbeam_channel::{bounded, unbounded, Sender, Receiver};
 
 #[allow(dead_code)]
 pub enum PlaybackHandle {
-    Cpal(cpal::Stream),
+    Cpal(cpal::Stream, Arc<std::sync::atomic::AtomicBool>),
     Bitstream(std::thread::JoinHandle<()>, Arc<std::sync::atomic::AtomicBool>),
     Dummy(std::thread::JoinHandle<()>, Arc<std::sync::atomic::AtomicBool>),
 }
 
 impl Drop for PlaybackHandle {
     fn drop(&mut self) {
-        if let PlaybackHandle::Bitstream(_, stop_token) = self {
-            stop_token.store(true, std::sync::atomic::Ordering::Relaxed);
-        } else if let PlaybackHandle::Dummy(_, stop_token) = self {
-            stop_token.store(true, std::sync::atomic::Ordering::Relaxed);
+        match self {
+            PlaybackHandle::Cpal(_, stop_token) => {
+                stop_token.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            PlaybackHandle::Bitstream(_, stop_token) => {
+                stop_token.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            PlaybackHandle::Dummy(_, stop_token) => {
+                stop_token.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
         }
     }
 }
@@ -262,7 +268,11 @@ pub fn spawn_dsp_thread(
                 
                 if msg.bpm != 0 { state.bpm = msg.bpm; }
                 if msg.speed != 0 { state.speed = msg.speed; }
-                state.current_seconds = msg.current_seconds;
+                if state.duration_seconds > 0.0 {
+                    state.current_seconds = msg.current_seconds.min(state.duration_seconds);
+                } else {
+                    state.current_seconds = msg.current_seconds;
+                }
                 state.current_tracker_row_string = msg.current_row_string;
                 
                 if state.current_tracker_order != msg.current_order || state.current_tracker_row != msg.current_row {
@@ -1086,11 +1096,17 @@ impl AudioSource for FfmpegSource {
     fn get_position_seconds(&mut self) -> f64 { self.current_time }
     
     fn set_position_seconds(&mut self, pos: f64) {
-        let pts = (pos * ffmpeg_next::ffi::AV_TIME_BASE as f64) as i64;
+        let (stream_idx, pts) = if let (Some(v_idx), Some(tb)) = (self.video_stream_index, self.video_time_base) {
+            let tb_f64 = tb.numerator() as f64 / tb.denominator() as f64;
+            (v_idx as i32, (pos / tb_f64) as i64)
+        } else {
+            (self.stream_index as i32, (pos / self.time_base) as i64)
+        };
+        
         unsafe {
             ffmpeg_next::ffi::av_seek_frame(
                 self.ictx.as_mut_ptr(),
-                -1,
+                stream_idx,
                 pts,
                 ffmpeg_next::ffi::AVSEEK_FLAG_BACKWARD
             );
@@ -1201,11 +1217,17 @@ impl AudioSource for VideoOnlySource {
     fn get_position_seconds(&mut self) -> f64 { self.current_time }
     
     fn set_position_seconds(&mut self, pos: f64) {
-        let pts = (pos * ffmpeg_next::ffi::AV_TIME_BASE as f64) as i64;
+        let (stream_idx, pts) = if let Some(tb) = self.video_time_base {
+            let tb_f64 = tb.numerator() as f64 / tb.denominator() as f64;
+            (self.video_stream_index as i32, (pos / tb_f64) as i64)
+        } else {
+            (-1, (pos * ffmpeg_next::ffi::AV_TIME_BASE as f64) as i64)
+        };
+        
         unsafe {
             ffmpeg_next::ffi::av_seek_frame(
                 self.ictx.as_mut_ptr(),
-                -1,
+                stream_idx,
                 pts,
                 ffmpeg_next::ffi::AVSEEK_FLAG_BACKWARD
             );
@@ -1252,6 +1274,20 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
     let mut duration = ictx.duration() as f64 / ffmpeg_next::ffi::AV_TIME_BASE as f64;
     if is_network || duration < 0.0 {
         duration = 0.0;
+    }
+    
+    if duration <= 0.0 {
+        let mut max_stream_duration = 0.0;
+        for stream in ictx.streams() {
+            let tb = stream.time_base();
+            let sd = stream.duration() as f64 * (tb.numerator() as f64 / tb.denominator() as f64);
+            if sd > max_stream_duration {
+                max_stream_duration = sd;
+            }
+        }
+        if max_stream_duration > 0.0 {
+            duration = max_stream_duration;
+        }
     }
     
     let ext = std::path::Path::new(file_path)
@@ -1666,167 +1702,233 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
             cpal::SampleFormat::U16 => run_mic::<u16>(&device, &config, shared_state, tx, config.sample_rate),
             _ => return Err(anyhow::anyhow!("Unsupported sample format")),
         }?;
-        return Ok(PlaybackHandle::Cpal(stream));
+        return Ok(PlaybackHandle::Cpal(stream, Arc::new(std::sync::atomic::AtomicBool::new(false))));
     }
 
     let shared_state_closure = shared_state.clone();
-    let cpal_stream_result = (|| -> Result<cpal::Stream> {
+    let cpal_stream_result = (|| -> Result<(cpal::Stream, Arc<std::sync::atomic::AtomicBool>)> {
         let selected_device_name = {
             let state = shared_state_closure.lock().unwrap();
             state.selected_audio_device.clone()
         };
-        let mut dev = None;
-        if let Some(ref name) = selected_device_name {
-            if let Ok(devices) = host.output_devices() {
-                for d in devices {
-                    if let Ok(desc) = d.description() {
-                        let d_name = desc.name();
-                        if d_name == name {
-                            dev = Some(d);
-                            break;
+        
+        let devices_to_try = if let Some(ref name) = selected_device_name {
+            let mut candidates = Vec::new();
+            let mut is_default = false;
+            
+            // ALSA WORKAROUND: If the user selected the default device by name, ensure we use the REAL default host handle.
+            // Matching by name in the output_devices() iterator on Linux can inadvertently pick a raw hardware endpoint 
+            // that bypasses PulseAudio/PipeWire and fails with ALSA `unable to open slave` lock errors.
+            if let Some(default_dev) = host.default_output_device() {
+                if let Ok(desc) = default_dev.description() {
+                    if &desc.name() == name {
+                        candidates.push(default_dev);
+                        is_default = true;
+                    }
+                }
+            }
+            
+            if !is_default {
+                if let Ok(devices) = host.output_devices() {
+                    for d in devices {
+                        if let Ok(desc) = d.description() {
+                            if &desc.name() == name {
+                                candidates.push(d);
+                                break;
+                            }
                         }
                     }
                 }
             }
-        }
-        let device = if let Some(d) = dev {
-            d
-        } else {
-            host.default_output_device().context("No output device available")?
-        };
-
-        let supported_config = {
-            let supported_configs_range = device.supported_output_configs().context("error while querying output configs")?;
-            let mut configs: Vec<_> = supported_configs_range
-                .filter(|c| {
-                    c.sample_format() == cpal::SampleFormat::F32 || c.sample_format() == cpal::SampleFormat::I16
-                })
-                .collect();
-                
-            configs.sort_by_key(|c| {
-                let ch_match = c.channels() == target_channels;
-                let stereo = c.channels() >= 2;
-                let rate_match = c.min_sample_rate() <= target_rate && c.max_sample_rate() >= target_rate;
-                
-                (
-                    std::cmp::Reverse(ch_match),
-                    std::cmp::Reverse(stereo),
-                    std::cmp::Reverse(rate_match),
-                    std::cmp::Reverse(c.channels())
-                )
-            });
             
-            configs.into_iter()
-                .next()
-                .map(|c| {
-                    let rate = if c.min_sample_rate() <= target_rate && c.max_sample_rate() >= target_rate {
-                        target_rate
-                    } else {
-                        c.max_sample_rate()
-                    };
-                    c.with_sample_rate(rate)
-                })
-                .or_else(|| device.default_output_config().ok())
-                .context("No supported config?!")?
+            if candidates.is_empty() {
+                return Err(anyhow::anyhow!("Selected audio device '{}' not found", name));
+            }
+            candidates
+        } else {
+            let mut candidates = Vec::new();
+            if let Some(default_dev) = host.default_output_device() {
+                candidates.push(default_dev);
+            }
+            if let Ok(devices) = host.output_devices() {
+                for d in devices {
+                    if let Some(default_dev) = host.default_output_device() {
+                        if let (Ok(desc1), Ok(desc2)) = (d.description(), default_dev.description()) {
+                            if desc1.name() == desc2.name() {
+                                continue;
+                            }
+                        }
+                    }
+                    candidates.push(d);
+                }
+            }
+            candidates
         };
 
-        let config: cpal::StreamConfig = supported_config.clone().into();
-        let (tx, rx) = bounded::<DspMessage>(32);
-        
-        let mut audio_source = audio_source_opt.take().unwrap();
-        
-        {
-            let mut state = shared_state_closure.lock().unwrap();
-            state.track_ended = false;
-            state.artist = audio_source.get_artist();
-            state.module_type = audio_source.get_type();
-            state.duration_seconds = audio_source.get_duration_seconds();
-            let tracker_channels = audio_source.get_tracker_channels();
-            state.num_channels = if let Some(tc) = tracker_channels {
-                tc + 2
-            } else {
-                audio_source.get_num_channels()
-            };
-            state.hardware_channels = config.channels as i32;
-            state.channel_vus = vec![0.0; state.num_channels as usize];
-            state.peak_vus = vec![0.0; state.num_channels as usize];
-            state.bpm = audio_source.get_tempo();
-            state.speed = audio_source.get_speed();
-            state.video_info = audio_source.get_video_info();
-            state.max_frequency = audio_source.get_intrinsic_sample_rate()
-                .map(|r| r as f32 / 2.0)
-                .unwrap_or(10000.0);
-            state.current_sample_rate = config.sample_rate as f32;
-            state.num_samples = audio_source.get_num_samples();
-            state.num_instruments = audio_source.get_num_instruments();
-            state.num_patterns = audio_source.get_num_patterns();
-            state.bitrate = audio_source.get_bitrate();
-            state.tracker_channels = tracker_channels;
-            state.tracker_patterns_by_order = audio_source.pre_format_tracker_data();
+        if devices_to_try.is_empty() {
+            return Err(anyhow::anyhow!("No audio output devices found."));
         }
 
-        let max_frequency = { shared_state_closure.lock().unwrap().max_frequency };
-        let window_size = (((config.sample_rate as f32 * 0.185).round() as usize) / 2) * 2;
-        let window_size = window_size.max(2048).min(65536);
-        
-        spawn_dsp_thread(rx, shared_state_closure.clone(), config.sample_rate, max_frequency, window_size);
+        let mut last_err = anyhow::anyhow!("No candidate audio device succeeded");
+        for device in devices_to_try {
+            let device_name = device.description().map(|desc| desc.name().to_string()).unwrap_or_else(|_| "Unknown Device".to_string());
+            
+            // Re-load the audio source for this attempt to ensure it is fresh
+            let mut attempt_audio_source_opt = if mic { None } else { Some(load_audio_source(file_path)?) };
+            
+            let result = (|| -> Result<(cpal::Stream, Arc<std::sync::atomic::AtomicBool>)> {
+                let supported_config = {
+                    let supported_configs_range = device.supported_output_configs().context("error while querying output configs")?;
+                    let mut configs: Vec<_> = supported_configs_range
+                        .filter(|c| {
+                            c.sample_format() == cpal::SampleFormat::F32 || c.sample_format() == cpal::SampleFormat::I16
+                        })
+                        .collect();
+                        
+                    configs.sort_by_key(|c| {
+                        let ch_match = c.channels() == target_channels;
+                        let stereo = c.channels() >= 2;
+                        let rate_match = c.min_sample_rate() <= target_rate && c.max_sample_rate() >= target_rate;
+                        
+                        (
+                            std::cmp::Reverse(ch_match),
+                            std::cmp::Reverse(stereo),
+                            std::cmp::Reverse(rate_match),
+                            std::cmp::Reverse(c.channels())
+                        )
+                    });
+                    
+                    configs.into_iter()
+                        .next()
+                        .map(|c| {
+                            let rate = if c.min_sample_rate() <= target_rate && c.max_sample_rate() >= target_rate {
+                                target_rate
+                            } else {
+                                c.max_sample_rate()
+                            };
+                            c.with_sample_rate(rate)
+                        })
+                        .or_else(|| device.default_output_config().ok())
+                        .context("No supported config?!")?
+                };
 
-        let stream = match supported_config.sample_format() {
-            cpal::SampleFormat::F32 => run::<f32>(&device, &config, audio_source, shared_state_closure.clone(), tx, config.sample_rate, max_frequency, window_size),
-            cpal::SampleFormat::I16 => run::<i16>(&device, &config, audio_source, shared_state_closure.clone(), tx, config.sample_rate, max_frequency, window_size),
-            cpal::SampleFormat::U16 => run::<u16>(&device, &config, audio_source, shared_state_closure.clone(), tx, config.sample_rate, max_frequency, window_size),
-            _ => return Err(anyhow::anyhow!("Unsupported sample format")),
-        }?;
+                let config: cpal::StreamConfig = supported_config.clone().into();
+                let (tx, rx) = bounded::<DspMessage>(32);
+                
+                let audio_source = attempt_audio_source_opt.as_mut().ok_or_else(|| anyhow::anyhow!("No audio source available"))?;
+                
+                {
+                    let mut state = shared_state_closure.lock().unwrap();
+                    state.track_ended = false;
+                    state.artist = audio_source.get_artist();
+                    state.module_type = audio_source.get_type();
+                    state.duration_seconds = audio_source.get_duration_seconds();
+                    let tracker_channels = audio_source.get_tracker_channels();
+                    state.num_channels = if let Some(tc) = tracker_channels {
+                        tc + 2
+                    } else {
+                        audio_source.get_num_channels()
+                    };
+                    state.hardware_channels = config.channels as i32;
+                    state.channel_vus = vec![0.0; state.num_channels as usize];
+                    state.peak_vus = vec![0.0; state.num_channels as usize];
+                    state.bpm = audio_source.get_tempo();
+                    state.speed = audio_source.get_speed();
+                    state.video_info = audio_source.get_video_info();
+                    state.max_frequency = audio_source.get_intrinsic_sample_rate()
+                        .map(|r| r as f32 / 2.0)
+                        .unwrap_or(10000.0);
+                    state.current_sample_rate = config.sample_rate as f32;
+                    state.num_samples = audio_source.get_num_samples();
+                    state.num_instruments = audio_source.get_num_instruments();
+                    state.num_patterns = audio_source.get_num_patterns();
+                    state.bitrate = audio_source.get_bitrate();
+                    state.tracker_channels = tracker_channels;
+                    state.tracker_patterns_by_order = audio_source.pre_format_tracker_data();
+                }
 
-        stream.play().context("Failed to play stream")?;
-        Ok(stream)
+                let max_frequency = { shared_state_closure.lock().unwrap().max_frequency };
+                let window_size = (((config.sample_rate as f32 * 0.185).round() as usize) / 2) * 2;
+                let window_size = window_size.max(2048).min(65536);
+                
+                spawn_dsp_thread(rx, shared_state_closure.clone(), config.sample_rate, max_frequency, window_size);
+
+                let (stream, stop_token) = match supported_config.sample_format() {
+                    cpal::SampleFormat::F32 => run::<f32>(&device, &config, &mut attempt_audio_source_opt, shared_state_closure.clone(), tx, config.sample_rate, max_frequency, window_size),
+                    cpal::SampleFormat::I16 => run::<i16>(&device, &config, &mut attempt_audio_source_opt, shared_state_closure.clone(), tx, config.sample_rate, max_frequency, window_size),
+                    cpal::SampleFormat::U16 => run::<u16>(&device, &config, &mut attempt_audio_source_opt, shared_state_closure.clone(), tx, config.sample_rate, max_frequency, window_size),
+                    _ => return Err(anyhow::anyhow!("Unsupported sample format")),
+                }?;
+
+                stream.play().context("Failed to play stream")?;
+                Ok((stream, stop_token))
+            })();
+
+            match result {
+                Ok((stream, stop_token)) => {
+                    return Ok((stream, stop_token));
+                }
+                Err(err) => {
+                    eprintln!("Warning: Failed to create/play audio stream on device '{}': {:?}", device_name, err);
+                    last_err = err;
+                }
+            }
+        }
+
+        Err(last_err)
     })();
 
     match cpal_stream_result {
-        Ok(stream) => Ok(PlaybackHandle::Cpal(stream)),
+        Ok((stream, stop_token)) => Ok(PlaybackHandle::Cpal(stream, stop_token)),
         Err(err) => {
+            if mic {
+                return Err(err);
+            }
             eprintln!("Warning: CPAL audio stream creation failed: {:?}. Falling back to silent dummy device.", err);
             
-            let mut audio_source = audio_source_opt.take().unwrap();
-            let sample_rate = target_rate;
-            let window_size = (((sample_rate as f32 * 0.185).round() as usize) / 2) * 2;
-            let window_size = window_size.max(2048).min(65536);
-            let (tx, rx) = bounded::<DspMessage>(32);
-            
-            {
-                let mut state = shared_state.lock().unwrap();
-                state.track_ended = false;
-                state.artist = audio_source.get_artist();
-                state.module_type = audio_source.get_type();
-                state.duration_seconds = audio_source.get_duration_seconds();
-                let tracker_channels = audio_source.get_tracker_channels();
-                state.num_channels = if let Some(tc) = tracker_channels {
-                    tc + 2
-                } else {
-                    audio_source.get_num_channels()
-                };
-                state.hardware_channels = 2;
-                state.channel_vus = vec![0.0; state.num_channels as usize];
-                state.peak_vus = vec![0.0; state.num_channels as usize];
-                state.bpm = audio_source.get_tempo();
-                state.speed = audio_source.get_speed();
-                state.video_info = audio_source.get_video_info();
-                state.max_frequency = audio_source.get_intrinsic_sample_rate()
-                    .map(|r| r as f32 / 2.0)
-                    .unwrap_or(10000.0);
-                state.current_sample_rate = sample_rate as f32;
-                state.num_samples = audio_source.get_num_samples();
-                state.num_instruments = audio_source.get_num_instruments();
-                state.num_patterns = audio_source.get_num_patterns();
-                state.bitrate = audio_source.get_bitrate();
-                state.tracker_channels = tracker_channels;
-                state.tracker_patterns_by_order = audio_source.pre_format_tracker_data();
-            }
+            if let Some(mut audio_source) = audio_source_opt.take() {
+                let sample_rate = target_rate;
+                let window_size = (((sample_rate as f32 * 0.185).round() as usize) / 2) * 2;
+                let window_size = window_size.max(2048).min(65536);
+                let (tx, rx) = bounded::<DspMessage>(32);
+                
+                {
+                    let mut state = shared_state.lock().unwrap();
+                    state.track_ended = false;
+                    state.artist = audio_source.get_artist();
+                    state.module_type = audio_source.get_type();
+                    state.duration_seconds = audio_source.get_duration_seconds();
+                    let tracker_channels = audio_source.get_tracker_channels();
+                    state.num_channels = if let Some(tc) = tracker_channels {
+                        tc + 2
+                    } else {
+                        audio_source.get_num_channels()
+                    };
+                    state.hardware_channels = 2;
+                    state.channel_vus = vec![0.0; state.num_channels as usize];
+                    state.peak_vus = vec![0.0; state.num_channels as usize];
+                    state.bpm = audio_source.get_tempo();
+                    state.speed = audio_source.get_speed();
+                    state.video_info = audio_source.get_video_info();
+                    state.max_frequency = audio_source.get_intrinsic_sample_rate()
+                        .map(|r| r as f32 / 2.0)
+                        .unwrap_or(10000.0);
+                    state.current_sample_rate = sample_rate as f32;
+                    state.num_samples = audio_source.get_num_samples();
+                    state.num_instruments = audio_source.get_num_instruments();
+                    state.num_patterns = audio_source.get_num_patterns();
+                    state.bitrate = audio_source.get_bitrate();
+                    state.tracker_channels = tracker_channels;
+                    state.tracker_patterns_by_order = audio_source.pre_format_tracker_data();
+                }
 
-            let max_frequency = { shared_state.lock().unwrap().max_frequency };
-            spawn_dsp_thread(rx, shared_state.clone(), sample_rate, max_frequency, window_size);
-            
-            run_dummy(audio_source, shared_state, tx, sample_rate, window_size)
+                let max_frequency = { shared_state.lock().unwrap().max_frequency };
+                spawn_dsp_thread(rx, shared_state.clone(), sample_rate, max_frequency, window_size);
+                
+                run_dummy(audio_source, shared_state, tx, sample_rate, window_size)
+            } else {
+                Err(anyhow::anyhow!("CPAL audio stream creation failed: {:?}, and no audio source was available for fallback.", err))
+            }
         }
     }
 }
@@ -1839,6 +1941,8 @@ fn run_dummy(
     sample_rate: u32,
     window_size: usize,
 ) -> Result<PlaybackHandle> {
+    let stop_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_token_clone = stop_token.clone();
     let hardware_channels = 2;
     let chunk_frames = 1024;
     let pool_size = 64; 
@@ -1878,6 +1982,7 @@ fn run_dummy(
         
         let state_for_video = shared_state.clone();
         let video_packet_rx_for_video = video_packet_rx.clone();
+        let stop_token_video = stop_token.clone();
         std::thread::spawn(move || {
             if let Ok(context) = ffmpeg_next::codec::context::Context::from_parameters(params) {
                 if let Ok(mut decoder) = context.decoder().video() {
@@ -1886,145 +1991,160 @@ fn run_dummy(
                     let mut fallback_pts_seconds = 0.0;
                     let mut is_first_frame_after_seek = false;
                     
-                    while let Ok((packet_epoch, packet)) = video_packet_rx_for_video.recv() {
-                        {
-                            let state = state_for_video.lock().unwrap();
-                            if state.seek_epoch > local_epoch {
-                                decoder.flush();
-                                local_epoch = state.seek_epoch;
-                                is_first_frame_after_seek = true;
-                            }
-                        }
-                        
-                        if packet_epoch < local_epoch {
-                            continue;
-                        }
-                        
-                        if decoder.send_packet(&packet).is_ok() {
-                            let mut decoded = ffmpeg_next::frame::Video::empty();
-                            while decoder.receive_frame(&mut decoded).is_ok() {
-                                let mut pts = decoded.timestamp().map(|t| t as f64 * tb)
-                                    .or_else(|| decoded.pts().map(|p| p as f64 * tb))
-                                    .unwrap_or(-1.0);
-                                    
-                                if pts < 0.0 {
-                                    pts = fallback_pts_seconds;
-                                    fallback_pts_seconds += 1.0 / 30.0;
-                                } else {
-                                    fallback_pts_seconds = pts + (1.0 / 30.0);
-                                }
-                                
-                                let mut skip_push = false;
-                                if is_first_frame_after_seek {
-                                    is_first_frame_after_seek = false;
-                                } else {
-                                    let sync_start = std::time::Instant::now();
-                                    loop {
-                                        let (cached_seconds, current_epoch, is_paused, track_ended) = {
-                                            let state = state_for_video.lock().unwrap();
-                                            (state.current_seconds, state.seek_epoch, state.is_paused, state.track_ended)
-                                        };
-                                        
-                                        if track_ended || current_epoch > local_epoch {
-                                            skip_push = true;
-                                            break;
-                                        }
-                                        
-                                        if pts < cached_seconds - 0.05 {
-                                            skip_push = true;
-                                            break;
-                                        }
-                                        
-                                        if pts <= cached_seconds + 0.05 {
-                                            break;
-                                        }
-                                        
-                                        if sync_start.elapsed() > std::time::Duration::from_millis(500) {
-                                            skip_push = true;
-                                            break;
-                                        }
-                                        
-                                        let sleep_dur = if is_paused { 50 } else { 5 };
-                                        std::thread::sleep(std::time::Duration::from_millis(sleep_dur));
+                    while !stop_token_video.load(std::sync::atomic::Ordering::Relaxed) {
+                        match video_packet_rx_for_video.recv_timeout(std::time::Duration::from_millis(50)) {
+                            Ok((packet_epoch, packet)) => {
+                                {
+                                    let state = state_for_video.lock().unwrap();
+                                    if state.seek_epoch > local_epoch {
+                                        decoder.flush();
+                                        local_epoch = state.seek_epoch;
+                                        is_first_frame_after_seek = true;
                                     }
                                 }
                                 
-                                if skip_push {
+                                if packet_epoch < local_epoch {
                                     continue;
                                 }
                                 
-                                let mut frame_opt = None;
-                                loop {
-                                    let (current_epoch, is_paused, track_ended) = {
-                                        let state = state_for_video.lock().unwrap();
-                                        (state.seek_epoch, state.is_paused, state.track_ended)
-                                    };
-                                    if track_ended || current_epoch > local_epoch {
-                                        skip_push = true;
-                                        break;
-                                    }
-                                    match free_video_frame_rx.recv_timeout(std::time::Duration::from_millis(10)) {
-                                        Ok(f) => {
-                                            frame_opt = Some(f);
-                                            break;
-                                        }
-                                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                                            let sleep_dur = if is_paused { 50 } else { 5 };
-                                            std::thread::sleep(std::time::Duration::from_millis(sleep_dur));
-                                        }
-                                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                                if decoder.send_packet(&packet).is_ok() {
+                                    let mut decoded = ffmpeg_next::frame::Video::empty();
+                                    while decoder.receive_frame(&mut decoded).is_ok() {
+                                        if stop_token_video.load(std::sync::atomic::Ordering::Relaxed) {
                                             return;
                                         }
-                                    }
-                                }
-                                
-                                if skip_push {
-                                    continue;
-                                }
-                                
-                                if let Some(mut frame) = frame_opt {
-                                    frame.pts = pts;
-                                    frame.width = decoded.width();
-                                    frame.height = decoded.height();
-                                    
-                                    let format_name = format!("{:?}", decoded.format());
-                                    frame.bit_depth = if format_name.contains("10LE") { 10 } else if format_name.contains("12LE") { 12 } else { 8 };
-                                    frame.color_space = decoded.color_space() as u32;
-                                    frame.color_range = decoded.color_range() as u32;
-                                    frame.color_trc = decoded.color_transfer_characteristic() as u32;
-                                    
-                                    frame.y_stride = decoded.stride(0);
-                                    frame.u_stride = decoded.stride(1);
-                                    frame.v_stride = decoded.stride(2);
-                                    
-                                    let height = decoded.height() as usize;
-                                    let y_len = frame.y_stride * height;
-                                    let u_len = frame.u_stride * (height / 2);
-                                    let v_len = frame.v_stride * (height / 2);
-                                    
-                                    frame.y_plane.clear();
-                                    let y_plane = decoded.data(0);
-                                    if y_len <= y_plane.len() {
-                                        frame.y_plane.extend_from_slice(&y_plane[..y_len]);
-                                    }
-                                    
-                                    frame.u_plane.clear();
-                                    let u_plane = decoded.data(1);
-                                    if u_len <= u_plane.len() {
-                                        frame.u_plane.extend_from_slice(&u_plane[..u_len]);
-                                    }
-                                    
-                                    frame.v_plane.clear();
-                                    let v_plane = decoded.data(2);
-                                    if v_len <= v_plane.len() {
-                                        frame.v_plane.extend_from_slice(&v_plane[..v_len]);
-                                    }
-                                    
-                                    if let Err(crossbeam_channel::TrySendError::Full(f)) = video_frame_tx.try_send(frame) {
-                                        let _ = free_video_frame_tx.try_send(f);
+                                        let mut pts = decoded.timestamp().map(|t| t as f64 * tb)
+                                            .or_else(|| decoded.pts().map(|p| p as f64 * tb))
+                                            .unwrap_or(-1.0);
+                                            
+                                        if pts < 0.0 {
+                                            pts = fallback_pts_seconds;
+                                            fallback_pts_seconds += 1.0 / 30.0;
+                                        } else {
+                                            fallback_pts_seconds = pts + (1.0 / 30.0);
+                                        }
+                                        
+                                        let mut skip_push = false;
+                                        if is_first_frame_after_seek {
+                                            is_first_frame_after_seek = false;
+                                        } else {
+                                            let sync_start = std::time::Instant::now();
+                                            loop {
+                                                if stop_token_video.load(std::sync::atomic::Ordering::Relaxed) {
+                                                    return;
+                                                }
+                                                let (cached_seconds, current_epoch, is_paused, track_ended) = {
+                                                    let state = state_for_video.lock().unwrap();
+                                                    (state.current_seconds, state.seek_epoch, state.is_paused, state.track_ended)
+                                                };
+                                                
+                                                if track_ended || current_epoch > local_epoch {
+                                                    skip_push = true;
+                                                    break;
+                                                }
+                                                
+                                                if pts < cached_seconds - 0.05 {
+                                                    skip_push = true;
+                                                    break;
+                                                }
+                                                
+                                                if pts <= cached_seconds + 0.05 {
+                                                    break;
+                                                }
+                                                
+                                                if sync_start.elapsed() > std::time::Duration::from_millis(500) {
+                                                    skip_push = true;
+                                                    break;
+                                                }
+                                                
+                                                let sleep_dur = if is_paused { 50 } else { 5 };
+                                                std::thread::sleep(std::time::Duration::from_millis(sleep_dur));
+                                            }
+                                        }
+                                        
+                                        if skip_push {
+                                            continue;
+                                        }
+                                        
+                                        let mut frame_opt = None;
+                                        loop {
+                                            if stop_token_video.load(std::sync::atomic::Ordering::Relaxed) {
+                                                return;
+                                            }
+                                            let (current_epoch, is_paused, track_ended) = {
+                                                let state = state_for_video.lock().unwrap();
+                                                (state.seek_epoch, state.is_paused, state.track_ended)
+                                            };
+                                            if track_ended || current_epoch > local_epoch {
+                                                skip_push = true;
+                                                break;
+                                            }
+                                            match free_video_frame_rx.recv_timeout(std::time::Duration::from_millis(10)) {
+                                                Ok(f) => {
+                                                    frame_opt = Some(f);
+                                                    break;
+                                                }
+                                                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                                                    let sleep_dur = if is_paused { 50 } else { 5 };
+                                                    std::thread::sleep(std::time::Duration::from_millis(sleep_dur));
+                                                }
+                                                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                        
+                                        if skip_push {
+                                            continue;
+                                        }
+                                        
+                                        if let Some(mut frame) = frame_opt {
+                                            frame.pts = pts;
+                                            frame.width = decoded.width();
+                                            frame.height = decoded.height();
+                                            
+                                            let format_name = format!("{:?}", decoded.format());
+                                            frame.bit_depth = if format_name.contains("10LE") { 10 } else if format_name.contains("12LE") { 12 } else { 8 };
+                                            frame.color_space = decoded.color_space() as u32;
+                                            frame.color_range = decoded.color_range() as u32;
+                                            frame.color_trc = decoded.color_transfer_characteristic() as u32;
+                                            
+                                            frame.y_stride = decoded.stride(0);
+                                            frame.u_stride = decoded.stride(1);
+                                            frame.v_stride = decoded.stride(2);
+                                            
+                                            let height = decoded.height() as usize;
+                                            let y_len = frame.y_stride * height;
+                                            let u_len = frame.u_stride * (height / 2);
+                                            let v_len = frame.v_stride * (height / 2);
+                                            
+                                            frame.y_plane.clear();
+                                            let y_plane = decoded.data(0);
+                                            if y_len <= y_plane.len() {
+                                                frame.y_plane.extend_from_slice(&y_plane[..y_len]);
+                                            }
+                                            
+                                            frame.u_plane.clear();
+                                            let u_plane = decoded.data(1);
+                                            if u_len <= u_plane.len() {
+                                                frame.u_plane.extend_from_slice(&u_plane[..u_len]);
+                                            }
+                                            
+                                            frame.v_plane.clear();
+                                            let v_plane = decoded.data(2);
+                                            if v_len <= v_plane.len() {
+                                                frame.v_plane.extend_from_slice(&v_plane[..v_len]);
+                                            }
+                                            
+                                            if let Err(crossbeam_channel::TrySendError::Full(f)) = video_frame_tx.try_send(frame) {
+                                                let _ = free_video_frame_tx.try_send(f);
+                                            }
+                                        }
                                     }
                                 }
                             }
+                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                         }
                     }
                 }
@@ -2055,10 +2175,14 @@ fn run_dummy(
     let ready_rx_for_decoder = ready_rx.clone();
     let free_tx_for_decoder = free_tx.clone();
     let video_rx_for_decoder = video_packet_rx.clone();
+    let stop_token_decoder = stop_token.clone();
     
     std::thread::spawn(move || {
-        loop {
+        while !stop_token_decoder.load(std::sync::atomic::Ordering::Relaxed) {
             let mut chunk = loop {
+                if stop_token_decoder.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
                 if let Ok(mut state) = state_for_decoder.try_lock() {
                     if let Some(pos) = state.seek_request.take() {
                         audio_source.set_position_seconds(pos);
@@ -2149,6 +2273,9 @@ fn run_dummy(
             
             let mut chunk_to_send = chunk;
             loop {
+                if stop_token_decoder.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
                 let mut seeked = false;
                 if let Ok(mut state) = state_for_decoder.try_lock() {
                     if let Some(pos) = state.seek_request.take() {
@@ -2183,8 +2310,6 @@ fn run_dummy(
         }
     });
 
-    let stop_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_token_clone = stop_token.clone();
     let shared_state_dummy = shared_state.clone();
 
     let thread_handle = std::thread::spawn(move || {
@@ -2195,13 +2320,6 @@ fn run_dummy(
         let mut spare_channels: Vec<Vec<f32>> = vec![vec![0.0; window_size]; hardware_channels];
         let mut fft_index = 0;
 
-        let mut last_channel_vus = Vec::new();
-        let mut last_current_order = 0;
-        let mut last_current_row = 0;
-        let mut last_bpm = 0;
-        let mut last_speed = 0;
-        let mut last_current_seconds = 0.0;
-        let mut last_current_row_string = String::new();
         let mut was_paused = false;
 
         while !stop_token_clone.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2219,17 +2337,7 @@ fn run_dummy(
             }
 
             match ready_rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                Ok(mut chunk) => {
-                    last_channel_vus.clear();
-                    last_channel_vus.extend_from_slice(&chunk.channel_vus);
-                    last_current_order = chunk.current_order;
-                    last_current_row = chunk.current_row;
-                    last_bpm = chunk.bpm;
-                    last_speed = chunk.speed;
-                    last_current_seconds = chunk.current_seconds;
-                    last_current_row_string.clear();
-                    last_current_row_string.push_str(&chunk.current_row_string);
-
+                Ok(chunk) => {
                     if chunk.track_ended {
                         if let Ok(mut state) = shared_state_dummy.try_lock() {
                             state.track_ended = true;
@@ -2262,20 +2370,20 @@ fn run_dummy(
 
                     let msg = DspMessage {
                         audio_data: windowed_buffer.clone(),
-                        channel_vus: last_channel_vus.clone(),
-                        current_order: last_current_order,
-                        current_row: last_current_row,
-                        bpm: last_bpm,
-                        speed: last_speed,
-                        current_seconds: last_current_seconds,
-                        current_row_string: last_current_row_string.clone(),
+                        channel_vus: chunk.channel_vus.clone(),
+                        current_order: chunk.current_order,
+                        current_row: chunk.current_row,
+                        bpm: chunk.bpm,
+                        speed: chunk.speed,
+                        current_seconds: chunk.current_seconds,
+                        current_row_string: chunk.current_row_string.clone(),
                         channel_audio_data: std::mem::replace(&mut spare_channels, vec![vec![0.0; window_size]; hardware_channels]),
                     };
 
                     let _ = tx.try_send(msg);
 
                     if let Ok(mut state) = shared_state_dummy.try_lock() {
-                        state.current_seconds = last_current_seconds;
+                        state.current_seconds = chunk.current_seconds;
                     }
 
                     // Sleep to simulate the playback duration of this chunk
@@ -2317,16 +2425,17 @@ struct AudioChunk {
 fn run<T>(
     device: &cpal::Device,
     config: &cpal::StreamConfig,
-    mut audio_source: Box<dyn AudioSource>,
+    audio_source_opt: &mut Option<Box<dyn AudioSource>>,
     shared_state: Arc<Mutex<AppState>>,
     tx: Sender<DspMessage>,
     sample_rate: u32,
     _max_frequency: f32,
     window_size: usize,
-) -> Result<cpal::Stream>
+) -> Result<(cpal::Stream, Arc<std::sync::atomic::AtomicBool>)>
 where
     T: cpal::Sample + cpal::FromSample<f32> + cpal::SizedSample,
 {
+    let stop_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let hardware_channels = config.channels as usize;
     
     let chunk_frames = 1024;
@@ -2336,6 +2445,159 @@ where
     let (free_tx, free_rx) = unbounded::<AudioChunk>();
     
     let (video_packet_tx, video_packet_rx) = bounded::<(u64, ffmpeg_next::Packet)>(4096);
+    
+    let mut current_chunk: Option<AudioChunk> = None;
+    let mut chunk_frame_pos = 0;
+    
+    let mut fft_buffer: Vec<f32> = vec![0.0; window_size];
+    let mut channel_fft_buffers: Vec<Vec<f32>> = vec![vec![0.0; window_size]; hardware_channels];
+    let mut windowed_buffer: Vec<f32> = vec![0.0; window_size];
+    let mut windowed_channels: Vec<Vec<f32>> = vec![vec![0.0; window_size]; hardware_channels];
+    let mut spare_channels: Vec<Vec<f32>> = vec![vec![0.0; window_size]; hardware_channels];
+    let mut fft_index = 0;
+    
+    let mut last_channel_vus = Vec::new();
+    let mut last_current_order = 0;
+    let mut last_current_row = 0;
+    let mut last_bpm = 0;
+    let mut last_speed = 0;
+    let mut last_current_seconds = 0.0;
+    let mut last_current_row_string = String::new();
+    let mut was_paused = false;
+
+    let shared_state_err = shared_state.clone();
+    let shared_state_cb = shared_state.clone();
+    let ready_rx_cb = ready_rx.clone();
+    let free_tx_cb = free_tx.clone();
+    let tx_cb = tx.clone();
+
+    let stream = device.build_output_stream(
+        config,
+        move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+            if let Ok(state) = shared_state_cb.try_lock() {
+                was_paused = state.is_paused;
+            }
+            
+            if was_paused {
+                for sample in data.iter_mut() {
+                    *sample = T::from_sample(0.0);
+                }
+                if let Ok(mut state) = shared_state_cb.try_lock() {
+                    state.raw_channel_vus.fill(0.0);
+                    state.raw_spectrum_data.fill(0.0);
+                }
+                return;
+            }
+
+            let frames_to_render = data.len() / hardware_channels;
+            let mut frames_written = 0;
+            
+            while frames_written < frames_to_render {
+                if current_chunk.is_none() {
+                    match ready_rx_cb.try_recv() {
+                        Ok(chunk) => {
+                            last_channel_vus.clear();
+                            last_channel_vus.extend_from_slice(&chunk.channel_vus);
+                            last_current_order = chunk.current_order;
+                            last_current_row = chunk.current_row;
+                            last_bpm = chunk.bpm;
+                            last_speed = chunk.speed;
+                            last_current_seconds = chunk.current_seconds;
+                            last_current_row_string.clear();
+                            last_current_row_string.push_str(&chunk.current_row_string);
+                            
+                            if chunk.track_ended {
+                                if let Ok(mut state) = shared_state_cb.try_lock() {
+                                    state.track_ended = true;
+                                }
+                            }
+                            
+                            current_chunk = Some(chunk);
+                            chunk_frame_pos = 0;
+                        }
+                        Err(_) => {
+                            for frame in data[frames_written * hardware_channels..].chunks_mut(hardware_channels) {
+                                for sample in frame.iter_mut() {
+                                    *sample = T::from_sample(0.0);
+                                }
+                            }
+                            break;
+                        }
+                    }
+                }
+                
+                if let Some(chunk) = current_chunk.as_mut() {
+                    let frames_available = chunk.valid_frames.saturating_sub(chunk_frame_pos);
+                    let frames_needed = frames_to_render - frames_written;
+                    
+                    if frames_available == 0 {
+                        let c = current_chunk.take().unwrap();
+                        let _ = free_tx_cb.try_send(c);
+                        continue;
+                    }
+                    
+                    let to_copy = std::cmp::min(frames_available, frames_needed);
+                    
+                    for i in 0..to_copy {
+                        let src_frame_idx = chunk_frame_pos + i;
+                        let dst_frame_idx = frames_written + i;
+                        
+                        let mut mono = 0.0;
+                        for c in 0..hardware_channels {
+                            let sample = chunk.samples[src_frame_idx * hardware_channels + c].clamp(-1.0, 1.0);
+                            data[dst_frame_idx * hardware_channels + c] = T::from_sample(sample);
+                            mono += sample;
+                            channel_fft_buffers[c][fft_index] = sample;
+                        }
+                        mono /= hardware_channels as f32;
+                        
+                        fft_buffer[fft_index] = mono;
+                        fft_index = (fft_index + 1) % window_size;
+                    }
+                    
+                    chunk_frame_pos += to_copy;
+                    frames_written += to_copy;
+                }
+            }
+
+            // Re-use pre-allocated windowed_channels instead of heap-allocating per callback
+            for i in 0..window_size {
+                let idx = (fft_index + i) % window_size;
+                windowed_buffer[i] = fft_buffer[idx];
+                for c in 0..hardware_channels {
+                    windowed_channels[c][i] = channel_fft_buffers[c][idx];
+                }
+            }
+            
+            // Swap filled buffers with spare set — zero allocations in the hot path
+            std::mem::swap(&mut windowed_channels, &mut spare_channels);
+            // spare_channels now has the filled data, windowed_channels has the empties
+            
+            let msg = DspMessage {
+                audio_data: windowed_buffer.clone(),
+                channel_vus: last_channel_vus.clone(),
+                current_order: last_current_order,
+                current_row: last_current_row,
+                bpm: last_bpm,
+                speed: last_speed,
+                current_seconds: last_current_seconds,
+                current_row_string: last_current_row_string.clone(),
+                channel_audio_data: std::mem::replace(&mut spare_channels, vec![vec![0.0; window_size]; hardware_channels]),
+            };
+            
+            let _ = tx_cb.try_send(msg);
+        },
+        move |err| {
+            eprintln!("an error occurred on stream: {}", err);
+            if let Ok(mut state) = shared_state_err.try_lock() {
+                state.audio_device_lost = true;
+            }
+        },
+        None,
+    )?;
+
+    // Only take the audio source once stream creation has succeeded
+    let mut audio_source = audio_source_opt.take().unwrap();
     audio_source.attach_video_queue(video_packet_tx);
     
     if let Some((params, time_base)) = audio_source.take_video_parameters() {
@@ -2367,6 +2629,7 @@ where
         
         let state_for_video = shared_state.clone();
         let video_packet_rx_for_video = video_packet_rx.clone();
+        let stop_token_video = stop_token.clone();
         std::thread::spawn(move || {
             if let Ok(context) = ffmpeg_next::codec::context::Context::from_parameters(params) {
                 if let Ok(mut decoder) = context.decoder().video() {
@@ -2375,145 +2638,160 @@ where
                     let mut fallback_pts_seconds = 0.0;
                     let mut is_first_frame_after_seek = false;
                     
-                    while let Ok((packet_epoch, packet)) = video_packet_rx_for_video.recv() {
-                        {
-                            let state = state_for_video.lock().unwrap();
-                            if state.seek_epoch > local_epoch {
-                                decoder.flush();
-                                local_epoch = state.seek_epoch;
-                                is_first_frame_after_seek = true;
-                            }
-                        }
-                        
-                        if packet_epoch < local_epoch {
-                            continue;
-                        }
-                        
-                        if decoder.send_packet(&packet).is_ok() {
-                            let mut decoded = ffmpeg_next::frame::Video::empty();
-                            while decoder.receive_frame(&mut decoded).is_ok() {
-                                let mut pts = decoded.timestamp().map(|t| t as f64 * tb)
-                                    .or_else(|| decoded.pts().map(|p| p as f64 * tb))
-                                    .unwrap_or(-1.0);
-                                    
-                                if pts < 0.0 {
-                                    pts = fallback_pts_seconds;
-                                    fallback_pts_seconds += 1.0 / 30.0;
-                                } else {
-                                    fallback_pts_seconds = pts + (1.0 / 30.0);
-                                }
-                                
-                                let mut skip_push = false;
-                                if is_first_frame_after_seek {
-                                    is_first_frame_after_seek = false;
-                                } else {
-                                    let sync_start = std::time::Instant::now();
-                                    loop {
-                                        let (cached_seconds, current_epoch, is_paused, track_ended) = {
-                                            let state = state_for_video.lock().unwrap();
-                                            (state.current_seconds, state.seek_epoch, state.is_paused, state.track_ended)
-                                        };
-                                        
-                                        if track_ended || current_epoch > local_epoch {
-                                            skip_push = true;
-                                            break;
-                                        }
-                                        
-                                        if pts < cached_seconds - 0.05 {
-                                            skip_push = true;
-                                            break;
-                                        }
-                                        
-                                        if pts <= cached_seconds + 0.05 {
-                                            break;
-                                        }
-                                        
-                                        if sync_start.elapsed() > std::time::Duration::from_millis(500) {
-                                            skip_push = true;
-                                            break;
-                                        }
-                                        
-                                        let sleep_dur = if is_paused { 50 } else { 5 };
-                                        std::thread::sleep(std::time::Duration::from_millis(sleep_dur));
+                    while !stop_token_video.load(std::sync::atomic::Ordering::Relaxed) {
+                        match video_packet_rx_for_video.recv_timeout(std::time::Duration::from_millis(50)) {
+                            Ok((packet_epoch, packet)) => {
+                                {
+                                    let state = state_for_video.lock().unwrap();
+                                    if state.seek_epoch > local_epoch {
+                                        decoder.flush();
+                                        local_epoch = state.seek_epoch;
+                                        is_first_frame_after_seek = true;
                                     }
                                 }
                                 
-                                if skip_push {
+                                if packet_epoch < local_epoch {
                                     continue;
                                 }
                                 
-                                let mut frame_opt = None;
-                                loop {
-                                    let (current_epoch, is_paused, track_ended) = {
-                                        let state = state_for_video.lock().unwrap();
-                                        (state.seek_epoch, state.is_paused, state.track_ended)
-                                    };
-                                    if track_ended || current_epoch > local_epoch {
-                                        skip_push = true;
-                                        break;
-                                    }
-                                    match free_video_frame_rx.recv_timeout(std::time::Duration::from_millis(10)) {
-                                        Ok(f) => {
-                                            frame_opt = Some(f);
-                                            break;
-                                        }
-                                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                                            let sleep_dur = if is_paused { 50 } else { 5 };
-                                            std::thread::sleep(std::time::Duration::from_millis(sleep_dur));
-                                        }
-                                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                                if decoder.send_packet(&packet).is_ok() {
+                                    let mut decoded = ffmpeg_next::frame::Video::empty();
+                                    while decoder.receive_frame(&mut decoded).is_ok() {
+                                        if stop_token_video.load(std::sync::atomic::Ordering::Relaxed) {
                                             return;
                                         }
-                                    }
-                                }
-                                
-                                if skip_push {
-                                    continue;
-                                }
-                                
-                                if let Some(mut frame) = frame_opt {
-                                    frame.pts = pts;
-                                    frame.width = decoded.width();
-                                    frame.height = decoded.height();
-                                    
-                                    let format_name = format!("{:?}", decoded.format());
-                                    frame.bit_depth = if format_name.contains("10LE") { 10 } else if format_name.contains("12LE") { 12 } else { 8 };
-                                    frame.color_space = decoded.color_space() as u32;
-                                    frame.color_range = decoded.color_range() as u32;
-                                    frame.color_trc = decoded.color_transfer_characteristic() as u32;
-                                    
-                                    frame.y_stride = decoded.stride(0);
-                                    frame.u_stride = decoded.stride(1);
-                                    frame.v_stride = decoded.stride(2);
-                                    
-                                    let height = decoded.height() as usize;
-                                    let y_len = frame.y_stride * height;
-                                    let u_len = frame.u_stride * (height / 2);
-                                    let v_len = frame.v_stride * (height / 2);
-                                    
-                                    frame.y_plane.clear();
-                                    let y_plane = decoded.data(0);
-                                    if y_len <= y_plane.len() {
-                                        frame.y_plane.extend_from_slice(&y_plane[..y_len]);
-                                    }
-                                    
-                                    frame.u_plane.clear();
-                                    let u_plane = decoded.data(1);
-                                    if u_len <= u_plane.len() {
-                                        frame.u_plane.extend_from_slice(&u_plane[..u_len]);
-                                    }
-                                    
-                                    frame.v_plane.clear();
-                                    let v_plane = decoded.data(2);
-                                    if v_len <= v_plane.len() {
-                                        frame.v_plane.extend_from_slice(&v_plane[..v_len]);
-                                    }
-                                    
-                                    if let Err(crossbeam_channel::TrySendError::Full(f)) = video_frame_tx.try_send(frame) {
-                                        let _ = free_video_frame_tx.try_send(f);
+                                        let mut pts = decoded.timestamp().map(|t| t as f64 * tb)
+                                            .or_else(|| decoded.pts().map(|p| p as f64 * tb))
+                                            .unwrap_or(-1.0);
+                                            
+                                        if pts < 0.0 {
+                                            pts = fallback_pts_seconds;
+                                            fallback_pts_seconds += 1.0 / 30.0;
+                                        } else {
+                                            fallback_pts_seconds = pts + (1.0 / 30.0);
+                                        }
+                                        
+                                        let mut skip_push = false;
+                                        if is_first_frame_after_seek {
+                                            is_first_frame_after_seek = false;
+                                        } else {
+                                            let sync_start = std::time::Instant::now();
+                                            loop {
+                                                if stop_token_video.load(std::sync::atomic::Ordering::Relaxed) {
+                                                    return;
+                                                }
+                                                let (cached_seconds, current_epoch, is_paused, track_ended) = {
+                                                    let state = state_for_video.lock().unwrap();
+                                                    (state.current_seconds, state.seek_epoch, state.is_paused, state.track_ended)
+                                                };
+                                                
+                                                if track_ended || current_epoch > local_epoch {
+                                                    skip_push = true;
+                                                    break;
+                                                }
+                                                
+                                                if pts < cached_seconds - 0.05 {
+                                                    skip_push = true;
+                                                    break;
+                                                }
+                                                
+                                                if pts <= cached_seconds + 0.05 {
+                                                    break;
+                                                }
+                                                
+                                                if sync_start.elapsed() > std::time::Duration::from_millis(500) {
+                                                    skip_push = true;
+                                                    break;
+                                                }
+                                                
+                                                let sleep_dur = if is_paused { 50 } else { 5 };
+                                                std::thread::sleep(std::time::Duration::from_millis(sleep_dur));
+                                            }
+                                        }
+                                        
+                                        if skip_push {
+                                            continue;
+                                        }
+                                        
+                                        let mut frame_opt = None;
+                                        loop {
+                                            if stop_token_video.load(std::sync::atomic::Ordering::Relaxed) {
+                                                return;
+                                            }
+                                            let (current_epoch, is_paused, track_ended) = {
+                                                let state = state_for_video.lock().unwrap();
+                                                (state.seek_epoch, state.is_paused, state.track_ended)
+                                            };
+                                            if track_ended || current_epoch > local_epoch {
+                                                skip_push = true;
+                                                break;
+                                            }
+                                            match free_video_frame_rx.recv_timeout(std::time::Duration::from_millis(10)) {
+                                                Ok(f) => {
+                                                    frame_opt = Some(f);
+                                                    break;
+                                                }
+                                                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                                                    let sleep_dur = if is_paused { 50 } else { 5 };
+                                                    std::thread::sleep(std::time::Duration::from_millis(sleep_dur));
+                                                }
+                                                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                                                    return;
+                                                }
+                                            }
+                                        }
+                                        
+                                        if skip_push {
+                                            continue;
+                                        }
+                                        
+                                        if let Some(mut frame) = frame_opt {
+                                            frame.pts = pts;
+                                            frame.width = decoded.width();
+                                            frame.height = decoded.height();
+                                            
+                                            let format_name = format!("{:?}", decoded.format());
+                                            frame.bit_depth = if format_name.contains("10LE") { 10 } else if format_name.contains("12LE") { 12 } else { 8 };
+                                            frame.color_space = decoded.color_space() as u32;
+                                            frame.color_range = decoded.color_range() as u32;
+                                            frame.color_trc = decoded.color_transfer_characteristic() as u32;
+                                            
+                                            frame.y_stride = decoded.stride(0);
+                                            frame.u_stride = decoded.stride(1);
+                                            frame.v_stride = decoded.stride(2);
+                                            
+                                            let height = decoded.height() as usize;
+                                            let y_len = frame.y_stride * height;
+                                            let u_len = frame.u_stride * (height / 2);
+                                            let v_len = frame.v_stride * (height / 2);
+                                            
+                                            frame.y_plane.clear();
+                                            let y_plane = decoded.data(0);
+                                            if y_len <= y_plane.len() {
+                                                frame.y_plane.extend_from_slice(&y_plane[..y_len]);
+                                            }
+                                            
+                                            frame.u_plane.clear();
+                                            let u_plane = decoded.data(1);
+                                            if u_len <= u_plane.len() {
+                                                frame.u_plane.extend_from_slice(&u_plane[..u_len]);
+                                            }
+                                            
+                                            frame.v_plane.clear();
+                                            let v_plane = decoded.data(2);
+                                            if v_len <= v_plane.len() {
+                                                frame.v_plane.extend_from_slice(&v_plane[..v_len]);
+                                            }
+                                            
+                                            if let Err(crossbeam_channel::TrySendError::Full(f)) = video_frame_tx.try_send(frame) {
+                                                let _ = free_video_frame_tx.try_send(f);
+                                            }
+                                        }
                                     }
                                 }
                             }
+                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                         }
                     }
                 }
@@ -2544,10 +2822,14 @@ where
     let ready_rx_for_decoder = ready_rx.clone();
     let free_tx_for_decoder = free_tx.clone();
     let video_rx_for_decoder = video_packet_rx.clone();
+    let stop_token_decoder = stop_token.clone();
     
     std::thread::spawn(move || {
-        loop {
+        while !stop_token_decoder.load(std::sync::atomic::Ordering::Relaxed) {
             let mut chunk = loop {
+                if stop_token_decoder.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
                 if let Ok(mut state) = state_for_decoder.try_lock() {
                     if let Some(pos) = state.seek_request.take() {
                         audio_source.set_position_seconds(pos);
@@ -2640,6 +2922,9 @@ where
             
             let mut chunk_to_send = chunk;
             loop {
+                if stop_token_decoder.load(std::sync::atomic::Ordering::Relaxed) {
+                    return;
+                }
                 let mut seeked = false;
                 if let Ok(mut state) = state_for_decoder.try_lock() {
                     if let Some(pos) = state.seek_request.take() {
@@ -2674,152 +2959,7 @@ where
         }
     });
 
-    let mut current_chunk: Option<AudioChunk> = None;
-    let mut chunk_frame_pos = 0;
-    
-    let mut fft_buffer: Vec<f32> = vec![0.0; window_size];
-    let mut channel_fft_buffers: Vec<Vec<f32>> = vec![vec![0.0; window_size]; hardware_channels];
-    let mut windowed_buffer: Vec<f32> = vec![0.0; window_size];
-    let mut windowed_channels: Vec<Vec<f32>> = vec![vec![0.0; window_size]; hardware_channels];
-    let mut spare_channels: Vec<Vec<f32>> = vec![vec![0.0; window_size]; hardware_channels];
-    let mut fft_index = 0;
-    
-    let mut last_channel_vus = Vec::new();
-    let mut last_current_order = 0;
-    let mut last_current_row = 0;
-    let mut last_bpm = 0;
-    let mut last_speed = 0;
-    let mut last_current_seconds = 0.0;
-    let mut last_current_row_string = String::new();
-    let mut was_paused = false;
-
-    let shared_state_err = shared_state.clone();
-    let stream = device.build_output_stream(
-        config,
-        move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-            if let Ok(state) = shared_state.try_lock() {
-                was_paused = state.is_paused;
-            }
-            
-            if was_paused {
-                for sample in data.iter_mut() {
-                    *sample = T::from_sample(0.0);
-                }
-                if let Ok(mut state) = shared_state.try_lock() {
-                    state.raw_channel_vus.fill(0.0);
-                    state.raw_spectrum_data.fill(0.0);
-                }
-                return;
-            }
-
-            let frames_to_render = data.len() / hardware_channels;
-            let mut frames_written = 0;
-            
-            while frames_written < frames_to_render {
-                if current_chunk.is_none() {
-                    match ready_rx.try_recv() {
-                        Ok(chunk) => {
-                            last_channel_vus.clear();
-                            last_channel_vus.extend_from_slice(&chunk.channel_vus);
-                            last_current_order = chunk.current_order;
-                            last_current_row = chunk.current_row;
-                            last_bpm = chunk.bpm;
-                            last_speed = chunk.speed;
-                            last_current_seconds = chunk.current_seconds;
-                            last_current_row_string.clear();
-                            last_current_row_string.push_str(&chunk.current_row_string);
-                            
-                            if chunk.track_ended {
-                                if let Ok(mut state) = shared_state.try_lock() {
-                                    state.track_ended = true;
-                                }
-                            }
-                            
-                            current_chunk = Some(chunk);
-                            chunk_frame_pos = 0;
-                        }
-                        Err(_) => {
-                            for frame in data[frames_written * hardware_channels..].chunks_mut(hardware_channels) {
-                                for sample in frame.iter_mut() {
-                                    *sample = T::from_sample(0.0);
-                                }
-                            }
-                            break;
-                        }
-                    }
-                }
-                
-                if let Some(chunk) = current_chunk.as_mut() {
-                    let frames_available = chunk.valid_frames.saturating_sub(chunk_frame_pos);
-                    let frames_needed = frames_to_render - frames_written;
-                    
-                    if frames_available == 0 {
-                        let c = current_chunk.take().unwrap();
-                        let _ = free_tx.try_send(c);
-                        continue;
-                    }
-                    
-                    let to_copy = std::cmp::min(frames_available, frames_needed);
-                    
-                    for i in 0..to_copy {
-                        let src_frame_idx = chunk_frame_pos + i;
-                        let dst_frame_idx = frames_written + i;
-                        
-                        let mut mono = 0.0;
-                        for c in 0..hardware_channels {
-                            let sample = chunk.samples[src_frame_idx * hardware_channels + c].clamp(-1.0, 1.0);
-                            data[dst_frame_idx * hardware_channels + c] = T::from_sample(sample);
-                            mono += sample;
-                            channel_fft_buffers[c][fft_index] = sample;
-                        }
-                        mono /= hardware_channels as f32;
-                        
-                        fft_buffer[fft_index] = mono;
-                        fft_index = (fft_index + 1) % window_size;
-                    }
-                    
-                    chunk_frame_pos += to_copy;
-                    frames_written += to_copy;
-                }
-            }
-
-            // Re-use pre-allocated windowed_channels instead of heap-allocating per callback
-            for i in 0..window_size {
-                let idx = (fft_index + i) % window_size;
-                windowed_buffer[i] = fft_buffer[idx];
-                for c in 0..hardware_channels {
-                    windowed_channels[c][i] = channel_fft_buffers[c][idx];
-                }
-            }
-            
-            // Swap filled buffers with spare set — zero allocations in the hot path
-            std::mem::swap(&mut windowed_channels, &mut spare_channels);
-            // spare_channels now has the filled data, windowed_channels has the empties
-            
-            let msg = DspMessage {
-                audio_data: windowed_buffer.clone(),
-                channel_vus: last_channel_vus.clone(),
-                current_order: last_current_order,
-                current_row: last_current_row,
-                bpm: last_bpm,
-                speed: last_speed,
-                current_seconds: last_current_seconds,
-                current_row_string: last_current_row_string.clone(),
-                channel_audio_data: std::mem::replace(&mut spare_channels, vec![vec![0.0; window_size]; hardware_channels]),
-            };
-            
-            let _ = tx.try_send(msg);
-        },
-        move |err| {
-            eprintln!("an error occurred on stream: {}", err);
-            if let Ok(mut state) = shared_state_err.try_lock() {
-                state.audio_device_lost = true;
-            }
-        },
-        None,
-    )?;
-
-    Ok(stream)
+    Ok((stream, stop_token))
 }
 
 fn run_mic<T>(

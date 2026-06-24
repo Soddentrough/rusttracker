@@ -265,7 +265,7 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
     fonts.families.get_mut(&egui::FontFamily::Proportional).unwrap().push("kenney_icons".to_owned());
     egui_ctx.set_fonts(fonts);
     
-    let mut egui_state = egui_winit::State::new(egui_ctx.clone(), egui::ViewportId::ROOT, &window, None, None, None);
+    let mut egui_state = egui_winit::State::new(egui_ctx.clone(), egui::ViewportId::ROOT, &window, Some(1.0), None, None);
 
     let mut last_mouse_move = Instant::now();
     let mut is_cursor_visible = true;
@@ -572,6 +572,9 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                 match event {
                 WindowEvent::CloseRequested => {
                     elwt.exit();
+                }
+                WindowEvent::ScaleFactorChanged { .. } => {
+                    engine.resize(window.inner_size());
                 }
                 WindowEvent::Resized(physical_size) => {
                     engine.resize(*physical_size);
@@ -937,27 +940,30 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                         
                         // Process engine actions
                         match action {
+                            EngineAction::ScrubPreview(pct, delta) => {
+                                let target = (state.duration_seconds * pct as f64).clamp(0.0, state.duration_seconds);
+                                state.scrub_target_seconds = Some(target);
+                                
+                                if delta != 0.0 {
+                                    if state.osd_timer > 0.0 && state.osd_text.as_ref().map_or(false, |s| s.starts_with("Scrubbing")) {
+                                        state.cumulative_scrub += delta;
+                                    } else {
+                                        state.cumulative_scrub = delta;
+                                    }
+                                    state.osd_timer = 0.5;
+                                    let sign = if state.cumulative_scrub > 0.0 { "+" } else { "-" };
+                                    state.osd_text = Some(format!("Scrubbing {}{:.1}s", sign, state.cumulative_scrub.abs()));
+                                }
+                            }
+                            EngineAction::ScrubEnd => {
+                                state.scrub_target_seconds = None;
+                            }
                             EngineAction::Seek(pct) => {
                                 let target = (state.duration_seconds * pct as f64).clamp(0.0, state.duration_seconds);
                                 state.seek_request = Some(target);
+                                state.scrub_target_seconds = None;
                                 state.spectrum_history.clear();
                                 for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
-                            }
-                            EngineAction::SeekWithScrub(pct, delta) => {
-                                let target = (state.duration_seconds * pct as f64).clamp(0.0, state.duration_seconds);
-                                state.seek_request = Some(target);
-                                state.spectrum_history.clear();
-                                for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
-                                
-                                if state.osd_timer > 0.0 && state.osd_text.as_ref().map_or(false, |s| s.starts_with("Scrubbing")) {
-                                    state.cumulative_scrub += delta;
-                                } else {
-                                    state.cumulative_scrub = delta;
-                                }
-                                
-                                let sign = if state.cumulative_scrub > 0.0 { "+" } else { "-" };
-                                state.osd_text = Some(format!("Scrubbing {}{:.1}s", sign, state.cumulative_scrub.abs()));
-                                state.osd_timer = 0.5;
                             }
                             EngineAction::OpenFile => {
                                 if is_game_mode {

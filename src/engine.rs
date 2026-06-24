@@ -49,6 +49,8 @@ pub enum EngineAction {
     OpenFile,
     LoadFiles(Vec<String>, bool),
     Seek(f32),
+    ScrubPreview(f32, f64),
+    ScrubEnd,
     SetForceStereo(bool),
     #[allow(dead_code)]
     SetPassthrough(bool),
@@ -58,7 +60,6 @@ pub enum EngineAction {
     VisPickerToggleEnabled(usize),
     VisPickerSetCursor(usize),
     VisPickerEnableAll,
-    SeekWithScrub(f32, f64),
     VisPickerEnableNone,
     OpenUrlDialog,
     CloseUrlDialog,
@@ -192,8 +193,8 @@ struct MeshBuffers {
     index_count: u32,
 }
 
-pub struct VulkanEngine<'a> {
-    surface: wgpu::Surface<'a>,
+pub struct VulkanEngine {
+    surface: Option<wgpu::Surface<'static>>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     pub config: wgpu::SurfaceConfiguration,
@@ -386,7 +387,7 @@ pub(crate) fn generate_lamp_mesh() -> (Vec<Vertex>, Vec<u32>) {
     (vertices, indices)
 }
 
-impl<'a> VulkanEngine<'a> {
+impl VulkanEngine {
     pub async fn new(window: Arc<Window>) -> Self {
         let size = window.inner_size();
 
@@ -2008,7 +2009,7 @@ impl<'a> VulkanEngine<'a> {
         // --- END 3D Engine Extensions Init ---
 
         Self {
-            surface,
+            surface: Some(surface),
             device,
             queue,
             config,
@@ -2104,7 +2105,9 @@ impl<'a> VulkanEngine<'a> {
             self.size = new_size;
             self.config.width = new_size.width;
             self.config.height = new_size.height;
-            self.surface.configure(&self.device, &self.config);
+            if let Some(surface) = &self.surface {
+                surface.configure(&self.device, &self.config);
+            }
             
             let depth_texture = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("Depth Texture"),
@@ -2119,6 +2122,7 @@ impl<'a> VulkanEngine<'a> {
             self.depth_texture_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
         }
     }
+
 
     pub fn clear_video_state(&mut self) {
         self.video_state = None;
@@ -2171,7 +2175,7 @@ impl<'a> VulkanEngine<'a> {
             display_order: [0; 16],
             num_channels: state.channel_vus.len().min(32) as u32,
             mode: state.visualizer_mode,
-            time: state.current_seconds as f32,
+            time: state.scrub_target_seconds.unwrap_or(state.current_seconds) as f32,
             duration: state.duration_seconds as f32,
             smooth_time: self.play_time as f32,
             heatmap_row: self.heatmap_row,
@@ -2529,8 +2533,13 @@ impl<'a> VulkanEngine<'a> {
         file_dialog: &mut egui_file_dialog::FileDialog,
         gamepad_events: Vec<egui::Event>
     ) -> Result<(EngineAction, f32, f32, Option<f32>, Option<f32>, Option<f32>, f32, f32, f32, f32), wgpu::SurfaceStatus> {
+        let physical_size = window.inner_size();
+        if physical_size.width > 0 && physical_size.height > 0 && physical_size != self.size {
+            self.resize(physical_size);
+        }
         let surface_start = std::time::Instant::now();
-        let output = self.surface.get_current_texture();
+        let surface = self.surface.as_ref().ok_or(wgpu::SurfaceStatus::Lost)?;
+        let output = surface.get_current_texture();
         let surface_texture = match output {
             wgpu::CurrentSurfaceTexture::Success(tex) | wgpu::CurrentSurfaceTexture::Suboptimal(tex) => tex,
             wgpu::CurrentSurfaceTexture::Lost => return Err(wgpu::SurfaceStatus::Lost),
@@ -3580,12 +3589,20 @@ impl<'a> VulkanEngine<'a> {
                             let (rect, response) = columns[0].allocate_exact_size(egui::vec2(columns[0].available_width(), 16.0), egui::Sense::click_and_drag());
                             out_fire_rect = Some(rect);
                             
-                            if response.dragged() || response.clicked() {
+                            if response.drag_stopped() || response.clicked() {
                                 if let Some(mouse_pos) = response.interact_pointer_pos() {
                                     let rel_x = (mouse_pos.x - rect.left()).clamp(0.0, rect.width());
                                     let pct = rel_x / rect.width();
                                     engine_action = EngineAction::Seek(pct);
                                 }
+                            } else if response.dragged() {
+                                if let Some(mouse_pos) = response.interact_pointer_pos() {
+                                    let rel_x = (mouse_pos.x - rect.left()).clamp(0.0, rect.width());
+                                    let pct = rel_x / rect.width();
+                                    engine_action = EngineAction::ScrubPreview(pct, 0.0);
+                                }
+                            } else if !response.is_pointer_button_down_on() {
+                                engine_action = EngineAction::ScrubEnd;
                             }
                             
                             let painter = columns[0].painter();
@@ -3596,10 +3613,11 @@ impl<'a> VulkanEngine<'a> {
                                 format!("{:02}:{:02}.{}", m, s, f)
                             };
                             
+                            let display_secs = state.scrub_target_seconds.unwrap_or(state.current_seconds);
                             let time_text = if state.duration_seconds <= 0.0 {
-                                format!("{} / LIVE", format_time(state.current_seconds))
+                                format!("{} / LIVE", format_time(display_secs))
                             } else {
-                                format!("{} / {}", format_time(state.current_seconds), format_time(state.duration_seconds))
+                                format!("{} / {}", format_time(display_secs), format_time(state.duration_seconds))
                             };
                             
                             painter.text(
@@ -3983,14 +4001,29 @@ impl<'a> VulkanEngine<'a> {
                 central_rect = rect;
                 
                 // Mouse drag scrubbing using global input to avoid interception by other transparent areas
-                #[allow(deprecated)]
-                let wants_pointer = ui.ctx().wants_pointer_input();
-                if ui.input(|i| i.pointer.primary_down()) && !wants_pointer && state.duration_seconds > 0.0 {
-                    let delta_x = ui.input(|i| i.pointer.delta().x);
-                    if delta_x.abs() > 0.0 {
-                        let scrub_amount = delta_x * 0.1; // 0.1s per pixel
-                        let new_time = (state.current_seconds + scrub_amount as f64).clamp(0.0, state.duration_seconds);
-                        engine_action = EngineAction::SeekWithScrub((new_time / state.duration_seconds) as f32, scrub_amount as f64);
+                let wants_pointer = ui.ctx().egui_wants_pointer_input();
+                let is_primary_down = ui.input(|i| i.pointer.primary_down());
+                let is_primary_released = ui.input(|i| i.pointer.primary_released());
+                
+                // If we are currently scrubbing, ignore wants_pointer so we don't miss the release event!
+                let is_scrubbing = state.scrub_target_seconds.is_some();
+                let should_process = (is_primary_down || is_primary_released) && (!wants_pointer || is_scrubbing) && state.duration_seconds > 0.0;
+                
+                if should_process {
+                    if is_primary_released {
+                        if let Some(target) = state.scrub_target_seconds {
+                            engine_action = EngineAction::Seek((target / state.duration_seconds) as f32);
+                        } else {
+                            engine_action = EngineAction::ScrubEnd;
+                        }
+                    } else {
+                        let delta_x = ui.input(|i| i.pointer.delta().x);
+                        if delta_x.abs() > 0.0 || is_scrubbing {
+                            let scrub_amount = delta_x * 0.1; // 0.1s per pixel
+                            let base_time = state.scrub_target_seconds.unwrap_or(state.current_seconds);
+                            let new_time = (base_time + scrub_amount as f64).clamp(0.0, state.duration_seconds);
+                            engine_action = EngineAction::ScrubPreview((new_time / state.duration_seconds) as f32, scrub_amount as f64);
+                        }
                     }
                 }
                 
@@ -4040,7 +4073,7 @@ impl<'a> VulkanEngine<'a> {
 
         });
 
-        let scale = window.scale_factor() as f32;
+        let scale = egui_ctx.pixels_per_point();
         let w = self.config.width as f32;
         let h = self.config.height as f32;
         
@@ -4074,7 +4107,7 @@ impl<'a> VulkanEngine<'a> {
 
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [self.config.width, self.config.height],
-            pixels_per_point: window.scale_factor() as f32,
+            pixels_per_point: egui_ctx.pixels_per_point(),
         };
         let render_start = std::time::Instant::now();
 
@@ -4270,7 +4303,7 @@ impl<'a> VulkanEngine<'a> {
                 multiview_mask: None,
             });
 
-            let scale_factor = window.scale_factor() as f32;
+            let scale_factor = egui_ctx.pixels_per_point();
             let vp_x = ((central_rect.min.x * scale_factor).clamp(0.0, self.config.width as f32)).round();
             let vp_y = ((central_rect.min.y * scale_factor).clamp(0.0, self.config.height as f32)).round();
             let max_w = (self.config.width as f32 - vp_x).max(1.0);
@@ -4401,10 +4434,20 @@ impl<'a> VulkanEngine<'a> {
                     if let Some(rect) = r {
                         let x = ((rect.min.x * scale_factor).clamp(0.0, self.config.width as f32)).round() as u32;
                         let y = ((rect.min.y * scale_factor).clamp(0.0, self.config.height as f32)).round() as u32;
-                        let max_w = (self.config.width as f32 - x as f32).max(1.0);
-                        let w = ((rect.width() * scale_factor).clamp(1.0, max_w)).round() as u32;
-                        let max_h = (self.config.height as f32 - y as f32).max(1.0);
-                        let h = ((rect.height() * scale_factor).clamp(1.0, max_h)).round() as u32;
+                        
+                        let w = if x < self.config.width {
+                            let max_w = self.config.width - x;
+                            ((rect.width() * scale_factor).round() as u32).clamp(1, max_w)
+                        } else {
+                            0
+                        };
+                        
+                        let h = if y < self.config.height {
+                            let max_h = self.config.height - y;
+                            ((rect.height() * scale_factor).round() as u32).clamp(1, max_h)
+                        } else {
+                            0
+                        };
                         
                         if w > 0 && h > 0 {
                             render_pass.set_scissor_rect(x, y, w, h);
