@@ -53,7 +53,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let dy = dpdy(in.uv.y);
     let aspect = dy / max(dx, 0.00001);
     
-    // Scale screen coords
+    // Scale screen coords to maintain horizontal FOV
     let p = vec2<f32>(distorted_uv.x * aspect, distorted_uv.y) * 0.9;
     
     // Subtly rotate camera around center

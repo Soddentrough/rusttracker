@@ -153,7 +153,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let dy = dpdy(in.uv.y);
     let aspect = dy / max(dx, 0.00001);
     let safe_aspect = select(1.0, aspect, abs(aspect) > 0.0001);
-    let p = vec2<f32>(uv.x * safe_aspect, -uv.y); // p.y is +1 at top, -1 at bottom
+    let p = vec2<f32>(uv.x, -uv.y / safe_aspect); // p.y is +1 at top, -1 at bottom
 
     let bass = max(audio.spectrum[0].x, audio.spectrum[1].x);
     let mid = (audio.spectrum[20].x + audio.spectrum[30].x) * 0.5;

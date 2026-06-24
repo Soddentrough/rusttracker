@@ -80,14 +80,12 @@ fn get_wave_dist(hist_idx: u32, uv: vec2<f32>, aspect: f32) -> f32 {
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // CRT barrel distortion
-    let crt_uv = in.uv * 2.0 - 1.0;
-    let r2 = dot(crt_uv, crt_uv);
-    let distorted_uv = crt_uv * (1.0 + r2 * 0.05);
-    let final_uv = distorted_uv * 0.5 + 0.5;
+    let final_uv = crt_distort_uv(in.uv, 0.05);
 
-    let aspect = dpdx(in.uv.x) / dpdy(in.uv.y);
+    let aspect = audio.aspect_ratio;
     var final_color = vec3<f32>(0.0);
 
+    let crt_uv = in.uv * 2.0 - 1.0;
     let r = length(crt_uv);
     let edge_blur = smoothstep(0.2, 1.5, r);
 
@@ -96,11 +94,20 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     var wave_intensity = 0.0;
 
+    let dy = dpdy(in.uv.y);
+    let base_thickness = max(dy * 0.6, 0.0005);
+    let blur_thickness = max(dy * 2.0, 0.0015);
+
     // Performance: skip every other history frame when count exceeds 72,
     // compensating with doubled contribution to maintain total brightness.
     let hist_count = min(audio.waveform_history_size, 144u);
     let step = select(1u, 2u, hist_count > 72u);
     let step_scale = f32(step);
+    
+    // Lock thickness to physical screen pixels so it doesn't vanish on short windows
+    let thickness = base_thickness + edge_blur * blur_thickness;
+    // Tighter bloom (reduced spread and intensity)
+    let bloom_spread = max(dy * 0.2, 0.0002);
 
     for (var i = 0u; i < hist_count; i = i + step) {
         let true_dist = get_wave_dist(i, final_uv, aspect);
@@ -111,12 +118,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // 0.05 gives a long 1-second smooth trail.
         let age = exp(-frames_old * 0.06);
 
-        // Much thinner beam for crisp, high-resolution lines instead of thick noodles
-        let thickness = 0.0005 + edge_blur * 0.0015;
         let core = smoothstep(thickness, 0.0, true_dist) * 0.6;
-
-        // Tighter bloom (reduced spread and intensity)
-        let bloom = 0.00005 / (true_dist * true_dist + 0.0002) * 0.02;
+        let bloom = 0.00005 / (true_dist * true_dist + bloom_spread) * 0.02;
 
         // Tighter halation (faster falloff)
         let halation = exp(-true_dist * 120.0) * 0.01;
@@ -130,24 +133,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let mapped = wave_intensity * amber;
     var tonemapped = (mapped * (2.51 * mapped + 0.03)) / (mapped * (2.43 * mapped + 0.59) + 0.14);
 
-    final_color = tonemapped;
-
-    // CRT scanlines
-    let scanline = 0.85 + 0.15 * cos(in.clip_position.y * 3.14159);
-    final_color *= scanline;
-
+    var crt_settings = get_default_crt();
+    crt_settings.phosphor_tint = amber; // Not used as tint for everything, just to configure if needed. Actually we'll keep final_color.
+    
     // Smooth CRT bezel fade (radial, no rectangular edges)
     let bezel = smoothstep(1.4, 0.9, r);
-
-    // Analog noise / static (like vis_flame)
-    let noise_val = hash21(in.clip_position.xy + fract(audio.smooth_time) * 137.0);
-    let static_noise = noise_val * 0.035 * bezel;
     
-    // Add extra faint glow from the waveform onto the noise
+    // Analog noise glow
+    let noise_val = hash21_crt(in.clip_position.xy + fract(audio.smooth_time) * 137.0);
     let noise_glow = amber * noise_val * 0.015 * bezel * clamp(wave_intensity * 0.8, 0.0, 1.0);
 
-    final_color = final_color * bezel;
-    final_color = final_color + static_noise + noise_glow;
+    final_color = apply_crt_effects(tonemapped, in.uv, in.clip_position.xy, audio.smooth_time, crt_settings);
+    final_color = final_color + noise_glow;
 
     // Output Linear RGB. WGPU Srgb surface will apply the sRGB gamma curve automatically.
     return vec4<f32>(final_color, 1.0);

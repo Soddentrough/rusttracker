@@ -382,12 +382,14 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                                 state.show_hud = !state.show_hud;
                                             },
                                             WinitKeyCode::KeyF => {
-                                                is_fullscreen = !is_fullscreen;
+                                                let currently_fullscreen = window.fullscreen().is_some();
+                                                is_fullscreen = !currently_fullscreen;
                                                 if is_fullscreen {
                                                     window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
                                                     keep_awake = keepawake::Builder::default().display(true).idle(true).create().ok();
                                                 } else {
                                                     window.set_fullscreen(None);
+                                                    let _ = window.request_inner_size(winit::dpi::LogicalSize::new(1024.0, 768.0));
                                                     keep_awake = None;
                                                 }
                                             },
@@ -1236,12 +1238,14 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                     continue;
                                 }
                                 gilrs::Button::Start => {
-                                    is_fullscreen = !is_fullscreen;
+                                    let currently_fullscreen = window.fullscreen().is_some();
+                                    is_fullscreen = !currently_fullscreen;
                                     if is_fullscreen {
                                         window.set_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
                                         keep_awake = keepawake::Builder::default().display(true).idle(true).create().ok();
                                     } else {
                                         window.set_fullscreen(None);
+                                        let _ = window.request_inner_size(winit::dpi::LogicalSize::new(1024.0, 768.0));
                                         keep_awake = None;
                                     }
                                     continue;

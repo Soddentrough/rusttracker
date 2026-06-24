@@ -31,11 +31,7 @@ fn demoscene_palette(h: f32) -> vec3<f32> {
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // --- CRT barrel distortion ---
-    let crt_uv = in.uv * 2.0 - 1.0;
-    let r2 = dot(crt_uv, crt_uv);
-    // Reduced from 0.08 to 0.03 for a more subtle bend
-    let distorted = crt_uv * (1.0 + r2 * 0.03);
-    let uv = distorted * 0.5 + 0.5;
+    let uv = crt_distort_uv(in.uv, 0.03);
 
     // Outside the CRT tube → pure black
     if uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 {
@@ -81,22 +77,19 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
     color *= phosphor;
 
-    // --- Vignette (darken edges of CRT) ---
-    let vignette = smoothstep(1.5, 0.85, length(crt_uv));
-    color *= vignette;
-
-    // --- Analog noise / static ---
-    let noise = hash12(in.clip_position.xy + fract(audio.smooth_time) * 137.0);
-    color += vec3<f32>(noise * 0.025 * vignette);
-
-    // --- CRT flicker (subtle 60Hz-ish wobble) ---
-    let flicker = 0.97 + 0.03 * sin(audio.smooth_time * 377.0);
-    color *= flicker;
-
     // --- Bezel edge glow (faint amber reflection near corners) ---
+    let crt_uv = uv * 2.0 - 1.0;
     let bezel_dist = max(abs(crt_uv.x) - 0.85, 0.0) + max(abs(crt_uv.y) - 0.85, 0.0);
     let bezel_glow = exp(-bezel_dist * 30.0) * 0.03;
     color += vec3<f32>(1.0, 0.6, 0.2) * bezel_glow * clamp(heat * 3.0, 0.0, 1.0);
+
+    var crt_settings = get_default_crt();
+    crt_settings.scanline_intensity = 0.0; // Use vis_flame's custom scanlines instead
+    crt_settings.vignette_scale = 1.5;
+    crt_settings.vignette_softness = 0.85;
+    crt_settings.noise_intensity = 0.025;
+    crt_settings.flicker_intensity = 0.03;
+    color = apply_crt_effects(color, in.uv, in.clip_position.xy, audio.smooth_time, crt_settings);
 
     return vec4<f32>(color, 1.0);
 }

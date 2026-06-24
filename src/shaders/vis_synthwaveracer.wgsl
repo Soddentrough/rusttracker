@@ -221,7 +221,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let dy = dpdy(in.uv.y);
     let aspect = dy / max(dx, 0.00001);
     let safe_aspect = select(1.0, aspect, aspect > 0.0001 || aspect < -0.0001);
-    let p = vec2<f32>((in.uv.x * 2.0 - 1.0) * safe_aspect, -(in.uv.y * 2.0 - 1.0));
+    let p = vec2<f32>((in.uv.x * 2.0 - 1.0), -(in.uv.y * 2.0 - 1.0) / safe_aspect);
     
     let speed = 72.0;
     let cam_z = audio.smooth_time * speed;

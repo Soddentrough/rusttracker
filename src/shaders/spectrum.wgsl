@@ -173,17 +173,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     } 
     else {
         // --- MODE 2: AMBER CRT ---
-        // Apply radial distortion
-        let crt_uv = in.uv * 2.0 - 1.0;
-        let r2 = dot(crt_uv, crt_uv);
-        let distorted_uv = crt_uv * (1.0 + r2 * 0.15); // Curve
-        let final_uv = distorted_uv * 0.5 + 0.5;
+        // Apply radial distortion (Disabled to preserve grid alignment with UI)
+        let final_uv = in.uv;
         
         if final_uv.x < 0.0 || final_uv.x > 1.0 || final_uv.y < 0.0 || final_uv.y > 1.0 {
             return vec4<f32>(0.0, 0.0, 0.0, 1.0);
         }
         
-        let aspect = dpdx(in.uv.x) / dpdy(in.uv.y);
+        let aspect = audio.aspect_ratio;
         var final_color = vec3<f32>(0.0);
         let amber = vec3<f32>(1.0, 0.65, 0.1);
         
@@ -230,11 +227,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let mask_intensity = 0.7 + 0.3 * sin(mask_x * 3.14159) * sin(mask_y * 3.14159);
         final_color = final_color * mask_intensity;
         
-        let vignette = smoothstep(1.5, 0.2, length(distorted_uv));
-        let scanlines = sin(final_uv.y * 400.0 * aspect) * 0.15 + 0.85;
-        let flicker = sin(audio.time * 60.0) * 0.03 + 0.97;
+        var crt_settings = get_default_crt();
+        crt_settings.scanline_intensity = 0.15;
+        crt_settings.vignette_scale = 1.5;
+        crt_settings.vignette_softness = 0.2;
+        crt_settings.flicker_intensity = 0.03;
+        crt_settings.noise_intensity = 0.0;
         
-        final_color = final_color * vignette * scanlines * flicker;
+        final_color = apply_crt_effects(final_color, in.uv, in.clip_position.xy, audio.time, crt_settings);
         
         return vec4<f32>(final_color, 1.0);
     }

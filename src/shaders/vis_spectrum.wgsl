@@ -46,7 +46,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         return vec4<f32>(0.02, 0.02, 0.03, 1.0);
     }
     
-    let aspect = dpdx(in.uv.x) / dpdy(in.uv.y);
+    let aspect = 1.0 / max(audio.aspect_ratio, 0.0001);
     let num_leds = 1024.0 * aspect;
     
     let led_y = fract((1.0 - in.uv.y) * num_leds);

@@ -42,7 +42,64 @@ struct AudioUniforms {
     frame_count: u32,
     step_fraction: f32,
     steps_to_fill: u32,
-    pad1: u32,
+    aspect_ratio: f32,
     pad2: u32,
     pad3: u32,
 };
+
+fn hash21_crt(p: vec2<f32>) -> f32 {
+    var p3 = fract(vec3<f32>(p.xyx) * 0.1031);
+    p3 = p3 + dot(p3, p3.yzx + 33.33);
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+fn crt_distort_uv(uv: vec2<f32>, distortion: f32) -> vec2<f32> {
+    let crt_uv = uv * 2.0 - 1.0;
+    let r2 = dot(crt_uv, crt_uv);
+    return (crt_uv * (1.0 + r2 * distortion)) * 0.5 + 0.5;
+}
+
+struct CRTSettings {
+    scanline_intensity: f32,
+    vignette_scale: f32,
+    vignette_softness: f32,
+    noise_intensity: f32,
+    flicker_intensity: f32,
+    phosphor_tint: vec3<f32>,
+}
+
+fn get_default_crt() -> CRTSettings {
+    var settings: CRTSettings;
+    settings.scanline_intensity = 0.15;
+    settings.vignette_scale = 1.4;
+    settings.vignette_softness = 0.85;
+    settings.noise_intensity = 0.025;
+    settings.flicker_intensity = 0.03;
+    settings.phosphor_tint = vec3<f32>(1.0, 1.0, 1.0);
+    return settings;
+}
+
+fn apply_crt_effects(color: vec3<f32>, uv: vec2<f32>, clip_pos: vec2<f32>, time: f32, settings: CRTSettings) -> vec3<f32> {
+    var final_color = color;
+    
+    // CRT scanlines
+    let scanline = 1.0 - settings.scanline_intensity + settings.scanline_intensity * cos(clip_pos.y * 3.14159);
+    final_color *= scanline;
+    
+    // Vignette
+    let crt_uv = uv * 2.0 - 1.0;
+    let r = length(crt_uv);
+    let bezel = smoothstep(settings.vignette_scale, settings.vignette_softness, r);
+    final_color *= bezel;
+    
+    // Flicker
+    let flicker = 1.0 - settings.flicker_intensity + settings.flicker_intensity * sin(time * 377.0);
+    final_color *= flicker;
+    
+    // Analog noise
+    let noise_val = hash21_crt(clip_pos + fract(time) * 137.0);
+    let static_noise = noise_val * settings.noise_intensity * bezel;
+    final_color = final_color + static_noise;
+    
+    return final_color * settings.phosphor_tint;
+}

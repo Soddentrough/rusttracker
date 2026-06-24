@@ -95,7 +95,8 @@ pub struct AudioUniforms {
     pub frame_count: u32,
     pub step_fraction: f32,
     pub steps_to_fill: u32,
-    pub padding: [u32; 3],
+    pub aspect_ratio: f32,
+    pub padding: [u32; 2],
 }
 
 
@@ -2189,7 +2190,8 @@ impl VulkanEngine {
             frame_count: self.frame_count,
             step_fraction,
             steps_to_fill: steps,
-            padding: [0; 3],
+            aspect_ratio: self.size.width as f32 / self.size.height as f32,
+            padding: [0; 2],
         };
 
         uniforms.spectrum.copy_from_slice(&state.spectrum_data);
@@ -4313,8 +4315,13 @@ impl VulkanEngine {
             
             // --- 3D Engine Camera Math ---
             let aspect = vp_w / vp_h.max(1.0);
+            
+            // Update aspect_ratio uniform dynamically based on the current viewport
+            self.queue.write_buffer(&self.uniform_buffer, 8676, bytemuck::cast_slice(&[aspect as f32]));
 
-            let proj = glam::Mat4::perspective_rh_gl(std::f32::consts::PI / 3.0, aspect, 0.1, 1000.0);
+            let fov_x = std::f32::consts::PI / 2.0;
+            let fov_y = 2.0 * ((fov_x / 2.0).tan() / aspect).atan();
+            let proj = glam::Mat4::perspective_rh_gl(fov_y, aspect, 0.1, 1000.0);
             let view = if state.visualizer_mode == 19 && state.biolum_top_down {
                 glam::Mat4::look_at_rh(
                     glam::Vec3::new(0.0, 14.0, 0.0),

@@ -52,7 +52,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let dy = dpdy(in.uv.y);
     let aspect = dy / max(dx, 0.00001);
     
-    // Scale screen coords
+    // Scale screen coords to maintain horizontal FOV
     let p = vec2<f32>(distorted_uv.x * aspect, distorted_uv.y) * 0.9;
     
     // Subtly rotate camera around center
@@ -75,7 +75,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     let num_lines = min(max(1u, audio.waveform_history_size), 144u);
     let res = f32(max(audio.waveform_resolution, 128u));
-    let inv_res_minus_1 = 19.2 / (res - 1.0);
+    let safe_aspect = max(aspect, 0.001);
+    let bound = 9.6 * safe_aspect;
+    let inner_bound = max(bound - 3.0, 0.0);
+    let inv_res_minus_1 = (bound * 2.0) / (res - 1.0);
     
     if rd.y > 0.0 {
         let t_min = max(0.0, (ro.z - 1.5) / max(0.2 - rd.z, 0.00001));
@@ -96,13 +99,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             
             let hit_x = ro.x + rd.x * t;
             
-            let edge_fade = smoothstep(9.6, 6.6, abs(hit_x));
+            let edge_fade = smoothstep(bound, inner_bound, abs(hit_x));
             if edge_fade <= 0.00001 {
                 continue;
             }
             
             // Map X from -9.6 to 9.6 to dynamic resolution
-            let float_idx = (hit_x + 9.6) / 19.2 * (res - 1.0);
+            let float_idx = (hit_x + bound) / (bound * 2.0) * (res - 1.0);
             let idx = i32(round(float_idx));
             
             // Search radius proportional to distance to avoid aliasing/dropout on distant lines
@@ -116,8 +119,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let hist_offset = clamp(hist_idx, 0u, max(1u, audio.waveform_history_size) - 1u) * 2048u;
             
             var j_u = u32(start_idx);
-            var x_prev = -9.6 + f32(j_u) * inv_res_minus_1;
-            var mask_prev = smoothstep(9.6, 6.6, abs(x_prev));
+            var x_prev = -bound + f32(j_u) * inv_res_minus_1;
+            var mask_prev = smoothstep(bound, inner_bound, abs(x_prev));
             var v_prev = waveform_history[hist_offset + j_u];
             var p_prev = v_prev * mask_prev * 1.2;
             var p3_prev = vec3<f32>(x_prev, y_line, p_prev);
@@ -125,8 +128,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             
             for (var j = start_idx; j <= end_idx; j = j + 1) {
                 j_u = u32(j + 1);
-                let x_curr = -9.6 + f32(j_u) * inv_res_minus_1;
-                let mask_curr = smoothstep(9.6, 6.6, abs(x_curr));
+                let x_curr = -bound + f32(j_u) * inv_res_minus_1;
+                let mask_curr = smoothstep(bound, inner_bound, abs(x_curr));
                 let v_curr = waveform_history[hist_offset + j_u];
                 let p_curr = v_curr * mask_curr * 1.2;
                 let p3_curr = vec3<f32>(x_curr, y_line, p_curr);
@@ -157,7 +160,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let age_fade = mix(0.05, 1.0, f32(i) / f32(num_lines - 1u));
             
             // Sample waveform height at hit point for color grading
-            let hit_wave_idx = u32(clamp((hit_x + 9.6) / 19.2 * (res - 1.0), 0.0, res - 1.0));
+            let hit_wave_idx = u32(clamp((hit_x + bound) / (bound * 2.0) * (res - 1.0), 0.0, res - 1.0));
             let wave_height = clamp(abs(waveform_history[hist_offset + hit_wave_idx]) * 2.0, 0.0, 1.0);
             let line_amber = mix(amber_lo, amber_hi, wave_height);
             
