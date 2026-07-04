@@ -26,6 +26,7 @@ struct AudioUniforms {
     channel_peaks: array<vec4<f32>, 8>,
     spatial_channels: array<vec4<f32>, 4>,
     display_order: array<vec4<u32>, 4>,
+    channel_phases: array<vec4<f32>, 8>,
     num_channels: u32,
     mode: u32,
     time: f32,

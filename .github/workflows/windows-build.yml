@@ -54,11 +54,54 @@ jobs:
         VERSION=$(grep -m 1 '^version' Cargo.toml | cut -d '"' -f 2)
         echo "VERSION=$VERSION" >> $GITHUB_ENV
         
+    - name: Sign Executable
+      shell: pwsh
+      env:
+        AZURE_CLIENT_ID: ${{ secrets.AZURE_SIGNING_CLIENT_ID }}
+        AZURE_CLIENT_SECRET: ${{ secrets.AZURE_SIGNING_CLIENT_SECRET }}
+        AZURE_TENANT_ID: ${{ secrets.AZURE_SIGNING_TENANT_ID }}
+        VAULT_URL: ${{ secrets.AZURE_SIGNING_VAULT_URL }}
+        CERT_NAME: ${{ secrets.AZURE_SIGNING_CERT_NAME }}
+      if: ${{ secrets.AZURE_SIGNING_CLIENT_ID != '' }}
+      run: |
+        dotnet tool install --global AzureSignTool
+        azuresigntool sign `
+          -kvu "$env:VAULT_URL" `
+          -kvi "$env:AZURE_CLIENT_ID" `
+          -kvs "$env:AZURE_CLIENT_SECRET" `
+          -kct "$env:AZURE_TENANT_ID" `
+          -kco "$env:CERT_NAME" `
+          -tr http://timestamp.digicert.com `
+          -td sha256 `
+          -fd sha256 `
+          release/rusttracker.exe
+
     - name: Build Installer
       shell: cmd
       run: |
         "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "/DMyAppVersion=%VERSION%" installer.iss
-        
+
+    - name: Sign Installer
+      shell: pwsh
+      env:
+        AZURE_CLIENT_ID: ${{ secrets.AZURE_SIGNING_CLIENT_ID }}
+        AZURE_CLIENT_SECRET: ${{ secrets.AZURE_SIGNING_CLIENT_SECRET }}
+        AZURE_TENANT_ID: ${{ secrets.AZURE_SIGNING_TENANT_ID }}
+        VAULT_URL: ${{ secrets.AZURE_SIGNING_VAULT_URL }}
+        CERT_NAME: ${{ secrets.AZURE_SIGNING_CERT_NAME }}
+      if: ${{ secrets.AZURE_SIGNING_CLIENT_ID != '' }}
+      run: |
+        azuresigntool sign `
+          -kvu "$env:VAULT_URL" `
+          -kvi "$env:AZURE_CLIENT_ID" `
+          -kvs "$env:AZURE_CLIENT_SECRET" `
+          -kct "$env:AZURE_TENANT_ID" `
+          -kco "$env:CERT_NAME" `
+          -tr http://timestamp.digicert.com `
+          -td sha256 `
+          -fd sha256 `
+          setup/RustTracker-Setup.exe
+          
     - name: Upload Artifact
       uses: actions/upload-artifact@v5
       with:

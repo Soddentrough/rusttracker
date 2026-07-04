@@ -129,6 +129,14 @@ jobs:
             "RustTracker-MacOS-Installer.dmg" \
             "RustTracker.app"
 
+      - name: Codesign DMG
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+        if: ${{ env.MACOS_CERTIFICATE != '' }}
+        run: |
+          echo "Signing the DMG container..."
+          codesign --force --sign "Developer ID Application" RustTracker-MacOS-Installer.dmg
+
       - name: Notarize DMG
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}

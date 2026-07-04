@@ -79,6 +79,7 @@ pub struct AudioUniforms {
     pub channel_peaks: [f32; 32],
     pub spatial_channels: [f32; 16],
     pub display_order: [u32; 16],
+    pub channel_phases: [f32; 32],
     pub num_channels: u32,
     pub mode: u32,
     pub time: f32,
@@ -300,6 +301,7 @@ pub struct VulkanEngine {
     time_since_last_push: f64,
     vu_needle_angles: Vec<f32>,
     vu_needle_velocities: Vec<f32>,
+    channel_phases: [f32; 32],
 }
 
 pub(crate) fn generate_lamp_mesh() -> (Vec<Vertex>, Vec<u32>) {
@@ -720,6 +722,7 @@ impl VulkanEngine {
                 18 => include_str!("shaders/vis_vumeters.wgsl"),
                 19 => include_str!("shaders/vis_bioluminescence.wgsl"),
                 20 => include_str!("shaders/vis_3doscilloscope_raster.wgsl"),
+                21 => include_str!("shaders/vis_matrix.wgsl"),
                 _ => include_str!("shaders/vis_spectrum.wgsl"),
             }
         };
@@ -2098,6 +2101,7 @@ impl VulkanEngine {
             time_since_last_push: 0.0,
             vu_needle_angles: vec![0.0; 32],
             vu_needle_velocities: vec![0.0; 32],
+            channel_phases: [0.0; 32],
         }
     }
 
@@ -2131,6 +2135,16 @@ impl VulkanEngine {
 
     pub fn update(&mut self, state: &AppState, dt: f32) {
         self.frame_count = self.frame_count.wrapping_add(1);
+        
+        // Accumulate matrix digital rain speed phases per channel
+        for i in 0..32 {
+            let ch_vu = if i < state.channel_vus.len() {
+                state.channel_vus[i]
+            } else {
+                0.0
+            };
+            self.channel_phases[i] += dt * (1.0 + ch_vu * 5.0);
+        }
         
         // Exponential moving average to smooth CPU scheduling time jitter
         let alpha = 0.03f64;
@@ -2174,6 +2188,7 @@ impl VulkanEngine {
             channel_peaks: [0.0; 32],
             spatial_channels: [0.0; 16],
             display_order: [0; 16],
+            channel_phases: self.channel_phases,
             num_channels: state.channel_vus.len().min(32) as u32,
             mode: state.visualizer_mode,
             time: state.scrub_target_seconds.unwrap_or(state.current_seconds) as f32,
@@ -4597,7 +4612,7 @@ mod tests {
     #[test]
     fn test_uniform_size_alignment() {
         let rust_size = std::mem::size_of::<AudioUniforms>();
-        assert_eq!(rust_size, 8688, "Rust AudioUniforms size is not 8688 bytes (actual: {})", rust_size);
+        assert_eq!(rust_size, 8816, "Rust AudioUniforms size is not 8816 bytes (actual: {})", rust_size);
 
         // Parse _common.wgsl to compute WGSL structure size
         let common_source = std::fs::read_to_string("src/shaders/_common.wgsl")
@@ -4650,7 +4665,7 @@ mod tests {
 
         // Align struct size to maximum alignment (16)
         let wgsl_size = (offset + 15) / 16 * 16;
-        assert_eq!(wgsl_size, 8688, "WGSL AudioUniforms size is not 8688 bytes (actual: {})", wgsl_size);
+        assert_eq!(wgsl_size, 8816, "WGSL AudioUniforms size is not 8816 bytes (actual: {})", wgsl_size);
         assert_eq!(rust_size, wgsl_size, "Size mismatch: Rust AudioUniforms is {}, WGSL is {}", rust_size, wgsl_size);
     }
 

@@ -43,3 +43,11 @@ Once the native 3D pipeline is established, the first 3D visualizer will be base
 *   **Asset Pipeline:** Requires integrating a loader (e.g., the `gltf` or `blend-rs` crate) to import the 3D object data and material properties into our new `wgpu` vertex buffers.
 *   **Lighting Strategy:** Instead of full hardware raytracing (which is too computationally intense for 120Hz on lower-end hardware), we will use standard 3D rasterization with dynamic point/spot lights linked to the `AudioUniforms` data.
 *   **Remaining Concerns:** Binary file size bloat from embedding 3D assets will need to be actively managed by optimizing model exports.
+
+## Future Target: Vaporwave Fountain Visualizer
+
+**Feature Request:**
+Implement a Vaporwave Fountain visualizer.
+*   **Concept:** A retro 3D fountain utilizing instanced particles for water droplets, with water jets that spray and change height/angle dynamically in reaction to audio frequencies.
+*   **Styling:** A classic Black & White (B&W) film tone.
+*   **Concerns:** Achieving an authentic B&W film look (film grain, bloom, vignette, proper contrast curves) alongside high-performance instanced particle updates on the GPU can be challenging and will require careful optimization.

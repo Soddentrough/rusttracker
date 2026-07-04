@@ -117,6 +117,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
     VisualizerDef { id: 17, name: "Neon Cuboids", filename: "vis_cuboids.wgsl", description: "3D neon wireframe cuboids reacting to audio", pipeline_type: PipelineType::Mesh3D { geometry: Geometry::UnitBox, instances: 1674 }, requires_history: true, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 18, name: "Retro VU Meters", filename: "vis_vumeters.wgsl", description: "3D retro VU meters with warm glow and analog needle ballistics", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 19, name: "Bioluminescent Waves", filename: "vis_bioluminescence.wgsl", description: "GPU compute-driven bioluminescent particle waves", pipeline_type: PipelineType::Mesh3D { geometry: Geometry::UnitBox, instances: 65536 }, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
+    VisualizerDef { id: 21, name: "Matrix Digital Rain", filename: "vis_matrix.wgsl", description: "Audio-reactive 3D parallax digital rain", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
 ];
 
 #[derive(Debug, Clone)]
