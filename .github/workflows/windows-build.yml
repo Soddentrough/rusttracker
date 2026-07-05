@@ -62,7 +62,7 @@ jobs:
         AZURE_TENANT_ID: ${{ secrets.AZURE_SIGNING_TENANT_ID }}
         VAULT_URL: ${{ secrets.AZURE_SIGNING_VAULT_URL }}
         CERT_NAME: ${{ secrets.AZURE_SIGNING_CERT_NAME }}
-      if: ${{ secrets.AZURE_SIGNING_CLIENT_ID != '' }}
+      if: ${{ env.AZURE_CLIENT_ID != '' }}
       run: |
         dotnet tool install --global AzureSignTool
         azuresigntool sign `
@@ -89,7 +89,7 @@ jobs:
         AZURE_TENANT_ID: ${{ secrets.AZURE_SIGNING_TENANT_ID }}
         VAULT_URL: ${{ secrets.AZURE_SIGNING_VAULT_URL }}
         CERT_NAME: ${{ secrets.AZURE_SIGNING_CERT_NAME }}
-      if: ${{ secrets.AZURE_SIGNING_CLIENT_ID != '' }}
+      if: ${{ env.AZURE_CLIENT_ID != '' }}
       run: |
         azuresigntool sign `
           -kvu "$env:VAULT_URL" `
