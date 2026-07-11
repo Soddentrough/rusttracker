@@ -33,10 +33,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // --- CRT barrel distortion ---
     let uv = crt_distort_uv(in.uv, 0.03);
 
-    // Outside the CRT tube → pure black
-    if uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 {
+    // Hard check slightly outside the tube to save performance
+    if uv.x < -0.015 || uv.x > 1.015 || uv.y < -0.015 || uv.y > 1.015 {
         return vec4<f32>(0.0, 0.0, 0.0, 1.0);
     }
+
+    // Soft bezel/vignette boundary fade (blends/blurs the hard edges nicely)
+    let bezel_fade_x = smoothstep(0.0, 0.015, uv.x) * smoothstep(1.0, 0.985, uv.x);
+    let bezel_fade_y = smoothstep(0.0, 0.015, uv.y) * smoothstep(1.0, 0.985, uv.y);
+    let bezel = bezel_fade_x * bezel_fade_y;
 
     // --- Pixelate to virtual resolution (nearest-neighbor, chunky pixels) ---
     let virt_res = vec2<f32>(256.0, 144.0);
@@ -90,6 +95,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     crt_settings.noise_intensity = 0.025;
     crt_settings.flicker_intensity = 0.03;
     color = apply_crt_effects(color, in.uv, in.clip_position.xy, audio.smooth_time, crt_settings);
+
+    // Apply soft bezel edge fade
+    color *= bezel;
 
     return vec4<f32>(color, 1.0);
 }

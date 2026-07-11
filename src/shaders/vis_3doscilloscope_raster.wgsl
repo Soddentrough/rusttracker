@@ -74,9 +74,9 @@ fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
     // Camera rotation matches the original 3D CRT Oscilloscope
     let rot_angle = sin(audio.time * 0.2) * 0.15;
     let cam_dist_val = 3.2;
-    let cam_height = 1.8;
+    let cam_height = 1.7; // Adjusted camera height to match others
     let ro = vec3<f32>(sin(rot_angle) * cam_dist_val, cam_height, -cos(rot_angle) * cam_dist_val);
-    let cam_target = vec3<f32>(0.0, 0.0, 0.0);
+    let cam_target = vec3<f32>(0.0, 0.0, 0.8); // Target adjusted to match others (Depth Z = 0.8, Height Y = 0.0)
 
     let f = normalize(cam_target - ro);
     let s = normalize(cross(f, vec3<f32>(0.0, 1.0, 0.0)));
@@ -89,7 +89,18 @@ fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
         vec4<f32>(-dot(s, ro), -dot(u, ro), dot(f, ro), 1.0)
     );
 
-    let clip_pos = camera.proj_matrix * view_matrix * vec4<f32>(p3, 1.0);
+    let view_pos = view_matrix * vec4<f32>(p3, 1.0);
+    // Custom projection matrix to match the 116 degree horizontal / 84 degree vertical FOV of the raymarched versions
+    let p_00 = 1.0 / (0.9 * audio.aspect_ratio);
+    let p_11 = 1.11111111;
+    let p_22 = -1.0001;
+    let p_32 = -0.10001;
+    let clip_pos = vec4<f32>(
+        view_pos.x * p_00,
+        view_pos.y * p_11,
+        view_pos.z * p_22 + p_32,
+        -view_pos.z
+    );
 
     // Apply barrel distortion in clip space (NDC) to match the curved CRT glass
     let ndc = clip_pos.xy / max(clip_pos.w, 0.0001);
@@ -124,8 +135,10 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     // UV derivative-based wireframe grid shader
     // Width has 128 lines, depth has 72 lines
     let grid_res = vec2<f32>(128.0, 72.0);
-    let fwidth_uv = fwidth(in.uv * grid_res) + 0.0001;
-
+    
+    // Use the continuous world-space Z for the vertical grid coordinate to eliminate temporal jitter
+    let uv_g = vec2<f32>(in.uv.x, (in.world_pos.z + 1.8) / 10.8);
+    
     // Amplitude-reactive bloom width and brightness
     let wave_height = clamp(abs(in.hit_val) * 2.0, 0.0, 1.0);
     let bloom_boost = 1.0 + wave_height * 0.8;
@@ -134,22 +147,23 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     let offset_r = vec2<f32>(0.0005, 0.0003);
     let offset_b = vec2<f32>(-0.0005, -0.0003);
 
+    let fwidth_uv = fwidth(uv_g * grid_res) + 0.0001;
+
     // Red Channel Grid
-    let uv_r = in.uv + offset_r;
+    let uv_r = uv_g + offset_r;
     let grid_r = abs(fract(uv_r * grid_res - 0.5) - 0.5) / fwidth_uv;
     let line_r = min(grid_r.x, grid_r.y) / (1.0 + total_coc);
     let wire_r = exp(-line_r * 1.8) / (1.0 + total_coc * 0.5) +
                  (exp(-line_r * 0.15) * 0.45 / (1.0 + total_coc * 0.2) + exp(-line_r * 0.04) * 0.2 / (1.0 + total_coc * 0.1)) * bloom_boost;
 
     // Green/Amber Channel Grid (center)
-    let uv_g = in.uv;
     let grid_g = abs(fract(uv_g * grid_res - 0.5) - 0.5) / fwidth_uv;
     let line_g = min(grid_g.x, grid_g.y) / (1.0 + total_coc);
     let wire_g = exp(-line_g * 1.8) / (1.0 + total_coc * 0.5) +
                  (exp(-line_g * 0.15) * 0.45 / (1.0 + total_coc * 0.2) + exp(-line_g * 0.04) * 0.2 / (1.0 + total_coc * 0.1)) * bloom_boost;
 
     // Blue Channel Grid
-    let uv_b = in.uv + offset_b;
+    let uv_b = uv_g + offset_b;
     let grid_b = abs(fract(uv_b * grid_res - 0.5) - 0.5) / fwidth_uv;
     let line_b = min(grid_b.x, grid_b.y) / (1.0 + total_coc);
     let wire_b = exp(-line_b * 1.8) / (1.0 + total_coc * 0.5) +

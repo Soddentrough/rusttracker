@@ -252,6 +252,15 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         Span::raw(&state.module_type)
     ]));
 
+    // 4b. Visualization
+    let vis_name = crate::state::VISUALIZERS.get(state.current_visualizer_idx)
+        .map(|v| v.name)
+        .unwrap_or("Unknown");
+    lines.push(Line::from(vec![
+        Span::raw("Vis:    "),
+        Span::raw(vis_name)
+    ]));
+
     // 5. BPM (if available)
     if state.bpm > 0 {
         lines.push(Line::from(vec![

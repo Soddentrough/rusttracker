@@ -58,10 +58,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Subtly rotate camera around center
     let rot_angle = sin(audio.time * 0.2) * 0.15; 
     let cam_dist = 3.2;
-    let cam_height = 1.8; // Higher up to look down at the grid
+    let cam_height = 1.7; // Adjusted camera height
     
     let ro = vec3<f32>(sin(rot_angle) * cam_dist, -cos(rot_angle) * cam_dist, cam_height);
-    let cam_target = vec3<f32>(0.0, 0.0, 0.0);
+    let cam_target = vec3<f32>(0.0, 0.8, 0.0); // Target adjusted to push the far edge higher up in the frame
     
     let w = normalize(cam_target - ro);
     let u = normalize(cross(w, vec3<f32>(0.0, 0.0, 1.0)));

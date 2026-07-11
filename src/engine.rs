@@ -3892,6 +3892,12 @@ impl VulkanEngine {
                                     // 4. Type
                                     ui.horizontal(|ui| { ui.label("Type"); ui.label(&state.module_type); });
                                     
+                                    // 4b. Visualization
+                                    let vis_name = crate::state::VISUALIZERS.get(state.current_visualizer_idx)
+                                        .map(|v| v.name)
+                                        .unwrap_or("Unknown");
+                                    ui.horizontal(|ui| { ui.label("Visualization"); ui.label(vis_name); });
+                                    
                                     // 5. Video
                                     if let Some(video) = &state.video_info {
                                         if video == "Unsupported Codec" {
