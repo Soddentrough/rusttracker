@@ -63,6 +63,12 @@ fn sdBox(p: vec3<f32>, b: vec3<f32>) -> f32 {
     return length(max(q, vec3<f32>(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0);
 }
 
+// Cylinder along the X axis SDF helper
+fn sd_cylinder_x(p: vec3<f32>, r: f32, h: f32) -> f32 {
+    let d = vec2<f32>(length(p.yz) - r, abs(p.x) - h);
+    return min(max(d.x, d.y), 0.0) + length(max(d, vec2<f32>(0.0)));
+}
+
 
 // Distance estimator (SDF) for the retro sports car — Countach/Testarossa inspired
 fn sd_car(p: vec3<f32>, car_pos: vec3<f32>) -> f32 {
@@ -81,25 +87,35 @@ fn sd_car(p: vec3<f32>, car_pos: vec3<f32>) -> f32 {
     let p_car = vec3<f32>(px, py, pz);
     
     // 1. Main body — wide, low wedge
-    var d = sdBox(p_car - vec3<f32>(0.0, -0.02, 0.0), vec3<f32>(1.15, 0.16, 2.0));
+    var d_body = sdBox(p_car - vec3<f32>(0.0, -0.02, 0.0), vec3<f32>(1.15, 0.16, 2.0));
     
     // 2. Front nose — tapered wedge sloping downward
     let p_nose = p_car - vec3<f32>(0.0, -0.10, 1.4);
     // Tilt forward ~20 degrees
     let p_nose_rot = vec3<f32>(p_nose.x, p_nose.y * 0.94 - p_nose.z * 0.34, p_nose.y * 0.34 + p_nose.z * 0.94);
     let d_nose = sdBox(p_nose_rot, vec3<f32>(1.10, 0.10, 0.7));
-    d = min(d, d_nose);
+    d_body = min(d_body, d_nose);
     
     // 3. Rear deck — slight upward slope for fastback profile
     let p_rear = p_car - vec3<f32>(0.0, -0.02, -1.4);
     let p_rear_rot = vec3<f32>(p_rear.x, p_rear.y * 0.97 + p_rear.z * 0.24, -p_rear.y * 0.24 + p_rear.z * 0.97);
     let d_rear = sdBox(p_rear_rot, vec3<f32>(1.14, 0.14, 0.65));
-    d = min(d, d_rear);
+    d_body = min(d_body, d_rear);
     
     // 4. Fender flares — wider haunches over rear wheels
     let d_fender_l = sdBox(p_car - vec3<f32>(-1.05, -0.06, -0.9), vec3<f32>(0.22, 0.12, 0.55));
     let d_fender_r = sdBox(p_car - vec3<f32>(1.05, -0.06, -0.9), vec3<f32>(0.22, 0.12, 0.55));
-    d = min(d, min(d_fender_l, d_fender_r));
+    d_body = min(d_body, min(d_fender_l, d_fender_r));
+    
+    // Wheel arches cutouts (slightly larger cylinders than the wheels)
+    let d_arch_fl = sd_cylinder_x(p_car - vec3<f32>(-1.05, -0.03, 1.15), 0.36, 0.16);
+    let d_arch_fr = sd_cylinder_x(p_car - vec3<f32>(1.05, -0.03, 1.15), 0.36, 0.16);
+    let d_arch_rl = sd_cylinder_x(p_car - vec3<f32>(-1.12, 0.01, -1.05), 0.40, 0.20);
+    let d_arch_rr = sd_cylinder_x(p_car - vec3<f32>(1.12, 0.01, -1.05), 0.40, 0.20);
+    let d_arches = min(d_arch_fl, min(d_arch_fr, min(d_arch_rl, d_arch_rr)));
+    
+    // Subtract wheel arches from body to create wheel wells
+    d_body = max(d_body, -d_arches);
     
     // 5. Cabin — raked windshield flowing into fastback
     // Windshield (steeply raked ~30 degrees)
@@ -116,18 +132,18 @@ fn sd_car(p: vec3<f32>, car_pos: vec3<f32>) -> f32 {
     let d_rw = sdBox(p_rw_rot, vec3<f32>(0.76, 0.10, 0.45));
     
     let d_cabin = min(d_ws, min(d_roof, d_rw));
-    d = min(d, d_cabin);
+    var d = min(d_body, d_cabin);
     
     // 6. Side intake scoops (Testarossa style strakes)
     let d_intake_l = sdBox(p_car - vec3<f32>(-1.17, 0.02, -0.3), vec3<f32>(0.06, 0.08, 0.45));
     let d_intake_r = sdBox(p_car - vec3<f32>(1.17, 0.02, -0.3), vec3<f32>(0.06, 0.08, 0.45));
     d = min(d, min(d_intake_l, d_intake_r));
     
-    // 7. Wheels — cylindrical proportions
-    let d_tire_fl = sdBox(p_car - vec3<f32>(-1.05, -0.18, 1.15), vec3<f32>(0.14, 0.18, 0.30));
-    let d_tire_fr = sdBox(p_car - vec3<f32>(1.05, -0.18, 1.15), vec3<f32>(0.14, 0.18, 0.30));
-    let d_tire_rl = sdBox(p_car - vec3<f32>(-1.12, -0.18, -1.05), vec3<f32>(0.18, 0.20, 0.35));
-    let d_tire_rr = sdBox(p_car - vec3<f32>(1.12, -0.18, -1.05), vec3<f32>(0.18, 0.20, 0.35));
+    // 7. Wheels — cylindrical shape, adjusted to sit perfectly on the ground plane
+    let d_tire_fl = sd_cylinder_x(p_car - vec3<f32>(-1.05, -0.03, 1.15), 0.32, 0.14);
+    let d_tire_fr = sd_cylinder_x(p_car - vec3<f32>(1.05, -0.03, 1.15), 0.32, 0.14);
+    let d_tire_rl = sd_cylinder_x(p_car - vec3<f32>(-1.12, 0.01, -1.05), 0.36, 0.18);
+    let d_tire_rr = sd_cylinder_x(p_car - vec3<f32>(1.12, 0.01, -1.05), 0.36, 0.18);
     d = min(d, min(d_tire_fl, min(d_tire_fr, min(d_tire_rl, d_tire_rr))));
     
     // 8. Side mirrors
@@ -360,6 +376,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 hit_box_max = l_max;
             }
             
+            // Left lamppost head (glowing fixture atop the pole)
+            let lh_min = vec3<f32>(rx - 8.75, 6.45, z_center - 0.45);
+            let lh_max = vec3<f32>(rx - 8.25, 6.75, z_center + 0.45);
+            let t_lh = intersect_box(ro, rd, lh_min, lh_max);
+            if (t_lh > 0.0 && t_lh < t_closest) {
+                t_closest = t_lh;
+                hit_material = 11;
+                hit_block_id = i;
+                hit_box_min = lh_min;
+                hit_box_max = lh_max;
+            }
+            
             // Right lamppost
             let r_min = vec3<f32>(rx + 8.4, 0.0, z_center - 0.2);
             let r_max = vec3<f32>(rx + 8.6, 6.5, z_center + 0.2);
@@ -370,6 +398,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 hit_block_id = i;
                 hit_box_min = r_min;
                 hit_box_max = r_max;
+            }
+            
+            // Right lamppost head (glowing fixture atop the pole)
+            let rh_min = vec3<f32>(rx + 8.25, 6.45, z_center - 0.45);
+            let rh_max = vec3<f32>(rx + 8.75, 6.75, z_center + 0.45);
+            let t_rh = intersect_box(ro, rd, rh_min, rh_max);
+            if (t_rh > 0.0 && t_rh < t_closest) {
+                t_closest = t_rh;
+                hit_material = 16;
+                hit_block_id = i;
+                hit_box_min = rh_min;
+                hit_box_max = rh_max;
             }
         }
     }
@@ -388,7 +428,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let t_entry = max(0.0, t_car_box);
         let t_exit = t_entry + 4.8;
         var t_march = t_entry;
-        for (var step = 0; step < 10; step++) {
+        for (var step = 0; step < 50; step++) {
             let p_march = ro + t_march * rd;
             let d_car = sd_car(p_march, car_pos);
             if (d_car < 0.005) {
@@ -431,13 +471,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             case 1, 2, 3, 4: {
                 let rx = road_x(f32(hit_block_id) * L);
                 let norm = get_box_normal(hit_pos, hit_box_min, hit_box_max);
-                // Sky reflecting on glass facades
-                let reflection = sample_sky(reflect(rd, norm)) * 0.15;
+                // Sky reflecting on glass facades (kept subtle so buildings read as solid)
+                let reflection = sample_sky(reflect(rd, norm)) * 0.05;
                 
-                // Base skyscraper gradient
+                // Base skyscraper gradient (raised base so facades are opaque, not washed out)
                 let height_ratio = hit_pos.y / hit_box_max.y;
-                let building_base = vec3<f32>(0.02, 0.005, 0.06);
-                let building_top = vec3<f32>(0.1, 0.02, 0.2);
+                let building_base = vec3<f32>(0.05, 0.012, 0.11);
+                let building_top = vec3<f32>(0.16, 0.04, 0.30);
                 var material_color_temp = mix(building_base, building_top, height_ratio) + reflection;
                 
                 // Lateral neon accent highlights on building walls
@@ -534,16 +574,32 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                     material_color = mix(vec3<f32>(0.02, 0.02, 0.02), vec3<f32>(0.04, 0.04, 0.06), strake_line);
                 }
                 
-                // 3. Wheels/Tires & Rims (updated positions)
-                let fl_dist = length(p_car - vec3<f32>(-1.05, -0.18, 1.15));
-                let fr_dist = length(p_car - vec3<f32>(1.05, -0.18, 1.15));
-                let rl_dist = length(p_car - vec3<f32>(-1.12, -0.18, -1.05));
-                let rr_dist = length(p_car - vec3<f32>(1.12, -0.18, -1.05));
-                if (min(fl_dist, min(fr_dist, min(rl_dist, rr_dist))) < 0.38) {
+                // 3. Wheels/Tires & Rims (updated positions, spinning spokes)
+                let wc_fl = vec3<f32>(-1.05, -0.03, 1.15);
+                let wc_fr = vec3<f32>(1.05, -0.03, 1.15);
+                let wc_rl = vec3<f32>(-1.12, 0.01, -1.05);
+                let wc_rr = vec3<f32>(1.12, 0.01, -1.05);
+                let is_wheel_fl = length(p_car.yz - wc_fl.yz) < 0.33 && abs(p_car.x - wc_fl.x) < 0.15;
+                let is_wheel_fr = length(p_car.yz - wc_fr.yz) < 0.33 && abs(p_car.x - wc_fr.x) < 0.15;
+                let is_wheel_rl = length(p_car.yz - wc_rl.yz) < 0.37 && abs(p_car.x - wc_rl.x) < 0.19;
+                let is_wheel_rr = length(p_car.yz - wc_rr.yz) < 0.37 && abs(p_car.x - wc_rr.x) < 0.19;
+                if (is_wheel_fl || is_wheel_fr || is_wheel_rl || is_wheel_rr) {
                     material_color = vec3<f32>(0.01, 0.01, 0.01); // Matte black tires
-                    // Neon cyan rims on the outer face
+                    // Neon cyan rims on the outer face with spinning spokes
                     if (abs(p_car.x) > 1.10) {
-                        material_color = vec3<f32>(0.0, 0.75, 0.88) * 1.2;
+                        // Find nearest wheel center for a local spoke angle
+                        var wc = wc_fl;
+                        if (is_wheel_fr) { wc = wc_fr; }
+                        else if (is_wheel_rl) { wc = wc_rl; }
+                        else if (is_wheel_rr) { wc = wc_rr; }
+                        let local = p_car - wc;
+                        // Visual spin only (smooth_time — does NOT affect car motion)
+                        let spin = audio.smooth_time * 220.0;
+                        let ang = atan2(local.y, local.z) + spin;
+                        let spoke = step(0.5, fract(ang * 3.0 / 3.14159));
+                        let rim_bright = vec3<f32>(0.0, 0.75, 0.88) * 1.2;
+                        let rim_dark = vec3<f32>(0.0, 0.40, 0.50) * 0.9;
+                        material_color = mix(rim_bright, rim_dark, spoke);
                     }
                 }
                 
@@ -622,15 +678,22 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             default: {}
         }
         
-        // 6. Horizon atmospheric fog to blend the 3D scene cleanly into the sunset
-        let fog_factor = smoothstep(120.0, 480.0, t_closest);
+        // 6. Horizon atmospheric fog — start farther out and cap it so buildings stay solid
+        let fog_factor = smoothstep(220.0, 520.0, t_closest) * 0.9;
         let sky_background = sample_sky(rd);
         final_color = mix(material_color, sky_background, fog_factor);
     }
     
     // ACES Cinematic Tone Mapping for premium visual color grading
     let tonemapped = (final_color * (2.51 * final_color + 0.03)) / (final_color * (2.43 * final_color + 0.59) + 0.14);
-    let exposure_adjusted = max(tonemapped, vec3<f32>(0.0));
+    var exposure_adjusted = max(tonemapped, vec3<f32>(0.0));
+    
+    // Subtle retro CRT finish (scanlines + vignette + faint flicker) — pure post-process
+    var crt = get_default_crt();
+    crt.scanline_intensity = 0.07;
+    crt.noise_intensity = 0.012;
+    crt.flicker_intensity = 0.02;
+    exposure_adjusted = apply_crt_effects(exposure_adjusted, in.uv, in.clip_position.xy, audio.smooth_time, crt);
     
     return vec4<f32>(exposure_adjusted, 1.0);
 }

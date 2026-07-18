@@ -156,7 +156,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let d = map(p);
         if (d < HIT_THRESHOLD) { hit = true; break; }
         if (t > MAX_MARCH_DIST) { break; }
-        t += max(d, 0.002);
+        // Adaptive minimum step: grow the floor with distance travelled so
+        // near-parallel far-field rays reach MAX_MARCH_DIST quickly, while
+        // near-surface rays keep fine 0.002 precision. Cuts iterations on
+        // grazing/empty rays without changing the SDF or hit threshold.
+        let min_step = 0.002 + t * 0.006;
+        t += max(d, min_step);
     }
 
     // Background gradient (used for both miss rays and fog target)
@@ -209,7 +214,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     col *= vignette;
     
     // Narkowicz ACES fitted tonemap
-    col = (col * (2.51 * col + 0.03)) / (col * (2.43 * col + 0.59) + 0.14);
+    col = aces_tonemap(col);
     
     return vec4<f32>(col, 1.0);
 }

@@ -332,7 +332,7 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
         let fog = smoothstep(5.0, 15.0, dist);
         color = mix(color, vec3<f32>(0.0), fog);
         
-        color = (color * (2.51 * color + 0.03)) / (color * (2.43 * color + 0.59) + 0.14);
+        color = aces_tonemap(color);
         
         return vec4<f32>(color, 1.0);
     }

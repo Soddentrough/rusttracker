@@ -168,7 +168,7 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     final_color = final_color * bezel_mask;
     
     // 9. Fitted ACES Tonemap
-    var final_col = (final_color * (2.51 * final_color + 0.03)) / (final_color * (2.43 * final_color + 0.59) + 0.14);
+    var final_col = aces_tonemap(final_color);
     final_col = max(final_col, vec3<f32>(0.0));
     
     return vec4<f32>(final_col, 1.0);

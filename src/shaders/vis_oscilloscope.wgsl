@@ -131,7 +131,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // ACES tonemapping (consistent with other visualizers)
     let mapped = wave_intensity * amber;
-    var tonemapped = (mapped * (2.51 * mapped + 0.03)) / (mapped * (2.43 * mapped + 0.59) + 0.14);
+    var tonemapped = aces_tonemap(mapped);
 
     var crt_settings = get_default_crt();
     crt_settings.phosphor_tint = amber; // Not used as tint for everything, just to configure if needed. Actually we'll keep final_color.

@@ -441,6 +441,7 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                                 state.show_vis_picker = !state.show_vis_picker;
                                                 if state.show_vis_picker {
                                                     state.vis_picker_cursor = state.current_visualizer_idx;
+                                                    state.vis_picker_scroll_to_cursor = true;
                                                 }
                                             },
                                             WinitKeyCode::KeyV => {
@@ -512,6 +513,7 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                                     } else {
                                                         state.vis_picker_cursor -= 1;
                                                     }
+                                                    state.vis_picker_scroll_to_cursor = true;
                                                 } else {
                                                     // Cycle to next enabled visualizer
                                                     let len = crate::state::VISUALIZERS.len();
@@ -528,6 +530,7 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                                 let mut state = app_state.lock().unwrap();
                                                 if state.show_vis_picker {
                                                     state.vis_picker_cursor = (state.vis_picker_cursor + 1) % crate::state::VISUALIZERS.len();
+                                                    state.vis_picker_scroll_to_cursor = true;
                                                 } else {
                                                     // Cycle to previous enabled visualizer
                                                     let len = crate::state::VISUALIZERS.len();
@@ -906,6 +909,7 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                     let mut trigger_picker = false;
                     {
                         let mut state = app_state.lock().unwrap();
+                        state.vis_picker_scroll_to_cursor = false;
                         
                         // Write back timing stats
                         if ui_time > 0.0 || render_time > 0.0 {
@@ -1405,6 +1409,7 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                         } else {
                                             state.vis_picker_cursor -= 1;
                                         }
+                                        state.vis_picker_scroll_to_cursor = true;
                                     } else {
                                         let len = crate::state::VISUALIZERS.len();
                                         let mut idx = state.current_visualizer_idx;
@@ -1420,6 +1425,7 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                     let mut state = app_state.lock().unwrap();
                                     if state.show_vis_picker {
                                         state.vis_picker_cursor = (state.vis_picker_cursor + 1) % crate::state::VISUALIZERS.len();
+                                        state.vis_picker_scroll_to_cursor = true;
                                     } else {
                                         let len = crate::state::VISUALIZERS.len();
                                         let mut idx = state.current_visualizer_idx;

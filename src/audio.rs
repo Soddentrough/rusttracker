@@ -137,12 +137,36 @@ pub fn spawn_dsp_thread(
         let mut complex_buf = vec![Complex { re: 0.0f32, im: 0.0f32 }; window_size];
         let mut magnitudes = vec![0.0f32; window_size / 2];
 
+        // Precompute log-spaced bin interpolation mapping for GPU spectrum
+        let resolution = sample_rate as f32 / window_size as f32; // Hz per FFT bin
+        let min_freq = 20.0f32;
+        let max_f = max_frequency.max(min_freq * 2.0);
+        let num_bins = 1024;
+        let nyquist = window_size / 2;
+
+        struct BinMapping {
+            i0: usize,
+            i1: usize,
+            frac: f32,
+        }
+        let mut log_bin_mappings = Vec::with_capacity(num_bins);
+        for i in 0..num_bins {
+            let t = i as f32 / num_bins as f32;
+            let freq = min_freq * (max_f / min_freq).powf(t);
+            let idx = freq / resolution;
+            let idx_clamped = idx.clamp(0.0, (nyquist - 1) as f32);
+            let i0 = idx_clamped.floor() as usize;
+            let i1 = (i0 + 1).min(nyquist - 1);
+            let frac = idx_clamped - i0 as f32;
+            log_bin_mappings.push(BinMapping { i0, i1, frac });
+        }
+
         let mut last_waveform_push = Instant::now();
 
         while let Ok(msg) = rx.recv() {
             let fft_start = Instant::now();
 
-            // Apply Hann window and prepare complex input
+            // 1. Apply Hann window and prepare complex input for mono channel
             for i in 0..window_size {
                 let sample = *msg.audio_data.get(i).unwrap_or(&0.0);
                 complex_buf[i] = Complex { re: sample * hann_window[i], im: 0.0 };
@@ -157,13 +181,7 @@ pub fn spawn_dsp_thread(
                 magnitudes[i] = complex_buf[i].norm() / n_sqrt;
             }
 
-            // Logarithmic binning into 1024 display bins
-            let resolution = sample_rate as f32 / window_size as f32; // Hz per FFT bin
-            let min_freq = 20.0f32;
-            let max_f = max_frequency.max(min_freq * 2.0);
-            let num_bins = 1024;
-            let nyquist = window_size / 2;
-
+            // Logarithmic binning into 1024 display bins (mono)
             binned_data.fill(0.0);
             for i in 0..num_bins {
                 let freq_start = min_freq * (max_f / min_freq).powf(i as f32 / num_bins as f32);
@@ -191,6 +209,33 @@ pub fn spawn_dsp_thread(
 
                 binned_data[i] = (max_val * 100.0).clamp(0.0, 100.0);
             }
+
+            // 2. Process multi-channel FFT for GPU visualizers (always run on background thread)
+            let mut gpu_spectrum = vec![0.0f32; 32 * 1024 * 2];
+            let num_channels = msg.channel_audio_data.len().min(32);
+            for c in 0..num_channels {
+                let channel_data = &msg.channel_audio_data[c];
+                for i in 0..window_size {
+                    let sample = *channel_data.get(i).unwrap_or(&0.0);
+                    complex_buf[i] = Complex { re: sample * hann_window[i], im: 0.0 };
+                }
+                fft.process(&mut complex_buf);
+
+                for (i, mapping) in log_bin_mappings.iter().enumerate() {
+                    let c0 = complex_buf[mapping.i0];
+                    let c1 = complex_buf[mapping.i1];
+                    let re = c0.re * (1.0 - mapping.frac) + c1.re * mapping.frac;
+                    let im = c0.im * (1.0 - mapping.frac) + c1.im * mapping.frac;
+                    
+                    let norm_re = re / n_sqrt;
+                    let norm_im = im / n_sqrt;
+                    
+                    let out_idx = c * 1024 * 2 + i * 2;
+                    gpu_spectrum[out_idx] = norm_re;
+                    gpu_spectrum[out_idx + 1] = norm_im;
+                }
+            }
+
             let fft_elapsed = fft_start.elapsed().as_micros() as f32;
 
             // Sync to UI state
@@ -210,6 +255,7 @@ pub fn spawn_dsp_thread(
                 }
                 
                 state.raw_spectrum_data.copy_from_slice(&binned_data);
+                state.gpu_spectrum_data = gpu_spectrum;
                 state.raw_audio_channels = msg.channel_audio_data;
                 
                 // --- Waveform extraction (Zero-Crossing Edge Trigger) ---

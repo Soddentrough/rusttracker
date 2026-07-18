@@ -155,7 +155,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
     
     let mapped = accumulated_color;
-    var tonemapped = (mapped * (2.51 * mapped + 0.03)) / (mapped * (2.43 * mapped + 0.59) + 0.14);
+    var tonemapped = aces_tonemap(mapped);
     
     var final_color = tonemapped;
     

@@ -217,12 +217,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var final_color = emission + in_scattering + halation + bloom;
     
     // ACES Filmic Tonemapping
-    let a = 2.51;
-    let b = 0.03;
-    let c = 2.43;
-    let d = 0.59;
-    let e = 0.14;
-    final_color = (final_color * (a * final_color + b)) / (final_color * (c * final_color + d) + e);
+    final_color = aces_tonemap(final_color);
 
     // --- Draw Debug Labels for Channels ---
     if (uv.y > 0.95) {

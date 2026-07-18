@@ -99,7 +99,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
     VisualizerDef { id: 0, name: "Frequency Spectrum", filename: "vis_spectrum.wgsl", description: "Standard 2D FFT spectrum analyzer", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 2, name: "CRT Oscilloscope", filename: "vis_oscilloscope.wgsl", description: "2D glowing CRT wave trace", pipeline_type: PipelineType::FullscreenQuad, requires_history: true, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 7, name: "3D CRT Oscilloscope", filename: "vis_3doscilloscope.wgsl", description: "3D waterfall history of waveform", pipeline_type: PipelineType::FullscreenQuad, requires_history: true, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
-    VisualizerDef { id: 20, name: "3D Oscilloscope (Raster)", filename: "vis_3doscilloscope_raster.wgsl", description: "Rasterized 3D waterfall grid of waveform history", pipeline_type: PipelineType::Mesh3D { geometry: Geometry::Grid { width: 1024, depth: 144 }, instances: 1 }, requires_history: true, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
+    VisualizerDef { id: 20, name: "3D Oscilloscope (Raster)", filename: "vis_3doscilloscope_raster.wgsl", description: "Rasterized 3D waterfall grid of waveform history", pipeline_type: PipelineType::Mesh3D { geometry: Geometry::Grid { width: 256, depth: 143 }, instances: 1 }, requires_history: true, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 8, name: "3D Freq Oscilloscope", filename: "vis_3doscilloscope_freq.wgsl", description: "3D topographical frequency view", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: false, requires_resynth: true, requires_ferrofluidsim: false },
     VisualizerDef { id: 1, name: "Retro Fire", filename: "vis_flame.wgsl", description: "Demoscene pixel fire with CRT filter", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: true, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 6, name: "Fire Simulation", filename: "vis_firesim.wgsl", description: "Multi-channel procedural fire simulation", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: true, requires_resynth: false, requires_ferrofluidsim: false },
@@ -147,6 +147,7 @@ pub struct AppState {
     pub waveform_history_push_count: u64,
     pub raw_waveform: Vec<f32>,
     pub raw_audio_channels: Vec<Vec<f32>>,
+    pub gpu_spectrum_data: Vec<f32>,
     pub fire_heat: Vec<f32>,
     pub show_hud: bool,
     pub gpu_fft: bool,
@@ -194,6 +195,7 @@ pub struct AppState {
     // Visualizer Picker
     pub show_vis_picker: bool,
     pub vis_picker_cursor: usize,
+    pub vis_picker_scroll_to_cursor: bool,
     pub vis_enabled: Vec<bool>,
     pub osd_text: Option<String>,
     pub osd_timer: f32,
@@ -302,6 +304,7 @@ impl AppState {
             waveform_history_push_count: 0,
             raw_waveform: vec![0.0; 1024],
             raw_audio_channels: Vec::new(),
+            gpu_spectrum_data: vec![0.0; 32 * 1024 * 2],
             fire_heat: vec![0.0; 1024],
             show_hud: true,
             gpu_fft: true,
@@ -347,6 +350,7 @@ impl AppState {
             has_gamepad: is_steam_deck,
             show_vis_picker: false,
             vis_picker_cursor: 0,
+            vis_picker_scroll_to_cursor: false,
             vis_enabled,
             osd_text: None,
             osd_timer: 0.0,
@@ -399,6 +403,7 @@ impl AppState {
             waveform_history_push_count: 0,
             raw_waveform: Vec::new(),              // Only used in main.rs smoothing (under lock)
             raw_audio_channels: Vec::new(),        // ~1 MB, only used in engine.update()
+            gpu_spectrum_data: Vec::new(),
             fire_heat: Vec::new(),                 // Only used in engine.update() (under lock)
             show_hud: self.show_hud,
             gpu_fft: self.gpu_fft,
@@ -442,6 +447,7 @@ impl AppState {
             has_gamepad: self.has_gamepad,
             show_vis_picker: self.show_vis_picker,
             vis_picker_cursor: self.vis_picker_cursor,
+            vis_picker_scroll_to_cursor: self.vis_picker_scroll_to_cursor,
             vis_enabled: self.vis_enabled.clone(),
             osd_text: self.osd_text.clone(),
             osd_timer: self.osd_timer,

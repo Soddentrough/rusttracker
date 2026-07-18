@@ -342,7 +342,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     col *= vignette;
 
     // Narkowicz ACES fitted tonemap (sRGB gamma applied by WGPU surface)
-    col = (col * (2.51 * col + 0.03)) / (col * (2.43 * col + 0.59) + 0.14);
+    col = aces_tonemap(col);
 
     // Output Linear RGB. WGPU Srgb surface will apply the sRGB gamma curve automatically.
     return vec4<f32>(col, 1.0);

@@ -445,8 +445,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     color *= smoothstep(2.5, 0.5, vr);
 
     // Narkowicz ACES fitted tonemap (sRGB gamma applied by WGPU surface)
-    var final_col = (color * (2.51 * color + 0.03)) / (color * (2.43 * color + 0.59) + 0.14);
-    final_col = max(final_col, vec3<f32>(0.0));
+    let final_col = aces_tonemap(color);
 
     return vec4<f32>(final_col, 1.0);
 }

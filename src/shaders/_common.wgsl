@@ -48,6 +48,14 @@ struct AudioUniforms {
     pad3: u32,
 };
 
+// Narkowicz ACES fitted tonemapping curve.
+// Shared by all visualizers so HDR->SDR mapping is consistent everywhere.
+// Input is linear HDR color; output is tonemapped, clamped to [0,1].
+fn aces_tonemap(col: vec3<f32>) -> vec3<f32> {
+    let mapped = (col * (2.51 * col + 0.03)) / (col * (2.43 * col + 0.59) + 0.14);
+    return clamp(mapped, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
 fn hash21_crt(p: vec2<f32>) -> f32 {
     var p3 = fract(vec3<f32>(p.xyx) * 0.1031);
     p3 = p3 + dot(p3, p3.yzx + 33.33);

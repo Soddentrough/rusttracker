@@ -49,34 +49,34 @@ fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
     // This avoids interpolating between two different waveform shapes (which
     // causes visible morphing/wobble) and instead keeps each row's shape
     // perfectly stable as it scrolls away from the camera.
-    let row_spacing = 10.8 / f32(max(history_size - 1u, 1u)); // Z range / rows
+    let row_spacing = 12.08 / f32(max(history_size - 1u, 1u)); // Z range / rows
     let z_shift = audio.step_fraction * row_spacing;
 
     // Integer history index — no fractional interpolation
-    let hist_idx = u32(clamp(v_coord * f32(history_size - 1u), 0.0, f32(history_size - 1u)));
+    let hist_idx = u32(round(clamp(v_coord * f32(history_size - 1u), 0.0, f32(history_size - 1u))));
 
-    let sample_idx = u32(u_coord * f32(res - 1u));
+    let sample_idx = u32(round(u_coord * f32(res - 1u)));
 
     // Read waveform amplitude from a single, stable history slot
     let wave_val = waveform_history[hist_idx * 2048u + sample_idx];
 
     // Scale coordinates into 3D world coordinates
-    // X goes from -4.0 to 4.0
-    // Y (height/UP) is wave_val * 0.8
-    // Z (depth/FORWARD) goes from 9.0 (oldest/back) to -1.8 (newest/front),
+    // X goes from -9.6 to 9.6 (matches the raymarched 3D CRT Oscilloscope)
+    // Y (height/UP) is wave_val * 1.2
+    // Z (depth/FORWARD) goes from 9.48 (oldest/back) to -2.6 (newest/front),
     //   offset by z_shift for smooth sub-frame physical scrolling
-    let x = (u_coord - 0.5) * 8.0;
-    let y = wave_val * 0.8;
-    let z = mix(9.0, -1.8, v_coord) - z_shift;
+    let x = (u_coord - 0.5) * 19.2;
+    let y = wave_val * 1.2;
+    let z = mix(9.48, -2.6, v_coord) + z_shift;
 
     let p3 = vec3<f32>(x, y, z);
 
     // Camera rotation matches the original 3D CRT Oscilloscope
     let rot_angle = sin(audio.time * 0.2) * 0.15;
-    let cam_dist_val = 3.2;
-    let cam_height = 1.7; // Adjusted camera height to match others
+    let cam_dist_val = 4.6;
+    let cam_height = 2.2; // Raised to frame the wider grid
     let ro = vec3<f32>(sin(rot_angle) * cam_dist_val, cam_height, -cos(rot_angle) * cam_dist_val);
-    let cam_target = vec3<f32>(0.0, 0.0, 0.8); // Target adjusted to match others (Depth Z = 0.8, Height Y = 0.0)
+    let cam_target = vec3<f32>(0.0, 0.0, 1.2); // Push target deeper to fill the frame
 
     let f = normalize(cam_target - ro);
     let s = normalize(cross(f, vec3<f32>(0.0, 1.0, 0.0)));
@@ -118,6 +118,13 @@ fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
 
     return out;
 }
+// Fast wireframe bloom function (cheaper alternative to exp)
+fn get_wire(line_val: f32, inv_coc_05: f32, inv_coc_02: f32, inv_coc_01: f32, bloom_boost: f32) -> f32 {
+    let core = 1.0 / (1.0 + line_val * line_val * 3.24);
+    let glow1 = 0.45 / (1.0 + line_val * 0.15) * bloom_boost;
+    let glow2 = 0.2 / (1.0 + line_val * 0.04) * bloom_boost;
+    return (core * inv_coc_05) + (glow1 * inv_coc_02) + (glow2 * inv_coc_01);
+}
 
 @fragment
 fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
@@ -137,7 +144,7 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     let grid_res = vec2<f32>(128.0, 72.0);
     
     // Use the continuous world-space Z for the vertical grid coordinate to eliminate temporal jitter
-    let uv_g = vec2<f32>(in.uv.x, (in.world_pos.z + 1.8) / 10.8);
+    let uv_g = vec2<f32>(in.uv.x, (in.world_pos.z + 2.6) / 12.08);
     
     // Amplitude-reactive bloom width and brightness
     let wave_height = clamp(abs(in.hit_val) * 2.0, 0.0, 1.0);
@@ -149,25 +156,27 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
 
     let fwidth_uv = fwidth(uv_g * grid_res) + 0.0001;
 
+    // Precalculate inverse circle of confusion terms
+    let inv_coc_05 = 1.0 / (1.0 + total_coc * 0.5);
+    let inv_coc_02 = 1.0 / (1.0 + total_coc * 0.2);
+    let inv_coc_01 = 1.0 / (1.0 + total_coc * 0.1);
+
     // Red Channel Grid
     let uv_r = uv_g + offset_r;
     let grid_r = abs(fract(uv_r * grid_res - 0.5) - 0.5) / fwidth_uv;
     let line_r = min(grid_r.x, grid_r.y) / (1.0 + total_coc);
-    let wire_r = exp(-line_r * 1.8) / (1.0 + total_coc * 0.5) +
-                 (exp(-line_r * 0.15) * 0.45 / (1.0 + total_coc * 0.2) + exp(-line_r * 0.04) * 0.2 / (1.0 + total_coc * 0.1)) * bloom_boost;
+    let wire_r = get_wire(line_r, inv_coc_05, inv_coc_02, inv_coc_01, bloom_boost);
 
     // Green/Amber Channel Grid (center)
     let grid_g = abs(fract(uv_g * grid_res - 0.5) - 0.5) / fwidth_uv;
     let line_g = min(grid_g.x, grid_g.y) / (1.0 + total_coc);
-    let wire_g = exp(-line_g * 1.8) / (1.0 + total_coc * 0.5) +
-                 (exp(-line_g * 0.15) * 0.45 / (1.0 + total_coc * 0.2) + exp(-line_g * 0.04) * 0.2 / (1.0 + total_coc * 0.1)) * bloom_boost;
+    let wire_g = get_wire(line_g, inv_coc_05, inv_coc_02, inv_coc_01, bloom_boost);
 
     // Blue Channel Grid
     let uv_b = uv_g + offset_b;
     let grid_b = abs(fract(uv_b * grid_res - 0.5) - 0.5) / fwidth_uv;
     let line_b = min(grid_b.x, grid_b.y) / (1.0 + total_coc);
-    let wire_b = exp(-line_b * 1.8) / (1.0 + total_coc * 0.5) +
-                 (exp(-line_b * 0.15) * 0.45 / (1.0 + total_coc * 0.2) + exp(-line_b * 0.04) * 0.2 / (1.0 + total_coc * 0.1)) * bloom_boost;
+    let wire_b = get_wire(line_b, inv_coc_05, inv_coc_02, inv_coc_01, bloom_boost);
 
     // Combine channels to get a shifted sub-pixel wireframe vector
     let base_wire = vec3<f32>(wire_r, wire_g, wire_b);
@@ -181,7 +190,7 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     let age_fade = mix(0.08, 1.0, in.uv.y);
 
     // Edge fade (fade out grid at left/right boundaries)
-    let edge_fade = 1.0 - smoothstep(0.35, 0.5, abs(in.uv.x - 0.5));
+    let edge_fade = 1.0 - smoothstep(0.46, 0.5, abs(in.uv.x - 0.5));
 
     // Smooth vignette boundary fade to transition seamlessly into the black background
     let depth_fade = smoothstep(0.0, 0.20, in.uv.y);
@@ -225,12 +234,12 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     color *= bezel;
 
     // Analog noise (vignetted by bezel and boundary_fade)
-    let noise_val = hash12(in.clip_position.xy + fract(f32(audio.frame_count) * 0.073) * 100.0);
+    let noise_val = hash12(in.clip_position.xy + fract(audio.smooth_time) * 100.0);
     let noise_color = vec3<f32>(0.8, 0.35, 0.05) * noise_val * 0.025 * bezel * boundary_fade;
     color += noise_color;
 
     // Tonemapping
-    let final_color = (color * (2.51 * color + 0.03)) / (color * (2.43 * color + 0.59) + 0.14);
+    let final_color = aces_tonemap(color);
 
     return vec4<f32>(final_color, 1.0);
 }

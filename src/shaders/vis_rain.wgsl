@@ -190,7 +190,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     color += vec3<f32>(grain);
 
     // ACES tonemapping
-    var final_col = (color * (2.51 * color + 0.03)) / (color * (2.43 * color + 0.59) + 0.14);
+    var final_col = aces_tonemap(color);
     final_col = max(final_col, vec3<f32>(0.0));
 
     return vec4<f32>(final_col, 1.0);

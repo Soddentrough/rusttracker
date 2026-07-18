@@ -256,13 +256,13 @@ pub struct VulkanEngine {
     pub start_time: std::time::Instant,
 
     // GPU FFT
-    fft_compute_pipeline: wgpu::ComputePipeline,
-    fft_bind_group: wgpu::BindGroup,
+    _fft_compute_pipeline: wgpu::ComputePipeline,
+    _fft_bind_group: wgpu::BindGroup,
     resynth_compute_pipeline: wgpu::ComputePipeline,
     resynth_bind_group: wgpu::BindGroup,
-    raw_audio_buffer: wgpu::Buffer,
+    _raw_audio_buffer: wgpu::Buffer,
     _gpu_spectrum_buffer: wgpu::Buffer,
-    fft_params_buffer: wgpu::Buffer,
+    _fft_params_buffer: wgpu::Buffer,
     
     // Neon Smoke Cache
     smoke_compute_pipeline: wgpu::ComputePipeline,
@@ -273,7 +273,7 @@ pub struct VulkanEngine {
     depth_texture_view: wgpu::TextureView,
     
     // Pre-allocated buffers to avoid per-frame heap allocations
-    flat_raw_audio: Vec<f32>,
+    _flat_raw_audio: Vec<f32>,
     waveform_history_flat: Vec<f32>,
     
     // Video
@@ -436,6 +436,46 @@ impl VulkanEngine {
             eprintln!("WGPU VALIDATION ERROR: {:?}", e);
         }));
 
+        // --- Pipeline Cache (persist compiled GPU pipelines across launches) ---
+        // Keyed by the adapter so caches from different devices don't collide.
+        let pipeline_cache_path: Option<std::path::PathBuf> = (|| {
+            let key = wgpu::util::pipeline_cache_key(&adapter.get_info())?;
+            let dir = directories::ProjectDirs::from("com", "RustTracker", "RustTracker")?
+                .cache_dir()
+                .to_path_buf();
+            let _ = std::fs::create_dir_all(&dir);
+            Some(dir.join(format!("pipeline_cache_{}.bin", key)))
+        })();
+        let pipeline_cache_data: Option<Vec<u8>> = pipeline_cache_path
+            .as_ref()
+            .and_then(|p| std::fs::read(p).ok());
+        // SAFETY: `data` is `None` on first run, and otherwise comes from a prior
+        // `PipelineCache::get_data()` for this same adapter (keyed via
+        // `util::pipeline_cache_key`), which is the documented-valid source.
+        // `fallback: true` ensures a fresh empty cache is created if the stored
+        // data is rejected (e.g. driver/version change).
+        //
+        // NOTE: pipeline caching is opt-in via the RUSTTRACKER_PIPELINE_CACHE=1
+        // environment variable. Some driver/backend combinations report a cache as
+        // created yet mark pipelines that reference it invalid at submit time, so
+        // the safe default is to NOT attach a cache (pass `cache: None`).
+        let pipeline_cache_enabled = std::env::var("RUSTTRACKER_PIPELINE_CACHE")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        let pipeline_cache = if pipeline_cache_enabled {
+            Some(unsafe {
+                device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
+                    label: Some("RustTracker Pipeline Cache"),
+                    data: pipeline_cache_data.as_deref(),
+                    fallback: true,
+                })
+            })
+        } else {
+            None
+        };
+        // Borrow that satisfies `cache: Option<&PipelineCache>` at every descriptor.
+        let pipeline_cache_ref = pipeline_cache.as_ref();
+
         let surface_caps = surface.get_capabilities(&adapter);
         let surface_format = surface_caps.formats.iter()
             .copied()
@@ -469,7 +509,7 @@ impl VulkanEngine {
         let gpu_spectrum_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("GPU FFT Spectrum Buffer"),
             size: 32 * 1024 * 8, // 32 channels, 1024 bins, vec2<f32>
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let waveform_storage_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -778,7 +818,7 @@ impl VulkanEngine {
                 alpha_to_coverage_enabled: false,
             },
             multiview_mask: None,
-            cache: None,
+            cache: pipeline_cache_ref,
         });
         let _ = scope_fallback.pop().await;
         
@@ -874,7 +914,7 @@ impl VulkanEngine {
                     alpha_to_coverage_enabled: false,
                 },
                 multiview_mask: None,
-                cache: None,
+                cache: pipeline_cache_ref,
             });
             
             let error_future = scope_main.pop();
@@ -927,7 +967,7 @@ impl VulkanEngine {
                             alpha_to_coverage_enabled: false,
                         },
                         multiview_mask: None,
-                        cache: None,
+                        cache: pipeline_cache_ref,
                     });
                     lamp_pipeline = lp;
                 }
@@ -1031,7 +1071,7 @@ impl VulkanEngine {
             }),
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
-            cache: None,
+            cache: pipeline_cache_ref,
         });
 
         let hud_source = resolve_shader_includes(include_str!("shaders/hud.wgsl"));
@@ -1080,7 +1120,7 @@ impl VulkanEngine {
                 alpha_to_coverage_enabled: false,
             },
             multiview_mask: None,
-            cache: None,
+            cache: pipeline_cache_ref,
         });
 
         let solid_black_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1147,7 +1187,7 @@ impl VulkanEngine {
             }),
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
-            cache: None,
+            cache: pipeline_cache_ref,
         });
 
         let solid_biolum_bg_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -1221,7 +1261,7 @@ impl VulkanEngine {
             }),
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
-            cache: None,
+            cache: pipeline_cache_ref,
         });
 
         let crt_background_shader_src = resolve_shader_includes(r#"
@@ -1365,7 +1405,7 @@ impl VulkanEngine {
             }),
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
-            cache: None,
+            cache: pipeline_cache_ref,
         });
 
         // ------------------------------------------------------------------
@@ -1465,7 +1505,7 @@ impl VulkanEngine {
             module: &smoke_shader,
             entry_point: Some("cs_main"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
+            cache: pipeline_cache_ref,
         });
 
         let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
@@ -1538,7 +1578,7 @@ impl VulkanEngine {
             label: Some("heatmap_compute_layout"), bind_group_layouts: &[Some(&heatmap_compute_layout)], immediate_size: 0,
         });
         let heatmap_compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Heatmap Compute Pipeline"), layout: Some(&heatmap_compute_pipeline_layout), module: &heatmap_compute_shader, entry_point: Some("main"), compilation_options: wgpu::PipelineCompilationOptions::default(), cache: None,
+            label: Some("Heatmap Compute Pipeline"), layout: Some(&heatmap_compute_pipeline_layout), module: &heatmap_compute_shader, entry_point: Some("main"), compilation_options: wgpu::PipelineCompilationOptions::default(), cache: pipeline_cache_ref,
         });
         let fire_compute_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("fire_compute_layout"),
@@ -1590,7 +1630,7 @@ impl VulkanEngine {
             module: &fire_compute_shader,
             entry_point: Some("main"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
+            cache: pipeline_cache_ref,
         });
         let firesim_compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some("FireSim Compute Pipeline"),
@@ -1598,7 +1638,7 @@ impl VulkanEngine {
             module: &firesim_compute_shader,
             entry_point: Some("main"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
+            cache: pipeline_cache_ref,
         });
 
         let ferrofluidsim_compute_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1629,10 +1669,10 @@ impl VulkanEngine {
         });
         
         let ferrofluidsim_compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Ferrofluid Compute"), layout: Some(&ferrofluidsim_pipeline_layout), module: &ferrofluidsim_compute_shader, entry_point: Some("main"), compilation_options: Default::default(), cache: None,
+            label: Some("Ferrofluid Compute"), layout: Some(&ferrofluidsim_pipeline_layout), module: &ferrofluidsim_compute_shader, entry_point: Some("main"), compilation_options: Default::default(), cache: pipeline_cache_ref,
         });
         let ferrofluidsim_clear_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Ferrofluid Clear"), layout: Some(&ferrofluidsim_pipeline_layout), module: &ferrofluidsim_compute_shader, entry_point: Some("clear"), compilation_options: Default::default(), cache: None,
+            label: Some("Ferrofluid Clear"), layout: Some(&ferrofluidsim_pipeline_layout), module: &ferrofluidsim_compute_shader, entry_point: Some("clear"), compilation_options: Default::default(), cache: pipeline_cache_ref,
         });
 
         // --- Bioluminescent Waves Compute & Render Setup ---
@@ -1703,7 +1743,7 @@ impl VulkanEngine {
             module: &biolum_compute_shader,
             entry_point: Some("main"),
             compilation_options: Default::default(),
-            cache: None,
+            cache: pipeline_cache_ref,
         });
 
         let biolum_render_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1820,7 +1860,7 @@ impl VulkanEngine {
             module: &fft_compute_shader,
             entry_point: Some("main"),
             compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: None,
+            cache: pipeline_cache_ref,
         });
         
         let resynth_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1840,7 +1880,7 @@ impl VulkanEngine {
             label: Some("resynth_compute_layout"), bind_group_layouts: &[Some(&resynth_bind_group_layout)], immediate_size: 0,
         });
         let resynth_compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Resynth Compute Pipeline"), layout: Some(&resynth_compute_pipeline_layout), module: &resynth_compute_shader, entry_point: Some("main"), compilation_options: wgpu::PipelineCompilationOptions::default(), cache: None,
+            label: Some("Resynth Compute Pipeline"), layout: Some(&resynth_compute_pipeline_layout), module: &resynth_compute_shader, entry_point: Some("main"), compilation_options: wgpu::PipelineCompilationOptions::default(), cache: pipeline_cache_ref,
         });
         // --- 3D Engine Extensions Init ---
         let mut mesh_registry = std::collections::HashMap::new();
@@ -2012,6 +2052,19 @@ impl VulkanEngine {
         let lamp_index_count = lamp_inds.len() as u32;
         // --- END 3D Engine Extensions Init ---
 
+        // Persist the pipeline cache back to disk atomically so the next launch
+        // can skip recompiling all visualizer/compute pipelines.
+        if pipeline_cache_enabled {
+            if let (Some(path), Some(cache)) = (&pipeline_cache_path, &pipeline_cache) {
+                if let Some(data) = cache.get_data() {
+                    let tmp = path.with_extension("tmp");
+                    if std::fs::write(&tmp, &data).is_ok() {
+                        let _ = std::fs::rename(&tmp, path);
+                    }
+                }
+            }
+        }
+
         Self {
             surface: Some(surface),
             device,
@@ -2061,13 +2114,13 @@ impl VulkanEngine {
             biolum_render_pipeline_layout,
 
             start_time: std::time::Instant::now(),
-            fft_compute_pipeline,
-            fft_bind_group,
+            _fft_compute_pipeline: fft_compute_pipeline,
+            _fft_bind_group: fft_bind_group,
             resynth_compute_pipeline,
             resynth_bind_group,
-            raw_audio_buffer,
+            _raw_audio_buffer: raw_audio_buffer,
             _gpu_spectrum_buffer: gpu_spectrum_buffer,
-            fft_params_buffer,
+            _fft_params_buffer: fft_params_buffer,
             
             smoke_compute_pipeline,
             smoke_compute_bind_group,
@@ -2076,7 +2129,7 @@ impl VulkanEngine {
             
             depth_texture_view,
             
-            flat_raw_audio: vec![0.0f32; 32 * 65536],
+            _flat_raw_audio: vec![0.0f32; 32 * 65536],
             waveform_history_flat: vec![0.0; 2048 * 144],
             video_bind_group_layout,
             video_pipeline,
@@ -2165,7 +2218,10 @@ impl VulkanEngine {
             self.time_since_last_push = 0.0;
             self.last_history_push_count = state.waveform_history_push_count;
         } else if !state.is_paused && state.file_loaded && !state.track_ended {
-            self.time_since_last_push += self.smooth_dt;
+            // Use the real frame dt (not the heavily-smoothed EMA) so the
+            // sub-frame scroll interpolation stays in phase with the actual
+            // DSP push cadence and does not judder.
+            self.time_since_last_push += (dt as f64).clamp(0.0, 0.1);
         }
 
         // Target interval between pushes
@@ -2386,33 +2442,11 @@ impl VulkanEngine {
             
             self.queue.write_buffer(&self.fire_params_buffer, 0, bytemuck::cast_slice(&[fire_params]));
         }
-
+        
         if state.gpu_fft {
-            let num_channels = state.raw_audio_channels.len().min(32);
-            let num_samples = state.raw_audio_channels.get(0).map_or(8192, |ch| ch.len()).min(65536);
-            
-            // Re-use pre-allocated buffer; only zero and fill active channels
-            self.flat_raw_audio.fill(0.0);
-            for (c, channel_data) in state.raw_audio_channels.iter().take(num_channels).enumerate() {
-                let len = channel_data.len().min(num_samples);
-                self.flat_raw_audio[(c * num_samples)..(c * num_samples + len)].copy_from_slice(&channel_data[..len]);
+            if !state.gpu_spectrum_data.is_empty() {
+                self.queue.write_buffer(&self._gpu_spectrum_buffer, 0, bytemuck::cast_slice(&state.gpu_spectrum_data));
             }
-            // Only upload the active channels' data instead of the full 32-channel buffer
-            let upload_size = num_channels.max(1) * num_samples;
-            self.queue.write_buffer(&self.raw_audio_buffer, 0, bytemuck::cast_slice(&self.flat_raw_audio[..upload_size]));
-
-            let min_safe_freq = 2.5 * state.current_sample_rate / (num_samples as f32);
-            let fft_params = FFTParams {
-                num_channels: num_channels as u32,
-                sample_rate: state.current_sample_rate, // Reverted to accurate sample rate
-                min_freq: 20.0f32.max(min_safe_freq),
-                max_freq: state.max_frequency,
-                num_samples: num_samples as u32,
-                _pad0: 0,
-                _pad1: 0,
-                _pad2: 0,
-            };
-            self.queue.write_buffer(&self.fft_params_buffer, 0, bytemuck::cast_slice(&[fft_params]));
         }
         
         if let Some(rx) = &state.video_frame_rx {
@@ -2965,6 +2999,7 @@ impl VulkanEngine {
 
                                     let row_resp = row_frame.show(ui, |ui| {
                                         ui.horizontal(|ui| {
+                                            ui.set_min_width(ui.available_width());
                                             // Enable/disable toggle indicator
                                             let toggle_text = if is_enabled { "✅" } else { "⬜" };
                                             let toggle_color = if i == 0 {
@@ -3030,19 +3065,23 @@ impl VulkanEngine {
                                         });
                                     });
 
+                                    let rect = row_resp.response.rect;
+                                    let id = ui.id().with(i);
+                                    let response = ui.interact(rect, id, egui::Sense::click());
+
                                     // Hover moves cursor to this row
-                                    if row_resp.response.hovered() && !is_cursor {
+                                    if response.hovered() && !is_cursor {
                                         engine_action = EngineAction::VisPickerSetCursor(i);
                                     }
 
                                     // Click row to select visualizer
-                                    if row_resp.response.interact(egui::Sense::click()).clicked() {
+                                    if response.clicked() {
                                         engine_action = EngineAction::VisPickerSelect(i);
                                     }
 
                                     // Ensure cursor row is scrolled into view (for keyboard/gamepad navigation)
-                                    if is_cursor {
-                                        row_resp.response.scroll_to_me(Some(egui::Align::Center));
+                                    if is_cursor && state.vis_picker_scroll_to_cursor {
+                                        response.scroll_to_me(Some(egui::Align::Center));
                                     }
                                 }
                             });
@@ -3618,7 +3657,7 @@ impl VulkanEngine {
                                     let pct = rel_x / rect.width();
                                     engine_action = EngineAction::ScrubPreview(pct, 0.0);
                                 }
-                            } else if !response.is_pointer_button_down_on() {
+                            } else if !response.is_pointer_button_down_on() && state.scrub_target_seconds.is_some() {
                                 engine_action = EngineAction::ScrubEnd;
                             }
                             
@@ -4158,21 +4197,20 @@ impl VulkanEngine {
             compute_pass.dispatch_workgroups(1, 1, 1); // 256x1x1 threads
         }
         
-        // GPU FFT compute
+        // GPU FFT compute - bypassed on GPU since we now compute Cooley-Tukey FFT on CPU
+        // Write dummy timestamps to satisfy Vulkan query resolving
+        if let Some(qs) = &self.query_set {
+            encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Dummy FFT Pass"),
+                timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                    query_set: qs,
+                    beginning_of_pass_write_index: Some(0),
+                    end_of_pass_write_index: Some(1),
+                }),
+            });
+        }
+
         if state.gpu_fft {
-            {
-                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("FFT Compute Pass"),
-                    timestamp_writes: self.query_set.as_ref().map(|qs| wgpu::ComputePassTimestampWrites {
-                        query_set: qs,
-                        beginning_of_pass_write_index: Some(0),
-                        end_of_pass_write_index: Some(1),
-                    }),
-                });
-                compute_pass.set_pipeline(&self.fft_compute_pipeline);
-                compute_pass.set_bind_group(0, Some(&self.fft_bind_group), &[]);
-                compute_pass.dispatch_workgroups(64, 2, 1); // 1024/16=64, 32/16=2
-            }
             let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
             if vis_def.requires_resynth {
                 let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
@@ -4182,18 +4220,6 @@ impl VulkanEngine {
                 compute_pass.set_pipeline(&self.resynth_compute_pipeline);
                 compute_pass.set_bind_group(0, Some(&self.resynth_bind_group), &[]);
                 compute_pass.dispatch_workgroups(32, 2, 1); // 512/16=32, 32/16=2
-            }
-        } else {
-            // Write dummy timestamps to satisfy Vulkan validation
-            if let Some(qs) = &self.query_set {
-                encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Dummy FFT Pass"),
-                    timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
-                        query_set: qs,
-                        beginning_of_pass_write_index: Some(0),
-                        end_of_pass_write_index: Some(1),
-                    }),
-                });
             }
         }
 
@@ -4337,8 +4363,12 @@ impl VulkanEngine {
             // --- 3D Engine Camera Math ---
             let aspect = vp_w / vp_h.max(1.0);
             
-            // Update aspect_ratio uniform dynamically based on the current viewport
-            self.queue.write_buffer(&self.uniform_buffer, 8676, bytemuck::cast_slice(&[aspect as f32]));
+            // Update aspect_ratio uniform dynamically based on the current viewport.
+            // Offset is computed from the actual struct layout (not a magic number) so it
+            // stays correct if AudioUniforms fields are reordered or resized.
+            const ASPECT_RATIO_OFFSET: wgpu::BufferAddress =
+                std::mem::offset_of!(AudioUniforms, aspect_ratio) as wgpu::BufferAddress;
+            self.queue.write_buffer(&self.uniform_buffer, ASPECT_RATIO_OFFSET, bytemuck::cast_slice(&[aspect as f32]));
 
             let fov_x = std::f32::consts::PI / 2.0;
             let fov_y = 2.0 * ((fov_x / 2.0).tan() / aspect).atan();

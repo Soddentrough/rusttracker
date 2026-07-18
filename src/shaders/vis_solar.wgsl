@@ -292,7 +292,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     col *= vignette;
 
     // Tonemapping
-    col = (col * (2.51 * col + 0.03)) / (col * (2.43 * col + 0.59) + 0.14);
+    col = aces_tonemap(col);
 
     return vec4<f32>(col, 1.0);
 }
