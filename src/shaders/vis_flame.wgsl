@@ -39,8 +39,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     // Soft bezel/vignette boundary fade (blends/blurs the hard edges nicely)
-    let bezel_fade_x = smoothstep(0.0, 0.015, uv.x) * smoothstep(1.0, 0.985, uv.x);
-    let bezel_fade_y = smoothstep(0.0, 0.015, uv.y) * smoothstep(1.0, 0.985, uv.y);
+    let bezel_fade_x = smoothstep(0.0, 0.015, uv.x) * smoothstep_r(1.0, 0.985, uv.x);
+    let bezel_fade_y = smoothstep(0.0, 0.015, uv.y) * smoothstep_r(1.0, 0.985, uv.y);
     let bezel = bezel_fade_x * bezel_fade_y;
 
     // --- Pixelate to virtual resolution (nearest-neighbor, chunky pixels) ---
@@ -60,14 +60,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // --- Pixel grid gap (dark lines between virtual pixels) ---
     let cell_frac = fract(uv * virt_res);
-    let grid_x = smoothstep(0.0, 0.08, cell_frac.x) * smoothstep(1.0, 0.92, cell_frac.x);
-    let grid_y = smoothstep(0.0, 0.08, cell_frac.y) * smoothstep(1.0, 0.92, cell_frac.y);
+    let grid_x = smoothstep(0.0, 0.08, cell_frac.x) * smoothstep_r(1.0, 0.92, cell_frac.x);
+    let grid_y = smoothstep(0.0, 0.08, cell_frac.y) * smoothstep_r(1.0, 0.92, cell_frac.y);
     color *= 0.7 + 0.3 * grid_x * grid_y;
 
     // --- CRT scanlines (prominent, every virtual pixel row) ---
     let scanline_phase = fract(uv.y * virt_res.y);
     let scanline = 0.65 + 0.35 * smoothstep(0.0, 0.35, scanline_phase)
-                                 * smoothstep(1.0, 0.65, scanline_phase);
+                                 * smoothstep_r(1.0, 0.65, scanline_phase);
     color *= scanline;
 
     // --- RGB phosphor sub-pixel tint ---

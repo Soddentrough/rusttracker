@@ -101,52 +101,75 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     for (var b = 0u; b < 64u; b += 8u) { bass_sum += get_spectrum_val(b); }
     let bass = clamp(bass_sum / 8.0 / 80.0, 0.0, 1.0);
 
-    var mids_sum = 0.0;
-    for (var b = 64u; b < 512u; b += 32u) { mids_sum += get_spectrum_val(b); }
-    let mids = clamp(mids_sum / 14.0 / 80.0, 0.0, 1.0);
-
     var highs_sum = 0.0;
     for (var b = 512u; b < 1024u; b += 32u) { highs_sum += get_spectrum_val(b); }
     let highs = clamp(highs_sum / 16.0 / 60.0, 0.0, 1.0);
 
-    let volume = bass * 0.5 + mids * 0.3 + highs * 0.2;
-
     let time = audio.time;
     let uv = in.uv;
-    
-    // Center UV and scale for aspect ratio
-    let uv_c = vec2<f32>(uv.x * 1.77, uv.y);
-    
-    // 1. Direct Base Heat Sampling
-    // The flame structure and fluid dynamics are entirely driven by the compute shader simulation.
-    // 1. Read Raw Physics Simulation State
-    let phys_val = get_base_heat(uv);
-    
+
+    // Center UV and scale for the true viewport aspect ratio
+    let uv_c = vec2<f32>(uv.x * audio.aspect_ratio, uv.y);
+
+    // Flame bending: real flames lean with air currents, increasingly toward
+    // the tips. (uv.y = 1 at the flame base/bottom of screen, 0 at the top,
+    // so the sway weight grows toward the tips.) Applied at sample time so
+    // the whole flame column bends coherently.
+    let h_up = 1.0 - uv.y;
+    let sway = (sin(time * 0.9 + h_up * 3.0) + 0.5 * sin(time * 1.7 + h_up * 5.0)) * 0.012 * h_up * h_up;
+
+    // 1. Read raw physics simulation state (with sway applied)
+    let phys_val = get_base_heat(uv + vec2<f32>(sway, 0.0));
+
     // Positive values = Heat (Fire & Embers). Negative values = Smoke density.
     let base_heat = max(phys_val, 0.0);
-    
-    // Procedural edge erosion!
-    // The physics simulation provides the distinct columns and vertical advection.
-    // We use noise to erode the *edges* of the flame, leaving the core solid, which 
-    // creates perfect, crisp plasma filaments!
-    let detail_uv = uv_c * 12.0 + vec2<f32>(0.0, time * 4.0);
-    let flame_noise = fbm(detail_uv) * 0.5 + 0.5;
-    
-    // High erosion at the edges (base_heat=0), low erosion at the core (base_heat=1)
-    let erosion = mix(0.85, 0.05, smoothstep(0.0, 0.8, base_heat));
-    let heat = base_heat * (1.0 - flame_noise * erosion);
-    
-    // Smoke density is negative values.
-    // Removed ambient haze so the background is clean.
     let smoke_density = max(-phys_val, 0.0);
-    
-    // 2. Render Fire & Embers (Emission)
-    var emission = blackbody(min(heat, 1.0) * 1.15);
-    
-    // Embers: Because the physics engine is now sharpened, embers (heat > 1.2) do not 
-    // blur into fireballs. They remain perfectly crisp, physical dots riding the fluid.
-    let ember_glow = smoothstep(1.5, 4.0, heat);
-    emission += vec3<f32>(1.0, 0.9, 0.4) * ember_glow * 8.0;
+
+    var heat = base_heat;
+    var emission = vec3<f32>(0.0);
+
+    // Skip the expensive erosion fbm for empty sky (most of a typical frame)
+    if (base_heat > 0.003) {
+        // Per-column intensity flicker — real flames fluctuate in brightness.
+        // Bass energy makes the flicker more violent on hits.
+        let col_id = floor(uv.x * 24.0);
+        let flick_noise = perlin_noise(vec2<f32>(col_id * 7.3, time * 2.4));
+        let flicker = 1.0 + flick_noise * (0.10 + bass * 0.15);
+
+        // Anisotropic edge erosion: lower horizontal frequency, vertically
+        // stretched, and scrolling UPWARD (features drift toward uv.y = 0, the
+        // top of the screen). The erosion floor is 0.18 (not ~0) so the flame
+        // BODY gets internal texture too — a floor near zero leaves a wide
+        // saturated core with a hard seam where the erosion starts biting.
+        let detail_uv = vec2<f32>(uv_c.x * 9.0, uv.y * 4.5 + time * 3.0);
+        let flame_noise = fbm(detail_uv) * 0.5 + 0.5;
+
+        // Large-scale tongue seeding: slow, low-frequency vertical channels of
+        // rising gas that make flame heights vary organically along the fire line
+        let tongue_noise = perlin_noise(vec2<f32>(uv_c.x * 3.0, time * 1.3));
+        let tongue_gain = 0.7 + 0.6 * tongue_noise;
+
+        // High erosion at the edges (base_heat=0), moderate inside the core
+        let erosion = mix(0.9, 0.18, smoothstep(0.0, 0.8, base_heat));
+        heat = base_heat * tongue_gain * (1.0 - flame_noise * erosion) * flicker;
+
+        // 2. Fire & ember emission. The blackbody mid-tones are compressed
+        // (pow 1.2) so most of the flame body stays yellow/orange and only
+        // the densest core reads white — like a real flame.
+        emission = blackbody(pow(min(heat, 1.0), 1.35)) * 0.9;
+
+        // Blue combustion fringe (CH-radical chemiluminescence). Real flames
+        // are blue/violet only right where fuel meets air: a THIN fringe
+        // hugging the fuel line at the very bottom of each column.
+        let heat_mid = smoothstep(0.12, 0.28, base_heat) * (1.0 - smoothstep(0.35, 0.6, base_heat));
+        let blue_zone = heat_mid * smoothstep(0.85, 0.97, uv.y);
+        emission += vec3<f32>(0.05, 0.20, 1.0) * blue_zone * 0.45;
+
+        // Embers: crisp physical dots riding the fluid (heat > 1.5).
+        // High-frequency energy (snares/hats) makes them sparkle brighter.
+        let ember_glow = smoothstep(1.5, 4.0, heat);
+        emission += vec3<f32>(1.0, 0.9, 0.4) * ember_glow * (3.5 + highs * 2.0);
+    }
 
     // Per-channel spatial FFT reactivity for core tint
     let n_ch = max(1u, audio.num_channels);
@@ -192,29 +215,58 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
     high_energy = min((high_energy / 44.0) / 100.0 * vu_scale, 1.0);
 
-    // High-frequency spectral tint (hot blue core)
-    let tint = vec3<f32>(0.1, 0.35, 1.0) * (high_energy * smoothstep(0.4, 0.8, heat) * 1.8);
+    // High-frequency spectral tint (hot blue-white core accent).
+    // Only where the flame is already white-hot (heat > ~1) — anywhere cooler,
+    // blue over orange reads as an unnatural purple fringe.
+    let tint = vec3<f32>(0.1, 0.35, 1.0) * (high_energy * smoothstep(0.95, 1.3, heat) * 0.5);
     emission += tint;
 
     // 3. Render Smoke (Beer's Law)
-    // Transmission through the physically simulated smoke. Reduced coefficient for lighter smoke.
-    let absorption_coeff = 2.0; 
+    // Transmission through the physically simulated smoke.
+    let absorption_coeff = 2.4;
     let transmittance = exp(-smoke_density * absorption_coeff);
     
-    // In-scattering: Ambient light and fire glow scattered by smoke
-    let scatter_color = mix(vec3<f32>(0.04, 0.05, 0.08), vec3<f32>(1.0, 0.3, 0.05), pow(uv.y, 3.0));
-    let in_scattering = scatter_color * (1.0 - transmittance) * 1.5;
+    // In-scattering: ambient light and fire glow scattered by smoke.
+    // Peaks just above the flame (uv.y = 1 at the base) and falls off with
+    // height, instead of glowing orange far above the fire.
+    let scatter_color = mix(vec3<f32>(0.03, 0.04, 0.06), vec3<f32>(1.0, 0.35, 0.08), exp(-(1.0 - uv.y) * 3.0));
+    let in_scattering = scatter_color * (1.0 - transmittance) * 1.8;
 
-    // 4. Post-Processing: Bloom and Halation
-    let halation_intensity = smoothstep(0.15, 0.55, min(heat, 1.0)) * 0.4;
+    // 4. Post-Processing: Bloom and Halation (kept below the ACES clip point
+    // so hot cores stay yellow-white instead of blowing out)
+    let halation_intensity = smoothstep(0.15, 0.55, min(heat, 1.0)) * 0.3;
     let halation = vec3<f32>(1.0, 0.1, 0.02) * halation_intensity;
-    
-    let bloom_intensity = smoothstep(0.4, 0.8, min(heat, 1.0)) * 0.6;
+
+    let bloom_intensity = smoothstep(0.4, 0.8, min(heat, 1.0)) * 0.45;
     let bloom = vec3<f32>(1.0, 0.85, 0.25) * bloom_intensity;
+
+    // 4b. Rising ember sparks — procedural, renderer-side.
+    // (Sim ember packets die within a few frames to numerical diffusion in the
+    // semi-Lagrangian advection, so they never read as rising sparks.)
+    var ember_sparks = vec3<f32>(0.0);
+    let ember_gate = smoothstep(0.15, 0.5, highs + bass * 0.4);
+    if (ember_gate > 0.01) {
+        for (var i = 0u; i < 24u; i++) {
+            let fi = f32(i);
+            let seed1 = fract(sin(fi * 7.13) * 43758.5);
+            let seed2 = fract(sin(fi * 13.71) * 24634.6);
+            let speed = 0.08 + seed2 * 0.10;
+            let life = fract(time * speed + seed1);
+            // Horizontal wobble, unique per particle and per life cycle
+            let wobble = sin(life * 9.0 + fi * 3.3) * 0.012;
+            let ex = (fi + 0.5) / 24.0 + wobble;
+            let ey = 1.0 - life * 0.85; // rise from the fire line upward
+            let d = distance(vec2<f32>(uv.x * audio.aspect_ratio, uv.y), vec2<f32>(ex * audio.aspect_ratio, ey));
+            let fade = (1.0 - life) * (1.0 - life);
+            // Tight bright core + faint halo — reads as a spark, not a glow blob
+            ember_sparks += vec3<f32>(1.0, 0.5, 0.12) * (exp(-d * d * 9000.0) * 2.5 + 0.0002 / (d * d + 0.003)) * fade;
+        }
+        ember_sparks *= ember_gate;
+    }
 
     // 5. Final Composition
     // Fire is the light source; it should not be blocked by its own smoke in this additive model.
-    var final_color = emission + in_scattering + halation + bloom;
+    var final_color = emission + in_scattering + halation + bloom + ember_sparks;
     
     // ACES Filmic Tonemapping
     final_color = aces_tonemap(final_color);
@@ -224,8 +276,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let channel_width = 1.0 / f32(max(n_spatial_ch, 1u));
         let center_x = (f32(hover_spatial_idx) + 0.5) * channel_width;
         
-        let center_xc = center_x * 1.77;
-        let uv_c = vec2<f32>(uv.x * 1.77, uv.y);
+        let center_xc = center_x * audio.aspect_ratio;
+        let uv_c = vec2<f32>(uv.x * audio.aspect_ratio, uv.y);
         
         var lbl = array<u32, 3>(19u, 19u, 19u);
         var lbl_len = 1u;

@@ -145,11 +145,15 @@ fn setup_flares() {
         g_flare_loop_height[i] = 0.08 + vu * 0.4;
         g_flare_loop_thick[i] = 0.015 + vu * 0.02;
         
+        // Ejecta extension: eased bump (grow AND retract smoothly each cycle)
+        // instead of a fract() sawtooth, which snapped back to zero visibly
         let t_shoot1 = fract(audio.time * 0.4 + seed);
-        g_flare_ex1[i] = t_shoot1 * (0.8 + vu * 1.5); 
-        
+        let pulse1 = sin(t_shoot1 * 3.14159);
+        g_flare_ex1[i] = pulse1 * pulse1 * (0.8 + vu * 1.5);
+
         let t_shoot2 = fract(audio.time * 0.6 + seed * 1.3);
-        g_flare_ex2[i] = t_shoot2 * (0.6 + vu * 2.0);
+        let pulse2 = sin(t_shoot2 * 3.14159);
+        g_flare_ex2[i] = pulse2 * pulse2 * (0.6 + vu * 2.0);
     }
 }
 
@@ -220,6 +224,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var t = 0.0;
     var hit = false;
     var final_p = vec3<f32>(0.0);
+    // Flare distance AT the hit point (captured before calcNormal overwrites it)
+    var hit_flare_dist = 0.0;
 
     for (var i = 0; i < MAX_MARCH_STEPS; i++) {
         let p_current = ro + rd * t;
@@ -235,6 +241,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         if d < HIT_THRESHOLD {
             hit = true;
             final_p = p_current;
+            hit_flare_dist = g_last_flare_dist;
             break;
         }
 
@@ -245,7 +252,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if hit {
         let n = calcNormal(final_p);
         let r = length(final_p);
-        let f_dist = g_last_flare_dist;
+        let f_dist = hit_flare_dist;
         
         // Base surface colors to match reference
         let dark_red = vec3<f32>(0.3, 0.02, 0.0);

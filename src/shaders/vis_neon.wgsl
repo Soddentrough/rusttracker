@@ -138,8 +138,8 @@ fn get_smoke_density(p: vec3<f32>, time: f32, audio_activity: f32) -> f32 {
     // Early-out: skip FBM outside the smoke bounding volume
     if (dist > 5.5 || p.y > 3.0) { return 0.0; }
 
-    var mask = smoothstep(5.5, 2.0, dist);
-    mask *= smoothstep(3.0, -1.0, p.y);
+    var mask = smoothstep_r(5.5, 2.0, dist);
+    mask *= smoothstep_r(3.0, -1.0, p.y);
 
     if (mask < 0.01) { return 0.0; }
 
@@ -284,13 +284,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     act /= f32(max(num_ch, 1u));
 
     // --- Raymarching ---
-    let jitter = hash(in.clip_position.x + in.clip_position.y * 57.0 + fract(audio.smooth_time)) * 0.2;
+    // Dither seed uses frame_count (per-frame variation); fract(smooth_time)
+    // only changed once per second, causing a visible dither pop every second
+    let jitter = hash(in.clip_position.x + in.clip_position.y * 57.0 + f32(audio.frame_count % 256u) * 0.618) * 0.2;
     var t = jitter;
     var T = 1.0;  // smoke transmittance
     var color = vec3<f32>(0.0);
     var neon_glow = vec3<f32>(0.0);
+    // Skip smoke entirely when the music is silent — saves the 3D texture
+    // fetch and per-light accumulation on every march step
+    let smoke_active = act > 0.02;
 
-    for(var i=0; i<100; i++) {
+    for(var i=0; i<80; i++) {
         let p_hit = ro + rd * t;
         let res = map_scene(p_hit);
         let d = res.x;
@@ -386,7 +391,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Volumetric smoke — lit by ALL light sources (frames + ambients)
         let smoke_bounding = length(p_hit - vec3<f32>(0.0, -0.5, FRAME_Z)) - 5.5;
 
-        if (smoke_bounding < 0.0 && T > 0.01) {
+        if (smoke_bounding < 0.0 && T > 0.01 && smoke_active) {
             let dens = get_smoke_density(p_hit, audio.time, act);
             if (dens > 0.0) {
                 // Accumulate lighting from all frames (unrolled)
@@ -414,10 +419,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
 
         var step_size = d;
-        if (smoke_bounding < 0.0 && T > 0.01) {
-            step_size = min(step_size, 0.2);
-        } else {
-            step_size = min(step_size, smoke_bounding + 0.05);
+        if (smoke_active) {
+            if (smoke_bounding < 0.0 && T > 0.01) {
+                step_size = min(step_size, 0.2);
+            } else {
+                step_size = min(step_size, smoke_bounding + 0.05);
+            }
         }
 
         t += max(step_size, 0.02);
@@ -435,14 +442,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let t_floor = -(ro.y + 1.0) / rd.y;
             let floor_hit = ro + rd * t_floor;
             let dist_center = length(floor_hit.xz - vec2<f32>(0.0, FRAME_Z));
-            let pulse = smoothstep(3.0, 0.0, dist_center) * lfe_vu * lfe_vu;
-            let pulse_ring = smoothstep(0.08, 0.0, abs(dist_center - 1.5 - lfe_vu * 2.0)) * lfe_vu;
+            let pulse = smoothstep_r(3.0, 0.0, dist_center) * lfe_vu * lfe_vu;
+            let pulse_ring = smoothstep_r(0.08, 0.0, abs(dist_center - 1.5 - lfe_vu * 2.0)) * lfe_vu;
             color += lfe_col * (pulse * 0.6 + pulse_ring * 0.4) * T;
         }
     }
 
     let vr = length(uv);
-    color *= smoothstep(2.5, 0.5, vr);
+    color *= smoothstep_r(2.5, 0.5, vr);
 
     // Narkowicz ACES fitted tonemap (sRGB gamma applied by WGPU surface)
     let final_col = aces_tonemap(color);

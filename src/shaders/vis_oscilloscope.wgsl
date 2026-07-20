@@ -7,28 +7,12 @@ var<uniform> audio: AudioUniforms;
 @group(0) @binding(1)
 var<storage, read> waveform_history: array<f32>;
 
-fn hash21(p: vec2<f32>) -> f32 {
-    var p3 = fract(vec3<f32>(p.xyx) * 0.1031);
-    p3 = p3 + dot(p3, p3.yzx + 33.33);
-    return fract((p3.x + p3.y) * p3.z);
-}
-
 // Waveforms are pre-smoothed on CPU, so we can read directly
 fn get_waveform(hist_idx: u32, idx: u32) -> f32 {
     let res = max(audio.waveform_resolution, 128u);
     let clamped_idx = clamp(idx, 0u, res - 1u);
     // engine.rs places each frame at a 2048 stride
     return waveform_history[hist_idx * 2048u + clamped_idx];
-}
-
-// Linear interpolation between integer sample indices for sub-pixel accuracy
-fn get_waveform_lerp(hist_idx: u32, x: f32) -> f32 {
-    let res = f32(max(audio.waveform_resolution, 128u));
-    let float_idx = clamp(x, 0.0, 0.999) * (res - 1.0);
-    let idx0 = u32(float_idx);
-    let idx1 = min(idx0 + 1u, u32(res) - 1u);
-    let frac = fract(float_idx);
-    return mix(get_waveform(hist_idx, idx0), get_waveform(hist_idx, idx1), frac);
 }
 
 fn sdLine(p: vec2<f32>, a: vec2<f32>, b: vec2<f32>) -> f32 {
@@ -118,7 +102,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // 0.05 gives a long 1-second smooth trail.
         let age = exp(-frames_old * 0.06);
 
-        let core = smoothstep(thickness, 0.0, true_dist) * 0.6;
+        let core = smoothstep_r(thickness, 0.0, true_dist) * 0.6;
         let bloom = 0.00005 / (true_dist * true_dist + bloom_spread) * 0.02;
 
         // Tighter halation (faster falloff)
@@ -133,11 +117,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let mapped = wave_intensity * amber;
     var tonemapped = aces_tonemap(mapped);
 
+    // Keep the phosphor tint WHITE: the color is already amber-tonemapped above,
+    // so tinting again would multiply amber by amber and crush the midtones to red.
     var crt_settings = get_default_crt();
-    crt_settings.phosphor_tint = amber; // Not used as tint for everything, just to configure if needed. Actually we'll keep final_color.
     
     // Smooth CRT bezel fade (radial, no rectangular edges)
-    let bezel = smoothstep(1.4, 0.9, r);
+    let bezel = smoothstep_r(1.4, 0.9, r);
     
     // Analog noise glow
     let noise_val = hash21_crt(in.clip_position.xy + fract(audio.smooth_time) * 137.0);

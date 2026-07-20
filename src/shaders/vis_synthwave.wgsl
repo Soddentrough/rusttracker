@@ -62,7 +62,7 @@ fn terrain_h(wx: f32, wz: f32, dist_z: f32) -> f32 {
     let r2 = ridge(vec2<f32>(wx, wz) * 0.05) * 1.0;
     let h = r1 + r2;
     
-    let horizon_fade = smoothstep(240.0, 60.0, dist_z);
+    let horizon_fade = smoothstep_r(240.0, 60.0, dist_z);
     
     return slope * h * 0.05 * horizon_fade - 1.0;
 }
@@ -72,7 +72,7 @@ fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
     var out: VertexOutput3D;
     
     // Calculate camera position
-    let cam_z = audio.smooth_time * 25.0;
+    let cam_z = audio.history_cam_z; // history-locked: 0.5 world units per history row
     
     // Map grid vertex coordinates
     let norm_x = in.position.x / 100.0;
@@ -215,14 +215,14 @@ fn get_street_lamps(world_pos: vec3<f32>, cam_z: f32, bass_pulse: f32) -> vec3<f
             let terrain_y = terrain_h(pole_x, z_left, 100.0);
             let light_pos = vec3<f32>(pole_x + 2.0, 10.6 + terrain_y, z_left);
             let dist_to_lamp = light_pos.z - cam_z;
-            let lamp_fog = smoothstep(220.0, 50.0, dist_to_lamp);
+            let lamp_fog = smoothstep_r(220.0, 50.0, dist_to_lamp);
             
             if (lamp_fog > 0.0) {
                 // Ground lighting cone (sodium light pool on ground)
                 let dist_xz = length(world_pos.xz - light_pos.xz);
                 let cone_radius = 14.0;
                 if (dist_xz < cone_radius && world_pos.y < light_pos.y) {
-                    let attenuation = smoothstep(cone_radius, 0.0, dist_xz);
+                    let attenuation = smoothstep_r(cone_radius, 0.0, dist_xz);
                     let dist_3d = length(world_pos - light_pos);
                     let light_pool = attenuation * (10.0 / (dist_3d * dist_3d + 1.0));
                     color_acc += sodium_color * light_pool * lamp_intensity * lamp_fog;
@@ -241,7 +241,7 @@ fn get_street_lamps(world_pos: vec3<f32>, cam_z: f32, bass_pulse: f32) -> vec3<f
                     
                     // Render the pole itself (dark silhouette with ambient neon orange highlight)
                     if (dist_to_post < 0.15) {
-                        let post_intensity = smoothstep(0.15, 0.0, dist_to_post);
+                        let post_intensity = smoothstep_r(0.15, 0.0, dist_to_post);
                         color_acc += vec3<f32>(0.05, 0.02, 0.01) * post_intensity * lamp_fog;
                     }
                     
@@ -249,10 +249,10 @@ fn get_street_lamps(world_pos: vec3<f32>, cam_z: f32, bass_pulse: f32) -> vec3<f
                     let dist_to_bulb = length(Q - light_pos);
                     let max_bulb_dist = 3.0;
                     if (dist_to_bulb < max_bulb_dist) {
-                        let fade = smoothstep(max_bulb_dist, 0.0, dist_to_bulb);
+                        let fade = smoothstep_r(max_bulb_dist, 0.0, dist_to_bulb);
                         var bulb_glow = (exp(-dist_to_bulb * 4.0) * 12.0 + exp(-dist_to_bulb * 1.8) * 1.2) * fade;
                         if (Q.y > light_pos.y) {
-                            bulb_glow *= smoothstep(0.02, 0.0, Q.y - light_pos.y);
+                            bulb_glow *= smoothstep_r(0.02, 0.0, Q.y - light_pos.y);
                         }
                         color_acc += sodium_color * bulb_glow * lamp_intensity * lamp_fog;
                     }
@@ -278,14 +278,14 @@ fn get_street_lamps(world_pos: vec3<f32>, cam_z: f32, bass_pulse: f32) -> vec3<f
             let terrain_y = terrain_h(pole_x, z_right, 100.0);
             let light_pos = vec3<f32>(pole_x - 2.0, 10.6 + terrain_y, z_right);
             let dist_to_lamp = light_pos.z - cam_z;
-            let lamp_fog = smoothstep(220.0, 50.0, dist_to_lamp);
+            let lamp_fog = smoothstep_r(220.0, 50.0, dist_to_lamp);
             
             if (lamp_fog > 0.0) {
                 // Ground lighting cone (sodium light pool on ground)
                 let dist_xz = length(world_pos.xz - light_pos.xz);
                 let cone_radius = 14.0;
                 if (dist_xz < cone_radius && world_pos.y < light_pos.y) {
-                    let attenuation = smoothstep(cone_radius, 0.0, dist_xz);
+                    let attenuation = smoothstep_r(cone_radius, 0.0, dist_xz);
                     let dist_3d = length(world_pos - light_pos);
                     let light_pool = attenuation * (10.0 / (dist_3d * dist_3d + 1.0));
                     color_acc += sodium_color * light_pool * lamp_intensity * lamp_fog;
@@ -303,17 +303,17 @@ fn get_street_lamps(world_pos: vec3<f32>, cam_z: f32, bass_pulse: f32) -> vec3<f
                     let dist_to_post = length(Q - C);
                     
                     if (dist_to_post < 0.15) {
-                        let post_intensity = smoothstep(0.15, 0.0, dist_to_post);
+                        let post_intensity = smoothstep_r(0.15, 0.0, dist_to_post);
                         color_acc += vec3<f32>(0.05, 0.02, 0.01) * post_intensity * lamp_fog;
                     }
                     
                     let dist_to_bulb = length(Q - light_pos);
                     let max_bulb_dist = 3.0;
                     if (dist_to_bulb < max_bulb_dist) {
-                        let fade = smoothstep(max_bulb_dist, 0.0, dist_to_bulb);
+                        let fade = smoothstep_r(max_bulb_dist, 0.0, dist_to_bulb);
                         var bulb_glow = (exp(-dist_to_bulb * 4.0) * 12.0 + exp(-dist_to_bulb * 1.8) * 1.2) * fade;
                         if (Q.y > light_pos.y) {
-                            bulb_glow *= smoothstep(0.02, 0.0, Q.y - light_pos.y);
+                            bulb_glow *= smoothstep_r(0.02, 0.0, Q.y - light_pos.y);
                         }
                         color_acc += sodium_color * bulb_glow * lamp_intensity * lamp_fog;
                     }
@@ -377,17 +377,17 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
         if p.y > 0.0 && p.y < 3.5 {
             let cu = vec2<f32>(p.x * 1.5 + audio.smooth_time * 0.025, p.y * 1.5);
             let cloud = noise2d(cu * 2.5) * 0.6 + noise2d(cu * 5.0 + vec2<f32>(3.7, 1.2)) * 0.4;
-            let alt_mask = smoothstep(0.0, 0.5, p.y) * smoothstep(3.5, 1.5, p.y);
+            let alt_mask = smoothstep(0.0, 0.5, p.y) * smoothstep_r(3.5, 1.5, p.y);
             let cloud_alpha = smoothstep(0.4, 0.6, cloud) * alt_mask * 0.55;
             sky_color = mix(sky_color, vec3<f32>(0.08, 0.02, 0.12), cloud_alpha);
-            sky_color += vec3<f32>(0.2, 0.05, 0.1) * smoothstep(0.55, 0.4, cloud) * alt_mask * exp(-sun_dist * 1.5) * 0.5;
+            sky_color += vec3<f32>(0.2, 0.05, 0.1) * smoothstep_r(0.55, 0.4, cloud) * alt_mask * exp(-sun_dist * 1.5) * 0.5;
         }
 
         // Stars
         let star_uv = p * 80.0;
         let star_id = floor(star_uv);
         let star_rnd = hash1(star_id.x * 127.1 + star_id.y * 311.7);
-        let star_b = step(0.97, star_rnd) * smoothstep(0.04, 0.0, length(fract(star_uv) - 0.5)) * clamp(p.y - 0.1, 0.0, 1.0);
+        let star_b = step(0.97, star_rnd) * smoothstep_r(0.04, 0.0, length(fract(star_uv) - 0.5)) * clamp(p.y - 0.1, 0.0, 1.0);
         sky_color += vec3<f32>(star_b) * (0.8 + treble_pulse * 0.4);
         
         final_color = sky_color;
@@ -445,7 +445,7 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     }
     
     // Add street lamps (lighting + volumetric + posts + bulbs)
-    let cam_z = audio.smooth_time * 25.0;
+    let cam_z = audio.history_cam_z; // history-locked: 0.5 world units per history row
     let lamps_color = get_street_lamps(in.world_pos, cam_z, bass_pulse);
     final_color += lamps_color;
     
@@ -456,7 +456,7 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
 fn vs_lamp(in: VertexInput, @builtin(instance_index) inst_idx: u32) -> VertexOutput3D {
     var out: VertexOutput3D;
     
-    let cam_z = audio.smooth_time * 25.0;
+    let cam_z = audio.history_cam_z; // history-locked: 0.5 world units per history row
     
     // Determine segment index and side from inst_idx
     // We have 8 segments (from current_seg to current_seg + 7)
@@ -534,7 +534,7 @@ fn fs_lamp(in: VertexOutput3D) -> @location(0) vec4<f32> {
     }
     
     // Depth fog
-    let cam_z = audio.smooth_time * 25.0;
+    let cam_z = audio.history_cam_z; // history-locked: 0.5 world units per history row
     let dist_to_lamp = in.world_pos.z - cam_z;
     let fog_f = smoothstep(50.0, 220.0, dist_to_lamp);
     let fog_c = vec3<f32>(0.04, 0.0, 0.08);

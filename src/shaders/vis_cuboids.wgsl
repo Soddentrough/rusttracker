@@ -127,7 +127,7 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     let amp_factor = 1.0 + clamp(in.amp / 30.0, 0.0, 3.0);
     
     let line_width = 1.5; // 1.5 pixels wide core
-    let core_glow = smoothstep(line_width + 1.0, line_width - 1.0, pixel_dist);
+    let core_glow = smoothstep_r(line_width + 1.0, line_width - 1.0, pixel_dist);
     
     // Exponential bloom/glow falloffs
     let bloom_glow = exp(-pixel_dist * 0.15) * amp_factor; // neon green glow

@@ -132,7 +132,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if (idx >= 65536u) { return; }
 
     var p = particles[idx];
-    let dt = 0.016;
+    // Framerate-independent timestep (real frame dt, clamped)
+    let dt = clamp(audio.frame_dt, 0.001, 0.033);
     let time = audio.smooth_time;
     let idx_f = f32(idx);
     
@@ -166,7 +167,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let target_vel = wave_vel + drift_vel;
         
         // High drag keeps particles flowing smoothly with currents rather than zipping around
-        vel = mix(vel, target_vel, 0.15);
+        // (0.15 per 16ms step, converted to the real dt)
+        vel = mix(vel, target_vel, 1.0 - pow(0.85, dt / 0.016));
         
         // Audio reactivity - Bass agitation triggers glow directly
         let bass = max(audio.spectrum[0].x, audio.spectrum[1].x) * 0.02;
@@ -184,8 +186,9 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         pos.z += vel.z * dt;
         
         // Snap vertical position to the surface wave height
-        let new_disp = get_wave_displacement(pos.xz, time);
-        pos.y = new_disp.y;
+        // (reuse disp from above — the field is smooth and the horizontal
+        // integration step is tiny, so a second evaluation is wasted work)
+        pos.y = wave_h;
         vel.y = 0.0;
         
         // Wave breaks and foam structure simulation (active at crests)

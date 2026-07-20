@@ -5,7 +5,10 @@
 
 // --- Tuning Constants ---
 const PUDDLE_RADIUS: f32 = 4.0;
-const STEP_SCALE: f32 = 0.45;       // Lipschitz correction for pow-8 lobes + smax(k=0.3)
+// Adaptive Lipschitz correction: worst-case spike-flank slope grows with VU
+// (|dh/dr| ≈ 4.5 * vu), so a fixed step scale overshoots on loud transients.
+// Computed once per frame in fs_main from the max channel VU.
+var<private> g_step_scale: f32 = 0.45;
 const MAX_MARCH_STEPS: i32 = 80;   // Safe ceiling with corrected step scale
 const HIT_THRESHOLD: f32 = 0.005;
 const NORMAL_EPS: f32 = 0.015;      // Increased epsilon for smoother, anti-aliased normals
@@ -145,7 +148,7 @@ fn map_dist(p: vec3<f32>, full_detail: bool) -> f32 {
 
     // Subtle ripples from spectrum bass
     let bass = clamp(audio.spectrum[0].x + audio.spectrum[1].x, 0.0, 2.0);
-    let ripple = sin(dist_xz * 12.0 - audio.time * 8.0) * 0.015 * bass * smoothstep(PUDDLE_RADIUS, 0.0, dist_xz);
+    let ripple = sin(dist_xz * 12.0 - audio.time * 8.0) * 0.015 * bass * smoothstep_r(PUDDLE_RADIUS, 0.0, dist_xz);
 
     // Organic surface perturbation (smooth magnetic domain noise)
     var surface_noise = 0.0;
@@ -161,7 +164,7 @@ fn map_dist(p: vec3<f32>, full_detail: bool) -> f32 {
     let d = p.y + 0.5 - fluid_h;
 
     // Lipschitz-corrected step size
-    return d * STEP_SCALE;
+    return d * g_step_scale;
 }
 
 // --- SDF: Full map with glow (used only in march loop) ---
@@ -224,7 +227,7 @@ fn map(p: vec3<f32>, full_detail: bool) -> MapData {
 
     // Subtle ripples from spectrum bass
     let bass = clamp(audio.spectrum[0].x + audio.spectrum[1].x, 0.0, 2.0);
-    let ripple = sin(dist_xz * 12.0 - audio.time * 8.0) * 0.015 * bass * smoothstep(PUDDLE_RADIUS, 0.0, dist_xz);
+    let ripple = sin(dist_xz * 12.0 - audio.time * 8.0) * 0.015 * bass * smoothstep_r(PUDDLE_RADIUS, 0.0, dist_xz);
 
     // Organic surface perturbation (smooth magnetic domain noise)
     var surface_noise = 0.0;
@@ -236,7 +239,7 @@ fn map(p: vec3<f32>, full_detail: bool) -> MapData {
 
     fluid_h += total_displacement + ripple + surface_noise;
 
-    let d = (p.y + 0.5 - fluid_h) * STEP_SCALE;
+    let d = (p.y + 0.5 - fluid_h) * g_step_scale;
 
     return MapData(d, 1, glow);
 }
@@ -282,8 +285,20 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var hit = false;
     var final_p = vec3<f32>(0.0);
 
+    // Adaptive Lipschitz step scale from the loudest channel this frame
+    var max_vu = 0.0;
+    for (var i = 0u; i < min(audio.num_channels, 12u); i++) {
+        max_vu = max(max_vu, get_vu(i));
+    }
+    g_step_scale = min(0.45, 1.0 / sqrt(1.0 + 20.25 * max_vu * max_vu));
+
     for (var i = 0; i < MAX_MARCH_STEPS; i++) {
         let p_current = ro + rd * t;
+
+        // Sky early-out: the fluid is a heightfield with max displacement ~1.5
+        // above its base plane; any ray above that and still rising can never hit
+        if (rd.y > 0.0 && p_current.y > 1.6) { break; }
+
         let map_data = map(p_current, true);
         let d = map_data.d;
 

@@ -85,7 +85,7 @@ fn get_density(p: vec2<f32>) -> f32 {
     let raw_density = sum / max(w_sum, 0.001);
     let h = log(1.0 + raw_density * DENSITY_SCALE) * HEIGHT_SCALE;
     // Smoothstep near the cap to round off spike tips
-    return min(h, MAX_HEIGHT) * smoothstep(MAX_HEIGHT + 0.5, MAX_HEIGHT - 0.3, h);
+    return min(h, MAX_HEIGHT) * smoothstep_r(MAX_HEIGHT + 0.5, MAX_HEIGHT - 0.3, h);
 
 }
 
@@ -99,7 +99,7 @@ fn map(p: vec3<f32>) -> f32 {
     
     // Base puddle: thin continuous fluid layer that prevents holes
     // Simulates surface tension — ferrofluid never has gaps in its surface
-    let base_h = BASE_HEIGHT * smoothstep(PUDDLE_RADIUS, PUDDLE_RADIUS * 0.5, dist_from_center);
+    let base_h = BASE_HEIGHT * smoothstep_r(PUDDLE_RADIUS, PUDDLE_RADIUS * 0.5, dist_from_center);
     
     let h = max(particle_h, base_h);
     // Multiply by Lipschitz bound factor to prevent raymarching through thin features

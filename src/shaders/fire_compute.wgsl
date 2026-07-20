@@ -10,7 +10,7 @@ struct FireParams {
     num_channels: u32,
     lfe_idx: u32,
     fft_channels: u32,
-    _pad1: u32,
+    dt: f32,
     display_order: array<vec4<u32>, 4>,
     channels: array<vec4<f32>, 8>,
 };
@@ -55,8 +55,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let bottom = params.height - 1u;
     let idx = y * w + x;
 
-    // Seed RNG from position + time
-    let seed = pcg_hash(x + y * 1337u + bitcast<u32>(params.time * 100.0));
+    // Rates below were tuned per-frame at 144fps; scale by real dt so the
+    // simulation evolves identically at any refresh rate.
+    let dt_scale = params.dt * 144.0;
 
     // === Bottom row: update coal bed with thermal inertia ===
     if (y == bottom) {
@@ -67,7 +68,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         if lfe_idx < n_ch {
             n_spatial_ch = n_ch - 1u;
         }
-        let channel_width = 1024.0 / f32(max(n_spatial_ch, 1u));
+        let channel_width = f32(params.width) / f32(max(n_spatial_ch, 1u));
         var sigma_scale = 0.18;
         if n_spatial_ch <= 2u {
             sigma_scale = 0.4;
@@ -93,7 +94,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
             spatial_idx += 1u;
         }
         if lfe_idx < n_ch {
-            let lfe_dist = f32(x) - 512.0;
+            let lfe_dist = f32(x) - f32(params.width) * 0.5;
             let lfe_influence = exp(-(lfe_dist * lfe_dist) / (2.0 * 90.0 * 90.0));
             var lfe_disp_idx = 999u;
             for (var i = 0u; i < n_ch; i = i + 1u) {
@@ -119,9 +120,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         let coal_target = 1.0 - exp(-(params.bass * 0.5 + activity * 3.0));
         let current = coal_bed[x];
         if (coal_target > current) {
-            coal_bed[x] = current + (coal_target - current) * 0.18;
+            coal_bed[x] = current + (coal_target - current) * min(0.18 * dt_scale, 1.0);
         } else {
-            coal_bed[x] = current + (coal_target - current) * 0.008;
+            coal_bed[x] = current + (coal_target - current) * min(0.008 * dt_scale, 1.0);
         }
         
         // Use lower frequency noise to create wide, organic hotspots rather than single-pixel static
@@ -173,10 +174,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let cool_noise = perlin_noise(p_cool + vec2<f32>(0.0, params.time * 6.0));
     
     // Higher variance in cooling forces the flame to tear into distinct licks
-    let base_cooling = 0.0015 + (cool_noise + 1.0) * 0.0015;
-    
+    let base_cooling = (0.0015 + (cool_noise + 1.0) * 0.0015) * dt_scale;
+
     // Occasional sparks (holes in the flame) for realism, clumped by noise
-    let spark = select(0.0, 0.06, cool_noise > 0.8 && y > 100u);
+    // (threshold 0.55: this perlin gradient noise peaks around +/-0.7, so 0.8 was unreachable)
+    let spark = select(0.0, 0.06 * dt_scale, cool_noise > 0.55 && y > 100u);
 
     // Normalize the cooling factor so heavily compressed tracks don't turn off cooling entirely
     let dynamic_cooling = mix(0.6, 1.0, params.cooling_factor);

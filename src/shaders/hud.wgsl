@@ -50,17 +50,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Default transparent background
     var out_color = vec4<f32>(0.0);
     
-    // Only render if rect is valid
-    if (meters_rect_max.x > 0.0 && uv.x >= meters_rect_min.x && uv.x <= meters_rect_max.x && uv.y >= meters_rect_min.y && uv.y <= meters_rect_max.y) {
+    // Only render if rect is valid (width AND height non-zero to avoid div-by-zero below)
+    if (meters_rect_max.x > 0.0 && meters_rect_max.y > meters_rect_min.y && uv.x >= meters_rect_min.x && uv.x <= meters_rect_max.x && uv.y >= meters_rect_min.y && uv.y <= meters_rect_max.y) {
         let num_ch = uniforms.num_channels;
         if (num_ch > 0u) {
             let meter_width_uv = (meters_rect_max.x - meters_rect_min.x) / f32(num_ch);
-            
+
             // Determine which channel we are in based on x
             let ch_f = (uv.x - meters_rect_min.x) / meter_width_uv;
             let ch_idx = min(u32(ch_f), num_ch - 1u);
-            
-            if (ch_idx < num_ch) {
+
+            {
                 // Determine position within the specific meter
                 let local_x = fract(ch_f);
                 
@@ -101,7 +101,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                     // Segment padding
                     if (segment_local_y < 0.75) {
                         let active_segments = ceil(vu * num_segments);
-                        let peak_segment = floor(peak * num_segments);
+                        // Clamp so a full-scale (0 dBFS) peak lands on the top segment (30 -> 29)
+                        let peak_segment = min(floor(peak * num_segments), num_segments - 1.0);
                         
                         let is_active = segment_idx < active_segments;
                         let is_peak = segment_idx == peak_segment && peak_segment > 0.0;

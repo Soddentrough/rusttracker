@@ -99,7 +99,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             // Hoist the first point evaluation to halve the workload
             let j_start_u = u32(start_idx);
             let x0_init = mix(-8.0, 8.0, f32(j_start_u) / f32(num_points - 1u));
-            var mask0 = smoothstep(8.0, 5.0, abs(x0_init));
+            var mask0 = smoothstep_r(8.0, 5.0, abs(x0_init));
             var x_norm0 = f32(j_start_u) / f32(num_points - 1u);
             var v0 = get_resynthesized_wave(i, x_norm0);
             var x0 = x0_init;
@@ -108,7 +108,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 let j_u = u32(j);
                 
                 let x1 = mix(-8.0, 8.0, f32(j_u + 1u) / f32(num_points - 1u));
-                let mask1 = smoothstep(8.0, 5.0, abs(x1));
+                let mask1 = smoothstep_r(8.0, 5.0, abs(x1));
                 let x_norm1 = f32(j_u + 1u) / f32(num_points - 1u);
                 
                 let v1 = get_resynthesized_wave(i, x_norm1);
@@ -137,13 +137,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let edge_blur = smoothstep(0.3, 1.2, r);
             
             let thickness = 0.002 + edge_blur * 0.004;
-            let core = smoothstep(thickness, 0.0, min_dist);
+            let core = smoothstep_r(thickness, 0.0, min_dist);
             // High bloom for that glowing CRT look
             let bloom = 0.0004 / (min_dist * min_dist + 0.0001) * 0.15;
             
             // Depth fade (lines further back are slightly darker)
             let depth_fade = exp(-t * 0.20);
-            let edge_fade = smoothstep(8.0, 5.0, abs(hit_x));
+            let edge_fade = smoothstep_r(8.0, 5.0, abs(hit_x));
             
             // Sample waveform height at hit point for color grading
             let hit_x_norm = clamp((hit_x + 8.0) / 16.0, 0.0, 1.0);
@@ -165,7 +165,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     
     // Smooth CRT bezel fade
     let r = length(crt_uv);
-    let bezel = smoothstep(1.3, 0.9, r);
+    let bezel = smoothstep_r(1.3, 0.9, r);
     
     // Analog noise
     let noise_val = hash12(in.clip_position.xy + fract(audio.smooth_time) * 100.0);

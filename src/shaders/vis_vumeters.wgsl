@@ -279,6 +279,12 @@ fn sdBox(p: vec3<f32>, b: vec3<f32>) -> f32 {
     return length(max(q, vec3<f32>(0.0))) + min(max(q.x, max(q.y, q.z)), 0.0);
 }
 
+// 2D rounded-rectangle signed distance (for the chassis outer boundary)
+fn sdRoundBox2D(p: vec2<f32>, b: vec2<f32>, r: f32) -> f32 {
+    let q = abs(p) - b + r;
+    return length(max(q, vec2<f32>(0.0))) + min(max(q.x, q.y), 0.0) - r;
+}
+
 // --- Layout ---
 struct MeterLayout {
     scale: f32,
@@ -340,7 +346,15 @@ fn map_scene(p: vec3<f32>) -> vec3<f32> {
     let d_cutout = sdBox(q - vec3<f32>(0.0, 0.0, -0.15), vec3<f32>(0.98, 0.52, 0.25));
     
     if (d_cutout >= 0.0) {
-        return vec3<f32>(p.z, 0.0, 0.0);
+        // Chassis face: finite unit with a rounded rectangular outer boundary
+        // and a rolled edge (slope catches a bevel highlight). Outside the
+        // boundary there is no geometry — background shows through.
+        let outer = sdRoundBox2D(p.xy, vec2<f32>(3.28, 0.72), 0.06);
+        if (outer > 0.01) {
+            return vec3<f32>(10.0 + outer, 0.0, 0.0); // miss
+        }
+        let edge_roll = 0.035 * smoothstep(-0.09, 0.01, outer);
+        return vec3<f32>(p.z - edge_roll, 0.0, 0.0);
     } else {
         let d_sidewalls = min(0.98 - abs(q.x), 0.52 - abs(q.y));
         let d_backplate = q.z - (-0.285);
@@ -439,7 +453,7 @@ fn get_panel_color(p_hit: vec3<f32>, q: vec3<f32>, N: vec3<f32>, L: vec3<f32>, V
     let dark_panel = panel_col * (diff_metal * 0.4 + 0.06) + vec3<f32>(spec_metal * 0.5);
     
     // Subtle thin bezel highlight right at the edge
-    let bezel_glow = smoothstep(0.02, 0.0, abs(edge_d)) * 0.08;
+    let bezel_glow = smoothstep_r(0.02, 0.0, abs(edge_d)) * 0.08;
     
     return dark_panel + vec3<f32>(bezel_glow);
 }
@@ -447,12 +461,9 @@ fn get_panel_color(p_hit: vec3<f32>, q: vec3<f32>, N: vec3<f32>, L: vec3<f32>, V
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let uv = in.uv * 2.0 - 1.0;
-    
-    var aspect = 1.7777;
-    let dy = abs(dpdy(in.uv.y));
-    let dx = abs(dpdx(in.uv.x));
-    if (dx > 0.0001 && dy > 0.0001) { aspect = dy / dx; }
-    
+
+    let aspect = audio.aspect_ratio;
+
     let p_coord = vec2<f32>(uv.x * aspect, -uv.y);
     
     // Camera: tight framing to fill viewport with the meters
@@ -471,13 +482,31 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let pixel_size_Z0 = abs(dpdy(in.uv.y)) * 2.0;
     let local_pixel_size = pixel_size_Z0 / mlayout.scale;
     
-    // Raymarching
+    // Raymarching — with an analytic AABB pre-test so background pixels
+    // (the majority of the frame) skip the 80-step march entirely.
     var t = 0.05;
+    var t_max = 10.0;
     var hit = false;
     var p_hit = vec3<f32>(0.0);
     var res = vec3<f32>(0.0);
-    
+
+    // Conservative bounds of the two-meter scene (chassis + meters near z=0)
+    let box_min = vec3<f32>(-3.5, -1.4, -1.0);
+    let box_max = vec3<f32>(3.5, 1.4, 0.6);
+    let inv_rd = 1.0 / rd;
+    let t0 = (box_min - ro) * inv_rd;
+    let t1 = (box_max - ro) * inv_rd;
+    let t_near = max(max(min(t0.x, t1.x), min(t0.y, t1.y)), min(t0.z, t1.z));
+    let t_far = min(min(max(t0.x, t1.x), max(t0.y, t1.y)), max(t0.z, t1.z));
+    let box_hit = t_far > max(t_near, 0.0);
+
+    if (box_hit) {
+        t = max(t_near, 0.05);
+        t_max = min(t_far + 0.1, 10.0);
+    }
+
     for (var step = 0; step < 80; step++) {
+        if (!box_hit) { break; }
         p_hit = ro + rd * t;
         res = map_scene(p_hit);
         let d = res.x;
@@ -486,11 +515,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             break;
         }
         t += d;
-        if (t > 10.0) { break; }
+        if (t > t_max) { break; }
     }
     
-    // Dark background
-    var color = vec3<f32>(0.01, 0.01, 0.015);
+    // Soft ambient pool behind the chassis so the meters sit in a space
+    // rather than floating in a void
+    let bg_r = length(p_coord);
+    var color = vec3<f32>(0.012, 0.012, 0.018) + vec3<f32>(0.020, 0.018, 0.028) * smoothstep_r(1.6, 0.0, bg_r);
     
     if (hit) {
         let mat = res.y;
@@ -515,7 +546,19 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let panel_col_raw = get_panel_color(p_hit, q, N, L, V, edge_d, pixel_size_Z0, local_pixel_size);
             let edge_shadow = smoothstep(-cutout_edge_blur, cutout_edge_blur, edge_d);
             mat_color = mix(vec3<f32>(0.005), panel_col_raw, edge_shadow);
-            
+
+            // Rack screws just outside the cutout corners (dark heads + slot highlight)
+            let screw_pos = array<vec2<f32>, 4>(vec2<f32>(-1.04, 0.58), vec2<f32>(1.04, 0.58), vec2<f32>(-1.04, -0.58), vec2<f32>(1.04, -0.58));
+            for (var si = 0u; si < 4u; si++) {
+                let d_screw = length(q.xy - screw_pos[si]);
+                let screw = smoothstep_r(0.022, 0.015, d_screw);
+                // Specular rim on the screw head, offset toward the light
+                let rim = smoothstep_r(0.020, 0.012, length(q.xy - screw_pos[si] + vec2<f32>(-0.006, -0.006)));
+                let slot = smoothstep_r(0.003, 0.001, abs(q.y - screw_pos[si].y)) * smoothstep_r(0.014, 0.008, d_screw);
+                mat_color = mix(mat_color, vec3<f32>(0.012), screw * 0.85);
+                mat_color += vec3<f32>(0.10) * max(rim - screw, 0.0) + vec3<f32>(0.06) * slot;
+            }
+
         } else {
             if (mat == 1.0) {
                 // --- Cavity Walls ---
@@ -549,9 +592,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 // Apply lamp glow (brighter near lamp) — more intense
                 let lamp_intensity = 0.8 + 0.6 * lamp_falloff;
                 back_color *= lamp_intensity;
+
+                // Incandescent backlight breathes slightly with the signal level
+                back_color *= 0.94 + 0.12 * clamp(get_needle_angle(meter_idx), 0.0, 1.0);
+
+                // Subtle ivory/paper grain so the dial reads as printed card, not plastic
+                back_color *= 0.97 + 0.05 * noise2d(q.xy * 220.0);
                 
                 // Darken edges for lamp falloff vignette  
-                let edge_vignette = smoothstep(0.95, 0.5, max(abs(q.x) / 0.98, abs(q.y) / 0.52));
+                let edge_vignette = smoothstep_r(0.95, 0.5, max(abs(q.x) / 0.98, abs(q.y) / 0.52));
                 back_color *= mix(0.3, 1.0, edge_vignette);
                 
                 // === TICK MARKS — Full VU standard scale ===
@@ -576,8 +625,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                     let inner_r = outer_r - tick_len;
                     
                     if (d_scale >= inner_r - local_pixel_size && d_scale <= outer_r + local_pixel_size) {
-                        let w_mask = smoothstep(tick_w + angular_pixel_size, tick_w - angular_pixel_size, diff_t);
-                        let r_mask = smoothstep(outer_r + local_pixel_size, outer_r - local_pixel_size, d_scale) *
+                        let w_mask = smoothstep_r(tick_w + angular_pixel_size, tick_w - angular_pixel_size, diff_t);
+                        let r_mask = smoothstep_r(outer_r + local_pixel_size, outer_r - local_pixel_size, d_scale) *
                                      smoothstep(inner_r - local_pixel_size, inner_r + local_pixel_size, d_scale);
                         let current_tick_mask = w_mask * r_mask;
                         
@@ -595,9 +644,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 let arc_r = 1.05;
                 if (d_scale >= arc_r - 0.008 && d_scale <= arc_r + 0.008 && theta >= phi_min - local_pixel_size && theta <= phi_max + local_pixel_size) {
                     let rad_diff = abs(d_scale - arc_r);
-                    let r_mask = smoothstep(0.006 + local_pixel_size, 0.006 - local_pixel_size, rad_diff);
+                    let r_mask = smoothstep_r(0.006 + local_pixel_size, 0.006 - local_pixel_size, rad_diff);
                     let end_mask = smoothstep(phi_min - local_pixel_size, phi_min + local_pixel_size, theta) *
-                                   smoothstep(phi_max + local_pixel_size, phi_max - local_pixel_size, theta);
+                                   smoothstep_r(phi_max + local_pixel_size, phi_max - local_pixel_size, theta);
                     arc_mask = r_mask * end_mask;
                     // Red section for positive dB
                     let is_red_arc = theta > (phi_min + 0.77 * (phi_max - phi_min));
@@ -617,8 +666,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                     let theta_pct = phi_min + pct_vals[pi] * (phi_max - phi_min);
                     let diff_p = abs(theta - theta_pct);
                     if (d_scale >= pct_inner - local_pixel_size && d_scale <= pct_outer + local_pixel_size) {
-                        let w_m = smoothstep(0.003 + angular_pixel_size, 0.003 - angular_pixel_size, diff_p);
-                        let r_m = smoothstep(pct_outer + local_pixel_size, pct_outer - local_pixel_size, d_scale) *
+                        let w_m = smoothstep_r(0.003 + angular_pixel_size, 0.003 - angular_pixel_size, diff_p);
+                        let r_m = smoothstep_r(pct_outer + local_pixel_size, pct_outer - local_pixel_size, d_scale) *
                                   smoothstep(pct_inner - local_pixel_size, pct_inner + local_pixel_size, d_scale);
                         pct_tick_mask = max(pct_tick_mask, w_m * r_m);
                     }
@@ -628,9 +677,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 var pct_arc_mask = 0.0;
                 if (d_scale >= pct_arc_r - 0.006 && d_scale <= pct_arc_r + 0.006 && theta >= phi_min - local_pixel_size && theta <= phi_max + local_pixel_size) {
                     let pct_rad_diff = abs(d_scale - pct_arc_r);
-                    let pct_r_mask = smoothstep(0.004 + local_pixel_size, 0.004 - local_pixel_size, pct_rad_diff);
+                    let pct_r_mask = smoothstep_r(0.004 + local_pixel_size, 0.004 - local_pixel_size, pct_rad_diff);
                     let pct_end = smoothstep(phi_min - local_pixel_size, phi_min + local_pixel_size, theta) *
-                                  smoothstep(phi_max + local_pixel_size, phi_max - local_pixel_size, theta);
+                                  smoothstep_r(phi_max + local_pixel_size, phi_max - local_pixel_size, theta);
                     pct_arc_mask = pct_r_mask * pct_end;
                 }
                 
@@ -673,10 +722,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 let theta_p3 = phi_min + 1.0 * (phi_max - phi_min);
                 db_num_ink = max(db_num_ink, draw_arc_label_1(3u, q.xy, pivot, theta_p3, label_r, lbl_scale, lps));
                 
-                // Determine if the dB label is in the red zone
-                // We check which label we're closest to by checking if the pixel is in the red region
+                // Determine if the dB label is in the red zone (matches the red
+                // arc/ticks which start at 0.77)
                 let pixel_theta_norm = (theta - phi_min) / (phi_max - phi_min);
-                let db_num_is_red = pixel_theta_norm > 0.80;
+                let db_num_is_red = pixel_theta_norm > 0.77;
                 let db_num_color = select(vec3<f32>(0.03, 0.02, 0.01), vec3<f32>(0.75, 0.05, 0.02), db_num_is_red);
                 
                 // === Percentage number labels ===
@@ -704,7 +753,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 pct_num_ink = max(pct_num_ink, draw_arc_label_1(25u, q.xy, pivot, phi_max, pct_label_r - 0.04, pct_lbl_scale, lps));
                 
                 // === String Labels ===
-                let denon_ink = draw_v_string_5(array<u32, 5>(14u, 15u, 16u, 17u, 16u), q.xy, vec2(-0.62, -0.38), 0.048, 0.014, lps);
+                // Generic AUDIO marker (no brand names)
+                let brand_ink = draw_v_string_5(array<u32, 5>(23u, 19u, 14u, 21u, 17u), q.xy, vec2(-0.62, -0.38), 0.048, 0.014, lps);
                 let vu_ink = draw_v_string_2(array<u32, 2>(18u, 19u), q.xy, vec2(0.40, -0.38), 0.048, 0.014, lps);
                 let signal_ink = draw_v_string_6(array<u32, 6>(20u, 21u, 22u, 16u, 23u, 10u), q.xy, vec2(-0.25, -0.16), 0.038, 0.010, lps);
                 
@@ -722,7 +772,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 let plus_ink = draw_vector_char(13u, q.xy, vec2(0.72, 0.06), 0.045, lps);
                 
                 // Composite ink layers
-                let all_text_ink = max(denon_ink, max(vu_ink, max(signal_ink, max(label_ink, max(minus_ink, plus_ink)))));
+                let all_text_ink = max(brand_ink, max(vu_ink, max(signal_ink, max(label_ink, max(minus_ink, plus_ink)))));
                 let all_db_ink = db_num_ink;
                 let all_pct_ink = pct_num_ink;
                 
@@ -751,6 +801,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 let angle_val = get_needle_angle(meter_idx);
                 let phi = phi_min + angle_val * (phi_max - phi_min);
                 let needle_dir = vec2<f32>(sin(phi), cos(phi));
+
+                // Pivot cap: dark mounting ring with a metallic center jewel,
+                // visible around the base of the needle
+                let d_pivot = length(q.xy - pivot);
+                let pivot_ring = smoothstep_r(0.030, 0.024, d_pivot) - smoothstep_r(0.016, 0.010, d_pivot);
+                let pivot_jewel = smoothstep_r(0.012, 0.006, d_pivot);
+                faceplate = mix(faceplate, vec3<f32>(0.02, 0.015, 0.01), clamp(pivot_ring, 0.0, 1.0) * 0.9);
+                faceplate += vec3<f32>(0.9, 0.85, 0.7) * pivot_jewel * (0.3 + 0.7 * max(dot(N, L), 0.0));
                 
                 let pivot_shadow = pivot + vec2<f32>(0.025, -0.025);
                 let pa_s = q.xy - pivot_shadow;
@@ -785,7 +843,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 
                 // Metallic highlight along needle length
                 let cross_dist = abs(dot(pa_n, vec2<f32>(-needle_dir.y, needle_dir.x)));
-                let metallic_highlight = smoothstep(0.008, 0.002, cross_dist) * 0.15;
+                let metallic_highlight = smoothstep_r(0.008, 0.002, cross_dist) * 0.15;
                 
                 var needle_col = vec3<f32>(0.02, 0.02, 0.025);
                 if (is_tip) {
@@ -830,7 +888,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // --- Post Processing ---
     // Subtle vignette
     let vr = length(uv);
-    color *= smoothstep(2.0, 0.6, vr);
+    color *= smoothstep_r(2.0, 0.6, vr);
     
     // Very subtle scanlines
     let scanline = 0.98 + 0.02 * cos(in.uv.y * 2.0 * PI * 240.0);

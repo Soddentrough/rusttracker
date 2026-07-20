@@ -44,8 +44,10 @@ struct AudioUniforms {
     step_fraction: f32,
     steps_to_fill: u32,
     aspect_ratio: f32,
-    pad2: u32,
-    pad3: u32,
+    // Real frame delta in seconds (clamped) — for framerate-independent sims
+    frame_dt: f32,
+    // (push_count + step_fraction) * 0.5 — world Z locked to history rows
+    history_cam_z: f32,
 };
 
 // Narkowicz ACES fitted tonemapping curve.
@@ -60,6 +62,12 @@ fn hash21_crt(p: vec2<f32>) -> f32 {
     var p3 = fract(vec3<f32>(p.xyx) * 0.1031);
     p3 = p3 + dot(p3, p3.yzx + 33.33);
     return fract((p3.x + p3.y) * p3.z);
+}
+
+// Reversed-edge smoothstep: equivalent to smoothstep(hi, lo, x) with hi > lo,
+// which is indeterminate per the WGSL spec. Use this instead.
+fn smoothstep_r(hi: f32, lo: f32, x: f32) -> f32 {
+    return 1.0 - smoothstep(lo, hi, x);
 }
 
 fn crt_distort_uv(uv: vec2<f32>, distortion: f32) -> vec2<f32> {
@@ -98,7 +106,7 @@ fn apply_crt_effects(color: vec3<f32>, uv: vec2<f32>, clip_pos: vec2<f32>, time:
     // Vignette
     let crt_uv = uv * 2.0 - 1.0;
     let r = length(crt_uv);
-    let bezel = smoothstep(settings.vignette_scale, settings.vignette_softness, r);
+    let bezel = smoothstep_r(settings.vignette_scale, settings.vignette_softness, r);
     final_color *= bezel;
     
     // Flicker

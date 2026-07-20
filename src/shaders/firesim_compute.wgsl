@@ -10,7 +10,7 @@ struct FireParams {
     num_channels: u32,
     lfe_idx: u32,
     fft_channels: u32,
-    _pad1: u32,
+    dt: f32,
     display_order: array<vec4<u32>, 4>,
     channels: array<vec4<f32>, 8>,
 };
@@ -85,8 +85,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let bottom = params.height - 1u;
     let idx = y * w + x;
 
-    // Seed RNG from position + time
-    let seed = pcg_hash(x + y * 1337u + bitcast<u32>(params.time * 100.0));
+    // Rates below were tuned per-frame at 144fps; scale by real dt so the
+    // simulation evolves identically at any refresh rate.
+    let dt_scale = params.dt * 144.0;
 
     // === Bottom row: update coal bed with thermal inertia ===
     if (y == bottom) {
@@ -97,10 +98,11 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         if lfe_idx < n_ch {
             n_spatial_ch = n_ch - 1u;
         }
-        let channel_width = 1024.0 / f32(max(n_spatial_ch, 1u));
-        // Sharp fuel sources for distinct columns
-        var sigma_scale = 0.08;
-        if n_spatial_ch <= 2u { sigma_scale = 0.2; }
+        let channel_width = f32(params.width) / f32(max(n_spatial_ch, 1u));
+        // Fuel gaussians: wide enough that adjacent channel fires merge into a
+        // continuous fire line (narrow ones read as separated pillars with gaps)
+        var sigma_scale = 0.14;
+        if n_spatial_ch <= 2u { sigma_scale = 0.25; }
         
         var spatial_idx = 0u;
         for (var i = 0u; i < n_ch; i = i + 1u) {
@@ -137,7 +139,12 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         }
         if lfe_idx < n_ch {
             var lfe_bass = 0.0;
-            let offset = lfe_idx * 1024u;
+            // Guard the FFT channel index the same way spatial channels are guarded above
+            var lfe_ch = lfe_idx;
+            if (params.fft_channels < params.num_channels) {
+                lfe_ch = lfe_ch % max(params.fft_channels, 1u);
+            }
+            let offset = lfe_ch * 1024u;
             for (var b = 0u; b < 200u; b = b + 5u) {
                 let c = multi_spectrum[offset + b];
                 lfe_bass += clamp(length(c) * 100.0, 0.0, 100.0);
@@ -152,9 +159,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         let coal_target = min(params.bass * 0.05 + activity * 1.2, 1.0);
         let current = coal_bed[x];
         if (coal_target > current) {
-            coal_bed[x] = current + (coal_target - current) * 0.18;
+            coal_bed[x] = current + (coal_target - current) * min(0.18 * dt_scale, 1.0);
         } else {
-            coal_bed[x] = current + (coal_target - current) * 0.008;
+            coal_bed[x] = current + (coal_target - current) * min(0.008 * dt_scale, 1.0);
         }
         
         output_grid[idx] = min(coal_bed[x], 1.0);
@@ -167,14 +174,17 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         
         var out_val = coal_heat;
         
-        // Embers are directly spawned by extreme high-frequency transients (snares, hi-hats)
+        // Embers are spawned by high-frequency transients (snares, hi-hats) and
+        // mid-band bursts (kicks, toms) so they rise through the flame regularly
         let spark_bin = 800u + (x % 200u);
         var spark_noise = 0.0;
+        var mid_noise = 0.0;
         for (var i = 0u; i < params.num_channels; i = i + 1u) {
             spark_noise += length(multi_spectrum[i * 1024u + spark_bin]);
+            mid_noise += length(multi_spectrum[i * 1024u + 300u + (x % 150u)]);
         }
-        
-        if (coal_heat > 0.4 && spark_noise * 150.0 > 1.0) {
+
+        if (coal_heat > 0.3 && (spark_noise * 150.0 > 0.6 || mid_noise * 90.0 > 1.6)) {
             out_val = 6.0; // Crisp ember packet
         }
         
@@ -193,7 +203,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let smoke = max(-current_val, 0.0);
     
     // 1. Thermal Buoyancy: Hot air and warm smoke rise.
-    var buoyancy = 0.5; // Stronger base updraft
+    var buoyancy = 0.7; // Stronger base updraft
     buoyancy += heat * 6.5; // Roaring vertical speed
     buoyancy += smoke * 1.5;
     let buoyancy_vel = vec2<f32>(0.0, -1.0) * buoyancy;
@@ -223,29 +233,33 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let jitter_seed = u32(x + y * params.width) + bitcast<u32>(params.time * 100.0);
     let jitter = (f32(pcg_hash(jitter_seed) % 100u) / 100.0) - 0.5; // -0.5 to 0.5
     
-    let dt = 1.0;
+    let dt = dt_scale;
     let src_p = p1 - vel * dt + vec2<f32>(0.0, jitter * 2.0);
-    
+
     var new_val = sample_grid(src_p.x, src_p.y);
-    
+
     if (new_val > 0.0) {
-        // Fire cooling (Constant to prevent spatial standing-wave interference)
-        let base_cooling = 0.02; 
-        
+        // Fire cooling (Constant to prevent spatial standing-wave interference).
+        // 0.016 (down from 0.02) lets tongues stretch taller before dying.
+        let base_cooling = 0.016;
+
         var cooling_rate = base_cooling * params.cooling_factor;
         // Embers (val > 1.0) cool logarithmically so they survive the journey upwards
-        if (new_val > 1.0) { cooling_rate = new_val * 0.02; } 
-        
+        // (slower than fire cooling: real embers stay lit while they rise)
+        if (new_val > 1.0) { cooling_rate = new_val * 0.012; }
+        cooling_rate *= dt_scale;
+
         new_val -= cooling_rate;
         
         // COMBUSTION: When fire runs out of heat (crosses 0), it becomes smoke.
         if (new_val <= 0.0) {
-            // A gentle puff of smoke when the flame dies (prevents screen-wide smoke explosion)
-            new_val = -0.15; 
+            // A puff of smoke when the flame dies (enough to read as sooty
+            // smoke above the flame tops, not a screen-wide haze)
+            new_val = -0.28;
         }
     } else if (new_val < 0.0) {
         // Smoke dissipating slowly as it mixes with cold air
-        new_val += 0.005; 
+        new_val += 0.005 * dt_scale;
         if (new_val > 0.0) { new_val = 0.0; }
     }
     

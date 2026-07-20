@@ -31,15 +31,20 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         // Compensate for natural pink noise (1/f) dropoff in music
         // by applying a +3dB/octave tilt (sqrt of frequency ratio)
         let eq_boost = sqrt(freq / 20.0);
-        
-        // Use magnitude to lock the phase, preventing horizontal scrolling
+
+        // Synthetic fixed phase (magnitude-only resynthesis; the true spectral
+        // phase is discarded) — keeps the waveform from scrolling horizontally
         val += (mag * eq_boost) * cos(phase);
     }
-    
+
     // Normalize and scale correctly to keep amplitude around 1.0
     // gpu_fft outputs are scaled by sqrt(N). We need to divide by sqrt(N) = 90.5
     // and apply an aesthetic multiplier.
     val = (val / 90.5) * 1.5;
+
+    // Soft-knee: the EQ boost reaches ~33x at the top bins, so HF-heavy material
+    // could otherwise exceed +/-1 and clip downstream in the consumer shader
+    val = tanh(val);
     
     // Store in unused channels 16..31 of gpu_spectrum
     // Each channel holds 1024 vec2s (2048 floats).

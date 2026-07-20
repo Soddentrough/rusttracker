@@ -30,6 +30,8 @@ fn bellrand(seed: f32, range: f32) -> f32 {
 }
 
 // --- Procedural 3x5 Bitmap Font Table ---
+// Authentic Matrix rain character set: half-width katakana + digits.
+// (At 3x5 resolution ﾖ/3 and ﾛ/0 share shapes, as they do in the film's font.)
 
 fn matrix_glyph_bitmap(ch: u32) -> u32 {
     switch ch {
@@ -43,27 +45,51 @@ fn matrix_glyph_bitmap(ch: u32) -> u32 {
         case 7u  { return 29330u; } // 7
         case 8u  { return 31727u; } // 8
         case 9u  { return 31695u; } // 9
-        case 10u { return 31725u; } // A
-        case 11u { return 27566u; } // B
-        case 12u { return 31015u; } // C
-        case 13u { return 27502u; } // D
-        case 14u { return 31207u; } // E
-        case 15u { return 31204u; } // F
-        case 16u { return 11962u; } // #
-        case 17u { return 448u; }   // -
-        case 18u { return 9682u; }  // +
-        case 19u { return 21845u; } // *
-        case 20u { return 29314u; } // ?
-        case 21u { return 3640u; }  // =
-        case 22u { return 1040u; }  // :
-        case 23u { return 9362u; }  // |
-        case 24u { return 5268u; }  // /
-        case 25u { return 17553u; } // \
-        case 26u { return 26918u; } // [
-        case 27u { return 12875u; } // ]
-        case 28u { return 5393u; }  // <
-        case 29u { return 17492u; } // >
-        case 30u { return 2u; }     // .
+        case 10u { return 11860u; } // ｱ
+        case 11u { return 17557u; } // ｲ
+        case 12u { return 12110u; } // ｳ
+        case 13u { return 29847u; } // ｴ
+        case 14u { return 11988u; } // ｵ
+        case 15u { return 7764u; }  // ｶ
+        case 16u { return 11962u; } // ｷ
+        case 17u { return 17609u; } // ｸ
+        case 18u { return 17866u; } // ｹ
+        case 19u { return 29263u; } // ｺ
+        case 20u { return 11927u; } // ｻ
+        case 21u { return 20558u; } // ｼ
+        case 22u { return 29333u; } // ｽ
+        case 23u { return 12073u; } // ｾ
+        case 24u { return 20564u; } // ｿ
+        case 25u { return 10954u; } // ﾀ
+        case 26u { return 30162u; } // ﾁ
+        case 27u { return 21518u; } // ﾂ
+        case 28u { return 29140u; } // ﾃ
+        case 29u { return 18852u; } // ﾄ
+        case 30u { return 11924u; } // ﾅ
+        case 31u { return 28679u; } // ﾆ
+        case 32u { return 21973u; } // ﾇ
+        case 33u { return 11946u; } // ﾈ
+        case 34u { return 4756u; }  // ﾉ
+        case 35u { return 23040u; } // ﾊ
+        case 36u { return 19311u; } // ﾋ
+        case 37u { return 29332u; } // ﾌ
+        case 38u { return 2560u; }  // ﾍ
+        case 39u { return 30061u; } // ﾎ
+        case 40u { return 29397u; } // ﾏ
+        case 41u { return 24966u; } // ﾐ
+        case 42u { return 9464u; }  // ﾑ
+        case 43u { return 23188u; } // ﾒ
+        case 44u { return 30163u; } // ﾓ
+        case 45u { return 20114u; } // ﾔ
+        case 46u { return 13760u; } // ﾕ
+        case 47u { return 29647u; } // ﾖ
+        case 48u { return 29134u; } // ﾗ
+        case 49u { return 23401u; } // ﾘ
+        case 50u { return 23403u; } // ﾙ
+        case 51u { return 18797u; } // ﾚ
+        case 52u { return 31599u; } // ﾛ
+        case 53u { return 31087u; } // ﾜ
+        case 54u { return 16468u; } // ﾝ
         default  { return 0u; }     // space
     }
 }
@@ -170,8 +196,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let col_active = hash11(col_seed + 0.5);
         if col_active > layer_density { continue; }
 
-        // Associate column with a tracker channel
-        let ch_idx = u32(abs(col)) % audio.num_channels;
+        // Associate column with a tracker channel (guard: no channels when no file loaded)
+        let ch_idx = u32(abs(col)) % max(audio.num_channels, 1u);
         let ch_vu = get_channel_vu(ch_idx);
 
         // Falling speed: must be strictly constant to prevent vertical jitter
@@ -213,7 +239,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             // Leading spinner glyph cycles rapidly, glitching on treble transients
             let spin_time = time * 15.0 + treble * 8.0;
             let glyph_hash = hash31(vec3<f32>(col, f32(layer), floor(spin_time)));
-            glyph_idx = u32(glyph_hash * 31.0);
+            glyph_idx = u32(glyph_hash * 55.0);
         } else {
             // Mostly static, but occasional slow flips
             let spin_chance = hash21(vec2<f32>(col * 17.3 + row * 31.7, f32(layer)));
@@ -221,11 +247,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 let spin_rate = 2.0 + hash21(vec2<f32>(col, row + f32(layer) * 100.0)) * 4.0;
                 let spin_time = time * spin_rate;
                 let glyph_hash = hash31(vec3<f32>(col, row, floor(spin_time) + f32(layer)));
-                glyph_idx = u32(glyph_hash * 31.0);
+                glyph_idx = u32(glyph_hash * 55.0);
             } else {
                 let cycle = floor((ch_phase * strip_speed + strip_offset) / cycle_length);
                 let glyph_hash = hash31(vec3<f32>(col, row, cycle + f32(layer) * 7.0));
-                glyph_idx = u32(glyph_hash * 31.0);
+                glyph_idx = u32(glyph_hash * 55.0);
             }
         }
 

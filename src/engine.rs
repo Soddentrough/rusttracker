@@ -97,7 +97,8 @@ pub struct AudioUniforms {
     pub step_fraction: f32,
     pub steps_to_fill: u32,
     pub aspect_ratio: f32,
-    pub padding: [u32; 2],
+    pub frame_dt: f32,
+    pub history_cam_z: f32,
 }
 
 
@@ -116,22 +117,9 @@ pub struct FireParams {
     pub num_channels: u32,
     pub lfe_idx: u32,
     pub fft_channels: u32,
-    pub _pad1: u32,
+    pub dt: f32,
     pub display_order: [u32; 16],
     pub channels: [[f32; 4]; 8],
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
-pub struct FFTParams {
-    pub num_channels: u32,
-    pub sample_rate: f32,
-    pub min_freq: f32,
-    pub max_freq: f32,
-    pub num_samples: u32,
-    pub _pad0: u32,
-    pub _pad1: u32,
-    pub _pad2: u32,
 }
 
 #[repr(C)]
@@ -255,14 +243,11 @@ pub struct VulkanEngine {
     #[allow(dead_code)]
     pub start_time: std::time::Instant,
 
-    // GPU FFT
-    _fft_compute_pipeline: wgpu::ComputePipeline,
-    _fft_bind_group: wgpu::BindGroup,
+    // GPU FFT was removed (FFT is computed on the CPU); the dummy timestamp
+    // pass in render() keeps the query-slot layout intact.
     resynth_compute_pipeline: wgpu::ComputePipeline,
     resynth_bind_group: wgpu::BindGroup,
-    _raw_audio_buffer: wgpu::Buffer,
     _gpu_spectrum_buffer: wgpu::Buffer,
-    _fft_params_buffer: wgpu::Buffer,
     
     // Neon Smoke Cache
     smoke_compute_pipeline: wgpu::ComputePipeline,
@@ -273,7 +258,6 @@ pub struct VulkanEngine {
     depth_texture_view: wgpu::TextureView,
     
     // Pre-allocated buffers to avoid per-frame heap allocations
-    _flat_raw_audio: Vec<f32>,
     waveform_history_flat: Vec<f32>,
     
     // Video
@@ -302,6 +286,9 @@ pub struct VulkanEngine {
     vu_needle_angles: Vec<f32>,
     vu_needle_velocities: Vec<f32>,
     channel_phases: [f32; 32],
+    // Change detection for waveform history uploads (skip 1.2MB write when unchanged)
+    last_uploaded_push_count: u64,
+    last_uploaded_vis_width: u32,
 }
 
 pub(crate) fn generate_lamp_mesh() -> (Vec<Vertex>, Vec<u32>) {
@@ -1785,84 +1772,7 @@ impl VulkanEngine {
             }));
         }
 
-        // --- GPU FFT INIT ---
-        let raw_audio_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("GPU FFT Raw Audio Buffer"),
-            size: 32 * 65536 * 4, // Increased capacity for high sample rates (up to ~350kHz at 185ms)
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-
-        let fft_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
-            label: Some("GPU FFT Params Buffer"),
-            size: std::mem::size_of::<FFTParams>() as u64,
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-            mapped_at_creation: false,
-        });
-
-        let fft_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
-                    },
-                    count: None,
-                },
-            ],
-            label: Some("fft_bind_group_layout"),
-        });
-
-        let fft_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("fft_bind_group"),
-            layout: &fft_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: raw_audio_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: gpu_spectrum_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: fft_params_buffer.as_entire_binding() },
-            ],
-        });
-
-        let fft_compute_shader = device.create_shader_module(wgpu::include_wgsl!("shaders/gpu_fft.wgsl"));
-        let fft_compute_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("fft_compute_layout"),
-            bind_group_layouts: &[Some(&fft_bind_group_layout)],
-            immediate_size: 0,
-        });
-
-        let fft_compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("FFT Compute Pipeline"),
-            layout: Some(&fft_compute_pipeline_layout),
-            module: &fft_compute_shader,
-            entry_point: Some("main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: pipeline_cache_ref,
-        });
-        
+        // --- Resynth compute (consumes the CPU-filled GPU spectrum buffer) ---
         let resynth_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("resynth_bind_group_layout"),
             entries: &[
@@ -2114,13 +2024,9 @@ impl VulkanEngine {
             biolum_render_pipeline_layout,
 
             start_time: std::time::Instant::now(),
-            _fft_compute_pipeline: fft_compute_pipeline,
-            _fft_bind_group: fft_bind_group,
             resynth_compute_pipeline,
             resynth_bind_group,
-            _raw_audio_buffer: raw_audio_buffer,
             _gpu_spectrum_buffer: gpu_spectrum_buffer,
-            _fft_params_buffer: fft_params_buffer,
             
             smoke_compute_pipeline,
             smoke_compute_bind_group,
@@ -2129,7 +2035,6 @@ impl VulkanEngine {
             
             depth_texture_view,
             
-            _flat_raw_audio: vec![0.0f32; 32 * 65536],
             waveform_history_flat: vec![0.0; 2048 * 144],
             video_bind_group_layout,
             video_pipeline,
@@ -2155,6 +2060,8 @@ impl VulkanEngine {
             vu_needle_angles: vec![0.0; 32],
             vu_needle_velocities: vec![0.0; 32],
             channel_phases: [0.0; 32],
+            last_uploaded_push_count: u64::MAX,
+            last_uploaded_vis_width: 0,
         }
     }
 
@@ -2234,9 +2141,17 @@ impl VulkanEngine {
         // Smoothly interpolate within the current frame push window
         let step_fraction = (self.time_since_last_push / push_interval).clamp(0.0, 1.0) as f32;
 
-        // Re-construct smooth play time monotonic timeline
-        self.play_time = (self.last_history_push_count as f64 + step_fraction as f64) * 0.02;
-        self.last_history_cam_z = self.last_history_push_count as f64 * 0.5;
+        // Animation time: advances in real time, scaled by 2.88 to preserve the
+        // look that was tuned at 144fps (144 pushes/s * 0.02s = 2.88 anim-seconds
+        // per real second). Render-framerate independent. Uses the EMA-smoothed
+        // dt to avoid CPU scheduling judder. Only advances while playing.
+        if !state.is_paused && state.file_loaded && !state.track_ended {
+            self.play_time += self.smooth_dt * 2.88;
+        }
+        // World-Z camera position locked to history rows (0.5 units/row), used by
+        // visualizers that scroll with the waveform/spectrum history ring buffer.
+        self.last_history_cam_z = (self.last_history_push_count as f64 + step_fraction as f64) * 0.5;
+        let frame_dt = (dt as f32).clamp(0.0005, 0.1);
         let mut uniforms = AudioUniforms {
             spectrum: [0.0; 1024],
             fire_heat: [0.0; 1024],
@@ -2262,7 +2177,8 @@ impl VulkanEngine {
             step_fraction,
             steps_to_fill: steps,
             aspect_ratio: self.size.width as f32 / self.size.height as f32,
-            padding: [0; 2],
+            frame_dt,
+            history_cam_z: self.last_history_cam_z as f32,
         };
 
         uniforms.spectrum.copy_from_slice(&state.spectrum_data);
@@ -2373,9 +2289,15 @@ impl VulkanEngine {
 
         self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
-        // Only upload waveform history when the active visualizer requires it
+        // Only upload waveform history when the active visualizer requires it,
+        // and only when new rows were pushed or the width changed (saves a
+        // 1.2MB buffer write + CPU flatten/smooth pass every frame while paused)
         let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
-        if vis_def.requires_history {
+        let history_dirty = state.waveform_history_push_count != self.last_uploaded_push_count
+            || vis_width != self.last_uploaded_vis_width;
+        if vis_def.requires_history && history_dirty {
+            self.last_uploaded_push_count = state.waveform_history_push_count;
+            self.last_uploaded_vis_width = vis_width;
             // Upload up to 144 most recent frames
             let hist_len = state.waveform_history.len();
             let start = hist_len.saturating_sub(144);
@@ -2428,7 +2350,7 @@ impl VulkanEngine {
                 num_channels: ch_len as u32,
                 lfe_idx: lfe_idx as u32,
                 fft_channels: state.raw_audio_channels.len() as u32,
-                _pad1: 0,
+                dt: frame_dt,
                 display_order: [0; 16],
                 channels: [[0.0; 4]; 8],
             };
@@ -2443,7 +2365,9 @@ impl VulkanEngine {
             self.queue.write_buffer(&self.fire_params_buffer, 0, bytemuck::cast_slice(&[fire_params]));
         }
         
-        if state.gpu_fft {
+        // GPU spectrum is consumed only by the firesim compute (id 6) and the
+        // resynth compute (requires_resynth, id 8) — skip the 256KB upload otherwise
+        if state.gpu_fft && (vis_def.id == 6 || vis_def.requires_resynth) {
             if !state.gpu_spectrum_data.is_empty() {
                 self.queue.write_buffer(&self._gpu_spectrum_buffer, 0, bytemuck::cast_slice(&state.gpu_spectrum_data));
             }
@@ -2535,32 +2459,59 @@ impl VulkanEngine {
                 }
                 
                 if let Some(vs) = &self.video_state {
+                    // wgpu requires bytes_per_row to be a multiple of 256; repack
+                    // into a staging buffer with padded rows when the decoder
+                    // stride doesn't comply.
+                    let pack_plane = |plane: &Vec<u8>, stride: usize, width_bytes: usize, rows: usize| -> (Vec<u8>, usize, bool) {
+                        if stride % 256 == 0 {
+                            return (Vec::new(), stride, false);
+                        }
+                        let aligned = (width_bytes + 255) & !255;
+                        let mut packed = vec![0u8; aligned * rows];
+                        for r in 0..rows {
+                            packed[r * aligned..r * aligned + width_bytes]
+                                .copy_from_slice(&plane[r * stride..r * stride + width_bytes]);
+                        }
+                        (packed, aligned, true)
+                    };
+                    let bytes_per_px = if frame.bit_depth > 8 { 2 } else { 1 };
+                    let y_w = frame.width as usize * bytes_per_px;
+                    let c_w = (frame.width / 2) as usize * bytes_per_px;
+                    let (y_packed, y_stride, y_repack) = pack_plane(&frame.y_plane, frame.y_stride, y_w, frame.height as usize);
+                    let (u_packed, u_stride, u_repack) = pack_plane(&frame.u_plane, frame.u_stride, c_w, (frame.height / 2) as usize);
+                    let (v_packed, v_stride, v_repack) = pack_plane(&frame.v_plane, frame.v_stride, c_w, (frame.height / 2) as usize);
+                    let y_data: &[u8] = if y_repack { &y_packed } else { &frame.y_plane };
+                    let u_data: &[u8] = if u_repack { &u_packed } else { &frame.u_plane };
+                    let v_data: &[u8] = if v_repack { &v_packed } else { &frame.v_plane };
+                    let y_stride = y_stride as u32;
+                    let u_stride = u_stride as u32;
+                    let v_stride = v_stride as u32;
                     self.queue.write_texture(
                         wgpu::TexelCopyTextureInfo { texture: &vs.y_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                        &frame.y_plane,
-                        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(frame.y_stride as u32), rows_per_image: Some(frame.height) },
+                        y_data,
+                        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(y_stride), rows_per_image: Some(frame.height) },
                         wgpu::Extent3d { width: frame.width, height: frame.height, depth_or_array_layers: 1 }
                     );
                     self.queue.write_texture(
                         wgpu::TexelCopyTextureInfo { texture: &vs.u_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                        &frame.u_plane,
-                        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(frame.u_stride as u32), rows_per_image: Some(frame.height / 2) },
+                        u_data,
+                        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(u_stride), rows_per_image: Some(frame.height / 2) },
                         wgpu::Extent3d { width: frame.width / 2, height: frame.height / 2, depth_or_array_layers: 1 }
                     );
                     self.queue.write_texture(
                         wgpu::TexelCopyTextureInfo { texture: &vs.v_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                        &frame.v_plane,
-                        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(frame.v_stride as u32), rows_per_image: Some(frame.height / 2) },
+                        v_data,
+                        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(v_stride), rows_per_image: Some(frame.height / 2) },
                         wgpu::Extent3d { width: frame.width / 2, height: frame.height / 2, depth_or_array_layers: 1 }
                     );
-                    
+
                     let params = VideoParams {
                         color_space: frame.color_space,
                         color_range: frame.color_range,
                         bit_depth: frame.bit_depth as u32,
                         color_trc: frame.color_trc,
-                        viewport_width: 1920.0,
-                        viewport_height: 1080.0,
+                        viewport_width: self.config.width as f32,
+                        viewport_height: self.config.height as f32,
                         video_width: frame.width as f32,
                         video_height: frame.height as f32,
                     };

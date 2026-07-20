@@ -62,7 +62,7 @@ fn lightning_bolt(uv: vec2<f32>, seed: f32, intensity: f32) -> f32 {
         let d = length(pa - ba * h);
 
         // Thin bright core + wider glow
-        bolt += smoothstep(0.012, 0.0, d) * 2.0;
+        bolt += smoothstep_r(0.012, 0.0, d) * 2.0;
         bolt += 0.003 / (d + 0.005);
     }
 
@@ -97,7 +97,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // Subtle cloud-like variation
     let cloud_noise = hash12(p * 3.0 + vec2<f32>(audio.smooth_time * 0.02, 0.0));
-    let cloud_band = smoothstep(0.3, 0.7, sky_t) * smoothstep(1.0, 0.7, sky_t);
+    let cloud_band = smoothstep(0.3, 0.7, sky_t) * smoothstep_r(1.0, 0.7, sky_t);
     color += vec3<f32>(0.01, 0.012, 0.02) * cloud_noise * cloud_band;
 
     // --- Lightning flash illumination ---
@@ -169,12 +169,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Streak shape: narrow horizontal, elongated vertical
         let dx_drop = abs(cell_uv.x - drop_x);
         let streak_width = 0.02 + 0.01 * (1.0 - f_layer * 0.1);
-        let streak = smoothstep(streak_width, 0.0, dx_drop);
+        let streak = smoothstep_r(streak_width, 0.0, dx_drop);
 
         // Teardrop shape: sharp bright head at the bottom, fading trail extending upwards
         let drop_length = 0.3 + rnd.x * 0.15;
         let head = smoothstep(-drop_length, -drop_length + 0.05, cell_uv.y);
-        let tail = smoothstep(drop_length, -drop_length, cell_uv.y);
+        let tail = smoothstep_r(drop_length, -drop_length, cell_uv.y);
         let vert = head * tail;
 
         let drop = streak * vert * visible * opacity;

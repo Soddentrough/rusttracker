@@ -256,14 +256,14 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
             if (i == 2u) { R = 1.25; }
             
             // Neon bezel ring
-            let ring = smoothstep(0.015, 0.0, abs(d - R));
+            let ring = smoothstep_r(0.015, 0.0, abs(d - R));
             let ring_glow = exp(-abs(d - R) * 16.0) * 0.35;
             bezel_acc = max(bezel_acc, ring + ring_glow);
             
             // Crosshair tick marks
             let tick_w = 0.012;
-            let is_on_axis_x = smoothstep(tick_w, 0.0, abs(in.world_pos.x - x_center));
-            let is_on_axis_y = smoothstep(tick_w, 0.0, abs(in.world_pos.y - 1.5));
+            let is_on_axis_x = smoothstep_r(tick_w, 0.0, abs(in.world_pos.x - x_center));
+            let is_on_axis_y = smoothstep_r(tick_w, 0.0, abs(in.world_pos.y - 1.5));
             let ticks = (is_on_axis_x + is_on_axis_y) * step(d, R) * step(R - 0.2, d) * (0.35 + 0.65 * abs(sin(d * 40.0)));
             ticks_acc = max(ticks_acc, ticks);
         }
@@ -272,7 +272,7 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
         
         // Combined colors with screen vignette
         var color = grid_color + bezel_color;
-        let vignette = smoothstep(11.0, 6.0, length(in.world_pos.xy - vec2<f32>(0.0, 1.5)));
+        let vignette = smoothstep_r(11.0, 6.0, length(in.world_pos.xy - vec2<f32>(0.0, 1.5)));
         color += vec3<f32>(0.002, 0.008, 0.006) * vignette;
         
         return vec4<f32>(color, 1.0);
@@ -308,11 +308,11 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
         let laser_core = vec3<f32>(1.0) * pow(core_align, 12.0) * 1.8;
         
         // Head scan spark
-        let head_spark = smoothstep(0.012, 0.0, dist_from_head) * 3.0;
+        let head_spark = smoothstep_r(0.012, 0.0, dist_from_head) * 3.0;
         let spark_color = (laser_color + vec3<f32>(1.0)) * 0.5 * head_spark;
         
         // Parallel laser filaments wrapping the tube
-        let filaments = smoothstep(0.12, 0.0, abs(sin(in.uv.y * 3.14159 * 4.0) - 0.5));
+        let filaments = smoothstep_r(0.12, 0.0, abs(sin(in.uv.y * 3.14159 * 4.0) - 0.5));
         let filament_intensity = mix(0.45, 1.0, filaments);
         
         var color = (laser_glow * filament_intensity + laser_core) * scan_intensity + spark_color;

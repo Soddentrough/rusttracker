@@ -3,11 +3,11 @@
 @group(0) @binding(0)
 var<uniform> audio: AudioUniforms;
 
+// Packed to exactly 32 bytes to match the host allocation (100_000 * 32B).
+// pos.w = mass, vel.w = EMA-smoothed spectrum value (filters transients for standing waves)
 struct Particle {
-    pos: vec3<f32>,
-    vel: vec3<f32>,
-    mass: f32,
-    smooth_spec: f32,  // EMA-smoothed spectrum value — filters transients for standing waves
+    pos: vec4<f32>,
+    vel: vec4<f32>,
 }
 
 @group(0) @binding(1)
@@ -30,21 +30,19 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if (idx >= 100000u) { return; }
 
     var p = particles[idx];
-    
+
     // Initialize if pos is exactly 0
-    if (length(p.pos) < 0.001 && length(p.vel) < 0.001) {
+    if (length(p.pos.xyz) < 0.001 && length(p.vel.xyz) < 0.001) {
         let rng1 = fract(sin(f32(idx) * 12.9898) * 43758.5453);
         let rng2 = fract(sin(f32(idx) * 78.233) * 43758.5453);
         let angle = rng1 * 6.28318;
         let r = sqrt(rng2) * 5.0;
-        p.pos = vec3<f32>(cos(angle) * r, 0.1, sin(angle) * r);
-        p.vel = vec3<f32>(0.0);
-        p.mass = 1.0;
-        p.smooth_spec = 0.0;
+        p.pos = vec4<f32>(cos(angle) * r, 0.1, sin(angle) * r, 1.0);
+        p.vel = vec4<f32>(0.0);
     }
 
-    // Physics
-    let dt = 0.016;
+    // Physics — framerate-independent timestep (real frame dt, clamped)
+    let dt = clamp(audio.frame_dt, 0.001, 0.033);
     var force = vec3<f32>(0.0, -9.8, 0.0); // Gravity
 
     // Frequency-driven magnetic field
@@ -52,20 +50,22 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let abs_angle = abs(angle);
     let spec_idx = min(u32((abs_angle / 3.14159) * 127.0), 127u);
     let raw_spec = clamp(audio.spectrum[spec_idx / 4u][spec_idx % 4u], 0.0, 1.0);
-    
+
     // Temporal EMA smoothing — standing wave filter
     // Slow attack (0.03): transient hits are ignored, only sustained frequencies build peaks
     // Moderate decay (0.08): fluid relaxes gracefully when a frequency stops
-    let rate = select(0.08, 0.03, raw_spec > p.smooth_spec);
-    p.smooth_spec = mix(p.smooth_spec, raw_spec, rate);
-    let spec_val = p.smooth_spec;
+    // Rates are per-16ms-step; converted to the real dt so behavior is fps-independent
+    let dt_scale = dt / 0.016;
+    let rate = 1.0 - pow(1.0 - select(0.08, 0.03, raw_spec > p.vel.w), dt_scale);
+    p.vel.w = mix(p.vel.w, raw_spec, rate);
+    let spec_val = p.vel.w;
     
     // Dynamic magnet position based on smoothed frequency
     let mag_r = 0.5 + spec_val * 4.0;
     let mag_h = -0.5 + spec_val * 3.0;
     let mag_pos = vec3<f32>(cos(angle) * mag_r, mag_h, sin(angle) * mag_r);
     
-    let dir = mag_pos - p.pos;
+    let dir = mag_pos - p.pos.xyz;
     let dist_sq = dot(dir, dir);
     let mag_force = (spec_val * 200.0 + 20.0) / (dist_sq + 0.5);
     force += normalize(dir) * mag_force;
@@ -80,7 +80,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     force += turbulence * (3.0 + spec_val * 8.0);
     
     // Central electromagnet to keep the fluid pooled together
-    let center_dir = vec3<f32>(0.0, -1.0, 0.0) - p.pos;
+    let center_dir = vec3<f32>(0.0, -1.0, 0.0) - p.pos.xyz;
     force += normalize(center_dir) * (60.0 / (dot(center_dir, center_dir) + 1.0));
 
     // Floor collision
@@ -91,12 +91,12 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
 
     // Spring back to origin slightly to keep them in bounds
-    force -= p.pos * 5.0;
+    force -= p.pos.xyz * 5.0;
 
-    // Integration with viscous damping (0.91 = thick fluid, resists rapid motion)
-    p.vel += force * dt;
-    p.vel *= 0.91;
-    p.pos += p.vel * dt;
+    // Integration with viscous damping (0.91 per 16ms step = thick fluid),
+    // converted to the real dt so damping strength is fps-independent
+    p.vel = vec4<f32>((p.vel.xyz + force * dt) * pow(0.91, dt_scale), p.vel.w);
+    p.pos = vec4<f32>(p.pos.xyz + p.vel.xyz * dt, p.pos.w);
 
     particles[idx] = p;
 

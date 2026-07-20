@@ -265,12 +265,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             
             let dx_drop = abs(cell_uv.x - drop_x);
             let streak_width = 0.02 + f32(i) * 0.003;
-            let streak = smoothstep(streak_width, 0.0, dx_drop);
+            let streak = smoothstep_r(streak_width, 0.0, dx_drop);
             
             let drop_line = cell_uv.y + cell_uv.x * 0.35;
             let drop_length = 0.25 + rnd.x * 0.24 + f32(i) * 0.08;
             let head = smoothstep(-0.05, 0.0, drop_line);
-            let tail = smoothstep(drop_length, -0.08, drop_line);
+            let tail = smoothstep_r(drop_length, -0.08, drop_line);
             let vert = head * tail;
             
             let drop = streak * vert * visible;

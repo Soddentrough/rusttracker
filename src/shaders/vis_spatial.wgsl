@@ -93,8 +93,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
         // Rectangular tile grid with warped coordinates
         let cell_size = 0.4;
-        let grid_x = smoothstep(0.015, 0.0, abs(fract(warped_xy.x / cell_size + 0.5) - 0.5) * cell_size);
-        let grid_y = smoothstep(0.015, 0.0, abs(fract(warped_xy.y / cell_size + 0.5) - 0.5) * cell_size);
+        let grid_x = smoothstep_r(0.015, 0.0, abs(fract(warped_xy.x / cell_size + 0.5) - 0.5) * cell_size);
+        let grid_y = smoothstep_r(0.015, 0.0, abs(fract(warped_xy.y / cell_size + 0.5) - 0.5) * cell_size);
         let grid_lines = max(grid_x, grid_y) * 0.4;
 
         // Extended perspective distance fade for wider view
@@ -110,13 +110,13 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
         // LFE expanding pressure rings
         let ring_phase = audio.time * 3.0;
-        let ring1 = smoothstep(0.06, 0.0, abs(dome_r - fract(ring_phase) * 3.5)) * lfe_vu;
-        let ring2 = smoothstep(0.06, 0.0, abs(dome_r - fract(ring_phase + 0.5) * 3.5)) * lfe_vu;
+        let ring1 = smoothstep_r(0.06, 0.0, abs(dome_r - fract(ring_phase) * 3.5)) * lfe_vu;
+        let ring2 = smoothstep_r(0.06, 0.0, abs(dome_r - fract(ring_phase + 0.5) * 3.5)) * lfe_vu;
         color = color + lfe_color * (ring1 + ring2) * 0.2 * grid_mask;
 
         // Ambient bass glow
         let bass = clamp(audio.spectrum[1].x * 2.0 + audio.spectrum[2].x, 0.0, 1.0);
-        color = color + vec3<f32>(0.05, 0.02, 0.08) * bass * smoothstep(3.5, 0.0, dome_r);
+        color = color + vec3<f32>(0.05, 0.02, 0.08) * bass * smoothstep_r(3.5, 0.0, dome_r);
     }
 
     // Dolby Atmos 7.1.4 speaker layout (SMPTE channel order)
@@ -185,7 +185,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
 
         // Depth cue
-        let depth_fade = smoothstep(6.0, 1.5, depth);
+        let depth_fade = smoothstep_r(6.0, 1.5, depth);
         let ch_color = base_color * (0.3 + 0.7 * depth_fade);
 
         // Size = audio importance. Front L/C/R are the primary sound source and must
@@ -204,7 +204,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let dist_room = length(floor_xy - room_xy);
             let ripple = sin(dist_room * 20.0 - time_offset) * 0.5 + 0.5;
             let ripple_radius = 0.8 + (size_factor - 1.0) * 0.5;
-            let ripple_mask = smoothstep(ripple_radius, 0.0, dist_room) * vu * 0.4;
+            let ripple_mask = smoothstep_r(ripple_radius, 0.0, dist_room) * vu * 0.4;
             let grid_fade = 1.0 - smoothstep(2.0, 7.0, length(floor_xy));
             color = color + ch_color * ripple * ripple_mask * grid_fade;
         }
@@ -224,7 +224,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
         // --- Speaker Orb ---
         let dist = length(p - proj_speaker_2d);
-        let noise_phase = hash_f(f32(i) * 17.3 + audio.time * 3.0) * 0.004 * vu * size_factor;
+        // Wrap time so the sin-based hash keeps f32 precision in long sessions
+        let noise_phase = hash_f(f32(i) * 17.3 + (audio.time % 341.0) * 3.0) * 0.004 * vu * size_factor;
         let organic_dist = dist + noise_phase;
 
         let dot_size = (0.03 + vu * 0.04) * scale * size_factor;
@@ -253,8 +254,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
         // --- Debug label below speaker ---
         // Labels: L, R, C, LFE, Ls, Rs, Lrs, Rrs, Ltf, Rtf, Ltr, Rtr
-        // Encoded as arrays of glyph indices (10=L,11=R,12=C,13=S,14=F,15=E,16=T,17=space)
-        var lbl = array<u32, 3>(17u, 17u, 17u); // default: spaces
+        // Encoded as arrays of glyph indices (10=L,11=R,12=C,13=S,14=F,15=E,16=T,19=space;
+        // NOTE: 17 is 'M' in _glyph_font.wgsl, not space — space is any index >= 19)
+        var lbl = array<u32, 3>(19u, 19u, 19u); // default: spaces
         var lbl_len = 1u;
         switch i {
             case 0u  { lbl[0]=10u; }                                // L

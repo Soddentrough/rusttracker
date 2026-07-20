@@ -74,19 +74,24 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let amber_hi = vec3<f32>(1.0, 0.55, 0.08);
 
     let num_lines = min(max(1u, audio.waveform_history_size), 144u);
+    // Guard against division by zero when history size is 1
+    let inv_nl = 1.0 / f32(max(num_lines, 2u) - 1u);
     let res = f32(max(audio.waveform_resolution, 128u));
     let safe_aspect = max(aspect, 0.001);
     let bound = 9.6 * safe_aspect;
     let inner_bound = max(bound - 3.0, 0.0);
     let inv_res_minus_1 = (bound * 2.0) / (res - 1.0);
-    
+    // Loop-invariant radial terms (hoisted out of the line loop)
+    let r = length(crt_uv);
+    let edge_blur = smoothstep(0.3, 1.2, r);
+
     if rd.y > 0.0 {
         let t_min = max(0.0, (ro.z - 1.5) / max(0.2 - rd.z, 0.00001));
         let t_max = (ro.z + 1.5) / max(-0.2 - rd.z, 0.00001);
 
         for (var i = 0u; i < num_lines; i = i + 1u) {
             // Z layout: back to front. i=0 is back (oldest), i=num_lines-1 is front (newest).
-            let y_line = mix(9.48, -1.8, f32(i) / f32(num_lines - 1u));
+            let y_line = mix(9.48, -1.8, f32(i) * inv_nl);
             let hist_idx = i;
             
             let t = (y_line - ro.y) / rd.y;
@@ -143,13 +148,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 proj_prev = proj_curr;
             }
             
-            let r = length(crt_uv);
-            let edge_blur = smoothstep(0.3, 1.2, r);
-            
             // Distance-based thickness to prevent sub-pixel wireframe flickering
             let depth_thickness = t * 0.0004;
             let thickness = 0.002 + edge_blur * 0.004 + depth_thickness;
-            let core = smoothstep(thickness, 0.0, min_dist);
+            let core = smoothstep_r(thickness, 0.0, min_dist);
             // High bloom for that glowing CRT look, scaling bloom spread with depth
             let bloom = 0.0004 / (min_dist * min_dist + 0.0001 + t * 0.00005) * 0.15;
             
@@ -157,7 +159,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let depth_fade = exp(-t * 0.20);
             
             // Age fade (older lines fade out)
-            let age_fade = mix(0.05, 1.0, f32(i) / f32(num_lines - 1u));
+            let age_fade = mix(0.05, 1.0, f32(i) * inv_nl);
             
             // Sample waveform height at hit point for color grading
             let hit_wave_idx = u32(clamp((hit_x + bound) / (bound * 2.0) * (res - 1.0), 0.0, res - 1.0));
@@ -178,8 +180,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     final_color *= scanline;
     
     // Smooth CRT bezel fade
-    let r = length(crt_uv);
-    let bezel = smoothstep(1.3, 0.9, r);
+    let bezel = smoothstep_r(1.3, 0.9, r);
     
     // Analog noise
     let noise_val = hash12(in.clip_position.xy + fract(audio.smooth_time) * 100.0);

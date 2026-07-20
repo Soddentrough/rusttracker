@@ -186,25 +186,27 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         
         var wave_intensity = 0.0;
         
-        // Accumulate 60 history frames for ghosting
-        // waveform_history[0] is oldest, waveform_history[59] is newest
-        for (var i = 0u; i < 60u; i = i + 1u) {
+        // Accumulate history frames for ghosting (honor the actual history size)
+        // waveform_history[0] is oldest, waveform_history[N-1] is newest
+        let hist_n = min(60u, max(audio.waveform_history_size, 1u));
+        // Phosphor decay in wall-clock time: frames arrive at ~target_fps, so
+        // age_seconds ≈ frames_old * frame_dt. k=115 preserves the look the
+        // 0.8-per-frame decay gave at 144fps, at any refresh rate.
+        let decay_rate = 115.0 * audio.frame_dt;
+        for (var i = 0u; i < hist_n; i = i + 1u) {
             let raw_wave = get_waveform_interpolated(i, final_uv.x); // -1.0 to 1.0
             let wave_y = raw_wave * 0.4 + 0.5; // Map to 0.1 - 0.9 range
             let dist = abs(final_uv.y - wave_y);
-            
+
             // True exponential decay (e^-kx) like a real CRT phosphor
-            // i=59 is the newest frame (frames_old = 0)
-            let frames_old = 59.0 - f32(i);
-            
-            // The audio DSP sends a new waveform frame roughly every 93ms.
-            // k=0.8 means it decays to ~5% brightness over 4 frames (4 * 93ms = ~370ms)
-            // This provides a realistic "fraction of a second" phosphor decay.
-            let age = exp(-frames_old * 0.8); 
+            // i=hist_n-1 is the newest frame (frames_old = 0)
+            let frames_old = f32(hist_n - 1u - i);
+
+            let age = exp(-frames_old * decay_rate);
             
             // Anti-aliased line thickness
             let thickness = 0.003;
-            let line_intensity = smoothstep(thickness, 0.0, dist);
+            let line_intensity = smoothstep_r(thickness, 0.0, dist);
             
             // Bloom / phosphor glow
             let bloom = 0.001 / (dist * dist + 0.001) * 0.3;
