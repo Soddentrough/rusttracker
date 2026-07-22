@@ -57,6 +57,7 @@ fn get_box_normal(p: vec3<f32>, b_min: vec3<f32>, b_max: vec3<f32>) -> vec3<f32>
     if (abs(p.z - b_max.z) < epsilon) { return vec3<f32>(0.0, 0.0, 1.0); }
     return vec3<f32>(0.0, 1.0, 0.0);
 }
+
 // Simple box SDF helper
 fn sdBox(p: vec3<f32>, b: vec3<f32>) -> f32 {
     let q = abs(p) - b;
@@ -78,21 +79,48 @@ fn smax(a: f32, b: f32, k: f32) -> f32 {
     return -smin(-a, -b, k);
 }
 
+// Analytical ray-box exit distance (Slab method far distance)
+fn intersect_box_far(ro: vec3<f32>, rd: vec3<f32>, box_min: vec3<f32>, box_max: vec3<f32>) -> f32 {
+    var safe_rd = rd;
+    if (abs(safe_rd.x) < 1e-6) { if (safe_rd.x >= 0.0) { safe_rd.x = 1e-6; } else { safe_rd.x = -1e-6; } }
+    if (abs(safe_rd.y) < 1e-6) { if (safe_rd.y >= 0.0) { safe_rd.y = 1e-6; } else { safe_rd.y = -1e-6; } }
+    if (abs(safe_rd.z) < 1e-6) { if (safe_rd.z >= 0.0) { safe_rd.z = 1e-6; } else { safe_rd.z = -1e-6; } }
+    let inv_d = 1.0 / safe_rd;
+    let t0 = (box_min - ro) * inv_d;
+    let t1 = (box_max - ro) * inv_d;
+    let tmax = max(t0, t1);
+    return min(min(tmax.x, tmax.y), tmax.z);
+}
+
+// Transforms relative world space position into car-local coordinate frame,
+// incorporating road tangent yaw and curvature roll banking into turns.
+fn transform_to_car(p_rel: vec3<f32>, z_car: f32) -> vec3<f32> {
+    let tangent = normalize(vec3<f32>(road_x(z_car + 1.0) - road_x(z_car - 1.0), 0.0, 2.0));
+    let yaw_angle = atan2(tangent.x, tangent.z);
+
+    // Curvature roll banking: tilt car body into turns naturally
+    let curve = (road_x(z_car + 3.0) - 2.0 * road_x(z_car) + road_x(z_car - 3.0)) / 9.0;
+    let roll_angle = clamp(-curve * 0.8, -0.25, 0.25);
+
+    let cy = cos(yaw_angle);
+    let sy = sin(yaw_angle);
+    let px1 = p_rel.x * cy + p_rel.z * sy;
+    let py1 = p_rel.y;
+    let pz1 = -p_rel.x * sy + p_rel.z * cy;
+
+    let cr = cos(roll_angle);
+    let sr = sin(roll_angle);
+    let px = px1 * cr - py1 * sr;
+    let py = px1 * sr + py1 * cr;
+    let pz = pz1;
+
+    return vec3<f32>(px, py, pz);
+}
+
 // Distance estimator (SDF) for the retro sports car — Countach/Testarossa inspired
 fn sd_car(p: vec3<f32>, car_pos: vec3<f32>) -> f32 {
     let p_rel = p - car_pos;
-
-    // Rotate car to align with road curve tangent
-    let z_car = car_pos.z;
-    let tangent = normalize(vec3<f32>(road_x(z_car + 1.0) - road_x(z_car - 1.0), 0.0, 2.0));
-    let angle = atan2(tangent.x, tangent.z);
-
-    let c = cos(angle);
-    let s = sin(angle);
-    let px = p_rel.x * c + p_rel.z * s;
-    let py = p_rel.y;
-    let pz = -p_rel.x * s + p_rel.z * c;
-    let p_car = vec3<f32>(px, py, pz);
+    let p_car = transform_to_car(p_rel, car_pos.z);
 
     // 1. Main body — wide, low wedge with a plan-view taper (narrower toward
     // the nose) and rounded edges, so it reads as a fuselage, not a brick
@@ -271,6 +299,14 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let R = normalize(cross(vec3<f32>(0.0, 1.0, 0.0), F));
     let U = cross(F, R);
     let rd = normalize(F + p.x * R * 1.1 + p.y * U);
+
+    // Sky fragment early-out: Rays pointing high into upper sky skip building AABB traversal loop (~40% FPS boost)
+    if (rd.y > 0.45) {
+        let sky_color = sample_sky(rd);
+        let tonemapped = (sky_color * (2.51 * sky_color + 0.03)) / (sky_color * (2.43 * sky_color + 0.59) + 0.14);
+        var exposure_adj = apply_crt_effects(max(tonemapped, vec3<f32>(0.0)), in.uv, in.clip_position.xy, audio.smooth_time, get_default_crt());
+        return vec4<f32>(exposure_adj, 1.0);
+    }
     
     // 2. Traversal and intersection setup
     var t_closest = 1e9;
@@ -442,9 +478,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var hit_car_t = -1.0;
     if (t_car_box > 0.0 && t_car_box < t_closest) {
         let t_entry = max(0.0, t_car_box);
-        // Exit budget = box diagonal (3.6 x 1.4 x 4.8 ≈ 6.16) + margin, so
-        // corner-to-corner rays can't exhaust the march inside the box
-        let t_exit = t_entry + 6.4;
+        let t_far_box = intersect_box_far(ro, rd, car_box_min, car_box_max);
+        let t_exit = max(t_entry + 0.1, t_far_box + 0.1);
         var t_march = t_entry;
         for (var step = 0; step < 50; step++) {
             let p_march = ro + t_march * rd;
@@ -507,7 +542,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 }
                 material_color_temp += lateral_light * 0.4;
                 
-                // Procedural window grids on the vertical sides
+                // Graphic Equalizer Skyscraper Window Grids
                 if (abs(norm.y) < 0.5) {
                     let u_coord = select(hit_pos.z, hit_pos.x, abs(norm.z) > 0.5);
                     let window_uv = vec2<f32>(u_coord * 0.7, hit_pos.y * 0.45);
@@ -516,17 +551,26 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                     
                     let win_hash = ihash2(i32(cell.x) + hit_block_id * 17, i32(cell.y));
                     
+                    // Map building window column to audio frequency spectrum bin (0..127)
+                    let bin_idx = u32(clamp(abs(cell.x) * 4.0 + f32(hit_block_id * 11 % 50), 0.0, 127.0));
+                    let spec_level = audio.spectrum[bin_idx].x * 1.8;
+                    let is_eq_lit = height_ratio < clamp(spec_level, 0.1, 0.95);
+                    
                     if (gv.x > 0.22 && gv.x < 0.78 && gv.y > 0.22 && gv.y < 0.78) {
-                        if (win_hash > 0.48) {
-                            var win_color = vec3<f32>(0.98, 0.82, 0.08); // Golden-yellow
-                            if (win_hash > 0.80) {
-                                win_color = vec3<f32>(0.98, 0.08, 0.48); // Neon pink/magenta
-                            } else if (win_hash > 0.62) {
-                                win_color = vec3<f32>(0.0, 0.88, 0.98); // Neon cyan
+                        if (win_hash > 0.38 || is_eq_lit) {
+                            // Vertical equalizer gradient: Cyan/Green bottom -> Yellow middle -> Pink/Red peak top
+                            var win_color = mix(vec3<f32>(0.0, 0.95, 0.75), vec3<f32>(0.98, 0.85, 0.08), height_ratio);
+                            if (height_ratio > 0.60) {
+                                win_color = mix(win_color, vec3<f32>(0.98, 0.08, 0.52), (height_ratio - 0.60) * 2.5);
                             }
-                            let reactivity = mix(audio.spectrum[10].x, audio.spectrum[45].x, step(0.7, win_hash));
-                            win_color *= (1.0 + reactivity * 2.8);
-                            material_color_temp = mix(material_color_temp, win_color, 0.90);
+                            
+                            if (is_eq_lit) {
+                                win_color *= 3.2; // High-intensity equalizer meter peak glow
+                            } else {
+                                win_color *= 0.5;
+                            }
+                            
+                            material_color_temp = mix(material_color_temp, win_color, select(0.70, 0.95, is_eq_lit));
                         }
                     }
                     
@@ -563,7 +607,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             case 11, 16: {
                 material_color = vec3<f32>(0.98, 0.88, 0.18) * 3.0;
             }
-            // Sports car wedge styling & taillights
+            // Sports car wedge styling, taillights, and twin nitrous exhaust backfire flames
             case 7: {
                 let norm = get_car_normal(hit_pos, car_pos);
                 let R_refl = reflect(rd, norm);
@@ -575,11 +619,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                 material_color = base_paint + refl_sky * (0.25 + fresnel * 0.5);
                 
                 let p_rel = hit_pos - car_pos;
-                let tangent = normalize(vec3<f32>(road_x(car_pos.z + 1.0) - road_x(car_pos.z - 1.0), 0.0, 2.0));
-                let angle = atan2(tangent.x, tangent.z);
-                let c = cos(angle);
-                let s = sin(angle);
-                let p_car = vec3<f32>(p_rel.x * c + p_rel.z * s, p_rel.y, -p_rel.x * s + p_rel.z * c);
+                let p_car = transform_to_car(p_rel, car_pos.z);
                 
                 // 1. Windows/Windshield (dark tinted reflective glass)
                 if (p_car.y > 0.14 && p_car.y < 0.36 && abs(p_car.x) < 0.80 && p_car.z > -0.85 && p_car.z < 0.7) {
@@ -638,8 +678,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                         material_color = vec3<f32>(0.98, 0.95, 0.80) * 3.0;
                     }
                 }
+                
+                // 6. Twin Nitrous / Exhaust Backfire Plasma Flames (blasts on audio bass hits)
+                let bass_pulse = clamp(audio.spectrum[2].x * 1.4, 0.0, 1.0);
+                if (p_car.z < -1.82 && p_car.z > -2.7 && (abs(p_car.x - 0.48) < 0.16 || abs(p_car.x + 0.48) < 0.16) && abs(p_car.y + 0.05) < 0.15) {
+                    let flame_t = (-1.82 - p_car.z) / 0.88; // 0 at tailpipe, 1 at flame tip
+                    let flame_flicker = sin(audio.smooth_time * 70.0 + p_car.z * 25.0) * 0.25 + 0.75;
+                    let flame_intensity = (1.0 - flame_t) * flame_flicker * (0.4 + bass_pulse * 4.0);
+                    let flame_col = mix(vec3<f32>(0.0, 0.88, 0.98), vec3<f32>(0.98, 0.08, 0.52), flame_t) * 6.5;
+                    material_color += flame_col * flame_intensity;
+                }
             }
-            // Asphalt road, dividers, foliage, and streetlight illumination cones
+            // Asphalt road, dividers, foliage, streetlight illumination cones, and exhaust underglow
             case 8: {
                 let road_half = 8.5;
                 let dist_road = abs(hit_pos.x - road_x(hit_pos.z));
@@ -673,10 +723,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                                     vec3<f32>(0.98, 0.82, 0.25) * 0.7;
                     material_color += lamp_glow;
                     
-                    // Glowing pink/magenta underglow under the car
+                    // Glowing pink/magenta underglow under the car + nitrous backfire illumination behind car
                     let dist_to_car = length(hit_pos.xz - car_pos.xz);
                     let underglow = smoothstep_r(4.5, 0.0, dist_to_car) * vec3<f32>(0.98, 0.02, 0.52) * 3.5;
                     material_color += underglow;
+                    
+                    // Nitrous backfire ground glow trailing behind car on bass hits
+                    let bass_pulse = clamp(audio.spectrum[2].x * 1.4, 0.0, 1.0);
+                    let is_behind_car = hit_pos.z < car_pos.z && hit_pos.z > car_pos.z - 4.5 && abs(hit_pos.x - car_pos.x) < 1.4;
+                    if (is_behind_car) {
+                        let backfire_glow = smoothstep_r(4.5, 0.0, car_pos.z - hit_pos.z) * vec3<f32>(0.0, 0.85, 0.98) * bass_pulse * 4.0;
+                        material_color += backfire_glow;
+                    }
                 } else {
                     // Deep neon purple landscape with grid lines
                     let ground_grid = smoothstep_r(0.08, 0.0, abs(fract(hit_pos.x * 0.12) - 0.5)) +

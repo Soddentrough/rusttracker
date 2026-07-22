@@ -37,13 +37,30 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         ].as_ref())
         .split(f.area());
 
-    let top_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([
+    let width = f.area().width;
+    let top_constraints = if width < 80 {
+        vec![
+            Constraint::Percentage(40), // VUs
+            Constraint::Percentage(0),  // Hide Heatmap
+            Constraint::Percentage(60), // Metadata
+        ]
+    } else if width < 110 {
+        vec![
+            Constraint::Percentage(30), // VUs
+            Constraint::Percentage(40), // Heatmap
+            Constraint::Percentage(30), // Metadata
+        ]
+    } else {
+        vec![
             Constraint::Percentage(30), // VUs
             Constraint::Percentage(50), // Heatmap
             Constraint::Percentage(20), // Metadata
-        ].as_ref())
+        ]
+    };
+
+    let top_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints(top_constraints)
         .split(main_chunks[0]);
 
     // 1. Layered Channel VUs with Peak Decay
@@ -119,41 +136,43 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     f.render_widget(vu_paragraph, top_chunks[0]);
 
     // 2. High-End Spectrogram Heatmap
-    let heatmap_width = top_chunks[1].width.saturating_sub(2) as usize;
-    let heatmap_height = top_chunks[1].height.saturating_sub(2) as usize;
-    let chars_per_bin = (heatmap_width / 128).max(1);
-    let bin_str = "▀".repeat(chars_per_bin);
+    if top_chunks[1].width > 2 && top_chunks[1].height > 2 {
+        let heatmap_width = top_chunks[1].width.saturating_sub(2) as usize;
+        let heatmap_height = top_chunks[1].height.saturating_sub(2) as usize;
+        let chars_per_bin = (heatmap_width / 128).max(1);
+        let bin_str = "▀".repeat(chars_per_bin);
 
-    let mut heatmap_lines = Vec::new();
-    let history_len = state.spectrum_history.len();
-    let total_history_lines = history_len / 2;
-    let start_line = total_history_lines.saturating_sub(heatmap_height);
-    
-    for cell_y in start_line..total_history_lines {
-        let mut spans = Vec::new();
-        let top_row_idx = cell_y * 2;
-        let bottom_row_idx = cell_y * 2 + 1;
+        let mut heatmap_lines = Vec::new();
+        let history_len = state.spectrum_history.len();
+        let total_history_lines = history_len / 2;
+        let start_line = total_history_lines.saturating_sub(heatmap_height);
+        
+        for cell_y in start_line..total_history_lines {
+            let mut spans = Vec::new();
+            let top_row_idx = cell_y * 2;
+            let bottom_row_idx = cell_y * 2 + 1;
 
-        if top_row_idx < history_len && bottom_row_idx < history_len {
-            let top_row = &state.spectrum_history[top_row_idx];
-            let bottom_row = &state.spectrum_history[bottom_row_idx];
+            if top_row_idx < history_len && bottom_row_idx < history_len {
+                let top_row = &state.spectrum_history[top_row_idx];
+                let bottom_row = &state.spectrum_history[bottom_row_idx];
 
-            for x in 0..top_row.len() {
-                let fg_col = val_to_color(top_row[x]);
-                let bg_col = val_to_color(bottom_row[x]);
+                for x in 0..top_row.len() {
+                    let fg_col = val_to_color(top_row[x]);
+                    let bg_col = val_to_color(bottom_row[x]);
 
-                spans.push(Span::styled(
-                    bin_str.clone(), 
-                    Style::default().fg(fg_col).bg(bg_col)
-                ));
+                    spans.push(Span::styled(
+                        bin_str.clone(), 
+                        Style::default().fg(fg_col).bg(bg_col)
+                    ));
+                }
             }
+            heatmap_lines.push(Line::from(spans));
         }
-        heatmap_lines.push(Line::from(spans));
-    }
 
-    let heatmap_paragraph = Paragraph::new(heatmap_lines)
-        .block(Block::default().title("Heatmap History").borders(Borders::ALL));
-    f.render_widget(heatmap_paragraph, top_chunks[1]);
+        let heatmap_paragraph = Paragraph::new(heatmap_lines)
+            .block(Block::default().title("Heatmap History").borders(Borders::ALL));
+        f.render_widget(heatmap_paragraph, top_chunks[1]);
+    }
 
 
     // 3. Metadata
@@ -415,7 +434,39 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     f.render_widget(gauge, main_chunks[2]);
 
     // 6. Instructions
-    let instructions = Paragraph::new("Press 'q' to quit | Space to pause | ⬅️  ➡️  to scrub timeline")
+    let instructions = Paragraph::new("Press 'q' to quit | Space to pause | ⬅️  ➡️  to scrub timeline | 'd' for device picker")
         .style(Style::default().add_modifier(Modifier::ITALIC));
     f.render_widget(instructions, main_chunks[3]);
+
+    // 7. Device Picker Modal Overlay
+    if state.show_tui_device_picker {
+        use ratatui::widgets::{Clear, List, ListItem};
+        
+        let area = f.area();
+        let modal_width = 50.min(area.width.saturating_sub(4));
+        let modal_height = (state.available_audio_devices.len() as u16 + 2).min(area.height.saturating_sub(4));
+        
+        let modal_area = ratatui::layout::Rect::new(
+            (area.width - modal_width) / 2,
+            (area.height - modal_height) / 2,
+            modal_width,
+            modal_height,
+        );
+        
+        f.render_widget(Clear, modal_area);
+        
+        let items: Vec<ListItem> = state.available_audio_devices.iter().enumerate().map(|(idx, dev)| {
+            let style = if idx == state.tui_device_picker_cursor {
+                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+            ListItem::new(dev.clone()).style(style)
+        }).collect();
+        
+        let list = List::new(items)
+            .block(Block::default().title("Select Audio Output Device").borders(Borders::ALL));
+            
+        f.render_widget(list, modal_area);
+    }
 }

@@ -4428,8 +4428,8 @@ impl VulkanEngine {
                     self.queue.write_buffer(&vs.params_buffer, 0, bytemuck::cast_slice(&[params]));
                     render_pass.set_pipeline(&self.video_pipeline);
                     render_pass.set_bind_group(0, &vs.bind_group, &[]);
+                    render_pass.draw(0..3, 0..1);
                 }
-                render_pass.draw(0..3, 0..1);
             }
             
             if state.show_hud && state.video_mode != 3 {

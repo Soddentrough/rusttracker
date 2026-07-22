@@ -1504,6 +1504,24 @@ where std::io::Error: From<<B as Backend>::Error>
         let load_path = {
             let mut state = app_state.lock().unwrap();
             
+            let device_change = state.audio_device_change_request.take();
+            if let Some(new_device) = device_change {
+                state.selected_audio_device = Some(new_device.clone());
+                let reload_path = if is_mic_launch {
+                    "".to_string()
+                } else if state.playlist_index < state.playlist.len() {
+                    state.playlist[state.playlist_index].clone()
+                } else {
+                    state.song_title.clone()
+                };
+                
+                if !reload_path.is_empty() || is_mic_launch {
+                    state.load_request = Some(reload_path);
+                    state.osd_text = Some(format!("Audio Output: {}", new_device));
+                    state.osd_timer = 3.0;
+                }
+            }
+
             if state.audio_device_lost {
                 state.audio_device_lost = false;
                 let reload_path = if is_mic_launch {
@@ -1669,60 +1687,108 @@ where std::io::Error: From<<B as Backend>::Error>
 
         if crossterm::event::poll(timeout)? {
             if let CEvent::Key(key) = event::read()? {
-                match key.code {
-                    KeyCode::Char('q') => {
-                        return Ok(());
-                    }
-                    KeyCode::Char('n') => {
-                        let mut state = app_state.lock().unwrap();
-                        if !state.playlist.is_empty() && state.playlist_index + 1 < state.playlist.len() {
-                            state.playlist_index += 1;
-                            state.load_request = Some(state.playlist[state.playlist_index].clone());
-                            state.is_paused = false;
+                let show_picker = { app_state.lock().unwrap().show_tui_device_picker };
+                if show_picker {
+                    match key.code {
+                        KeyCode::Esc => {
+                            let mut state = app_state.lock().unwrap();
+                            state.show_tui_device_picker = false;
                         }
-                    }
-                    KeyCode::Char('p') => {
-                        let mut state = app_state.lock().unwrap();
-                        if !state.playlist.is_empty() && state.playlist_index > 0 {
-                            state.playlist_index -= 1;
-                            state.load_request = Some(state.playlist[state.playlist_index].clone());
-                            state.is_paused = false;
+                        KeyCode::Up => {
+                            let mut state = app_state.lock().unwrap();
+                            let count = state.available_audio_devices.len();
+                            if count > 0 {
+                                if state.tui_device_picker_cursor == 0 {
+                                    state.tui_device_picker_cursor = count - 1;
+                                } else {
+                                    state.tui_device_picker_cursor -= 1;
+                                }
+                            }
                         }
+                        KeyCode::Down => {
+                            let mut state = app_state.lock().unwrap();
+                            let count = state.available_audio_devices.len();
+                            if count > 0 {
+                                state.tui_device_picker_cursor = (state.tui_device_picker_cursor + 1) % count;
+                            }
+                        }
+                        KeyCode::Enter => {
+                            let mut state = app_state.lock().unwrap();
+                            let cursor = state.tui_device_picker_cursor;
+                            if cursor < state.available_audio_devices.len() {
+                                let dev = state.available_audio_devices[cursor].clone();
+                                state.audio_device_change_request = Some(dev);
+                            }
+                            state.show_tui_device_picker = false;
+                        }
+                        _ => {}
                     }
-                    KeyCode::Char(' ') => {
-                        let mut state = app_state.lock().unwrap();
-                        if state.current_seconds >= state.duration_seconds - 0.1 && state.duration_seconds > 0.0 {
-                            state.seek_request = Some(0.0);
+                } else {
+                    match key.code {
+                        KeyCode::Char('q') => {
+                            return Ok(());
+                        }
+                        KeyCode::Char('d') => {
+                            let mut state = app_state.lock().unwrap();
+                            state.show_tui_device_picker = true;
+                            state.tui_device_picker_cursor = 0;
+                            if let Some(ref current) = state.selected_audio_device {
+                                if let Some(idx) = state.available_audio_devices.iter().position(|d| d == current) {
+                                    state.tui_device_picker_cursor = idx;
+                                }
+                            }
+                        }
+                        KeyCode::Char('n') => {
+                            let mut state = app_state.lock().unwrap();
+                            if !state.playlist.is_empty() && state.playlist_index + 1 < state.playlist.len() {
+                                state.playlist_index += 1;
+                                state.load_request = Some(state.playlist[state.playlist_index].clone());
+                                state.is_paused = false;
+                            }
+                        }
+                        KeyCode::Char('p') => {
+                            let mut state = app_state.lock().unwrap();
+                            if !state.playlist.is_empty() && state.playlist_index > 0 {
+                                state.playlist_index -= 1;
+                                state.load_request = Some(state.playlist[state.playlist_index].clone());
+                                state.is_paused = false;
+                            }
+                        }
+                        KeyCode::Char(' ') => {
+                            let mut state = app_state.lock().unwrap();
+                            if state.current_seconds >= state.duration_seconds - 0.1 && state.duration_seconds > 0.0 {
+                                state.seek_request = Some(0.0);
+                                state.spectrum_history.clear();
+                                for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
+                                state.is_paused = false;
+                            } else if state.playlist_index >= state.playlist.len() && !state.playlist.is_empty() {
+                                if state.duration_seconds == 0.0 {
+                                    state.playlist_index = state.playlist.len() - 1;
+                                } else {
+                                    state.playlist_index = 0;
+                                }
+                                state.load_request = Some(state.playlist[state.playlist_index].clone());
+                                state.is_paused = false;
+                            } else {
+                                state.is_paused = !state.is_paused;
+                            }
+                        }
+                        KeyCode::Right => {
+                            let mut state = app_state.lock().unwrap();
+                            let target = (state.current_seconds + 5.0).min(state.duration_seconds);
+                            state.seek_request = Some(target);
                             state.spectrum_history.clear();
                             for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
-                            state.is_paused = false;
-                        } else if state.playlist_index >= state.playlist.len() && !state.playlist.is_empty() {
-                            if state.duration_seconds == 0.0 {
-                                state.playlist_index = state.playlist.len() - 1;
-                            } else {
-                                state.playlist_index = 0;
-                            }
-                            state.load_request = Some(state.playlist[state.playlist_index].clone());
-                            state.is_paused = false;
-                        } else {
-                            state.is_paused = !state.is_paused;
                         }
+                        KeyCode::Left => {
+                            let mut state = app_state.lock().unwrap();
+                            let target = (state.current_seconds - 5.0).max(0.0);
+                            state.seek_request = Some(target);
+                            state.spectrum_history.clear();
+                            for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
+                        }
+                        _ => {}
                     }
-                    KeyCode::Right => {
-                        let mut state = app_state.lock().unwrap();
-                        let target = (state.current_seconds + 5.0).min(state.duration_seconds);
-                        state.seek_request = Some(target);
-                        state.spectrum_history.clear();
-                        for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
-                    }
-                    KeyCode::Left => {
-                        let mut state = app_state.lock().unwrap();
-                        let target = (state.current_seconds - 5.0).max(0.0);
-                        state.seek_request = Some(target);
-                        state.spectrum_history.clear();
-                        for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
-                    }
-                    _ => {}
                 }
             }
         }

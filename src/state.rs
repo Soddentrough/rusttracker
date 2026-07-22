@@ -110,10 +110,10 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
     VisualizerDef { id: 5, name: "Neon Corridor", filename: "vis_neon.wgsl", description: "Raymarched neon sci-fi tunnel", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 11, name: "Lissajous Laser", filename: "vis_lissajous.wgsl", description: "Analog laser projector simulation", pipeline_type: PipelineType::Mesh3D { geometry: Geometry::Grid { width: 200, depth: 200 }, instances: 6 }, requires_history: true, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 12, name: "Synthwave Terrain", filename: "vis_synthwave.wgsl", description: "Retro 80s wireframe landscape", pipeline_type: PipelineType::Mesh3D { geometry: Geometry::Grid { width: 200, depth: 200 }, instances: 1 }, requires_history: true, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
+    VisualizerDef { id: 16, name: "Synthwave Racer", filename: "vis_synthwaveracer.wgsl", description: "Retro 80s synthwave racer visualizer", pipeline_type: PipelineType::FullscreenQuad, requires_history: true, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 13, name: "Starfield Constellation", filename: "vis_starfield.wgsl", description: "Audio-reactive galaxy and starfield", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 14, name: "Midnight Storm", filename: "vis_rain.wgsl", description: "Nighttime rain and audio-reactive lightning", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 15, name: "3D Midnight Storm", filename: "vis_3drain.wgsl", description: "3D rain and lightning across audio frequencies", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
-    VisualizerDef { id: 16, name: "Synthwave Racer", filename: "vis_synthwaveracer.wgsl", description: "Retro 80s synthwave racer visualizer", pipeline_type: PipelineType::FullscreenQuad, requires_history: true, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 17, name: "Neon Cuboids", filename: "vis_cuboids.wgsl", description: "3D neon wireframe cuboids reacting to audio", pipeline_type: PipelineType::Mesh3D { geometry: Geometry::UnitBox, instances: 1674 }, requires_history: true, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 18, name: "Retro VU Meters", filename: "vis_vumeters.wgsl", description: "3D retro VU meters with warm glow and analog needle ballistics", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 19, name: "Bioluminescent Waves", filename: "vis_bioluminescence.wgsl", description: "GPU compute-driven bioluminescent particle waves", pipeline_type: PipelineType::Mesh3D { geometry: Geometry::UnitBox, instances: 65536 }, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
@@ -205,6 +205,8 @@ pub struct AppState {
     pub selected_audio_device: Option<String>,
     pub available_audio_devices: Vec<String>,
     pub audio_device_change_request: Option<String>,
+    pub show_tui_device_picker: bool,
+    pub tui_device_picker_cursor: usize,
 }
 
 pub fn get_history_file_path() -> std::path::PathBuf {
@@ -360,6 +362,8 @@ impl AppState {
             selected_audio_device: default_audio_device,
             available_audio_devices,
             audio_device_change_request: None,
+            show_tui_device_picker: false,
+            tui_device_picker_cursor: 0,
         }
     }
     
@@ -457,6 +461,8 @@ impl AppState {
             selected_audio_device: self.selected_audio_device.clone(),
             available_audio_devices: self.available_audio_devices.clone(),
             audio_device_change_request: self.audio_device_change_request.clone(),
+            show_tui_device_picker: self.show_tui_device_picker,
+            tui_device_picker_cursor: self.tui_device_picker_cursor,
         }
     }
 }

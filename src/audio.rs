@@ -116,6 +116,12 @@ pub fn get_default_audio_device_name(mic: bool) -> Option<String> {
     default_device.and_then(|d| d.description().ok().map(|desc| desc.name().to_string()))
 }
 
+pub fn calculate_power_of_two_window_size(sample_rate: u32) -> usize {
+    let target = (sample_rate as f32 * 0.185).round() as usize;
+    let window_size = 1 << (target as f32).log2().round() as usize;
+    window_size.max(2048).min(65536)
+}
+
 pub fn spawn_dsp_thread(
     rx: Receiver<DspMessage>,
     shared_state: Arc<Mutex<AppState>>,
@@ -161,6 +167,7 @@ pub fn spawn_dsp_thread(
             log_bin_mappings.push(BinMapping { i0, i1, frac });
         }
 
+        let n_sqrt = (window_size as f32).sqrt();
         let mut last_waveform_push = Instant::now();
 
         while let Ok(msg) = rx.recv() {
@@ -176,7 +183,6 @@ pub fn spawn_dsp_thread(
             fft.process(&mut complex_buf);
 
             // Compute magnitudes (only first half — up to Nyquist)
-            let n_sqrt = (window_size as f32).sqrt();
             for i in 0..window_size / 2 {
                 magnitudes[i] = complex_buf[i].norm() / n_sqrt;
             }
@@ -1569,40 +1575,47 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
 
     // 3. Try MIDI
     if ext == "mid" || ext == "midi" {
-        // Look for soundfont in project dir, then fallback to executable-relative paths and macOS Resources bundle
+        // Look for soundfont in project dir, then fallback to executable-relative paths, system-wide paths, and macOS Resources bundle
         let mut sf_path = "assets/soundfont.sf2".to_string();
         if !std::path::Path::new(&sf_path).exists() {
             if std::path::Path::new("soundfont.sf2").exists() {
                 sf_path = "soundfont.sf2".to_string();
-            } else if let Ok(exe_path) = std::env::current_exe() {
-                if let Some(exe_dir) = exe_path.parent() {
-                    let test_path = exe_dir.join("assets/soundfont.sf2");
-                    if test_path.exists() {
-                        sf_path = test_path.to_string_lossy().into_owned();
-                    } else {
-                        let test_path = exe_dir.join("soundfont.sf2");
-                        if test_path.exists() {
-                            sf_path = test_path.to_string_lossy().into_owned();
-                        } else {
-                            let test_path = exe_dir.join("../share/rusttracker/assets/soundfont.sf2");
-                            if test_path.exists() {
-                                sf_path = test_path.to_string_lossy().into_owned();
-                            } else {
-                                let test_path = exe_dir.join("../share/rusttracker/soundfont.sf2");
-                                if test_path.exists() {
-                                    sf_path = test_path.to_string_lossy().into_owned();
-                                } else {
-                                    let test_path = exe_dir.join("../Resources/soundfont.sf2");
-                                    if test_path.exists() {
-                                        sf_path = test_path.to_string_lossy().into_owned();
-                                    } else {
-                                        let test_path = exe_dir.join("../Resources/assets/soundfont.sf2");
-                                        if test_path.exists() {
-                                            sf_path = test_path.to_string_lossy().into_owned();
-                                        }
-                                    }
-                                }
+            } else {
+                let mut found = false;
+                if let Ok(exe_path) = std::env::current_exe() {
+                    if let Some(exe_dir) = exe_path.parent() {
+                        let test_paths = vec![
+                            exe_dir.join("assets/soundfont.sf2"),
+                            exe_dir.join("soundfont.sf2"),
+                            exe_dir.join("../share/rusttracker/assets/soundfont.sf2"),
+                            exe_dir.join("../share/rusttracker/soundfont.sf2"),
+                            exe_dir.join("../Resources/soundfont.sf2"),
+                            exe_dir.join("../Resources/assets/soundfont.sf2"),
+                        ];
+                        for tp in test_paths {
+                            if tp.exists() {
+                                sf_path = tp.to_string_lossy().into_owned();
+                                found = true;
+                                break;
                             }
+                        }
+                    }
+                }
+                
+                // Fallback to system-wide paths on Linux/BSD if not found yet
+                if !found {
+                    let system_paths = vec![
+                        "/usr/share/sounds/sf2/FluidR3_GM.sf2",
+                        "/usr/share/sounds/sf2/default.sf2",
+                        "/usr/share/soundfonts/FluidR3_GM.sf2",
+                        "/usr/share/soundfonts/default.sf2",
+                        "/usr/share/soundfonts/FluidR3_GM.sf3",
+                        "/usr/share/soundfonts/freepats-general-midi.sf2",
+                    ];
+                    for sp in system_paths {
+                        if std::path::Path::new(sp).exists() {
+                            sf_path = sp.to_string();
+                            break;
                         }
                     }
                 }
@@ -1636,8 +1649,7 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
             if let Ok((handle, decoder_rate, codec_name, has_video)) = crate::bitstream::start_bitstream_thread(file_path, shared_state.clone(), tx.clone(), stop_token.clone()) {
                 let max_frequency = shared_state.lock().unwrap().max_frequency;
                 let sample_rate = decoder_rate;
-                let window_size = (((sample_rate as f32 * 0.185).round() as usize) / 2) * 2;
-                let window_size = window_size.max(2048).min(65536);
+                let window_size = calculate_power_of_two_window_size(sample_rate);
                 
                 let display_name = match codec_name.as_str() {
                     "truehd" => "TrueHD / Dolby Atmos",
@@ -1738,8 +1750,7 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
         }
 
         let max_frequency = { shared_state.lock().unwrap().max_frequency };
-        let window_size = (((config.sample_rate as f32 * 0.185).round() as usize) / 2) * 2;
-        let window_size = window_size.max(2048).min(65536);
+        let window_size = calculate_power_of_two_window_size(config.sample_rate);
         spawn_dsp_thread(rx, shared_state.clone(), config.sample_rate, max_frequency, window_size);
 
         let stream = match supported_config.sample_format() {
@@ -1894,8 +1905,7 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
                 }
 
                 let max_frequency = { shared_state_closure.lock().unwrap().max_frequency };
-                let window_size = (((config.sample_rate as f32 * 0.185).round() as usize) / 2) * 2;
-                let window_size = window_size.max(2048).min(65536);
+                let window_size = calculate_power_of_two_window_size(config.sample_rate);
                 
                 spawn_dsp_thread(rx, shared_state_closure.clone(), config.sample_rate, max_frequency, window_size);
 
@@ -1934,8 +1944,7 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
             
             if let Some(mut audio_source) = audio_source_opt.take() {
                 let sample_rate = target_rate;
-                let window_size = (((sample_rate as f32 * 0.185).round() as usize) / 2) * 2;
-                let window_size = window_size.max(2048).min(65536);
+                let window_size = calculate_power_of_two_window_size(sample_rate);
                 let (tx, rx) = bounded::<DspMessage>(32);
                 
                 {
@@ -2166,20 +2175,26 @@ fn run_dummy(
                                             
                                             frame.y_plane.clear();
                                             let y_plane = decoded.data(0);
-                                            if y_len <= y_plane.len() {
-                                                frame.y_plane.extend_from_slice(&y_plane[..y_len]);
+                                            let y_copy_len = y_len.min(y_plane.len());
+                                            frame.y_plane.extend_from_slice(&y_plane[..y_copy_len]);
+                                            if y_copy_len < y_len {
+                                                frame.y_plane.resize(y_len, 0);
                                             }
                                             
                                             frame.u_plane.clear();
                                             let u_plane = decoded.data(1);
-                                            if u_len <= u_plane.len() {
-                                                frame.u_plane.extend_from_slice(&u_plane[..u_len]);
+                                            let u_copy_len = u_len.min(u_plane.len());
+                                            frame.u_plane.extend_from_slice(&u_plane[..u_copy_len]);
+                                            if u_copy_len < u_len {
+                                                frame.u_plane.resize(u_len, 0);
                                             }
                                             
                                             frame.v_plane.clear();
                                             let v_plane = decoded.data(2);
-                                            if v_len <= v_plane.len() {
-                                                frame.v_plane.extend_from_slice(&v_plane[..v_len]);
+                                            let v_copy_len = v_len.min(v_plane.len());
+                                            frame.v_plane.extend_from_slice(&v_plane[..v_copy_len]);
+                                            if v_copy_len < v_len {
+                                                frame.v_plane.resize(v_len, 0);
                                             }
                                             
                                             if let Err(crossbeam_channel::TrySendError::Full(f)) = video_frame_tx.try_send(frame) {
@@ -2813,20 +2828,26 @@ where
                                             
                                             frame.y_plane.clear();
                                             let y_plane = decoded.data(0);
-                                            if y_len <= y_plane.len() {
-                                                frame.y_plane.extend_from_slice(&y_plane[..y_len]);
+                                            let y_copy_len = y_len.min(y_plane.len());
+                                            frame.y_plane.extend_from_slice(&y_plane[..y_copy_len]);
+                                            if y_copy_len < y_len {
+                                                frame.y_plane.resize(y_len, 0);
                                             }
                                             
                                             frame.u_plane.clear();
                                             let u_plane = decoded.data(1);
-                                            if u_len <= u_plane.len() {
-                                                frame.u_plane.extend_from_slice(&u_plane[..u_len]);
+                                            let u_copy_len = u_len.min(u_plane.len());
+                                            frame.u_plane.extend_from_slice(&u_plane[..u_copy_len]);
+                                            if u_copy_len < u_len {
+                                                frame.u_plane.resize(u_len, 0);
                                             }
                                             
                                             frame.v_plane.clear();
                                             let v_plane = decoded.data(2);
-                                            if v_len <= v_plane.len() {
-                                                frame.v_plane.extend_from_slice(&v_plane[..v_len]);
+                                            let v_copy_len = v_len.min(v_plane.len());
+                                            frame.v_plane.extend_from_slice(&v_plane[..v_copy_len]);
+                                            if v_copy_len < v_len {
+                                                frame.v_plane.resize(v_len, 0);
                                             }
                                             
                                             if let Err(crossbeam_channel::TrySendError::Full(f)) = video_frame_tx.try_send(frame) {
@@ -3019,8 +3040,7 @@ where
     T: cpal::Sample + cpal::FromSample<f32> + cpal::SizedSample + Into<f32>,
 {
     let channels = config.channels as usize;
-    let window_size = (((config.sample_rate as f32 * 0.185).round() as usize) / 2) * 2;
-    let window_size = window_size.max(2048).min(65536);
+    let window_size = calculate_power_of_two_window_size(config.sample_rate);
 
     let mut fft_buffer: Vec<f32> = vec![0.0; window_size];
     let mut channel_fft_buffers: Vec<Vec<f32>> = vec![vec![0.0; window_size]; channels];

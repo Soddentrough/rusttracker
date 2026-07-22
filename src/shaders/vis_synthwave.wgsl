@@ -71,8 +71,9 @@ fn terrain_h(wx: f32, wz: f32, dist_z: f32) -> f32 {
 fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
     var out: VertexOutput3D;
     
-    // Calculate camera position
-    let cam_z = audio.history_cam_z; // history-locked: 0.5 world units per history row
+    // Calculate camera position with modulo wrapping to maintain single-precision float accuracy in long sessions
+    let raw_cam_z = audio.history_cam_z;
+    let cam_z = raw_cam_z % 6000.0; // history-locked: 0.5 world units per history row
     
     // Map grid vertex coordinates
     let norm_x = in.position.x / 100.0;
@@ -155,11 +156,12 @@ fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
             acc += mix(sample_bin1, sample_bin2, fract_bin);
         }
         let raw_hit = acc / 8.0;
-        hit_val = clamp(raw_hit * 0.015, 0.0, 1.5);
+        // Calm, smooth, subtle audio elevation (prevents jarring geometric shifts)
+        hit_val = clamp(raw_hit * 0.01, 0.0, 1.0);
         
-        // Elevate the terrain into reactive peaks outside the road limits
+        // Elevate the terrain into gentle reactive hills outside the road limits
         let road_mask = smoothstep(12.0, 30.0, abs(world_x));
-        h += hit_val * 12.0 * road_mask;
+        h += hit_val * 8.0 * road_mask;
     }
     
     let view_pos = vec3<f32>(local_x, h, local_z);
@@ -445,11 +447,13 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     }
     
     // Add street lamps (lighting + volumetric + posts + bulbs)
-    let cam_z = audio.history_cam_z; // history-locked: 0.5 world units per history row
+    let cam_z = audio.history_cam_z % 6000.0; // history-locked: 0.5 world units per history row
     let lamps_color = get_street_lamps(in.world_pos, cam_z, bass_pulse);
     final_color += lamps_color;
     
-    return vec4<f32>(final_color, 1.0);
+    // ACES Film Tone Mapping to prevent HDR highlight blowout on bright streetlamps & grid lines
+    let tonemapped = aces_tonemap(final_color);
+    return vec4<f32>(tonemapped, 1.0);
 }
 
 @vertex
@@ -534,12 +538,14 @@ fn fs_lamp(in: VertexOutput3D) -> @location(0) vec4<f32> {
     }
     
     // Depth fog
-    let cam_z = audio.history_cam_z; // history-locked: 0.5 world units per history row
+    let cam_z = audio.history_cam_z % 6000.0; // history-locked: 0.5 world units per history row
     let dist_to_lamp = in.world_pos.z - cam_z;
     let fog_f = smoothstep(50.0, 220.0, dist_to_lamp);
     let fog_c = vec3<f32>(0.04, 0.0, 0.08);
     let final_color = mix(color, fog_c, fog_f);
     
-    return vec4<f32>(final_color, 1.0);
+    // ACES Film Tone Mapping for instanced street lamps pass
+    let tonemapped = aces_tonemap(final_color);
+    return vec4<f32>(tonemapped, 1.0);
 }
 
