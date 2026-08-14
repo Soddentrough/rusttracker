@@ -52,7 +52,7 @@ jobs:
         sed -i '/AV_CODEC_ID_V410/d' /mingw64/include/libavcodec/codec_id.h || true
         sed -i '/AV_CODEC_ID_V308/d' /mingw64/include/libavcodec/codec_id.h || true
         sed -i '/AV_CODEC_ID_V408/d' /mingw64/include/libavcodec/codec_id.h || true
-        sed -i '/AV_CODEC_ID_V210/a \    AV_CODEC_ID_V410,\n    AV_CODEC_ID_V308,\n    AV_CODEC_ID_V408,' /mingw64/include/libavcodec/codec_id.h || true
+        sed -i '0,/AV_CODEC_ID_V210/s/AV_CODEC_ID_V210/AV_CODEC_ID_V210,\n    AV_CODEC_ID_V410,\n    AV_CODEC_ID_V308,\n    AV_CODEC_ID_V408/' /mingw64/include/libavcodec/codec_id.h || true
         cargo build --release
         
     - name: Package Release
