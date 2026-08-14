@@ -28,17 +28,23 @@ jobs:
           mingw-w64-x86_64-toolchain
           mingw-w64-x86_64-rust
           mingw-w64-x86_64-libopenmpt
-          mingw-w64-x86_64-ffmpeg
           mingw-w64-x86_64-clang
+          mingw-w64-x86_64-pkgconf
+          mingw-w64-x86_64-yasm
+          mingw-w64-x86_64-nasm
+          diffutils
+          git
+          make
           
     - name: Build RustTracker
       env:
-        BINDGEN_EXTRA_CLANG_ARGS: "-target x86_64-pc-windows-gnu"
+        BINDGEN_EXTRA_CLANG_ARGS: "-target x86_64-pc-windows-gnu -I/mingw64/include"
+        PKG_CONFIG_PATH: "/mingw64/lib/pkgconfig"
         CARGO_PROFILE_RELEASE_LTO: "true"
         CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
         CARGO_PROFILE_RELEASE_STRIP: "true"
       run: |
-        cargo build --release
+        cargo build --release --features ffmpeg-next/build,ffmpeg-next/build-license-gpl
         
     - name: Package Release
       run: |
