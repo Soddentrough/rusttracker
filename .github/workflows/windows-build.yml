@@ -42,7 +42,12 @@ jobs:
         CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
         CARGO_PROFILE_RELEASE_STRIP: "true"
       run: |
-        cargo build --release --features ffmpeg-next/non-exhaustive-enums
+        sed -i '/AV_FRAME_DATA_DYNAMIC_HDR_SMPTE_2094_APP5/d' /mingw64/include/libavutil/frame.h || true
+        sed -i '/AV_FRAME_DATA_IAMF_/d' /mingw64/include/libavutil/frame.h || true
+        sed -i '/AV_FRAME_DATA_RAW_COLOR_PARAMS/d' /mingw64/include/libavutil/frame.h || true
+        sed -i '/AV_PKT_DATA_DYNAMIC_HDR_SMPTE_2094_APP5/d' /mingw64/include/libavcodec/packet.h || true
+        sed -i '/AV_PKT_DATA_HEVC_CONF/d' /mingw64/include/libavcodec/packet.h || true
+        cargo build --release
         
     - name: Package Release
       run: |
