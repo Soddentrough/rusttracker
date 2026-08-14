@@ -377,6 +377,300 @@ pub(crate) fn generate_lamp_mesh() -> (Vec<Vertex>, Vec<u32>) {
     (vertices, indices)
 }
 
+fn room_add_quad(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>, p0: [f32; 3], p1: [f32; 3], p2: [f32; 3], p3: [f32; 3], normal: [f32; 3], ch: f32, mat: f32) {
+    let start = vertices.len() as u32;
+    vertices.push(Vertex { position: p0, normal, tex_coords: [ch, mat] });
+    vertices.push(Vertex { position: p1, normal, tex_coords: [ch, mat] });
+    vertices.push(Vertex { position: p2, normal, tex_coords: [ch, mat] });
+    vertices.push(Vertex { position: p3, normal, tex_coords: [ch, mat] });
+    indices.extend_from_slice(&[start, start + 1, start + 2, start, start + 2, start + 3]);
+}
+
+fn room_add_box(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>, center: [f32; 3], size: [f32; 3], rot_y: f32, ch: f32, mat: f32) {
+    let hx = size[0] / 2.0;
+    let hy = size[1] / 2.0;
+    let hz = size[2] / 2.0;
+    let cos_r = rot_y.cos();
+    let sin_r = rot_y.sin();
+
+    let rotate_pt = |p: [f32; 3]| -> [f32; 3] {
+        let rx = p[0] * cos_r + p[2] * sin_r;
+        let rz = -p[0] * sin_r + p[2] * cos_r;
+        [rx + center[0], p[1] + center[1], rz + center[2]]
+    };
+    let rotate_norm = |n: [f32; 3]| -> [f32; 3] {
+        let rx = n[0] * cos_r + n[2] * sin_r;
+        let rz = -n[0] * sin_r + n[2] * cos_r;
+        [rx, n[1], rz]
+    };
+
+    // Front face (+z)
+    room_add_quad(
+        vertices, indices,
+        rotate_pt([-hx, -hy, hz]), rotate_pt([hx, -hy, hz]), rotate_pt([hx, hy, hz]), rotate_pt([-hx, hy, hz]),
+        rotate_norm([0.0, 0.0, 1.0]), ch, mat
+    );
+    // Back face (-z)
+    room_add_quad(
+        vertices, indices,
+        rotate_pt([hx, -hy, -hz]), rotate_pt([-hx, -hy, -hz]), rotate_pt([-hx, hy, -hz]), rotate_pt([hx, hy, -hz]),
+        rotate_norm([0.0, 0.0, -1.0]), ch, mat
+    );
+    // Left face (-x)
+    room_add_quad(
+        vertices, indices,
+        rotate_pt([-hx, -hy, -hz]), rotate_pt([-hx, -hy, hz]), rotate_pt([-hx, hy, hz]), rotate_pt([-hx, hy, -hz]),
+        rotate_norm([-1.0, 0.0, 0.0]), ch, mat
+    );
+    // Right face (+x)
+    room_add_quad(
+        vertices, indices,
+        rotate_pt([hx, -hy, hz]), rotate_pt([hx, -hy, -hz]), rotate_pt([hx, hy, -hz]), rotate_pt([hx, hy, hz]),
+        rotate_norm([1.0, 0.0, 0.0]), ch, mat
+    );
+    // Top face (+y)
+    room_add_quad(
+        vertices, indices,
+        rotate_pt([-hx, hy, hz]), rotate_pt([hx, hy, hz]), rotate_pt([hx, hy, -hz]), rotate_pt([-hx, hy, -hz]),
+        rotate_norm([0.0, 1.0, 0.0]), ch, mat
+    );
+    // Bottom face (-y)
+    room_add_quad(
+        vertices, indices,
+        rotate_pt([-hx, -hy, -hz]), rotate_pt([hx, -hy, -hz]), rotate_pt([hx, -hy, hz]), rotate_pt([-hx, -hy, hz]),
+        rotate_norm([0.0, -1.0, 0.0]), ch, mat
+    );
+}
+
+fn room_add_cone(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>, center: [f32; 3], radius: f32, depth: f32, rot_y: f32, ch: f32, mat: f32) {
+    let segs = 14;
+    let cos_r = rot_y.cos();
+    let sin_r = rot_y.sin();
+    let rotate_pt = |p: [f32; 3]| -> [f32; 3] {
+        let rx = p[0] * cos_r + p[2] * sin_r;
+        let rz = -p[0] * sin_r + p[2] * cos_r;
+        [rx + center[0], p[1] + center[1], rz + center[2]]
+    };
+    let rotate_norm = |n: [f32; 3]| -> [f32; 3] {
+        let rx = n[0] * cos_r + n[2] * sin_r;
+        let rz = -n[0] * sin_r + n[2] * cos_r;
+        [rx, n[1], rz]
+    };
+
+    let apex = rotate_pt([0.0, 0.0, -depth]);
+    for i in 0..segs {
+        let a0 = (i as f32) / (segs as f32) * std::f32::consts::TAU;
+        let a1 = ((i + 1) as f32) / (segs as f32) * std::f32::consts::TAU;
+        let p0 = rotate_pt([a0.cos() * radius, a0.sin() * radius, 0.0]);
+        let p1 = rotate_pt([a1.cos() * radius, a1.sin() * radius, 0.0]);
+
+        let n = rotate_norm([0.0, 0.0, 1.0]);
+        let start = vertices.len() as u32;
+        vertices.push(Vertex { position: apex, normal: n, tex_coords: [ch, mat] });
+        vertices.push(Vertex { position: p0, normal: n, tex_coords: [ch, mat] });
+        vertices.push(Vertex { position: p1, normal: n, tex_coords: [ch, mat] });
+        indices.extend_from_slice(&[start, start + 1, start + 2]);
+
+        // Emissive halo ring
+        let r_out = radius * 1.16;
+        let p0_out = rotate_pt([a0.cos() * r_out, a0.sin() * r_out, 0.015]);
+        let p1_out = rotate_pt([a1.cos() * r_out, a1.sin() * r_out, 0.015]);
+        room_add_quad(vertices, indices, p0, p1, p1_out, p0_out, n, ch, 5.0);
+    }
+}
+
+fn room_add_speaker_tower(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>, pos: [f32; 3], rot_y: f32, ch: f32, is_tower: bool) {
+    if is_tower {
+        // Pedestal base & Cabinet
+        room_add_box(vertices, indices, [pos[0], pos[1] - 0.7, pos[2]], [0.95, 0.12, 1.05], rot_y, ch, 1.0);
+        room_add_box(vertices, indices, pos, [0.80, 2.2, 0.90], rot_y, ch, 1.0);
+
+        // Baffle front face is at offset +0.45 in local Z
+        let cos_r = rot_y.cos();
+        let sin_r = rot_y.sin();
+        let local_to_world = |lx: f32, ly: f32, lz: f32| -> [f32; 3] {
+            let rx = lx * cos_r + lz * sin_r;
+            let rz = -lx * sin_r + lz * cos_r;
+            [rx + pos[0], ly + pos[1], rz + pos[2]]
+        };
+
+        // Lower Bass Woofer (mat = 2.0)
+        room_add_cone(vertices, indices, local_to_world(0.0, -0.45, 0.46), 0.28, 0.12, rot_y, ch, 2.0);
+        // Midrange Cone (mat = 3.0)
+        room_add_cone(vertices, indices, local_to_world(0.0, 0.25, 0.46), 0.19, 0.08, rot_y, ch, 3.0);
+        // Tweeter Dome (mat = 4.0)
+        room_add_cone(vertices, indices, local_to_world(0.0, 0.72, 0.46), 0.09, 0.03, rot_y, ch, 4.0);
+
+        // Decorative vertical neon accent strip on cabinet sides
+        room_add_box(vertices, indices, local_to_world(-0.41, 0.0, 0.0), [0.03, 2.0, 0.03], rot_y, ch, 5.0);
+        room_add_box(vertices, indices, local_to_world(0.41, 0.0, 0.0), [0.03, 2.0, 0.03], rot_y, ch, 5.0);
+    } else {
+        // Stand-mounted surround monitor
+        // Stand pole
+        room_add_box(vertices, indices, [pos[0], pos[1] - 0.9, pos[2]], [0.08, 1.6, 0.08], rot_y, ch, 1.0);
+        room_add_box(vertices, indices, [pos[0], pos[1] - 1.7, pos[2]], [0.7, 0.06, 0.7], rot_y, ch, 1.0);
+        // Monitor box
+        room_add_box(vertices, indices, pos, [0.65, 1.1, 0.65], rot_y, ch, 1.0);
+
+        let cos_r = rot_y.cos();
+        let sin_r = rot_y.sin();
+        let local_to_world = |lx: f32, ly: f32, lz: f32| -> [f32; 3] {
+            let rx = lx * cos_r + lz * sin_r;
+            let rz = -lx * sin_r + lz * cos_r;
+            [rx + pos[0], ly + pos[1], rz + pos[2]]
+        };
+        // Woofer
+        room_add_cone(vertices, indices, local_to_world(0.0, -0.15, 0.33), 0.22, 0.09, rot_y, ch, 2.0);
+        // Tweeter
+        room_add_cone(vertices, indices, local_to_world(0.0, 0.32, 0.33), 0.08, 0.03, rot_y, ch, 4.0);
+        // Neon perimeter halo
+        room_add_box(vertices, indices, local_to_world(0.0, -0.56, 0.0), [0.66, 0.03, 0.66], rot_y, ch, 5.0);
+    }
+}
+
+pub(crate) fn generate_neon_room_mesh() -> (Vec<Vertex>, Vec<u32>) {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+
+    // 1. FLOOR & STAGE (mat = 0.0)
+    room_add_quad(
+        &mut vertices, &mut indices,
+        [-11.0, -1.6, 9.0], [11.0, -1.6, 9.0], [11.0, -1.6, -9.0], [-11.0, -1.6, -9.0],
+        [0.0, 1.0, 0.0], 0.0, 0.0
+    );
+
+    // Front stage platform riser
+    room_add_box(&mut vertices, &mut indices, [0.0, -1.48, 6.2], [10.5, 0.24, 4.8], 0.0, 0.0, 1.0);
+    // Neon edge along stage riser
+    room_add_box(&mut vertices, &mut indices, [0.0, -1.35, 3.8], [10.6, 0.04, 0.04], 0.0, 3.0, 5.0);
+
+    // 2. WALLS & CEILING (mat = 0.5)
+    // Back acoustic wall (+Z)
+    room_add_quad(
+        &mut vertices, &mut indices,
+        [-11.0, -1.6, 9.0], [-11.0, 5.0, 9.0], [11.0, 5.0, 9.0], [11.0, -1.6, 9.0],
+        [0.0, 0.0, -1.0], 0.0, 0.5
+    );
+    // Rear studio wall (-Z)
+    room_add_quad(
+        &mut vertices, &mut indices,
+        [11.0, -1.6, -9.0], [11.0, 5.0, -9.0], [-11.0, 5.0, -9.0], [-11.0, -1.6, -9.0],
+        [0.0, 0.0, 1.0], 0.0, 0.5
+    );
+    // Left wall (-X)
+    room_add_quad(
+        &mut vertices, &mut indices,
+        [-11.0, -1.6, -9.0], [-11.0, 5.0, -9.0], [-11.0, 5.0, 9.0], [-11.0, -1.6, 9.0],
+        [1.0, 0.0, 0.0], 0.0, 0.5
+    );
+    // Right wall (+X)
+    room_add_quad(
+        &mut vertices, &mut indices,
+        [11.0, -1.6, 9.0], [11.0, 5.0, 9.0], [11.0, 5.0, -9.0], [11.0, -1.6, -9.0],
+        [-1.0, 0.0, 0.0], 0.0, 0.5
+    );
+    // Ceiling (+Y)
+    room_add_quad(
+        &mut vertices, &mut indices,
+        [-11.0, 5.0, -9.0], [11.0, 5.0, -9.0], [11.0, 5.0, 9.0], [-11.0, 5.0, 9.0],
+        [0.0, -1.0, 0.0], 0.0, 0.5
+    );
+
+    // 3. ACOUSTIC DIFFUSER SLATS (mat = 6.0) on back wall
+    for i in 0..14 {
+        let x = -6.5 + (i as f32) * 1.0;
+        let depth_offset = ((i * 7 + 3) % 5) as f32 * 0.06;
+        room_add_box(&mut vertices, &mut indices, [x, 1.6, 8.8 - depth_offset], [0.55, 4.2, 0.15 + depth_offset], 0.0, 0.0, 6.0);
+    }
+
+    // Rear studio control room observation window & diffusers
+    // Soundproof glass observation pane (mat = 7.0)
+    room_add_quad(
+        &mut vertices, &mut indices,
+        [-4.5, 0.4, -8.85], [-4.5, 3.4, -8.85], [4.5, 3.4, -8.85], [4.5, 0.4, -8.85],
+        [0.0, 0.0, 1.0], 6.0, 7.0
+    );
+    // Window neon illuminated perimeter frame
+    room_add_box(&mut vertices, &mut indices, [0.0, 3.45, -8.82], [9.2, 0.08, 0.08], 0.0, 6.0, 5.0);
+    room_add_box(&mut vertices, &mut indices, [0.0, 0.35, -8.82], [9.2, 0.08, 0.08], 0.0, 7.0, 5.0);
+    room_add_box(&mut vertices, &mut indices, [-4.55, 1.9, -8.82], [0.08, 3.1, 0.08], 0.0, 6.0, 5.0);
+    room_add_box(&mut vertices, &mut indices, [4.55, 1.9, -8.82], [0.08, 3.1, 0.08], 0.0, 7.0, 5.0);
+
+    // Rear flank acoustic diffuser panels
+    for i in 0..4 {
+        let x_left = -8.8 + (i as f32) * 0.9;
+        let x_right = 6.1 + (i as f32) * 0.9;
+        let depth_offset = ((i * 5 + 2) % 4) as f32 * 0.05;
+        room_add_box(&mut vertices, &mut indices, [x_left, 1.6, -8.8 + depth_offset], [0.5, 3.6, 0.12 + depth_offset], 0.0, 6.0, 6.0);
+        room_add_box(&mut vertices, &mut indices, [x_right, 1.6, -8.8 + depth_offset], [0.5, 3.6, 0.12 + depth_offset], 0.0, 7.0, 6.0);
+    }
+
+    // Side acoustic panels with illuminated neon perimeter backlights
+    for i in 0..4 {
+        let z = -4.5 + (i as f32) * 3.0;
+        // Left side panel + halo
+        room_add_box(&mut vertices, &mut indices, [-10.8, 1.2, z], [0.18, 2.4, 1.8], 0.0, 4.0, 6.0);
+        room_add_box(&mut vertices, &mut indices, [-10.85, 1.2, z], [0.06, 2.5, 1.9], 0.0, 4.0, 5.0);
+
+        // Right side panel + halo
+        room_add_box(&mut vertices, &mut indices, [10.8, 1.2, z], [0.18, 2.4, 1.8], 0.0, 5.0, 6.0);
+        room_add_box(&mut vertices, &mut indices, [10.85, 1.2, z], [0.06, 2.5, 1.9], 0.0, 5.0, 5.0);
+    }
+
+    // Overhead neon rail trusses
+    room_add_box(&mut vertices, &mut indices, [0.0, 4.8, 4.0], [21.0, 0.08, 0.08], 0.0, 0.0, 5.0);
+    room_add_box(&mut vertices, &mut indices, [0.0, 4.8, -3.0], [21.0, 0.08, 0.08], 0.0, 6.0, 5.0);
+    room_add_box(&mut vertices, &mut indices, [-8.0, 4.8, 0.0], [0.08, 0.08, 16.0], 0.0, 4.0, 5.0);
+    room_add_box(&mut vertices, &mut indices, [8.0, 4.8, 0.0], [0.08, 0.08, 16.0], 0.0, 5.0, 5.0);
+
+    // 4. SPATIAL SPEAKERS (7.1.4 Surround Placement)
+    // Channel 0: Front Left (Tower)
+    room_add_speaker_tower(&mut vertices, &mut indices, [-3.8, -0.25, 5.5], -0.42, 0.0, true);
+    // Channel 1: Front Right (Tower)
+    room_add_speaker_tower(&mut vertices, &mut indices, [3.8, -0.25, 5.5], 0.42, 1.0, true);
+
+    // Channel 2: Center Channel (Horizontal Cabinet on Riser)
+    room_add_box(&mut vertices, &mut indices, [0.0, -0.85, 6.8], [1.7, 0.55, 0.65], 0.0, 2.0, 1.0);
+    room_add_cone(&mut vertices, &mut indices, [-0.52, -0.85, 7.13], 0.18, 0.07, 0.0, 2.0, 3.0);
+    room_add_cone(&mut vertices, &mut indices, [0.52, -0.85, 7.13], 0.18, 0.07, 0.0, 2.0, 3.0);
+    room_add_cone(&mut vertices, &mut indices, [0.0, -0.85, 7.13], 0.09, 0.03, 0.0, 2.0, 4.0);
+    room_add_box(&mut vertices, &mut indices, [0.0, -1.14, 6.8], [1.75, 0.03, 0.68], 0.0, 2.0, 5.0);
+
+    // Channel 3: Massive LFE Dual Subwoofer
+    room_add_box(&mut vertices, &mut indices, [0.0, -1.05, 5.2], [2.4, 0.85, 1.1], 0.0, 3.0, 1.0);
+    room_add_cone(&mut vertices, &mut indices, [-0.62, -1.05, 5.76], 0.36, 0.16, 0.0, 3.0, 2.0);
+    room_add_cone(&mut vertices, &mut indices, [0.62, -1.05, 5.76], 0.36, 0.16, 0.0, 3.0, 2.0);
+    // Subwoofer bass reflex port & neon trim
+    room_add_box(&mut vertices, &mut indices, [0.0, -0.75, 5.76], [0.35, 0.08, 0.05], 0.0, 3.0, 5.0);
+    room_add_box(&mut vertices, &mut indices, [0.0, -1.48, 5.2], [2.45, 0.04, 1.15], 0.0, 3.0, 5.0);
+
+    // Channel 4: Surround Left (Stand Monitor)
+    room_add_speaker_tower(&mut vertices, &mut indices, [-6.2, 0.5, 0.5], -1.42, 4.0, false);
+    // Channel 5: Surround Right (Stand Monitor)
+    room_add_speaker_tower(&mut vertices, &mut indices, [6.2, 0.5, 0.5], 1.42, 5.0, false);
+
+    // Channel 6: Rear Left (Rear Surround Tower)
+    room_add_speaker_tower(&mut vertices, &mut indices, [-4.2, 0.1, -4.8], -2.65, 6.0, true);
+    // Channel 7: Rear Right (Rear Surround Tower)
+    room_add_speaker_tower(&mut vertices, &mut indices, [4.2, 0.1, -4.8], 2.65, 7.0, true);
+
+    // Channels 8..11: Overhead Ceiling Atmos Height Speakers
+    // Top Front Left (8)
+    room_add_box(&mut vertices, &mut indices, [-3.2, 4.3, 3.5], [0.65, 0.45, 0.65], 0.0, 8.0, 1.0);
+    room_add_cone(&mut vertices, &mut indices, [-3.2, 4.05, 3.5], 0.20, 0.08, 0.0, 8.0, 2.0);
+    // Top Front Right (9)
+    room_add_box(&mut vertices, &mut indices, [3.2, 4.3, 3.5], [0.65, 0.45, 0.65], 0.0, 9.0, 1.0);
+    room_add_cone(&mut vertices, &mut indices, [3.2, 4.05, 3.5], 0.20, 0.08, 0.0, 9.0, 2.0);
+    // Top Rear Left (10)
+    room_add_box(&mut vertices, &mut indices, [-3.2, 4.3, -2.5], [0.65, 0.45, 0.65], 0.0, 10.0, 1.0);
+    room_add_cone(&mut vertices, &mut indices, [-3.2, 4.05, -2.5], 0.20, 0.08, 0.0, 10.0, 2.0);
+    // Top Rear Right (11)
+    room_add_box(&mut vertices, &mut indices, [3.2, 4.3, -2.5], [0.65, 0.45, 0.65], 0.0, 11.0, 1.0);
+    room_add_cone(&mut vertices, &mut indices, [3.2, 4.05, -2.5], 0.20, 0.08, 0.0, 11.0, 2.0);
+
+    (vertices, indices)
+}
+
 impl VulkanEngine {
     pub async fn new(window: Arc<Window>) -> Self {
         let size = window.inner_size();
@@ -750,6 +1044,7 @@ impl VulkanEngine {
                 19 => include_str!("shaders/vis_bioluminescence.wgsl"),
                 20 => include_str!("shaders/vis_3doscilloscope_raster.wgsl"),
                 21 => include_str!("shaders/vis_matrix.wgsl"),
+                22 => include_str!("shaders/vis_neon_room.wgsl"),
                 _ => include_str!("shaders/vis_spectrum.wgsl"),
             }
         };
@@ -1902,6 +2197,7 @@ impl VulkanEngine {
                     
                     (vertices, indices)
                 }
+                crate::state::Geometry::NeonRoom => generate_neon_room_mesh(),
             };
             
             let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -3180,14 +3476,14 @@ impl VulkanEngine {
                     bg_painter.add(egui::Shape::convex_polygon(
                         vec![p1, p2, p3],
                         egui::Color32::from_rgb(27, 27, 58),
-                        egui::Stroke::new(1.0, egui::Color32::from_rgb(91, 50, 212)),
+                        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(91, 50, 212)),
                     ));
                     
                     // Center ridge
                     let ridge_offset = (pseudo_rand(i * 17 + 3) - 0.5) * 0.4;
                     bg_painter.line_segment(
                         [p3, egui::pos2(cx + width * ridge_offset, cy)],
-                        egui::Stroke::new(1.0, egui::Color32::from_rgb(91, 50, 212))
+                        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(91, 50, 212))
                     );
                 }
 
@@ -3211,7 +3507,7 @@ impl VulkanEngine {
                     
                     bg_painter.line_segment(
                         [egui::pos2(center_x, horizon_y), egui::pos2(bottom_x, rect.bottom())],
-                        egui::Stroke::new(1.0, grid_color)
+                        egui::Stroke::new(1.0_f32, grid_color)
                     );
                 }
                 
@@ -3468,11 +3764,11 @@ impl VulkanEngine {
                                                     .strong()
                                             )
                                             .fill(egui::Color32::from_rgb(0, 100, 200))
-                                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(80, 180, 255)));
+                                            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(80, 180, 255)));
                                             
                                             let resp1 = ui.add_sized([300.0, 60.0], btn);
                                             if resp1.has_focus() {
-                                                ui.painter().rect(resp1.rect.expand(2.0), 6.0, egui::Color32::TRANSPARENT, egui::Stroke::new(3.0, egui::Color32::YELLOW), egui::StrokeKind::Outside);
+                                                ui.painter().rect(resp1.rect.expand(2.0), 6.0, egui::Color32::TRANSPARENT, egui::Stroke::new(3.0_f32, egui::Color32::YELLOW), egui::StrokeKind::Outside);
                                             }
                                             if resp1.clicked() {
                                                 engine_action = EngineAction::OpenFile;
@@ -3487,11 +3783,11 @@ impl VulkanEngine {
                                                     .strong()
                                             )
                                             .fill(egui::Color32::from_rgb(100, 50, 150))
-                                            .stroke(egui::Stroke::new(1.0, egui::Color32::from_rgb(180, 80, 255)));
+                                            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(180, 80, 255)));
                                             
                                             let resp2 = ui.add_sized([300.0, 60.0], url_btn);
                                             if resp2.has_focus() {
-                                                ui.painter().rect(resp2.rect.expand(2.0), 6.0, egui::Color32::TRANSPARENT, egui::Stroke::new(3.0, egui::Color32::YELLOW), egui::StrokeKind::Outside);
+                                                ui.painter().rect(resp2.rect.expand(2.0), 6.0, egui::Color32::TRANSPARENT, egui::Stroke::new(3.0_f32, egui::Color32::YELLOW), egui::StrokeKind::Outside);
                                             }
                                             if resp2.clicked() {
                                                 engine_action = EngineAction::OpenUrlDialog;

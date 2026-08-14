@@ -70,6 +70,7 @@ impl std::fmt::Debug for VideoFrame {
 pub enum Geometry {
     Grid { width: u32, depth: u32 },
     UnitBox,
+    NeonRoom,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -118,6 +119,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
     VisualizerDef { id: 18, name: "Retro VU Meters", filename: "vis_vumeters.wgsl", description: "3D retro VU meters with warm glow and analog needle ballistics", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 19, name: "Bioluminescent Waves", filename: "vis_bioluminescence.wgsl", description: "GPU compute-driven bioluminescent particle waves", pipeline_type: PipelineType::Mesh3D { geometry: Geometry::UnitBox, instances: 65536 }, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 21, name: "Matrix Digital Rain", filename: "vis_matrix.wgsl", description: "Audio-reactive 3D parallax digital rain", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
+    VisualizerDef { id: 22, name: "Neon Spatial Room", filename: "vis_neon_room.wgsl", description: "3D interactive spatial listening room with multi-channel speakers", pipeline_type: PipelineType::Mesh3D { geometry: Geometry::NeonRoom, instances: 1 }, requires_history: false, requires_fire: true, requires_resynth: false, requires_ferrofluidsim: false },
 ];
 
 #[derive(Debug, Clone)]

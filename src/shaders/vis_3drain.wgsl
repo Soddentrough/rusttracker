@@ -55,7 +55,7 @@ fn draw_projected_segment(p: vec2<f32>, pA: vec3<f32>, pB: vec3<f32>, thickness_
     let d = sd_segment(p, pA.xy, pB.xy);
     let depth = max(0.4, max(pA.z, pB.z));
     let thickness = thickness_base / depth;
-    let core = smoothstep(thickness * 0.5, 0.0, d);
+    let core = smoothstep_r(thickness * 0.5, 0.0, d);
     let glow_radius = select(60.0, 120.0, is_branch); // Branches have a tighter, less intense glow
     let glow_mult = select(0.7, 0.3, is_branch);
     let glow = exp(-d * glow_radius) * glow_mult;
