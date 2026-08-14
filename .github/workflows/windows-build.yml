@@ -49,6 +49,7 @@ jobs:
         sed -i '/AV_PKT_DATA_HEVC_CONF/d' /mingw64/include/libavcodec/packet.h || true
         sed -i '/uint8_t max_lowres;/a \    const AVRational *supported_framerates;\n    const enum AVPixelFormat *pix_fmts;\n    const int *supported_samplerates;\n    const enum AVSampleFormat *sample_fmts;\n    const struct AVChannelLayout *ch_layouts;' /mingw64/include/libavcodec/codec.h || true
         sed -i '/uint8_t max_lowres;/a \    const AVRational *supported_framerates;\n    const enum AVPixelFormat *pix_fmts;\n    const int *supported_samplerates;\n    const enum AVSampleFormat *sample_fmts;\n    const struct AVChannelLayout *ch_layouts;' /mingw64/include/libavcodec/avcodec.h || true
+        sed -i '/AV_CODEC_ID_V210/a \    AV_CODEC_ID_V410,\n    AV_CODEC_ID_V308,\n    AV_CODEC_ID_V408,' /mingw64/include/libavcodec/codec_id.h || true
         cargo build --release
         
     - name: Package Release
