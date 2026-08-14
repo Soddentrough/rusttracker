@@ -54,20 +54,20 @@ if __name__ == '__main__':
         print("ERROR: Could not locate FFmpeg include directory!")
         sys.exit(1)
 
-    # 1. Patch frame.h
+    # 1. Patch frame.h: remove unsupported development side data enums
     filter_lines(os.path.join(inc_dir, 'libavutil', 'frame.h'), [
         'AV_FRAME_DATA_DYNAMIC_HDR_SMPTE_2094_APP5',
         'AV_FRAME_DATA_IAMF_',
         'AV_FRAME_DATA_RAW_COLOR_PARAMS',
     ])
 
-    # 2. Patch packet.h
+    # 2. Patch packet.h: remove unsupported development packet side data enums
     filter_lines(os.path.join(inc_dir, 'libavcodec', 'packet.h'), [
         'AV_PKT_DATA_DYNAMIC_HDR_SMPTE_2094_APP5',
         'AV_PKT_DATA_HEVC_CONF',
     ])
 
-    # 3. Patch codec.h & avcodec.h
+    # 3. Patch codec.h & avcodec.h: restore legacy AVCodec fields
     avcodec_fields = '''    const AVRational *supported_framerates;
     const enum AVPixelFormat *pix_fmts;
     const int *supported_samplerates;
@@ -77,11 +77,13 @@ if __name__ == '__main__':
     insert_after(os.path.join(inc_dir, 'libavcodec', 'codec.h'), 'uint8_t max_lowres;', avcodec_fields)
     insert_after(os.path.join(inc_dir, 'libavcodec', 'avcodec.h'), 'uint8_t max_lowres;', avcodec_fields)
 
-    # 4. Patch codec_id.h
+    # 4. Patch codec_id.h: ensure legacy codec IDs exist and remove unreleased new codec IDs
     filter_lines(os.path.join(inc_dir, 'libavcodec', 'codec_id.h'), [
         'AV_CODEC_ID_V410',
         'AV_CODEC_ID_V308',
         'AV_CODEC_ID_V408',
+        'AV_CODEC_ID_WEBP_ANIM',
+        'AV_CODEC_ID_APPLE_APAC',
     ])
     insert_after(os.path.join(inc_dir, 'libavcodec', 'codec_id.h'), 'AV_CODEC_ID_V210,', '''    AV_CODEC_ID_V410,
     AV_CODEC_ID_V308,
