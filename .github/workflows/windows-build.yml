@@ -47,6 +47,8 @@ jobs:
         sed -i '/AV_FRAME_DATA_RAW_COLOR_PARAMS/d' /mingw64/include/libavutil/frame.h || true
         sed -i '/AV_PKT_DATA_DYNAMIC_HDR_SMPTE_2094_APP5/d' /mingw64/include/libavcodec/packet.h || true
         sed -i '/AV_PKT_DATA_HEVC_CONF/d' /mingw64/include/libavcodec/packet.h || true
+        sed -i '/uint8_t max_lowres;/a \    const AVRational *supported_framerates;\n    const enum AVPixelFormat *pix_fmts;\n    const int *supported_samplerates;\n    const enum AVSampleFormat *sample_fmts;\n    const struct AVChannelLayout *ch_layouts;' /mingw64/include/libavcodec/codec.h || true
+        sed -i '/uint8_t max_lowres;/a \    const AVRational *supported_framerates;\n    const enum AVPixelFormat *pix_fmts;\n    const int *supported_samplerates;\n    const enum AVSampleFormat *sample_fmts;\n    const struct AVChannelLayout *ch_layouts;' /mingw64/include/libavcodec/avcodec.h || true
         cargo build --release
         
     - name: Package Release
