@@ -42,17 +42,7 @@ jobs:
         CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
         CARGO_PROFILE_RELEASE_STRIP: "true"
       run: |
-        sed -i '/AV_FRAME_DATA_DYNAMIC_HDR_SMPTE_2094_APP5/d' /mingw64/include/libavutil/frame.h || true
-        sed -i '/AV_FRAME_DATA_IAMF_/d' /mingw64/include/libavutil/frame.h || true
-        sed -i '/AV_FRAME_DATA_RAW_COLOR_PARAMS/d' /mingw64/include/libavutil/frame.h || true
-        sed -i '/AV_PKT_DATA_DYNAMIC_HDR_SMPTE_2094_APP5/d' /mingw64/include/libavcodec/packet.h || true
-        sed -i '/AV_PKT_DATA_HEVC_CONF/d' /mingw64/include/libavcodec/packet.h || true
-        sed -i '/uint8_t max_lowres;/a \    const AVRational *supported_framerates;\n    const enum AVPixelFormat *pix_fmts;\n    const int *supported_samplerates;\n    const enum AVSampleFormat *sample_fmts;\n    const struct AVChannelLayout *ch_layouts;' /mingw64/include/libavcodec/codec.h || true
-        sed -i '/uint8_t max_lowres;/a \    const AVRational *supported_framerates;\n    const enum AVPixelFormat *pix_fmts;\n    const int *supported_samplerates;\n    const enum AVSampleFormat *sample_fmts;\n    const struct AVChannelLayout *ch_layouts;' /mingw64/include/libavcodec/avcodec.h || true
-        sed -i '/AV_CODEC_ID_V410/d' /mingw64/include/libavcodec/codec_id.h || true
-        sed -i '/AV_CODEC_ID_V308/d' /mingw64/include/libavcodec/codec_id.h || true
-        sed -i '/AV_CODEC_ID_V408/d' /mingw64/include/libavcodec/codec_id.h || true
-        sed -i '0,/AV_CODEC_ID_V210/s/AV_CODEC_ID_V210/AV_CODEC_ID_V210,\n    AV_CODEC_ID_V410,\n    AV_CODEC_ID_V308,\n    AV_CODEC_ID_V408/' /mingw64/include/libavcodec/codec_id.h || true
+        python3 scripts/patch_msys2_headers.py
         cargo build --release
         
     - name: Package Release
