@@ -523,12 +523,6 @@ impl AndroidRustTrackerApp {
             TouchGesture::SingleTap { x, y } => {
                 let is_portrait = window_width < window_height;
 
-                // Tapping while in fullscreen video exits back to split view
-                if state.video_mode == 3 {
-                    state.video_mode = 0;
-                    return None;
-                }
-
                 // Check if top right [📂 OPEN] header button was tapped
                 if is_portrait && y < 160.0 && x > window_width * 0.72 {
                     return Some(EngineAction::OpenFile);
@@ -539,7 +533,7 @@ impl AndroidRustTrackerApp {
                     return None;
                 }
 
-                // Single tap toggles Play / Pause
+                // Single tap always toggles Play / Pause
                 state.is_paused = !state.is_paused;
                 state.osd_text = Some(if state.is_paused { "Paused".to_string() } else { "Playing".to_string() });
                 state.osd_timer = 1.5;
