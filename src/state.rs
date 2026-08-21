@@ -8,6 +8,35 @@ pub enum GamepadType {
     SteamDeck,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MobileHudTab {
+    #[default]
+    Channels,
+    Heatmap,
+    Info,
+    Video,
+}
+
+impl MobileHudTab {
+    pub fn next(&self, has_video: bool) -> Self {
+        match self {
+            Self::Channels => Self::Heatmap,
+            Self::Heatmap => Self::Info,
+            Self::Info => if has_video { Self::Video } else { Self::Channels },
+            Self::Video => Self::Channels,
+        }
+    }
+    
+    pub fn prev(&self, has_video: bool) -> Self {
+        match self {
+            Self::Channels => if has_video { Self::Video } else { Self::Info },
+            Self::Heatmap => Self::Channels,
+            Self::Info => Self::Heatmap,
+            Self::Video => Self::Info,
+        }
+    }
+}
+
 #[derive(Clone, Default, Debug)]
 pub struct PerformanceStats {
     pub decode_us: f32,
@@ -184,6 +213,7 @@ pub struct AppState {
     pub tracker_channels: Option<i32>,
     pub load_request: Option<String>,
     pub video_mode: u32,
+    pub has_video_stream: bool,
     pub playlist: Vec<String>,
     pub playlist_index: usize,
     pub passthrough_enabled: bool,
@@ -231,6 +261,7 @@ pub struct AppState {
     pub lyrics: Option<std::sync::Arc<crate::lyrics::Lyrics>>,
     pub hovered_file: Option<String>,
     pub track_info_rect: Option<[f32; 4]>,
+    pub mobile_hud_tab: MobileHudTab,
 }
 
 pub fn get_history_file_path() -> std::path::PathBuf {
@@ -273,6 +304,24 @@ impl AppState {
         }
 
         // Lissajous Laser is now working and fully optimized, so it remains enabled by default.
+
+        #[cfg(target_os = "android")]
+        {
+            // Disable heavy pixel-loop raymarched oscilloscopes and problematic/redundant shaders on mobile
+            let mobile_disabled_ids = [
+                1,  // CRT Oscilloscope (23.8ms on mobile)
+                2,  // 3D CRT Oscilloscope (38.2ms on mobile -> replaced by 3D Oscilloscope Raster at 178 FPS)
+                4,  // 3D Freq Oscilloscope (23.3ms on mobile)
+                11, // Neon Corridor
+                12, // Lissajous Laser
+                17, // 3D Midnight Storm (redundant with Midnight Storm ID 16)
+            ];
+            for id in mobile_disabled_ids {
+                if let Some(idx) = VISUALIZERS.iter().position(|v| v.id == id) {
+                    vis_enabled[idx] = false;
+                }
+            }
+        }
 
         if is_steam_deck {
             // Disabled heavy shaders on Steam Deck to ensure smooth performance
@@ -365,6 +414,7 @@ impl AppState {
             video_frame_rx: None,
             free_video_frame_tx: None,
             video_mode: 0,
+            has_video_stream: false,
             is_file_picker_open: false,
             open_file_request: false,
             is_url_dialog_open: false,
@@ -394,6 +444,7 @@ impl AppState {
             lyrics: None,
             hovered_file: None,
             track_info_rect: None,
+            mobile_hud_tab: MobileHudTab::default(),
         }
     }
     
@@ -447,6 +498,7 @@ impl AppState {
             tracker_channels: self.tracker_channels.clone(),
             load_request: None,
             video_mode: self.video_mode,
+            has_video_stream: self.has_video_stream,
             file_loaded: self.file_loaded,
             video_info: self.video_info.clone(),
             show_stats: self.show_stats,
@@ -492,6 +544,7 @@ impl AppState {
             lyrics: self.lyrics.clone(),
             hovered_file: self.hovered_file.clone(),
             track_info_rect: self.track_info_rect,
+            mobile_hud_tab: self.mobile_hud_tab,
         }
     }
 }

@@ -198,11 +198,10 @@ fn calcNormal(p: vec3<f32>) -> vec3<f32> {
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let uv = in.uv * 2.0 - 1.0;
-    var aspect = 1.7777;
-    let dy = abs(dpdy(in.uv.y));
-    let dx = abs(dpdx(in.uv.x));
-    if (dx > 0.0001 && dy > 0.0001) { aspect = dy / dx; }
-    let p = vec2<f32>(uv.x * aspect, -uv.y);
+    let aspect = audio.aspect_ratio;
+    // Scale UV so the solar sphere fits gracefully in both square and wide aspect ratios
+    let fit_scale = min(aspect / 1.33, 1.0);
+    let p = vec2<f32>(uv.x * aspect, -uv.y) / fit_scale;
 
     setup_flares();
 
@@ -227,26 +226,36 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Flare distance AT the hit point (captured before calcNormal overwrites it)
     var hit_flare_dist = 0.0;
 
-    for (var i = 0; i < MAX_MARCH_STEPS; i++) {
-        let p_current = ro + rd * t;
-        let d = map(p_current, true);
-        
-        let r = length(p_current);
-        if r > BASE_RADIUS + 0.05 {
-            flare_glow += 0.05 / (1.0 + abs(d) * 40.0);
-        } else {
-            glow += 0.05 / (1.0 + abs(d) * 20.0);
-        }
+    let ray_miss_dist = length(cross(ro, rd));
+    if (ray_miss_dist < 5.0) {
+        let t_start = max(0.0, 11.0 - sqrt(max(0.0, 25.0 - ray_miss_dist * ray_miss_dist)));
+        t = t_start;
+        let t_end = 11.0 + sqrt(max(0.0, 25.0 - ray_miss_dist * ray_miss_dist));
 
-        if d < HIT_THRESHOLD {
-            hit = true;
-            final_p = p_current;
-            hit_flare_dist = g_last_flare_dist;
-            break;
-        }
+        for (var i = 0; i < 48; i++) {
+            let p_current = ro + rd * t;
+            let d = map(p_current, true);
+            
+            let r = length(p_current);
+            if (r > BASE_RADIUS + 0.05) {
+                flare_glow += 0.05 / (1.0 + abs(d) * 40.0);
+            } else {
+                glow += 0.05 / (1.0 + abs(d) * 20.0);
+            }
 
-        t += d * 0.95;
-        if t > MAX_MARCH_DIST { break; }
+            if (d < HIT_THRESHOLD) {
+                hit = true;
+                final_p = p_current;
+                hit_flare_dist = g_last_flare_dist;
+                break;
+            }
+
+            t += d * 0.95;
+            if (t > t_end) { break; }
+        }
+    } else {
+        let outer_glow = 1.0 / (1.0 + (ray_miss_dist - 4.5) * 8.0);
+        glow = outer_glow * 0.15;
     }
 
     if hit {

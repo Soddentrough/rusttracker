@@ -1,9 +1,13 @@
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+#[cfg(not(target_os = "android"))]
 use openmpt::module::{Logger, Module};
 use rustfft::{FftPlanner, num_complex::Complex};
 use std::fs::File;
-use std::io::{Cursor, Read};
+#[cfg(not(target_os = "android"))]
+use std::io::Cursor;
+#[allow(unused_imports)]
+use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use symphonia::core::audio::SampleBuffer;
@@ -372,26 +376,33 @@ pub trait AudioSource: Send {
     fn pre_format_tracker_data(&mut self) -> Vec<Vec<String>> { Vec::new() }
     fn get_current_row_string(&mut self) -> String { String::new() }
     fn get_video_info(&mut self) -> Option<String> { None }
+    #[cfg(not(target_os = "android"))]
     fn attach_video_queue(&mut self, _tx: crossbeam_channel::Sender<(u64, ffmpeg_next::Packet)>) {}
+    #[cfg(not(target_os = "android"))]
     fn take_video_parameters(&mut self) -> Option<(ffmpeg_next::codec::Parameters, ffmpeg_next::Rational)> { None }
     fn get_bitrate(&mut self) -> Option<u32> { None }
     fn get_audio_tracks(&self) -> Vec<crate::state::AudioTrackInfo> { Vec::new() }
     fn get_selected_audio_track(&self) -> usize { 0 }
     fn select_audio_track(&mut self, _track_idx: usize) -> Result<()> { Ok(()) }
+    fn has_video_stream(&self) -> bool { false }
 }
 
 // ---------------------------------------------------------
 // OpenMPT Tracker Decoder
 // ---------------------------------------------------------
+#[cfg(not(target_os = "android"))]
 pub struct SafeModule(pub Module);
+#[cfg(not(target_os = "android"))]
 unsafe impl Send for SafeModule {}
 
+#[cfg(not(target_os = "android"))]
 struct OpenMptSource {
     module: SafeModule,
     left_buf: Vec<f32>,
     right_buf: Vec<f32>,
 }
 
+#[cfg(not(target_os = "android"))]
 impl AudioSource for OpenMptSource {
     fn read_frames(&mut self, hardware_channels: usize, sample_rate: u32, output: &mut [f32]) -> usize {
         let frames_to_render = output.len() / hardware_channels;
@@ -832,6 +843,7 @@ struct SymphoniaSource {
     video_info: Option<String>,
     audio_tracks: Vec<crate::state::AudioTrackInfo>,
     selected_track_idx: usize,
+    has_video: bool,
 }
 
 impl AudioSource for SymphoniaSource {
@@ -1003,11 +1015,16 @@ impl AudioSource for SymphoniaSource {
         self.set_position_seconds(self.current_time);
         Ok(())
     }
+
+    fn has_video_stream(&self) -> bool {
+        self.has_video
+    }
 }
 
 // ---------------------------------------------------------
 // FFmpeg Native Decoder
 // ---------------------------------------------------------
+#[cfg(not(target_os = "android"))]
 struct FfmpegSource {
     ictx: ffmpeg_next::format::context::Input,
     decoder: ffmpeg_next::decoder::Audio,
@@ -1037,6 +1054,7 @@ struct FfmpegSource {
     output_sample_rate: u32,
 }
 
+#[cfg(not(target_os = "android"))]
 impl FfmpegSource {
     fn get_next_frame(&mut self) -> bool {
         let mut decoded = ffmpeg_next::frame::Audio::empty();
@@ -1122,6 +1140,7 @@ impl FfmpegSource {
     }
 }
 
+#[cfg(not(target_os = "android"))]
 impl AudioSource for FfmpegSource {
     fn read_frames(&mut self, hardware_channels: usize, sample_rate: u32, output: &mut [f32]) -> usize {
         if sample_rate > 0 {
@@ -1316,11 +1335,16 @@ impl AudioSource for FfmpegSource {
         self.set_position_seconds(self.current_time);
         Ok(())
     }
+
+    fn has_video_stream(&self) -> bool {
+        self.video_stream_index.is_some()
+    }
 }
 
 // ---------------------------------------------------------
 // Video Only Source (No Audio)
 // ---------------------------------------------------------
+#[cfg(not(target_os = "android"))]
 struct VideoOnlySource {
     ictx: ffmpeg_next::format::context::Input,
     video_stream_index: usize,
@@ -1334,6 +1358,41 @@ struct VideoOnlySource {
     ext_type: String,
 }
 
+#[cfg(target_os = "android")]
+struct AndroidVideoOnlySource {
+    current_time: f64,
+    duration: f64,
+}
+
+#[cfg(target_os = "android")]
+impl AudioSource for AndroidVideoOnlySource {
+    fn read_frames(&mut self, hardware_channels: usize, sample_rate: u32, output: &mut [f32]) -> usize {
+        let frames_to_write = output.len() / hardware_channels;
+        for v in output.iter_mut() {
+            *v = 0.0;
+        }
+        self.current_time += frames_to_write as f64 / sample_rate as f64;
+        frames_to_write
+    }
+    fn get_duration_seconds(&mut self) -> f64 { self.duration }
+    fn get_position_seconds(&mut self) -> f64 { self.current_time }
+    fn set_position_seconds(&mut self, pos: f64) { self.current_time = pos; }
+    fn get_num_channels(&mut self) -> i32 { 2 }
+    fn get_current_channel_vu_mono(&mut self, _channel: i32) -> f32 { 0.0 }
+    fn get_artist(&mut self) -> String { "Video Stream".to_string() }
+    fn get_type(&mut self) -> String { "Video".to_string() }
+    fn get_tempo(&mut self) -> i32 { 0 }
+    fn get_speed(&mut self) -> i32 { 0 }
+    fn get_intrinsic_sample_rate(&mut self) -> Option<u32> { Some(48000) }
+    fn get_num_samples(&mut self) -> i32 { 0 }
+    fn get_num_instruments(&mut self) -> i32 { 0 }
+    fn get_num_patterns(&mut self) -> i32 { 0 }
+    fn get_current_order(&mut self) -> i32 { 0 }
+    fn get_current_row(&mut self) -> i32 { 0 }
+    fn has_video_stream(&self) -> bool { true }
+}
+
+#[cfg(not(target_os = "android"))]
 impl AudioSource for VideoOnlySource {
     fn read_frames(&mut self, hardware_channels: usize, sample_rate: u32, output: &mut [f32]) -> usize {
         let frames_to_write = output.len() / hardware_channels;
@@ -1408,8 +1467,13 @@ impl AudioSource for VideoOnlySource {
             None
         }
     }
+
+    fn has_video_stream(&self) -> bool {
+        true
+    }
 }
 
+#[cfg(not(target_os = "android"))]
 fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>> {
     let _ = ffmpeg_next::init();
     let mut dict = ffmpeg_next::Dictionary::new();
@@ -1608,7 +1672,48 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
 }
 
 
-fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(file: R, probe_ext: &str, display_ext: &str, video_info: Option<String>) -> Result<Box<dyn AudioSource>> {
+/// Helper to extract human-readable track names (e.g. "Instrumental (Karaoke)", "Vocals (Guide)")
+/// from ISO-BMFF / MP4 containers when present in `udta.name` or `name` atoms.
+pub fn extract_mp4_track_names(path: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    if let Ok(mut file) = std::fs::File::open(path) {
+        use std::io::Read;
+        // Limit to first 2MB which contains the moov/trak/udta metadata atoms
+        let mut data = vec![0u8; 2 * 1024 * 1024];
+        let bytes_read = file.read(&mut data).unwrap_or(0);
+        data.truncate(bytes_read);
+
+        let name_marker = b"name";
+        let mut i = 0;
+        while i + 8 < data.len() {
+            if &data[i..i+4] == name_marker {
+                let start = i + 4;
+                let mut end = start;
+                while end < data.len() && end < start + 64 && data[end] >= 0x20 && data[end] <= 0x7E {
+                    end += 1;
+                }
+                if end > start + 2 {
+                    if let Ok(name_str) = std::str::from_utf8(&data[start..end]) {
+                        let trimmed = name_str.trim();
+                        if !trimmed.is_empty() && !names.contains(&trimmed.to_string()) {
+                            names.push(trimmed.to_string());
+                        }
+                    }
+                }
+            }
+            i += 1;
+        }
+    }
+    names
+}
+
+fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(
+    file: R,
+    probe_ext: &str,
+    display_ext: &str,
+    video_info: Option<String>,
+    file_path: Option<&str>,
+) -> Result<Box<dyn AudioSource>> {
     let mss = MediaSourceStream::new(Box::new(file), Default::default());
     let mut hint = Hint::new();
     hint.with_extension(probe_ext);
@@ -1619,14 +1724,37 @@ fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(file: R, probe_e
 
     let format = probed.format;
     
+    let mp4_track_names = if let Some(p) = file_path {
+        if p.to_lowercase().ends_with(".mp4") || p.to_lowercase().ends_with(".m4a") || p.to_lowercase().ends_with(".mov") {
+            extract_mp4_track_names(p)
+        } else {
+            Vec::new()
+        }
+    } else {
+        Vec::new()
+    };
+
+    let has_video = format.tracks().iter().any(|t| {
+        t.codec_params.codec == symphonia::core::codecs::CODEC_TYPE_NULL
+    }) || probe_ext == "mp4" || probe_ext == "mkv" || probe_ext == "webm" || probe_ext == "mov" || probe_ext == "avi";
+
     let mut audio_tracks = Vec::new();
     let mut selected_track = None;
     let mut selected_track_idx = 0;
+    let mut audio_track_count = 0;
 
     for track in format.tracks().iter() {
         if track.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL && 
            symphonia::default::get_codecs().make(&track.codec_params, &DecoderOptions::default()).is_ok() {
-            let codec_name = format!("{:?}", track.codec_params.codec);
+            let codec_name = match track.codec_params.codec {
+                symphonia::core::codecs::CODEC_TYPE_AAC => "AAC".to_string(),
+                symphonia::core::codecs::CODEC_TYPE_MP3 => "MP3".to_string(),
+                symphonia::core::codecs::CODEC_TYPE_FLAC => "FLAC".to_string(),
+                symphonia::core::codecs::CODEC_TYPE_VORBIS => "Vorbis".to_string(),
+                symphonia::core::codecs::CODEC_TYPE_OPUS => "Opus".to_string(),
+                symphonia::core::codecs::CODEC_TYPE_ALAC => "ALAC".to_string(),
+                _ => format!("{:?}", track.codec_params.codec),
+            };
             let sym_channels = track.codec_params.channels.unwrap_or(symphonia::core::audio::Channels::FRONT_LEFT | symphonia::core::audio::Channels::FRONT_RIGHT);
             let channels = sym_channels.count() as u16;
             let rate = track.codec_params.sample_rate.unwrap_or(44100);
@@ -1637,7 +1765,17 @@ fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(file: R, probe_e
                 8 => "7.1".to_string(),
                 n => format!("{} ch", n),
             };
-            let title = format!("Track {}: {} {} {}Hz", audio_tracks.len() + 1, codec_name, ch_desc, rate);
+
+            let track_name_opt = mp4_track_names.get(audio_track_count).cloned();
+            audio_track_count += 1;
+
+            let title = if let Some(ref name) = track_name_opt {
+                format!("Track {}: {} [{} {}]", audio_tracks.len() + 1, name, codec_name, ch_desc)
+            } else if let Some(ref lang) = track.language {
+                format!("Track {}: {} [{}] {} {}Hz", audio_tracks.len() + 1, codec_name, lang, ch_desc, rate)
+            } else {
+                format!("Track {}: {} {} {}Hz", audio_tracks.len() + 1, codec_name, ch_desc, rate)
+            };
 
             if selected_track.is_none() {
                 selected_track = Some(track.clone());
@@ -1650,7 +1788,7 @@ fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(file: R, probe_e
                 codec: codec_name,
                 channels,
                 sample_rate: rate,
-                language: None,
+                language: track.language.clone(),
             });
         }
     }
@@ -1685,14 +1823,17 @@ fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(file: R, probe_e
         video_info,
         audio_tracks,
         selected_track_idx,
+        has_video,
     }))
 }
 
 pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
+    #[cfg(not(target_os = "android"))]
     let _ = ffmpeg_next::format::network::init();
 
-    let mut actual_path = file_path.to_string();
-    if actual_path.starts_with("http") {
+    #[cfg(not(target_os = "android"))]
+    if file_path.starts_with("http") {
+        let mut actual_path = file_path.to_string();
         if let Ok(mut resp) = ureq::get(&actual_path).call() {
             let content_type = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_lowercase();
             if content_type.contains("audio/x-scpls") || actual_path.ends_with(".pls") {
@@ -1735,8 +1876,8 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
         
     let video_info = None; // Symphonia doesn't do video
 
-    // 1. Prioritize FFmpeg for video containers (MKV, MP4) to ensure video streams are processed.
-    // Symphonia might successfully parse the audio in these containers but would ignore the video.
+    // 1. Prioritize FFmpeg for video containers (MKV, MP4) on desktop to ensure video streams are processed.
+    #[cfg(not(target_os = "android"))]
     if ext == "mkv" || ext == "mp4" {
         match try_ffmpeg(file_path, false) {
             Ok(source) => return Ok(source),
@@ -1744,24 +1885,18 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
                 eprintln!("FFmpeg load failed for {}: {:?}", file_path, err);
             }
         }
-        // Fallback to Symphonia if FFmpeg fails
-        if let Ok(file) = File::open(file_path) {
-            if let Ok(source) = try_symphonia(file, &ext, &ext, video_info.clone()) {
-                return Ok(source);
-            }
+    }
+
+    // 2. Try Symphonia for all supported audio and container formats (FLAC, MP3, WAV, AAC, M4A, OGG, OPUS, etc.)
+    if let Ok(file) = File::open(file_path) {
+        match try_symphonia(file, &ext, &ext, video_info.clone(), Some(file_path)) {
+            Ok(source) => return Ok(source),
+            Err(e) => eprintln!("[RustTracker] Symphonia load failed for {}: {:?}", file_path, e),
         }
     }
 
-    // 2. Try standard audio formats natively via Symphonia first
-    if ext == "wav" || ext == "flac" || ext == "mp3" || ext == "ogg" || ext == "m4a" || ext == "aac" {
-        if let Ok(file) = File::open(file_path) {
-            if let Ok(source) = try_symphonia(file, &ext, &ext, video_info.clone()) {
-                return Ok(source);
-            }
-        }
-    }
-
-    // 2. Try OpenMPT Tracker module ONLY for likely tracker files first
+    // 3. Try OpenMPT Tracker module ONLY for likely tracker files on desktop
+    #[cfg(not(target_os = "android"))]
     if ext == "mod" || ext == "s3m" || ext == "xm" || ext == "it" || ext == "mptm" {
         if let Ok(mut file) = File::open(file_path) {
             let mut data = Vec::new();
@@ -1778,7 +1913,7 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
         }
     }
 
-    // 3. Try MIDI
+    // 4. Try MIDI
     if ext == "mid" || ext == "midi" {
         // Look for soundfont in project dir, then fallback to executable-relative paths, system-wide paths, and macOS Resources bundle
         let mut sf_path = "assets/soundfont.sf2".to_string();
@@ -1807,9 +1942,13 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
                     }
                 }
                 
-                // Fallback to system-wide paths on Linux/BSD if not found yet
+                // Fallback to system-wide paths on Linux/Android/BSD if not found yet
                 if !found {
                     let system_paths = vec![
+                        "/data/user/0/com.rusttracker.app/files/soundfont.sf2",
+                        "/data/user/0/com.rusttracker.app/cache/soundfont.sf2",
+                        "/data/data/com.rusttracker.app/files/soundfont.sf2",
+                        "/data/data/com.rusttracker.app/cache/soundfont.sf2",
                         "/usr/share/sounds/sf2/FluidR3_GM.sf2",
                         "/usr/share/sounds/sf2/default.sf2",
                         "/usr/share/soundfonts/FluidR3_GM.sf2",
@@ -1833,19 +1972,35 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
         }
     }
 
-    // 4. Try FFmpeg native bindings
-    let ffmpeg_result = try_ffmpeg(file_path, false);
-    if let Ok(source) = ffmpeg_result {
-        return Ok(source);
-    } else if let Err(ref err) = ffmpeg_result {
-        eprintln!("FFmpeg fallback load failed for {}: {:?}", file_path, err);
+    // 5. Try FFmpeg native bindings on desktop
+    #[cfg(not(target_os = "android"))]
+    {
+        let ffmpeg_result = try_ffmpeg(file_path, false);
+        if let Ok(source) = ffmpeg_result {
+            return Ok(source);
+        } else if let Err(ref err) = ffmpeg_result {
+            eprintln!("FFmpeg fallback load failed for {}: {:?}", file_path, err);
+        }
+
+        // If all failed, return the ffmpeg error since it's the most descriptive for standard media
+        ffmpeg_result
     }
 
-    // If all failed, return the ffmpeg error since it's the most descriptive for standard media
-    ffmpeg_result
+    // 6. Fallback for Video-Only containers on Android (e.g. camera videos or silent MP4 clips)
+    #[cfg(target_os = "android")]
+    {
+        if ext == "mp4" || ext == "mkv" || ext == "mov" || ext == "webm" || ext == "3gp" || ext == "m4v" || ext == "avi" || ext == "ts" {
+            return Ok(Box::new(AndroidVideoOnlySource {
+                current_time: 0.0,
+                duration: 0.0,
+            }));
+        }
+        Err(anyhow::anyhow!("Unsupported or unreadable audio format: {}", file_path))
+    }
 }
 
 pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<AppState>>) -> Result<PlaybackHandle> {
+    #[cfg(not(target_os = "android"))]
     if !mic {
         let passthrough = shared_state.lock().unwrap().passthrough_enabled;
         if passthrough {
@@ -2108,6 +2263,7 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
                     state.audio_tracks = audio_source.get_audio_tracks();
                     state.selected_audio_track = audio_source.get_selected_audio_track();
                     state.audio_track_request = None;
+                    state.has_video_stream = audio_source.has_video_stream();
                     state.tracker_channels = tracker_channels;
                     state.tracker_patterns_by_order = audio_source.pre_format_tracker_data();
                 }
@@ -2118,9 +2274,9 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
                 spawn_dsp_thread(rx, shared_state_closure.clone(), config.sample_rate, max_frequency, window_size);
 
                 let (stream, stop_token) = match supported_config.sample_format() {
-                    cpal::SampleFormat::F32 => run::<f32>(&device, &config, &mut attempt_audio_source_opt, shared_state_closure.clone(), tx, config.sample_rate, max_frequency, window_size),
-                    cpal::SampleFormat::I16 => run::<i16>(&device, &config, &mut attempt_audio_source_opt, shared_state_closure.clone(), tx, config.sample_rate, max_frequency, window_size),
-                    cpal::SampleFormat::U16 => run::<u16>(&device, &config, &mut attempt_audio_source_opt, shared_state_closure.clone(), tx, config.sample_rate, max_frequency, window_size),
+                    cpal::SampleFormat::F32 => run::<f32>(&device, &config, &mut attempt_audio_source_opt, shared_state_closure.clone(), tx, config.sample_rate, max_frequency, window_size, file_path),
+                    cpal::SampleFormat::I16 => run::<i16>(&device, &config, &mut attempt_audio_source_opt, shared_state_closure.clone(), tx, config.sample_rate, max_frequency, window_size, file_path),
+                    cpal::SampleFormat::U16 => run::<u16>(&device, &config, &mut attempt_audio_source_opt, shared_state_closure.clone(), tx, config.sample_rate, max_frequency, window_size, file_path),
                     _ => return Err(anyhow::anyhow!("Unsupported sample format")),
                 }?;
 
@@ -2184,6 +2340,7 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
                     state.audio_tracks = audio_source.get_audio_tracks();
                     state.selected_audio_track = audio_source.get_selected_audio_track();
                     state.audio_track_request = None;
+                    state.has_video_stream = audio_source.has_video_stream();
                     state.tracker_channels = tracker_channels;
                     state.tracker_patterns_by_order = audio_source.pre_format_tracker_data();
                 }
@@ -2191,7 +2348,7 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
                 let max_frequency = { shared_state.lock().unwrap().max_frequency };
                 spawn_dsp_thread(rx, shared_state.clone(), sample_rate, max_frequency, window_size);
                 
-                run_dummy(audio_source, shared_state, tx, sample_rate, window_size)
+                run_dummy(audio_source, shared_state, tx, sample_rate, window_size, file_path)
             } else {
                 Err(anyhow::anyhow!("CPAL audio stream creation failed: {:?}, and no audio source was available for fallback.", err))
             }
@@ -2206,6 +2363,7 @@ fn run_dummy(
     tx: Sender<DspMessage>,
     sample_rate: u32,
     window_size: usize,
+    _current_path: &str,
 ) -> Result<PlaybackHandle> {
     let stop_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let stop_token_clone = stop_token.clone();
@@ -2215,10 +2373,23 @@ fn run_dummy(
     
     let (ready_tx, ready_rx) = bounded::<AudioChunk>(pool_size);
     let (free_tx, free_rx) = unbounded::<AudioChunk>();
-    
+    #[cfg(not(target_os = "android"))]
     let (video_packet_tx, video_packet_rx) = bounded::<(u64, ffmpeg_next::Packet)>(4096);
+    #[cfg(target_os = "android")]
+    let (_video_packet_tx, video_packet_rx) = bounded::<(u64, ())>(1);
+    #[cfg(not(target_os = "android"))]
     audio_source.attach_video_queue(video_packet_tx);
     
+    #[cfg(target_os = "android")]
+    if audio_source.has_video_stream() {
+        crate::android_video::decoder::start_android_video_thread(
+            _current_path,
+            shared_state.clone(),
+            stop_token.clone(),
+        );
+    }
+    
+    #[cfg(not(target_os = "android"))]
     if let Some((params, time_base)) = audio_source.take_video_parameters() {
         let (video_frame_tx, video_frame_rx) = bounded::<crate::state::VideoFrame>(16);
         let (free_video_frame_tx, free_video_frame_rx) = unbounded::<crate::state::VideoFrame>();
@@ -2468,7 +2639,7 @@ fn run_dummy(
                                 state.channel_vus = vec![0.0; state.num_channels as usize];
                                 state.peak_vus = vec![0.0; state.num_channels as usize];
                                 let track_title = state.audio_tracks.get(track_idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", track_idx + 1));
-                                state.osd_text = Some(format!("Audio Track: {}", track_title));
+                                state.osd_text = Some(track_title);
                                 state.osd_timer = 3.0;
                                 state.seek_epoch += 1;
                                 while let Ok(c) = ready_rx_for_decoder.try_recv() {
@@ -2584,7 +2755,7 @@ fn run_dummy(
                                 state.channel_vus = vec![0.0; state.num_channels as usize];
                                 state.peak_vus = vec![0.0; state.num_channels as usize];
                                 let track_title = state.audio_tracks.get(track_idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", track_idx + 1));
-                                state.osd_text = Some(format!("Audio Track: {}", track_title));
+                                state.osd_text = Some(track_title);
                                 state.osd_timer = 3.0;
                                 state.seek_epoch += 1;
                                 while let Ok(c) = ready_rx_for_decoder.try_recv() {
@@ -2748,6 +2919,7 @@ fn run<T>(
     sample_rate: u32,
     _max_frequency: f32,
     window_size: usize,
+    _current_path: &str,
 ) -> Result<(cpal::Stream, Arc<std::sync::atomic::AtomicBool>)>
 where
     T: cpal::Sample + cpal::FromSample<f32> + cpal::SizedSample,
@@ -2761,7 +2933,10 @@ where
     let (ready_tx, ready_rx) = bounded::<AudioChunk>(pool_size);
     let (free_tx, free_rx) = unbounded::<AudioChunk>();
     
+    #[cfg(not(target_os = "android"))]
     let (video_packet_tx, video_packet_rx) = bounded::<(u64, ffmpeg_next::Packet)>(4096);
+    #[cfg(target_os = "android")]
+    let (_video_packet_tx, video_packet_rx) = bounded::<(u64, ())>(1);
     
     let mut current_chunk: Option<AudioChunk> = None;
     let mut chunk_frame_pos = 0;
@@ -2915,8 +3090,19 @@ where
 
     // Only take the audio source once stream creation has succeeded
     let mut audio_source = audio_source_opt.take().unwrap();
+    #[cfg(not(target_os = "android"))]
     audio_source.attach_video_queue(video_packet_tx);
     
+    #[cfg(target_os = "android")]
+    if audio_source.has_video_stream() {
+        crate::android_video::decoder::start_android_video_thread(
+            _current_path,
+            shared_state.clone(),
+            stop_token.clone(),
+        );
+    }
+    
+    #[cfg(not(target_os = "android"))]
     if let Some((params, time_base)) = audio_source.take_video_parameters() {
         let (video_frame_tx, video_frame_rx) = bounded::<crate::state::VideoFrame>(16);
         let (free_video_frame_tx, free_video_frame_rx) = unbounded::<crate::state::VideoFrame>();
@@ -3166,7 +3352,7 @@ where
                                 state.channel_vus = vec![0.0; state.num_channels as usize];
                                 state.peak_vus = vec![0.0; state.num_channels as usize];
                                 let track_title = state.audio_tracks.get(track_idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", track_idx + 1));
-                                state.osd_text = Some(format!("Audio Track: {}", track_title));
+                                state.osd_text = Some(track_title);
                                 state.osd_timer = 3.0;
                                 state.seek_epoch += 1;
                                 while let Ok(c) = ready_rx_for_decoder.try_recv() {
@@ -3284,7 +3470,12 @@ where
                                 state.channel_vus = vec![0.0; state.num_channels as usize];
                                 state.peak_vus = vec![0.0; state.num_channels as usize];
                                 let track_title = state.audio_tracks.get(track_idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", track_idx + 1));
-                                state.osd_text = Some(format!("Audio Track: {}", track_title));
+                                let display_title = if track_title.to_lowercase().starts_with("track") {
+                                    format!("🎛 {}", track_title)
+                                } else {
+                                    format!("🎛 Track {}: {}", track_idx + 1, track_title)
+                                };
+                                state.osd_text = Some(display_title);
                                 state.osd_timer = 3.0;
                                 state.seek_epoch += 1;
                                 while let Ok(c) = ready_rx_for_decoder.try_recv() {

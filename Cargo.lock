@@ -117,6 +117,7 @@ dependencies = [
  "ndk-context",
  "ndk-sys",
  "num_enum",
+ "simd_cesu8",
  "thiserror 2.0.18",
 ]
 
@@ -4256,6 +4257,7 @@ dependencies = [
 name = "rusttracker"
 version = "0.9.15"
 dependencies = [
+ "android-activity",
  "anyhow",
  "bytemuck",
  "clap",
@@ -4272,6 +4274,7 @@ dependencies = [
  "gilrs",
  "glam",
  "image",
+ "jni 0.21.1",
  "keepawake",
  "midly",
  "naga",

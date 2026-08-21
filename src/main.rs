@@ -1140,6 +1140,9 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                     state.audio_track_request = Some(track_idx);
                                 }
                             }
+                            EngineAction::SetMobileHudTab(tab) => {
+                                state.mobile_hud_tab = tab;
+                            }
                             EngineAction::VisPickerSelect(idx) => {
                                 state.current_visualizer_idx = idx;
                                 state.visualizer_mode = crate::state::VISUALIZERS[idx].id;

@@ -47,6 +47,21 @@ screenshot*
 scratch/
 scratch_bitstream/target/
 scratch_bitstream_windows/target/
-check_shader
 /test.rs
 /test_*
+test_*.png
+test_*.wav
+test_*.lrc
+test_baselines/
+
+# Android Build Outputs
+.gradle/
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/app/src/main/jniLibs/
+android/.cxx/
+android/.idea/
+*.apk
+*.aab

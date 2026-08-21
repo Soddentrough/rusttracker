@@ -69,6 +69,8 @@ pub enum EngineAction {
     ClearFocusUrlInput,
     SetAudioDevice(String),
     SetAudioTrack(usize),
+    #[allow(dead_code)]
+    SetMobileHudTab(crate::state::MobileHudTab),
 }
 
 #[repr(C)]
@@ -1566,7 +1568,11 @@ impl VulkanEngine {
         ).await.unwrap();
 
         let mut required_features = wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
-        let supports_timestamps = adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY);
+        let supports_timestamps = if cfg!(target_os = "android") {
+            false
+        } else {
+            adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY)
+        };
         if supports_timestamps {
             required_features |= wgpu::Features::TIMESTAMP_QUERY;
         }
@@ -3457,6 +3463,11 @@ impl VulkanEngine {
         self.video_state = None;
     }
 
+    #[allow(dead_code)]
+    pub fn has_video_stream(&self) -> bool {
+        self.video_state.is_some()
+    }
+
     pub fn update(&mut self, state: &AppState, dt: f32) {
         self.frame_count = self.frame_count.wrapping_add(1);
         
@@ -4092,6 +4103,7 @@ impl VulkanEngine {
         let mut out_heatmap_rect = None;
         let mut out_track_info_rect = None;
         let mut out_top_panel_rect = None;
+        let mut out_video_rect = None;
         
         let vis_name = crate::state::VISUALIZERS
             .get(state.current_visualizer_idx)
@@ -4713,30 +4725,58 @@ impl VulkanEngine {
                 }
                 // --- End Retro Grid ---
                 
+                let is_mobile = cfg!(target_os = "android");
                 let is_game_mode = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_lowercase() == "gamescope" || 
                                    std::env::var("XDG_SESSION_DESKTOP").unwrap_or_default().to_lowercase() == "gamescope" ||
                                    std::env::var("STEAM_DECK").is_ok();
                                    
-                let show_kb = !is_game_mode;
-                let show_gp = state.has_gamepad;
+                let show_kb = !is_game_mode && !is_mobile;
+                let show_gp = state.has_gamepad && !is_mobile;
+                let show_touch = is_mobile;
 
-                if show_kb || show_gp {
+                if show_kb || show_gp || show_touch {
                     egui::Panel::bottom("splash_bottom")
-                        .frame(egui::Frame::NONE.fill(egui::Color32::from_rgba_unmultiplied(10, 10, 15, 180)).inner_margin(40.0))
+                        .frame(egui::Frame::NONE.fill(egui::Color32::from_rgba_unmultiplied(10, 10, 15, 180)).inner_margin(if is_mobile { 12.0 } else { 40.0 }))
                         .show_inside(ctx, |ui| {
-                            let height = if show_kb && show_gp { 170.0 } else { 140.0 };
+                            let height = if is_mobile { 120.0 } else if show_kb && show_gp { 170.0 } else { 140.0 };
                             ui.add_space(height);
                         });
                         
                     egui::Area::new(egui::Id::new("splash_shortcuts_area"))
-                        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -40.0))
+                        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, if is_mobile { -12.0 } else { -40.0 }))
                         .show(ctx, |ui| {
                             egui::Frame::NONE
-                                .fill(egui::Color32::from_black_alpha(200))
+                                .fill(egui::Color32::from_black_alpha(210))
                                 .corner_radius(10.0)
-                                .inner_margin(20.0)
+                                .inner_margin(if is_mobile { 12.0 } else { 20.0 })
                                 .show(ui, |ui| {
-                                    ui.horizontal_centered(|ui| {
+                                    if show_touch {
+                                        ui.vertical_centered(|ui| {
+                                            ui.label(egui::RichText::new("Touch Gestures Guide").color(egui::Color32::LIGHT_GRAY).strong().size(14.0));
+                                            ui.add_space(6.0);
+                                            egui::Grid::new("touch_shortcuts")
+                                                .num_columns(2)
+                                                .spacing([18.0, 5.0])
+                                                .show(ui, |ui| {
+                                                    ui.label(egui::RichText::new("Swipe L / R").color(egui::Color32::from_rgb(0, 220, 255)).strong().size(12.5));
+                                                    ui.label(egui::RichText::new("Switch Visualizers (22)").color(egui::Color32::LIGHT_GRAY).size(12.5));
+                                                    ui.end_row();
+
+                                                    ui.label(egui::RichText::new("Swipe U / D").color(egui::Color32::from_rgb(0, 220, 255)).strong().size(12.5));
+                                                    ui.label(egui::RichText::new("Heatmap / Channels / Info").color(egui::Color32::LIGHT_GRAY).size(12.5));
+                                                    ui.end_row();
+
+                                                    ui.label(egui::RichText::new("Double Tap").color(egui::Color32::from_rgb(0, 220, 255)).strong().size(12.5));
+                                                    ui.label(egui::RichText::new("Play / Pause").color(egui::Color32::LIGHT_GRAY).size(12.5));
+                                                    ui.end_row();
+
+                                                    ui.label(egui::RichText::new("Single Tap").color(egui::Color32::from_rgb(0, 220, 255)).strong().size(12.5));
+                                                    ui.label(egui::RichText::new("Toggle HUD / Cinema").color(egui::Color32::LIGHT_GRAY).size(12.5));
+                                                    ui.end_row();
+                                                });
+                                        });
+                                    } else {
+                                        ui.horizontal_centered(|ui| {
                                             let pairs_per_row = if show_kb && show_gp { 2 } else { 3 };
                                             
                                             if show_kb {
@@ -4823,13 +4863,14 @@ impl VulkanEngine {
                                                 });
                                             }
                                         });
+                                    }
                                 });
                         });
                 }
 
                 let frame = egui::Frame::NONE
                     .fill(egui::Color32::from_rgba_unmultiplied(10, 10, 15, 180)) // Translucent to show grid
-                    .inner_margin(40.0);
+                    .inner_margin(if is_mobile { 16.0 } else { 40.0 });
                     
                 egui::CentralPanel::default().frame(frame).show_inside(ctx, |ui| {
                     let real_avail_height = ui.available_height();
@@ -4837,18 +4878,23 @@ impl VulkanEngine {
                     
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         ui.vertical_centered(|ui| {
-                            let space = real_avail_height * 0.15;
-                            if space > 0.0 {
-                                ui.add_space(space);
+                            let top_space = if is_mobile {
+                                (real_avail_height * 0.06).max(20.0)
+                            } else {
+                                real_avail_height * 0.15
+                            };
+                            if top_space > 0.0 {
+                                ui.add_space(top_space);
                             }
-                            // Scale title to fit smaller screens (like Steam Deck 1280x800)
-                            let width_scale = (real_avail_width / 1100.0).clamp(0.4, 1.0);
-                            let height_scale = (real_avail_height / 500.0).clamp(0.4, 1.0);
+                            // Scale title dynamically to fit portrait phone (9:19.5), steam deck, or 4K monitors
+                            let target_w = (real_avail_width - 32.0).max(100.0);
+                            let width_scale = (target_w / 950.0).clamp(0.25, 1.0);
+                            let height_scale = (real_avail_height / 450.0).clamp(0.25, 1.0);
                             let scale_factor = width_scale.min(height_scale);
-                            let title_width = 1000.0 * scale_factor;
-                            let title_height = 160.0 * scale_factor;
-                            let font_size = 140.0 * scale_factor;
-                            let gradient_extent = 65.0 * scale_factor;
+                            let title_width = 950.0 * scale_factor;
+                            let title_height = 140.0 * scale_factor;
+                            let font_size = 120.0 * scale_factor;
+                            let gradient_extent = 55.0 * scale_factor;
 
                             // --- Glowing Animated Title ---
                             let (title_rect, _) = ui.allocate_exact_size(egui::vec2(title_width, title_height), egui::Sense::hover());
@@ -4925,7 +4971,7 @@ impl VulkanEngine {
                                     let g = (15.0 * (1.0 - ground_t) + 160.0 * ground_t) as u8;
                                     let b = (0.0 * (1.0 - ground_t) + 50.0 * ground_t) as u8;
                                     egui::Color32::from_rgb(r, g, b)
-                                };
+                                } ;
 
                                 painter.with_clip_rect(clip_rect).text(
                                     title_rect.center(),
@@ -4964,57 +5010,67 @@ impl VulkanEngine {
                                 ui.add_space(10.0);
                             }
 
+                                let is_narrow = real_avail_width < 640.0;
+                                let btn_text = if is_file_hovered { "📥 DROP TO PLAY" } else { "OPEN AUDIO FILE" };
+                                let btn_fill = if is_file_hovered { egui::Color32::from_rgb(0, 160, 240) } else { egui::Color32::from_rgb(0, 100, 200) };
+                                let btn_stroke = if is_file_hovered { egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(160, 240, 255)) } else { egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(80, 180, 255)) };
+
+                                let btn_font_size = if is_narrow { 18.0 } else { 22.0 };
+                                let btn_h = if is_narrow { 52.0 } else { 60.0 };
+                                let btn_w = if is_narrow { (real_avail_width - 48.0).min(340.0) } else { 280.0 };
+
+                                let btn = egui::Button::new(
+                                    egui::RichText::new(btn_text)
+                                        .size(btn_font_size)
+                                        .color(egui::Color32::WHITE)
+                                        .strong()
+                                )
+                                .fill(btn_fill)
+                                .stroke(btn_stroke);
+
+                                let url_btn = egui::Button::new(
+                                    egui::RichText::new("OPEN URL / STREAM")
+                                        .size(btn_font_size)
+                                        .color(egui::Color32::WHITE)
+                                        .strong()
+                                )
+                                .fill(egui::Color32::from_rgb(100, 50, 150))
+                                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(180, 80, 255)));
+
                                 egui::Frame::NONE
                                     .shadow(egui::Shadow { offset: [0, 4], blur: 12, spread: 0, color: egui::Color32::from_black_alpha(200) })
-                                    .corner_radius(6.0)
+                                    .corner_radius(8.0)
                                     .show(ui, |ui| {
-                                        ui.horizontal(|ui| {
-                                            let total_width = 300.0 + 20.0 + 300.0;
-                                            ui.add_space((ui.available_width() - total_width) / 2.0);
-                                            
-                                            let btn_text = if is_file_hovered { "  📥 DROP TO PLAY  " } else { "  OPEN AUDIO FILE  " };
-                                            let btn_fill = if is_file_hovered { egui::Color32::from_rgb(0, 160, 240) } else { egui::Color32::from_rgb(0, 100, 200) };
-                                            let btn_stroke = if is_file_hovered { egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(160, 240, 255)) } else { egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(80, 180, 255)) };
-
-                                            let btn = egui::Button::new(
-                                                egui::RichText::new(btn_text)
-                                                    .size(24.0)
-                                                    .color(egui::Color32::WHITE)
-                                                    .strong()
-                                            )
-                                            .fill(btn_fill)
-                                            .stroke(btn_stroke);
-                                            
-                                            let resp1 = ui.add_sized([300.0, 60.0], btn);
-                                            if resp1.has_focus() {
-                                                ui.painter().rect(resp1.rect.expand(2.0), 6.0, egui::Color32::TRANSPARENT, egui::Stroke::new(3.0_f32, egui::Color32::YELLOW), egui::StrokeKind::Outside);
-                                            }
-                                            if resp1.clicked() {
-                                                engine_action = EngineAction::OpenFile;
-                                            }
-                                            
-                                            ui.add_space(20.0);
-                                            
-                                            let url_btn = egui::Button::new(
-                                                egui::RichText::new("  OPEN URL  ")
-                                                    .size(24.0)
-                                                    .color(egui::Color32::WHITE)
-                                                    .strong()
-                                            )
-                                            .fill(egui::Color32::from_rgb(100, 50, 150))
-                                            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(180, 80, 255)));
-                                            
-                                            let resp2 = ui.add_sized([300.0, 60.0], url_btn);
-                                            if resp2.has_focus() {
-                                                ui.painter().rect(resp2.rect.expand(2.0), 6.0, egui::Color32::TRANSPARENT, egui::Stroke::new(3.0_f32, egui::Color32::YELLOW), egui::StrokeKind::Outside);
-                                            }
-                                            if resp2.clicked() {
-                                                engine_action = EngineAction::OpenUrlDialog;
-                                            }
-                                        });
+                                        if is_narrow {
+                                            ui.vertical_centered(|ui| {
+                                                let resp1 = ui.add_sized([btn_w, btn_h], btn);
+                                                if resp1.clicked() {
+                                                    engine_action = EngineAction::OpenFile;
+                                                }
+                                                ui.add_space(14.0);
+                                                let resp2 = ui.add_sized([btn_w, btn_h], url_btn);
+                                                if resp2.clicked() {
+                                                    engine_action = EngineAction::OpenUrlDialog;
+                                                }
+                                            });
+                                        } else {
+                                            ui.horizontal(|ui| {
+                                                let total_width = btn_w * 2.0 + 20.0;
+                                                ui.add_space((ui.available_width() - total_width) / 2.0);
+                                                let resp1 = ui.add_sized([btn_w, btn_h], btn);
+                                                if resp1.clicked() {
+                                                    engine_action = EngineAction::OpenFile;
+                                                }
+                                                ui.add_space(20.0);
+                                                let resp2 = ui.add_sized([btn_w, btn_h], url_btn);
+                                                if resp2.clicked() {
+                                                    engine_action = EngineAction::OpenUrlDialog;
+                                                }
+                                            });
+                                        }
                                     });
                                 
-                                ui.add_space(30.0);
+                                ui.add_space(20.0);
                             
                             let mut force_stereo = state.force_stereo_downmix;
                             if ui.checkbox(&mut force_stereo, "Force Stereo Downmix (Fixes crackling on some devices)").changed() {
@@ -5052,614 +5108,668 @@ impl VulkanEngine {
                 return;
             }
 
-            if state.show_hud && state.video_mode != 3 {
+            let is_portrait = ctx.viewport_rect().width() < ctx.viewport_rect().height();
+            if is_portrait && state.show_hud && state.video_mode != 3 {
                 let total_h = ctx.viewport_rect().height();
                 let min_h = 220.0f32;
                 let top_h = (total_h * state.panel_split_ratio).clamp(min_h, (total_h - min_h).max(min_h));
                 let panel_resp = egui::Panel::top("top_panel")
                     .resizable(false)
-                    .frame(egui::Frame::NONE.fill(egui::Color32::TRANSPARENT))
+                    .frame(
+                        egui::Frame::NONE
+                            .fill(egui::Color32::TRANSPARENT)
+                            .inner_margin(egui::Margin {
+                                left: 16,
+                                right: 16,
+                                top: 54,
+                                bottom: 8,
+                            })
+                    )
                     .exact_size(top_h)
                     .show_inside(ctx, |ui| {
                         if state.video_mode == 2 && self.video_state.is_some() {
                             // Video occupies the entire top panel
                         } else {
-                            ui.columns(3, |columns| {
-                                // Column 0: Channels
-                                columns[0].heading("Channels");
-                            columns[0].separator();
-                            let (channel_rect, _) = columns[0].allocate_exact_size(
-                                egui::vec2(columns[0].available_width(), columns[0].available_height() - 25.0), 
-                                egui::Sense::hover()
-                            );
-                            out_meters_rect = Some(channel_rect);
-                            
-                            let painter = columns[0].painter();
-                            let num_channels = state.channel_vus.len();
-                            if num_channels > 0 {
-                                let w = channel_rect.width() / num_channels as f32;
-                                for i in 0..num_channels {
-                                    let x = channel_rect.left() + i as f32 * w + w * 0.2;
-                                    let bw = w * 0.6;
-                                    let y_bottom = channel_rect.bottom() - 15.0;
-                                    
-                                    // Label
-                                    if num_channels <= 16 {
-                                        let label = if state.tracker_channels.is_some() {
-                                            if i == 0 {
-                                                "L".to_string()
-                                            } else if i == num_channels - 1 {
-                                                "R".to_string()
-                                            } else {
-                                                format!("{}", i)
-                                            }
-                                        } else {
-                                            match num_channels {
-                                                2 => ["L", "R"].get(i).unwrap_or(&"?").to_string(),
-                                                3 => ["L", "C", "R"].get(i).unwrap_or(&"?").to_string(),
-                                                4 => ["Ls", "L", "R", "Rs"].get(i).unwrap_or(&"?").to_string(),
-                                                6 => ["Ls", "L", "C", "LFE", "R", "Rs"].get(i).unwrap_or(&"?").to_string(),
-                                                // SMPTE 7.1: display matches display_order [Lrs, Ls, L, C, LFE, R, Rs, Rrs]
-                                                8 => ["Lrs", "Ls", "L", "C", "LFE", "R", "Rs", "Rrs"].get(i).unwrap_or(&"?").to_string(),
-                                                12 => ["Ltr", "Ltf", "Ls", "L", "C", "LFE", "R", "Rs", "Rtf", "Rtr", "Lrs", "Rrs"].get(i).unwrap_or(&"?").to_string(),
-                                                _ => format!("{}", i + 1),
-                                            }
-                                        };
-                                        painter.text(
-                                            egui::pos2(x + bw * 0.5, y_bottom + 2.0),
-                                            egui::Align2::CENTER_TOP,
-                                            label,
-                                            egui::FontId::proportional(12.0),
-                                            egui::Color32::GRAY,
-                                        );
+                            let render_progress_bar = |col: &mut egui::Ui, out_fire_rect: &mut Option<egui::Rect>, engine_action: &mut EngineAction| {
+                                // Custom Fire/Charred Progress Bar
+                                let (rect, response) = col.allocate_exact_size(egui::vec2(col.available_width(), 16.0), egui::Sense::click_and_drag());
+                                *out_fire_rect = Some(rect);
+                                
+                                if response.drag_stopped() || response.clicked() {
+                                    if let Some(mouse_pos) = response.interact_pointer_pos() {
+                                        let rel_x = (mouse_pos.x - rect.left()).clamp(0.0, rect.width());
+                                        let pct = rel_x / rect.width();
+                                        *engine_action = EngineAction::Seek(pct);
                                     }
+                                } else if response.dragged() {
+                                    if let Some(mouse_pos) = response.interact_pointer_pos() {
+                                        let rel_x = (mouse_pos.x - rect.left()).clamp(0.0, rect.width());
+                                        let pct = rel_x / rect.width();
+                                        *engine_action = EngineAction::ScrubPreview(pct, 0.0);
+                                    }
+                                } else if !response.is_pointer_button_down_on() && state.scrub_target_seconds.is_some() {
+                                    *engine_action = EngineAction::ScrubEnd;
                                 }
-                            }
-                            
-                            columns[0].add_space(5.0);
-                            
-                            // Custom Fire/Charred Progress Bar
-                            let (rect, response) = columns[0].allocate_exact_size(egui::vec2(columns[0].available_width(), 16.0), egui::Sense::click_and_drag());
-                            out_fire_rect = Some(rect);
-                            
-                            if response.drag_stopped() || response.clicked() {
-                                if let Some(mouse_pos) = response.interact_pointer_pos() {
-                                    let rel_x = (mouse_pos.x - rect.left()).clamp(0.0, rect.width());
-                                    let pct = rel_x / rect.width();
-                                    engine_action = EngineAction::Seek(pct);
-                                }
-                            } else if response.dragged() {
-                                if let Some(mouse_pos) = response.interact_pointer_pos() {
-                                    let rel_x = (mouse_pos.x - rect.left()).clamp(0.0, rect.width());
-                                    let pct = rel_x / rect.width();
-                                    engine_action = EngineAction::ScrubPreview(pct, 0.0);
-                                }
-                            } else if !response.is_pointer_button_down_on() && state.scrub_target_seconds.is_some() {
-                                engine_action = EngineAction::ScrubEnd;
-                            }
-                            
-                            let painter = columns[0].painter();
-                            let format_time = |secs: f64| -> String {
-                                let m = (secs / 60.0).floor() as u32;
-                                let s = (secs % 60.0).floor() as u32;
-                                let f = (secs.fract() * 10.0).floor() as u32;
-                                format!("{:02}:{:02}.{}", m, s, f)
-                            };
-                            
-                            let display_secs = state.scrub_target_seconds.unwrap_or(state.current_seconds);
-                            let time_text = if state.duration_seconds <= 0.0 {
-                                format!("{} / LIVE", format_time(display_secs))
-                            } else {
-                                format!("{} / {}", format_time(display_secs), format_time(state.duration_seconds))
-                            };
-                            
-                            painter.text(
-                                rect.center(),
-                                egui::Align2::CENTER_CENTER,
-                                time_text,
-                                egui::FontId::proportional(11.0),
-                                egui::Color32::WHITE,
-                            );
-                            
-                            // Column 1: Heatmap History, Tracker Pattern & Lyrics
-                            let col1_heading = if state.lyrics.is_some() {
-                                "Lyrics"
-                            } else if !state.tracker_patterns_by_order.is_empty() {
-                                "Tracker Pattern"
-                            } else {
-                                "Pattern Heatmap"
-                            };
-                            columns[1].heading(col1_heading);
-                            columns[1].separator();
-                            let hm_rect = columns[1].available_rect_before_wrap();
-                            out_heatmap_rect = Some(hm_rect);
-                            
-                            columns[1].painter().rect_filled(hm_rect, 0.0, egui::Color32::TRANSPARENT);
-                            
-                            let painter = columns[1].painter().with_clip_rect(hm_rect);
-                            let chunks = 64;
-                            let cell_w = hm_rect.width() / chunks as f32;
-                            
-                            for c in 0..=chunks {
-                                let x = hm_rect.left() + c as f32 * cell_w;
-                                painter.line_segment([egui::pos2(x, hm_rect.top()), egui::pos2(x, hm_rect.bottom())], (1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 5)));
-                            }
-                            
-                            if let Some(lyrics) = &state.lyrics {
-                                // Layer 1: Backdrop Scrim - Dim heatmap slightly for crisp lyrics readability
-                                painter.rect_filled(
-                                    hm_rect,
-                                    0.0,
-                                    egui::Color32::from_rgba_unmultiplied(10, 10, 14, 175)
-                                );
-
+                                
+                                let painter = col.painter();
+                                let format_time = |secs: f64| -> String {
+                                    let m = (secs / 60.0).floor() as u32;
+                                    let s = (secs % 60.0).floor() as u32;
+                                    let f = (secs.fract() * 10.0).floor() as u32;
+                                    format!("{:02}:{:02}.{}", m, s, f)
+                                };
+                                
                                 let display_secs = state.scrub_target_seconds.unwrap_or(state.current_seconds);
-                                let center_y = hm_rect.top() + hm_rect.height() / 2.0;
-                                let row_height = 32.0;
-                                let num_rows_to_draw = (hm_rect.height() / row_height) as i32;
-                                let half_rows = (num_rows_to_draw / 2).max(1);
+                                let time_text = if state.duration_seconds <= 0.0 {
+                                    format!("{} / LIVE", format_time(display_secs))
+                                } else {
+                                    format!("{} / {}", format_time(display_secs), format_time(state.duration_seconds))
+                                };
+                                
+                                painter.text(
+                                    rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    time_text,
+                                    egui::FontId::proportional(11.0),
+                                    egui::Color32::WHITE,
+                                );
+                            };
 
-                                let active_idx = lyrics.find_current_line_idx(display_secs);
-                                let is_intro = active_idx.is_none();
-                                let base_idx = active_idx.unwrap_or(0);
-
-                                for offset in -half_rows..=half_rows {
-                                    let target_idx = (base_idx as i32) + offset - if is_intro && offset > 0 { 1 } else { 0 };
-                                    let y = center_y + (offset as f32) * row_height;
-
-                                    let distance = offset.abs() as f32 / (half_rows as f32);
-                                    let alpha = (1.0 - distance * 0.80).clamp(0.0, 1.0);
-                                    if alpha <= 0.02 {
-                                        continue;
-                                    }
-
-                                    if is_intro && offset == 0 {
-                                        // Active Intro indicator
-                                        let font_id = egui::FontId::proportional(18.0);
-                                        let text = "♪   ♪   ♪   (Intro)";
-                                        let galley = painter.layout_no_wrap(
-                                            text.to_string(),
-                                            font_id,
-                                            egui::Color32::from_rgba_unmultiplied(225, 225, 240, 240),
-                                        );
-                                        let pos = egui::pos2(hm_rect.center().x, y);
-                                        let rect = egui::Rect::from_center_size(pos, galley.size());
-                                        painter.rect(
-                                            rect.expand2(egui::vec2(14.0, 4.0)),
-                                            5.0,
-                                            egui::Color32::from_rgba_unmultiplied(14, 14, 18, 235),
-                                            egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 50)),
-                                            egui::StrokeKind::Outside,
-                                        );
-                                        painter.galley(rect.min, galley, egui::Color32::from_rgba_unmultiplied(225, 225, 240, 240));
-                                        continue;
-                                    }
-
-                                    if is_intro && offset < 0 {
-                                        continue;
-                                    }
-
-                                    if target_idx >= 0 && (target_idx as usize) < lyrics.lines.len() {
-                                        let line = &lyrics.lines[target_idx as usize];
-                                        let is_current = !is_intro && offset == 0;
-                                        let text_display = if line.text.is_empty() {
-                                            "♪   ♪   ♪"
-                                        } else {
-                                            line.text.as_str()
-                                        };
-
-                                        let pos = egui::pos2(hm_rect.center().x, y);
-
-                                        if is_current {
-                                            // Active line: prominent large font + high contrast pill with subtle luminous border
-                                            let font_id = egui::FontId::proportional(20.0);
-                                            let max_w = (hm_rect.width() - 24.0).max(50.0);
-                                            let galley = painter.layout(
-                                                text_display.to_string(),
-                                                font_id,
-                                                egui::Color32::WHITE,
-                                                max_w,
-                                            );
-                                            let rect = egui::Rect::from_center_size(pos, galley.size());
-
-                                            painter.rect(
-                                                rect.expand2(egui::vec2(16.0, 5.0)),
-                                                6.0,
-                                                egui::Color32::from_rgba_unmultiplied(12, 12, 16, 240),
-                                                egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 60)),
-                                                egui::StrokeKind::Outside,
-                                            );
-                                            painter.galley(rect.min, galley, egui::Color32::WHITE);
-                                        } else {
-                                            // Surrounding lines: readable 16pt font with smooth distance fade + soft dark backdrop for contrast
-                                            let font_id = egui::FontId::proportional(16.0);
-                                            let max_w = (hm_rect.width() - 24.0).max(50.0);
-                                            let text_color = if line.text.is_empty() {
-                                                egui::Color32::from_rgba_unmultiplied(150, 150, 160, (alpha * 140.0) as u8)
+                            let render_col_channels = |col: &mut egui::Ui, out_meters_rect: &mut Option<egui::Rect>, out_fire_rect: &mut Option<egui::Rect>, engine_action: &mut EngineAction| {
+                                if !is_portrait {
+                                    col.heading("Channels");
+                                    col.separator();
+                                }
+                                let meters_height = if is_portrait {
+                                    col.available_height()
+                                } else {
+                                    col.available_height() - 25.0
+                                };
+                                let (channel_rect, _) = col.allocate_exact_size(
+                                    egui::vec2(col.available_width(), meters_height), 
+                                    egui::Sense::hover()
+                                );
+                                *out_meters_rect = Some(channel_rect);
+                                
+                                let painter = col.painter();
+                                let num_channels = state.channel_vus.len();
+                                if num_channels > 0 {
+                                    let w = channel_rect.width() / num_channels as f32;
+                                    for i in 0..num_channels {
+                                        let x = channel_rect.left() + i as f32 * w + w * 0.2;
+                                        let bw = w * 0.6;
+                                        let y_bottom = channel_rect.bottom() - 15.0;
+                                        
+                                        // Label
+                                        if num_channels <= 16 {
+                                            let label = if state.tracker_channels.is_some() {
+                                                if i == 0 {
+                                                    "L".to_string()
+                                                } else if i == num_channels - 1 {
+                                                    "R".to_string()
+                                                } else {
+                                                    format!("{}", i)
+                                                }
                                             } else {
-                                                egui::Color32::from_rgba_unmultiplied(225, 225, 235, (alpha * 200.0) as u8)
+                                                match num_channels {
+                                                    2 => ["L", "R"].get(i).unwrap_or(&"?").to_string(),
+                                                    3 => ["L", "C", "R"].get(i).unwrap_or(&"?").to_string(),
+                                                    4 => ["Ls", "L", "R", "Rs"].get(i).unwrap_or(&"?").to_string(),
+                                                    6 => ["Ls", "L", "C", "LFE", "R", "Rs"].get(i).unwrap_or(&"?").to_string(),
+                                                    8 => ["Lrs", "Ls", "L", "C", "LFE", "R", "Rs", "Rrs"].get(i).unwrap_or(&"?").to_string(),
+                                                    12 => ["Ltr", "Ltf", "Ls", "L", "C", "LFE", "R", "Rs", "Rtf", "Rtr", "Lrs", "Rrs"].get(i).unwrap_or(&"?").to_string(),
+                                                    _ => format!("{}", i + 1),
+                                                }
                                             };
-                                            let galley = painter.layout(
-                                                text_display.to_string(),
-                                                font_id,
-                                                text_color,
-                                                max_w,
+                                            painter.text(
+                                                egui::pos2(x + bw * 0.5, y_bottom + 2.0),
+                                                egui::Align2::CENTER_TOP,
+                                                label,
+                                                egui::FontId::proportional(12.0),
+                                                egui::Color32::GRAY,
                                             );
-                                            let rect = egui::Rect::from_center_size(pos, galley.size());
-
-                                            let pill_alpha = (alpha * 180.0) as u8;
-                                            if pill_alpha > 15 {
-                                                painter.rect_filled(
-                                                    rect.expand2(egui::vec2(10.0, 3.0)),
-                                                    4.0,
-                                                    egui::Color32::from_rgba_unmultiplied(10, 10, 14, pill_alpha),
-                                                );
-                                            }
-                                            painter.galley(rect.min, galley, text_color);
                                         }
                                     }
                                 }
-                            } else if !state.tracker_patterns_by_order.is_empty() {
-                                let current_order = state.current_tracker_order as i32;
-                                let current_row = state.current_tracker_row as i32;
-                                let center_y = hm_rect.top() + hm_rect.height() / 2.0;
-                                let row_height = 16.0;
-                                let num_rows_to_draw = (hm_rect.height() / row_height) as i32;
                                 
-                                let font_id = egui::FontId::monospace(12.0);
-                                let char_width = 7.0; // Approx monospace char width at 12pt
-                                let max_chars = ((hm_rect.width() - 20.0) / char_width).max(10.0) as usize;
-                                let max_text_chars = max_chars.saturating_sub(4);
+                                if !is_portrait {
+                                    col.add_space(5.0);
+                                    render_progress_bar(col, out_fire_rect, engine_action);
+                                }
+                            };
+
+                            let render_col_heatmap = |col: &mut egui::Ui, out_heatmap_rect: &mut Option<egui::Rect>| {
+                                if !is_portrait {
+                                    let col1_heading = if state.lyrics.is_some() {
+                                        "Lyrics"
+                                    } else if !state.tracker_patterns_by_order.is_empty() {
+                                        "Tracker Pattern"
+                                    } else {
+                                        "Pattern Heatmap"
+                                    };
+                                    col.heading(col1_heading);
+                                    col.separator();
+                                }
+                                let hm_rect = col.available_rect_before_wrap();
+                                *out_heatmap_rect = Some(hm_rect);
                                 
-                                let mut formatted = String::with_capacity(max_text_chars + 16);
+                                col.painter().rect_filled(hm_rect, 0.0, egui::Color32::TRANSPARENT);
                                 
-                                for offset in -(num_rows_to_draw / 2)..=(num_rows_to_draw / 2) {
-                                    let mut resolved_order = current_order;
-                                    let mut resolved_row = current_row + offset;
+                                let painter = col.painter().with_clip_rect(hm_rect);
+                                let chunks = 64;
+                                let cell_w = hm_rect.width() / chunks as f32;
+                                
+                                for c in 0..=chunks {
+                                    let x = hm_rect.left() + c as f32 * cell_w;
+                                    painter.line_segment([egui::pos2(x, hm_rect.top()), egui::pos2(x, hm_rect.bottom())], (1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 5)));
+                                }
+                                
+                                if let Some(lyrics) = &state.lyrics {
+                                    // Layer 1: Backdrop Scrim - Dim heatmap slightly for crisp lyrics readability
+                                    painter.rect_filled(
+                                        hm_rect,
+                                        0.0,
+                                        egui::Color32::from_rgba_unmultiplied(10, 10, 14, 175)
+                                    );
+
+                                    let display_secs = state.scrub_target_seconds.unwrap_or(state.current_seconds);
+                                    let center_y = hm_rect.top() + hm_rect.height() / 2.0;
+                                    let row_height = 32.0;
+                                    let num_rows_to_draw = (hm_rect.height() / row_height) as i32;
+                                    let half_rows = (num_rows_to_draw / 2).max(1);
+
+                                    let active_idx = lyrics.find_current_line_idx(display_secs);
+                                    let is_intro = active_idx.is_none();
+                                    let base_idx = active_idx.unwrap_or(0);
+
+                                    for offset in -half_rows..=half_rows {
+                                        let target_idx = (base_idx as i32) + offset - if is_intro && offset > 0 { 1 } else { 0 };
+                                        let y = center_y + (offset as f32) * row_height;
+
+                                        let distance = offset.abs() as f32 / (half_rows as f32);
+                                        let alpha = (1.0 - distance * 0.80).clamp(0.0, 1.0);
+                                        if alpha <= 0.02 {
+                                            continue;
+                                        }
+
+                                        if is_intro && offset == 0 {
+                                            // Active Intro indicator
+                                            let font_id = egui::FontId::proportional(18.0);
+                                            let text = "♪   ♪   ♪   (Intro)";
+                                            let galley = painter.layout_no_wrap(
+                                                text.to_string(),
+                                                font_id,
+                                                egui::Color32::from_rgba_unmultiplied(225, 225, 240, 240),
+                                            );
+                                            let pos = egui::pos2(hm_rect.center().x, y);
+                                            let rect = egui::Rect::from_center_size(pos, galley.size());
+                                            painter.rect(
+                                                rect.expand2(egui::vec2(14.0, 4.0)),
+                                                5.0,
+                                                egui::Color32::from_rgba_unmultiplied(14, 14, 18, 235),
+                                                egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 50)),
+                                                egui::StrokeKind::Outside,
+                                            );
+                                            painter.galley(rect.min, galley, egui::Color32::from_rgba_unmultiplied(225, 225, 240, 240));
+                                            continue;
+                                        }
+
+                                        if is_intro && offset < 0 {
+                                            continue;
+                                        }
+
+                                        if target_idx >= 0 && (target_idx as usize) < lyrics.lines.len() {
+                                            let line = &lyrics.lines[target_idx as usize];
+                                            let is_current = !is_intro && offset == 0;
+                                            let text_display = if line.text.is_empty() {
+                                                "♪   ♪   ♪"
+                                            } else {
+                                                line.text.as_str()
+                                            };
+
+                                            let pos = egui::pos2(hm_rect.center().x, y);
+
+                                            if is_current {
+                                                // Active line: prominent large font + high contrast pill with subtle luminous border
+                                                let font_id = egui::FontId::proportional(20.0);
+                                                let max_w = (hm_rect.width() - 24.0).max(50.0);
+                                                let galley = painter.layout(
+                                                    text_display.to_string(),
+                                                    font_id,
+                                                    egui::Color32::WHITE,
+                                                    max_w,
+                                                );
+                                                let rect = egui::Rect::from_center_size(pos, galley.size());
+
+                                                painter.rect(
+                                                    rect.expand2(egui::vec2(16.0, 5.0)),
+                                                    6.0,
+                                                    egui::Color32::from_rgba_unmultiplied(12, 12, 16, 240),
+                                                    egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 60)),
+                                                    egui::StrokeKind::Outside,
+                                                );
+                                                painter.galley(rect.min, galley, egui::Color32::WHITE);
+                                            } else {
+                                                // Surrounding lines: readable 16pt font with smooth distance fade + soft dark backdrop for contrast
+                                                let font_id = egui::FontId::proportional(16.0);
+                                                let max_w = (hm_rect.width() - 24.0).max(50.0);
+                                                let text_color = if line.text.is_empty() {
+                                                    egui::Color32::from_rgba_unmultiplied(150, 150, 160, (alpha * 140.0) as u8)
+                                                } else {
+                                                    egui::Color32::from_rgba_unmultiplied(225, 225, 235, (alpha * 200.0) as u8)
+                                                };
+                                                let galley = painter.layout(
+                                                    text_display.to_string(),
+                                                    font_id,
+                                                    text_color,
+                                                    max_w,
+                                                );
+                                                let rect = egui::Rect::from_center_size(pos, galley.size());
+
+                                                let pill_alpha = (alpha * 180.0) as u8;
+                                                if pill_alpha > 15 {
+                                                    painter.rect_filled(
+                                                        rect.expand2(egui::vec2(10.0, 3.0)),
+                                                        4.0,
+                                                        egui::Color32::from_rgba_unmultiplied(10, 10, 14, pill_alpha),
+                                                    );
+                                                }
+                                                painter.galley(rect.min, galley, text_color);
+                                            }
+                                        }
+                                    }
+                                } else if !state.tracker_patterns_by_order.is_empty() {
+                                    let current_order = state.current_tracker_order as i32;
+                                    let current_row = state.current_tracker_row as i32;
+                                    let center_y = hm_rect.top() + hm_rect.height() / 2.0;
+                                    let row_height = 16.0;
+                                    let num_rows_to_draw = (hm_rect.height() / row_height) as i32;
                                     
-                                    if offset < 0 {
-                                        // Read exact playback sequence from history
-                                        let history_idx = (-offset - 1) as usize;
-                                        if history_idx < state.tracker_row_history.len() {
-                                            let (hist_order, hist_row) = state.tracker_row_history[history_idx];
-                                            resolved_order = hist_order;
-                                            resolved_row = hist_row;
-                                        } else {
-                                            // Fall back to underflow if history hasn't built up yet
-                                            while resolved_row < 0 && resolved_order > 0 {
-                                                resolved_order -= 1;
-                                                if (resolved_order as usize) < state.tracker_patterns_by_order.len() {
-                                                    resolved_row += state.tracker_patterns_by_order[resolved_order as usize].len() as i32;
+                                    let font_id = egui::FontId::monospace(12.0);
+                                    let char_width = 7.0; // Approx monospace char width at 12pt
+                                    let max_chars = ((hm_rect.width() - 20.0) / char_width).max(10.0) as usize;
+                                    let max_text_chars = max_chars.saturating_sub(4);
+                                    
+                                    let mut formatted = String::with_capacity(max_text_chars + 16);
+                                    
+                                    for offset in -(num_rows_to_draw / 2)..=(num_rows_to_draw / 2) {
+                                        let mut resolved_order = current_order;
+                                        let mut resolved_row = current_row + offset;
+                                        
+                                        if offset < 0 {
+                                            // Read exact playback sequence from history
+                                            let history_idx = (-offset - 1) as usize;
+                                            if history_idx < state.tracker_row_history.len() {
+                                                let (hist_order, hist_row) = state.tracker_row_history[history_idx];
+                                                resolved_order = hist_order;
+                                                resolved_row = hist_row;
+                                            } else {
+                                                // Fall back to underflow if history hasn't built up yet
+                                                while resolved_row < 0 && resolved_order > 0 {
+                                                    resolved_order -= 1;
+                                                    if (resolved_order as usize) < state.tracker_patterns_by_order.len() {
+                                                        resolved_row += state.tracker_patterns_by_order[resolved_order as usize].len() as i32;
+                                                    } else {
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        } else if offset > 0 {
+                                            // Overflow forwards within the current pattern, clamped
+                                            while (resolved_order as usize) < state.tracker_patterns_by_order.len() {
+                                                let pattern_len = state.tracker_patterns_by_order[resolved_order as usize].len() as i32;
+                                                if resolved_row >= pattern_len {
+                                                    resolved_row -= pattern_len;
+                                                    resolved_order += 1;
                                                 } else {
                                                     break;
                                                 }
                                             }
                                         }
-                                    } else {
-                                        // Handle overflow (next predicted patterns)
-                                        while resolved_order >= 0 
-                                            && (resolved_order as usize) < state.tracker_patterns_by_order.len() 
-                                            && resolved_row >= state.tracker_patterns_by_order[resolved_order as usize].len() as i32 
-                                        {
-                                            resolved_row -= state.tracker_patterns_by_order[resolved_order as usize].len() as i32;
-                                            resolved_order += 1;
-                                        }
-                                    }
-                                    
-                                    if resolved_order >= 0 && (resolved_order as usize) < state.tracker_patterns_by_order.len() && resolved_row >= 0 {
-                                        if (resolved_row as usize) < state.tracker_patterns_by_order[resolved_order as usize].len() {
-                                            let text = &state.tracker_patterns_by_order[resolved_order as usize][resolved_row as usize];
-                                            let y = center_y + offset as f32 * row_height;
-                                            
-                                            // Fade out based on distance
-                                            let distance = offset.abs() as f32 / (num_rows_to_draw as f32 / 2.0);
-                                            let alpha = (1.0 - distance).max(0.0);
-                                            if alpha <= 0.02 { continue; } // Skip invisible rows to save layout time
-                                            
-                                            let (text_slice, is_truncated) = if text.len() > max_text_chars {
-                                                let end_idx = max_text_chars.saturating_sub(3);
-                                                let safe_end = text.char_indices().map(|(i, _)| i).find(|&i| i >= end_idx).unwrap_or(text.len());
-                                                (&text[..safe_end], true)
-                                            } else {
-                                                (text.as_str(), false)
-                                            };
-                                            
-                                            formatted.clear();
-                                            use std::fmt::Write;
-                                            if is_truncated {
-                                                let _ = write!(formatted, "{:02X}  {}...", resolved_row, text_slice);
-                                            } else {
-                                                let _ = write!(formatted, "{:02X}  {}", resolved_row, text_slice);
-                                            };
-                                            
-                                            let pos = egui::pos2(hm_rect.center().x, y);
-                                            
-                                            if offset == 0 {
-                                                let galley = painter.layout_no_wrap(
-                                                    formatted.clone(),
-                                                    font_id.clone(),
-                                                    egui::Color32::WHITE,
-                                                );
-                                                let rect = egui::Rect::from_center_size(pos, galley.size());
-                                                
-                                                painter.rect_filled(
-                                                    rect.expand2(egui::vec2(10.0, 2.0)),
-                                                    4.0,
-                                                    egui::Color32::from_black_alpha(220)
-                                                );
-                                                painter.galley(rect.min, galley, egui::Color32::WHITE);
-                                            } else {
-                                                // Valid unmultiplied alpha color
-                                                let color = egui::Color32::from_rgba_unmultiplied(150, 150, 150, (alpha * 100.0) as u8);
-                                                
-                                                let galley = painter.layout_no_wrap(
-                                                    formatted.clone(),
-                                                    font_id.clone(),
-                                                    egui::Color32::WHITE,
-                                                );
-                                                
-                                                let rect = egui::Rect::from_center_size(pos, galley.size());
-                                                painter.galley(rect.min, galley, color);
-                                            }
-                                            
-                                            // Pattern boundary indicator
-                                            if resolved_row == 0 {
-                                                painter.line_segment(
-                                                    [egui::pos2(hm_rect.left(), y - row_height / 2.0), egui::pos2(hm_rect.right(), y - row_height / 2.0)],
-                                                    (1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, (alpha * 150.0) as u8))
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            
-                            // Column 2: Track Info
-                            if state.video_mode == 1 && self.video_state.is_some() {
-                                let available = columns[2].available_size();
-                                let (rect, _) = columns[2].allocate_exact_size(available, egui::Sense::hover());
-                                out_track_info_rect = Some(rect);
-                            } else {
-                                columns[2].style_mut().visuals.override_text_color = Some(egui::Color32::from_gray(235)); // Slightly lighter for contrast
-                                let heading_text = if state.playlist.len() > 1 {
-                                    format!("Track Info ({}/{})", state.playlist_index + 1, state.playlist.len())
-                                } else {
-                                    "Track Info".to_string()
-                                };
-                                columns[2].heading(heading_text);
-                                columns[2].separator();
-                            
-                                let render_smooth_marquee = |ui: &mut egui::Ui, text: &str, size: f32, is_title: bool| {
-                                 let available_width = ui.available_width();
-                                 let font_id = egui::FontId::proportional(size);
-                                 let color = ui.style().visuals.override_text_color.unwrap_or(egui::Color32::from_gray(235));
-                                 let text_color = if is_title { egui::Color32::WHITE } else { color };
-                                 
-                                 let galley = ui.painter().layout_no_wrap(text.to_string(), font_id, text_color);
-                                 let text_width = galley.rect.width();
-                                 let height = galley.rect.height();
-                                 
-                                 let (rect, _response) = ui.allocate_exact_size(egui::vec2(available_width, height), egui::Sense::hover());
-                                 let painter = ui.painter().with_clip_rect(rect);
-                                 
-                                 if text_width > available_width {
-                                     let max_scroll = text_width - available_width;
-                                     let scroll_duration = max_scroll / 35.0; // 35 pixels per second
-                                     let total_period = 2.0 + scroll_duration + 2.0 + scroll_duration;
-                                     let t = (state.current_seconds as f32) % total_period;
-                                     
-                                     let offset = if t < 2.0 {
-                                         0.0
-                                     } else if t < 2.0 + scroll_duration {
-                                         let progress = (t - 2.0) / scroll_duration;
-                                         progress * max_scroll
-                                     } else if t < 2.0 + scroll_duration + 2.0 {
-                                         max_scroll
-                                     } else {
-                                         let progress = (t - (2.0 + scroll_duration + 2.0)) / scroll_duration;
-                                         max_scroll - (progress * max_scroll)
-                                     };
-                                     
-                                     painter.galley(rect.min + egui::vec2(-offset, 0.0), galley, text_color);
-                                 } else {
-                                     painter.galley(rect.min, galley, text_color);
-                                 }
-                             };
-
-                            let current_path_str = if state.playlist_index < state.playlist.len() {
-                                state.playlist[state.playlist_index].clone()
-                            } else {
-                                state.song_title.clone()
-                            };
-                            let is_network = current_path_str.starts_with("http://") || current_path_str.starts_with("https://");
-                            let file_name = if is_network {
-                                state.song_title.clone()
-                            } else {
-                                std::path::Path::new(&state.song_title).file_name().unwrap_or_default().to_string_lossy().to_string()
-                            };
-                            let file_dir = if is_network {
-                                current_path_str
-                            } else {
-                                let abs_path = if std::path::Path::new(&current_path_str).is_absolute() {
-                                    std::path::PathBuf::from(&current_path_str)
-                                } else if let Ok(cwd) = std::env::current_dir() {
-                                    cwd.join(&current_path_str)
-                                } else {
-                                    std::path::PathBuf::from(&current_path_str)
-                                };
-                                let path_str = abs_path.to_string_lossy().to_string();
-                                if let Ok(home) = std::env::var("HOME") {
-                                    if path_str.starts_with(&home) {
-                                        path_str.replacen(&home, "~", 1)
-                                    } else {
-                                        path_str
-                                    }
-                                } else if let Ok(home) = std::env::var("USERPROFILE") {
-                                    if path_str.starts_with(&home) {
-                                        path_str.replacen(&home, "%USERPROFILE%", 1)
-                                    } else {
-                                        path_str
-                                    }
-                                } else {
-                                    path_str
-                                }
-                            };
-                            
-                            egui::ScrollArea::vertical()
-                                .id_salt("track_info_scroll")
-                                .show(&mut columns[2], |ui| {
-                                    ui.spacing_mut().item_spacing.y = 4.0;
-                                    
-                                    // 1. Title/File Name (Prominent at top, smooth marquee if long)
-                                    render_smooth_marquee(ui, &file_name, 15.0, true);
-                                    
-                                    // 2. Artist
-                                    ui.horizontal(|ui| { ui.label("Artist"); ui.label(&state.artist); });
-                                    
-                                    // 3. Path / URL (Smooth marquee if long, stretches to the right edge)
-                                    let path_label = if is_network { "URL" } else { "Path" };
-                                    ui.horizontal(|ui| { 
-                                        ui.label(path_label); 
-                                        render_smooth_marquee(ui, &file_dir, 14.0, false); 
-                                    });
-                                    
-                                    // 4. Type
-                                    ui.horizontal(|ui| { ui.label("Type"); ui.label(&state.module_type); });
-                                    
-                                    // 4b. Visualization
-                                    let vis_name = crate::state::VISUALIZERS.get(state.current_visualizer_idx)
-                                        .map(|v| v.name)
-                                        .unwrap_or("Unknown");
-                                    ui.horizontal(|ui| { ui.label("Visualization"); ui.label(vis_name); });
-                                    
-                                    // 5. Video
-                                    if let Some(video) = &state.video_info {
-                                        if video == "Unsupported Codec" {
-                                            ui.horizontal(|ui| { ui.label("Video"); ui.label(video); });
-                                        } else {
-                                            let msg = if state.has_gamepad {
-                                                let button_name = match state.gamepad_type {
-                                                    crate::state::GamepadType::PlayStation => "Square",
-                                                    crate::state::GamepadType::Nintendo => "Y",
-                                                     _ => "X",
-                                                };
-                                                format!("{} (Video available: 'v' or '{}' to view)", video, button_name)
-                                            } else {
-                                                format!("{} (Video available: 'v' to view)", video)
-                                            };
-                                            ui.horizontal(|ui| { ui.label("Video"); ui.label(msg); });
-                                        }
-                                    }
-                                    
-                                    // 5b. Lyrics
-                                    if let Some(lyrics) = &state.lyrics {
-                                        let lyrics_label = if let Some(fname) = &lyrics.file_name {
-                                            format!("Found ({}) - Synced", fname)
-                                        } else {
-                                            "Found (LRC Sidecar Synced)".to_string()
-                                        };
-                                        ui.horizontal(|ui| {
-                                            ui.label("Lyrics");
-                                            ui.colored_label(egui::Color32::from_rgb(100, 230, 140), lyrics_label);
-                                        });
-                                    }
-                                    
-                                    // 6. Track layout parameters
-                                    if state.bpm > 0 { ui.horizontal(|ui| { ui.label("BPM"); ui.label(format!("{}", state.bpm)); }); }
-                                    if state.speed > 0 { ui.horizontal(|ui| { ui.label("Speed"); ui.label(format!("{}", state.speed)); }); }
-                                    if state.num_patterns > 0 { ui.horizontal(|ui| { ui.label("Patterns"); ui.label(format!("{}", state.num_patterns)); }); }
-                                    if state.num_instruments > 0 { ui.horizontal(|ui| { ui.label("Instruments"); ui.label(format!("{}", state.num_instruments)); }); }
-                                    if state.num_samples > 0 { ui.horizontal(|ui| { ui.label("Samples"); ui.label(format!("{}", state.num_samples)); }); }
-                                    
-                                    // 7. Audio technical parameters
-                                    ui.horizontal(|ui| { ui.label("Sample Rate"); ui.label(format!("{} Hz", state.current_sample_rate as u32)); });
-                                    ui.horizontal(|ui| { ui.label("Bitrate"); ui.label(state.bitrate.map(|b| format!("{} kbps", b)).unwrap_or_else(|| "Unknown".to_string())); });
-                                    ui.horizontal(|ui| { 
-                                        if let Some(tc) = state.tracker_channels {
-                                            ui.label("Tracker Channels");
-                                            ui.label(format!("{}", tc));
-                                        } else {
-                                            ui.label("Channels"); 
-                                            if state.num_channels > state.hardware_channels && state.hardware_channels > 0 {
-                                                ui.label(format!("{} (Downmixed to {})", state.num_channels, state.hardware_channels));
-                                            } else {
-                                                ui.label(format!("{}", state.num_channels));
-                                            }
-                                        }
-                                    });
-                                    
-                                    ui.horizontal(|ui| { 
-                                        ui.label("Length"); 
-                                        if state.duration_seconds <= 0.0 {
-                                            ui.label("LIVE");
-                                        } else {
-                                            ui.label(format!("{:.1}s", state.duration_seconds)); 
-                                        }
-                                    });
-
-                                    if state.audio_tracks.len() > 1 {
-                                        ui.horizontal(|ui| {
-                                            ui.label("Audio Track");
-                                            let mut selected_idx = state.selected_audio_track;
-                                            let prev_idx = selected_idx;
-                                            let selected_title = state.audio_tracks.get(selected_idx)
-                                                .map(|t| t.title.clone())
-                                                .unwrap_or_else(|| format!("Track {}", selected_idx + 1));
-
-                                            egui::ComboBox::from_id_salt("audio_track_combo")
-                                                .selected_text(&selected_title)
-                                                .width(ui.available_width().max(80.0))
-                                                .show_ui(ui, |ui| {
-                                                    for (idx, track) in state.audio_tracks.iter().enumerate() {
-                                                        ui.selectable_value(&mut selected_idx, idx, &track.title);
-                                                    }
-                                                });
-
-                                            if selected_idx != prev_idx {
-                                                engine_action = EngineAction::SetAudioTrack(selected_idx);
-                                            }
-                                        });
-                                    }
-                                    
-                                    ui.horizontal(|ui| {
-                                        ui.label("Device");
-                                        let mut current_device = state.selected_audio_device.clone().unwrap_or_else(|| "Default Device".to_string());
-                                        let prev_device = current_device.clone();
                                         
-                                        egui::ComboBox::from_id_salt("audio_device_combo")
-                                            .selected_text(&current_device)
-                                            .width(ui.available_width().max(80.0))
-                                            .show_ui(ui, |ui| {
-                                                for dev in &state.available_audio_devices {
-                                                    ui.selectable_value(&mut current_device, dev.clone(), dev);
+                                        if resolved_order >= 0 && (resolved_order as usize) < state.tracker_patterns_by_order.len() {
+                                            let pattern = &state.tracker_patterns_by_order[resolved_order as usize];
+                                            if resolved_row >= 0 && (resolved_row as usize) < pattern.len() {
+                                                let row_str = &pattern[resolved_row as usize];
+                                                
+                                                let distance = offset.abs() as f32 / (num_rows_to_draw as f32 / 2.0);
+                                                let alpha = (1.0 - distance * 0.75).clamp(0.0, 1.0);
+                                                let y = center_y + (offset as f32) * row_height;
+                                                
+                                                // Format tracker row text
+                                                formatted.clear();
+                                                let text_slice = if row_str.chars().count() > max_text_chars {
+                                                    let mut end = row_str.len();
+                                                    for (char_count, (byte_idx, _)) in row_str.char_indices().enumerate() {
+                                                        if char_count == max_text_chars {
+                                                            end = byte_idx;
+                                                            break;
+                                                        }
+                                                    }
+                                                    &row_str[..end]
+                                                } else {
+                                                    row_str.as_str()
+                                                };
+                                                
+                                                use std::fmt::Write;
+                                                let _ = write!(formatted, "{:02} | {}", resolved_row, text_slice);
+                                                
+                                                let pos = egui::pos2(hm_rect.left() + 10.0, y);
+                                                if offset == 0 {
+                                                    // Prominent highlight background on the active playback row
+                                                    let galley = painter.layout_no_wrap(
+                                                        formatted.clone(),
+                                                        font_id.clone(),
+                                                        egui::Color32::WHITE,
+                                                    );
+                                                    let rect = egui::Rect::from_min_size(
+                                                        pos + egui::vec2(0.0, -galley.size().y / 2.0),
+                                                        galley.size(),
+                                                    );
+                                                    painter.rect_filled(
+                                                        rect.expand2(egui::vec2(10.0, 2.0)),
+                                                        4.0,
+                                                        egui::Color32::from_black_alpha(220)
+                                                    );
+                                                    painter.galley(rect.min, galley, egui::Color32::WHITE);
+                                                } else {
+                                                    // Valid unmultiplied alpha color
+                                                    let color = egui::Color32::from_rgba_unmultiplied(150, 150, 150, (alpha * 100.0) as u8);
+                                                    
+                                                    let galley = painter.layout_no_wrap(
+                                                        formatted.clone(),
+                                                        font_id.clone(),
+                                                        egui::Color32::WHITE,
+                                                    );
+                                                    
+                                                    let rect = egui::Rect::from_center_size(pos, galley.size());
+                                                    painter.galley(rect.min, galley, color);
+                                                }
+                                                
+                                                // Pattern boundary indicator
+                                                if resolved_row == 0 {
+                                                    painter.line_segment(
+                                                        [egui::pos2(hm_rect.left(), y - row_height / 2.0), egui::pos2(hm_rect.right(), y - row_height / 2.0)],
+                                                        (1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, (alpha * 150.0) as u8))
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            };
+
+                            let render_col_info = |col: &mut egui::Ui, out_track_info_rect: &mut Option<egui::Rect>, engine_action: &mut EngineAction| {
+                                if state.video_mode == 1 && self.video_state.is_some() {
+                                    let available = col.available_size();
+                                    let (rect, _) = col.allocate_exact_size(available, egui::Sense::hover());
+                                    *out_track_info_rect = Some(rect);
+                                } else {
+                                    col.style_mut().visuals.override_text_color = Some(egui::Color32::from_gray(235));
+                                    if !is_portrait {
+                                        let heading_text = if state.playlist.len() > 1 {
+                                            format!("Track Info ({}/{})", state.playlist_index + 1, state.playlist.len())
+                                        } else {
+                                            "Track Info".to_string()
+                                        };
+                                        col.heading(heading_text);
+                                        col.separator();
+                                    }
+                                
+                                    let render_smooth_marquee = |ui: &mut egui::Ui, text: &str, size: f32, is_title: bool| {
+                                        let available_width = ui.available_width();
+                                        let font_id = egui::FontId::proportional(size);
+                                        let color = ui.style().visuals.override_text_color.unwrap_or(egui::Color32::from_gray(235));
+                                        let text_color = if is_title { egui::Color32::WHITE } else { color };
+                                        
+                                        let galley = ui.painter().layout_no_wrap(text.to_string(), font_id, text_color);
+                                        let text_width = galley.rect.width();
+                                        let height = galley.rect.height();
+                                        
+                                        let (rect, _response) = ui.allocate_exact_size(egui::vec2(available_width, height), egui::Sense::hover());
+                                        let painter = ui.painter().with_clip_rect(rect);
+                                        
+                                        if text_width > available_width {
+                                            let max_scroll = text_width - available_width;
+                                            let scroll_duration = max_scroll / 35.0;
+                                            let total_period = 2.0 + scroll_duration + 2.0 + scroll_duration;
+                                            let t = (state.current_seconds as f32) % total_period;
+                                            
+                                            let offset = if t < 2.0 {
+                                                0.0
+                                            } else if t < 2.0 + scroll_duration {
+                                                let progress = (t - 2.0) / scroll_duration;
+                                                progress * max_scroll
+                                            } else if t < 2.0 + scroll_duration + 2.0 {
+                                                max_scroll
+                                            } else {
+                                                let progress = (t - (2.0 + scroll_duration + 2.0)) / scroll_duration;
+                                                max_scroll - (progress * max_scroll)
+                                            };
+                                            
+                                            painter.galley(rect.min + egui::vec2(-offset, 0.0), galley, text_color);
+                                        } else {
+                                            painter.galley(rect.min, galley, text_color);
+                                        }
+                                    };
+
+                                    let current_path_str = if state.playlist_index < state.playlist.len() {
+                                        state.playlist[state.playlist_index].clone()
+                                    } else {
+                                        state.song_title.clone()
+                                    };
+                                    let is_network = current_path_str.starts_with("http://") || current_path_str.starts_with("https://");
+                                    let file_name = if is_network {
+                                        state.song_title.clone()
+                                    } else {
+                                        std::path::Path::new(&state.song_title).file_name().unwrap_or_default().to_string_lossy().to_string()
+                                    };
+                                    let file_dir = if is_network {
+                                        current_path_str
+                                    } else {
+                                        let abs_path = if std::path::Path::new(&current_path_str).is_absolute() {
+                                            std::path::PathBuf::from(&current_path_str)
+                                        } else if let Ok(cwd) = std::env::current_dir() {
+                                            cwd.join(&current_path_str)
+                                        } else {
+                                            std::path::PathBuf::from(&current_path_str)
+                                        };
+                                        let path_str = abs_path.to_string_lossy().to_string();
+                                        if let Ok(home) = std::env::var("HOME") {
+                                            if path_str.starts_with(&home) {
+                                                path_str.replacen(&home, "~", 1)
+                                            } else {
+                                                path_str
+                                            }
+                                        } else {
+                                            path_str
+                                        }
+                                    };
+
+                                    egui::ScrollArea::vertical()
+                                        .auto_shrink([false, false])
+                                        .show(col, |ui| {
+                                            // 1. Song Title
+                                            ui.horizontal(|ui| {
+                                                ui.label("Title:");
+                                                render_smooth_marquee(ui, &state.song_title, 14.0, true);
+                                            });
+                                            
+                                            // 2. Artist
+                                            ui.horizontal(|ui| {
+                                                ui.label("Artist:");
+                                                render_smooth_marquee(ui, &state.artist, 14.0, false);
+                                            });
+                                            
+                                            // 3. File Name
+                                            ui.horizontal(|ui| {
+                                                ui.label("File:");
+                                                render_smooth_marquee(ui, &file_name, 14.0, false);
+                                            });
+
+                                            // 4. File Directory / URL
+                                            ui.horizontal(|ui| {
+                                                let label = if is_network { "Stream:" } else { "Folder:" };
+                                                ui.label(label);
+                                                render_smooth_marquee(ui, &file_dir, 14.0, false);
+                                            });
+                                            
+                                            // 5. Codec / Format & Bitrate
+                                            let format_str = if let Some(br) = state.bitrate {
+                                                format!("{} ({} kbps)", state.module_type, br)
+                                            } else {
+                                                state.module_type.clone()
+                                            };
+                                            ui.horizontal(|ui| {
+                                                ui.label("Format:");
+                                                ui.label(format_str);
+                                            });
+                                            
+                                            // 6. Channels & Track Info
+                                            let ch_info = if let Some(tc) = state.tracker_channels {
+                                                format!("{} hardware / {} tracker channels", state.hardware_channels, tc)
+                                            } else {
+                                                format!("{} channels", state.num_channels)
+                                            };
+                                            ui.horizontal(|ui| {
+                                                ui.label("Channels:");
+                                                ui.label(ch_info);
+                                            });
+
+                                            // 7. Track Duration
+                                            ui.horizontal(|ui| {
+                                                ui.label("Duration:");
+                                                if state.duration_seconds <= 0.0 {
+                                                    ui.label("Live Stream");
+                                                } else {
+                                                    ui.label(format!("{:.1}s", state.duration_seconds)); 
                                                 }
                                             });
-                                        
-                                        if current_device != prev_device {
-                                            engine_action = EngineAction::SetAudioDevice(current_device);
-                                        }
-                                    });
-                                    
-                                    // 8. Next Song (placed at the bottom, smooth marquee if long)
-                                    if state.playlist_index + 1 < state.playlist.len() {
-                                        let next_path = std::path::Path::new(&state.playlist[state.playlist_index + 1]);
-                                        let next_song = next_path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                                        ui.horizontal(|ui| { 
-                                            ui.label("Next Song:"); 
-                                            render_smooth_marquee(ui, &next_song, 14.0, false); 
+
+                                            if state.audio_tracks.len() > 1 {
+                                                ui.add_space(6.0);
+                                                ui.label(egui::RichText::new("Audio Tracks (tap icon to switch):").strong().color(egui::Color32::from_rgb(0, 210, 255)));
+                                                ui.add_space(2.0);
+                                                for (idx, track) in state.audio_tracks.iter().enumerate() {
+                                                    let is_selected = state.selected_audio_track == idx;
+                                                    let lower = track.title.to_lowercase();
+                                                    let (icon, color) = if lower.contains("vocal") || lower.contains("guide") {
+                                                        ("♪", egui::Color32::from_rgb(255, 110, 180))
+                                                    } else if lower.contains("instrumental") || lower.contains("karaoke") || lower.contains("music") {
+                                                        ("♫", egui::Color32::from_rgb(0, 230, 160))
+                                                    } else {
+                                                        ("♪", egui::Color32::from_rgb(255, 200, 60))
+                                                    };
+                                                    let btn_label = if is_selected {
+                                                        format!("▶ {} {}", icon, track.title)
+                                                    } else {
+                                                        format!("   {} {}", icon, track.title)
+                                                    };
+
+                                                    let btn = if is_selected {
+                                                        egui::Button::new(egui::RichText::new(btn_label).color(color).strong().size(12.5))
+                                                            .stroke(egui::Stroke::new(1.5_f32, color))
+                                                            .fill(egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 45))
+                                                    } else {
+                                                        egui::Button::new(egui::RichText::new(btn_label).color(egui::Color32::LIGHT_GRAY).size(12.0))
+                                                            .fill(egui::Color32::from_rgba_unmultiplied(45, 45, 50, 200))
+                                                    };
+
+                                                    if ui.add_sized([ui.available_width().max(160.0), 30.0], btn).clicked() && !is_selected {
+                                                        *engine_action = EngineAction::SetAudioTrack(idx);
+                                                    }
+                                                    ui.add_space(2.0);
+                                                }
+                                                ui.add_space(4.0);
+                                            }
+                                            
+                                            ui.horizontal(|ui| {
+                                                ui.label("Device");
+                                                let mut current_device = state.selected_audio_device.clone().unwrap_or_else(|| "Default Device".to_string());
+                                                let prev_device = current_device.clone();
+                                                
+                                                egui::ComboBox::from_id_salt("audio_device_combo")
+                                                    .selected_text(&current_device)
+                                                    .width(ui.available_width().max(80.0))
+                                                    .show_ui(ui, |ui| {
+                                                        for dev in &state.available_audio_devices {
+                                                            ui.selectable_value(&mut current_device, dev.clone(), dev);
+                                                        }
+                                                    });
+                                                
+                                                if current_device != prev_device {
+                                                    *engine_action = EngineAction::SetAudioDevice(current_device);
+                                                }
+                                            });
+                                            
+                                            // 8. Next Song (placed at the bottom, smooth marquee if long)
+                                            if state.playlist_index + 1 < state.playlist.len() {
+                                                let next_path = std::path::Path::new(&state.playlist[state.playlist_index + 1]);
+                                                let next_song = next_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                                                ui.horizontal(|ui| { 
+                                                    ui.label("Next Song:"); 
+                                                    render_smooth_marquee(ui, &next_song, 14.0, false); 
+                                                });
+                                            }
+                                            ui.add_space(4.0);
+                                            if ui.button(egui::RichText::new("📂 Open Audio File").strong().size(12.5)).clicked() {
+                                                *engine_action = EngineAction::OpenFile;
+                                            }
                                         });
+                                    
+                                    *out_track_info_rect = Some(col.max_rect());
+                                }
+                            };
+
+                            if is_portrait {
+                                let has_video = state.has_video_stream || self.video_state.is_some();
+                                let progress_height = 20.0;
+                                let available_h = ui.available_height();
+                                let content_h = (available_h - progress_height).max(40.0);
+
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(ui.available_width(), content_h),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        match state.mobile_hud_tab {
+                                            crate::state::MobileHudTab::Channels => {
+                                                render_col_channels(ui, &mut out_meters_rect, &mut out_fire_rect, &mut engine_action);
+                                            }
+                                            crate::state::MobileHudTab::Heatmap => {
+                                                render_col_heatmap(ui, &mut out_heatmap_rect);
+                                            }
+                                            crate::state::MobileHudTab::Info => {
+                                                render_col_info(ui, &mut out_track_info_rect, &mut engine_action);
+                                            }
+                                            crate::state::MobileHudTab::Video => {
+                                                if has_video {
+                                                    let (rect, _) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
+                                                    out_video_rect = Some(rect);
+                                                } else {
+                                                    ui.centered_and_justified(|ui| {
+                                                        ui.label(egui::RichText::new("No video stream present").italics());
+                                                    });
+                                                }
+                                            }
+                                        }
                                     }
+                                );
+
+                                ui.add_space(2.0);
+                                render_progress_bar(ui, &mut out_fire_rect, &mut engine_action);
+                            } else {
+                                ui.columns(3, |columns| {
+                                    render_col_channels(&mut columns[0], &mut out_meters_rect, &mut out_fire_rect, &mut engine_action);
+                                    render_col_heatmap(&mut columns[1], &mut out_heatmap_rect);
+                                    render_col_info(&mut columns[2], &mut out_track_info_rect, &mut engine_action);
                                 });
-                            
-                            out_track_info_rect = Some(columns[2].max_rect());
+                            }
                         }
                     });
-                }
-            });
-            out_top_panel_rect = Some(panel_resp.response.rect);
-        }
+                out_top_panel_rect = Some(panel_resp.response.rect);
+            }
 
-        if state.show_hud && state.video_mode != 3 {
+        if is_portrait && state.show_hud && state.video_mode != 3 {
             let total_height = ctx.content_rect().height();
             let total_width = ctx.content_rect().width();
             
@@ -5721,45 +5831,90 @@ impl VulkanEngine {
                     }
                 }
                 
-                // Draw OSD text from keyboard/gamepad actions
+                // Draw OSD text from keyboard/gamepad/touch actions
                 if let Some(osd) = &state.osd_text {
                     if state.osd_timer > 0.0 {
                         let painter = ui.painter();
                         let alpha = (state.osd_timer.min(0.5) * 2.0 * 255.0) as u8;
-                        painter.text(
-                            rect.center(),
-                            egui::Align2::CENTER_CENTER,
-                            osd,
-                            egui::FontId::proportional(32.0),
-                            egui::Color32::from_rgba_premultiplied(255, 255, 255, alpha),
+                        let is_portrait = ui.ctx().viewport_rect().width() < ui.ctx().viewport_rect().height();
+                        
+                        let max_width = if is_portrait {
+                            (ui.ctx().viewport_rect().width() - 40.0).max(100.0)
+                        } else {
+                            (ui.ctx().viewport_rect().width() * 0.85).max(200.0)
+                        };
+                        
+                        let font_size = if is_portrait {
+                            if osd.len() > 32 {
+                                17.0
+                            } else if osd.len() > 18 {
+                                21.0
+                            } else {
+                                26.0
+                            }
+                        } else {
+                            if osd.len() > 35 {
+                                24.0
+                            } else {
+                                32.0
+                            }
+                        };
+                        
+                        let text_color = egui::Color32::from_rgba_premultiplied(255, 255, 255, alpha);
+                        let galley = painter.layout(
+                            osd.clone(),
+                            egui::FontId::proportional(font_size),
+                            text_color,
+                            max_width,
                         );
+                        
+                        let center = rect.center();
+                        let galley_pos = egui::pos2(
+                            center.x - galley.rect.width() * 0.5,
+                            center.y - galley.rect.height() * 0.5,
+                        );
+                        
+                        let bg_rect = galley.rect.translate(galley_pos.to_vec2()).expand2(egui::vec2(14.0, 8.0));
+                        let bg_alpha = (alpha as f32 * 0.65) as u8;
+                        painter.rect_filled(
+                            bg_rect,
+                            8.0,
+                            egui::Color32::from_rgba_unmultiplied(10, 10, 15, bg_alpha),
+                        );
+                        
+                        painter.galley(galley_pos, galley, text_color);
                     }
                 }
                 
                 if state.visualizer_mode == 0 && state.show_hud && state.video_mode != 3 {
                     let painter = ui.painter();
-                    let y = rect.bottom() - 20.0;
+                    let is_portrait = ui.ctx().viewport_rect().width() < ui.ctx().viewport_rect().height();
+                    let bottom_margin = if is_portrait { 36.0 } else { 20.0 };
+                    let y = rect.bottom() - bottom_margin;
                     
                     let max_freq = state.max_frequency;
                     let min_freq = 20.0_f32;
                     let x_at = |f: f32| -> f32 { (f / min_freq).ln() / (max_freq / min_freq).ln() };
+                    
+                    let side_margin = if is_portrait { 28.0 } else { 16.0 };
+                    let usable_width = (rect.width() - 2.0 * side_margin).max(10.0);
+                    
                     let labels = [
-                        (0.0, format!("{}Hz", min_freq as u32)),
-                        (x_at(100.0), "100Hz".to_string()),
-                        (x_at(1000.0), "1kHz".to_string()),
-                        (x_at(5000.0), "5kHz".to_string()),
-                        (0.97, format!("{:.0}kHz", max_freq / 1000.0)),
+                        (0.0_f32, format!("{}Hz", min_freq as u32), egui::Align2::LEFT_BOTTOM),
+                        (x_at(100.0), "100Hz".to_string(), egui::Align2::CENTER_BOTTOM),
+                        (x_at(1000.0), "1kHz".to_string(), egui::Align2::CENTER_BOTTOM),
+                        (x_at(5000.0), "5kHz".to_string(), egui::Align2::CENTER_BOTTOM),
+                        (1.0_f32, format!("{:.0}kHz", max_freq / 1000.0), egui::Align2::RIGHT_BOTTOM),
                     ];
                     
-                    let width = rect.width();
-                    for (x_pct, text) in labels.iter() {
-                        let x = rect.left() + width * x_pct;
+                    for (x_pct, text, align) in labels.iter() {
+                        let x = rect.left() + side_margin + usable_width * x_pct;
                         painter.text(
                             egui::pos2(x, y),
-                            egui::Align2::LEFT_BOTTOM,
+                            *align,
                             text,
-                            egui::FontId::proportional(16.0),
-                            egui::Color32::WHITE,
+                            egui::FontId::proportional(15.0),
+                            egui::Color32::from_gray(230),
                         );
                     }
                 }
@@ -6074,8 +6229,13 @@ impl VulkanEngine {
                 std::mem::offset_of!(AudioUniforms, aspect_ratio) as wgpu::BufferAddress;
             self.queue.write_buffer(&self.uniform_buffer, ASPECT_RATIO_OFFSET, bytemuck::cast_slice(&[aspect as f32]));
 
-            // Fixed vertical FOV ensures vehicles and scenes maintain perfect aspect ratio without squashing
-            let fov_y = 48.0_f32.to_radians();
+            // Adapt FOV when aspect ratio is square or portrait (< 1.0) so 3D scenes fit without horizontal clipping
+            let base_fov = 48.0_f32.to_radians();
+            let fov_y = if aspect < 1.0 {
+                (base_fov / aspect.clamp(0.65, 1.0)).min(75.0_f32.to_radians())
+            } else {
+                base_fov
+            };
             let proj = glam::Mat4::perspective_rh_gl(fov_y, aspect, 0.1, 1000.0);
             let view = if state.visualizer_mode == 20 && state.biolum_top_down {
                 glam::Mat4::look_at_rh(
@@ -6131,6 +6291,7 @@ impl VulkanEngine {
             self.queue.write_buffer(&self.camera_uniform_buffer, 0, bytemuck::cast_slice(&[camera_uniforms]));
             
             render_pass.set_viewport(vp_x, vp_y, vp_w, vp_h, 0.0, 1.0);
+            render_pass.set_scissor_rect(vp_x as u32, vp_y as u32, vp_w as u32, vp_h as u32);
 
             let mode_idx = state.current_visualizer_idx.min(self.render_pipelines.len() - 1);
             let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
@@ -6196,13 +6357,22 @@ impl VulkanEngine {
                 }
             }
             
-            if state.video_mode > 0 && self.video_state.is_some() {
+            let is_portrait = self.config.width < self.config.height;
+            let is_video_active = self.video_state.is_some() && (
+                state.video_mode > 0 || (is_portrait && state.mobile_hud_tab == crate::state::MobileHudTab::Video)
+            );
+            
+            if is_video_active {
                 let mut v_vp_x = 0.0;
                 let mut v_vp_y = 0.0;
                 let mut v_vp_w = self.config.width as f32;
                 let mut v_vp_h = self.config.height as f32;
                 
-                let target_rect = if state.video_mode == 1 {
+                let target_rect = if state.video_mode == 3 {
+                    None // mode 3: full screen
+                } else if is_portrait && state.mobile_hud_tab == crate::state::MobileHudTab::Video {
+                    out_video_rect
+                } else if state.video_mode == 1 {
                     out_track_info_rect
                 } else if state.video_mode == 2 {
                     out_top_panel_rect
@@ -6220,6 +6390,7 @@ impl VulkanEngine {
                 }
                 
                 render_pass.set_viewport(v_vp_x, v_vp_y, v_vp_w, v_vp_h, 0.0, 1.0);
+                render_pass.set_scissor_rect(v_vp_x as u32, v_vp_y as u32, v_vp_w as u32, v_vp_h as u32);
                 
                 if let Some(vs) = &self.video_state {
                     let params = VideoParams {
@@ -6277,7 +6448,7 @@ impl VulkanEngine {
                 draw_rect(out_heatmap_rect);
                 draw_rect(out_fire_rect);
 
-                if !drawn {
+                if !drawn && !is_portrait {
                     render_pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
                     render_pass.draw(0..3, 0..1);
                 }
