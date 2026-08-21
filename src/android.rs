@@ -522,8 +522,6 @@ impl AndroidRustTrackerApp {
             }
             TouchGesture::SingleTap { x, y } => {
                 let is_portrait = window_width < window_height;
-                let split_ratio = state.panel_split_ratio;
-                let split_y = window_height * split_ratio;
 
                 // Tapping while in fullscreen video exits back to split view
                 if state.video_mode == 3 {
@@ -541,14 +539,10 @@ impl AndroidRustTrackerApp {
                     return None;
                 }
 
-                // If tapped in visualizer area, toggle HUD
-                if is_portrait {
-                    if y >= split_y {
-                        state.show_hud = !state.show_hud;
-                    }
-                } else {
-                    state.show_hud = !state.show_hud;
-                }
+                // Single tap toggles Play / Pause
+                state.is_paused = !state.is_paused;
+                state.osd_text = Some(if state.is_paused { "Paused".to_string() } else { "Playing".to_string() });
+                state.osd_timer = 1.5;
                 None
             }
             TouchGesture::TwoFingerDoubleTap | TouchGesture::TwoFingerTap => {
@@ -565,8 +559,9 @@ impl AndroidRustTrackerApp {
                 None
             }
             TouchGesture::DoubleTap { .. } => {
-                state.is_paused = !state.is_paused;
-                state.osd_text = Some(if state.is_paused { "Paused".to_string() } else { "Playing".to_string() });
+                // Double tap toggles HUD visibility
+                state.show_hud = !state.show_hud;
+                state.osd_text = Some(if state.show_hud { "HUD: Visible".to_string() } else { "HUD: Hidden".to_string() });
                 state.osd_timer = 1.5;
                 None
             }

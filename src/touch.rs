@@ -212,12 +212,12 @@ impl TouchGestureController {
                     }
                 }
 
-                // Check for tap gestures (moved < 25px in < 350ms)
-                if dist < 25.0 && dt < 0.35 {
+                // Check for tap gestures (moved < 25px in < 250ms)
+                if dist < 25.0 && dt < 0.25 {
                     let now = Instant::now();
                     if let (Some(last_time), Some((lx, ly))) = (self.last_tap_time, self.last_tap_pos) {
                         let tap_dist = ((x - lx).powi(2) + (y - ly).powi(2)).sqrt();
-                        if now.duration_since(last_time) < Duration::from_millis(350) && tap_dist < 35.0 {
+                        if now.duration_since(last_time) < Duration::from_millis(250) && tap_dist < 35.0 {
                             self.last_tap_time = None;
                             self.last_tap_pos = None;
                             self.pending_single_tap = None;
@@ -247,7 +247,7 @@ impl TouchGestureController {
     /// Check if a pending single tap has expired
     pub fn update_pending_tap(&mut self) -> Option<TouchGesture> {
         if let Some(((x, y), tap_time)) = self.pending_single_tap {
-            if tap_time.elapsed() >= Duration::from_millis(350) {
+            if tap_time.elapsed() >= Duration::from_millis(250) {
                 self.pending_single_tap = None;
                 return Some(TouchGesture::SingleTap { x, y });
             }
