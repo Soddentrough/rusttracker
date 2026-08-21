@@ -1571,7 +1571,10 @@ impl VulkanEngine {
         let supports_timestamps = if cfg!(target_os = "android") {
             false
         } else {
-            adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY)
+            std::env::var("RUSTTRACKER_PROFILE")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false)
+                && adapter.features().contains(wgpu::Features::TIMESTAMP_QUERY)
         };
         if supports_timestamps {
             required_features |= wgpu::Features::TIMESTAMP_QUERY;
