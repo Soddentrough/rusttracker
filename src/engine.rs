@@ -3954,16 +3954,25 @@ impl VulkanEngine {
                 if let Some(vs) = &self.video_state {
                     // wgpu requires bytes_per_row to be a multiple of 256; repack
                     // into a staging buffer with padded rows when the decoder
-                    // stride doesn't comply.
-                    let pack_plane = |plane: &Vec<u8>, stride: usize, width_bytes: usize, rows: usize| -> (Vec<u8>, usize, bool) {
-                        if stride % 256 == 0 {
+                    // stride doesn't comply or buffer size is under-allocated.
+                    let pack_plane = |plane: &[u8], stride: usize, width_bytes: usize, rows: usize| -> (Vec<u8>, usize, bool) {
+                        let aligned = (width_bytes + 255) & !255;
+                        if stride == aligned && plane.len() >= aligned * rows {
                             return (Vec::new(), stride, false);
                         }
-                        let aligned = (width_bytes + 255) & !255;
                         let mut packed = vec![0u8; aligned * rows];
+                        let plane_len = plane.len();
                         for r in 0..rows {
-                            packed[r * aligned..r * aligned + width_bytes]
-                                .copy_from_slice(&plane[r * stride..r * stride + width_bytes]);
+                            let src_start = r * stride;
+                            let src_end = src_start + width_bytes;
+                            let dst_start = r * aligned;
+                            let dst_end = dst_start + width_bytes;
+                            if src_end <= plane_len && dst_end <= packed.len() {
+                                packed[dst_start..dst_end].copy_from_slice(&plane[src_start..src_end]);
+                            } else if src_start < plane_len && dst_end <= packed.len() {
+                                let available = plane_len - src_start;
+                                packed[dst_start..dst_start + available].copy_from_slice(&plane[src_start..plane_len]);
+                            }
                         }
                         (packed, aligned, true)
                     };

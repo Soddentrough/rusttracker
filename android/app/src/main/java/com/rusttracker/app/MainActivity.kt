@@ -98,52 +98,69 @@ class MainActivity : GameActivity() {
     }
 
     private fun handleSelectedUri(uri: Uri) {
-        try {
-            var displayName = "audio_track"
-            val decodedPath = uri.path?.let { Uri.decode(it) }
-            if (uri.scheme == "content") {
-                contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-                    if (cursor.moveToFirst()) {
-                        val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                        if (nameIdx >= 0) {
-                            val name = cursor.getString(nameIdx)
-                            if (!name.isNullOrBlank()) {
-                                displayName = name
+        Thread {
+            try {
+                var displayName = "audio_track"
+                val decodedPath = uri.path?.let { Uri.decode(it) }
+                if (uri.scheme == "content") {
+                    contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                        if (cursor.moveToFirst()) {
+                            val nameIdx = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                            if (nameIdx >= 0) {
+                                val name = cursor.getString(nameIdx)
+                                if (!name.isNullOrBlank()) {
+                                    displayName = name
+                                }
                             }
                         }
                     }
+                } else if (uri.scheme == "file" && decodedPath != null) {
+                    displayName = File(decodedPath).name
                 }
-            } else if (uri.scheme == "file" && decodedPath != null) {
-                displayName = File(decodedPath).name
-            }
 
-            val targetFile = File(cacheDir, displayName)
-            if (uri.scheme == "file" && decodedPath != null) {
-                val srcFile = File(decodedPath)
-                if (srcFile.exists() && srcFile.canonicalPath == targetFile.canonicalPath) {
-                    Log.i(TAG, "File already in cache: ${targetFile.absolutePath}")
-                    nativeOnFileSelected(targetFile.absolutePath)
-                    return
+                val safeName = displayName.replace(Regex("[^a-zA-Z0-9._ -]"), "_")
+                val targetFile = File(cacheDir, safeName)
+                if (uri.scheme == "file" && decodedPath != null) {
+                    val srcFile = File(decodedPath)
+                    if (srcFile.exists() && srcFile.canonicalPath == targetFile.canonicalPath) {
+                        Log.i(TAG, "File already in cache: ${targetFile.absolutePath}")
+                        nativeOnFileSelected(targetFile.absolutePath)
+                        return@Thread
+                    }
                 }
-            }
 
-            val inputStream = if (uri.scheme == "file" && decodedPath != null) {
-                FileInputStream(File(decodedPath))
-            } else {
-                contentResolver.openInputStream(uri)
-            }
-
-            inputStream?.use { input ->
-                FileOutputStream(targetFile).use { output ->
-                    input.copyTo(output)
+                val tempFile = File(cacheDir, "temp_${System.currentTimeMillis()}_$safeName")
+                val inputStream = if (uri.scheme == "file" && decodedPath != null) {
+                    FileInputStream(File(decodedPath))
+                } else {
+                    contentResolver.openInputStream(uri)
                 }
-            }
 
-            Log.i(TAG, "Selected file successfully saved to cache: ${targetFile.absolutePath}")
-            nativeOnFileSelected(targetFile.absolutePath)
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to cache and process selected URI: $uri", e)
-        }
+                inputStream?.use { input ->
+                    FileOutputStream(tempFile).use { output ->
+                        input.copyTo(output)
+                    }
+                }
+
+                val finalFile = if (tempFile.exists() && tempFile.length() > 0) {
+                    if (targetFile.exists()) {
+                        targetFile.delete()
+                    }
+                    if (tempFile.renameTo(targetFile)) {
+                        targetFile
+                    } else {
+                        tempFile
+                    }
+                } else {
+                    targetFile
+                }
+
+                Log.i(TAG, "Selected file successfully saved to cache: ${finalFile.absolutePath}")
+                nativeOnFileSelected(finalFile.absolutePath)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to cache and process selected URI: $uri", e)
+            }
+        }.start()
     }
 
     private external fun nativeOnFileSelected(filePath: String)

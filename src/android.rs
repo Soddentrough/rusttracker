@@ -406,7 +406,9 @@ impl AndroidRustTrackerApp {
             }
             // Top pane swipe up in portrait: If on video pane or video exists, toggle fullscreen video!
             TouchGesture::TopPaneSwipeUp => {
-                if has_video {
+                if state.video_mode == 3 {
+                    state.video_mode = 0;
+                } else if has_video {
                     state.video_mode = 3;
                     state.mobile_hud_tab = crate::state::MobileHudTab::Video;
                 }
@@ -456,12 +458,15 @@ impl AndroidRustTrackerApp {
                 state.osd_timer = 2.0;
                 None
             }
-            TouchGesture::BottomPaneSwipeUp => None,
+            TouchGesture::BottomPaneSwipeUp => {
+                if state.video_mode == 3 {
+                    state.video_mode = 0;
+                }
+                None
+            }
             TouchGesture::BottomPaneSwipeDown => {
                 if state.video_mode == 3 {
                     state.video_mode = 0;
-                    state.osd_text = Some("Split View".to_string());
-                    state.osd_timer = 1.5;
                 }
                 None
             }
@@ -544,6 +549,7 @@ impl AndroidRustTrackerApp {
     }
 
     fn load_and_play_file(&mut self, path: &str) {
+        log_android(3, &format!("Loading and playing file: {}", path));
         self.active_stream = None;
         {
             let mut state = self.app_state.lock().unwrap();
@@ -561,6 +567,7 @@ impl AndroidRustTrackerApp {
 
         match crate::audio::start_audio_thread(path, false, Arc::clone(&self.app_state)) {
             Ok(stream) => {
+                log_android(3, &format!("Successfully started audio thread for {}", path));
                 eprintln!("[RustTracker] Successfully started audio thread for {}", path);
                 let mut state = self.app_state.lock().unwrap();
                 state.file_loaded = true;
@@ -571,11 +578,13 @@ impl AndroidRustTrackerApp {
                 state.playlist_index = 0;
                 state.lyrics = crate::lyrics::load_lyrics_for_file(path).map(std::sync::Arc::new);
                 if let Some(l) = &state.lyrics {
+                    log_android(3, &format!("Loaded {} lines from {:?}", l.lines.len(), l.file_name));
                     eprintln!("[RustTracker Lyrics] Loaded {} lines from {:?}", l.lines.len(), l.file_name);
                 }
                 self.active_stream = Some(stream);
             }
             Err(e) => {
+                log_android(6, &format!("Failed to start audio thread: {:?}", e));
                 eprintln!("[RustTracker] Failed to start audio thread: {:?}", e);
                 let mut state = self.app_state.lock().unwrap();
                 state.osd_text = Some("Load Failed".to_string());
@@ -585,12 +594,28 @@ impl AndroidRustTrackerApp {
     }
 }
 
+#[link(name = "log")]
+unsafe extern "C" {
+    fn __android_log_write(prio: i32, tag: *const std::ffi::c_char, text: *const std::ffi::c_char) -> i32;
+}
+
+pub fn log_android(prio: i32, msg: &str) {
+    if let Ok(c_msg) = std::ffi::CString::new(msg) {
+        unsafe {
+            __android_log_write(prio, c"RustTracker".as_ptr(), c_msg.as_ptr());
+        }
+    }
+}
+
 #[unsafe(no_mangle)]
 fn android_main(app: AndroidApp) {
     std::panic::set_hook(Box::new(|panic_info| {
+        let msg = format!("[PANIC] {}", panic_info);
+        log_android(6, &msg);
         eprintln!("[RustTracker PANIC] {}", panic_info);
     }));
 
+    log_android(3, "Starting RustTracker on Android with Touch Gestures, SAF, and Audio Engine...");
     eprintln!("[RustTracker] Starting on Android with Touch Gestures, SAF, and Audio Engine...");
 
     let event_loop = EventLoop::builder()
