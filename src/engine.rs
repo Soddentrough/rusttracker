@@ -5845,14 +5845,15 @@ impl VulkanEngine {
                 // Draw OSD text from keyboard/gamepad/touch actions
                 if let Some(osd) = &state.osd_text {
                     if state.osd_timer > 0.0 {
-                        let painter = ui.painter();
+                        let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("osd_notification")));
                         let alpha = (state.osd_timer.min(0.5) * 2.0 * 255.0) as u8;
-                        let is_portrait = ui.ctx().viewport_rect().width() < ui.ctx().viewport_rect().height();
+                        let screen = ui.ctx().viewport_rect();
+                        let is_portrait = screen.width() < screen.height();
                         
                         let max_width = if is_portrait {
-                            (ui.ctx().viewport_rect().width() - 40.0).max(100.0)
+                            (screen.width() - 40.0).max(100.0)
                         } else {
-                            (ui.ctx().viewport_rect().width() * 0.85).max(200.0)
+                            (screen.width() * 0.85).max(200.0)
                         };
                         
                         let font_size = if is_portrait {
@@ -5879,10 +5880,14 @@ impl VulkanEngine {
                             max_width,
                         );
                         
-                        let center = rect.center();
+                        let top_y = if is_portrait {
+                            screen.top() + 65.0
+                        } else {
+                            screen.top() + 40.0
+                        };
                         let galley_pos = egui::pos2(
-                            center.x - galley.rect.width() * 0.5,
-                            center.y - galley.rect.height() * 0.5,
+                            screen.center().x - galley.rect.width() * 0.5,
+                            top_y,
                         );
                         
                         let bg_rect = galley.rect.translate(galley_pos.to_vec2()).expand2(egui::vec2(14.0, 8.0));
