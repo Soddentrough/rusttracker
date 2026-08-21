@@ -152,43 +152,49 @@ class MainActivity : GameActivity() {
                 }
 
                 val safeName = displayName.replace(Regex("[^a-zA-Z0-9._ -]"), "_")
-                val targetFile = File(cacheDir, safeName)
-                if (uri.scheme == "file" && decodedPath != null) {
-                    val srcFile = File(decodedPath)
-                    if (srcFile.exists() && srcFile.canonicalPath == targetFile.canonicalPath) {
-                        Log.i(TAG, "File already in cache: ${targetFile.absolutePath}")
-                        nativeOnFileSelected(targetFile.absolutePath)
-                        return@Thread
+                val finalFile = File(cacheDir, "track_${System.currentTimeMillis()}_$safeName")
+
+                val inputStream = try {
+                    contentResolver.openInputStream(uri)
+                } catch (e: Exception) {
+                    if (decodedPath != null) {
+                        try {
+                            FileInputStream(File(decodedPath))
+                        } catch (e2: Exception) {
+                            null
+                        }
+                    } else {
+                        null
                     }
                 }
 
-                val tempFile = File(cacheDir, "temp_${System.currentTimeMillis()}_$safeName")
-                val inputStream = if (uri.scheme == "file" && decodedPath != null) {
-                    FileInputStream(File(decodedPath))
-                } else {
-                    contentResolver.openInputStream(uri)
+                if (inputStream == null) {
+                    Log.e(TAG, "Could not open input stream for URI: $uri")
+                    return@Thread
                 }
 
-                inputStream?.use { input ->
-                    FileOutputStream(tempFile).use { output ->
+                inputStream.use { input ->
+                    FileOutputStream(finalFile).use { output ->
                         input.copyTo(output)
                     }
                 }
 
-                val finalFile = if (tempFile.exists() && tempFile.length() > 0) {
-                    if (targetFile.exists()) {
-                        targetFile.delete()
-                    }
-                    if (tempFile.renameTo(targetFile)) {
-                        targetFile
-                    } else {
-                        tempFile
-                    }
-                } else {
-                    targetFile
+                if (!finalFile.exists() || finalFile.length() == 0L) {
+                    Log.e(TAG, "Cached file is missing or empty: ${finalFile.absolutePath}")
+                    return@Thread
                 }
 
-                Log.i(TAG, "Selected file successfully saved to cache: ${finalFile.absolutePath}")
+                // Clean up old cached files (older than 1 hour)
+                try {
+                    val oneHourAgo = System.currentTimeMillis() - 3600_000L
+                    cacheDir.listFiles()?.forEach { file ->
+                        if (file.name.startsWith("track_") && file != finalFile && file.lastModified() < oneHourAgo) {
+                            file.delete()
+                        }
+                    }
+                } catch (_: Exception) {}
+
+                Log.i(TAG, "Selected file successfully saved to cache: ${finalFile.absolutePath} (${finalFile.length()} bytes)")
                 nativeOnFileSelected(finalFile.absolutePath)
             } catch (e: Exception) {
                 Log.e(TAG, "Failed to cache and process selected URI: $uri", e)

@@ -3878,8 +3878,9 @@ impl VulkanEngine {
             }
             
             if let Some(frame) = latest_frame {
-                let needs_init = self.video_state.as_ref().map_or(true, |vs| vs.width != frame.width || vs.height != frame.height || vs.bit_depth != frame.bit_depth as u32);
-                if needs_init {
+                if frame.width >= 2 && frame.height >= 2 {
+                    let needs_init = self.video_state.as_ref().map_or(true, |vs| vs.width != frame.width || vs.height != frame.height || vs.bit_depth != frame.bit_depth as u32);
+                    if needs_init {
                     let tex_format = if frame.bit_depth > 8 { wgpu::TextureFormat::R16Unorm } else { wgpu::TextureFormat::R8Unorm };
                     let y_texture = self.device.create_texture(&wgpu::TextureDescriptor {
                         label: Some("Video Y Texture"),
@@ -4018,6 +4019,7 @@ impl VulkanEngine {
                         video_height: frame.height as f32,
                     };
                     self.queue.write_buffer(&vs.params_buffer, 0, bytemuck::cast_slice(&[params]));
+                }
                 }
                 
                 if let Some(tx) = &state.free_video_frame_tx {

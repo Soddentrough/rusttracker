@@ -70,6 +70,29 @@ struct AndroidRustTrackerApp {
     frame_count: u64,
 }
 
+fn create_egui_context() -> egui::Context {
+    let egui_ctx = egui::Context::default();
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "kenney_icons".to_owned(),
+        egui::FontData::from_static(include_bytes!("../assets/kenney-icon-font.ttf")).into(),
+    );
+    fonts.font_data.insert(
+        "orbitron".to_owned(),
+        egui::FontData::from_static(include_bytes!("../assets/Orbitron-Black.ttf")).into(),
+    );
+    fonts.families.insert(
+        egui::FontFamily::Name("Orbitron".into()),
+        vec!["orbitron".to_owned()],
+    );
+    fonts.families
+        .get_mut(&egui::FontFamily::Proportional)
+        .unwrap()
+        .push("kenney_icons".to_owned());
+    egui_ctx.set_fonts(fonts);
+    egui_ctx
+}
+
 impl ApplicationHandler for AndroidRustTrackerApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         eprintln!("[RustTracker] Android Lifecycle: Resumed");
@@ -85,8 +108,9 @@ impl ApplicationHandler for AndroidRustTrackerApp {
                     eprintln!("[RustTracker] Created Android Native Window: {:?}", win.inner_size());
                     
                     let eng = pollster::block_on(VulkanEngine::new(win.clone()));
+                    let egui_ctx = create_egui_context();
                     let state = egui_winit::State::new(
-                        self.egui_ctx.clone(),
+                        egui_ctx.clone(),
                         egui::ViewportId::ROOT,
                         &win,
                         Some(win.scale_factor() as f32),
@@ -94,6 +118,7 @@ impl ApplicationHandler for AndroidRustTrackerApp {
                         None,
                     );
 
+                    self.egui_ctx = egui_ctx;
                     self.window = Some(win);
                     self.engine = Some(eng);
                     self.egui_state = Some(state);
@@ -629,27 +654,7 @@ fn android_main(app: AndroidApp) {
         .expect("Failed to create Android EventLoop");
 
     let app_state = Arc::new(Mutex::new(AppState::new("RustTracker Mobile".to_string())));
-    let egui_ctx = egui::Context::default();
-
-    // Load bundled fonts
-    let mut fonts = egui::FontDefinitions::default();
-    fonts.font_data.insert(
-        "kenney_icons".to_owned(),
-        egui::FontData::from_static(include_bytes!("../assets/kenney-icon-font.ttf")).into(),
-    );
-    fonts.font_data.insert(
-        "orbitron".to_owned(),
-        egui::FontData::from_static(include_bytes!("../assets/Orbitron-Black.ttf")).into(),
-    );
-    fonts.families.insert(
-        egui::FontFamily::Name("Orbitron".into()),
-        vec!["orbitron".to_owned()],
-    );
-    fonts.families
-        .get_mut(&egui::FontFamily::Proportional)
-        .unwrap()
-        .push("kenney_icons".to_owned());
-    egui_ctx.set_fonts(fonts);
+    let egui_ctx = create_egui_context();
 
     event_loop.set_control_flow(ControlFlow::Poll);
 
