@@ -511,6 +511,11 @@ impl AndroidRustTrackerApp {
                     return Some(EngineAction::OpenFile);
                 }
 
+                // If no file loaded, keep splash screen and HUD active
+                if !state.file_loaded {
+                    return None;
+                }
+
                 // If tapped in visualizer area, toggle HUD
                 if is_portrait {
                     if y >= split_y {
