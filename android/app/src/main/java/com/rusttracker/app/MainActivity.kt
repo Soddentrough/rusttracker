@@ -34,6 +34,39 @@ class MainActivity : GameActivity() {
                 }
             } ?: Log.e(TAG, "MainActivity instance is null when requesting file picker")
         }
+
+        private val SUPPORTED_MIME_TYPES = arrayOf(
+            "audio/*",
+            "video/*",
+            "application/ogg",
+            "application/x-ogg",
+            "audio/midi",
+            "audio/x-midi",
+            "audio/mid",
+            "audio/sp-midi",
+            "application/midi",
+            "application/x-midi",
+            "audio/x-mod",
+            "audio/mod",
+            "audio/x-xm",
+            "audio/xm",
+            "audio/x-s3m",
+            "audio/s3m",
+            "audio/x-it",
+            "audio/it",
+            "audio/x-stm",
+            "audio/x-med",
+            "audio/x-mptm",
+            "audio/x-669",
+            "audio/x-mtm",
+            "audio/x-far",
+            "audio/x-ult",
+            "audio/x-okt",
+            "application/x-mod",
+            "application/x-xm",
+            "application/x-s3m",
+            "application/x-it"
+        )
     }
 
     private val openDocumentLauncher = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
@@ -90,9 +123,9 @@ class MainActivity : GameActivity() {
     fun openFilePicker() {
         runOnUiThread {
             try {
-                openDocumentLauncher.launch(arrayOf("*/*"))
+                openDocumentLauncher.launch(SUPPORTED_MIME_TYPES)
             } catch (e: Exception) {
-                Log.e(TAG, "Error launching openDocumentLauncher", e)
+                Log.e(TAG, "Error launching openDocumentLauncher with media filters", e)
             }
         }
     }

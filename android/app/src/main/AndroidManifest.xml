@@ -44,12 +44,18 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
 
-            <!-- Intent filters for opening audio & tracker files -->
+            <!-- Intent filters for opening audio, video, tracker, and midi files -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
                 <category android:name="android.intent.category.BROWSABLE" />
                 <data android:mimeType="audio/*" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.VIEW" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+                <data android:mimeType="video/*" />
             </intent-filter>
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
@@ -60,9 +66,19 @@
                 <data android:pathPattern=".*\\.xm" />
                 <data android:pathPattern=".*\\.it" />
                 <data android:pathPattern=".*\\.s3m" />
+                <data android:pathPattern=".*\\.mptm" />
                 <data android:pathPattern=".*\\.flac" />
                 <data android:pathPattern=".*\\.mp3" />
+                <data android:pathPattern=".*\\.wav" />
+                <data android:pathPattern=".*\\.ogg" />
+                <data android:pathPattern=".*\\.opus" />
+                <data android:pathPattern=".*\\.m4a" />
+                <data android:pathPattern=".*\\.aac" />
                 <data android:pathPattern=".*\\.mid" />
+                <data android:pathPattern=".*\\.midi" />
+                <data android:pathPattern=".*\\.mp4" />
+                <data android:pathPattern=".*\\.mkv" />
+                <data android:pathPattern=".*\\.webm" />
             </intent-filter>
         </activity>
     </application>
