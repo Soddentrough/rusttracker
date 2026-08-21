@@ -4250,8 +4250,13 @@ impl VulkanEngine {
                                 .color(egui::Color32::WHITE)
                         );
                         if state.gpu_fft {
+                            let fft_label = if state.stats.gpu_fft_us > 0.0 {
+                                format!("GPU FFT: {:.2} ms", state.stats.gpu_fft_us / 1000.0)
+                            } else {
+                                "GPU FFT: Active (Compute)".to_string()
+                            };
                             ui.label(
-                                egui::RichText::new(format!("GPU FFT: {:.2} ms", state.stats.gpu_fft_us / 1000.0))
+                                egui::RichText::new(fft_label)
                                     .color(egui::Color32::LIGHT_BLUE)
                             );
                             ui.label(
@@ -4273,10 +4278,12 @@ impl VulkanEngine {
                         if vis_def.requires_fire {
                             total_vis_us += state.stats.fire_us;
                         }
-                        ui.label(
-                            egui::RichText::new(format!("Visualization Shader (GPU): {:.2} ms", total_vis_us / 1000.0))
-                                .color(egui::Color32::LIGHT_BLUE)
-                        );
+                        if total_vis_us > 0.0 {
+                            ui.label(
+                                egui::RichText::new(format!("Visualization Shader (GPU): {:.2} ms", total_vis_us / 1000.0))
+                                    .color(egui::Color32::LIGHT_BLUE)
+                            );
+                        }
                         let buffer_label = if state.duration_seconds <= 0.0 { "Network Buffer" } else { "Audio Buffer" };
                         ui.label(
                             egui::RichText::new(format!("{}: {:.1}%", buffer_label, state.stats.audio_buffer_fill_pct))
