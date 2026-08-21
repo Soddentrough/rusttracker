@@ -4254,7 +4254,7 @@ dependencies = [
 
 [[package]]
 name = "rusttracker"
-version = "0.9.14"
+version = "0.9.15"
 dependencies = [
  "anyhow",
  "bytemuck",
@@ -4285,6 +4285,7 @@ dependencies = [
  "rustfft",
  "rustysynth",
  "symphonia",
+ "ttf-parser",
  "ureq",
  "wgpu",
  "windows",

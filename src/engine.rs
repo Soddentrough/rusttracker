@@ -68,6 +68,7 @@ pub enum EngineAction {
     EditUrl(String),
     ClearFocusUrlInput,
     SetAudioDevice(String),
+    SetAudioTrack(usize),
 }
 
 #[repr(C)]
@@ -267,6 +268,10 @@ pub struct VulkanEngine {
     clear_black_pipeline: wgpu::RenderPipeline,
     crt_background_pipeline: wgpu::RenderPipeline,
     biolum_bg_pipeline: wgpu::RenderPipeline,
+    synthwave_sky_pipeline: wgpu::RenderPipeline,
+    vumeters_bg_pipeline: wgpu::RenderPipeline,
+    neon_bg_pipeline: wgpu::RenderPipeline,
+    storm_sky_pipeline: wgpu::RenderPipeline,
     
     // 3D Engine Extensions
     camera_uniform_buffer: wgpu::Buffer,
@@ -289,6 +294,9 @@ pub struct VulkanEngine {
     // Change detection for waveform history uploads (skip 1.2MB write when unchanged)
     last_uploaded_push_count: u64,
     last_uploaded_vis_width: u32,
+    pub lyric_slam_timer: f32,
+    pub last_lyric_line_idx: Option<usize>,
+    pub current_lyric_mesh_text: String,
 }
 
 pub(crate) fn generate_lamp_mesh() -> (Vec<Vertex>, Vec<u32>) {
@@ -671,6 +679,869 @@ pub(crate) fn generate_neon_room_mesh() -> (Vec<Vertex>, Vec<u32>) {
     (vertices, indices)
 }
 
+fn glass_add_quad(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    p0: [f32; 3],
+    p1: [f32; 3],
+    p2: [f32; 3],
+    p3: [f32; 3],
+    normal: [f32; 3],
+    ch: f32,
+    mat: f32,
+) {
+    let start = vertices.len() as u32;
+    vertices.push(Vertex { position: p0, normal, tex_coords: [ch, mat] });
+    vertices.push(Vertex { position: p1, normal, tex_coords: [ch, mat] });
+    vertices.push(Vertex { position: p2, normal, tex_coords: [ch, mat] });
+    vertices.push(Vertex { position: p3, normal, tex_coords: [ch, mat] });
+    indices.extend_from_slice(&[start, start + 1, start + 2, start, start + 2, start + 3]);
+}
+
+static EMBEDDED_GLASS_FONT: &[u8] = include_bytes!("../assets/Orbitron-Black.ttf");
+
+struct GlassGlyphContour {
+    points: Vec<[f32; 2]>,
+}
+
+struct GlassContourBuilder {
+    contours: Vec<GlassGlyphContour>,
+    current_contour: Vec<[f32; 2]>,
+    start_point: [f32; 2],
+    last_point: [f32; 2],
+}
+
+impl GlassContourBuilder {
+    fn new() -> Self {
+        Self {
+            contours: Vec::new(),
+            current_contour: Vec::new(),
+            start_point: [0.0, 0.0],
+            last_point: [0.0, 0.0],
+        }
+    }
+
+    fn finish(mut self) -> Vec<GlassGlyphContour> {
+        if !self.current_contour.is_empty() {
+            self.contours.push(GlassGlyphContour { points: self.current_contour });
+        }
+        self.contours
+    }
+}
+
+impl ttf_parser::OutlineBuilder for GlassContourBuilder {
+    fn move_to(&mut self, x: f32, y: f32) {
+        if !self.current_contour.is_empty() {
+            self.contours.push(GlassGlyphContour { points: std::mem::take(&mut self.current_contour) });
+        }
+        self.start_point = [x, y];
+        self.last_point = [x, y];
+        self.current_contour.push([x, y]);
+    }
+
+    fn line_to(&mut self, x: f32, y: f32) {
+        self.last_point = [x, y];
+        self.current_contour.push([x, y]);
+    }
+
+    fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
+        let p0 = self.last_point;
+        let p1 = [x1, y1];
+        let p2 = [x, y];
+        let steps = 4;
+        for i in 1..=steps {
+            let t = i as f32 / steps as f32;
+            let it = 1.0 - t;
+            let qx = it * it * p0[0] + 2.0 * it * t * p1[0] + t * t * p2[0];
+            let qy = it * it * p0[1] + 2.0 * it * t * p1[1] + t * t * p2[1];
+            self.current_contour.push([qx, qy]);
+        }
+        self.last_point = [x, y];
+    }
+
+    fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
+        let p0 = self.last_point;
+        let p1 = [x1, y1];
+        let p2 = [x2, y2];
+        let p3 = [x, y];
+        let steps = 6;
+        for i in 1..=steps {
+            let t = i as f32 / steps as f32;
+            let it = 1.0 - t;
+            let cx = it * it * it * p0[0] + 3.0 * it * it * t * p1[0] + 3.0 * it * t * t * p2[0] + t * t * t * p3[0];
+            let cy = it * it * it * p0[1] + 3.0 * it * it * t * p1[1] + 3.0 * it * t * t * p2[1] + t * t * t * p3[1];
+            self.current_contour.push([cx, cy]);
+        }
+        self.last_point = [x, y];
+    }
+
+    fn close(&mut self) {
+        if let Some(last) = self.current_contour.last() {
+            let dx = last[0] - self.start_point[0];
+            let dy = last[1] - self.start_point[1];
+            if (dx * dx + dy * dy).sqrt() < 0.001 && self.current_contour.len() > 1 {
+                self.current_contour.pop();
+            }
+        }
+        if !self.current_contour.is_empty() {
+            self.contours.push(GlassGlyphContour { points: std::mem::take(&mut self.current_contour) });
+        }
+    }
+}
+
+fn glass_contour_signed_area(pts: &[[f32; 2]]) -> f32 {
+    let n = pts.len();
+    if n < 3 { return 0.0; }
+    let mut area = 0.0;
+    for i in 0..n {
+        let j = (i + 1) % n;
+        area += pts[i][0] * pts[j][1] - pts[j][0] * pts[i][1];
+    }
+    area * 0.5
+}
+
+fn point_in_polygon(p: [f32; 2], poly: &[[f32; 2]]) -> bool {
+    let mut inside = false;
+    let n = poly.len();
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let pi = poly[i];
+        let pj = poly[j];
+        if (pi[1] > p[1]) != (pj[1] > p[1]) {
+            let x_int = pi[0] + (p[1] - pi[1]) * (pj[0] - pi[0]) / (pj[1] - pi[1]);
+            if p[0] < x_int {
+                inside = !inside;
+            }
+        }
+    }
+    inside
+}
+
+fn point_strictly_in_triangle(p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> bool {
+    if (p[0] - a[0]).abs() < 1e-4 && (p[1] - a[1]).abs() < 1e-4 { return false; }
+    if (p[0] - b[0]).abs() < 1e-4 && (p[1] - b[1]).abs() < 1e-4 { return false; }
+    if (p[0] - c[0]).abs() < 1e-4 && (p[1] - c[1]).abs() < 1e-4 { return false; }
+
+    let cross1 = (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]);
+    let cross2 = (c[0] - b[0]) * (p[1] - b[1]) - (c[1] - b[1]) * (p[0] - b[0]);
+    let cross3 = (a[0] - c[0]) * (p[1] - c[1]) - (a[1] - c[1]) * (p[0] - c[0]);
+
+    cross1 > 1e-6 && cross2 > 1e-6 && cross3 > 1e-6
+}
+
+fn earcut_triangulate_polygon(outer: &[[f32; 2]], holes: &[Vec<[f32; 2]>]) -> (Vec<[f32; 2]>, Vec<[usize; 3]>) {
+    let mut ring: Vec<[f32; 2]> = outer.to_vec();
+    if glass_contour_signed_area(&ring) < 0.0 {
+        ring.reverse(); // Ensure CCW
+    }
+
+    let mut sorted_holes: Vec<Vec<[f32; 2]>> = holes.to_vec();
+    for h in &mut sorted_holes {
+        if glass_contour_signed_area(h) > 0.0 {
+            h.reverse(); // Ensure CW for holes
+        }
+    }
+    sorted_holes.sort_by(|a, b| {
+        let max_a = a.iter().map(|p| p[0]).fold(f32::NEG_INFINITY, f32::max);
+        let max_b = b.iter().map(|p| p[0]).fold(f32::NEG_INFINITY, f32::max);
+        max_b.partial_cmp(&max_a).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    for h in &sorted_holes {
+        if h.len() < 3 { continue; }
+        let mut best_h_idx = 0;
+        let mut max_hx = f32::NEG_INFINITY;
+        for (i, p) in h.iter().enumerate() {
+            if p[0] > max_hx {
+                max_hx = p[0];
+                best_h_idx = i;
+            }
+        }
+        let h_pt = h[best_h_idx];
+
+        let mut min_x_intersect = f32::INFINITY;
+        let mut best_m_idx = 0;
+        let n_ring = ring.len();
+
+        for i in 0..n_ring {
+            let p0 = ring[i];
+            let p1 = ring[(i + 1) % n_ring];
+
+            let (low, high) = if p0[1] < p1[1] { (p0, p1) } else { (p1, p0) };
+            if h_pt[1] >= low[1] && h_pt[1] <= high[1] && (high[1] - low[1]).abs() > 1e-6 {
+                let t = (h_pt[1] - low[1]) / (high[1] - low[1]);
+                let ix = low[0] + t * (high[0] - low[0]);
+                if ix >= h_pt[0] && ix < min_x_intersect {
+                    min_x_intersect = ix;
+                    best_m_idx = if p0[0] > p1[0] { i } else { (i + 1) % n_ring };
+                }
+            }
+        }
+
+        if min_x_intersect.is_infinite() {
+            let mut min_dist_sq = f32::INFINITY;
+            for (i, p) in ring.iter().enumerate() {
+                let dx = p[0] - h_pt[0];
+                let dy = p[1] - h_pt[1];
+                let d2 = dx * dx + dy * dy;
+                if d2 < min_dist_sq {
+                    min_dist_sq = d2;
+                    best_m_idx = i;
+                }
+            }
+        }
+
+        let mut new_ring = Vec::with_capacity(ring.len() + h.len() + 2);
+        new_ring.extend_from_slice(&ring[..=best_m_idx]);
+        for k in 0..h.len() {
+            new_ring.push(h[(best_h_idx + k) % h.len()]);
+        }
+        new_ring.push(h[best_h_idx]);
+        new_ring.extend_from_slice(&ring[best_m_idx..]);
+        ring = new_ring;
+    }
+
+    let verts = ring;
+    let mut indices_map: Vec<usize> = (0..verts.len()).collect();
+    let mut triangles = Vec::new();
+
+    let mut count = 0;
+    while indices_map.len() > 2 && count < 2000 {
+        count += 1;
+        let n = indices_map.len();
+        let mut ear_found = false;
+
+        for i in 0..n {
+            let prev_idx = indices_map[(i + n - 1) % n];
+            let curr_idx = indices_map[i];
+            let next_idx = indices_map[(i + 1) % n];
+
+            let a = verts[prev_idx];
+            let b = verts[curr_idx];
+            let c = verts[next_idx];
+
+            let cross = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+            if cross <= 1e-7 {
+                continue;
+            }
+
+            let mut inside = false;
+            for j in 0..n {
+                if j == (i + n - 1) % n || j == i || j == (i + 1) % n {
+                    continue;
+                }
+                let test_pt = verts[indices_map[j]];
+                if point_strictly_in_triangle(test_pt, a, b, c) {
+                    inside = true;
+                    break;
+                }
+            }
+
+            if !inside {
+                triangles.push([prev_idx, curr_idx, next_idx]);
+                indices_map.remove(i);
+                ear_found = true;
+                break;
+            }
+        }
+
+        if !ear_found {
+            let mut best_cut = 0;
+            let mut max_cross = f32::NEG_INFINITY;
+            for i in 0..n {
+                let prev_idx = indices_map[(i + n - 1) % n];
+                let curr_idx = indices_map[i];
+                let next_idx = indices_map[(i + 1) % n];
+                let a = verts[prev_idx];
+                let b = verts[curr_idx];
+                let c = verts[next_idx];
+                let cross = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+                if cross > max_cross {
+                    max_cross = cross;
+                    best_cut = i;
+                }
+            }
+            if n > 2 && max_cross > -1.0 {
+                let prev_idx = indices_map[(best_cut + n - 1) % n];
+                let curr_idx = indices_map[best_cut];
+                let next_idx = indices_map[(best_cut + 1) % n];
+                triangles.push([prev_idx, curr_idx, next_idx]);
+                indices_map.remove(best_cut);
+            } else {
+                break;
+            }
+        }
+    }
+
+    (verts, triangles)
+}
+
+fn glass_triangulate_contours(contours: &[Vec<[f32; 2]>]) -> (Vec<[f32; 2]>, Vec<[usize; 3]>) {
+    let mut outers = Vec::new();
+    let mut holes = Vec::new();
+
+    for c in contours {
+        if c.len() < 3 { continue; }
+        let area = glass_contour_signed_area(c);
+        if area < 0.0 {
+            outers.push(c.clone());
+        } else {
+            holes.push(c.clone());
+        }
+    }
+
+    if outers.is_empty() && !holes.is_empty() {
+        outers = holes;
+        holes = Vec::new();
+    }
+
+    let mut all_verts = Vec::new();
+    let mut all_tris = Vec::new();
+
+    for outer in &outers {
+        let matching_holes: Vec<Vec<[f32; 2]>> = holes
+            .iter()
+            .filter(|h| h.first().map_or(false, |p| point_in_polygon(*p, outer)))
+            .cloned()
+            .collect();
+
+        let (verts, tris) = earcut_triangulate_polygon(outer, &matching_holes);
+        let base_idx = all_verts.len();
+        all_verts.extend(verts);
+        for t in tris {
+            all_tris.push([base_idx + t[0], base_idx + t[1], base_idx + t[2]]);
+        }
+    }
+
+    (all_verts, all_tris)
+}
+
+pub(crate) fn generate_glass_lyrics_mesh(text: &str) -> (Vec<Vertex>, Vec<u32>) {
+    let mut vertices = Vec::with_capacity(16384);
+    let mut indices = Vec::with_capacity(65536);
+
+    let trimmed = text.trim();
+    let display_str = if trimmed.is_empty() { "RUSTTRACKER" } else { trimmed };
+
+    // Try system DejaVu Sans Bold first, fallback to embedded Orbitron Black
+    let sys_font_path = "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf";
+    let font_bytes = std::fs::read(sys_font_path).unwrap_or_else(|_| EMBEDDED_GLASS_FONT.to_vec());
+    let face = ttf_parser::Face::parse(&font_bytes, 0).ok();
+
+    if let Some(face) = face {
+        let em = face.units_per_em() as f32;
+        let base_scale = 1.0 / em;
+
+        // First pass: compute total text width with typographic advances
+        let mut total_advance = 0.0f32;
+        for ch in display_str.chars() {
+            if let Some(glyph_id) = face.glyph_index(ch) {
+                let adv = face.glyph_hor_advance(glyph_id).unwrap_or(face.units_per_em()) as f32 * base_scale;
+                total_advance += adv;
+            } else {
+                total_advance += 0.5;
+            }
+        }
+
+        let target_width = 7.5f32;
+        let text_scale = (target_width / total_advance.max(1.0)).clamp(0.40, 1.25);
+        let start_x = -total_advance * text_scale * 0.5;
+        let baseline_y = 0.16; // Sits just above water level y = 0.0
+        let depth = 0.22 * text_scale;
+        let bevel = 0.024 * text_scale;
+        let hz = depth * 0.5;
+
+        let mut curr_x = start_x;
+
+        for (ch_idx, ch) in display_str.chars().enumerate() {
+            if let Some(glyph_id) = face.glyph_index(ch) {
+                let adv = face.glyph_hor_advance(glyph_id).unwrap_or(face.units_per_em()) as f32 * base_scale * text_scale;
+
+                let mut builder = GlassContourBuilder::new();
+                if let Some(_bbox) = face.outline_glyph(glyph_id, &mut builder) {
+                    let contours = builder.finish();
+
+                    let scaled_contours: Vec<Vec<[f32; 2]>> = contours
+                        .iter()
+                        .filter(|c| c.points.len() >= 3)
+                        .map(|c| {
+                            c.points.iter().map(|p| {
+                                [
+                                    curr_x + p[0] * base_scale * text_scale,
+                                    baseline_y + p[1] * base_scale * text_scale,
+                                ]
+                            }).collect()
+                        })
+                        .collect();
+
+                    if !scaled_contours.is_empty() {
+                        let (face_verts_2d, face_tris) = glass_triangulate_contours(&scaled_contours);
+
+                        // 1. Front and Back Faces
+                        let start_front = vertices.len() as u32;
+                        for p in &face_verts_2d {
+                            vertices.push(Vertex {
+                                position: [p[0], p[1], hz],
+                                normal: [0.0, 0.0, 1.0],
+                                tex_coords: [ch_idx as f32, 1.0], // Mat 1.0 = Glass
+                            });
+                        }
+                        for tri in &face_tris {
+                            indices.push(start_front + tri[0] as u32);
+                            indices.push(start_front + tri[1] as u32);
+                            indices.push(start_front + tri[2] as u32);
+                        }
+
+                        let start_back = vertices.len() as u32;
+                        for p in &face_verts_2d {
+                            vertices.push(Vertex {
+                                position: [p[0], p[1], -hz],
+                                normal: [0.0, 0.0, -1.0],
+                                tex_coords: [ch_idx as f32, 1.0],
+                            });
+                        }
+                        for tri in &face_tris {
+                            indices.push(start_back + tri[0] as u32);
+                            indices.push(start_back + tri[2] as u32);
+                            indices.push(start_back + tri[1] as u32);
+                        }
+
+                        // 2. Extruded Sidewalls & 45 deg Bevel Chamfers
+                        for pts in &scaled_contours {
+                            let n_pts = pts.len();
+                            let area = glass_contour_signed_area(pts);
+                            let is_outer = area < 0.0;
+
+                            for i in 0..n_pts {
+                                let p0 = pts[i];
+                                let p1 = pts[(i + 1) % n_pts];
+
+                                let dx = p1[0] - p0[0];
+                                let dy = p1[1] - p0[1];
+                                let len = (dx * dx + dy * dy).sqrt();
+                                if len < 1e-6 { continue; }
+
+                                let mut nx = dy / len;
+                                let mut ny = -dx / len;
+                                if !is_outer {
+                                    nx = -nx;
+                                    ny = -ny;
+                                }
+
+                                let start_v = vertices.len() as u32;
+
+                                // Side quad
+                                let norm_side = [nx, ny, 0.0];
+                                vertices.push(Vertex { position: [p0[0], p0[1], -hz + bevel], normal: norm_side, tex_coords: [ch_idx as f32, 1.0] });
+                                vertices.push(Vertex { position: [p1[0], p1[1], -hz + bevel], normal: norm_side, tex_coords: [ch_idx as f32, 1.0] });
+                                vertices.push(Vertex { position: [p1[0], p1[1], hz - bevel],  normal: norm_side, tex_coords: [ch_idx as f32, 1.0] });
+                                vertices.push(Vertex { position: [p0[0], p0[1], hz - bevel],  normal: norm_side, tex_coords: [ch_idx as f32, 1.0] });
+                                indices.extend_from_slice(&[start_v, start_v + 1, start_v + 2, start_v, start_v + 2, start_v + 3]);
+
+                                // Top Chamfer quad (+Z)
+                                let start_c1 = vertices.len() as u32;
+                                let norm_c1 = [nx * 0.7071, ny * 0.7071, 0.7071];
+                                vertices.push(Vertex { position: [p0[0], p0[1], hz - bevel], normal: norm_c1, tex_coords: [ch_idx as f32, 1.0] });
+                                vertices.push(Vertex { position: [p1[0], p1[1], hz - bevel], normal: norm_c1, tex_coords: [ch_idx as f32, 1.0] });
+                                vertices.push(Vertex { position: [p1[0] - nx * bevel, p1[1] - ny * bevel, hz], normal: norm_c1, tex_coords: [ch_idx as f32, 1.0] });
+                                vertices.push(Vertex { position: [p0[0] - nx * bevel, p0[1] - ny * bevel, hz], normal: norm_c1, tex_coords: [ch_idx as f32, 1.0] });
+                                indices.extend_from_slice(&[start_c1, start_c1 + 1, start_c1 + 2, start_c1, start_c1 + 2, start_c1 + 3]);
+
+                                // Bot Chamfer quad (-Z)
+                                let start_c2 = vertices.len() as u32;
+                                let norm_c2 = [nx * 0.7071, ny * 0.7071, -0.7071];
+                                vertices.push(Vertex { position: [p0[0] - nx * bevel, p0[1] - ny * bevel, -hz], normal: norm_c2, tex_coords: [ch_idx as f32, 1.0] });
+                                vertices.push(Vertex { position: [p1[0] - nx * bevel, p1[1] - ny * bevel, -hz], normal: norm_c2, tex_coords: [ch_idx as f32, 1.0] });
+                                vertices.push(Vertex { position: [p1[0], p1[1], -hz + bevel], normal: norm_c2, tex_coords: [ch_idx as f32, 1.0] });
+                                vertices.push(Vertex { position: [p0[0], p0[1], -hz + bevel], normal: norm_c2, tex_coords: [ch_idx as f32, 1.0] });
+                                indices.extend_from_slice(&[start_c2, start_c2 + 1, start_c2 + 2, start_c2, start_c2 + 2, start_c2 + 3]);
+                            }
+                        }
+                    }
+                }
+                curr_x += adv;
+            } else {
+                curr_x += 0.4 * text_scale;
+            }
+        }
+    }
+
+    // 2. Tessellated 3D Water Grid Plane: 64 x 64 vertices spanning [-16.0, 16.0] x [-10.0, 10.0]
+    let grid_res_x = 64;
+    let grid_res_z = 64;
+    let start_water_vert = vertices.len() as u32;
+
+    for iz in 0..grid_res_z {
+        let fz = iz as f32 / (grid_res_z - 1) as f32;
+        let z = -10.0 + fz * 20.0;
+        for ix in 0..grid_res_x {
+            let fx = ix as f32 / (grid_res_x - 1) as f32;
+            let x = -16.0 + fx * 32.0;
+            vertices.push(Vertex {
+                position: [x, 0.0, z],
+                normal: [0.0, 1.0, 0.0],
+                tex_coords: [0.0, 2.0], // Mat 2.0 = Water
+            });
+        }
+    }
+
+    for iz in 0..(grid_res_z - 1) {
+        for ix in 0..(grid_res_x - 1) {
+            let v0 = start_water_vert + iz * grid_res_x + ix;
+            let v1 = v0 + 1;
+            let v2 = v0 + grid_res_x;
+            let v3 = v2 + 1;
+            indices.extend_from_slice(&[v0, v2, v1, v1, v2, v3]);
+        }
+    }
+
+    // 3. Overhead Softbox Area Light Emitter Quad: at y = 5.2, z = -1.5, tilted downward 35 deg
+    let sb_center = [0.0f32, 5.2, -1.5];
+    let sb_w = 16.0f32;
+    let sb_h = 3.6f32;
+    let tilt: f32 = 35.0f32.to_radians();
+    let cos_t = tilt.cos();
+    let sin_t = tilt.sin();
+
+    let p0 = [sb_center[0] - sb_w * 0.5, sb_center[1] + sb_h * 0.5 * cos_t, sb_center[2] + sb_h * 0.5 * sin_t];
+    let p1 = [sb_center[0] + sb_w * 0.5, sb_center[1] + sb_h * 0.5 * cos_t, sb_center[2] + sb_h * 0.5 * sin_t];
+    let p2 = [sb_center[0] + sb_w * 0.5, sb_center[1] - sb_h * 0.5 * cos_t, sb_center[2] - sb_h * 0.5 * sin_t];
+    let p3 = [sb_center[0] - sb_w * 0.5, sb_center[1] - sb_h * 0.5 * cos_t, sb_center[2] - sb_h * 0.5 * sin_t];
+    let sb_norm = [0.0, -sin_t, cos_t];
+
+    glass_add_quad(
+        &mut vertices, &mut indices,
+        p0, p1, p2, p3,
+        sb_norm,
+        0.0,
+        3.0, // Mat 3.0 = Emissive Softbox
+    );
+
+    (vertices, indices)
+}
+
+fn cyber_add_quad(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>, p0: [f32; 3], p1: [f32; 3], p2: [f32; 3], p3: [f32; 3], normal: [f32; 3], mat: f32, uv_y: f32) {
+    let start = vertices.len() as u32;
+    vertices.push(Vertex { position: p0, normal, tex_coords: [mat, uv_y] });
+    vertices.push(Vertex { position: p1, normal, tex_coords: [mat, uv_y] });
+    vertices.push(Vertex { position: p2, normal, tex_coords: [mat, uv_y] });
+    vertices.push(Vertex { position: p3, normal, tex_coords: [mat, uv_y] });
+    indices.extend_from_slice(&[start, start + 1, start + 2, start, start + 2, start + 3]);
+}
+
+fn cyber_add_box(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>, center: [f32; 3], size: [f32; 3], rot_y: f32, mat: f32) {
+    let hx = size[0] / 2.0;
+    let hy = size[1] / 2.0;
+    let hz = size[2] / 2.0;
+    let cos_r = rot_y.cos();
+    let sin_r = rot_y.sin();
+
+    let rotate_pt = |p: [f32; 3]| -> [f32; 3] {
+        let rx = p[0] * cos_r + p[2] * sin_r;
+        let rz = -p[0] * sin_r + p[2] * cos_r;
+        [rx + center[0], p[1] + center[1], rz + center[2]]
+    };
+    let rotate_norm = |n: [f32; 3]| -> [f32; 3] {
+        let rx = n[0] * cos_r + n[2] * sin_r;
+        let rz = -n[0] * sin_r + n[2] * cos_r;
+        [rx, n[1], rz]
+    };
+
+    cyber_add_quad(vertices, indices, rotate_pt([-hx, -hy, hz]), rotate_pt([hx, -hy, hz]), rotate_pt([hx, hy, hz]), rotate_pt([-hx, hy, hz]), rotate_norm([0.0, 0.0, 1.0]), mat, center[1] + hy);
+    cyber_add_quad(vertices, indices, rotate_pt([hx, -hy, -hz]), rotate_pt([-hx, -hy, -hz]), rotate_pt([-hx, hy, -hz]), rotate_pt([hx, hy, -hz]), rotate_norm([0.0, 0.0, -1.0]), mat, center[1] + hy);
+    cyber_add_quad(vertices, indices, rotate_pt([-hx, -hy, -hz]), rotate_pt([-hx, -hy, hz]), rotate_pt([-hx, hy, hz]), rotate_pt([-hx, hy, -hz]), rotate_norm([-1.0, 0.0, 0.0]), mat, center[1] + hy);
+    cyber_add_quad(vertices, indices, rotate_pt([hx, -hy, hz]), rotate_pt([hx, -hy, -hz]), rotate_pt([hx, hy, -hz]), rotate_pt([hx, hy, hz]), rotate_norm([1.0, 0.0, 0.0]), mat, center[1] + hy);
+    cyber_add_quad(vertices, indices, rotate_pt([-hx, hy, hz]), rotate_pt([hx, hy, hz]), rotate_pt([hx, hy, -hz]), rotate_pt([-hx, hy, -hz]), rotate_norm([0.0, 1.0, 0.0]), mat, center[1] + hy);
+    cyber_add_quad(vertices, indices, rotate_pt([-hx, -hy, -hz]), rotate_pt([hx, -hy, -hz]), rotate_pt([hx, -hy, hz]), rotate_pt([-hx, -hy, hz]), rotate_norm([0.0, -1.0, 0.0]), mat, center[1] - hy);
+}
+
+fn load_obj_mesh(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    obj_src: &str,
+    translation: [f32; 3],
+    scale: [f32; 3],
+    rot_y: f32,
+    default_mat: f32,
+) {
+    let mut raw_positions: Vec<[f32; 3]> = Vec::new();
+    let mut raw_normals: Vec<[f32; 3]> = Vec::new();
+    let mut current_mat = default_mat;
+
+    let cos_r = rot_y.cos();
+    let sin_r = rot_y.sin();
+    let transform_pos = |p: [f32; 3]| -> [f32; 3] {
+        let sx = p[0] * scale[0];
+        let sy = p[1] * scale[1];
+        let sz = p[2] * scale[2];
+        let rx = sx * cos_r + sz * sin_r;
+        let rz = -sx * sin_r + sz * cos_r;
+        [rx + translation[0], sy + translation[1], rz + translation[2]]
+    };
+    let transform_norm = |n: [f32; 3]| -> [f32; 3] {
+        let rx = n[0] * cos_r + n[2] * sin_r;
+        let rz = -n[0] * sin_r + n[2] * cos_r;
+        [rx, n[1], rz]
+    };
+
+    for line in obj_src.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("v ") {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if parts.len() >= 3 {
+                if let (Ok(x), Ok(y), Ok(z)) = (parts[0].parse::<f32>(), parts[1].parse::<f32>(), parts[2].parse::<f32>()) {
+                    raw_positions.push([x, y, z]);
+                }
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("vn ") {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if parts.len() >= 3 {
+                if let (Ok(x), Ok(y), Ok(z)) = (parts[0].parse::<f32>(), parts[1].parse::<f32>(), parts[2].parse::<f32>()) {
+                    raw_normals.push([x, y, z]);
+                }
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("g ") {
+            let group_name = rest.trim();
+            current_mat = match group_name {
+                "floor" => 0.0,
+                "neon_frame_0" => 1.0,
+                "neon_frame_1" => 2.0,
+                "neon_frame_2" => 3.0,
+                "neon_frame_3" => 4.0,
+                "neon_frame_4" => 5.0,
+                "neon_frame_5" => 6.0,
+                "neon_frame_6" => 7.0,
+                "neon_frame_7" => 8.0,
+                "faceplate" => 1.0,
+                "meter_frame" => 2.0,
+                "dial_scale" => 3.0,
+                "needle_left" => 4.0,
+                "needle_right" => 5.0,
+                "knob" => 6.0,
+                "meter_glass" => 7.0,
+                "leds" => 8.0,
+                "screws" => 9.0,
+                "hull" => 1.0,
+                "arch_rib" => 2.0,
+                "floor_grating" => 3.0,
+                "neon_strip" => 4.0,
+                "conduit" => 5.0,
+                "hazard_trim" => 6.0,
+                "paint" => 3.0,
+                "glass" => 4.0,
+                "taillight" => 6.0,
+                "tire" => 7.0,
+                "rim" => 7.5,
+                "carbon" => 8.0,
+                "exhaust" => 9.0,
+                "trunk" => 10.0,
+                "frond" => 10.5,
+                "mast" => 11.0,
+                "lamp" => 11.5,
+                "tower" => 12.0,
+                "spire" => 12.5,
+                _ => default_mat,
+            };
+        } else if let Some(rest) = trimmed.strip_prefix("f ") {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if parts.len() >= 3 {
+                let parse_vert = |tok: &str| -> Option<(usize, usize)> {
+                    let segs: Vec<&str> = tok.split('/').collect();
+                    let v_idx = segs[0].parse::<usize>().ok()?.checked_sub(1)?;
+                    let vn_idx = if segs.len() >= 3 && !segs[2].is_empty() {
+                        segs[2].parse::<usize>().ok()?.checked_sub(1)?
+                    } else {
+                        v_idx
+                    };
+                    Some((v_idx, vn_idx))
+                };
+
+                let face_verts: Vec<(usize, usize)> = parts.iter().filter_map(|p| parse_vert(p)).collect();
+                if face_verts.len() >= 3 {
+                    for i in 1..face_verts.len() - 1 {
+                        let tri = [face_verts[0], face_verts[i], face_verts[i + 1]];
+                        let start_idx = vertices.len() as u32;
+                        for &(v_i, vn_i) in &tri {
+                            let pos = if v_i < raw_positions.len() { raw_positions[v_i] } else { [0.0, 0.0, 0.0] };
+                            let norm = if vn_i < raw_normals.len() { raw_normals[vn_i] } else { [0.0, 1.0, 0.0] };
+                            let world_p = transform_pos(pos);
+                            let world_n = transform_norm(norm);
+                            vertices.push(Vertex {
+                                position: world_p,
+                                normal: world_n,
+                                tex_coords: [current_mat, translation[2]],
+                            });
+                        }
+                        indices.extend_from_slice(&[start_idx, start_idx + 1, start_idx + 2]);
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn generate_synthwave_racer_mesh() -> (Vec<Vertex>, Vec<u32>) {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+
+    // 1. Continuous Desert / Terrain Ground Planes (mat = 0.5)
+    let ground_w = 200.0;
+    cyber_add_quad(
+        &mut vertices, &mut indices,
+        [-ground_w, -0.05, -10.0], [-9.0, -0.05, -10.0],
+        [-9.0, -0.05, 360.0], [-ground_w, -0.05, 360.0],
+        [0.0, 1.0, 0.0], 0.5, 0.0
+    );
+    cyber_add_quad(
+        &mut vertices, &mut indices,
+        [9.0, -0.05, -10.0], [ground_w, -0.05, -10.0],
+        [ground_w, -0.05, 360.0], [9.0, -0.05, 360.0],
+        [0.0, 1.0, 0.0], 0.5, 0.0
+    );
+
+    // 2. 3D Highway Roadbed, Curbs & Concrete K-Rails
+    let road_half_w = 9.0;
+    let seg_len = 3.5;
+    let num_segs = 100;
+    for i in 0..num_segs {
+        let z0 = -8.0 + (i as f32) * seg_len;
+        let z1 = z0 + seg_len;
+
+        // Asphalt (mat = 0.0)
+        cyber_add_quad(
+            &mut vertices, &mut indices,
+            [-road_half_w, 0.0, z0], [road_half_w, 0.0, z0],
+            [road_half_w, 0.0, z1], [-road_half_w, 0.0, z1],
+            [0.0, 1.0, 0.0], 0.0, z0
+        );
+
+        // Curbs (mat = 1.0)
+        cyber_add_quad(
+            &mut vertices, &mut indices,
+            [-road_half_w - 0.8, 0.15, z0], [-road_half_w, 0.0, z0],
+            [-road_half_w, 0.0, z1], [-road_half_w - 0.8, 0.15, z1],
+            [0.2, 0.98, 0.0], 1.0, z0
+        );
+        cyber_add_quad(
+            &mut vertices, &mut indices,
+            [road_half_w, 0.0, z0], [road_half_w + 0.8, 0.15, z0],
+            [road_half_w + 0.8, 0.15, z1], [road_half_w, 0.0, z1],
+            [-0.2, 0.98, 0.0], 1.0, z0
+        );
+
+        // Concrete K-Rail Barriers (mat = 2.0)
+        cyber_add_box(&mut vertices, &mut indices, [-road_half_w - 1.2, 0.45, (z0 + z1) / 2.0], [0.35, 0.75, seg_len], 0.0, 2.0);
+        cyber_add_box(&mut vertices, &mut indices, [road_half_w + 1.2, 0.45, (z0 + z1) / 2.0], [0.35, 0.75, seg_len], 0.0, 2.0);
+    }
+
+    // 3. Embedded 3D Low-Poly Supercar Model (.OBJ)
+    load_obj_mesh(
+        &mut vertices, &mut indices,
+        include_str!("assets/models/supercar_f40.obj"),
+        [0.0, 0.40, 5.2],
+        [1.0, 1.0, 1.0],
+        0.0,
+        3.0
+    );
+
+    // 4. Roadside Streetlamps & Palm Trees (.OBJ Meshes)
+    for i in 0..12 {
+        let pz = 18.0 + (i as f32) * 26.0;
+        // Left Palm Tree
+        load_obj_mesh(
+            &mut vertices, &mut indices,
+            include_str!("assets/models/palm_tree.obj"),
+            [-road_half_w - 3.8, 0.0, pz],
+            [1.0, 1.0, 1.0],
+            (i as f32) * 0.8,
+            10.0
+        );
+        // Right Cobra-Head Streetlamp
+        load_obj_mesh(
+            &mut vertices, &mut indices,
+            include_str!("assets/models/streetlamp.obj"),
+            [road_half_w + 2.4, 0.0, pz + 13.0],
+            [1.0, 1.0, 1.0],
+            std::f32::consts::PI,
+            11.0
+        );
+    }
+
+    // 5. Distant Horizon Skyscrapers (.OBJ Meshes)
+    for i in 0..16 {
+        let ang = (i as f32) * 0.38 - 3.0;
+        let tx = ang * 46.0;
+        let tz = 260.0 + ((i * 7) % 5) as f32 * 14.0;
+        let s = 0.75 + ((i * 3) % 4) as f32 * 0.15;
+        load_obj_mesh(
+            &mut vertices, &mut indices,
+            include_str!("assets/models/skyscraper.obj"),
+            [tx, -2.0, tz],
+            [s, s, s],
+            (i as f32) * 0.5,
+            12.0
+        );
+    }
+
+    (vertices, indices)
+}
+
+pub(crate) fn generate_vumeter_rack_mesh() -> (Vec<Vertex>, Vec<u32>) {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    load_obj_mesh(
+        &mut vertices, &mut indices,
+        include_str!("assets/models/vumeter_rack.obj"),
+        [0.0, 0.0, 0.0],
+        [1.0, 1.0, 1.0],
+        0.0,
+        1.0
+    );
+    (vertices, indices)
+}
+
+pub(crate) fn generate_neon_corridor_mesh() -> (Vec<Vertex>, Vec<u32>) {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    load_obj_mesh(
+        &mut vertices, &mut indices,
+        include_str!("assets/models/neon_corridor_frames.obj"),
+        [0.0, 0.0, 0.0],
+        [1.0, 1.0, 1.0],
+        0.0,
+        0.0
+    );
+    (vertices, indices)
+}
+
+pub(crate) fn generate_storm_rain_volume_mesh() -> (Vec<Vertex>, Vec<u32>) {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    
+    // Pure 3D Instanced Falling Raindrops across viewing frustum (mat = 3.0)
+    for i in 0..2500 {
+        let seed = (i as f32) * 1.6180339887;
+        let rx = (((seed * 17.3).fract()) - 0.5) * 44.0;
+        let ry = ((seed * 29.1).fract()) * 30.0;
+        let rz = 2.0 + ((seed * 43.7).fract()) * 110.0;
+        let drop_len = 0.55;
+        cyber_add_quad(
+            &mut vertices, &mut indices,
+            [rx - 0.015, ry, rz], [rx + 0.015, ry, rz],
+            [rx + 0.015, ry + drop_len, rz], [rx - 0.015, ry + drop_len, rz],
+            [0.0, 0.0, 1.0], 3.0, ry
+        );
+    }
+
+    (vertices, indices)
+}
+
+
+
 impl VulkanEngine {
     pub async fn new(window: Arc<Window>) -> Self {
         let size = window.inner_size();
@@ -1023,28 +1894,29 @@ impl VulkanEngine {
         let get_shader_source = |id: u32| -> &'static str {
             match id {
                 0 => include_str!("shaders/vis_spectrum.wgsl"),
-                1 => include_str!("shaders/vis_flame.wgsl"),
-                2 => include_str!("shaders/vis_oscilloscope.wgsl"),
-                3 => include_str!("shaders/vis_spatial.wgsl"),
-                4 => include_str!("shaders/vis_ferrofluid.wgsl"),
-                5 => include_str!("shaders/vis_neon.wgsl"),
+                1 => include_str!("shaders/vis_oscilloscope.wgsl"),
+                2 => include_str!("shaders/vis_3doscilloscope.wgsl"),
+                3 => include_str!("shaders/vis_3doscilloscope_raster.wgsl"),
+                4 => include_str!("shaders/vis_3doscilloscope_freq.wgsl"),
+                5 => include_str!("shaders/vis_flame.wgsl"),
                 6 => include_str!("shaders/vis_firesim.wgsl"),
-                7 => include_str!("shaders/vis_3doscilloscope.wgsl"),
-                8 => include_str!("shaders/vis_3doscilloscope_freq.wgsl"),
-                9 => include_str!("shaders/vis_solar.wgsl"),
+                7 => include_str!("shaders/vis_solar.wgsl"),
+                8 => include_str!("shaders/vis_spatial.wgsl"),
+                9 => include_str!("shaders/vis_ferrofluid.wgsl"),
                 10 => include_str!("shaders/vis_ferrofluidsim.wgsl"),
-                11 => include_str!("shaders/vis_lissajous.wgsl"),
-                12 => include_str!("shaders/vis_synthwave.wgsl"),
-                13 => include_str!("shaders/vis_starfield.wgsl"),
-                14 => include_str!("shaders/vis_rain.wgsl"),
-                15 => include_str!("shaders/vis_3drain.wgsl"),
-                16 => include_str!("shaders/vis_synthwaveracer.wgsl"),
-                17 => include_str!("shaders/vis_cuboids.wgsl"),
-                18 => include_str!("shaders/vis_vumeters.wgsl"),
-                19 => include_str!("shaders/vis_bioluminescence.wgsl"),
-                20 => include_str!("shaders/vis_3doscilloscope_raster.wgsl"),
+                11 => include_str!("shaders/vis_neon_3d.wgsl"),
+                12 => include_str!("shaders/vis_lissajous.wgsl"),
+                13 => include_str!("shaders/vis_synthwave.wgsl"),
+                14 => include_str!("shaders/vis_synthwave_racer_3d.wgsl"),
+                15 => include_str!("shaders/vis_starfield.wgsl"),
+                16 => include_str!("shaders/vis_rain.wgsl"),
+                17 => include_str!("shaders/vis_storm_3d.wgsl"),
+                18 => include_str!("shaders/vis_cuboids.wgsl"),
+                19 => include_str!("shaders/vis_vumeters_3d.wgsl"),
+                20 => include_str!("shaders/vis_bioluminescence.wgsl"),
                 21 => include_str!("shaders/vis_matrix.wgsl"),
                 22 => include_str!("shaders/vis_neon_room.wgsl"),
+                23 => include_str!("shaders/vis_lyrics.wgsl"),
                 _ => include_str!("shaders/vis_spectrum.wgsl"),
             }
         };
@@ -1115,7 +1987,7 @@ impl VulkanEngine {
                 source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(source.as_str())),
             });
             
-            let (layout, vertex_buffers, primitive, vs_entry) = if vis_def.id == 19 {
+            let (layout, vertex_buffers, primitive, vs_entry) = if vis_def.id == 20 {
                 (
                     &biolum_render_pipeline_layout,
                     vec![Vertex::desc()],
@@ -1207,7 +2079,7 @@ impl VulkanEngine {
                 render_pipelines.push(fallback_pipeline.clone());
             } else {
                 render_pipelines.push(pipeline);
-                if vis_def.id == 12 {
+                if vis_def.id == 13 {
                     let lp = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                         label: Some("Lamp Render Pipeline"),
                         layout: Some(&render_pipeline_layout_3d),
@@ -1681,6 +2553,190 @@ impl VulkanEngine {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: wgpu::TextureFormat::Depth32Float,
                 depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: pipeline_cache_ref,
+        });
+
+        let synthwave_sky_shader_src = resolve_shader_includes(include_str!("shaders/vis_synthwave_racer_sky.wgsl"));
+        let synthwave_sky_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Synthwave Sky Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(synthwave_sky_shader_src)),
+        });
+
+        let synthwave_sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Synthwave Sky Pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &synthwave_sky_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &synthwave_sky_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: pipeline_cache_ref,
+        });
+
+        let vumeters_bg_shader_src = resolve_shader_includes(include_str!("shaders/vis_vumeters_bg.wgsl"));
+        let vumeters_bg_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("VU Meters Background Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(vumeters_bg_shader_src)),
+        });
+
+        let vumeters_bg_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("VU Meters Background Pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &vumeters_bg_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &vumeters_bg_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: pipeline_cache_ref,
+        });
+
+        let neon_bg_shader_src = resolve_shader_includes(include_str!("shaders/vis_neon_bg.wgsl"));
+        let neon_bg_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Neon Corridor Background Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(neon_bg_shader_src)),
+        });
+
+        let neon_bg_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Neon Corridor Background Pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &neon_bg_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &neon_bg_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: pipeline_cache_ref,
+        });
+
+        let storm_sky_shader_src = resolve_shader_includes(include_str!("shaders/vis_storm_sky.wgsl"));
+        let storm_sky_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Storm Sky Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(storm_sky_shader_src)),
+        });
+
+        let storm_sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Storm Sky Pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &storm_sky_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &storm_sky_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(false),
                 depth_compare: Some(wgpu::CompareFunction::Always),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
@@ -2198,6 +3254,11 @@ impl VulkanEngine {
                     (vertices, indices)
                 }
                 crate::state::Geometry::NeonRoom => generate_neon_room_mesh(),
+                crate::state::Geometry::SynthwaveRacerScene => generate_synthwave_racer_mesh(),
+                crate::state::Geometry::VuMeterRack => generate_vumeter_rack_mesh(),
+                crate::state::Geometry::NeonCorridorFrames => generate_neon_corridor_mesh(),
+                crate::state::Geometry::StormRainVolume => generate_storm_rain_volume_mesh(),
+                crate::state::Geometry::GlassLyricsScene => generate_glass_lyrics_mesh("RUSTTRACKER"),
             };
             
             let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -2338,6 +3399,10 @@ impl VulkanEngine {
             clear_black_pipeline,
             crt_background_pipeline,
             biolum_bg_pipeline,
+            synthwave_sky_pipeline,
+            vumeters_bg_pipeline,
+            neon_bg_pipeline,
+            storm_sky_pipeline,
             
             camera_uniform_buffer,
             camera_bind_group,
@@ -2358,6 +3423,9 @@ impl VulkanEngine {
             channel_phases: [0.0; 32],
             last_uploaded_push_count: u64::MAX,
             last_uploaded_vis_width: 0,
+            lyric_slam_timer: 0.0,
+            last_lyric_line_idx: None,
+            current_lyric_mesh_text: "RUSTTRACKER".to_string(),
         }
     }
 
@@ -2564,7 +3632,7 @@ impl VulkanEngine {
             }
         }
         
-        if state.visualizer_mode == 18 {
+        if state.visualizer_mode == 19 {
             let actual_ch = state.channel_vus.len().max(2);
             uniforms.num_channels = actual_ch as u32;
             for i in 0..actual_ch {
@@ -2575,6 +3643,124 @@ impl VulkanEngine {
                         0.0
                     };
                 }
+            }
+        }
+
+        if state.visualizer_mode == 23 {
+            let display_secs = state.scrub_target_seconds.unwrap_or(state.current_seconds);
+            let active_idx = state.lyrics.as_ref().and_then(|l| l.find_current_line_idx(display_secs));
+
+            // Smooth 500+ FPS frame-interpolated slam timer
+            if active_idx != self.last_lyric_line_idx {
+                self.last_lyric_line_idx = active_idx;
+                self.lyric_slam_timer = 0.0;
+            } else if !state.is_paused && state.file_loaded && !state.track_ended {
+                self.lyric_slam_timer += frame_dt;
+            }
+
+            let (char_bytes, line_progress, is_instrumental, line_duration) = if let Some(lyrics) = &state.lyrics {
+                if !lyrics.lines.is_empty() {
+                    if let Some(idx) = active_idx {
+                        let cur_time = lyrics.lines[idx].time_seconds;
+                        let next_time = if idx + 1 < lyrics.lines.len() {
+                            lyrics.lines[idx + 1].time_seconds
+                        } else {
+                            cur_time + 4.0
+                        };
+                        let dur = (next_time - cur_time).max(0.1) as f32;
+                        let elapsed = (display_secs - cur_time).max(0.0) as f32;
+                        let prog = (elapsed / dur).clamp(0.0, 1.0);
+                        let text = lyrics.lines[idx].text.trim().to_uppercase();
+                        let bytes = text.into_bytes();
+                        
+                        let gap = (next_time - display_secs) as f32;
+                        let is_inst = if (next_time - cur_time) > 4.5 && elapsed > 2.5 && gap > 1.5 { 1.0 } else { 0.0 };
+                        (bytes, prog, is_inst, dur)
+                    } else {
+                        // Intro
+                        let first_time = lyrics.lines[0].time_seconds;
+                        let prog = (display_secs / first_time.max(0.1)).clamp(0.0, 1.0) as f32;
+                        ("RUSTTRACKER".to_string().into_bytes(), prog, 1.0, 4.0)
+                    }
+                } else {
+                    let title = if !state.song_title.is_empty() {
+                        state.song_title.trim().to_uppercase()
+                    } else {
+                        "RUSTTRACKER".to_string()
+                    };
+                    (title.into_bytes(), 0.0, 1.0, 4.0)
+                }
+            } else {
+                let title = if !state.song_title.is_empty() {
+                    state.song_title.trim().to_uppercase()
+                } else {
+                    "RUSTTRACKER".to_string()
+                };
+                (title.into_bytes(), 0.0, 1.0, 4.0)
+            };
+
+            let slam_t = self.lyric_slam_timer;
+            // Calculate exact slam vertical drop and spring damping
+            let slam_y = if slam_t < 0.28 {
+                // Gravity drop from y = 3.5 down to 0.0
+                let t_norm = (slam_t / 0.28).clamp(0.0, 1.0);
+                3.5 * (1.0 - t_norm * t_norm)
+            } else {
+                // Water impact, plunge and damped spring bobbing
+                let dt_impact = slam_t - 0.28;
+                -0.32 * (-3.6 * dt_impact).exp() * (9.5 * dt_impact).cos()
+            };
+
+            let bass = if state.spectrum_data.len() > 4 {
+                state.spectrum_data[1..5].iter().copied().fold(0.0f32, f32::max)
+            } else {
+                0.0
+            };
+
+            let char_count = char_bytes.len().min(64);
+
+            // Store lyric parameters in fire_heat array (without touching ui_meters_rect or display_order!)
+            uniforms.fire_heat[0] = slam_t;
+            uniforms.fire_heat[1] = slam_y;
+            uniforms.fire_heat[2] = line_progress;
+            uniforms.fire_heat[3] = char_count as f32;
+            uniforms.fire_heat[4] = line_duration;
+            uniforms.fire_heat[5] = is_instrumental;
+            uniforms.fire_heat[6] = bass;
+
+            for (i, &b) in char_bytes.iter().take(64).enumerate() {
+                uniforms.fire_heat[16 + i] = b as f32;
+            }
+
+            let active_text_str = String::from_utf8_lossy(&char_bytes).to_string();
+            if self.current_lyric_mesh_text != active_text_str {
+                let (vertices, indices) = generate_glass_lyrics_mesh(&active_text_str);
+                let vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Mesh Vertex Buffer GlassLyricsScene"),
+                    size: (vertices.len() * std::mem::size_of::<Vertex>()) as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                self.queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+
+                let index_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("Mesh Index Buffer GlassLyricsScene"),
+                    size: (indices.len() * std::mem::size_of::<u32>()) as u64,
+                    usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                self.queue.write_buffer(&index_buffer, 0, bytemuck::cast_slice(&indices));
+                let index_count = indices.len() as u32;
+
+                self.mesh_registry.insert(
+                    crate::state::Geometry::GlassLyricsScene,
+                    MeshBuffers {
+                        vertex_buffer,
+                        index_buffer,
+                        index_count,
+                    },
+                );
+                self.current_lyric_mesh_text = active_text_str;
             }
         }
 
@@ -3175,8 +4361,9 @@ impl VulkanEngine {
                                 shortcut(ui, "q / esc", Some("Select"), "Quit");
                                 shortcut(ui, "f", Some("Start"), "Toggle Fullscreen");
                                 shortcut(ui, "g", Some("R1"), "Toggle GPU FFT");
+                                shortcut(ui, "1-9", None, "Select Audio Track");
                                 shortcut(ui, "[ / ]", None, "Scale Panels");
-                                if state.visualizer_mode == 19 {
+                                if state.visualizer_mode == 20 {
                                     shortcut(ui, "c", None, "Toggle Camera Mode");
                                 }
                             });
@@ -3582,6 +4769,7 @@ impl VulkanEngine {
                                                             kb_shortcut("q / esc", "Quit");
                                                             kb_shortcut("f", "Fullscreen");
                                                             kb_shortcut("g", "GPU FFT");
+                                                            kb_shortcut("1-9", "Audio Track");
                                                             let ctrl_mod = if std::env::consts::OS == "macos" { "⌘" } else { "ctrl+" };
                                                             kb_shortcut(&format!("{}L/R", ctrl_mod), "Prev/Next");
                                                             kb_shortcut("[ / ]", "Scale Panels");
@@ -3749,6 +4937,33 @@ impl VulkanEngine {
                             }
                             ui.add_space(20.0);
                             
+                            let is_file_hovered = !ui.input(|i| i.raw.hovered_files.is_empty()) || state.hovered_file.is_some();
+                            if is_file_hovered {
+                                let badge_text = if let Some(hf) = &state.hovered_file {
+                                    let fn_only = std::path::Path::new(hf).file_name().unwrap_or_default().to_string_lossy();
+                                    format!("📥 Drop '{}' to start playing", fn_only)
+                                } else {
+                                    "📥 Drop audio file here to start playing".to_string()
+                                };
+                                let font_id = egui::FontId::proportional(16.0);
+                                let galley = ui.painter().layout(
+                                    badge_text,
+                                    font_id,
+                                    egui::Color32::WHITE,
+                                    ui.available_width().min(600.0),
+                                );
+                                let (badge_rect, _) = ui.allocate_exact_size(galley.size() + egui::vec2(28.0, 14.0), egui::Sense::hover());
+                                ui.painter().rect(
+                                    badge_rect,
+                                    8.0,
+                                    egui::Color32::from_rgba_unmultiplied(0, 120, 220, 230),
+                                    egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(140, 230, 255)),
+                                    egui::StrokeKind::Outside,
+                                );
+                                ui.painter().galley(badge_rect.min + egui::vec2(14.0, 7.0), galley, egui::Color32::WHITE);
+                                ui.add_space(10.0);
+                            }
+
                                 egui::Frame::NONE
                                     .shadow(egui::Shadow { offset: [0, 4], blur: 12, spread: 0, color: egui::Color32::from_black_alpha(200) })
                                     .corner_radius(6.0)
@@ -3757,14 +4972,18 @@ impl VulkanEngine {
                                             let total_width = 300.0 + 20.0 + 300.0;
                                             ui.add_space((ui.available_width() - total_width) / 2.0);
                                             
+                                            let btn_text = if is_file_hovered { "  📥 DROP TO PLAY  " } else { "  OPEN AUDIO FILE  " };
+                                            let btn_fill = if is_file_hovered { egui::Color32::from_rgb(0, 160, 240) } else { egui::Color32::from_rgb(0, 100, 200) };
+                                            let btn_stroke = if is_file_hovered { egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(160, 240, 255)) } else { egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(80, 180, 255)) };
+
                                             let btn = egui::Button::new(
-                                                egui::RichText::new("  OPEN AUDIO FILE  ")
+                                                egui::RichText::new(btn_text)
                                                     .size(24.0)
                                                     .color(egui::Color32::WHITE)
                                                     .strong()
                                             )
-                                            .fill(egui::Color32::from_rgb(0, 100, 200))
-                                            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(80, 180, 255)));
+                                            .fill(btn_fill)
+                                            .stroke(btn_stroke);
                                             
                                             let resp1 = ui.add_sized([300.0, 60.0], btn);
                                             if resp1.has_focus() {
@@ -3805,7 +5024,7 @@ impl VulkanEngine {
                             #[cfg(any(target_os = "windows", target_os = "linux"))]
                             {
                                 let mut passthrough = state.passthrough_enabled;
-                                
+                                 
                                 #[cfg(target_os = "windows")]
                                 let label = "Enable Bitstream Passthrough (WASAPI Exclusive)";
                                 #[cfg(target_os = "linux")]
@@ -3819,6 +5038,17 @@ impl VulkanEngine {
                         });
                     });
                 });
+
+                let dropped_files: Vec<String> = ctx.input(|i| {
+                    i.raw.dropped_files
+                        .iter()
+                        .filter_map(|df| df.path.as_ref().map(|p| p.to_string_lossy().into_owned()))
+                        .collect()
+                });
+                if !dropped_files.is_empty() {
+                    engine_action = EngineAction::LoadFiles(dropped_files, false);
+                }
+
                 return;
             }
 
@@ -3831,8 +5061,8 @@ impl VulkanEngine {
                     .frame(egui::Frame::NONE.fill(egui::Color32::TRANSPARENT))
                     .exact_size(top_h)
                     .show_inside(ctx, |ui| {
-                        if state.video_mode == 2 {
-                            // Do nothing
+                        if state.video_mode == 2 && self.video_state.is_some() {
+                            // Video occupies the entire top panel
                         } else {
                             ui.columns(3, |columns| {
                                 // Column 0: Channels
@@ -3931,8 +5161,15 @@ impl VulkanEngine {
                                 egui::Color32::WHITE,
                             );
                             
-                            // Column 1: Heatmap History & Tracker Pattern
-                            columns[1].heading("Pattern Heatmap");
+                            // Column 1: Heatmap History, Tracker Pattern & Lyrics
+                            let col1_heading = if state.lyrics.is_some() {
+                                "Lyrics"
+                            } else if !state.tracker_patterns_by_order.is_empty() {
+                                "Tracker Pattern"
+                            } else {
+                                "Pattern Heatmap"
+                            };
+                            columns[1].heading(col1_heading);
                             columns[1].separator();
                             let hm_rect = columns[1].available_rect_before_wrap();
                             out_heatmap_rect = Some(hm_rect);
@@ -3940,126 +5177,237 @@ impl VulkanEngine {
                             columns[1].painter().rect_filled(hm_rect, 0.0, egui::Color32::TRANSPARENT);
                             
                             let painter = columns[1].painter().with_clip_rect(hm_rect);
-                            let history_len = state.spectrum_history.len();
-                            if history_len > 0 && state.spectrum_history[0].len() > 0 {
-                                let chunks = 64;
-                                let cell_w = hm_rect.width() / chunks as f32;
-                                
-                                for c in 0..=chunks {
-                                    let x = hm_rect.left() + c as f32 * cell_w;
-                                    painter.line_segment([egui::pos2(x, hm_rect.top()), egui::pos2(x, hm_rect.bottom())], (1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 5)));
-                                }
-                                
-                                if !state.tracker_patterns_by_order.is_empty() {
-                                    let current_order = state.current_tracker_order as i32;
-                                    let current_row = state.current_tracker_row as i32;
-                                    let center_y = hm_rect.top() + hm_rect.height() / 2.0;
-                                    let row_height = 16.0;
-                                    let num_rows_to_draw = (hm_rect.height() / row_height) as i32;
-                                    
-                                    let font_id = egui::FontId::monospace(12.0);
-                                    let char_width = 7.0; // Approx monospace char width at 12pt
-                                    let max_chars = ((hm_rect.width() - 20.0) / char_width).max(10.0) as usize;
-                                    let max_text_chars = max_chars.saturating_sub(4);
-                                    
-                                    let mut formatted = String::with_capacity(max_text_chars + 16);
-                                    
-                                    for offset in -(num_rows_to_draw / 2)..=(num_rows_to_draw / 2) {
-                                        let mut resolved_order = current_order;
-                                        let mut resolved_row = current_row + offset;
-                                        
-                                        if offset < 0 {
-                                            // Read exact playback sequence from history
-                                            let history_idx = (-offset - 1) as usize;
-                                            if history_idx < state.tracker_row_history.len() {
-                                                let (hist_order, hist_row) = state.tracker_row_history[history_idx];
-                                                resolved_order = hist_order;
-                                                resolved_row = hist_row;
-                                            } else {
-                                                // Fall back to underflow if history hasn't built up yet
-                                                while resolved_row < 0 && resolved_order > 0 {
-                                                    resolved_order -= 1;
-                                                    if (resolved_order as usize) < state.tracker_patterns_by_order.len() {
-                                                        resolved_row += state.tracker_patterns_by_order[resolved_order as usize].len() as i32;
-                                                    } else {
-                                                        break;
-                                                    }
-                                                }
-                                            }
+                            let chunks = 64;
+                            let cell_w = hm_rect.width() / chunks as f32;
+                            
+                            for c in 0..=chunks {
+                                let x = hm_rect.left() + c as f32 * cell_w;
+                                painter.line_segment([egui::pos2(x, hm_rect.top()), egui::pos2(x, hm_rect.bottom())], (1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 5)));
+                            }
+                            
+                            if let Some(lyrics) = &state.lyrics {
+                                // Layer 1: Backdrop Scrim - Dim heatmap slightly for crisp lyrics readability
+                                painter.rect_filled(
+                                    hm_rect,
+                                    0.0,
+                                    egui::Color32::from_rgba_unmultiplied(10, 10, 14, 175)
+                                );
+
+                                let display_secs = state.scrub_target_seconds.unwrap_or(state.current_seconds);
+                                let center_y = hm_rect.top() + hm_rect.height() / 2.0;
+                                let row_height = 32.0;
+                                let num_rows_to_draw = (hm_rect.height() / row_height) as i32;
+                                let half_rows = (num_rows_to_draw / 2).max(1);
+
+                                let active_idx = lyrics.find_current_line_idx(display_secs);
+                                let is_intro = active_idx.is_none();
+                                let base_idx = active_idx.unwrap_or(0);
+
+                                for offset in -half_rows..=half_rows {
+                                    let target_idx = (base_idx as i32) + offset - if is_intro && offset > 0 { 1 } else { 0 };
+                                    let y = center_y + (offset as f32) * row_height;
+
+                                    let distance = offset.abs() as f32 / (half_rows as f32);
+                                    let alpha = (1.0 - distance * 0.80).clamp(0.0, 1.0);
+                                    if alpha <= 0.02 {
+                                        continue;
+                                    }
+
+                                    if is_intro && offset == 0 {
+                                        // Active Intro indicator
+                                        let font_id = egui::FontId::proportional(18.0);
+                                        let text = "♪   ♪   ♪   (Intro)";
+                                        let galley = painter.layout_no_wrap(
+                                            text.to_string(),
+                                            font_id,
+                                            egui::Color32::from_rgba_unmultiplied(225, 225, 240, 240),
+                                        );
+                                        let pos = egui::pos2(hm_rect.center().x, y);
+                                        let rect = egui::Rect::from_center_size(pos, galley.size());
+                                        painter.rect(
+                                            rect.expand2(egui::vec2(14.0, 4.0)),
+                                            5.0,
+                                            egui::Color32::from_rgba_unmultiplied(14, 14, 18, 235),
+                                            egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 50)),
+                                            egui::StrokeKind::Outside,
+                                        );
+                                        painter.galley(rect.min, galley, egui::Color32::from_rgba_unmultiplied(225, 225, 240, 240));
+                                        continue;
+                                    }
+
+                                    if is_intro && offset < 0 {
+                                        continue;
+                                    }
+
+                                    if target_idx >= 0 && (target_idx as usize) < lyrics.lines.len() {
+                                        let line = &lyrics.lines[target_idx as usize];
+                                        let is_current = !is_intro && offset == 0;
+                                        let text_display = if line.text.is_empty() {
+                                            "♪   ♪   ♪"
                                         } else {
-                                            // Handle overflow (next predicted patterns)
-                                            while resolved_order >= 0 
-                                                && (resolved_order as usize) < state.tracker_patterns_by_order.len() 
-                                                && resolved_row >= state.tracker_patterns_by_order[resolved_order as usize].len() as i32 
-                                            {
-                                                resolved_row -= state.tracker_patterns_by_order[resolved_order as usize].len() as i32;
-                                                resolved_order += 1;
+                                            line.text.as_str()
+                                        };
+
+                                        let pos = egui::pos2(hm_rect.center().x, y);
+
+                                        if is_current {
+                                            // Active line: prominent large font + high contrast pill with subtle luminous border
+                                            let font_id = egui::FontId::proportional(20.0);
+                                            let max_w = (hm_rect.width() - 24.0).max(50.0);
+                                            let galley = painter.layout(
+                                                text_display.to_string(),
+                                                font_id,
+                                                egui::Color32::WHITE,
+                                                max_w,
+                                            );
+                                            let rect = egui::Rect::from_center_size(pos, galley.size());
+
+                                            painter.rect(
+                                                rect.expand2(egui::vec2(16.0, 5.0)),
+                                                6.0,
+                                                egui::Color32::from_rgba_unmultiplied(12, 12, 16, 240),
+                                                egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 60)),
+                                                egui::StrokeKind::Outside,
+                                            );
+                                            painter.galley(rect.min, galley, egui::Color32::WHITE);
+                                        } else {
+                                            // Surrounding lines: readable 16pt font with smooth distance fade + soft dark backdrop for contrast
+                                            let font_id = egui::FontId::proportional(16.0);
+                                            let max_w = (hm_rect.width() - 24.0).max(50.0);
+                                            let text_color = if line.text.is_empty() {
+                                                egui::Color32::from_rgba_unmultiplied(150, 150, 160, (alpha * 140.0) as u8)
+                                            } else {
+                                                egui::Color32::from_rgba_unmultiplied(225, 225, 235, (alpha * 200.0) as u8)
+                                            };
+                                            let galley = painter.layout(
+                                                text_display.to_string(),
+                                                font_id,
+                                                text_color,
+                                                max_w,
+                                            );
+                                            let rect = egui::Rect::from_center_size(pos, galley.size());
+
+                                            let pill_alpha = (alpha * 180.0) as u8;
+                                            if pill_alpha > 15 {
+                                                painter.rect_filled(
+                                                    rect.expand2(egui::vec2(10.0, 3.0)),
+                                                    4.0,
+                                                    egui::Color32::from_rgba_unmultiplied(10, 10, 14, pill_alpha),
+                                                );
+                                            }
+                                            painter.galley(rect.min, galley, text_color);
+                                        }
+                                    }
+                                }
+                            } else if !state.tracker_patterns_by_order.is_empty() {
+                                let current_order = state.current_tracker_order as i32;
+                                let current_row = state.current_tracker_row as i32;
+                                let center_y = hm_rect.top() + hm_rect.height() / 2.0;
+                                let row_height = 16.0;
+                                let num_rows_to_draw = (hm_rect.height() / row_height) as i32;
+                                
+                                let font_id = egui::FontId::monospace(12.0);
+                                let char_width = 7.0; // Approx monospace char width at 12pt
+                                let max_chars = ((hm_rect.width() - 20.0) / char_width).max(10.0) as usize;
+                                let max_text_chars = max_chars.saturating_sub(4);
+                                
+                                let mut formatted = String::with_capacity(max_text_chars + 16);
+                                
+                                for offset in -(num_rows_to_draw / 2)..=(num_rows_to_draw / 2) {
+                                    let mut resolved_order = current_order;
+                                    let mut resolved_row = current_row + offset;
+                                    
+                                    if offset < 0 {
+                                        // Read exact playback sequence from history
+                                        let history_idx = (-offset - 1) as usize;
+                                        if history_idx < state.tracker_row_history.len() {
+                                            let (hist_order, hist_row) = state.tracker_row_history[history_idx];
+                                            resolved_order = hist_order;
+                                            resolved_row = hist_row;
+                                        } else {
+                                            // Fall back to underflow if history hasn't built up yet
+                                            while resolved_row < 0 && resolved_order > 0 {
+                                                resolved_order -= 1;
+                                                if (resolved_order as usize) < state.tracker_patterns_by_order.len() {
+                                                    resolved_row += state.tracker_patterns_by_order[resolved_order as usize].len() as i32;
+                                                } else {
+                                                    break;
+                                                }
                                             }
                                         }
-                                        
-                                        if resolved_order >= 0 && (resolved_order as usize) < state.tracker_patterns_by_order.len() && resolved_row >= 0 {
-                                            if (resolved_row as usize) < state.tracker_patterns_by_order[resolved_order as usize].len() {
-                                                let text = &state.tracker_patterns_by_order[resolved_order as usize][resolved_row as usize];
-                                                let y = center_y + offset as f32 * row_height;
+                                    } else {
+                                        // Handle overflow (next predicted patterns)
+                                        while resolved_order >= 0 
+                                            && (resolved_order as usize) < state.tracker_patterns_by_order.len() 
+                                            && resolved_row >= state.tracker_patterns_by_order[resolved_order as usize].len() as i32 
+                                        {
+                                            resolved_row -= state.tracker_patterns_by_order[resolved_order as usize].len() as i32;
+                                            resolved_order += 1;
+                                        }
+                                    }
+                                    
+                                    if resolved_order >= 0 && (resolved_order as usize) < state.tracker_patterns_by_order.len() && resolved_row >= 0 {
+                                        if (resolved_row as usize) < state.tracker_patterns_by_order[resolved_order as usize].len() {
+                                            let text = &state.tracker_patterns_by_order[resolved_order as usize][resolved_row as usize];
+                                            let y = center_y + offset as f32 * row_height;
+                                            
+                                            // Fade out based on distance
+                                            let distance = offset.abs() as f32 / (num_rows_to_draw as f32 / 2.0);
+                                            let alpha = (1.0 - distance).max(0.0);
+                                            if alpha <= 0.02 { continue; } // Skip invisible rows to save layout time
+                                            
+                                            let (text_slice, is_truncated) = if text.len() > max_text_chars {
+                                                let end_idx = max_text_chars.saturating_sub(3);
+                                                let safe_end = text.char_indices().map(|(i, _)| i).find(|&i| i >= end_idx).unwrap_or(text.len());
+                                                (&text[..safe_end], true)
+                                            } else {
+                                                (text.as_str(), false)
+                                            };
+                                            
+                                            formatted.clear();
+                                            use std::fmt::Write;
+                                            if is_truncated {
+                                                let _ = write!(formatted, "{:02X}  {}...", resolved_row, text_slice);
+                                            } else {
+                                                let _ = write!(formatted, "{:02X}  {}", resolved_row, text_slice);
+                                            };
+                                            
+                                            let pos = egui::pos2(hm_rect.center().x, y);
+                                            
+                                            if offset == 0 {
+                                                let galley = painter.layout_no_wrap(
+                                                    formatted.clone(),
+                                                    font_id.clone(),
+                                                    egui::Color32::WHITE,
+                                                );
+                                                let rect = egui::Rect::from_center_size(pos, galley.size());
                                                 
-                                                // Fade out based on distance
-                                                let distance = offset.abs() as f32 / (num_rows_to_draw as f32 / 2.0);
-                                                let alpha = (1.0 - distance).max(0.0);
-                                                if alpha <= 0.02 { continue; } // Skip invisible rows to save layout time
+                                                painter.rect_filled(
+                                                    rect.expand2(egui::vec2(10.0, 2.0)),
+                                                    4.0,
+                                                    egui::Color32::from_black_alpha(220)
+                                                );
+                                                painter.galley(rect.min, galley, egui::Color32::WHITE);
+                                            } else {
+                                                // Valid unmultiplied alpha color
+                                                let color = egui::Color32::from_rgba_unmultiplied(150, 150, 150, (alpha * 100.0) as u8);
                                                 
-                                                let (text_slice, is_truncated) = if text.len() > max_text_chars {
-                                                    let end_idx = max_text_chars.saturating_sub(3);
-                                                    let safe_end = text.char_indices().map(|(i, _)| i).find(|&i| i >= end_idx).unwrap_or(text.len());
-                                                    (&text[..safe_end], true)
-                                                } else {
-                                                    (text.as_str(), false)
-                                                };
+                                                let galley = painter.layout_no_wrap(
+                                                    formatted.clone(),
+                                                    font_id.clone(),
+                                                    egui::Color32::WHITE,
+                                                );
                                                 
-                                                formatted.clear();
-                                                use std::fmt::Write;
-                                                if is_truncated {
-                                                    let _ = write!(formatted, "{:02X}  {}...", resolved_row, text_slice);
-                                                } else {
-                                                    let _ = write!(formatted, "{:02X}  {}", resolved_row, text_slice);
-                                                };
-                                                
-                                                let pos = egui::pos2(hm_rect.center().x, y);
-                                                
-                                                if offset == 0 {
-                                                    let galley = painter.layout_no_wrap(
-                                                        formatted.clone(),
-                                                        font_id.clone(),
-                                                        egui::Color32::WHITE,
-                                                    );
-                                                    let rect = egui::Rect::from_center_size(pos, galley.size());
-                                                    
-                                                    painter.rect_filled(
-                                                        rect.expand2(egui::vec2(10.0, 2.0)),
-                                                        4.0,
-                                                        egui::Color32::from_black_alpha(220)
-                                                    );
-                                                    painter.galley(rect.min, galley, egui::Color32::WHITE);
-                                                } else {
-                                                    // Valid unmultiplied alpha color
-                                                    let color = egui::Color32::from_rgba_unmultiplied(150, 150, 150, (alpha * 100.0) as u8);
-                                                    
-                                                    let galley = painter.layout_no_wrap(
-                                                        formatted.clone(),
-                                                        font_id.clone(),
-                                                        egui::Color32::WHITE,
-                                                    );
-                                                    
-                                                    let rect = egui::Rect::from_center_size(pos, galley.size());
-                                                    painter.galley(rect.min, galley, color);
-                                                }
-                                                
-                                                // Pattern boundary indicator
-                                                if resolved_row == 0 {
-                                                    painter.line_segment(
-                                                        [egui::pos2(hm_rect.left(), y - row_height / 2.0), egui::pos2(hm_rect.right(), y - row_height / 2.0)],
-                                                        (1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, (alpha * 150.0) as u8))
-                                                    );
-                                                }
+                                                let rect = egui::Rect::from_center_size(pos, galley.size());
+                                                painter.galley(rect.min, galley, color);
+                                            }
+                                            
+                                            // Pattern boundary indicator
+                                            if resolved_row == 0 {
+                                                painter.line_segment(
+                                                    [egui::pos2(hm_rect.left(), y - row_height / 2.0), egui::pos2(hm_rect.right(), y - row_height / 2.0)],
+                                                    (1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, (alpha * 150.0) as u8))
+                                                );
                                             }
                                         }
                                     }
@@ -4067,7 +5415,7 @@ impl VulkanEngine {
                             }
                             
                             // Column 2: Track Info
-                            if state.video_mode == 1 {
+                            if state.video_mode == 1 && self.video_state.is_some() {
                                 let available = columns[2].available_size();
                                 let (rect, _) = columns[2].allocate_exact_size(available, egui::Sense::hover());
                                 out_track_info_rect = Some(rect);
@@ -4203,6 +5551,19 @@ impl VulkanEngine {
                                         }
                                     }
                                     
+                                    // 5b. Lyrics
+                                    if let Some(lyrics) = &state.lyrics {
+                                        let lyrics_label = if let Some(fname) = &lyrics.file_name {
+                                            format!("Found ({}) - Synced", fname)
+                                        } else {
+                                            "Found (LRC Sidecar Synced)".to_string()
+                                        };
+                                        ui.horizontal(|ui| {
+                                            ui.label("Lyrics");
+                                            ui.colored_label(egui::Color32::from_rgb(100, 230, 140), lyrics_label);
+                                        });
+                                    }
+                                    
                                     // 6. Track layout parameters
                                     if state.bpm > 0 { ui.horizontal(|ui| { ui.label("BPM"); ui.label(format!("{}", state.bpm)); }); }
                                     if state.speed > 0 { ui.horizontal(|ui| { ui.label("Speed"); ui.label(format!("{}", state.speed)); }); }
@@ -4235,6 +5596,30 @@ impl VulkanEngine {
                                             ui.label(format!("{:.1}s", state.duration_seconds)); 
                                         }
                                     });
+
+                                    if state.audio_tracks.len() > 1 {
+                                        ui.horizontal(|ui| {
+                                            ui.label("Audio Track");
+                                            let mut selected_idx = state.selected_audio_track;
+                                            let prev_idx = selected_idx;
+                                            let selected_title = state.audio_tracks.get(selected_idx)
+                                                .map(|t| t.title.clone())
+                                                .unwrap_or_else(|| format!("Track {}", selected_idx + 1));
+
+                                            egui::ComboBox::from_id_salt("audio_track_combo")
+                                                .selected_text(&selected_title)
+                                                .width(ui.available_width().max(80.0))
+                                                .show_ui(ui, |ui| {
+                                                    for (idx, track) in state.audio_tracks.iter().enumerate() {
+                                                        ui.selectable_value(&mut selected_idx, idx, &track.title);
+                                                    }
+                                                });
+
+                                            if selected_idx != prev_idx {
+                                                engine_action = EngineAction::SetAudioTrack(selected_idx);
+                                            }
+                                        });
+                                    }
                                     
                                     ui.horizontal(|ui| {
                                         ui.label("Device");
@@ -4266,7 +5651,7 @@ impl VulkanEngine {
                                     }
                                 });
                             
-                            out_track_info_rect = Some(columns[2].min_rect());
+                            out_track_info_rect = Some(columns[2].max_rect());
                         }
                     });
                 }
@@ -4380,6 +5765,80 @@ impl VulkanEngine {
                 }
             });
 
+            let dropped_files: Vec<String> = ctx.input(|i| {
+                i.raw.dropped_files
+                    .iter()
+                    .filter_map(|df| df.path.as_ref().map(|p| p.to_string_lossy().into_owned()))
+                    .collect()
+            });
+
+            let pointer_pos = ctx.input(|i| i.pointer.hover_pos().or(i.pointer.latest_pos()));
+            let is_over_track_info = if let (Some(pos), Some(ti_rect)) = (pointer_pos, out_track_info_rect) {
+                ti_rect.contains(pos)
+            } else {
+                false
+            };
+
+            if !dropped_files.is_empty() {
+                if !state.file_loaded {
+                    engine_action = EngineAction::LoadFiles(dropped_files, false);
+                } else if is_over_track_info {
+                    engine_action = EngineAction::LoadFiles(dropped_files, true);
+                } else {
+                    engine_action = EngineAction::LoadFiles(dropped_files, false);
+                }
+            } else if (!ctx.input(|i| i.raw.hovered_files.is_empty()) || state.hovered_file.is_some()) && state.file_loaded {
+                let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drag_overlay")));
+                if is_over_track_info {
+                    if let Some(ti_rect) = out_track_info_rect {
+                        painter.rect(
+                            ti_rect.expand(2.0),
+                            6.0,
+                            egui::Color32::from_rgba_unmultiplied(20, 80, 40, 100),
+                            egui::Stroke::new(2.5_f32, egui::Color32::from_rgb(80, 240, 120)),
+                            egui::StrokeKind::Outside,
+                        );
+                        let font_id = egui::FontId::proportional(15.0);
+                        let galley = painter.layout(
+                            "➕ Add to Playlist".to_string(),
+                            font_id,
+                            egui::Color32::WHITE,
+                            ti_rect.width(),
+                        );
+                        let badge_rect = egui::Rect::from_center_size(ti_rect.center(), galley.size() + egui::vec2(20.0, 10.0));
+                        painter.rect(
+                            badge_rect,
+                            6.0,
+                            egui::Color32::from_rgba_unmultiplied(12, 35, 18, 235),
+                            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(90, 230, 130)),
+                            egui::StrokeKind::Outside,
+                        );
+                        painter.galley(badge_rect.min + egui::vec2(10.0, 5.0), galley, egui::Color32::WHITE);
+                    }
+                } else {
+                    let screen_rect = ctx.content_rect();
+                    let font_id = egui::FontId::proportional(16.0);
+                    let galley = painter.layout(
+                        "▶  Drop to Play Immediately".to_string(),
+                        font_id,
+                        egui::Color32::WHITE,
+                        400.0,
+                    );
+                    let banner_rect = egui::Rect::from_center_size(
+                        egui::pos2(screen_rect.center().x, screen_rect.top() + 45.0),
+                        galley.size() + egui::vec2(28.0, 14.0),
+                    );
+                    painter.rect(
+                        banner_rect,
+                        8.0,
+                        egui::Color32::from_rgba_unmultiplied(10, 25, 45, 240),
+                        egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(80, 180, 255)),
+                        egui::StrokeKind::Outside,
+                    );
+                    painter.galley(banner_rect.min + egui::vec2(14.0, 7.0), galley, egui::Color32::WHITE);
+                }
+            }
+
         });
 
         let scale = egui_ctx.pixels_per_point();
@@ -4482,7 +5941,7 @@ impl VulkanEngine {
                         end_of_pass_write_index: Some(3),
                     }),
                 });
-                if vis_def.id == 1 {
+                if vis_def.id == 5 {
                     compute_pass.set_pipeline(&self.fire_compute_pipeline);
                 } else {
                     compute_pass.set_pipeline(&self.firesim_compute_pipeline);
@@ -4525,7 +5984,7 @@ impl VulkanEngine {
             }
         }
 
-        if vis_def.id == 5 { // Neon Corridor
+        if vis_def.id == 11 { // Neon Corridor
             // Update params
             let mut act = 0.0;
             let count = state.channel_vus.len().min(8);
@@ -4560,7 +6019,7 @@ impl VulkanEngine {
             compute_pass.dispatch_workgroups(391, 1, 1);
         }
 
-        if vis_def.id == 19 {
+        if vis_def.id == 20 {
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Bioluminescence Waves Sim Compute"),
                 timestamp_writes: None,
@@ -4610,21 +6069,53 @@ impl VulkanEngine {
             // --- 3D Engine Camera Math ---
             let aspect = vp_w / vp_h.max(1.0);
             
-            // Update aspect_ratio uniform dynamically based on the current viewport.
-            // Offset is computed from the actual struct layout (not a magic number) so it
-            // stays correct if AudioUniforms fields are reordered or resized.
+            // Update aspect_ratio uniform dynamically based on current viewport
             const ASPECT_RATIO_OFFSET: wgpu::BufferAddress =
                 std::mem::offset_of!(AudioUniforms, aspect_ratio) as wgpu::BufferAddress;
             self.queue.write_buffer(&self.uniform_buffer, ASPECT_RATIO_OFFSET, bytemuck::cast_slice(&[aspect as f32]));
 
-            let fov_x = std::f32::consts::PI / 2.0;
-            let fov_y = 2.0 * ((fov_x / 2.0).tan() / aspect).atan();
+            // Fixed vertical FOV ensures vehicles and scenes maintain perfect aspect ratio without squashing
+            let fov_y = 48.0_f32.to_radians();
             let proj = glam::Mat4::perspective_rh_gl(fov_y, aspect, 0.1, 1000.0);
-            let view = if state.visualizer_mode == 19 && state.biolum_top_down {
+            let view = if state.visualizer_mode == 20 && state.biolum_top_down {
                 glam::Mat4::look_at_rh(
                     glam::Vec3::new(0.0, 14.0, 0.0),
                     glam::Vec3::new(0.0, 0.0, 0.0),
                     glam::Vec3::new(0.0, 0.0, 1.0),
+                )
+            } else if state.visualizer_mode == 14 {
+                glam::Mat4::look_at_rh(
+                    glam::Vec3::new(0.0, 1.50, 0.6),
+                    glam::Vec3::new(0.0, 0.95, 14.0),
+                    glam::Vec3::new(0.0, 1.0, 0.0),
+                )
+            } else if state.visualizer_mode == 19 {
+                // 3D Vintage Hi-Fi Master Rack
+                glam::Mat4::look_at_rh(
+                    glam::Vec3::new(0.0, 0.0, 6.2),
+                    glam::Vec3::new(0.0, 0.0, 0.0),
+                    glam::Vec3::new(0.0, 1.0, 0.0),
+                )
+            } else if state.visualizer_mode == 11 {
+                // 3D Concentric Neon Audio Portal Frames Corridor
+                glam::Mat4::look_at_rh(
+                    glam::Vec3::new(0.0, 2.1, -3.8),
+                    glam::Vec3::new(0.0, 1.8, 20.0),
+                    glam::Vec3::new(0.0, 1.0, 0.0),
+                )
+            } else if state.visualizer_mode == 17 {
+                // 3D Volumetric Falling Rain Storm
+                glam::Mat4::look_at_rh(
+                    glam::Vec3::new(0.0, 8.0, 0.0),
+                    glam::Vec3::new(0.0, 14.0, 50.0),
+                    glam::Vec3::new(0.0, 1.0, 0.0),
+                )
+            } else if state.visualizer_mode == 23 {
+                // 3D Glass Water Lyrics: Low-angle studio camera
+                glam::Mat4::look_at_rh(
+                    glam::Vec3::new(0.0, 1.4, 4.2),
+                    glam::Vec3::new(0.0, 0.45, 0.0),
+                    glam::Vec3::new(0.0, 1.0, 0.0),
                 )
             } else {
                 glam::Mat4::look_at_rh(
@@ -4644,14 +6135,34 @@ impl VulkanEngine {
             let mode_idx = state.current_visualizer_idx.min(self.render_pipelines.len() - 1);
             let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
 
-            if vis_def.id == 11 || vis_def.id == 20 {
+            if vis_def.id == 12 || vis_def.id == 3 || vis_def.id == 23 {
                 render_pass.set_pipeline(&self.clear_black_pipeline);
                 render_pass.draw(0..3, 0..1);
-            } else if vis_def.id == 19 {
+            } else if vis_def.id == 20 {
                 render_pass.set_pipeline(&self.biolum_bg_pipeline);
                 render_pass.draw(0..3, 0..1);
-            } else if vis_def.id == 17 {
+            } else if vis_def.id == 18 {
                 render_pass.set_pipeline(&self.crt_background_pipeline);
+                render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
+                render_pass.draw(0..3, 0..1);
+            } else if vis_def.id == 14 {
+                render_pass.set_pipeline(&self.synthwave_sky_pipeline);
+                render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
+                render_pass.draw(0..3, 0..1);
+            } else if vis_def.id == 19 {
+                render_pass.set_pipeline(&self.vumeters_bg_pipeline);
+                render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
+                render_pass.draw(0..3, 0..1);
+            } else if vis_def.id == 11 {
+                render_pass.set_pipeline(&self.neon_bg_pipeline);
+                render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
+                render_pass.draw(0..3, 0..1);
+            } else if vis_def.id == 17 {
+                render_pass.set_pipeline(&self.storm_sky_pipeline);
                 render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
                 render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
                 render_pass.draw(0..3, 0..1);
@@ -4667,7 +6178,7 @@ impl VulkanEngine {
                 },
                 crate::state::PipelineType::Mesh3D { geometry, instances } => {
                     render_pass.set_bind_group(2, &self.camera_bind_group, &[]);
-                    if vis_def.id == 19 {
+                    if vis_def.id == 20 {
                         render_pass.set_bind_group(3, &self.biolum_render_bind_group, &[]);
                     }
                     if let Some(mesh) = self.mesh_registry.get(geometry) {
@@ -4676,7 +6187,7 @@ impl VulkanEngine {
                         render_pass.draw_indexed(0..mesh.index_count, 0, 0..*instances);
                     }
                     
-                    if vis_def.id == 12 {
+                    if vis_def.id == 13 {
                         render_pass.set_pipeline(&self.lamp_pipeline);
                         render_pass.set_vertex_buffer(0, self.lamp_vertex_buffer.slice(..));
                         render_pass.set_index_buffer(self.lamp_index_buffer.slice(..), wgpu::IndexFormat::Uint32);
@@ -5002,5 +6513,89 @@ mod tests {
             max_smooth_acc,
             max_raw_acc
         );
+    }
+
+    #[test]
+    fn test_drag_and_drop_use_cases() {
+        let mut state = crate::state::AppState::new("Test App".to_string());
+        let track_info_rect = [800.0f32, 0.0, 1200.0, 300.0];
+        state.track_info_rect = Some(track_info_rect);
+
+        let dropped_file = "song1.flac".to_string();
+
+        // Use Case 1: Splash screen drop (file_loaded == false)
+        assert!(!state.file_loaded);
+        state.playlist = vec![dropped_file.clone()];
+        state.playlist_index = 0;
+        state.load_request = Some(dropped_file.clone());
+        state.file_loaded = true;
+
+        assert!(state.file_loaded);
+        assert_eq!(state.playlist.len(), 1);
+        assert_eq!(state.load_request, Some("song1.flac".to_string()));
+
+        // Use Case 2: Drop on main view outside Track Info (e.g. cursor at (400, 150))
+        let cursor_outside = [400.0f32, 150.0];
+        let is_over_ti = cursor_outside[0] >= track_info_rect[0] && cursor_outside[0] <= track_info_rect[2]
+            && cursor_outside[1] >= track_info_rect[1] && cursor_outside[1] <= track_info_rect[3];
+        assert!(!is_over_ti);
+
+        let new_file = "song2.mp3".to_string();
+        if !is_over_ti {
+            state.playlist = vec![new_file.clone()];
+            state.playlist_index = 0;
+            state.load_request = Some(new_file.clone());
+        }
+        assert_eq!(state.playlist, vec!["song2.mp3".to_string()]);
+        assert_eq!(state.load_request, Some("song2.mp3".to_string()));
+
+        // Use Case 3: Drop on Track Info pane (e.g. cursor at (950, 100))
+        let cursor_inside = [950.0f32, 100.0];
+        let is_over_ti_inside = cursor_inside[0] >= track_info_rect[0] && cursor_inside[0] <= track_info_rect[2]
+            && cursor_inside[1] >= track_info_rect[1] && cursor_inside[1] <= track_info_rect[3];
+        assert!(is_over_ti_inside);
+
+        let append_file = "song3.wav".to_string();
+        if is_over_ti_inside {
+            state.playlist.push(append_file.clone());
+            state.osd_text = Some(format!("Added to Playlist: {}", append_file));
+            state.osd_timer = 3.0;
+        }
+        assert_eq!(state.playlist.len(), 2);
+        assert_eq!(state.playlist[1], "song3.wav");
+        assert_eq!(state.osd_text, Some("Added to Playlist: song3.wav".to_string()));
+    }
+
+    #[test]
+    fn test_view_mode_rotation() {
+        let mut state = crate::state::AppState::new("Test App".to_string());
+        assert_eq!(state.show_hud, true);
+        assert_eq!(state.video_mode, 0);
+
+        // Press 'v' in audio mode -> Toggle HUD off (Full Screen Visualizer)
+        state.show_hud = !state.show_hud;
+        state.video_mode = 0;
+        assert_eq!(state.show_hud, false);
+
+        // Press 'v' again -> Toggle HUD back on (Standard View)
+        state.show_hud = !state.show_hud;
+        state.video_mode = 0;
+        assert_eq!(state.show_hud, true);
+    }
+
+    #[test]
+    fn test_synthwave_lyrics_visualizer_registration() {
+        let vis = crate::state::VISUALIZERS.iter().find(|v| v.id == 23);
+        assert!(vis.is_some(), "Visualizer ID 23 (3D Glass Water Lyrics) must be registered in VISUALIZERS");
+        let def = vis.unwrap();
+        assert_eq!(def.name, "3D Glass Water Lyrics");
+        assert_eq!(def.filename, "vis_lyrics.wgsl");
+        assert_eq!(def.pipeline_type, crate::state::PipelineType::Mesh3D { geometry: crate::state::Geometry::GlassLyricsScene, instances: 1 });
+
+        // Verify that the shader source is present and includes compile cleanly
+        let raw_source = include_str!("shaders/vis_lyrics.wgsl");
+        assert!(raw_source.contains("// INCLUDE: common"));
+        assert!(raw_source.contains("vs_main_3d"));
+        assert!(raw_source.contains("fs_main"));
     }
 }

@@ -375,6 +375,9 @@ pub trait AudioSource: Send {
     fn attach_video_queue(&mut self, _tx: crossbeam_channel::Sender<(u64, ffmpeg_next::Packet)>) {}
     fn take_video_parameters(&mut self) -> Option<(ffmpeg_next::codec::Parameters, ffmpeg_next::Rational)> { None }
     fn get_bitrate(&mut self) -> Option<u32> { None }
+    fn get_audio_tracks(&self) -> Vec<crate::state::AudioTrackInfo> { Vec::new() }
+    fn get_selected_audio_track(&self) -> usize { 0 }
+    fn select_audio_track(&mut self, _track_idx: usize) -> Result<()> { Ok(()) }
 }
 
 // ---------------------------------------------------------
@@ -827,6 +830,8 @@ struct SymphoniaSource {
     ext_type: String,
     intrinsic_sample_rate: Option<u32>,
     video_info: Option<String>,
+    audio_tracks: Vec<crate::state::AudioTrackInfo>,
+    selected_track_idx: usize,
 }
 
 impl AudioSource for SymphoniaSource {
@@ -961,6 +966,43 @@ impl AudioSource for SymphoniaSource {
     fn get_current_row(&mut self) -> i32 { 0 }
 
     fn get_video_info(&mut self) -> Option<String> { self.video_info.clone() }
+
+    fn get_audio_tracks(&self) -> Vec<crate::state::AudioTrackInfo> { self.audio_tracks.clone() }
+    fn get_selected_audio_track(&self) -> usize { self.selected_track_idx }
+    fn select_audio_track(&mut self, track_idx: usize) -> Result<()> {
+        if track_idx >= self.audio_tracks.len() {
+            return Err(anyhow::anyhow!("Track index out of range: {}", track_idx));
+        }
+        let target_track_id = self.audio_tracks[track_idx].id as u32;
+        if target_track_id == self.track_id && track_idx == self.selected_track_idx {
+            return Ok(());
+        }
+        let track = self.format.tracks().iter().find(|t| t.id == target_track_id).context("Track not found")?.clone();
+        let decoder = symphonia::default::get_codecs()
+            .make(&track.codec_params, &DecoderOptions::default())
+            .context("Unsupported codec for track")?;
+
+        let sym_channels = track.codec_params.channels.unwrap_or(symphonia::core::audio::Channels::FRONT_LEFT | symphonia::core::audio::Channels::FRONT_RIGHT);
+        let channels = sym_channels.count() as u16;
+        let time_base = track.codec_params.time_base.map(|t| t.calc_time(1).seconds as f64 + t.calc_time(1).frac).unwrap_or(1.0 / 44100.0);
+        let duration = track.codec_params.n_frames.map(|n| n as f64 * time_base).unwrap_or(0.0);
+        let intrinsic_sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
+
+        self.decoder = decoder;
+        self.track_id = target_track_id;
+        self.selected_track_idx = track_idx;
+        self.sample_buf = SampleBuffer::<f32>::new(0, symphonia::core::audio::SignalSpec::new(intrinsic_sample_rate, sym_channels));
+        self.buf_pos = 0;
+        self.time_base = time_base;
+        self.duration = duration;
+        self.channels = channels;
+        self.channel_vus = vec![0.0; channels as usize];
+        self.ext_type = self.audio_tracks[track_idx].codec.clone();
+        self.intrinsic_sample_rate = Some(intrinsic_sample_rate);
+
+        self.set_position_seconds(self.current_time);
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------
@@ -989,6 +1031,10 @@ struct FfmpegSource {
     video_epoch: u64,
     video_params: Option<ffmpeg_next::codec::Parameters>,
     video_time_base: Option<ffmpeg_next::Rational>,
+
+    audio_tracks: Vec<crate::state::AudioTrackInfo>,
+    selected_track_idx: usize,
+    output_sample_rate: u32,
 }
 
 impl FfmpegSource {
@@ -1077,7 +1123,10 @@ impl FfmpegSource {
 }
 
 impl AudioSource for FfmpegSource {
-    fn read_frames(&mut self, hardware_channels: usize, _sample_rate: u32, output: &mut [f32]) -> usize {
+    fn read_frames(&mut self, hardware_channels: usize, sample_rate: u32, output: &mut [f32]) -> usize {
+        if sample_rate > 0 {
+            self.output_sample_rate = sample_rate;
+        }
         let mut frames_written = 0;
         let frames_needed = output.len() / hardware_channels;
         self.channel_vus.fill(0.0);
@@ -1221,6 +1270,51 @@ impl AudioSource for FfmpegSource {
         } else {
             None
         }
+    }
+
+    fn get_audio_tracks(&self) -> Vec<crate::state::AudioTrackInfo> { self.audio_tracks.clone() }
+    fn get_selected_audio_track(&self) -> usize { self.selected_track_idx }
+    fn select_audio_track(&mut self, track_idx: usize) -> Result<()> {
+        if track_idx >= self.audio_tracks.len() {
+            return Err(anyhow::anyhow!("Track index out of range: {}", track_idx));
+        }
+        let target_stream_index = self.audio_tracks[track_idx].id;
+        if target_stream_index == self.stream_index && track_idx == self.selected_track_idx {
+            return Ok(());
+        }
+
+        let stream = self.ictx.stream(target_stream_index).context("Target stream not found in container")?;
+        let context = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())?;
+        let decoder = context.decoder().audio()?;
+
+        let channels = decoder.channels() as u16;
+        let sample_rate = decoder.rate();
+        let time_base = stream.time_base();
+        let tb = time_base.numerator() as f64 / time_base.denominator() as f64;
+
+        let out_rate = if self.output_sample_rate > 0 { self.output_sample_rate } else { sample_rate };
+        let resampler = ffmpeg_next::software::resampling::context::Context::get(
+            decoder.format(),
+            decoder.channel_layout(),
+            decoder.rate(),
+            ffmpeg_next::format::sample::Sample::F32(ffmpeg_next::format::sample::Type::Packed),
+            decoder.channel_layout(),
+            out_rate,
+        ).context("Failed to create resampler for switched audio track")?;
+
+        self.decoder = decoder;
+        self.resampler = resampler;
+        self.stream_index = target_stream_index;
+        self.selected_track_idx = track_idx;
+        self.channels = channels;
+        self.time_base = tb;
+        self.intrinsic_sample_rate = sample_rate;
+        self.channel_vus = vec![0.0; channels as usize];
+        self.ext_type = self.audio_tracks[track_idx].codec.clone();
+
+        // Seek back to current playback position so new track starts immediately from current timestamp
+        self.set_position_seconds(self.current_time);
+        Ok(())
     }
 }
 
@@ -1367,9 +1461,77 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
         }
     }
 
-    let audio_stream = ictx.streams().best(ffmpeg_next::media::Type::Audio);
+    let mut audio_tracks = Vec::new();
+    let mut selected_track_idx = 0;
     
-    if audio_stream.is_none() {
+    for stream in ictx.streams() {
+        if stream.parameters().medium() == ffmpeg_next::media::Type::Audio {
+            let s_idx = stream.index();
+            let p = stream.parameters();
+            let codec_id = p.id();
+            let codec_name = match codec_id {
+                ffmpeg_next::codec::Id::TRUEHD => "TrueHD".to_string(),
+                ffmpeg_next::codec::Id::EAC3 => "E-AC3".to_string(),
+                ffmpeg_next::codec::Id::AC3 => "AC3".to_string(),
+                ffmpeg_next::codec::Id::DTS => "DTS".to_string(),
+                ffmpeg_next::codec::Id::FLAC => "FLAC".to_string(),
+                ffmpeg_next::codec::Id::AAC => "AAC".to_string(),
+                ffmpeg_next::codec::Id::MP3 => "MP3".to_string(),
+                ffmpeg_next::codec::Id::VORBIS => "Vorbis".to_string(),
+                ffmpeg_next::codec::Id::OPUS => "Opus".to_string(),
+                ffmpeg_next::codec::Id::PCM_S16LE | ffmpeg_next::codec::Id::PCM_S24LE | ffmpeg_next::codec::Id::PCM_S32LE | ffmpeg_next::codec::Id::PCM_F32LE => "PCM".to_string(),
+                _ => format!("{:?}", codec_id).to_uppercase(),
+            };
+
+            let (channels, rate) = if let Ok(ctx) = ffmpeg_next::codec::context::Context::from_parameters(p.clone()) {
+                if let Ok(dec) = ctx.decoder().audio() {
+                    (dec.channels() as u16, dec.rate())
+                } else {
+                    (2, 48000)
+                }
+            } else {
+                (2, 48000)
+            };
+
+            let ch_desc = match channels {
+                1 => "Mono".to_string(),
+                2 => "Stereo".to_string(),
+                6 => "5.1".to_string(),
+                8 => "7.1".to_string(),
+                n => format!("{} ch", n),
+            };
+
+            let meta = stream.metadata();
+            let lang = meta.get("language").or_else(|| meta.get("LANG")).map(|s| s.to_string());
+            let title = meta.get("title").map(|s| s.to_string());
+
+            let mut desc_parts = Vec::new();
+            desc_parts.push(codec_name.clone());
+            desc_parts.push(ch_desc);
+            if rate > 0 {
+                desc_parts.push(format!("{}Hz", rate));
+            }
+
+            let technical = desc_parts.join(" ");
+            let display_title = match (lang.as_deref(), title.as_deref()) {
+                (Some(l), Some(t)) => format!("Track {}: {} [{} - {}]", audio_tracks.len() + 1, technical, l, t),
+                (Some(l), None) => format!("Track {}: {} [{}]", audio_tracks.len() + 1, technical, l),
+                (None, Some(t)) => format!("Track {}: {} [{}]", audio_tracks.len() + 1, technical, t),
+                (None, None) => format!("Track {}: {}", audio_tracks.len() + 1, technical),
+            };
+
+            audio_tracks.push(crate::state::AudioTrackInfo {
+                id: s_idx,
+                title: display_title,
+                codec: codec_name,
+                channels,
+                sample_rate: rate,
+                language: lang,
+            });
+        }
+    }
+
+    if audio_tracks.is_empty() {
         if let Some(v_idx) = video_stream_index {
             return Ok(Box::new(VideoOnlySource {
                 ictx,
@@ -1387,10 +1549,18 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
             return Err(anyhow::anyhow!("No audio stream found and no video stream found"));
         }
     }
-    
-    let stream = audio_stream.unwrap();
-    let stream_index = stream.index();
-    
+
+    let best_audio_stream = ictx.streams().best(ffmpeg_next::media::Type::Audio);
+    let stream_index = if let Some(ref best) = best_audio_stream {
+        if let Some(pos) = audio_tracks.iter().position(|t| t.id == best.index()) {
+            selected_track_idx = pos;
+        }
+        best.index()
+    } else {
+        audio_tracks[0].id
+    };
+
+    let stream = ictx.stream(stream_index).context("Audio stream not found")?;
     let context = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())?;
     let decoder = context.decoder().audio()?;
     
@@ -1422,7 +1592,7 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
         current_time: 0.0,
         duration,
         artist: initial_artist,
-        ext_type: ext,
+        ext_type: audio_tracks.get(selected_track_idx).map(|t| t.codec.clone()).unwrap_or(ext),
         intrinsic_sample_rate: sample_rate,
         video_info,
         channel_vus: vec![0.0; channels as usize],
@@ -1431,6 +1601,9 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
         video_epoch: 0,
         video_params,
         video_time_base: video_tb,
+        audio_tracks,
+        selected_track_idx,
+        output_sample_rate: sample_rate,
     }))
 }
 
@@ -1446,13 +1619,43 @@ fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(file: R, probe_e
 
     let format = probed.format;
     
-    // Find the first supported audio track instead of the default track (which might be video)
-    let track = format.tracks().iter()
-        .find(|t| t.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL && 
-                  symphonia::default::get_codecs().make(&t.codec_params, &DecoderOptions::default()).is_ok())
-        .context("No supported audio track found")?
-        .clone();
-        
+    let mut audio_tracks = Vec::new();
+    let mut selected_track = None;
+    let mut selected_track_idx = 0;
+
+    for track in format.tracks().iter() {
+        if track.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL && 
+           symphonia::default::get_codecs().make(&track.codec_params, &DecoderOptions::default()).is_ok() {
+            let codec_name = format!("{:?}", track.codec_params.codec);
+            let sym_channels = track.codec_params.channels.unwrap_or(symphonia::core::audio::Channels::FRONT_LEFT | symphonia::core::audio::Channels::FRONT_RIGHT);
+            let channels = sym_channels.count() as u16;
+            let rate = track.codec_params.sample_rate.unwrap_or(44100);
+            let ch_desc = match channels {
+                1 => "Mono".to_string(),
+                2 => "Stereo".to_string(),
+                6 => "5.1".to_string(),
+                8 => "7.1".to_string(),
+                n => format!("{} ch", n),
+            };
+            let title = format!("Track {}: {} {} {}Hz", audio_tracks.len() + 1, codec_name, ch_desc, rate);
+
+            if selected_track.is_none() {
+                selected_track = Some(track.clone());
+                selected_track_idx = audio_tracks.len();
+            }
+
+            audio_tracks.push(crate::state::AudioTrackInfo {
+                id: track.id as usize,
+                title,
+                codec: codec_name,
+                channels,
+                sample_rate: rate,
+                language: None,
+            });
+        }
+    }
+
+    let track = selected_track.context("No supported audio track found")?;
     let track_id = track.id;
     let decoder = symphonia::default::get_codecs()
         .make(&track.codec_params, &DecoderOptions::default())
@@ -1480,6 +1683,8 @@ fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(file: R, probe_e
         ext_type: if display_ext.is_empty() { "UNKNOWN".to_string() } else { display_ext.to_uppercase() },
         intrinsic_sample_rate: Some(intrinsic_sample_rate),
         video_info,
+        audio_tracks,
+        selected_track_idx,
     }))
 }
 
@@ -1900,6 +2105,9 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
                     state.num_instruments = audio_source.get_num_instruments();
                     state.num_patterns = audio_source.get_num_patterns();
                     state.bitrate = audio_source.get_bitrate();
+                    state.audio_tracks = audio_source.get_audio_tracks();
+                    state.selected_audio_track = audio_source.get_selected_audio_track();
+                    state.audio_track_request = None;
                     state.tracker_channels = tracker_channels;
                     state.tracker_patterns_by_order = audio_source.pre_format_tracker_data();
                 }
@@ -1973,6 +2181,9 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
                     state.num_instruments = audio_source.get_num_instruments();
                     state.num_patterns = audio_source.get_num_patterns();
                     state.bitrate = audio_source.get_bitrate();
+                    state.audio_tracks = audio_source.get_audio_tracks();
+                    state.selected_audio_track = audio_source.get_selected_audio_track();
+                    state.audio_track_request = None;
                     state.tracker_channels = tracker_channels;
                     state.tracker_patterns_by_order = audio_source.pre_format_tracker_data();
                 }
@@ -2245,6 +2456,28 @@ fn run_dummy(
                     return;
                 }
                 if let Ok(mut state) = state_for_decoder.try_lock() {
+                    if let Some(track_idx) = state.audio_track_request.take() {
+                        if state.audio_tracks.len() > 1 && track_idx < state.audio_tracks.len() && track_idx != state.selected_audio_track {
+                            let play_pos = state.current_seconds;
+                            if audio_source.select_audio_track(track_idx).is_ok() {
+                                audio_source.set_position_seconds(play_pos);
+                                state.selected_audio_track = track_idx;
+                                state.num_channels = audio_source.get_num_channels();
+                                state.module_type = audio_source.get_type();
+                                state.bitrate = audio_source.get_bitrate();
+                                state.channel_vus = vec![0.0; state.num_channels as usize];
+                                state.peak_vus = vec![0.0; state.num_channels as usize];
+                                let track_title = state.audio_tracks.get(track_idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", track_idx + 1));
+                                state.osd_text = Some(format!("Audio Track: {}", track_title));
+                                state.osd_timer = 3.0;
+                                state.seek_epoch += 1;
+                                while let Ok(c) = ready_rx_for_decoder.try_recv() {
+                                    let _ = free_tx_for_decoder.try_send(c);
+                                }
+                                while let Ok(_) = video_rx_for_decoder.try_recv() {}
+                            }
+                        }
+                    }
                     if let Some(pos) = state.seek_request.take() {
                         audio_source.set_position_seconds(pos);
                         state.current_seconds = pos;
@@ -2339,6 +2572,29 @@ fn run_dummy(
                 }
                 let mut seeked = false;
                 if let Ok(mut state) = state_for_decoder.try_lock() {
+                    if let Some(track_idx) = state.audio_track_request.take() {
+                        if state.audio_tracks.len() > 1 && track_idx < state.audio_tracks.len() && track_idx != state.selected_audio_track {
+                            let play_pos = state.current_seconds;
+                            if audio_source.select_audio_track(track_idx).is_ok() {
+                                audio_source.set_position_seconds(play_pos);
+                                state.selected_audio_track = track_idx;
+                                state.num_channels = audio_source.get_num_channels();
+                                state.module_type = audio_source.get_type();
+                                state.bitrate = audio_source.get_bitrate();
+                                state.channel_vus = vec![0.0; state.num_channels as usize];
+                                state.peak_vus = vec![0.0; state.num_channels as usize];
+                                let track_title = state.audio_tracks.get(track_idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", track_idx + 1));
+                                state.osd_text = Some(format!("Audio Track: {}", track_title));
+                                state.osd_timer = 3.0;
+                                state.seek_epoch += 1;
+                                while let Ok(c) = ready_rx_for_decoder.try_recv() {
+                                    let _ = free_tx_for_decoder.try_send(c);
+                                }
+                                while let Ok(_) = video_rx_for_decoder.try_recv() {}
+                                seeked = true;
+                            }
+                        }
+                    }
                     if let Some(pos) = state.seek_request.take() {
                         audio_source.set_position_seconds(pos);
                         state.current_seconds = pos;
@@ -2898,6 +3154,28 @@ where
                     return;
                 }
                 if let Ok(mut state) = state_for_decoder.try_lock() {
+                    if let Some(track_idx) = state.audio_track_request.take() {
+                        if state.audio_tracks.len() > 1 && track_idx < state.audio_tracks.len() && track_idx != state.selected_audio_track {
+                            let play_pos = state.current_seconds;
+                            if audio_source.select_audio_track(track_idx).is_ok() {
+                                audio_source.set_position_seconds(play_pos);
+                                state.selected_audio_track = track_idx;
+                                state.num_channels = audio_source.get_num_channels();
+                                state.module_type = audio_source.get_type();
+                                state.bitrate = audio_source.get_bitrate();
+                                state.channel_vus = vec![0.0; state.num_channels as usize];
+                                state.peak_vus = vec![0.0; state.num_channels as usize];
+                                let track_title = state.audio_tracks.get(track_idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", track_idx + 1));
+                                state.osd_text = Some(format!("Audio Track: {}", track_title));
+                                state.osd_timer = 3.0;
+                                state.seek_epoch += 1;
+                                while let Ok(c) = ready_rx_for_decoder.try_recv() {
+                                    let _ = free_tx_for_decoder.try_send(c);
+                                }
+                                while let Ok(_) = video_rx_for_decoder.try_recv() {}
+                            }
+                        }
+                    }
                     if let Some(pos) = state.seek_request.take() {
                         audio_source.set_position_seconds(pos);
                         state.current_seconds = pos;
@@ -2994,6 +3272,29 @@ where
                 }
                 let mut seeked = false;
                 if let Ok(mut state) = state_for_decoder.try_lock() {
+                    if let Some(track_idx) = state.audio_track_request.take() {
+                        if state.audio_tracks.len() > 1 && track_idx < state.audio_tracks.len() && track_idx != state.selected_audio_track {
+                            let play_pos = state.current_seconds;
+                            if audio_source.select_audio_track(track_idx).is_ok() {
+                                audio_source.set_position_seconds(play_pos);
+                                state.selected_audio_track = track_idx;
+                                state.num_channels = audio_source.get_num_channels();
+                                state.module_type = audio_source.get_type();
+                                state.bitrate = audio_source.get_bitrate();
+                                state.channel_vus = vec![0.0; state.num_channels as usize];
+                                state.peak_vus = vec![0.0; state.num_channels as usize];
+                                let track_title = state.audio_tracks.get(track_idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", track_idx + 1));
+                                state.osd_text = Some(format!("Audio Track: {}", track_title));
+                                state.osd_timer = 3.0;
+                                state.seek_epoch += 1;
+                                while let Ok(c) = ready_rx_for_decoder.try_recv() {
+                                    let _ = free_tx_for_decoder.try_send(c);
+                                }
+                                while let Ok(_) = video_rx_for_decoder.try_recv() {}
+                                seeked = true;
+                            }
+                        }
+                    }
                     if let Some(pos) = state.seek_request.take() {
                         audio_source.set_position_seconds(pos);
                         state.current_seconds = pos;

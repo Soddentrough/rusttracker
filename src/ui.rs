@@ -135,43 +135,101 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         .block(Block::default().title("Channels").borders(Borders::ALL));
     f.render_widget(vu_paragraph, top_chunks[0]);
 
-    // 2. High-End Spectrogram Heatmap
+    // 2. High-End Spectrogram Heatmap / Synchronized Lyrics
     if top_chunks[1].width > 2 && top_chunks[1].height > 2 {
         let heatmap_width = top_chunks[1].width.saturating_sub(2) as usize;
         let heatmap_height = top_chunks[1].height.saturating_sub(2) as usize;
-        let chars_per_bin = (heatmap_width / 128).max(1);
-        let bin_str = "▀".repeat(chars_per_bin);
 
-        let mut heatmap_lines = Vec::new();
-        let history_len = state.spectrum_history.len();
-        let total_history_lines = history_len / 2;
-        let start_line = total_history_lines.saturating_sub(heatmap_height);
-        
-        for cell_y in start_line..total_history_lines {
-            let mut spans = Vec::new();
-            let top_row_idx = cell_y * 2;
-            let bottom_row_idx = cell_y * 2 + 1;
+        if let Some(lyrics) = &state.lyrics {
+            let display_secs = state.scrub_target_seconds.unwrap_or(state.current_seconds);
+            let active_idx = lyrics.find_current_line_idx(display_secs);
+            let is_intro = active_idx.is_none();
+            let base_idx = active_idx.unwrap_or(0);
+            let center_row = heatmap_height / 2;
 
-            if top_row_idx < history_len && bottom_row_idx < history_len {
-                let top_row = &state.spectrum_history[top_row_idx];
-                let bottom_row = &state.spectrum_history[bottom_row_idx];
+            let mut lyric_lines = Vec::new();
+            for r in 0..heatmap_height {
+                let offset = (r as i32) - (center_row as i32);
+                let target_idx = (base_idx as i32) + offset - if is_intro && offset > 0 { 1 } else { 0 };
 
-                for x in 0..top_row.len() {
-                    let fg_col = val_to_color(top_row[x]);
-                    let bg_col = val_to_color(bottom_row[x]);
-
-                    spans.push(Span::styled(
-                        bin_str.clone(), 
-                        Style::default().fg(fg_col).bg(bg_col)
-                    ));
+                if is_intro && offset == 0 {
+                    let intro_text = "♪ ♪ ♪  (Intro)";
+                    let padding = heatmap_width.saturating_sub(intro_text.chars().count()) / 2;
+                    let padded = format!("{}{}", " ".repeat(padding), intro_text);
+                    lyric_lines.push(Line::from(vec![
+                        Span::styled(padded, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+                    ]));
+                } else if is_intro && offset < 0 {
+                    lyric_lines.push(Line::raw(""));
+                } else if target_idx >= 0 && (target_idx as usize) < lyrics.lines.len() {
+                    let line = &lyrics.lines[target_idx as usize];
+                    let text = if line.text.is_empty() { "♪ ♪ ♪" } else { &line.text };
+                    let truncated: String = text.chars().take(heatmap_width.saturating_sub(4)).collect();
+                    let padding = heatmap_width.saturating_sub(truncated.chars().count() + 2) / 2;
+                    
+                    if !is_intro && offset == 0 {
+                        // Current active line
+                        let formatted = format!("{}> {} <", " ".repeat(padding), truncated);
+                        lyric_lines.push(Line::from(vec![
+                            Span::styled(formatted, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+                        ]));
+                    } else {
+                        let distance = offset.abs();
+                        let fg_color = if distance == 1 {
+                            Color::Rgb(200, 200, 200)
+                        } else if distance == 2 {
+                            Color::Rgb(140, 140, 140)
+                        } else {
+                            Color::Rgb(80, 80, 80)
+                        };
+                        let formatted = format!("{}{}", " ".repeat(padding + 2), truncated);
+                        lyric_lines.push(Line::from(vec![
+                            Span::styled(formatted, Style::default().fg(fg_color))
+                        ]));
+                    }
+                } else {
+                    lyric_lines.push(Line::raw(""));
                 }
             }
-            heatmap_lines.push(Line::from(spans));
-        }
 
-        let heatmap_paragraph = Paragraph::new(heatmap_lines)
-            .block(Block::default().title("Heatmap History").borders(Borders::ALL));
-        f.render_widget(heatmap_paragraph, top_chunks[1]);
+            let lyrics_paragraph = Paragraph::new(lyric_lines)
+                .block(Block::default().title("Lyrics").borders(Borders::ALL));
+            f.render_widget(lyrics_paragraph, top_chunks[1]);
+        } else {
+            let chars_per_bin = (heatmap_width / 128).max(1);
+            let bin_str = "▀".repeat(chars_per_bin);
+
+            let mut heatmap_lines = Vec::new();
+            let history_len = state.spectrum_history.len();
+            let total_history_lines = history_len / 2;
+            let start_line = total_history_lines.saturating_sub(heatmap_height);
+            
+            for cell_y in start_line..total_history_lines {
+                let mut spans = Vec::new();
+                let top_row_idx = cell_y * 2;
+                let bottom_row_idx = cell_y * 2 + 1;
+
+                if top_row_idx < history_len && bottom_row_idx < history_len {
+                    let top_row = &state.spectrum_history[top_row_idx];
+                    let bottom_row = &state.spectrum_history[bottom_row_idx];
+
+                    for x in 0..top_row.len() {
+                        let fg_col = val_to_color(top_row[x]);
+                        let bg_col = val_to_color(bottom_row[x]);
+
+                        spans.push(Span::styled(
+                            bin_str.clone(), 
+                            Style::default().fg(fg_col).bg(bg_col)
+                        ));
+                    }
+                }
+                heatmap_lines.push(Line::from(spans));
+            }
+
+            let heatmap_paragraph = Paragraph::new(heatmap_lines)
+                .block(Block::default().title("Heatmap History").borders(Borders::ALL));
+            f.render_widget(heatmap_paragraph, top_chunks[1]);
+        }
     }
 
 
@@ -280,6 +338,19 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         Span::raw(vis_name)
     ]));
 
+    // 4c. Lyrics
+    if let Some(lyrics) = &state.lyrics {
+        let label = if let Some(fname) = &lyrics.file_name {
+            format!("Found ({}) - Synced", fname)
+        } else {
+            "Found (LRC Synced)".to_string()
+        };
+        lines.push(Line::from(vec![
+            Span::raw("Lyrics: "),
+            Span::styled(label, Style::default().fg(Color::Green))
+        ]));
+    }
+
     // 5. BPM (if available)
     if state.bpm > 0 {
         lines.push(Line::from(vec![
@@ -319,6 +390,15 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         Span::raw("Length: "),
         Span::raw(if state.duration_seconds <= 0.0 { "LIVE".to_string() } else { format!("{:.1}s", state.duration_seconds) })
     ]));
+
+    // 10b. Audio Track (if multi-track)
+    if state.audio_tracks.len() > 1 {
+        let track_str = format!("{}/{} [1-{} to switch]", state.selected_audio_track + 1, state.audio_tracks.len(), state.audio_tracks.len().min(9));
+        lines.push(Line::from(vec![
+            Span::raw("Track:  "),
+            Span::styled(track_str, Style::default().fg(Color::Yellow)),
+        ]));
+    }
 
     // 11. Next Song (at the bottom, scrollable)
     if state.playlist_index + 1 < state.playlist.len() {

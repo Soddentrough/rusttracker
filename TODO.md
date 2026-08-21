@@ -51,3 +51,4 @@ Implement a Vaporwave Fountain visualizer.
 *   **Concept:** A retro 3D fountain utilizing instanced particles for water droplets, with water jets that spray and change height/angle dynamically in reaction to audio frequencies.
 *   **Styling:** A classic Black & White (B&W) film tone.
 *   **Concerns:** Achieving an authentic B&W film look (film grain, bloom, vignette, proper contrast curves) alongside high-performance instanced particle updates on the GPU can be challenging and will require careful optimization.
+* We should not use hacky quasi-3D fragment shaders when dealing with 3D. No PipelineType::FullscreenQuad. Only fully 3D Mesh3D scenes. We need to decide which visualizations need to be migrated or re-written. Also, which shouldn't be for performance reasons.
