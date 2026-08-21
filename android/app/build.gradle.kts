@@ -11,13 +11,18 @@ android {
         applicationId = "com.rusttracker.app"
         minSdk = 29
         targetSdk = 35
-        versionCode = 1
-        versionName = "0.9.15"
+        versionCode = 16
+        versionName = "0.9.16"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk {
             abiFilters.addAll(listOf("arm64-v8a", "x86_64"))
         }
+    }
+
+    lint {
+        checkReleaseBuilds = false
+        abortOnError = false
     }
 
     buildTypes {

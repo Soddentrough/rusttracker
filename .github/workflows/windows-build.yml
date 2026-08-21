@@ -6,6 +6,9 @@ on:
     tags:
       - "v*.*.*"
 
+permissions:
+  contents: write
+
 jobs:
   build-windows:
     runs-on: windows-latest
@@ -113,3 +116,11 @@ jobs:
       with:
         name: RustTracker-Windows
         path: setup/RustTracker-Setup.exe
+
+    - name: Upload to Release
+      uses: softprops/action-gh-release@v2
+      if: startsWith(github.ref, 'refs/tags/')
+      with:
+        files: setup/RustTracker-Setup.exe
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
