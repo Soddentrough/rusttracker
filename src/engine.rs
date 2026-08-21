@@ -4780,19 +4780,23 @@ impl VulkanEngine {
                                                 .spacing([18.0, 5.0])
                                                 .show(ui, |ui| {
                                                     ui.label(egui::RichText::new("Swipe L / R").color(egui::Color32::from_rgb(0, 220, 255)).strong().size(12.5));
-                                                    ui.label(egui::RichText::new("Switch Visualizers (22)").color(egui::Color32::LIGHT_GRAY).size(12.5));
+                                                    ui.label(egui::RichText::new(format!("Switch Visualizers ({})", crate::state::VISUALIZERS.len())).color(egui::Color32::LIGHT_GRAY).size(12.5));
                                                     ui.end_row();
 
                                                     ui.label(egui::RichText::new("Swipe U / D").color(egui::Color32::from_rgb(0, 220, 255)).strong().size(12.5));
-                                                    ui.label(egui::RichText::new("Heatmap / Channels / Info").color(egui::Color32::LIGHT_GRAY).size(12.5));
-                                                    ui.end_row();
-
-                                                    ui.label(egui::RichText::new("Double Tap").color(egui::Color32::from_rgb(0, 220, 255)).strong().size(12.5));
-                                                    ui.label(egui::RichText::new("Play / Pause").color(egui::Color32::LIGHT_GRAY).size(12.5));
+                                                    ui.label(egui::RichText::new("Tabs / Fullscreen Video").color(egui::Color32::LIGHT_GRAY).size(12.5));
                                                     ui.end_row();
 
                                                     ui.label(egui::RichText::new("Single Tap").color(egui::Color32::from_rgb(0, 220, 255)).strong().size(12.5));
-                                                    ui.label(egui::RichText::new("Toggle HUD / Cinema").color(egui::Color32::LIGHT_GRAY).size(12.5));
+                                                    ui.label(egui::RichText::new("Play / Pause").color(egui::Color32::LIGHT_GRAY).size(12.5));
+                                                    ui.end_row();
+
+                                                    ui.label(egui::RichText::new("Double Tap").color(egui::Color32::from_rgb(0, 220, 255)).strong().size(12.5));
+                                                    ui.label(egui::RichText::new("Toggle HUD Visibility").color(egui::Color32::LIGHT_GRAY).size(12.5));
+                                                    ui.end_row();
+
+                                                    ui.label(egui::RichText::new("2-Finger Tap").color(egui::Color32::from_rgb(0, 220, 255)).strong().size(12.5));
+                                                    ui.label(egui::RichText::new("Cycle Audio Track").color(egui::Color32::LIGHT_GRAY).size(12.5));
                                                     ui.end_row();
                                                 });
                                         });
