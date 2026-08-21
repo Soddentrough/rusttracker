@@ -5123,10 +5123,11 @@ impl VulkanEngine {
             }
 
             let is_portrait = ctx.viewport_rect().width() < ctx.viewport_rect().height();
-            if is_portrait && state.show_hud && state.video_mode != 3 {
+            if state.show_hud && state.video_mode != 3 {
                 let total_h = ctx.viewport_rect().height();
                 let min_h = 220.0f32;
                 let top_h = (total_h * state.panel_split_ratio).clamp(min_h, (total_h - min_h).max(min_h));
+                let top_margin = if is_portrait { 54 } else { 8 };
                 let panel_resp = egui::Panel::top("top_panel")
                     .resizable(false)
                     .frame(
@@ -5135,7 +5136,7 @@ impl VulkanEngine {
                             .inner_margin(egui::Margin {
                                 left: 16,
                                 right: 16,
-                                top: 54,
+                                top: top_margin,
                                 bottom: 8,
                             })
                     )
@@ -5783,7 +5784,7 @@ impl VulkanEngine {
                 out_top_panel_rect = Some(panel_resp.response.rect);
             }
 
-        if is_portrait && state.show_hud && state.video_mode != 3 {
+        if state.show_hud && state.video_mode != 3 {
             let total_height = ctx.content_rect().height();
             let total_width = ctx.content_rect().width();
             
