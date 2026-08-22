@@ -187,11 +187,15 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let local_y = (fire_rect_max.y - uv.y) / (fire_rect_max.y - fire_rect_min.y); // 0 at bottom, 1 at top
         
         let dist_behind = progress - local_x;
+        let fire_act = uniforms.fire_intensity;
         
         // Base backgrounds (charred vs unplayed fuse)
         if (local_x < progress) {
             if (abs(local_y - 0.1) < 0.02) {
-                out_color = vec4<f32>(1.0, 0.3, 0.0, 0.5); // Glowing fuse wire behind
+                // Hot glowing fuse when burning, dark charred wire when extinguished
+                let hot_wire = vec4<f32>(1.0, 0.3, 0.0, 0.5);
+                let cold_wire = vec4<f32>(0.2, 0.15, 0.15, 0.4);
+                out_color = mix(cold_wire, hot_wire, fire_act);
             } else {
                 out_color = vec4<f32>(0.0);
             }
@@ -205,7 +209,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         
         // Procedural Fire Overlay
         // Fire trails behind for 0.1, and leads ahead for 0.015
-        if (dist_behind > -0.015 && dist_behind < 0.1) {
+        if (fire_act > 0.001 && dist_behind > -0.015 && dist_behind < 0.1) {
             var intensity = 0.0;
             if (dist_behind >= 0.0) {
                 intensity = pow(1.0 - (dist_behind / 0.1), 2.0);
@@ -222,8 +226,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let n2 = fbm(vec2<f32>(px * 2.0 - t, py * 2.0 - t * 3.0));
             let noise_mask = (n1 * 0.7 + n2 * 0.3);
             
-            // Base heat comes from proximity to playhead + noise
-            var heat = intensity * noise_mask * 2.5;
+            // Base heat comes from proximity to playhead + noise + fire activity
+            var heat = intensity * noise_mask * 2.5 * fire_act;
             
             // Vertical falloff (flames go up)
             heat *= pow(1.0 - local_y, 1.5);
@@ -248,19 +252,19 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             // Alpha blend the fire over the background
             if (fire_color.a > 0.0) {
                 out_color = vec4<f32>(
-                    mix(out_color.rgb, fire_color.rgb, fire_color.a),
-                    min(out_color.a + fire_color.a, 1.0f)
+                    mix(out_color.rgb, fire_color.rgb, fire_color.a * fire_act),
+                    min(out_color.a + fire_color.a * fire_act, 1.0f)
                 );
             }
         }
         
         // Embers at the bottom, falling far behind
-        if (local_x < progress && local_y < 0.2) {
+        if (fire_act > 0.001 && local_x < progress && local_y < 0.2) {
             let px = local_x * 100.0;
             let static_seed = hash(vec2<f32>(floor(px), 0.0));
             if (static_seed > 0.85) {
                 let pulse = sin(uniforms.smooth_time * 4.0 + px * 0.5) * 0.5 + 0.5;
-                let brightness = ((static_seed - 0.85) / 0.15) * (0.3 + 0.7 * pulse);
+                let brightness = ((static_seed - 0.85) / 0.15) * (0.3 + 0.7 * pulse) * fire_act;
                 // Blend ember
                 let ember_color = vec4<f32>(1.0, 0.25 * brightness, 0.0, brightness);
                 out_color = vec4<f32>(

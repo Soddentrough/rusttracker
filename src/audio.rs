@@ -330,6 +330,54 @@ pub fn spawn_dsp_thread(
                     state.current_seconds = msg.current_seconds;
                 }
                 state.current_tracker_row_string = msg.current_row_string;
+
+                // --- Lookahead Timeline Extraction (600 slices: -1.0s past to +5.0s future) ---
+                if state.lookahead_timeline.len() != 600 * 8 {
+                    state.lookahead_timeline = vec![0.0; 600 * 8];
+                }
+                if !state.lookahead_queue.is_empty() {
+                    let cur_t = msg.current_seconds;
+                    let q_len = state.lookahead_queue.len();
+                    for k in 0..600 {
+                        let target_t = cur_t + (k as f64 - 100.0) * 0.01;
+                        let off = k * 8;
+                        
+                        let idx = match state.lookahead_queue.binary_search_by(|(t, _)| t.partial_cmp(&target_t).unwrap_or(std::cmp::Ordering::Equal)) {
+                            Ok(i) => i,
+                            Err(i) => i,
+                        };
+                        
+                        if idx == 0 {
+                            let (t0, d0) = state.lookahead_queue[0];
+                            if (t0 - target_t).abs() < 0.08 {
+                                state.lookahead_timeline[off..off + 8].copy_from_slice(&d0);
+                            } else {
+                                state.lookahead_timeline[off..off + 8].fill(0.0);
+                            }
+                        } else if idx >= q_len {
+                            let (t_last, d_last) = state.lookahead_queue[q_len - 1];
+                            if (t_last - target_t).abs() < 0.08 {
+                                state.lookahead_timeline[off..off + 8].copy_from_slice(&d_last);
+                            } else {
+                                state.lookahead_timeline[off..off + 8].fill(0.0);
+                            }
+                        } else {
+                            let (t0, d0) = state.lookahead_queue[idx - 1];
+                            let (t1, d1) = state.lookahead_queue[idx];
+                            let dt = t1 - t0;
+                            if dt > 0.0001 && (target_t - t0).abs() < 0.1 {
+                                let frac = ((target_t - t0) / dt).clamp(0.0, 1.0) as f32;
+                                for c in 0..8 {
+                                    state.lookahead_timeline[off + c] = d0[c] * (1.0 - frac) + d1[c] * frac;
+                                }
+                            } else if (t1 - target_t).abs() < 0.08 {
+                                state.lookahead_timeline[off..off + 8].copy_from_slice(&d1);
+                            } else {
+                                state.lookahead_timeline[off..off + 8].fill(0.0);
+                            }
+                        }
+                    }
+                }
                 
                 if state.current_tracker_order != msg.current_order || state.current_tracker_row != msg.current_row {
                     let cur_order = state.current_tracker_order;
@@ -384,6 +432,14 @@ pub trait AudioSource: Send {
     fn get_audio_tracks(&self) -> Vec<crate::state::AudioTrackInfo> { Vec::new() }
     fn get_selected_audio_track(&self) -> usize { 0 }
     fn select_audio_track(&mut self, _track_idx: usize) -> Result<()> { Ok(()) }
+    fn get_active_audio_tracks(&self) -> Vec<usize> { vec![self.get_selected_audio_track()] }
+    fn set_active_audio_tracks(&mut self, tracks: &[(usize, f32)]) -> Result<()> {
+        if let Some(&(idx, _)) = tracks.first() {
+            self.select_audio_track(idx)
+        } else {
+            Ok(())
+        }
+    }
     fn has_video_stream(&self) -> bool { false }
 }
 
@@ -826,12 +882,24 @@ impl AudioSource for MidiSource {
 // ---------------------------------------------------------
 // Symphonia Standard Audio Decoder
 // ---------------------------------------------------------
+struct ActiveSymphoniaTrack {
+    track_idx: usize,
+    #[allow(dead_code)]
+    track_id: u32,
+    decoder: Box<dyn Decoder>,
+    sample_buf: SampleBuffer<f32>,
+    samples: Vec<f32>,
+    buf_pos: usize,
+    volume: f32,
+    channels: u16,
+    time_base: f64,
+    current_time: f64,
+}
+
 struct SymphoniaSource {
     format: Box<dyn FormatReader>,
-    decoder: Box<dyn Decoder>,
-    track_id: u32,
-    sample_buf: SampleBuffer<f32>,
-    buf_pos: usize,
+    active_tracks: std::collections::HashMap<u32, ActiveSymphoniaTrack>,
+    primary_track_id: u32,
     time_base: f64,
     current_time: f64,
     duration: f64,
@@ -853,78 +921,104 @@ impl AudioSource for SymphoniaSource {
         self.channel_vus.fill(0.0);
 
         while frames_written < frames_needed {
-            if self.buf_pos >= self.sample_buf.len() {
-                match self.format.next_packet() {
-                    Ok(packet) => {
-                        if packet.track_id() != self.track_id { continue; }
-                        match self.decoder.decode(&packet) {
-                            Ok(decoded) => {
-                                if self.sample_buf.capacity() < decoded.capacity() {
-                                    self.sample_buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
-                                }
-                                self.sample_buf.copy_interleaved_ref(decoded);
-                                self.buf_pos = 0;
-                                self.current_time = packet.ts() as f64 * self.time_base;
-                            }
-                            Err(_) => break,
-                        }
-                    }
-                    Err(_) => break, // EOF
+            let mut need_more = false;
+            for track in self.active_tracks.values() {
+                let avail = (track.samples.len().saturating_sub(track.buf_pos)) / track.channels.max(1) as usize;
+                if avail < (frames_needed - frames_written) {
+                    need_more = true;
+                    break;
                 }
             }
 
-            let frames_available = (self.sample_buf.len() - self.buf_pos) / self.channels as usize;
-            if frames_available == 0 { break; }
-            let frames_to_copy = frames_available.min(frames_needed - frames_written);
-            let samples = self.sample_buf.samples();
+            if need_more {
+                for _ in 0..64 {
+                    let all_satisfied = self.active_tracks.values().all(|t| {
+                        let avail = (t.samples.len().saturating_sub(t.buf_pos)) / t.channels.max(1) as usize;
+                        avail >= (frames_needed - frames_written)
+                    });
+                    if all_satisfied {
+                        break;
+                    }
+
+                    match self.format.next_packet() {
+                        Ok(packet) => {
+                            let pkt_track_id = packet.track_id();
+                            if let Some(track) = self.active_tracks.get_mut(&pkt_track_id) {
+                                if let Ok(decoded) = track.decoder.decode(&packet) {
+                                    if track.sample_buf.capacity() < decoded.capacity() {
+                                        track.sample_buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
+                                    }
+                                    track.sample_buf.copy_interleaved_ref(decoded);
+                                    
+                                    if track.buf_pos > 4096 {
+                                        track.samples.drain(0..track.buf_pos);
+                                        track.buf_pos = 0;
+                                    }
+                                    track.samples.extend_from_slice(track.sample_buf.samples());
+                                }
+                            }
+                        }
+                        Err(_) => break, // EOF
+                    }
+                }
+            }
+
+            let mut min_available = usize::MAX;
+            for track in self.active_tracks.values() {
+                let avail = (track.samples.len().saturating_sub(track.buf_pos)) / track.channels.max(1) as usize;
+                min_available = min_available.min(avail);
+            }
+
+            if min_available == 0 || min_available == usize::MAX {
+                if let Some(primary) = self.active_tracks.get(&self.primary_track_id) {
+                    let avail = (primary.samples.len().saturating_sub(primary.buf_pos)) / primary.channels.max(1) as usize;
+                    if avail == 0 { break; }
+                    min_available = avail;
+                } else {
+                    break;
+                }
+            }
+
+            let frames_to_copy = min_available.min(frames_needed - frames_written);
+            if frames_to_copy == 0 { break; }
+
+            let active_count = self.active_tracks.values().filter(|t| t.volume > 0.0).count().max(1) as f32;
+            let headroom = 1.0 / active_count.sqrt();
 
             for i in 0..frames_to_copy {
-                let base_idx = self.buf_pos + i * self.channels as usize;
-                
-                // Track VUs for all native channels
-                for c in 0..self.channels as usize {
-                    let val = samples[base_idx + c];
-                    self.channel_vus[c] = self.channel_vus[c].max(val.abs());
-                }
-                
-                // Matrix Downmix / Remap to hardware_channels
                 let out_base = (frames_written + i) * hardware_channels;
-                
-                if self.channels as usize == hardware_channels {
-                    // Direct copy
-                    for c in 0..hardware_channels {
-                        output[out_base + c] = samples[base_idx + c];
-                    }
-                } else if hardware_channels == 2 && self.channels > 2 {
-                    // Downmix to Stereo
-                    // Assuming Ch0=L, Ch1=R, Ch2=C, Ch3=LFE, Ch4=Ls, Ch5=Rs
-                    let l = samples[base_idx];
-                    let r = samples[base_idx + 1];
-                    let c = if self.channels > 2 { samples[base_idx + 2] } else { 0.0 };
-                    
-                    let mut l_surround = 0.0;
-                    let mut r_surround = 0.0;
-                    if self.channels >= 6 {
-                        l_surround = samples[base_idx + 4];
-                        r_surround = samples[base_idx + 5];
-                    }
-                    
-                    // LFE usually discarded in 2.0 downmix
-                    output[out_base] = (l + c * 0.707 + l_surround * 0.707).clamp(-1.0, 1.0);
-                    output[out_base + 1] = (r + c * 0.707 + r_surround * 0.707).clamp(-1.0, 1.0);
-                } else {
-                    // Generic fallback (copy what we can, zero the rest)
-                    for c in 0..hardware_channels {
-                        if c < self.channels as usize {
-                            output[out_base + c] = samples[base_idx + c];
-                        } else {
-                            output[out_base + c] = 0.0;
+                for c in 0..hardware_channels {
+                    let mut sum_val = 0.0f32;
+                    for track in self.active_tracks.values() {
+                        if track.volume > 0.0 {
+                            let base_idx = track.buf_pos + i * track.channels as usize;
+                            let s_val = if c < track.channels as usize {
+                                track.samples.get(base_idx + c).copied().unwrap_or(0.0)
+                            } else if track.channels == 1 {
+                                track.samples.get(base_idx).copied().unwrap_or(0.0)
+                            } else {
+                                0.0
+                            };
+                            sum_val += s_val * track.volume;
                         }
+                    }
+                    let final_val = (sum_val * headroom).clamp(-1.0, 1.0);
+                    output[out_base + c] = final_val;
+                    if c < self.channel_vus.len() {
+                        self.channel_vus[c] = self.channel_vus[c].max(final_val.abs());
                     }
                 }
             }
-            
-            self.buf_pos += frames_to_copy * self.channels as usize;
+
+            for track in self.active_tracks.values_mut() {
+                let avail = (track.samples.len().saturating_sub(track.buf_pos)) / track.channels.max(1) as usize;
+                let consume = frames_to_copy.min(avail);
+                track.buf_pos += consume * track.channels as usize;
+                track.current_time += consume as f64 / self.intrinsic_sample_rate.unwrap_or(44100) as f64;
+            }
+            if let Some(primary) = self.active_tracks.get(&self.primary_track_id) {
+                self.current_time = primary.current_time;
+            }
             frames_written += frames_to_copy;
         }
 
@@ -940,33 +1034,40 @@ impl AudioSource for SymphoniaSource {
             symphonia::core::formats::SeekMode::Coarse,
             symphonia::core::formats::SeekTo::TimeStamp {
                 ts,
-                track_id: self.track_id,
+                track_id: self.primary_track_id,
             }
         );
         
         if seek_res.is_ok() {
-            self.decoder.reset();
+            for track in self.active_tracks.values_mut() {
+                track.decoder.reset();
+                track.current_time = pos;
+                track.samples.clear();
+                track.buf_pos = 0;
+            }
             self.current_time = pos;
-            self.buf_pos = self.sample_buf.len(); // drain buffer
         } else {
-            // If TimeStamp seek fails, fallback to Time seek just in case
-            if let Ok(_) = self.format.seek(
+            let seek_res_start = self.format.seek(
                 symphonia::core::formats::SeekMode::Coarse,
-                symphonia::core::formats::SeekTo::Time {
-                    time: symphonia::core::units::Time::from(pos),
-                    track_id: Some(self.track_id),
+                symphonia::core::formats::SeekTo::TimeStamp {
+                    ts: 0,
+                    track_id: self.primary_track_id,
                 }
-            ) {
-                self.decoder.reset();
+            );
+            if seek_res_start.is_ok() {
+                for track in self.active_tracks.values_mut() {
+                    track.decoder.reset();
+                    track.current_time = pos;
+                    track.samples.clear();
+                    track.buf_pos = 0;
+                }
                 self.current_time = pos;
-                self.buf_pos = self.sample_buf.len();
             }
         }
     }
     
     fn get_num_channels(&mut self) -> i32 { self.channels as i32 }
     fn get_current_channel_vu_mono(&mut self, channel: i32) -> f32 { self.channel_vus.get(channel as usize).cloned().unwrap_or(0.0) }
-    fn get_artist(&mut self) -> String { self.artist.clone() }
     fn get_type(&mut self) -> String { self.ext_type.clone() }
     fn get_tempo(&mut self) -> i32 { 0 }
     fn get_speed(&mut self) -> i32 { 0 }
@@ -976,44 +1077,51 @@ impl AudioSource for SymphoniaSource {
     fn get_num_patterns(&mut self) -> i32 { 0 }
     fn get_current_order(&mut self) -> i32 { 0 }
     fn get_current_row(&mut self) -> i32 { 0 }
-
+    fn get_tracker_channels(&mut self) -> Option<i32> { None }
+    fn pre_format_tracker_data(&mut self) -> Vec<Vec<String>> { Vec::new() }
+    fn get_current_row_string(&mut self) -> String { String::new() }
+    fn get_artist(&mut self) -> String { self.artist.clone() }
     fn get_video_info(&mut self) -> Option<String> { self.video_info.clone() }
 
     fn get_audio_tracks(&self) -> Vec<crate::state::AudioTrackInfo> { self.audio_tracks.clone() }
     fn get_selected_audio_track(&self) -> usize { self.selected_track_idx }
-    fn select_audio_track(&mut self, track_idx: usize) -> Result<()> {
-        if track_idx >= self.audio_tracks.len() {
-            return Err(anyhow::anyhow!("Track index out of range: {}", track_idx));
-        }
-        let target_track_id = self.audio_tracks[track_idx].id as u32;
-        if target_track_id == self.track_id && track_idx == self.selected_track_idx {
+    
+    fn get_active_audio_tracks(&self) -> Vec<usize> {
+        let mut list: Vec<usize> = self.active_tracks.values()
+            .filter(|t| t.volume > 0.0)
+            .map(|t| t.track_idx)
+            .collect();
+        list.sort();
+        if list.is_empty() { vec![self.selected_track_idx] } else { list }
+    }
+
+    fn set_active_audio_tracks(&mut self, tracks: &[(usize, f32)]) -> Result<()> {
+        if tracks.is_empty() {
             return Ok(());
         }
-        let track = self.format.tracks().iter().find(|t| t.id == target_track_id).context("Track not found")?.clone();
-        let decoder = symphonia::default::get_codecs()
-            .make(&track.codec_params, &DecoderOptions::default())
-            .context("Unsupported codec for track")?;
 
-        let sym_channels = track.codec_params.channels.unwrap_or(symphonia::core::audio::Channels::FRONT_LEFT | symphonia::core::audio::Channels::FRONT_RIGHT);
-        let channels = sym_channels.count() as u16;
-        let time_base = track.codec_params.time_base.map(|t| t.calc_time(1).seconds as f64 + t.calc_time(1).frac).unwrap_or(1.0 / 44100.0);
-        let duration = track.codec_params.n_frames.map(|n| n as f64 * time_base).unwrap_or(0.0);
-        let intrinsic_sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
+        let track_map: std::collections::HashMap<usize, f32> = tracks.iter().copied().collect();
+        for track in self.active_tracks.values_mut() {
+            track.volume = track_map.get(&track.track_idx).copied().unwrap_or(0.0);
+        }
 
-        self.decoder = decoder;
-        self.track_id = target_track_id;
-        self.selected_track_idx = track_idx;
-        self.sample_buf = SampleBuffer::<f32>::new(0, symphonia::core::audio::SignalSpec::new(intrinsic_sample_rate, sym_channels));
-        self.buf_pos = 0;
-        self.time_base = time_base;
-        self.duration = duration;
-        self.channels = channels;
-        self.channel_vus = vec![0.0; channels as usize];
-        self.ext_type = self.audio_tracks[track_idx].codec.clone();
-        self.intrinsic_sample_rate = Some(intrinsic_sample_rate);
-
-        self.set_position_seconds(self.current_time);
+        if let Some(&(first_idx, _)) = tracks.first() {
+            if first_idx < self.audio_tracks.len() {
+                self.selected_track_idx = first_idx;
+                self.primary_track_id = self.audio_tracks[first_idx].id as u32;
+                self.ext_type = self.audio_tracks[first_idx].codec.clone();
+                self.channels = self.audio_tracks[first_idx].channels;
+                self.intrinsic_sample_rate = Some(self.audio_tracks[first_idx].sample_rate);
+                if let Some(t) = self.active_tracks.get(&self.primary_track_id) {
+                    self.time_base = t.time_base;
+                }
+            }
+        }
         Ok(())
+    }
+
+    fn select_audio_track(&mut self, track_idx: usize) -> Result<()> {
+        self.set_active_audio_tracks(&[(track_idx, 1.0)])
     }
 
     fn has_video_stream(&self) -> bool {
@@ -1025,14 +1133,26 @@ impl AudioSource for SymphoniaSource {
 // FFmpeg Native Decoder
 // ---------------------------------------------------------
 #[cfg(not(target_os = "android"))]
-struct FfmpegSource {
-    ictx: ffmpeg_next::format::context::Input,
-    decoder: ffmpeg_next::decoder::Audio,
+struct ActiveFfmpegTrack {
+    track_idx: usize,
+    #[allow(dead_code)]
     stream_index: usize,
+    decoder: ffmpeg_next::decoder::Audio,
     resampler: ffmpeg_next::software::resampling::Context,
-    
     sample_buf: Vec<f32>,
     buf_pos: usize,
+    volume: f32,
+    channels: u16,
+    time_base: f64,
+    current_time: f64,
+    seek_in_progress: bool,
+}
+
+#[cfg(not(target_os = "android"))]
+struct FfmpegSource {
+    ictx: ffmpeg_next::format::context::Input,
+    active_tracks: std::collections::HashMap<usize, ActiveFfmpegTrack>,
+    primary_stream_index: usize,
     
     channels: u16,
     time_base: f64,
@@ -1052,91 +1172,142 @@ struct FfmpegSource {
     audio_tracks: Vec<crate::state::AudioTrackInfo>,
     selected_track_idx: usize,
     output_sample_rate: u32,
+    is_eof: bool,
+    target_seek_time: Option<f64>,
 }
 
 #[cfg(not(target_os = "android"))]
 impl FfmpegSource {
-    fn get_next_frame(&mut self) -> bool {
-        let mut decoded = ffmpeg_next::frame::Audio::empty();
-        
-        // 1. Try to receive a frame from already-buffered packets
-        if self.decoder.receive_frame(&mut decoded).is_ok() {
-            let mut resampled = ffmpeg_next::frame::Audio::empty();
-            match self.resampler.run(&decoded, &mut resampled) {
-                Ok(_) => {
+    fn fill_buffers(&mut self) -> bool {
+        let mut progress = false;
+        let target_pos_opt = self.target_seek_time;
+
+        // 1. Drain any packets currently in the decoders
+        for track in self.active_tracks.values_mut() {
+            let mut decoded = ffmpeg_next::frame::Audio::empty();
+            while track.decoder.receive_frame(&mut decoded).is_ok() {
+                let mut resampled = ffmpeg_next::frame::Audio::empty();
+                if track.resampler.run(&decoded, &mut resampled).is_ok() {
                     let data = resampled.plane::<f32>(0);
                     let actual_len = resampled.samples() * resampled.channels() as usize;
                     let actual_data = unsafe { std::slice::from_raw_parts(data.as_ptr(), actual_len) };
-                    
-                    self.sample_buf.clear();
-                    self.sample_buf.extend_from_slice(actual_data);
-                    self.buf_pos = 0;
-                    return true;
-                }
-                Err(_) => {
-                    // Recreate resampler if input format/layout changed mid-stream
-                    if let Ok(new_resampler) = ffmpeg_next::software::resampling::context::Context::get(
-                        decoded.format(),
-                        decoded.channel_layout(),
-                        decoded.rate(),
-                        ffmpeg_next::format::sample::Sample::F32(ffmpeg_next::format::sample::Type::Packed),
-                        self.resampler.output().channel_layout,
-                        self.resampler.output().rate,
-                    ) {
-                        self.resampler = new_resampler;
+                    if track.buf_pos > 4096 {
+                        track.sample_buf.drain(0..track.buf_pos);
+                        track.buf_pos = 0;
+                    }
+                    if let Some(target_pos) = target_pos_opt {
+                        let actual_frames = actual_len / track.channels.max(1) as usize;
+                        let frame_dur = actual_frames as f64 / self.output_sample_rate as f64;
+                        if track.current_time + frame_dur <= target_pos {
+                            track.current_time += frame_dur;
+                        } else if track.current_time < target_pos {
+                            let skip_sec = target_pos - track.current_time;
+                            let skip_frames = (skip_sec * self.output_sample_rate as f64).round() as usize;
+                            let skip_samples = (skip_frames * track.channels as usize).min(actual_len);
+                            track.sample_buf.extend_from_slice(&actual_data[skip_samples..]);
+                            track.current_time = target_pos + (actual_frames - skip_frames) as f64 / self.output_sample_rate as f64;
+                            progress = true;
+                        } else {
+                            track.sample_buf.extend_from_slice(actual_data);
+                            track.current_time += frame_dur;
+                            progress = true;
+                        }
+                    } else {
+                        track.sample_buf.extend_from_slice(actual_data);
+                        progress = true;
                     }
                 }
             }
         }
-        
-        // 2. Decoder needs more data, read packets
-        for (stream, packet) in self.ictx.packets() {
-            if Some(stream.index()) == self.video_stream_index {
-                if let Some(tx) = &self.video_tx {
-                    let _ = tx.try_send((self.video_epoch, packet.clone()));
+
+        // 2. Read packets from container if any track still needs data
+        let mut need_packets = false;
+        for track in self.active_tracks.values() {
+            let avail = (track.sample_buf.len().saturating_sub(track.buf_pos)) / track.channels.max(1) as usize;
+            if avail < 1024 {
+                need_packets = true;
+                break;
+            }
+        }
+
+        if need_packets && !self.is_eof {
+            for _ in 0..512 {
+                let all_satisfied = self.active_tracks.values().all(|t| {
+                    let avail = (t.sample_buf.len().saturating_sub(t.buf_pos)) / t.channels.max(1) as usize;
+                    avail >= 1024
+                });
+                if all_satisfied {
+                    break;
                 }
-            } else if stream.index() == self.stream_index {
-                // Send the packet to the decoder
-                if let Err(_e) = self.decoder.send_packet(&packet) {
-                    // Packet might be rejected if decoder is full, but we just drained it above.
-                    // Or it could be a decode error. We continue to see if we can receive.
-                }
-                
-                // Now try to receive a frame
-                if self.decoder.receive_frame(&mut decoded).is_ok() {
-                    let mut resampled = ffmpeg_next::frame::Audio::empty();
-                    match self.resampler.run(&decoded, &mut resampled) {
-                        Ok(_) => {
-                            let data = resampled.plane::<f32>(0);
-                            let actual_len = resampled.samples() * resampled.channels() as usize;
-                            let actual_data = unsafe { std::slice::from_raw_parts(data.as_ptr(), actual_len) };
-                            
-                            self.sample_buf.clear();
-                            self.sample_buf.extend_from_slice(actual_data);
-                            self.buf_pos = 0;
-                            if let Some(pts) = packet.pts() {
-                                self.current_time = pts as f64 * self.time_base;
-                            }
-                            return true;
+
+                let mut any_packet = false;
+                for (stream, packet) in self.ictx.packets() {
+                    any_packet = true;
+                    let s_idx = stream.index();
+                    if Some(s_idx) == self.video_stream_index {
+                        if let Some(tx) = &self.video_tx {
+                            let _ = tx.try_send((self.video_epoch, packet.clone()));
                         }
-                        Err(_) => {
-                            if let Ok(new_resampler) = ffmpeg_next::software::resampling::context::Context::get(
-                                decoded.format(),
-                                decoded.channel_layout(),
-                                decoded.rate(),
-                                ffmpeg_next::format::sample::Sample::F32(ffmpeg_next::format::sample::Type::Packed),
-                                self.resampler.output().channel_layout,
-                                self.resampler.output().rate,
-                            ) {
-                                self.resampler = new_resampler;
+                    } else if let Some(track) = self.active_tracks.get_mut(&s_idx) {
+                        if track.seek_in_progress {
+                            if let Some(pkt_pts) = packet.pts() {
+                                track.current_time = pkt_pts as f64 * track.time_base;
+                                track.seek_in_progress = false;
+                            }
+                        }
+                        let _ = track.decoder.send_packet(&packet);
+                        let mut decoded = ffmpeg_next::frame::Audio::empty();
+                        while track.decoder.receive_frame(&mut decoded).is_ok() {
+                            let mut resampled = ffmpeg_next::frame::Audio::empty();
+                            if track.resampler.run(&decoded, &mut resampled).is_ok() {
+                                let data = resampled.plane::<f32>(0);
+                                let actual_len = resampled.samples() * resampled.channels() as usize;
+                                let actual_data = unsafe { std::slice::from_raw_parts(data.as_ptr(), actual_len) };
+                                if track.buf_pos > 4096 {
+                                    track.sample_buf.drain(0..track.buf_pos);
+                                    track.buf_pos = 0;
+                                }
+                                if let Some(target_pos) = self.target_seek_time {
+                                    let actual_frames = actual_len / track.channels.max(1) as usize;
+                                    let frame_dur = actual_frames as f64 / self.output_sample_rate as f64;
+                                    if track.current_time + frame_dur <= target_pos {
+                                        track.current_time += frame_dur;
+                                    } else if track.current_time < target_pos {
+                                        let skip_sec = target_pos - track.current_time;
+                                        let skip_frames = (skip_sec * self.output_sample_rate as f64).round() as usize;
+                                        let skip_samples = (skip_frames * track.channels as usize).min(actual_len);
+                                        track.sample_buf.extend_from_slice(&actual_data[skip_samples..]);
+                                        track.current_time = target_pos + (actual_frames - skip_frames) as f64 / self.output_sample_rate as f64;
+                                        progress = true;
+                                    } else {
+                                        track.sample_buf.extend_from_slice(actual_data);
+                                        track.current_time += frame_dur;
+                                        progress = true;
+                                    }
+                                } else {
+                                    track.sample_buf.extend_from_slice(actual_data);
+                                    progress = true;
+                                }
                             }
                         }
                     }
+                    break;
+                }
+                if !any_packet {
+                    self.is_eof = true;
+                    break;
                 }
             }
         }
-        
-        false
+
+        if let Some(target_pos) = self.target_seek_time {
+            let all_reached = self.active_tracks.values().all(|t| !t.seek_in_progress && t.current_time >= target_pos);
+            if all_reached {
+                self.target_seek_time = None;
+            }
+        }
+
+        progress
     }
 }
 
@@ -1151,61 +1322,73 @@ impl AudioSource for FfmpegSource {
         self.channel_vus.fill(0.0);
 
         while frames_written < frames_needed {
-            let frames_available = (self.sample_buf.len() - self.buf_pos) / self.channels as usize;
-            
-            if frames_available == 0 {
-                if !self.get_next_frame() {
-                    break;
-                }
-                continue;
+            let mut min_available = usize::MAX;
+            for track in self.active_tracks.values() {
+                let avail = (track.sample_buf.len().saturating_sub(track.buf_pos)) / track.channels.max(1) as usize;
+                min_available = min_available.min(avail);
             }
 
-            let frames_to_copy = std::cmp::min(frames_needed - frames_written, frames_available);
+            if min_available == 0 || min_available == usize::MAX {
+                if !self.fill_buffers() {
+                    if let Some(primary) = self.active_tracks.get(&self.primary_stream_index) {
+                        let avail = (primary.sample_buf.len().saturating_sub(primary.buf_pos)) / primary.channels.max(1) as usize;
+                        if avail == 0 {
+                            if self.is_eof {
+                                break;
+                            }
+                            // Try filling one more batch before giving up
+                            if !self.fill_buffers() {
+                                break;
+                            }
+                            continue;
+                        }
+                        min_available = avail;
+                    } else {
+                        break;
+                    }
+                } else {
+                    continue;
+                }
+            }
 
-            let out_base = frames_written * hardware_channels;
-            let in_base = self.buf_pos;
+            let frames_to_copy = min_available.min(frames_needed - frames_written);
+            if frames_to_copy == 0 { break; }            let active_count = self.active_tracks.values().filter(|t| t.volume > 0.0).count().max(1) as f32;
+            let headroom = 1.0 / active_count.sqrt();
 
             for f in 0..frames_to_copy {
-                let out_idx = out_base + f * hardware_channels;
-                let in_idx = in_base + f * self.channels as usize;
-
-                // Track VUs
-                for c in 0..self.channels as usize {
-                    let val = self.sample_buf[in_idx + c];
-                    if val.abs() > self.channel_vus[c] {
-                        self.channel_vus[c] = val.abs();
-                    }
-                }
-
-                if self.channels as usize == hardware_channels {
-                    for c in 0..hardware_channels {
-                        output[out_idx + c] = self.sample_buf[in_idx + c];
-                    }
-                } else if hardware_channels == 2 && self.channels >= 6 {
-                    // Downmix 5.1/7.1 to stereo
-                    let l = self.sample_buf[in_idx];
-                    let r = self.sample_buf[in_idx + 1];
-                    let c = self.sample_buf[in_idx + 2];
-                    
-                    let l_surround = self.sample_buf[in_idx + 4];
-                    let r_surround = self.sample_buf[in_idx + 5];
-                    
-                    // Normalize by 1.5 to prevent hard clipping when summing loud correlated channels
-                    output[out_idx] = ((l + c * 0.707 + l_surround * 0.707) / 1.5).clamp(-1.0, 1.0);
-                    output[out_idx + 1] = ((r + c * 0.707 + r_surround * 0.707) / 1.5).clamp(-1.0, 1.0);
-                } else {
-                    // Fallback generic mapping
-                    for c in 0..hardware_channels {
-                        if c < self.channels as usize {
-                            output[out_idx + c] = self.sample_buf[in_idx + c];
-                        } else {
-                            output[out_idx + c] = 0.0;
+                let out_idx = (frames_written + f) * hardware_channels;
+                for c in 0..hardware_channels {
+                    let mut sum_val = 0.0f32;
+                    for track in self.active_tracks.values() {
+                        if track.volume > 0.0 {
+                            let in_idx = track.buf_pos + f * track.channels as usize;
+                            let s_val = if c < track.channels as usize {
+                                track.sample_buf.get(in_idx + c).copied().unwrap_or(0.0)
+                            } else if track.channels == 1 {
+                                track.sample_buf.get(in_idx).copied().unwrap_or(0.0)
+                            } else {
+                                0.0
+                            };
+                            sum_val += s_val * track.volume;
                         }
+                    }
+                    let out_val = (sum_val * headroom).clamp(-1.0, 1.0);
+                    output[out_idx + c] = out_val;
+                    if c < self.channel_vus.len() {
+                        self.channel_vus[c] = self.channel_vus[c].max(out_val.abs());
                     }
                 }
             }
-            
-            self.buf_pos += frames_to_copy * self.channels as usize;
+
+            for track in self.active_tracks.values_mut() {
+                let avail = (track.sample_buf.len().saturating_sub(track.buf_pos)) / track.channels.max(1) as usize;
+                let consume = frames_to_copy.min(avail);
+                track.buf_pos += consume * track.channels as usize;
+                track.current_time += consume as f64 / self.output_sample_rate as f64;
+            }
+            if let Some(primary) = self.active_tracks.get(&self.primary_stream_index) {
+                self.current_time = primary.current_time;
+            }
             frames_written += frames_to_copy;
         }
 
@@ -1216,23 +1399,41 @@ impl AudioSource for FfmpegSource {
     fn get_position_seconds(&mut self) -> f64 { self.current_time }
     
     fn set_position_seconds(&mut self, pos: f64) {
+        self.is_eof = false;
         let (stream_idx, pts) = if let (Some(v_idx), Some(tb)) = (self.video_stream_index, self.video_time_base) {
             let tb_f64 = tb.numerator() as f64 / tb.denominator() as f64;
             (v_idx as i32, (pos / tb_f64) as i64)
         } else {
-            (self.stream_index as i32, (pos / self.time_base) as i64)
+            (-1, (pos * ffmpeg_next::ffi::AV_TIME_BASE as f64).max(0.0) as i64)
         };
         
-        unsafe {
+        let ret = unsafe {
             ffmpeg_next::ffi::av_seek_frame(
                 self.ictx.as_mut_ptr(),
                 stream_idx,
                 pts,
-                ffmpeg_next::ffi::AVSEEK_FLAG_BACKWARD
-            );
+                ffmpeg_next::ffi::AVSEEK_FLAG_BACKWARD,
+            )
+        };
+        if ret < 0 && stream_idx != -1 {
+            let fallback_pts = (pos * ffmpeg_next::ffi::AV_TIME_BASE as f64).max(0.0) as i64;
+            unsafe {
+                ffmpeg_next::ffi::av_seek_frame(
+                    self.ictx.as_mut_ptr(),
+                    -1,
+                    fallback_pts,
+                    ffmpeg_next::ffi::AVSEEK_FLAG_BACKWARD,
+                );
+            }
         }
-        self.decoder.flush();
-        self.buf_pos = self.sample_buf.len();
+        self.target_seek_time = Some(pos);
+        for track in self.active_tracks.values_mut() {
+            track.decoder.flush();
+            track.sample_buf.clear();
+            track.buf_pos = 0;
+            track.current_time = 0.0;
+            track.seek_in_progress = true;
+        }
         self.current_time = pos;
         self.video_epoch += 1;
     }
@@ -1240,16 +1441,6 @@ impl AudioSource for FfmpegSource {
     fn get_num_channels(&mut self) -> i32 { self.channels as i32 }
     fn get_current_channel_vu_mono(&mut self, channel: i32) -> f32 { self.channel_vus.get(channel as usize).cloned().unwrap_or(0.0) }
     fn get_artist(&mut self) -> String {
-        if let Some(stream_title) = self.ictx.metadata().get("StreamTitle") {
-            if !stream_title.is_empty() {
-                return stream_title.to_string();
-            }
-        }
-        if let Some(icy_name) = self.ictx.metadata().get("icy-name") {
-            if !icy_name.is_empty() {
-                return icy_name.to_string();
-            }
-        }
         self.artist.clone()
     }
     fn get_type(&mut self) -> String { self.ext_type.clone() }
@@ -1261,7 +1452,9 @@ impl AudioSource for FfmpegSource {
     fn get_num_patterns(&mut self) -> i32 { 0 }
     fn get_current_order(&mut self) -> i32 { 0 }
     fn get_current_row(&mut self) -> i32 { 0 }
-
+    fn get_tracker_channels(&mut self) -> Option<i32> { None }
+    fn pre_format_tracker_data(&mut self) -> Vec<Vec<String>> { Vec::new() }
+    fn get_current_row_string(&mut self) -> String { String::new() }
     fn get_video_info(&mut self) -> Option<String> { self.video_info.clone() }
     
     fn get_bitrate(&mut self) -> Option<u32> {
@@ -1293,47 +1486,42 @@ impl AudioSource for FfmpegSource {
 
     fn get_audio_tracks(&self) -> Vec<crate::state::AudioTrackInfo> { self.audio_tracks.clone() }
     fn get_selected_audio_track(&self) -> usize { self.selected_track_idx }
-    fn select_audio_track(&mut self, track_idx: usize) -> Result<()> {
-        if track_idx >= self.audio_tracks.len() {
-            return Err(anyhow::anyhow!("Track index out of range: {}", track_idx));
+
+    fn get_active_audio_tracks(&self) -> Vec<usize> {
+        let mut list: Vec<usize> = self.active_tracks.values()
+            .filter(|t| t.volume > 0.0)
+            .map(|t| t.track_idx)
+            .collect();
+        list.sort();
+        if list.is_empty() { vec![self.selected_track_idx] } else { list }
+    }
+
+    fn set_active_audio_tracks(&mut self, tracks: &[(usize, f32)]) -> Result<()> {
+        if tracks.is_empty() { return Ok(()); }
+
+        let track_map: std::collections::HashMap<usize, f32> = tracks.iter().copied().collect();
+        for track in self.active_tracks.values_mut() {
+            track.volume = track_map.get(&track.track_idx).copied().unwrap_or(0.0);
         }
-        let target_stream_index = self.audio_tracks[track_idx].id;
-        if target_stream_index == self.stream_index && track_idx == self.selected_track_idx {
-            return Ok(());
+
+        if let Some(&(first_idx, _)) = tracks.first() {
+            if first_idx < self.audio_tracks.len() {
+                self.selected_track_idx = first_idx;
+                self.primary_stream_index = self.audio_tracks[first_idx].id;
+                self.channels = self.audio_tracks[first_idx].channels;
+                self.time_base = self.ictx.stream(self.primary_stream_index).map(|s| {
+                    let tb = s.time_base();
+                    tb.numerator() as f64 / tb.denominator() as f64
+                }).unwrap_or(1.0 / 44100.0);
+                self.ext_type = self.audio_tracks[first_idx].codec.clone();
+                self.channel_vus = vec![0.0; self.channels as usize];
+            }
         }
-
-        let stream = self.ictx.stream(target_stream_index).context("Target stream not found in container")?;
-        let context = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())?;
-        let decoder = context.decoder().audio()?;
-
-        let channels = decoder.channels() as u16;
-        let sample_rate = decoder.rate();
-        let time_base = stream.time_base();
-        let tb = time_base.numerator() as f64 / time_base.denominator() as f64;
-
-        let out_rate = if self.output_sample_rate > 0 { self.output_sample_rate } else { sample_rate };
-        let resampler = ffmpeg_next::software::resampling::context::Context::get(
-            decoder.format(),
-            decoder.channel_layout(),
-            decoder.rate(),
-            ffmpeg_next::format::sample::Sample::F32(ffmpeg_next::format::sample::Type::Packed),
-            decoder.channel_layout(),
-            out_rate,
-        ).context("Failed to create resampler for switched audio track")?;
-
-        self.decoder = decoder;
-        self.resampler = resampler;
-        self.stream_index = target_stream_index;
-        self.selected_track_idx = track_idx;
-        self.channels = channels;
-        self.time_base = tb;
-        self.intrinsic_sample_rate = sample_rate;
-        self.channel_vus = vec![0.0; channels as usize];
-        self.ext_type = self.audio_tracks[track_idx].codec.clone();
-
-        // Seek back to current playback position so new track starts immediately from current timestamp
-        self.set_position_seconds(self.current_time);
         Ok(())
+    }
+
+    fn select_audio_track(&mut self, track_idx: usize) -> Result<()> {
+        self.set_active_audio_tracks(&[(track_idx, 1.0)])
     }
 
     fn has_video_stream(&self) -> bool {
@@ -1625,32 +1813,54 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
     };
 
     let stream = ictx.stream(stream_index).context("Audio stream not found")?;
-    let context = ffmpeg_next::codec::context::Context::from_parameters(stream.parameters())?;
-    let decoder = context.decoder().audio()?;
-    
-    let channels = decoder.channels() as u16;
-    let sample_rate = decoder.rate();
+    let channels = audio_tracks.get(selected_track_idx).map(|t| t.channels).unwrap_or(2);
+    let sample_rate = audio_tracks.get(selected_track_idx).map(|t| t.sample_rate).unwrap_or(48000);
     let time_base = stream.time_base();
     let tb = time_base.numerator() as f64 / time_base.denominator() as f64;
-    
-    let resampler = ffmpeg_next::software::resampling::context::Context::get(
-        decoder.format(),
-        decoder.channel_layout(),
-        decoder.rate(),
-        ffmpeg_next::format::sample::Sample::F32(ffmpeg_next::format::sample::Type::Packed),
-        decoder.channel_layout(),
-        decoder.rate(),
-    ).context("Failed to create resampler")?;
 
     let initial_artist = ictx.metadata().get("artist").map(|s| s.to_string()).unwrap_or_else(|| "Unknown".to_string());
 
+    let mut active_tracks = std::collections::HashMap::new();
+    for (t_idx, track_info) in audio_tracks.iter().enumerate() {
+        if let Some(st) = ictx.stream(track_info.id) {
+            if let Ok(ctx) = ffmpeg_next::codec::context::Context::from_parameters(st.parameters()) {
+                if let Ok(dec) = ctx.decoder().audio() {
+                    let ch = dec.channels() as u16;
+                    let sr = dec.rate();
+                    if let Ok(resamp) = ffmpeg_next::software::resampling::context::Context::get(
+                        dec.format(),
+                        dec.channel_layout(),
+                        dec.rate(),
+                        ffmpeg_next::format::sample::Sample::F32(ffmpeg_next::format::sample::Type::Packed),
+                        dec.channel_layout(),
+                        sr,
+                    ) {
+                        let vol = if t_idx == selected_track_idx { 1.0 } else { 0.0 };
+                        let track_st_tb = st.time_base();
+                        let track_tb_f64 = track_st_tb.numerator() as f64 / track_st_tb.denominator() as f64;
+                        active_tracks.insert(track_info.id, ActiveFfmpegTrack {
+                            track_idx: t_idx,
+                            stream_index: track_info.id,
+                            decoder: dec,
+                            resampler: resamp,
+                            sample_buf: Vec::new(),
+                            buf_pos: 0,
+                            volume: vol,
+                            channels: ch,
+                            time_base: track_tb_f64,
+                            current_time: 0.0,
+                            seek_in_progress: false,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
     Ok(Box::new(FfmpegSource {
         ictx,
-        decoder,
-        stream_index,
-        resampler,
-        sample_buf: Vec::new(),
-        buf_pos: 0,
+        active_tracks,
+        primary_stream_index: stream_index,
         channels,
         time_base: tb,
         current_time: 0.0,
@@ -1668,6 +1878,8 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
         audio_tracks,
         selected_track_idx,
         output_sample_rate: sample_rate,
+        is_eof: false,
+        target_seek_time: None,
     }))
 }
 
@@ -1795,23 +2007,41 @@ fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(
 
     let track = selected_track.context("No supported audio track found")?;
     let track_id = track.id;
-    let decoder = symphonia::default::get_codecs()
-        .make(&track.codec_params, &DecoderOptions::default())
-        .context("Unsupported codec")?;
-
     let sym_channels = track.codec_params.channels.unwrap_or(symphonia::core::audio::Channels::FRONT_LEFT | symphonia::core::audio::Channels::FRONT_RIGHT);
     let channels = sym_channels.count() as u16;
+    let intrinsic_sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
     let time_base = track.codec_params.time_base.map(|t| t.calc_time(1).seconds as f64 + t.calc_time(1).frac).unwrap_or(1.0 / 44100.0);
     let duration = track.codec_params.n_frames.map(|n| n as f64 * time_base).unwrap_or(0.0);
 
-    let intrinsic_sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
+    let mut active_tracks = std::collections::HashMap::new();
+    for (t_idx, track_info) in audio_tracks.iter().enumerate() {
+        if let Some(t) = format.tracks().iter().find(|t| t.id == track_info.id as u32) {
+            if let Ok(dec) = symphonia::default::get_codecs().make(&t.codec_params, &DecoderOptions::default()) {
+                let t_sym_channels = t.codec_params.channels.unwrap_or(symphonia::core::audio::Channels::FRONT_LEFT | symphonia::core::audio::Channels::FRONT_RIGHT);
+                let t_channels = t_sym_channels.count() as u16;
+                let t_sample_rate = t.codec_params.sample_rate.unwrap_or(44100);
+                let t_time_base = t.codec_params.time_base.map(|tb| tb.calc_time(1).seconds as f64 + tb.calc_time(1).frac).unwrap_or(1.0 / 44100.0);
+                let vol = if t_idx == selected_track_idx { 1.0 } else { 0.0 };
+                active_tracks.insert(t.id, ActiveSymphoniaTrack {
+                    track_idx: t_idx,
+                    track_id: t.id,
+                    decoder: dec,
+                    sample_buf: SampleBuffer::<f32>::new(0, symphonia::core::audio::SignalSpec::new(t_sample_rate, t_sym_channels)),
+                    samples: Vec::new(),
+                    buf_pos: 0,
+                    volume: vol,
+                    channels: t_channels,
+                    time_base: t_time_base,
+                    current_time: 0.0,
+                });
+            }
+        }
+    }
 
     Ok(Box::new(SymphoniaSource {
         format,
-        decoder,
-        track_id,
-        sample_buf: SampleBuffer::<f32>::new(0, symphonia::core::audio::SignalSpec::new(intrinsic_sample_rate, sym_channels)),
-        buf_pos: 0,
+        active_tracks,
+        primary_track_id: track_id,
         time_base,
         current_time: 0.0,
         duration,
@@ -2262,7 +2492,11 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
                     state.bitrate = audio_source.get_bitrate();
                     state.audio_tracks = audio_source.get_audio_tracks();
                     state.selected_audio_track = audio_source.get_selected_audio_track();
+                    state.active_audio_tracks = audio_source.get_active_audio_tracks();
+                    state.audio_track_volumes = vec![1.0; state.audio_tracks.len()];
+                    state.multi_track_mix_mode = true;
                     state.audio_track_request = None;
+                    state.audio_mix_request = None;
                     state.has_video_stream = audio_source.has_video_stream();
                     state.tracker_channels = tracker_channels;
                     state.tracker_patterns_by_order = audio_source.pre_format_tracker_data();
@@ -2339,7 +2573,11 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
                     state.bitrate = audio_source.get_bitrate();
                     state.audio_tracks = audio_source.get_audio_tracks();
                     state.selected_audio_track = audio_source.get_selected_audio_track();
+                    state.active_audio_tracks = audio_source.get_active_audio_tracks();
+                    state.audio_track_volumes = vec![1.0; state.audio_tracks.len()];
+                    state.multi_track_mix_mode = true;
                     state.audio_track_request = None;
+                    state.audio_mix_request = None;
                     state.has_video_stream = audio_source.has_video_stream();
                     state.tracker_channels = tracker_channels;
                     state.tracker_patterns_by_order = audio_source.pre_format_tracker_data();
@@ -2357,6 +2595,95 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
 }
 
 
+fn push_chunk_lookahead_slices(
+    state: &mut AppState,
+    chunk: &AudioChunk,
+    frames_read: usize,
+    hardware_channels: usize,
+    sample_rate: u32,
+) {
+    if frames_read == 0 || hardware_channels == 0 || sample_rate == 0 {
+        return;
+    }
+    let slice_frames = ((sample_rate as f64 * 0.01).round() as usize).max(16);
+    let valid_samples = frames_read * hardware_channels;
+    
+    let existing_end_time = state.lookahead_buffer_start_time + (state.lookahead_sample_buffer.len() / hardware_channels) as f64 / sample_rate as f64;
+    if state.lookahead_sample_buffer.is_empty() || (chunk.current_seconds - existing_end_time).abs() > 0.05 {
+        state.lookahead_sample_buffer.clear();
+        state.lookahead_buffer_start_time = chunk.current_seconds;
+    }
+    state.lookahead_sample_buffer.extend_from_slice(&chunk.samples[..valid_samples]);
+    
+    let buffer_frames = state.lookahead_sample_buffer.len() / hardware_channels;
+    let full_slices = buffer_frames / slice_frames;
+    
+    for s in 0..full_slices {
+        let start_f = s * slice_frames;
+        let end_f = start_f + slice_frames;
+        let slice_time = state.lookahead_buffer_start_time + (start_f as f64 / sample_rate as f64);
+        
+        let mut min_l = 0.0f32;
+        let mut max_l = 0.0f32;
+        let mut min_r = 0.0f32;
+        let mut max_r = 0.0f32;
+        let mut sq_l = 0.0f32;
+        let mut sq_r = 0.0f32;
+        let mut bass_acc = 0.0f32;
+        let mut treb_acc = 0.0f32;
+        
+        let cnt = slice_frames as f32;
+        for i in start_f..end_f {
+            let l = state.lookahead_sample_buffer[i * hardware_channels];
+            let r = if hardware_channels > 1 { state.lookahead_sample_buffer[i * hardware_channels + 1] } else { l };
+            
+            min_l = min_l.min(l);
+            max_l = max_l.max(l);
+            min_r = min_r.min(r);
+            max_r = max_r.max(r);
+            sq_l += l * l;
+            sq_r += r * r;
+            
+            let mono = (l + r) * 0.5;
+            let diff = if i > start_f {
+                let prev_l = state.lookahead_sample_buffer[(i - 1) * hardware_channels];
+                (l - prev_l).abs()
+            } else {
+                0.0
+            };
+            
+            bass_acc += mono.abs();
+            treb_acc += diff * 2.0;
+        }
+        
+        let rms_l = (sq_l / cnt).sqrt().min(1.0);
+        let rms_r = (sq_r / cnt).sqrt().min(1.0);
+        let bass = (bass_acc / cnt * 2.0).min(1.0);
+        let treble = (treb_acc / cnt * 2.0).min(1.0);
+        
+        state.lookahead_queue.push_back((slice_time, [
+            min_l.clamp(-1.0, 1.0),
+            max_l.clamp(-1.0, 1.0),
+            min_r.clamp(-1.0, 1.0),
+            max_r.clamp(-1.0, 1.0),
+            rms_l,
+            rms_r,
+            bass,
+            treble,
+        ]));
+    }
+    
+    let consumed_samples = full_slices * slice_frames * hardware_channels;
+    if consumed_samples > 0 {
+        state.lookahead_sample_buffer.drain(0..consumed_samples);
+        state.lookahead_buffer_start_time += (full_slices * slice_frames) as f64 / sample_rate as f64;
+    }
+    
+    while state.lookahead_queue.len() > 1200 {
+        state.lookahead_queue.pop_front();
+    }
+}
+
 fn run_dummy(
     mut audio_source: Box<dyn AudioSource>,
     shared_state: Arc<Mutex<AppState>>,
@@ -2369,7 +2696,7 @@ fn run_dummy(
     let stop_token_clone = stop_token.clone();
     let hardware_channels = 2;
     let chunk_frames = 1024;
-    let pool_size = 64; 
+    let pool_size = 256; 
     
     let (ready_tx, ready_rx) = bounded::<AudioChunk>(pool_size);
     let (free_tx, free_rx) = unbounded::<AudioChunk>();
@@ -2621,38 +2948,88 @@ fn run_dummy(
     let stop_token_decoder = stop_token.clone();
     
     std::thread::spawn(move || {
+        let mut target_playback_time: Option<f64> = None;
         while !stop_token_decoder.load(std::sync::atomic::Ordering::Relaxed) {
             let mut chunk = loop {
                 if stop_token_decoder.load(std::sync::atomic::Ordering::Relaxed) {
                     return;
                 }
                 if let Ok(mut state) = state_for_decoder.try_lock() {
-                    if let Some(track_idx) = state.audio_track_request.take() {
-                        if state.audio_tracks.len() > 1 && track_idx < state.audio_tracks.len() && track_idx != state.selected_audio_track {
+                    if let Some(mix_req) = state.audio_mix_request.take() {
+                        if state.audio_tracks.len() > 1 && !mix_req.is_empty() {
                             let play_pos = state.current_seconds;
-                            if audio_source.select_audio_track(track_idx).is_ok() {
-                                audio_source.set_position_seconds(play_pos);
-                                state.selected_audio_track = track_idx;
+                            let hist_pos = (play_pos - 1.2).max(0.0);
+                            if audio_source.set_active_audio_tracks(&mix_req).is_ok() {
+                                audio_source.set_position_seconds(hist_pos);
+                                target_playback_time = if hist_pos < play_pos - 0.01 { Some(play_pos) } else { None };
+                                state.active_audio_tracks = audio_source.get_active_audio_tracks();
+                                if let Some(&first_idx) = state.active_audio_tracks.first() {
+                                    state.selected_audio_track = first_idx;
+                                }
                                 state.num_channels = audio_source.get_num_channels();
                                 state.module_type = audio_source.get_type();
                                 state.bitrate = audio_source.get_bitrate();
-                                state.channel_vus = vec![0.0; state.num_channels as usize];
-                                state.peak_vus = vec![0.0; state.num_channels as usize];
-                                let track_title = state.audio_tracks.get(track_idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", track_idx + 1));
-                                state.osd_text = Some(track_title);
+                                
+                                let mix_desc = if state.active_audio_tracks.len() > 1 {
+                                    let track_nums: Vec<String> = state.active_audio_tracks.iter().map(|idx| (idx + 1).to_string()).collect();
+                                    format!("🎛 Audio Mix: Tracks {}", track_nums.join("+"))
+                                } else {
+                                    let idx = state.selected_audio_track;
+                                    let track_title = state.audio_tracks.get(idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", idx + 1));
+                                    if track_title.to_lowercase().starts_with("track") {
+                                        format!("🎛 {}", track_title)
+                                    } else {
+                                        format!("🎛 Track {}: {}", idx + 1, track_title)
+                                    }
+                                };
+                                state.osd_text = Some(mix_desc);
                                 state.osd_timer = 3.0;
-                                state.seek_epoch += 1;
+                                state.lookahead_queue.clear();
+                                state.lookahead_sample_buffer.clear();
+                                state.lookahead_buffer_start_time = hist_pos;
                                 while let Ok(c) = ready_rx_for_decoder.try_recv() {
                                     let _ = free_tx_for_decoder.try_send(c);
                                 }
-                                while let Ok(_) = video_rx_for_decoder.try_recv() {}
+                            }
+                        }
+                    }
+                    if let Some(track_idx) = state.audio_track_request.take() {
+                        if state.audio_tracks.len() > 1 && track_idx < state.audio_tracks.len() && track_idx != state.selected_audio_track {
+                            let play_pos = state.current_seconds;
+                            let hist_pos = (play_pos - 1.2).max(0.0);
+                            if audio_source.select_audio_track(track_idx).is_ok() {
+                                audio_source.set_position_seconds(hist_pos);
+                                target_playback_time = if hist_pos < play_pos - 0.01 { Some(play_pos) } else { None };
+                                state.selected_audio_track = track_idx;
+                                state.active_audio_tracks = vec![track_idx];
+                                state.num_channels = audio_source.get_num_channels();
+                                state.module_type = audio_source.get_type();
+                                state.bitrate = audio_source.get_bitrate();
+                                let track_title = state.audio_tracks.get(track_idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", track_idx + 1));
+                                let display_title = if track_title.to_lowercase().starts_with("track") {
+                                    format!("🎛 {}", track_title)
+                                } else {
+                                    format!("🎛 Track {}: {}", track_idx + 1, track_title)
+                                };
+                                state.osd_text = Some(display_title);
+                                state.osd_timer = 3.0;
+                                state.lookahead_queue.clear();
+                                state.lookahead_sample_buffer.clear();
+                                state.lookahead_buffer_start_time = hist_pos;
+                                while let Ok(c) = ready_rx_for_decoder.try_recv() {
+                                    let _ = free_tx_for_decoder.try_send(c);
+                                }
                             }
                         }
                     }
                     if let Some(pos) = state.seek_request.take() {
                         audio_source.set_position_seconds(pos);
+                        target_playback_time = None;
                         state.current_seconds = pos;
+                        state.track_ended = false;
                         state.seek_epoch += 1;
+                        state.lookahead_queue.clear();
+                        state.lookahead_sample_buffer.clear();
                         while let Ok(c) = ready_rx_for_decoder.try_recv() {
                             let _ = free_tx_for_decoder.try_send(c);
                         }
@@ -2666,6 +3043,7 @@ fn run_dummy(
                 }
             };
             
+            let chunk_start_seconds = audio_source.get_position_seconds();
             let decode_start = Instant::now();
             let frames_read = audio_source.read_frames(hardware_channels, sample_rate, &mut chunk.samples[..chunk_frames * hardware_channels]);
             let decode_elapsed = decode_start.elapsed().as_micros() as f32;
@@ -2675,7 +3053,7 @@ fn run_dummy(
             chunk.current_row = audio_source.get_current_row();
             chunk.bpm = audio_source.get_tempo();
             chunk.speed = audio_source.get_speed();
-            chunk.current_seconds = audio_source.get_position_seconds();
+            chunk.current_seconds = chunk_start_seconds;
             chunk.current_row_string.clear();
             chunk.current_row_string.push_str(&audio_source.get_current_row_string());
             chunk.tracker_channels = audio_source.get_tracker_channels();
@@ -2734,6 +3112,18 @@ fn run_dummy(
                 let video_pct = (video_rx_for_decoder.len() as f32 / 4096.0) * 100.0;
                 state.stats.video_buffer_fill_pct = video_pct;
                 state.stats.clipping_events += clips;
+                push_chunk_lookahead_slices(&mut state, &chunk, frames_read, hardware_channels, sample_rate);
+            }
+
+            if let Some(target_t) = target_playback_time {
+                let chunk_dur = frames_read as f64 / sample_rate as f64;
+                let chunk_end = chunk_start_seconds + chunk_dur;
+                if chunk_end < target_t - 0.01 {
+                    let _ = free_tx_for_decoder.try_send(chunk);
+                    continue;
+                } else {
+                    target_playback_time = None;
+                }
             }
             
             let mut chunk_to_send = chunk;
@@ -2743,25 +3133,71 @@ fn run_dummy(
                 }
                 let mut seeked = false;
                 if let Ok(mut state) = state_for_decoder.try_lock() {
-                    if let Some(track_idx) = state.audio_track_request.take() {
-                        if state.audio_tracks.len() > 1 && track_idx < state.audio_tracks.len() && track_idx != state.selected_audio_track {
+                    if let Some(mix_req) = state.audio_mix_request.take() {
+                        if state.audio_tracks.len() > 1 && !mix_req.is_empty() {
                             let play_pos = state.current_seconds;
-                            if audio_source.select_audio_track(track_idx).is_ok() {
-                                audio_source.set_position_seconds(play_pos);
-                                state.selected_audio_track = track_idx;
+                            let hist_pos = (play_pos - 1.2).max(0.0);
+                            if audio_source.set_active_audio_tracks(&mix_req).is_ok() {
+                                audio_source.set_position_seconds(hist_pos);
+                                target_playback_time = if hist_pos < play_pos - 0.01 { Some(play_pos) } else { None };
+                                state.active_audio_tracks = audio_source.get_active_audio_tracks();
+                                if let Some(&first_idx) = state.active_audio_tracks.first() {
+                                    state.selected_audio_track = first_idx;
+                                }
                                 state.num_channels = audio_source.get_num_channels();
                                 state.module_type = audio_source.get_type();
                                 state.bitrate = audio_source.get_bitrate();
-                                state.channel_vus = vec![0.0; state.num_channels as usize];
-                                state.peak_vus = vec![0.0; state.num_channels as usize];
-                                let track_title = state.audio_tracks.get(track_idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", track_idx + 1));
-                                state.osd_text = Some(track_title);
+                                
+                                let mix_desc = if state.active_audio_tracks.len() > 1 {
+                                    let track_nums: Vec<String> = state.active_audio_tracks.iter().map(|idx| (idx + 1).to_string()).collect();
+                                    format!("🎛 Audio Mix: Tracks {}", track_nums.join("+"))
+                                } else {
+                                    let idx = state.selected_audio_track;
+                                    let track_title = state.audio_tracks.get(idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", idx + 1));
+                                    if track_title.to_lowercase().starts_with("track") {
+                                        format!("🎛 {}", track_title)
+                                    } else {
+                                        format!("🎛 Track {}: {}", idx + 1, track_title)
+                                    }
+                                };
+                                state.osd_text = Some(mix_desc);
                                 state.osd_timer = 3.0;
-                                state.seek_epoch += 1;
+                                state.lookahead_queue.clear();
+                                state.lookahead_sample_buffer.clear();
+                                state.lookahead_buffer_start_time = hist_pos;
                                 while let Ok(c) = ready_rx_for_decoder.try_recv() {
                                     let _ = free_tx_for_decoder.try_send(c);
                                 }
-                                while let Ok(_) = video_rx_for_decoder.try_recv() {}
+                                seeked = true;
+                            }
+                        }
+                    }
+                    if let Some(track_idx) = state.audio_track_request.take() {
+                        if state.audio_tracks.len() > 1 && track_idx < state.audio_tracks.len() && track_idx != state.selected_audio_track {
+                            let play_pos = state.current_seconds;
+                            let hist_pos = (play_pos - 1.2).max(0.0);
+                            if audio_source.select_audio_track(track_idx).is_ok() {
+                                audio_source.set_position_seconds(hist_pos);
+                                target_playback_time = if hist_pos < play_pos - 0.01 { Some(play_pos) } else { None };
+                                state.selected_audio_track = track_idx;
+                                state.active_audio_tracks = vec![track_idx];
+                                state.num_channels = audio_source.get_num_channels();
+                                state.module_type = audio_source.get_type();
+                                state.bitrate = audio_source.get_bitrate();
+                                let track_title = state.audio_tracks.get(track_idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", track_idx + 1));
+                                let display_title = if track_title.to_lowercase().starts_with("track") {
+                                    format!("🎛 {}", track_title)
+                                } else {
+                                    format!("🎛 Track {}: {}", track_idx + 1, track_title)
+                                };
+                                state.osd_text = Some(display_title);
+                                state.osd_timer = 3.0;
+                                state.lookahead_queue.clear();
+                                state.lookahead_sample_buffer.clear();
+                                state.lookahead_buffer_start_time = hist_pos;
+                                while let Ok(c) = ready_rx_for_decoder.try_recv() {
+                                    let _ = free_tx_for_decoder.try_send(c);
+                                }
                                 seeked = true;
                             }
                         }
@@ -2769,7 +3205,10 @@ fn run_dummy(
                     if let Some(pos) = state.seek_request.take() {
                         audio_source.set_position_seconds(pos);
                         state.current_seconds = pos;
+                        state.track_ended = false;
                         state.seek_epoch += 1;
+                        state.lookahead_queue.clear();
+                        state.lookahead_sample_buffer.clear();
                         while let Ok(c) = ready_rx_for_decoder.try_recv() {
                             let _ = free_tx_for_decoder.try_send(c);
                         }
@@ -2928,7 +3367,7 @@ where
     let hardware_channels = config.channels as usize;
     
     let chunk_frames = 1024;
-    let pool_size = 64; 
+    let pool_size = 256; 
     
     let (ready_tx, ready_rx) = bounded::<AudioChunk>(pool_size);
     let (free_tx, free_rx) = unbounded::<AudioChunk>();
@@ -3065,6 +3504,7 @@ where
             std::mem::swap(&mut windowed_channels, &mut spare_channels);
             // spare_channels now has the filled data, windowed_channels has the empties
             
+            let play_time = last_current_seconds + (chunk_frame_pos as f64 / sample_rate as f64);
             let msg = DspMessage {
                 audio_data: windowed_buffer.clone(),
                 channel_vus: last_channel_vus.clone(),
@@ -3072,7 +3512,7 @@ where
                 current_row: last_current_row,
                 bpm: last_bpm,
                 speed: last_speed,
-                current_seconds: last_current_seconds,
+                current_seconds: play_time,
                 current_row_string: last_current_row_string.clone(),
                 channel_audio_data: std::mem::replace(&mut spare_channels, vec![vec![0.0; window_size]; hardware_channels]),
             };
@@ -3334,38 +3774,88 @@ where
     let stop_token_decoder = stop_token.clone();
     
     std::thread::spawn(move || {
+        let mut target_playback_time: Option<f64> = None;
         while !stop_token_decoder.load(std::sync::atomic::Ordering::Relaxed) {
             let mut chunk = loop {
                 if stop_token_decoder.load(std::sync::atomic::Ordering::Relaxed) {
                     return;
                 }
                 if let Ok(mut state) = state_for_decoder.try_lock() {
-                    if let Some(track_idx) = state.audio_track_request.take() {
-                        if state.audio_tracks.len() > 1 && track_idx < state.audio_tracks.len() && track_idx != state.selected_audio_track {
+                    if let Some(mix_req) = state.audio_mix_request.take() {
+                        if state.audio_tracks.len() > 1 && !mix_req.is_empty() {
                             let play_pos = state.current_seconds;
-                            if audio_source.select_audio_track(track_idx).is_ok() {
-                                audio_source.set_position_seconds(play_pos);
-                                state.selected_audio_track = track_idx;
+                            let hist_pos = (play_pos - 1.2).max(0.0);
+                            if audio_source.set_active_audio_tracks(&mix_req).is_ok() {
+                                audio_source.set_position_seconds(hist_pos);
+                                target_playback_time = if hist_pos < play_pos - 0.01 { Some(play_pos) } else { None };
+                                state.active_audio_tracks = audio_source.get_active_audio_tracks();
+                                if let Some(&first_idx) = state.active_audio_tracks.first() {
+                                    state.selected_audio_track = first_idx;
+                                }
                                 state.num_channels = audio_source.get_num_channels();
                                 state.module_type = audio_source.get_type();
                                 state.bitrate = audio_source.get_bitrate();
-                                state.channel_vus = vec![0.0; state.num_channels as usize];
-                                state.peak_vus = vec![0.0; state.num_channels as usize];
-                                let track_title = state.audio_tracks.get(track_idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", track_idx + 1));
-                                state.osd_text = Some(track_title);
+                                
+                                let mix_desc = if state.active_audio_tracks.len() > 1 {
+                                    let track_nums: Vec<String> = state.active_audio_tracks.iter().map(|idx| (idx + 1).to_string()).collect();
+                                    format!("🎛 Audio Mix: Tracks {}", track_nums.join("+"))
+                                } else {
+                                    let idx = state.selected_audio_track;
+                                    let track_title = state.audio_tracks.get(idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", idx + 1));
+                                    if track_title.to_lowercase().starts_with("track") {
+                                        format!("🎛 {}", track_title)
+                                    } else {
+                                        format!("🎛 Track {}: {}", idx + 1, track_title)
+                                    }
+                                };
+                                state.osd_text = Some(mix_desc);
                                 state.osd_timer = 3.0;
-                                state.seek_epoch += 1;
+                                state.lookahead_queue.clear();
+                                state.lookahead_sample_buffer.clear();
+                                state.lookahead_buffer_start_time = hist_pos;
                                 while let Ok(c) = ready_rx_for_decoder.try_recv() {
                                     let _ = free_tx_for_decoder.try_send(c);
                                 }
-                                while let Ok(_) = video_rx_for_decoder.try_recv() {}
+                            }
+                        }
+                    }
+                    if let Some(track_idx) = state.audio_track_request.take() {
+                        if state.audio_tracks.len() > 1 && track_idx < state.audio_tracks.len() && track_idx != state.selected_audio_track {
+                            let play_pos = state.current_seconds;
+                            let hist_pos = (play_pos - 1.2).max(0.0);
+                            if audio_source.select_audio_track(track_idx).is_ok() {
+                                audio_source.set_position_seconds(hist_pos);
+                                target_playback_time = if hist_pos < play_pos - 0.01 { Some(play_pos) } else { None };
+                                state.selected_audio_track = track_idx;
+                                state.active_audio_tracks = vec![track_idx];
+                                state.num_channels = audio_source.get_num_channels();
+                                state.module_type = audio_source.get_type();
+                                state.bitrate = audio_source.get_bitrate();
+                                let track_title = state.audio_tracks.get(track_idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", track_idx + 1));
+                                let display_title = if track_title.to_lowercase().starts_with("track") {
+                                    format!("🎛 {}", track_title)
+                                } else {
+                                    format!("🎛 Track {}: {}", track_idx + 1, track_title)
+                                };
+                                state.osd_text = Some(display_title);
+                                state.osd_timer = 3.0;
+                                state.lookahead_queue.clear();
+                                state.lookahead_sample_buffer.clear();
+                                state.lookahead_buffer_start_time = hist_pos;
+                                while let Ok(c) = ready_rx_for_decoder.try_recv() {
+                                    let _ = free_tx_for_decoder.try_send(c);
+                                }
                             }
                         }
                     }
                     if let Some(pos) = state.seek_request.take() {
                         audio_source.set_position_seconds(pos);
+                        target_playback_time = None;
                         state.current_seconds = pos;
+                        state.track_ended = false;
                         state.seek_epoch += 1;
+                        state.lookahead_queue.clear();
+                        state.lookahead_sample_buffer.clear();
                         while let Ok(c) = ready_rx_for_decoder.try_recv() {
                             let _ = free_tx_for_decoder.try_send(c);
                         }
@@ -3379,6 +3869,7 @@ where
                 }
             };
             
+            let chunk_start_seconds = audio_source.get_position_seconds();
             let decode_start = Instant::now();
             let frames_read = audio_source.read_frames(hardware_channels, sample_rate, &mut chunk.samples[..chunk_frames * hardware_channels]);
             let decode_elapsed = decode_start.elapsed().as_micros() as f32;
@@ -3388,7 +3879,7 @@ where
             chunk.current_row = audio_source.get_current_row();
             chunk.bpm = audio_source.get_tempo();
             chunk.speed = audio_source.get_speed();
-            chunk.current_seconds = audio_source.get_position_seconds();
+            chunk.current_seconds = chunk_start_seconds;
             chunk.current_row_string.clear();
             chunk.current_row_string.push_str(&audio_source.get_current_row_string());
             chunk.tracker_channels = audio_source.get_tracker_channels();
@@ -3401,8 +3892,6 @@ where
             for i in 0..frames_read {
                 let l_val = chunk.samples[i * hardware_channels];
                 left_peak = left_peak.max(l_val.abs());
-                // Use a small epsilon above 1.0 to prevent 0dBFS peaks in losslessly 
-                // mastered tracks from falsely triggering clipping events
                 if l_val.abs() > 1.0001 { clips += 1; }
                 
                 if hardware_channels > 1 {
@@ -3449,6 +3938,18 @@ where
                 let video_pct = (video_rx_for_decoder.len() as f32 / 4096.0) * 100.0;
                 state.stats.video_buffer_fill_pct = video_pct;
                 state.stats.clipping_events += clips;
+                push_chunk_lookahead_slices(&mut state, &chunk, frames_read, hardware_channels, sample_rate);
+            }
+
+            if let Some(target_t) = target_playback_time {
+                let chunk_dur = frames_read as f64 / sample_rate as f64;
+                let chunk_end = chunk_start_seconds + chunk_dur;
+                if chunk_end < target_t - 0.01 {
+                    let _ = free_tx_for_decoder.try_send(chunk);
+                    continue;
+                } else {
+                    target_playback_time = None;
+                }
             }
             
             let mut chunk_to_send = chunk;
@@ -3458,17 +3959,57 @@ where
                 }
                 let mut seeked = false;
                 if let Ok(mut state) = state_for_decoder.try_lock() {
-                    if let Some(track_idx) = state.audio_track_request.take() {
-                        if state.audio_tracks.len() > 1 && track_idx < state.audio_tracks.len() && track_idx != state.selected_audio_track {
+                    if let Some(mix_req) = state.audio_mix_request.take() {
+                        if state.audio_tracks.len() > 1 && !mix_req.is_empty() {
                             let play_pos = state.current_seconds;
-                            if audio_source.select_audio_track(track_idx).is_ok() {
-                                audio_source.set_position_seconds(play_pos);
-                                state.selected_audio_track = track_idx;
+                            let hist_pos = (play_pos - 1.2).max(0.0);
+                            if audio_source.set_active_audio_tracks(&mix_req).is_ok() {
+                                audio_source.set_position_seconds(hist_pos);
+                                target_playback_time = if hist_pos < play_pos - 0.01 { Some(play_pos) } else { None };
+                                state.active_audio_tracks = audio_source.get_active_audio_tracks();
+                                if let Some(&first_idx) = state.active_audio_tracks.first() {
+                                    state.selected_audio_track = first_idx;
+                                }
                                 state.num_channels = audio_source.get_num_channels();
                                 state.module_type = audio_source.get_type();
                                 state.bitrate = audio_source.get_bitrate();
-                                state.channel_vus = vec![0.0; state.num_channels as usize];
-                                state.peak_vus = vec![0.0; state.num_channels as usize];
+                                
+                                let mix_desc = if state.active_audio_tracks.len() > 1 {
+                                    let track_nums: Vec<String> = state.active_audio_tracks.iter().map(|idx| (idx + 1).to_string()).collect();
+                                    format!("🎛 Audio Mix: Tracks {}", track_nums.join("+"))
+                                } else {
+                                    let idx = state.selected_audio_track;
+                                    let track_title = state.audio_tracks.get(idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", idx + 1));
+                                    if track_title.to_lowercase().starts_with("track") {
+                                        format!("🎛 {}", track_title)
+                                    } else {
+                                        format!("🎛 Track {}: {}", idx + 1, track_title)
+                                    }
+                                };
+                                state.osd_text = Some(mix_desc);
+                                state.osd_timer = 3.0;
+                                state.lookahead_queue.clear();
+                                state.lookahead_sample_buffer.clear();
+                                state.lookahead_buffer_start_time = hist_pos;
+                                while let Ok(c) = ready_rx_for_decoder.try_recv() {
+                                    let _ = free_tx_for_decoder.try_send(c);
+                                }
+                                seeked = true;
+                            }
+                        }
+                    }
+                    if let Some(track_idx) = state.audio_track_request.take() {
+                        if state.audio_tracks.len() > 1 && track_idx < state.audio_tracks.len() && track_idx != state.selected_audio_track {
+                            let play_pos = state.current_seconds;
+                            let hist_pos = (play_pos - 1.2).max(0.0);
+                            if audio_source.select_audio_track(track_idx).is_ok() {
+                                audio_source.set_position_seconds(hist_pos);
+                                target_playback_time = if hist_pos < play_pos - 0.01 { Some(play_pos) } else { None };
+                                state.selected_audio_track = track_idx;
+                                state.active_audio_tracks = vec![track_idx];
+                                state.num_channels = audio_source.get_num_channels();
+                                state.module_type = audio_source.get_type();
+                                state.bitrate = audio_source.get_bitrate();
                                 let track_title = state.audio_tracks.get(track_idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", track_idx + 1));
                                 let display_title = if track_title.to_lowercase().starts_with("track") {
                                     format!("🎛 {}", track_title)
@@ -3477,11 +4018,12 @@ where
                                 };
                                 state.osd_text = Some(display_title);
                                 state.osd_timer = 3.0;
-                                state.seek_epoch += 1;
+                                state.lookahead_queue.clear();
+                                state.lookahead_sample_buffer.clear();
+                                state.lookahead_buffer_start_time = hist_pos;
                                 while let Ok(c) = ready_rx_for_decoder.try_recv() {
                                     let _ = free_tx_for_decoder.try_send(c);
                                 }
-                                while let Ok(_) = video_rx_for_decoder.try_recv() {}
                                 seeked = true;
                             }
                         }
@@ -3489,7 +4031,10 @@ where
                     if let Some(pos) = state.seek_request.take() {
                         audio_source.set_position_seconds(pos);
                         state.current_seconds = pos;
+                        state.track_ended = false;
                         state.seek_epoch += 1;
+                        state.lookahead_queue.clear();
+                        state.lookahead_sample_buffer.clear();
                         while let Ok(c) = ready_rx_for_decoder.try_recv() {
                             let _ = free_tx_for_decoder.try_send(c);
                         }

@@ -25,6 +25,7 @@ pub enum TouchGesture {
     DoubleTap { x: f32, y: f32 },
     TwoFingerTap,
     TwoFingerDoubleTap,
+    ThreeFingerTap,
     Scrub { pct: f32 },
     ScrubEnd,
 }
@@ -42,7 +43,7 @@ pub struct TouchGestureController {
     // Multi-touch tracking
     active_touches: HashMap<u64, (f32, f32, Instant)>,
     max_touch_count: usize,
-    two_finger_start_time: Option<Instant>,
+    multi_finger_start_time: Option<Instant>,
 }
 
 impl Default for TouchGestureController {
@@ -63,15 +64,15 @@ impl TouchGestureController {
             pending_single_tap: None,
             active_touches: HashMap::new(),
             max_touch_count: 0,
-            two_finger_start_time: None,
+            multi_finger_start_time: None,
         }
     }
 
     pub fn handle_touch(
         &mut self,
         touch: &Touch,
-        window_width: f32,
-        window_height: f32,
+        _window_width: f32,
+        _window_height: f32,
         is_portrait: bool,
         split_y: f32,
     ) -> Option<TouchGesture> {
@@ -86,23 +87,17 @@ impl TouchGestureController {
                     self.max_touch_count = touch_count;
                 }
 
-                if touch_count == 2 {
-                    self.two_finger_start_time = Some(Instant::now());
+                if touch_count >= 2 {
+                    if self.multi_finger_start_time.is_none() {
+                        self.multi_finger_start_time = Some(Instant::now());
+                    }
                     self.pending_single_tap = None;
                     self.is_scrubbing = false;
                 } else if touch_count == 1 {
                     self.touch_start_pos = Some((x, y));
                     self.touch_start_time = Some(Instant::now());
                     self.current_pos = Some((x, y));
-
-                    // Bottom 12% zone is the timeline scrubber zone
-                    if window_height > 0.0 && y > window_height * 0.88 {
-                        self.is_scrubbing = true;
-                        let pct = (x / window_width).clamp(0.0, 1.0);
-                        return Some(TouchGesture::Scrub { pct });
-                    } else {
-                        self.is_scrubbing = false;
-                    }
+                    self.is_scrubbing = false;
                 }
                 None
             }
@@ -112,37 +107,30 @@ impl TouchGestureController {
                     entry.1 = y;
                 }
                 self.current_pos = Some((x, y));
-                if self.is_scrubbing && self.max_touch_count == 1 && window_width > 0.0 {
-                    let pct = (x / window_width).clamp(0.0, 1.0);
-                    return Some(TouchGesture::Scrub { pct });
-                }
                 None
             }
             TouchPhase::Ended => {
                 self.active_touches.remove(&touch.id);
                 let remaining = self.active_touches.len();
 
-                if self.is_scrubbing && self.max_touch_count == 1 {
-                    self.is_scrubbing = false;
-                    self.touch_start_pos = None;
-                    self.touch_start_time = None;
-                    self.max_touch_count = remaining;
-                    return Some(TouchGesture::ScrubEnd);
-                }
-
-                // Check if a 2-finger touch gesture has concluded (all fingers lifted)
+                // Check if a multi-finger (2-finger or 3-finger) touch gesture has concluded (all fingers lifted)
                 if self.max_touch_count >= 2 {
                     if remaining == 0 {
-                        let dt = self.two_finger_start_time.map(|t| t.elapsed().as_secs_f32()).unwrap_or(1.0);
+                        let count = self.max_touch_count;
+                        let dt = self.multi_finger_start_time.map(|t| t.elapsed().as_secs_f32()).unwrap_or(1.0);
                         self.max_touch_count = 0;
-                        self.two_finger_start_time = None;
+                        self.multi_finger_start_time = None;
                         self.touch_start_pos = None;
                         self.touch_start_time = None;
                         self.pending_single_tap = None;
 
-                        // Immediate responsive 2-finger tap (< 500ms)
+                        // Immediate responsive multi-finger tap (< 500ms)
                         if dt < 0.50 {
-                            return Some(TouchGesture::TwoFingerTap);
+                            if count >= 3 {
+                                return Some(TouchGesture::ThreeFingerTap);
+                            } else {
+                                return Some(TouchGesture::TwoFingerTap);
+                            }
                         }
                     }
                     return None;
@@ -235,7 +223,7 @@ impl TouchGestureController {
             TouchPhase::Cancelled => {
                 self.active_touches.clear();
                 self.max_touch_count = 0;
-                self.two_finger_start_time = None;
+                self.multi_finger_start_time = None;
                 self.touch_start_pos = None;
                 self.touch_start_time = None;
                 self.is_scrubbing = false;
@@ -281,6 +269,20 @@ mod tests {
         controller.handle_touch(&make_touch(TouchPhase::Ended, 0, 300.0, 500.0), 1080.0, 2400.0, true, 1200.0);
         let g1 = controller.handle_touch(&make_touch(TouchPhase::Ended, 1, 600.0, 500.0), 1080.0, 2400.0, true, 1200.0);
         assert_eq!(g1, Some(TouchGesture::TwoFingerTap));
+    }
+
+    #[test]
+    fn test_three_finger_tap() {
+        let mut controller = TouchGestureController::new();
+
+        // 3-finger tap
+        controller.handle_touch(&make_touch(TouchPhase::Started, 0, 200.0, 500.0), 1080.0, 2400.0, true, 1200.0);
+        controller.handle_touch(&make_touch(TouchPhase::Started, 1, 500.0, 500.0), 1080.0, 2400.0, true, 1200.0);
+        controller.handle_touch(&make_touch(TouchPhase::Started, 2, 800.0, 500.0), 1080.0, 2400.0, true, 1200.0);
+        controller.handle_touch(&make_touch(TouchPhase::Ended, 0, 200.0, 500.0), 1080.0, 2400.0, true, 1200.0);
+        controller.handle_touch(&make_touch(TouchPhase::Ended, 1, 500.0, 500.0), 1080.0, 2400.0, true, 1200.0);
+        let g = controller.handle_touch(&make_touch(TouchPhase::Ended, 2, 800.0, 500.0), 1080.0, 2400.0, true, 1200.0);
+        assert_eq!(g, Some(TouchGesture::ThreeFingerTap));
     }
 
     #[test]

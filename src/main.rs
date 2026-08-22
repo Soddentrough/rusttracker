@@ -157,7 +157,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         
         if let Some(vis) = &args.vis {
             let vis_lower = vis.to_lowercase();
-            let matched_idx = crate::state::VISUALIZERS.iter().position(|v| {
+            let matched_idx = crate::state::VISUALIZERS.iter().enumerate().position(|(i, v)| {
                 let short_name = v.filename
                     .strip_prefix("vis_")
                     .unwrap_or(v.filename)
@@ -165,6 +165,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .unwrap_or(v.filename)
                     .to_lowercase();
                 v.id.to_string() == vis_lower
+                    || i.to_string() == vis_lower
                     || v.name.to_lowercase() == vis_lower
                     || short_name == vis_lower
             });
@@ -255,7 +256,8 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
     #[allow(unused_mut)]
     let mut attrs = winit::window::Window::default_attributes()
         .with_title("RustTracker Vulkan Visualizer")
-        .with_inner_size(winit::dpi::LogicalSize::new(1280.0, 720.0))
+        .with_inner_size(winit::dpi::LogicalSize::new(1440.0, 840.0))
+        .with_min_inner_size(winit::dpi::LogicalSize::new(1024.0, 600.0))
         .with_window_icon(Some(window_icon));
         
     if is_fullscreen {
@@ -292,7 +294,7 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
     fonts.families.get_mut(&egui::FontFamily::Proportional).unwrap().push("kenney_icons".to_owned());
     egui_ctx.set_fonts(fonts);
     
-    let mut egui_state = egui_winit::State::new(egui_ctx.clone(), egui::ViewportId::ROOT, &window, Some(1.0), None, None);
+    let mut egui_state = egui_winit::State::new(egui_ctx.clone(), egui::ViewportId::ROOT, &window, None, None, None);
 
     let mut last_mouse_move = Instant::now();
     let mut is_cursor_visible = true;
@@ -517,7 +519,8 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                                     if idx != 0 {
                                                         state.vis_enabled[idx] = !state.vis_enabled[idx];
                                                     }
-                                                } else if state.current_seconds >= state.duration_seconds - 0.1 && state.duration_seconds > 0.0 {
+                                                } else if state.track_ended || (state.current_seconds >= state.duration_seconds - 0.1 && state.duration_seconds > 0.0) {
+                                                    state.track_ended = false;
                                                     state.seek_request = Some(0.0);
                                                     state.spectrum_history.clear();
                                                     for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
@@ -623,10 +626,30 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                                 };
                                                 if track_num > 0 {
                                                     let mut state = app_state.lock().unwrap();
-                                                    if state.audio_tracks.len() > 1 {
-                                                        let track_idx = track_num - 1;
-                                                        if track_idx < state.audio_tracks.len() && track_idx != state.selected_audio_track {
-                                                            state.audio_track_request = Some(track_idx);
+                                                    let num_tracks = state.audio_tracks.len();
+                                                    if num_tracks > 1 {
+                                                        if track_num <= num_tracks {
+                                                            let track_idx = track_num - 1;
+                                                            if state.active_audio_tracks != vec![track_idx] || state.selected_audio_track != track_idx {
+                                                                state.selected_audio_track = track_idx;
+                                                                state.active_audio_tracks = vec![track_idx];
+                                                                if state.audio_track_volumes.len() != num_tracks {
+                                                                    state.audio_track_volumes = vec![1.0; num_tracks];
+                                                                }
+                                                                state.audio_track_request = Some(track_idx);
+                                                                state.audio_mix_request = Some(vec![(track_idx, 1.0)]);
+                                                            }
+                                                        } else if track_num == num_tracks + 1 {
+                                                            // Shortcut for mixing tracks: <number of tracks + 1>
+                                                            // E.g. for a 2-track file, "3" plays the mix of all tracks!
+                                                            if state.audio_track_volumes.len() != num_tracks {
+                                                                state.audio_track_volumes = vec![1.0; num_tracks];
+                                                            }
+                                                            let mix: Vec<(usize, f32)> = (0..num_tracks)
+                                                                .map(|idx| (idx, state.audio_track_volumes.get(idx).copied().unwrap_or(1.0)))
+                                                                .collect();
+                                                            state.active_audio_tracks = (0..num_tracks).collect();
+                                                            state.audio_mix_request = Some(mix);
                                                         }
                                                     }
                                                 }
@@ -733,11 +756,13 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                         }
                         
                         if state.track_ended {
-                            state.track_ended = false;
                             if state.load_request.is_none() {
-                                state.playlist_index += 1;
-                                if state.playlist_index < state.playlist.len() {
+                                if state.playlist_index + 1 < state.playlist.len() {
+                                    state.track_ended = false;
+                                    state.playlist_index += 1;
                                     state.load_request = Some(state.playlist[state.playlist_index].clone());
+                                } else {
+                                    state.is_paused = true;
                                 }
                             }
                         }
@@ -1136,9 +1161,81 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                 state.audio_device_change_request = Some(device_name);
                             }
                             EngineAction::SetAudioTrack(track_idx) => {
-                                if state.audio_tracks.len() > 1 && track_idx < state.audio_tracks.len() && track_idx != state.selected_audio_track {
+                                if state.audio_tracks.len() > 1 && track_idx < state.audio_tracks.len() {
+                                    state.selected_audio_track = track_idx;
+                                    state.active_audio_tracks = vec![track_idx];
+                                    if state.audio_track_volumes.len() != state.audio_tracks.len() {
+                                        state.audio_track_volumes = vec![1.0; state.audio_tracks.len()];
+                                    }
                                     state.audio_track_request = Some(track_idx);
+                                    state.audio_mix_request = Some(vec![(track_idx, 1.0)]);
                                 }
+                            }
+                            EngineAction::ToggleAudioTrackInMix(track_idx) => {
+                                if state.audio_tracks.len() > 1 && track_idx < state.audio_tracks.len() {
+                                    if state.active_audio_tracks.is_empty() {
+                                        state.active_audio_tracks = vec![state.selected_audio_track];
+                                    }
+                                    if let Some(pos) = state.active_audio_tracks.iter().position(|&t| t == track_idx) {
+                                        if state.active_audio_tracks.len() > 1 {
+                                            state.active_audio_tracks.remove(pos);
+                                        }
+                                    } else {
+                                        state.active_audio_tracks.push(track_idx);
+                                        state.active_audio_tracks.sort();
+                                    }
+                                    if state.audio_track_volumes.len() != state.audio_tracks.len() {
+                                        state.audio_track_volumes = vec![1.0; state.audio_tracks.len()];
+                                    }
+                                    let mix: Vec<(usize, f32)> = state.active_audio_tracks.iter().map(|&idx| (idx, state.audio_track_volumes.get(idx).copied().unwrap_or(1.0))).collect();
+                                    state.audio_mix_request = Some(mix);
+                                }
+                            }
+                            EngineAction::SetAudioTrackVolume(track_idx, volume) => {
+                                if track_idx < state.audio_tracks.len() {
+                                    if state.audio_track_volumes.len() != state.audio_tracks.len() {
+                                        state.audio_track_volumes = vec![1.0; state.audio_tracks.len()];
+                                    }
+                                    state.audio_track_volumes[track_idx] = volume.clamp(0.0, 1.0);
+                                    let mix: Vec<(usize, f32)> = state.active_audio_tracks.iter().map(|&idx| (idx, state.audio_track_volumes.get(idx).copied().unwrap_or(1.0))).collect();
+                                    state.audio_mix_request = Some(mix);
+                                }
+                            }
+                            EngineAction::SetAudioMixMode(enabled) => {
+                                state.multi_track_mix_mode = enabled;
+                                if !enabled && !state.active_audio_tracks.is_empty() {
+                                    let track_idx = state.active_audio_tracks[0];
+                                    state.selected_audio_track = track_idx;
+                                    state.active_audio_tracks = vec![track_idx];
+                                    state.audio_mix_request = Some(vec![(track_idx, 1.0)]);
+                                }
+                            }
+                            EngineAction::SetAudioMixTracks(tracks) => {
+                                state.multi_track_mix_mode = true;
+                                state.active_audio_tracks = tracks.iter().map(|(idx, _)| *idx).collect();
+                                if state.audio_track_volumes.len() != state.audio_tracks.len() {
+                                    state.audio_track_volumes = vec![1.0; state.audio_tracks.len()];
+                                }
+                                for &(idx, vol) in &tracks {
+                                    if idx < state.audio_track_volumes.len() {
+                                        state.audio_track_volumes[idx] = vol;
+                                    }
+                                }
+                                if let Some(&(first_idx, _)) = tracks.first() {
+                                    state.selected_audio_track = first_idx;
+                                }
+                                let mix_desc = if tracks.len() > 1 {
+                                    let track_nums: Vec<String> = tracks.iter().map(|(idx, _)| (idx + 1).to_string()).collect();
+                                    format!("🎛 Mix: Tracks {}", track_nums.join("+"))
+                                } else if let Some(&(idx, _)) = tracks.first() {
+                                    let track_title = state.audio_tracks.get(idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", idx + 1));
+                                    format!("🎛 Audio: {}", track_title)
+                                } else {
+                                    "🎛 Audio Mix".to_string()
+                                };
+                                state.osd_text = Some(mix_desc);
+                                state.osd_timer = 2.0;
+                                state.audio_mix_request = Some(tracks);
                             }
                             EngineAction::SetMobileHudTab(tab) => {
                                 state.mobile_hud_tab = tab;
@@ -1572,11 +1669,12 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                         state.current_visualizer_idx = state.vis_picker_cursor;
                                         state.visualizer_mode = crate::state::VISUALIZERS[state.vis_picker_cursor].id;
                                         state.show_vis_picker = false;
-                                    } else if state.current_seconds >= state.duration_seconds - 0.1 && state.duration_seconds > 0.0 {
-                                        state.seek_request = Some(0.0);
-                                        state.spectrum_history.clear();
-                                        for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
-                                        state.is_paused = false;
+                                    } else if state.track_ended || (state.current_seconds >= state.duration_seconds - 0.1 && state.duration_seconds > 0.0) {
+                                         state.track_ended = false;
+                                         state.seek_request = Some(0.0);
+                                         state.spectrum_history.clear();
+                                         for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }
+                                         state.is_paused = false;
                                     } else if state.playlist_index >= state.playlist.len() && !state.playlist.is_empty() {
                                         if state.duration_seconds == 0.0 {
                                             state.playlist_index = state.playlist.len() - 1;
@@ -1887,7 +1985,8 @@ where std::io::Error: From<<B as Backend>::Error>
                         }
                         KeyCode::Char(' ') => {
                             let mut state = app_state.lock().unwrap();
-                            if state.current_seconds >= state.duration_seconds - 0.1 && state.duration_seconds > 0.0 {
+                            if state.track_ended || (state.current_seconds >= state.duration_seconds - 0.1 && state.duration_seconds > 0.0) {
+                                state.track_ended = false;
                                 state.seek_request = Some(0.0);
                                 state.spectrum_history.clear();
                                 for _ in 0..120 { state.spectrum_history.push_back(vec![0.0; 1024]); }

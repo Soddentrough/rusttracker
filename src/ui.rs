@@ -393,10 +393,15 @@ pub fn draw(f: &mut Frame, state: &AppState) {
 
     // 10b. Audio Track (if multi-track)
     if state.audio_tracks.len() > 1 {
-        let track_str = format!("{}/{} [1-{} to switch]", state.selected_audio_track + 1, state.audio_tracks.len(), state.audio_tracks.len().min(9));
+        let track_str = if state.active_audio_tracks.len() > 1 {
+            let nums: Vec<String> = state.active_audio_tracks.iter().map(|i| (i + 1).to_string()).collect();
+            format!("Mix [{}] / {} tracks", nums.join("+"), state.audio_tracks.len())
+        } else {
+            format!("{}/{} [1-{} to switch]", state.selected_audio_track + 1, state.audio_tracks.len(), state.audio_tracks.len().min(9))
+        };
         lines.push(Line::from(vec![
             Span::raw("Track:  "),
-            Span::styled(track_str, Style::default().fg(Color::Yellow)),
+            Span::styled(track_str, Style::default().fg(if state.active_audio_tracks.len() > 1 { Color::Green } else { Color::Yellow })),
         ]));
     }
 

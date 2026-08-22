@@ -48,6 +48,10 @@ struct AudioUniforms {
     frame_dt: f32,
     // (push_count + step_fraction) * 0.5 — world Z locked to history rows
     history_cam_z: f32,
+    fire_intensity: f32,
+    _pad1: f32,
+    _pad2: f32,
+    _pad3: f32,
 };
 
 // Narkowicz ACES fitted tonemapping curve.

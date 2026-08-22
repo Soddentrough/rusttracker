@@ -68,7 +68,13 @@ pub enum EngineAction {
     EditUrl(String),
     ClearFocusUrlInput,
     SetAudioDevice(String),
+    #[allow(dead_code)]
     SetAudioTrack(usize),
+    ToggleAudioTrackInMix(usize),
+    SetAudioTrackVolume(usize, f32),
+    #[allow(dead_code)]
+    SetAudioMixMode(bool),
+    SetAudioMixTracks(Vec<(usize, f32)>),
     #[allow(dead_code)]
     SetMobileHudTab(crate::state::MobileHudTab),
 }
@@ -102,6 +108,10 @@ pub struct AudioUniforms {
     pub aspect_ratio: f32,
     pub frame_dt: f32,
     pub history_cam_z: f32,
+    pub fire_intensity: f32,
+    pub _pad1: f32,
+    pub _pad2: f32,
+    pub _pad3: f32,
 }
 
 
@@ -299,6 +309,7 @@ pub struct VulkanEngine {
     pub lyric_slam_timer: f32,
     pub last_lyric_line_idx: Option<usize>,
     pub current_lyric_mesh_text: String,
+    pub fire_intensity: f32,
 }
 
 pub(crate) fn generate_lamp_mesh() -> (Vec<Vertex>, Vec<u32>) {
@@ -1643,8 +1654,22 @@ impl VulkanEngine {
             .find(|f| f.is_srgb())
             .unwrap_or(surface_caps.formats[0]);
 
-        // Let WGPU pick the best non-vsync method to ensure frame pacing doesn't tear/stutter under Wayland
-        let present_mode = wgpu::PresentMode::AutoNoVsync;
+        // Enable dynamic display refresh & VRR (Adaptive Sync / FreeSync / G-Sync)
+        let present_mode = if let Ok(mode_str) = std::env::var("RUSTTRACKER_PRESENT_MODE") {
+            match mode_str.to_lowercase().as_str() {
+                "novsync" | "immediate" => wgpu::PresentMode::AutoNoVsync,
+                "mailbox" if surface_caps.present_modes.contains(&wgpu::PresentMode::Mailbox) => wgpu::PresentMode::Mailbox,
+                "fiforelaxed" | "adaptive" if surface_caps.present_modes.contains(&wgpu::PresentMode::FifoRelaxed) => wgpu::PresentMode::FifoRelaxed,
+                "fifo" => wgpu::PresentMode::Fifo,
+                _ => wgpu::PresentMode::AutoVsync,
+            }
+        } else if surface_caps.present_modes.contains(&wgpu::PresentMode::AutoVsync) {
+            wgpu::PresentMode::AutoVsync
+        } else if surface_caps.present_modes.contains(&wgpu::PresentMode::FifoRelaxed) {
+            wgpu::PresentMode::FifoRelaxed
+        } else {
+            wgpu::PresentMode::Fifo
+        };
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
@@ -1926,6 +1951,7 @@ impl VulkanEngine {
                 21 => include_str!("shaders/vis_matrix.wgsl"),
                 22 => include_str!("shaders/vis_neon_room.wgsl"),
                 23 => include_str!("shaders/vis_lyrics.wgsl"),
+                24 => include_str!("shaders/vis_tape_head.wgsl"),
                 _ => include_str!("shaders/vis_spectrum.wgsl"),
             }
         };
@@ -3435,6 +3461,7 @@ impl VulkanEngine {
             lyric_slam_timer: 0.0,
             last_lyric_line_idx: None,
             current_lyric_mesh_text: "RUSTTRACKER".to_string(),
+            fire_intensity: 0.0,
         }
     }
 
@@ -3526,6 +3553,19 @@ impl VulkanEngine {
         if !state.is_paused && state.file_loaded && !state.track_ended {
             self.play_time += self.smooth_dt * 2.88;
         }
+
+        // Progress bar fire dies off when playback stops / pauses / ends / reaches end of song
+        let is_at_end = state.duration_seconds > 0.0 && state.current_seconds >= state.duration_seconds - 0.05;
+        let is_playing = !state.is_paused && state.file_loaded && !state.track_ended && !is_at_end;
+        let target_intensity = if is_playing { 1.0f32 } else { 0.0f32 };
+        let fire_rate = if is_playing { 5.0f32 } else { 3.5f32 };
+        let dt_clamped = dt.clamp(0.001, 0.1);
+        if self.fire_intensity < target_intensity {
+            self.fire_intensity = (self.fire_intensity + fire_rate * dt_clamped).min(target_intensity);
+        } else if self.fire_intensity > target_intensity {
+            self.fire_intensity = (self.fire_intensity - fire_rate * dt_clamped).max(target_intensity);
+        }
+
         // World-Z camera position locked to history rows (0.5 units/row), used by
         // visualizers that scroll with the waveform/spectrum history ring buffer.
         self.last_history_cam_z = (self.last_history_push_count as f64 + step_fraction as f64) * 0.5;
@@ -3557,6 +3597,10 @@ impl VulkanEngine {
             aspect_ratio: self.size.width as f32 / self.size.height as f32,
             frame_dt,
             history_cam_z: self.last_history_cam_z as f32,
+            fire_intensity: self.fire_intensity,
+            _pad1: 0.0,
+            _pad2: 0.0,
+            _pad3: 0.0,
         };
 
         uniforms.spectrum.copy_from_slice(&state.spectrum_data);
@@ -3791,7 +3835,11 @@ impl VulkanEngine {
         let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
         let history_dirty = state.waveform_history_push_count != self.last_uploaded_push_count
             || vis_width != self.last_uploaded_vis_width;
-        if vis_def.requires_history && history_dirty {
+        if vis_def.id == 24 {
+            if !state.lookahead_timeline.is_empty() {
+                self.queue.write_buffer(&self.waveform_storage_buffer, 0, bytemuck::cast_slice(&state.lookahead_timeline));
+            }
+        } else if vis_def.requires_history && history_dirty {
             self.last_uploaded_push_count = state.waveform_history_push_count;
             self.last_uploaded_vis_width = vis_width;
             // Upload up to 144 most recent frames
@@ -4798,6 +4846,10 @@ impl VulkanEngine {
                                                     ui.label(egui::RichText::new("2-Finger Tap").color(egui::Color32::from_rgb(0, 220, 255)).strong().size(12.5));
                                                     ui.label(egui::RichText::new("Cycle Audio Track").color(egui::Color32::LIGHT_GRAY).size(12.5));
                                                     ui.end_row();
+
+                                                    ui.label(egui::RichText::new("3-Finger Tap").color(egui::Color32::from_rgb(0, 220, 255)).strong().size(12.5));
+                                                    ui.label(egui::RichText::new("Toggle Engine Stats").color(egui::Color32::LIGHT_GRAY).size(12.5));
+                                                    ui.end_row();
                                                 });
                                         });
                                     } else {
@@ -5579,6 +5631,17 @@ impl VulkanEngine {
                                         }
                                     };
 
+                                    let display_title = if state.song_title.is_empty() {
+                                        "Unknown Title".to_string()
+                                    } else {
+                                        let p = std::path::Path::new(&state.song_title);
+                                        if p.extension().is_some() || state.song_title.contains('/') || state.song_title.contains('\\') {
+                                            p.file_stem().unwrap_or_default().to_string_lossy().to_string()
+                                        } else {
+                                            state.song_title.clone()
+                                        }
+                                    };
+
                                     let current_path_str = if state.playlist_index < state.playlist.len() {
                                         state.playlist[state.playlist_index].clone()
                                     } else {
@@ -5586,9 +5649,9 @@ impl VulkanEngine {
                                     };
                                     let is_network = current_path_str.starts_with("http://") || current_path_str.starts_with("https://");
                                     let file_name = if is_network {
-                                        state.song_title.clone()
+                                        display_title.clone()
                                     } else {
-                                        std::path::Path::new(&state.song_title).file_name().unwrap_or_default().to_string_lossy().to_string()
+                                        std::path::Path::new(&current_path_str).file_name().unwrap_or_default().to_string_lossy().to_string()
                                     };
                                     let file_dir = if is_network {
                                         current_path_str
@@ -5600,84 +5663,89 @@ impl VulkanEngine {
                                         } else {
                                             std::path::PathBuf::from(&current_path_str)
                                         };
-                                        let path_str = abs_path.to_string_lossy().to_string();
+                                        let dir_path = abs_path.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
                                         if let Ok(home) = std::env::var("HOME") {
-                                            if path_str.starts_with(&home) {
-                                                path_str.replacen(&home, "~", 1)
+                                            if dir_path.starts_with(&home) {
+                                                dir_path.replacen(&home, "~", 1)
                                             } else {
-                                                path_str
+                                                dir_path
                                             }
                                         } else {
-                                            path_str
+                                            dir_path
                                         }
                                     };
 
                                     egui::ScrollArea::vertical()
                                         .auto_shrink([false, false])
                                         .show(col, |ui| {
-                                            // 1. Song Title
-                                            ui.horizontal(|ui| {
-                                                ui.label("Title:");
-                                                render_smooth_marquee(ui, &state.song_title, 14.0, true);
-                                            });
-                                            
-                                            // 2. Artist
-                                            ui.horizontal(|ui| {
-                                                ui.label("Artist:");
-                                                render_smooth_marquee(ui, &state.artist, 14.0, false);
-                                            });
-                                            
-                                            // 3. File Name
-                                            ui.horizontal(|ui| {
-                                                ui.label("File:");
-                                                render_smooth_marquee(ui, &file_name, 14.0, false);
-                                            });
+                                            egui::Grid::new("track_info_meta_grid")
+                                                .num_columns(2)
+                                                .spacing([10.0, 4.0])
+                                                .show(ui, |ui| {
+                                                    // 1. Song Title
+                                                    ui.label(egui::RichText::new("Title:").color(egui::Color32::from_rgb(160, 180, 200)).strong());
+                                                    render_smooth_marquee(ui, &display_title, 14.0, true);
+                                                    ui.end_row();
+                                                    
+                                                    // 2. Artist
+                                                    let artist_str = if state.artist.is_empty() { "Unknown" } else { &state.artist };
+                                                    ui.label(egui::RichText::new("Artist:").color(egui::Color32::from_rgb(160, 180, 200)));
+                                                    render_smooth_marquee(ui, artist_str, 14.0, false);
+                                                    ui.end_row();
+                                                    
+                                                    // 3. File Name
+                                                    ui.label(egui::RichText::new("File:").color(egui::Color32::from_rgb(160, 180, 200)));
+                                                    render_smooth_marquee(ui, &file_name, 14.0, false);
+                                                    ui.end_row();
 
-                                            // 4. File Directory / URL
-                                            ui.horizontal(|ui| {
-                                                let label = if is_network { "Stream:" } else { "Folder:" };
-                                                ui.label(label);
-                                                render_smooth_marquee(ui, &file_dir, 14.0, false);
-                                            });
-                                            
-                                            // 5. Codec / Format & Bitrate
-                                            let format_str = if let Some(br) = state.bitrate {
-                                                format!("{} ({} kbps)", state.module_type, br)
-                                            } else {
-                                                state.module_type.clone()
-                                            };
-                                            ui.horizontal(|ui| {
-                                                ui.label("Format:");
-                                                ui.label(format_str);
-                                            });
-                                            
-                                            // 6. Channels & Track Info
-                                            let ch_info = if let Some(tc) = state.tracker_channels {
-                                                format!("{} hardware / {} tracker channels", state.hardware_channels, tc)
-                                            } else {
-                                                format!("{} channels", state.num_channels)
-                                            };
-                                            ui.horizontal(|ui| {
-                                                ui.label("Channels:");
-                                                ui.label(ch_info);
-                                            });
+                                                    // 4. File Directory / URL
+                                                    let folder_label = if is_network { "Stream:" } else { "Folder:" };
+                                                    ui.label(egui::RichText::new(folder_label).color(egui::Color32::from_rgb(160, 180, 200)));
+                                                    render_smooth_marquee(ui, &file_dir, 14.0, false);
+                                                    ui.end_row();
+                                                    
+                                                    // 5. Codec / Format & Bitrate
+                                                    let format_str = if let Some(br) = state.bitrate {
+                                                        format!("{} ({} kbps)", state.module_type, br)
+                                                    } else {
+                                                        state.module_type.clone()
+                                                    };
+                                                    ui.label(egui::RichText::new("Format:").color(egui::Color32::from_rgb(160, 180, 200)));
+                                                    ui.label(format_str);
+                                                    ui.end_row();
+                                                    
+                                                    // 6. Channels & Track Info
+                                                    let ch_info = if let Some(tc) = state.tracker_channels {
+                                                        format!("{} hw / {} tracker", state.hardware_channels, tc)
+                                                    } else {
+                                                        format!("{} channels", state.num_channels)
+                                                    };
+                                                    ui.label(egui::RichText::new("Channels:").color(egui::Color32::from_rgb(160, 180, 200)));
+                                                    ui.label(ch_info);
+                                                    ui.end_row();
 
-                                            // 7. Track Duration
-                                            ui.horizontal(|ui| {
-                                                ui.label("Duration:");
-                                                if state.duration_seconds <= 0.0 {
-                                                    ui.label("Live Stream");
-                                                } else {
-                                                    ui.label(format!("{:.1}s", state.duration_seconds)); 
-                                                }
-                                            });
+                                                    // 7. Track Duration
+                                                    ui.label(egui::RichText::new("Duration:").color(egui::Color32::from_rgb(160, 180, 200)));
+                                                    if state.duration_seconds <= 0.0 {
+                                                        ui.label("Live Stream");
+                                                    } else {
+                                                        let mins = (state.duration_seconds / 60.0).floor() as u32;
+                                                        let secs = (state.duration_seconds % 60.0).floor() as u32;
+                                                        ui.label(format!("{:.1}s ({:02}:{:02})", state.duration_seconds, mins, secs));
+                                                    }
+                                                    ui.end_row();
+                                                });
 
                                             if state.audio_tracks.len() > 1 {
                                                 ui.add_space(6.0);
-                                                ui.label(egui::RichText::new("Audio Tracks (tap icon to switch):").strong().color(egui::Color32::from_rgb(0, 210, 255)));
-                                                ui.add_space(2.0);
+                                                ui.horizontal(|ui| {
+                                                    ui.label(egui::RichText::new("Audio Tracks:").strong().color(egui::Color32::from_rgb(0, 210, 255)));
+                                                });
+                                                ui.add_space(3.0);
+
+                                                // Multi-Track Mix Interface
                                                 for (idx, track) in state.audio_tracks.iter().enumerate() {
-                                                    let is_selected = state.selected_audio_track == idx;
+                                                    let is_in_mix = state.active_audio_tracks.contains(&idx);
                                                     let lower = track.title.to_lowercase();
                                                     let (icon, color) = if lower.contains("vocal") || lower.contains("guide") {
                                                         ("♪", egui::Color32::from_rgb(255, 110, 180))
@@ -5686,31 +5754,192 @@ impl VulkanEngine {
                                                     } else {
                                                         ("♪", egui::Color32::from_rgb(255, 200, 60))
                                                     };
-                                                    let btn_label = if is_selected {
-                                                        format!("▶ {} {}", icon, track.title)
-                                                    } else {
-                                                        format!("   {} {}", icon, track.title)
-                                                    };
 
-                                                    let btn = if is_selected {
-                                                        egui::Button::new(egui::RichText::new(btn_label).color(color).strong().size(12.5))
-                                                            .stroke(egui::Stroke::new(1.5_f32, color))
-                                                            .fill(egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 45))
-                                                    } else {
-                                                        egui::Button::new(egui::RichText::new(btn_label).color(egui::Color32::LIGHT_GRAY).size(12.0))
-                                                            .fill(egui::Color32::from_rgba_unmultiplied(45, 45, 50, 200))
-                                                    };
+                                                    let mut current_vol = state.audio_track_volumes.get(idx).copied().unwrap_or(1.0);
 
-                                                    if ui.add_sized([ui.available_width().max(160.0), 30.0], btn).clicked() && !is_selected {
-                                                        *engine_action = EngineAction::SetAudioTrack(idx);
-                                                    }
+                                                    ui.horizontal(|ui| {
+                                                        // Checkbox / Toggle Button
+                                                        let check_label = if is_in_mix {
+                                                            format!("☑ 🔗 {} {}", icon, track.title)
+                                                        } else {
+                                                            format!("☐   {} {}", icon, track.title)
+                                                        };
+                                                        let btn_color = if is_in_mix { color } else { egui::Color32::GRAY };
+                                                        let chk_btn = egui::Button::new(egui::RichText::new(check_label).color(btn_color).size(12.0))
+                                                            .fill(if is_in_mix { egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 35) } else { egui::Color32::from_rgba_unmultiplied(40, 40, 45, 160) })
+                                                            .stroke(if is_in_mix { egui::Stroke::new(1.0_f32, color) } else { egui::Stroke::NONE });
+                                                        
+                                                        let btn_w = if is_in_mix {
+                                                            (ui.available_width() - 110.0).max(110.0).min(180.0)
+                                                        } else {
+                                                            ui.available_width()
+                                                        };
+
+                                                        if ui.add_sized([btn_w, 28.0], chk_btn).clicked() {
+                                                            *engine_action = EngineAction::ToggleAudioTrackInMix(idx);
+                                                        }
+
+                                                        // Inline Controls when track is active in mix
+                                                        if is_in_mix {
+                                                            let vol_text = format!("{:.0}%", current_vol * 100.0);
+                                                            let slider = egui::Slider::new(&mut current_vol, 0.0..=1.0)
+                                                                .show_value(false)
+                                                                .text(vol_text);
+                                                            if ui.add(slider).changed() {
+                                                                *engine_action = EngineAction::SetAudioTrackVolume(idx, current_vol);
+                                                            }
+
+                                                            // Mute button [M]
+                                                            let is_muted = current_vol == 0.0;
+                                                            let m_btn = egui::Button::new(egui::RichText::new("M").strong().color(if is_muted { egui::Color32::RED } else { egui::Color32::LIGHT_GRAY }).size(11.0))
+                                                                .fill(if is_muted { egui::Color32::from_rgba_unmultiplied(200, 50, 50, 80) } else { egui::Color32::from_rgba_unmultiplied(50, 50, 55, 180) });
+                                                            if ui.add_sized([22.0, 24.0], m_btn).clicked() {
+                                                                let new_vol = if is_muted { 1.0 } else { 0.0 };
+                                                                *engine_action = EngineAction::SetAudioTrackVolume(idx, new_vol);
+                                                            }
+
+                                                            // Solo button [S]
+                                                            let s_btn = egui::Button::new(egui::RichText::new("S").strong().color(egui::Color32::YELLOW).size(11.0))
+                                                                .fill(egui::Color32::from_rgba_unmultiplied(50, 50, 55, 180));
+                                                            if ui.add_sized([22.0, 24.0], s_btn).clicked() {
+                                                                *engine_action = EngineAction::SetAudioMixTracks(vec![(idx, 1.0)]);
+                                                            }
+                                                        }
+                                                    });
                                                     ui.add_space(2.0);
+                                                }
+
+                                                // Quick Mix Presets Bar (Always Available)
+                                                ui.add_space(5.0);
+                                                ui.label(egui::RichText::new("Quick Mix Presets:").size(12.0).color(egui::Color32::from_rgb(170, 190, 210)).strong());
+                                                ui.add_space(2.0);
+
+                                                let num_tracks = state.audio_tracks.len();
+                                                let is_all_on = state.active_audio_tracks.len() == num_tracks && num_tracks > 0;
+                                                let is_mix_1_2 = state.active_audio_tracks.len() == 2 && state.active_audio_tracks.contains(&0) && state.active_audio_tracks.contains(&1);
+
+                                                let total_width = ui.available_width();
+                                                let spacing = 6.0;
+
+                                                if num_tracks <= 2 {
+                                                    // 4 full-width buttons in a single row: [All On] [Trk 1] [Trk 2] [Mix 1&2]
+                                                    let btn_count = if num_tracks == 2 { 4.0 } else { 2.0 };
+                                                    let btn_w = ((total_width - spacing * (btn_count - 1.0)) / btn_count).max(50.0);
+                                                    let btn_h = 34.0;
+
+                                                    ui.horizontal(|ui| {
+                                                        ui.spacing_mut().item_spacing.x = spacing;
+
+                                                        // All On
+                                                        let all_btn = egui::Button::new(
+                                                            egui::RichText::new("All On").strong().size(12.0).color(if is_all_on { egui::Color32::from_rgb(0, 240, 170) } else { egui::Color32::LIGHT_GRAY })
+                                                        )
+                                                        .fill(if is_all_on { egui::Color32::from_rgba_unmultiplied(0, 140, 100, 180) } else { egui::Color32::from_rgba_unmultiplied(50, 60, 70, 220) })
+                                                        .stroke(if is_all_on { egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0, 240, 170)) } else { egui::Stroke::NONE });
+
+                                                        if ui.add_sized([btn_w, btn_h], all_btn).clicked() {
+                                                            let all_mix: Vec<(usize, f32)> = (0..num_tracks).map(|i| (i, 1.0)).collect();
+                                                            *engine_action = EngineAction::SetAudioMixTracks(all_mix);
+                                                        }
+
+                                                        // Trk 1
+                                                        let is_solo_0 = state.active_audio_tracks.len() == 1 && state.active_audio_tracks.contains(&0);
+                                                        let trk1_btn = egui::Button::new(
+                                                            egui::RichText::new("Trk 1").strong().size(12.0).color(if is_solo_0 { egui::Color32::from_rgb(0, 220, 255) } else { egui::Color32::LIGHT_GRAY })
+                                                        )
+                                                        .fill(if is_solo_0 { egui::Color32::from_rgba_unmultiplied(0, 100, 150, 180) } else { egui::Color32::from_rgba_unmultiplied(50, 60, 70, 220) })
+                                                        .stroke(if is_solo_0 { egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0, 220, 255)) } else { egui::Stroke::NONE });
+
+                                                        if ui.add_sized([btn_w, btn_h], trk1_btn).clicked() {
+                                                            *engine_action = EngineAction::SetAudioMixTracks(vec![(0, 1.0)]);
+                                                        }
+
+                                                        if num_tracks >= 2 {
+                                                            // Trk 2
+                                                            let is_solo_1 = state.active_audio_tracks.len() == 1 && state.active_audio_tracks.contains(&1);
+                                                            let trk2_btn = egui::Button::new(
+                                                                egui::RichText::new("Trk 2").strong().size(12.0).color(if is_solo_1 { egui::Color32::from_rgb(0, 220, 255) } else { egui::Color32::LIGHT_GRAY })
+                                                            )
+                                                            .fill(if is_solo_1 { egui::Color32::from_rgba_unmultiplied(0, 100, 150, 180) } else { egui::Color32::from_rgba_unmultiplied(50, 60, 70, 220) })
+                                                            .stroke(if is_solo_1 { egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0, 220, 255)) } else { egui::Stroke::NONE });
+
+                                                            if ui.add_sized([btn_w, btn_h], trk2_btn).clicked() {
+                                                                *engine_action = EngineAction::SetAudioMixTracks(vec![(1, 1.0)]);
+                                                            }
+
+                                                            // Mix 1&2
+                                                            let mix_btn = egui::Button::new(
+                                                                egui::RichText::new("Mix 1&2").strong().size(12.0).color(if is_mix_1_2 { egui::Color32::from_rgb(0, 240, 170) } else { egui::Color32::from_rgb(0, 210, 160) })
+                                                            )
+                                                            .fill(if is_mix_1_2 { egui::Color32::from_rgba_unmultiplied(0, 150, 110, 200) } else { egui::Color32::from_rgba_unmultiplied(0, 80, 70, 180) })
+                                                            .stroke(if is_mix_1_2 { egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0, 240, 170)) } else { egui::Stroke::NONE });
+
+                                                            if ui.add_sized([btn_w, btn_h], mix_btn).clicked() {
+                                                                *engine_action = EngineAction::SetAudioMixTracks(vec![(0, 1.0), (1, 1.0)]);
+                                                            }
+                                                        }
+                                                    });
+                                                } else {
+                                                    // 2 rows for 3+ tracks:
+                                                    // Row 1: Mix combos [All On] [Mix 1&2] (each 50% width)
+                                                    let row1_w = ((total_width - spacing) / 2.0).max(60.0);
+                                                    let btn_h = 34.0;
+
+                                                    ui.horizontal(|ui| {
+                                                        ui.spacing_mut().item_spacing.x = spacing;
+
+                                                        // All On
+                                                        let all_btn = egui::Button::new(
+                                                            egui::RichText::new("All On").strong().size(12.5).color(if is_all_on { egui::Color32::from_rgb(0, 240, 170) } else { egui::Color32::LIGHT_GRAY })
+                                                        )
+                                                        .fill(if is_all_on { egui::Color32::from_rgba_unmultiplied(0, 140, 100, 180) } else { egui::Color32::from_rgba_unmultiplied(50, 60, 70, 220) })
+                                                        .stroke(if is_all_on { egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0, 240, 170)) } else { egui::Stroke::NONE });
+
+                                                        if ui.add_sized([row1_w, btn_h], all_btn).clicked() {
+                                                            let all_mix: Vec<(usize, f32)> = (0..num_tracks).map(|i| (i, 1.0)).collect();
+                                                            *engine_action = EngineAction::SetAudioMixTracks(all_mix);
+                                                        }
+
+                                                        // Mix 1&2
+                                                        let mix_btn = egui::Button::new(
+                                                            egui::RichText::new("Mix 1&2").strong().size(12.5).color(if is_mix_1_2 { egui::Color32::from_rgb(0, 240, 170) } else { egui::Color32::from_rgb(0, 210, 160) })
+                                                        )
+                                                        .fill(if is_mix_1_2 { egui::Color32::from_rgba_unmultiplied(0, 150, 110, 200) } else { egui::Color32::from_rgba_unmultiplied(0, 80, 70, 180) })
+                                                        .stroke(if is_mix_1_2 { egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0, 240, 170)) } else { egui::Stroke::NONE });
+
+                                                        if ui.add_sized([row1_w, btn_h], mix_btn).clicked() {
+                                                            *engine_action = EngineAction::SetAudioMixTracks(vec![(0, 1.0), (1, 1.0)]);
+                                                        }
+                                                    });
+
+                                                    ui.add_space(3.0);
+
+                                                    // Row 2: Solo Tracks [Trk 1] [Trk 2] [Trk 3] [Trk 4] (equally dividing width)
+                                                    let display_count = num_tracks.min(4);
+                                                    let row2_w = ((total_width - spacing * (display_count - 1) as f32) / display_count as f32).max(45.0);
+
+                                                    ui.horizontal(|ui| {
+                                                        ui.spacing_mut().item_spacing.x = spacing;
+
+                                                        for i in 0..display_count {
+                                                            let is_solo_i = state.active_audio_tracks.len() == 1 && state.active_audio_tracks.contains(&i);
+                                                            let btn = egui::Button::new(
+                                                                egui::RichText::new(format!("Trk {}", i + 1)).strong().size(12.0).color(if is_solo_i { egui::Color32::from_rgb(0, 220, 255) } else { egui::Color32::LIGHT_GRAY })
+                                                            )
+                                                            .fill(if is_solo_i { egui::Color32::from_rgba_unmultiplied(0, 100, 150, 180) } else { egui::Color32::from_rgba_unmultiplied(50, 60, 70, 220) })
+                                                            .stroke(if is_solo_i { egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0, 220, 255)) } else { egui::Stroke::NONE });
+
+                                                            if ui.add_sized([row2_w, 32.0], btn).clicked() {
+                                                                *engine_action = EngineAction::SetAudioMixTracks(vec![(i, 1.0)]);
+                                                            }
+                                                        }
+                                                    });
                                                 }
                                                 ui.add_space(4.0);
                                             }
                                             
                                             ui.horizontal(|ui| {
-                                                ui.label("Device");
+                                                ui.label(egui::RichText::new("Device:").color(egui::Color32::from_rgb(160, 180, 200)));
                                                 let mut current_device = state.selected_audio_device.clone().unwrap_or_else(|| "Default Device".to_string());
                                                 let prev_device = current_device.clone();
                                                 
@@ -5737,8 +5966,18 @@ impl VulkanEngine {
                                                     render_smooth_marquee(ui, &next_song, 14.0, false); 
                                                 });
                                             }
-                                            ui.add_space(4.0);
-                                            if ui.button(egui::RichText::new("📂 Open Audio File").strong().size(12.5)).clicked() {
+                                            ui.add_space(6.0);
+                                            let open_btn = egui::Button::new(
+                                                egui::RichText::new("📂  OPEN AUDIO FILE")
+                                                    .strong()
+                                                    .size(13.5)
+                                                    .color(egui::Color32::WHITE)
+                                            )
+                                            .fill(egui::Color32::from_rgb(0, 100, 200))
+                                            .stroke(egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(80, 200, 255)))
+                                            .min_size(egui::vec2(ui.available_width(), 38.0));
+
+                                            if ui.add(open_btn).clicked() {
                                                 *engine_action = EngineAction::OpenFile;
                                             }
                                         });
@@ -5829,33 +6068,6 @@ impl VulkanEngine {
             egui::CentralPanel::default().frame(frame).show_inside(ctx, |ui| {
                 let rect = ui.available_rect_before_wrap();
                 central_rect = rect;
-                
-                // Mouse drag scrubbing using global input to avoid interception by other transparent areas
-                let wants_pointer = ui.ctx().egui_wants_pointer_input();
-                let is_primary_down = ui.input(|i| i.pointer.primary_down());
-                let is_primary_released = ui.input(|i| i.pointer.primary_released());
-                
-                // If we are currently scrubbing, ignore wants_pointer so we don't miss the release event!
-                let is_scrubbing = state.scrub_target_seconds.is_some();
-                let should_process = (is_primary_down || is_primary_released) && (!wants_pointer || is_scrubbing) && state.duration_seconds > 0.0;
-                
-                if should_process {
-                    if is_primary_released {
-                        if let Some(target) = state.scrub_target_seconds {
-                            engine_action = EngineAction::Seek((target / state.duration_seconds) as f32);
-                        } else {
-                            engine_action = EngineAction::ScrubEnd;
-                        }
-                    } else {
-                        let delta_x = ui.input(|i| i.pointer.delta().x);
-                        if delta_x.abs() > 0.0 || is_scrubbing {
-                            let scrub_amount = delta_x * 0.1; // 0.1s per pixel
-                            let base_time = state.scrub_target_seconds.unwrap_or(state.current_seconds);
-                            let new_time = (base_time + scrub_amount as f64).clamp(0.0, state.duration_seconds);
-                            engine_action = EngineAction::ScrubPreview((new_time / state.duration_seconds) as f32, scrub_amount as f64);
-                        }
-                    }
-                }
                 
                 // Draw OSD text from keyboard/gamepad/touch actions
                 if let Some(osd) = &state.osd_text {
@@ -6608,7 +6820,7 @@ mod tests {
     #[test]
     fn test_uniform_size_alignment() {
         let rust_size = std::mem::size_of::<AudioUniforms>();
-        assert_eq!(rust_size, 8816, "Rust AudioUniforms size is not 8816 bytes (actual: {})", rust_size);
+        assert_eq!(rust_size, 8832, "Rust AudioUniforms size is not 8832 bytes (actual: {})", rust_size);
 
         // Parse _common.wgsl to compute WGSL structure size
         let common_source = std::fs::read_to_string("src/shaders/_common.wgsl")
@@ -6661,7 +6873,7 @@ mod tests {
 
         // Align struct size to maximum alignment (16)
         let wgsl_size = (offset + 15) / 16 * 16;
-        assert_eq!(wgsl_size, 8816, "WGSL AudioUniforms size is not 8816 bytes (actual: {})", wgsl_size);
+        assert_eq!(wgsl_size, 8832, "WGSL AudioUniforms size is not 8832 bytes (actual: {})", wgsl_size);
         assert_eq!(rust_size, wgsl_size, "Size mismatch: Rust AudioUniforms is {}, WGSL is {}", rust_size, wgsl_size);
     }
 
@@ -6799,5 +7011,78 @@ mod tests {
         assert!(raw_source.contains("// INCLUDE: common"));
         assert!(raw_source.contains("vs_main_3d"));
         assert!(raw_source.contains("fs_main"));
+    }
+
+    #[test]
+    fn test_progress_fire_decay_when_stopped() {
+        let mut state = crate::state::AppState::new("Test App".to_string());
+        state.file_loaded = true;
+        state.is_paused = false;
+        state.track_ended = false;
+
+        let mut fire_intensity = 0.0f32;
+        let dt = 1.0f32 / 60.0f32;
+
+        // 1. When playing, fire should ramp up to 1.0
+        for _ in 0..60 {
+            let is_playing = !state.is_paused && state.file_loaded && !state.track_ended;
+            let target_intensity = if is_playing { 1.0f32 } else { 0.0f32 };
+            let fire_rate = if is_playing { 5.0f32 } else { 2.5f32 };
+            if fire_intensity < target_intensity {
+                fire_intensity = (fire_intensity + fire_rate * dt).min(target_intensity);
+            } else if fire_intensity > target_intensity {
+                fire_intensity = (fire_intensity - fire_rate * dt).max(target_intensity);
+            }
+        }
+        assert!((fire_intensity - 1.0).abs() < 1e-4, "Fire should be fully ignited (1.0) while playing");
+
+        // 2. Pause playback -> fire intensity should decay down to 0.0
+        state.is_paused = true;
+        for _ in 0..60 {
+            let is_playing = !state.is_paused && state.file_loaded && !state.track_ended;
+            let target_intensity = if is_playing { 1.0f32 } else { 0.0f32 };
+            let fire_rate = if is_playing { 5.0f32 } else { 2.5f32 };
+            if fire_intensity < target_intensity {
+                fire_intensity = (fire_intensity + fire_rate * dt).min(target_intensity);
+            } else if fire_intensity > target_intensity {
+                fire_intensity = (fire_intensity - fire_rate * dt).max(target_intensity);
+            }
+        }
+        assert_eq!(fire_intensity, 0.0, "Fire intensity should die off completely (0.0) when paused");
+
+        // 3. Track ended -> fire intensity should die off
+        state.is_paused = false;
+        state.track_ended = true;
+        fire_intensity = 0.8;
+        for _ in 0..60 {
+            let is_at_end = state.duration_seconds > 0.0 && state.current_seconds >= state.duration_seconds - 0.05;
+            let is_playing = !state.is_paused && state.file_loaded && !state.track_ended && !is_at_end;
+            let target_intensity = if is_playing { 1.0f32 } else { 0.0f32 };
+            let fire_rate = if is_playing { 5.0f32 } else { 3.5f32 };
+            if fire_intensity < target_intensity {
+                fire_intensity = (fire_intensity + fire_rate * dt).min(target_intensity);
+            } else if fire_intensity > target_intensity {
+                fire_intensity = (fire_intensity - fire_rate * dt).max(target_intensity);
+            }
+        }
+        assert_eq!(fire_intensity, 0.0, "Fire intensity should die off completely (0.0) when track ended");
+
+        // 4. End of song reached (current_seconds >= duration_seconds) -> fire intensity should die off
+        state.track_ended = false;
+        state.duration_seconds = 180.0;
+        state.current_seconds = 180.0;
+        fire_intensity = 0.9;
+        for _ in 0..60 {
+            let is_at_end = state.duration_seconds > 0.0 && state.current_seconds >= state.duration_seconds - 0.05;
+            let is_playing = !state.is_paused && state.file_loaded && !state.track_ended && !is_at_end;
+            let target_intensity = if is_playing { 1.0f32 } else { 0.0f32 };
+            let fire_rate = if is_playing { 5.0f32 } else { 3.5f32 };
+            if fire_intensity < target_intensity {
+                fire_intensity = (fire_intensity + fire_rate * dt).min(target_intensity);
+            } else if fire_intensity > target_intensity {
+                fire_intensity = (fire_intensity - fire_rate * dt).max(target_intensity);
+            }
+        }
+        assert_eq!(fire_intensity, 0.0, "Fire intensity should die off completely (0.0) when end of song is reached");
     }
 }
