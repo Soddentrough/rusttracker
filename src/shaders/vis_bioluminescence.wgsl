@@ -143,6 +143,7 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     let static_noise = noise_val * 0.022 * bezel_mask;
     final_color = final_color + vec3<f32>(static_noise);
     
-    return vec4<f32>(final_color, 1.0);
+    let tonemapped = aces_tonemap(final_color);
+    return vec4<f32>(tonemapped, 1.0);
 }
 

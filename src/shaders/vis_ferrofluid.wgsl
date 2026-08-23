@@ -256,15 +256,19 @@ fn calcNormal(p: vec3<f32>) -> vec3<f32> {
     );
 }
 
+fn ray_box_intersect(ro: vec3<f32>, rd: vec3<f32>, bmin: vec3<f32>, bmax: vec3<f32>) -> vec2<f32> {
+    let inv_d = 1.0 / (rd + select(vec3<f32>(1e-6), vec3<f32>(-1e-6), rd < vec3<f32>(0.0)));
+    let t0 = (bmin - ro) * inv_d;
+    let t1 = (bmax - ro) * inv_d;
+    let tmin = max(max(min(t0.x, t1.x), min(t0.y, t1.y)), min(t0.z, t1.z));
+    let tmax = min(min(max(t0.x, t1.x), max(t0.y, t1.y)), max(t0.z, t1.z));
+    return vec2<f32>(tmin, tmax);
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let uv = in.uv * 2.0 - 1.0;
-
-    // Fix aspect ratio with safe division guard, and invert Y
-    var aspect = 1.7777;
-    let dy = abs(dpdy(in.uv.y));
-    let dx = abs(dpdx(in.uv.x));
-    if (dx > 0.0001 && dy > 0.0001) { aspect = dy / dx; }
+    let aspect = max(audio.aspect_ratio, 0.1);
     let p = vec2<f32>(uv.x * aspect, -uv.y);
 
     // Camera looking slightly down at the puddle
@@ -285,35 +289,45 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var hit = false;
     var final_p = vec3<f32>(0.0);
 
-    // Adaptive Lipschitz step scale from the loudest channel this frame
-    var max_vu = 0.0;
-    for (var i = 0u; i < min(audio.num_channels, 12u); i++) {
-        max_vu = max(max_vu, get_vu(i));
-    }
-    g_step_scale = min(0.45, 1.0 / sqrt(1.0 + 20.25 * max_vu * max_vu));
+    // Puddle bounding box early-out (rejects empty sky/background in 0 steps)
+    let bound_min = vec3<f32>(-PUDDLE_RADIUS - 0.4, -0.65, -PUDDLE_RADIUS - 0.4);
+    let bound_max = vec3<f32>(PUDDLE_RADIUS + 0.4, 1.60, PUDDLE_RADIUS + 0.4);
+    let t_bounds = ray_box_intersect(ro, rd, bound_min, bound_max);
 
-    for (var i = 0; i < MAX_MARCH_STEPS; i++) {
-        let p_current = ro + rd * t;
+    let ray_hits_bounds = t_bounds.y >= max(t_bounds.x, 0.0) && t_bounds.x < MAX_MARCH_DIST;
 
-        // Sky early-out: the fluid is a heightfield with max displacement ~1.5
-        // above its base plane; any ray above that and still rising can never hit
-        if (rd.y > 0.0 && p_current.y > 1.6) { break; }
+    if ray_hits_bounds {
+        t = max(t_bounds.x, 0.0);
+        let t_end = min(t_bounds.y, MAX_MARCH_DIST);
 
-        let map_data = map(p_current, true);
-        let d = map_data.d;
-
-        // Accumulate glow with distance attenuation to prevent oversaturation on long rays
-        glow += map_data.glow * 0.05 / (1.0 + abs(d) * 20.0 + t * 0.5);
-
-        if d < HIT_THRESHOLD {
-            hit = true;
-            final_p = p_current;
-            break;
+        // Adaptive Lipschitz step scale from the loudest channel this frame
+        var max_vu = 0.0;
+        for (var i = 0u; i < min(audio.num_channels, 12u); i++) {
+            max_vu = max(max_vu, get_vu(i));
         }
+        g_step_scale = min(0.45, 1.0 / sqrt(1.0 + 20.25 * max_vu * max_vu));
 
-        t += d;
-        if t > MAX_MARCH_DIST {
-            break;
+        for (var i = 0; i < MAX_MARCH_STEPS; i++) {
+            let p_current = ro + rd * t;
+
+            if (rd.y > 0.0 && p_current.y > 1.6) { break; }
+
+            let map_data = map(p_current, true);
+            let d = map_data.d;
+
+            // Accumulate glow with distance attenuation
+            glow += map_data.glow * 0.05 / (1.0 + abs(d) * 20.0 + t * 0.5);
+
+            if d < HIT_THRESHOLD {
+                hit = true;
+                final_p = p_current;
+                break;
+            }
+
+            t += d;
+            if t > t_end {
+                break;
+            }
         }
     }
 

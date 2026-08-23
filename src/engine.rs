@@ -1398,8 +1398,8 @@ fn load_obj_mesh(
 }
 
 pub(crate) fn generate_synthwave_racer_mesh() -> (Vec<Vertex>, Vec<u32>) {
-    let mut vertices = Vec::new();
-    let mut indices = Vec::new();
+    let mut vertices = Vec::with_capacity(32768);
+    let mut indices = Vec::with_capacity(49152);
 
     // 1. Continuous Desert / Terrain Ground Planes (mat = 0.5)
     let ground_w = 200.0;
@@ -1460,6 +1460,10 @@ pub(crate) fn generate_synthwave_racer_mesh() -> (Vec<Vertex>, Vec<u32>) {
         0.0,
         3.0
     );
+
+    // 3b. Solid Supercar Underbody Floor Pan & Interior Cabin Firewall (mat = 8.0 carbon)
+    cyber_add_box(&mut vertices, &mut indices, [0.0, 0.35, 5.2], [1.70, 0.04, 3.8], 0.0, 8.0);
+    cyber_add_box(&mut vertices, &mut indices, [0.0, 0.44, 4.8], [1.30, 0.16, 1.8], 0.0, 8.0);
 
     // 4. Roadside Streetlamps & Palm Trees (.OBJ Meshes)
     for i in 0..12 {
@@ -1674,8 +1678,8 @@ impl VulkanEngine {
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
             format: surface_format,
-            width: size.width,
-            height: size.height,
+            width: size.width.max(1),
+            height: size.height.max(1),
             present_mode,
             alpha_mode: surface_caps.alpha_modes[0],
             view_formats: vec![],
@@ -1952,6 +1956,7 @@ impl VulkanEngine {
                 22 => include_str!("shaders/vis_neon_room.wgsl"),
                 23 => include_str!("shaders/vis_lyrics.wgsl"),
                 24 => include_str!("shaders/vis_tape_head.wgsl"),
+                25 => include_str!("shaders/vis_spectrum_led.wgsl"),
                 _ => include_str!("shaders/vis_spectrum.wgsl"),
             }
         };
@@ -2883,7 +2888,7 @@ impl VulkanEngine {
 
         let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Depth Texture"),
-            size: wgpu::Extent3d { width: config.width, height: config.height, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d { width: config.width.max(1), height: config.height.max(1), depth_or_array_layers: 1 },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -3468,15 +3473,15 @@ impl VulkanEngine {
     pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
         if new_size.width > 0 && new_size.height > 0 {
             self.size = new_size;
-            self.config.width = new_size.width;
-            self.config.height = new_size.height;
+            self.config.width = new_size.width.max(1);
+            self.config.height = new_size.height.max(1);
             if let Some(surface) = &self.surface {
                 surface.configure(&self.device, &self.config);
             }
             
             let depth_texture = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("Depth Texture"),
-                size: wgpu::Extent3d { width: self.config.width, height: self.config.height, depth_or_array_layers: 1 },
+                size: wgpu::Extent3d { width: self.config.width.max(1), height: self.config.height.max(1), depth_or_array_layers: 1 },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
@@ -3500,16 +3505,6 @@ impl VulkanEngine {
 
     pub fn update(&mut self, state: &AppState, dt: f32) {
         self.frame_count = self.frame_count.wrapping_add(1);
-        
-        // Accumulate matrix digital rain speed phases per channel
-        for i in 0..32 {
-            let ch_vu = if i < state.channel_vus.len() {
-                state.channel_vus[i]
-            } else {
-                0.0
-            };
-            self.channel_phases[i] += dt * (1.0 + ch_vu * 5.0);
-        }
         
         // Exponential moving average to smooth CPU scheduling time jitter
         let alpha = 0.03f64;
@@ -3910,9 +3905,10 @@ impl VulkanEngine {
         }
         
         // GPU spectrum is consumed only by the firesim compute (id 6) and the
-        // resynth compute (requires_resynth, id 8) — skip the 256KB upload otherwise
+        // resynth compute (requires_resynth, id 8) — skip the 256KB upload otherwise,
+        // and only upload when new audio FFT data arrived (history_dirty)
         if state.gpu_fft && (vis_def.id == 6 || vis_def.requires_resynth) {
-            if !state.gpu_spectrum_data.is_empty() {
+            if !state.gpu_spectrum_data.is_empty() && history_dirty {
                 self.queue.write_buffer(&self._gpu_spectrum_buffer, 0, bytemuck::cast_slice(&state.gpu_spectrum_data));
             }
         }
@@ -5734,6 +5730,14 @@ impl VulkanEngine {
                                                         ui.label(format!("{:.1}s ({:02}:{:02})", state.duration_seconds, mins, secs));
                                                     }
                                                     ui.end_row();
+
+                                                    // 8. Synchronized Lyrics Source (if loaded)
+                                                    if let Some(lyrics) = &state.lyrics {
+                                                        let lrc_name = lyrics.file_name.as_deref().unwrap_or("Synchronized LRC");
+                                                        ui.label(egui::RichText::new("Lyrics:").color(egui::Color32::from_rgb(160, 180, 200)));
+                                                        render_smooth_marquee(ui, lrc_name, 14.0, false);
+                                                        ui.end_row();
+                                                    }
                                                 });
 
                                             if state.audio_tracks.len() > 1 {
@@ -6487,8 +6491,10 @@ impl VulkanEngine {
                     glam::Vec3::new(0.0, 0.0, 1.0),
                 )
             } else if state.visualizer_mode == 14 {
+                let cam_y = if aspect < 1.0 { 1.65 } else { 1.50 };
+                let cam_z = if aspect < 1.0 { 0.2 } else { 0.6 };
                 glam::Mat4::look_at_rh(
-                    glam::Vec3::new(0.0, 1.50, 0.6),
+                    glam::Vec3::new(0.0, cam_y, cam_z),
                     glam::Vec3::new(0.0, 0.95, 14.0),
                     glam::Vec3::new(0.0, 1.0, 0.0),
                 )

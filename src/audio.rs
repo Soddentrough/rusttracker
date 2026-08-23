@@ -2948,7 +2948,6 @@ fn run_dummy(
     let stop_token_decoder = stop_token.clone();
     
     std::thread::spawn(move || {
-        let mut target_playback_time: Option<f64> = None;
         while !stop_token_decoder.load(std::sync::atomic::Ordering::Relaxed) {
             let mut chunk = loop {
                 if stop_token_decoder.load(std::sync::atomic::Ordering::Relaxed) {
@@ -2958,10 +2957,8 @@ fn run_dummy(
                     if let Some(mix_req) = state.audio_mix_request.take() {
                         if state.audio_tracks.len() > 1 && !mix_req.is_empty() {
                             let play_pos = state.current_seconds;
-                            let hist_pos = (play_pos - 1.2).max(0.0);
                             if audio_source.set_active_audio_tracks(&mix_req).is_ok() {
-                                audio_source.set_position_seconds(hist_pos);
-                                target_playback_time = if hist_pos < play_pos - 0.01 { Some(play_pos) } else { None };
+                                audio_source.set_position_seconds(play_pos);
                                 state.active_audio_tracks = audio_source.get_active_audio_tracks();
                                 if let Some(&first_idx) = state.active_audio_tracks.first() {
                                     state.selected_audio_track = first_idx;
@@ -2984,9 +2981,17 @@ fn run_dummy(
                                 };
                                 state.osd_text = Some(mix_desc);
                                 state.osd_timer = 3.0;
-                                state.lookahead_queue.clear();
+
+                                while let Some((t, _)) = state.lookahead_queue.back() {
+                                    if *t >= play_pos {
+                                        state.lookahead_queue.pop_back();
+                                    } else {
+                                        break;
+                                    }
+                                }
                                 state.lookahead_sample_buffer.clear();
-                                state.lookahead_buffer_start_time = hist_pos;
+                                state.lookahead_buffer_start_time = play_pos;
+
                                 while let Ok(c) = ready_rx_for_decoder.try_recv() {
                                     let _ = free_tx_for_decoder.try_send(c);
                                 }
@@ -2996,10 +3001,8 @@ fn run_dummy(
                     if let Some(track_idx) = state.audio_track_request.take() {
                         if state.audio_tracks.len() > 1 && track_idx < state.audio_tracks.len() && track_idx != state.selected_audio_track {
                             let play_pos = state.current_seconds;
-                            let hist_pos = (play_pos - 1.2).max(0.0);
                             if audio_source.select_audio_track(track_idx).is_ok() {
-                                audio_source.set_position_seconds(hist_pos);
-                                target_playback_time = if hist_pos < play_pos - 0.01 { Some(play_pos) } else { None };
+                                audio_source.set_position_seconds(play_pos);
                                 state.selected_audio_track = track_idx;
                                 state.active_audio_tracks = vec![track_idx];
                                 state.num_channels = audio_source.get_num_channels();
@@ -3013,9 +3016,17 @@ fn run_dummy(
                                 };
                                 state.osd_text = Some(display_title);
                                 state.osd_timer = 3.0;
-                                state.lookahead_queue.clear();
+
+                                while let Some((t, _)) = state.lookahead_queue.back() {
+                                    if *t >= play_pos {
+                                        state.lookahead_queue.pop_back();
+                                    } else {
+                                        break;
+                                    }
+                                }
                                 state.lookahead_sample_buffer.clear();
-                                state.lookahead_buffer_start_time = hist_pos;
+                                state.lookahead_buffer_start_time = play_pos;
+
                                 while let Ok(c) = ready_rx_for_decoder.try_recv() {
                                     let _ = free_tx_for_decoder.try_send(c);
                                 }
@@ -3024,7 +3035,6 @@ fn run_dummy(
                     }
                     if let Some(pos) = state.seek_request.take() {
                         audio_source.set_position_seconds(pos);
-                        target_playback_time = None;
                         state.current_seconds = pos;
                         state.track_ended = false;
                         state.seek_epoch += 1;
@@ -3115,17 +3125,6 @@ fn run_dummy(
                 push_chunk_lookahead_slices(&mut state, &chunk, frames_read, hardware_channels, sample_rate);
             }
 
-            if let Some(target_t) = target_playback_time {
-                let chunk_dur = frames_read as f64 / sample_rate as f64;
-                let chunk_end = chunk_start_seconds + chunk_dur;
-                if chunk_end < target_t - 0.01 {
-                    let _ = free_tx_for_decoder.try_send(chunk);
-                    continue;
-                } else {
-                    target_playback_time = None;
-                }
-            }
-            
             let mut chunk_to_send = chunk;
             loop {
                 if stop_token_decoder.load(std::sync::atomic::Ordering::Relaxed) {
@@ -3136,10 +3135,8 @@ fn run_dummy(
                     if let Some(mix_req) = state.audio_mix_request.take() {
                         if state.audio_tracks.len() > 1 && !mix_req.is_empty() {
                             let play_pos = state.current_seconds;
-                            let hist_pos = (play_pos - 1.2).max(0.0);
                             if audio_source.set_active_audio_tracks(&mix_req).is_ok() {
-                                audio_source.set_position_seconds(hist_pos);
-                                target_playback_time = if hist_pos < play_pos - 0.01 { Some(play_pos) } else { None };
+                                audio_source.set_position_seconds(play_pos);
                                 state.active_audio_tracks = audio_source.get_active_audio_tracks();
                                 if let Some(&first_idx) = state.active_audio_tracks.first() {
                                     state.selected_audio_track = first_idx;
@@ -3162,9 +3159,17 @@ fn run_dummy(
                                 };
                                 state.osd_text = Some(mix_desc);
                                 state.osd_timer = 3.0;
-                                state.lookahead_queue.clear();
+
+                                while let Some((t, _)) = state.lookahead_queue.back() {
+                                    if *t >= play_pos {
+                                        state.lookahead_queue.pop_back();
+                                    } else {
+                                        break;
+                                    }
+                                }
                                 state.lookahead_sample_buffer.clear();
-                                state.lookahead_buffer_start_time = hist_pos;
+                                state.lookahead_buffer_start_time = play_pos;
+
                                 while let Ok(c) = ready_rx_for_decoder.try_recv() {
                                     let _ = free_tx_for_decoder.try_send(c);
                                 }
@@ -3175,10 +3180,8 @@ fn run_dummy(
                     if let Some(track_idx) = state.audio_track_request.take() {
                         if state.audio_tracks.len() > 1 && track_idx < state.audio_tracks.len() && track_idx != state.selected_audio_track {
                             let play_pos = state.current_seconds;
-                            let hist_pos = (play_pos - 1.2).max(0.0);
                             if audio_source.select_audio_track(track_idx).is_ok() {
-                                audio_source.set_position_seconds(hist_pos);
-                                target_playback_time = if hist_pos < play_pos - 0.01 { Some(play_pos) } else { None };
+                                audio_source.set_position_seconds(play_pos);
                                 state.selected_audio_track = track_idx;
                                 state.active_audio_tracks = vec![track_idx];
                                 state.num_channels = audio_source.get_num_channels();
@@ -3192,9 +3195,17 @@ fn run_dummy(
                                 };
                                 state.osd_text = Some(display_title);
                                 state.osd_timer = 3.0;
-                                state.lookahead_queue.clear();
+
+                                while let Some((t, _)) = state.lookahead_queue.back() {
+                                    if *t >= play_pos {
+                                        state.lookahead_queue.pop_back();
+                                    } else {
+                                        break;
+                                    }
+                                }
                                 state.lookahead_sample_buffer.clear();
-                                state.lookahead_buffer_start_time = hist_pos;
+                                state.lookahead_buffer_start_time = play_pos;
+
                                 while let Ok(c) = ready_rx_for_decoder.try_recv() {
                                     let _ = free_tx_for_decoder.try_send(c);
                                 }
@@ -3774,7 +3785,6 @@ where
     let stop_token_decoder = stop_token.clone();
     
     std::thread::spawn(move || {
-        let mut target_playback_time: Option<f64> = None;
         while !stop_token_decoder.load(std::sync::atomic::Ordering::Relaxed) {
             let mut chunk = loop {
                 if stop_token_decoder.load(std::sync::atomic::Ordering::Relaxed) {
@@ -3784,10 +3794,8 @@ where
                     if let Some(mix_req) = state.audio_mix_request.take() {
                         if state.audio_tracks.len() > 1 && !mix_req.is_empty() {
                             let play_pos = state.current_seconds;
-                            let hist_pos = (play_pos - 1.2).max(0.0);
                             if audio_source.set_active_audio_tracks(&mix_req).is_ok() {
-                                audio_source.set_position_seconds(hist_pos);
-                                target_playback_time = if hist_pos < play_pos - 0.01 { Some(play_pos) } else { None };
+                                audio_source.set_position_seconds(play_pos);
                                 state.active_audio_tracks = audio_source.get_active_audio_tracks();
                                 if let Some(&first_idx) = state.active_audio_tracks.first() {
                                     state.selected_audio_track = first_idx;
@@ -3810,9 +3818,17 @@ where
                                 };
                                 state.osd_text = Some(mix_desc);
                                 state.osd_timer = 3.0;
-                                state.lookahead_queue.clear();
+
+                                while let Some((t, _)) = state.lookahead_queue.back() {
+                                    if *t >= play_pos {
+                                        state.lookahead_queue.pop_back();
+                                    } else {
+                                        break;
+                                    }
+                                }
                                 state.lookahead_sample_buffer.clear();
-                                state.lookahead_buffer_start_time = hist_pos;
+                                state.lookahead_buffer_start_time = play_pos;
+
                                 while let Ok(c) = ready_rx_for_decoder.try_recv() {
                                     let _ = free_tx_for_decoder.try_send(c);
                                 }
@@ -3822,10 +3838,8 @@ where
                     if let Some(track_idx) = state.audio_track_request.take() {
                         if state.audio_tracks.len() > 1 && track_idx < state.audio_tracks.len() && track_idx != state.selected_audio_track {
                             let play_pos = state.current_seconds;
-                            let hist_pos = (play_pos - 1.2).max(0.0);
                             if audio_source.select_audio_track(track_idx).is_ok() {
-                                audio_source.set_position_seconds(hist_pos);
-                                target_playback_time = if hist_pos < play_pos - 0.01 { Some(play_pos) } else { None };
+                                audio_source.set_position_seconds(play_pos);
                                 state.selected_audio_track = track_idx;
                                 state.active_audio_tracks = vec![track_idx];
                                 state.num_channels = audio_source.get_num_channels();
@@ -3839,9 +3853,17 @@ where
                                 };
                                 state.osd_text = Some(display_title);
                                 state.osd_timer = 3.0;
-                                state.lookahead_queue.clear();
+
+                                while let Some((t, _)) = state.lookahead_queue.back() {
+                                    if *t >= play_pos {
+                                        state.lookahead_queue.pop_back();
+                                    } else {
+                                        break;
+                                    }
+                                }
                                 state.lookahead_sample_buffer.clear();
-                                state.lookahead_buffer_start_time = hist_pos;
+                                state.lookahead_buffer_start_time = play_pos;
+
                                 while let Ok(c) = ready_rx_for_decoder.try_recv() {
                                     let _ = free_tx_for_decoder.try_send(c);
                                 }
@@ -3850,7 +3872,6 @@ where
                     }
                     if let Some(pos) = state.seek_request.take() {
                         audio_source.set_position_seconds(pos);
-                        target_playback_time = None;
                         state.current_seconds = pos;
                         state.track_ended = false;
                         state.seek_epoch += 1;
@@ -3941,17 +3962,6 @@ where
                 push_chunk_lookahead_slices(&mut state, &chunk, frames_read, hardware_channels, sample_rate);
             }
 
-            if let Some(target_t) = target_playback_time {
-                let chunk_dur = frames_read as f64 / sample_rate as f64;
-                let chunk_end = chunk_start_seconds + chunk_dur;
-                if chunk_end < target_t - 0.01 {
-                    let _ = free_tx_for_decoder.try_send(chunk);
-                    continue;
-                } else {
-                    target_playback_time = None;
-                }
-            }
-            
             let mut chunk_to_send = chunk;
             loop {
                 if stop_token_decoder.load(std::sync::atomic::Ordering::Relaxed) {
@@ -3962,10 +3972,8 @@ where
                     if let Some(mix_req) = state.audio_mix_request.take() {
                         if state.audio_tracks.len() > 1 && !mix_req.is_empty() {
                             let play_pos = state.current_seconds;
-                            let hist_pos = (play_pos - 1.2).max(0.0);
                             if audio_source.set_active_audio_tracks(&mix_req).is_ok() {
-                                audio_source.set_position_seconds(hist_pos);
-                                target_playback_time = if hist_pos < play_pos - 0.01 { Some(play_pos) } else { None };
+                                audio_source.set_position_seconds(play_pos);
                                 state.active_audio_tracks = audio_source.get_active_audio_tracks();
                                 if let Some(&first_idx) = state.active_audio_tracks.first() {
                                     state.selected_audio_track = first_idx;
@@ -3988,9 +3996,17 @@ where
                                 };
                                 state.osd_text = Some(mix_desc);
                                 state.osd_timer = 3.0;
-                                state.lookahead_queue.clear();
+
+                                while let Some((t, _)) = state.lookahead_queue.back() {
+                                    if *t >= play_pos {
+                                        state.lookahead_queue.pop_back();
+                                    } else {
+                                        break;
+                                    }
+                                }
                                 state.lookahead_sample_buffer.clear();
-                                state.lookahead_buffer_start_time = hist_pos;
+                                state.lookahead_buffer_start_time = play_pos;
+
                                 while let Ok(c) = ready_rx_for_decoder.try_recv() {
                                     let _ = free_tx_for_decoder.try_send(c);
                                 }
@@ -4001,10 +4017,8 @@ where
                     if let Some(track_idx) = state.audio_track_request.take() {
                         if state.audio_tracks.len() > 1 && track_idx < state.audio_tracks.len() && track_idx != state.selected_audio_track {
                             let play_pos = state.current_seconds;
-                            let hist_pos = (play_pos - 1.2).max(0.0);
                             if audio_source.select_audio_track(track_idx).is_ok() {
-                                audio_source.set_position_seconds(hist_pos);
-                                target_playback_time = if hist_pos < play_pos - 0.01 { Some(play_pos) } else { None };
+                                audio_source.set_position_seconds(play_pos);
                                 state.selected_audio_track = track_idx;
                                 state.active_audio_tracks = vec![track_idx];
                                 state.num_channels = audio_source.get_num_channels();
@@ -4018,9 +4032,17 @@ where
                                 };
                                 state.osd_text = Some(display_title);
                                 state.osd_timer = 3.0;
-                                state.lookahead_queue.clear();
+
+                                while let Some((t, _)) = state.lookahead_queue.back() {
+                                    if *t >= play_pos {
+                                        state.lookahead_queue.pop_back();
+                                    } else {
+                                        break;
+                                    }
+                                }
                                 state.lookahead_sample_buffer.clear();
-                                state.lookahead_buffer_start_time = hist_pos;
+                                state.lookahead_buffer_start_time = play_pos;
+
                                 while let Ok(c) = ready_rx_for_decoder.try_recv() {
                                     let _ = free_tx_for_decoder.try_send(c);
                                 }

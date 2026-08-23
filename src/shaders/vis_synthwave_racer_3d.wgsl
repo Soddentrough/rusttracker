@@ -31,15 +31,35 @@ fn hash2(p: vec2<f32>) -> f32 { return fract(sin(dot(p, vec2<f32>(12.9898, 78.23
 fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
     var out: VertexOutput3D;
     
-    let bass_pulse = clamp(audio.spectrum[2].x * 1.3, 0.0, 1.0);
+    let bass_pulse = clamp(audio.spectrum[2].x * 1.5, 0.0, 1.2);
     let mat_id = in.tex_coords.x;
     
     var pos = in.position;
 
-    // Smooth lane steering sway without vertical hopping
+    // Smooth lane steering sway with dynamic roll banking & pitch squat
     if (mat_id >= 2.5 && mat_id <= 9.5) {
-        let drift_sway = sin(audio.smooth_time * 0.45) * 0.25;
-        pos.x += drift_sway;
+        let sway_phase = audio.smooth_time * 0.45;
+        let sway = sin(sway_phase) * 0.35 + sin(sway_phase * 0.5) * 0.15;
+        
+        // Roll banking (leaning naturally into turns)
+        let roll = -cos(sway_phase) * 0.055;
+        let cos_r = cos(roll);
+        let sin_r = sin(roll);
+        let rel_xy = vec2<f32>(pos.x, pos.y - 0.40);
+        let rot_x = rel_xy.x * cos_r - rel_xy.y * sin_r;
+        var rot_y = rel_xy.x * sin_r + rel_xy.y * cos_r;
+
+        // Pitch squat (front dips, rear squats on bass acceleration)
+        let pitch = -bass_pulse * 0.020;
+        let cos_p = cos(pitch);
+        let sin_p = sin(pitch);
+        let rel_yz = vec2<f32>(rot_y, pos.z - 5.2);
+        rot_y = rel_yz.x * cos_p - rel_yz.y * sin_p;
+        let rot_z = rel_yz.x * sin_p + rel_yz.y * cos_p;
+
+        pos.x = sway + rot_x;
+        pos.y = 0.40 + rot_y;
+        pos.z = 5.2 + rot_z;
     }
 
     // Roadside Palm Trees & Streetlamps Streaming Continuously Past the Camera (-Z direction)
@@ -67,8 +87,9 @@ fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
 
 @fragment
 fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
-    let bass_pulse = clamp(audio.spectrum[2].x * 1.4, 0.0, 1.0);
-    let treble_pulse = clamp(audio.spectrum[80].x * 1.6, 0.0, 1.0);
+    let bass_pulse = clamp(audio.spectrum[2].x * 1.5, 0.0, 1.2);
+    let mid_pulse = clamp(audio.spectrum[25].x * 1.6, 0.0, 1.2);
+    let treble_pulse = clamp(audio.spectrum[80].x * 1.8, 0.0, 1.2);
     let mat_id = in.mat;
 
     let v = normalize(vec3<f32>(0.0, 2.0, -4.6) - in.world_pos);
@@ -80,11 +101,11 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
 
     if (mat_id < 0.2) {
         // =========================================================================
-        // 0.0: WET SPECULAR ASPHALT HIGHWAY (Forward Motion)
+        // 0.0: WET SPECULAR ASPHALT HIGHWAY (Forward Motion + Dynamic Lights)
         // =========================================================================
         let speed_z = in.world_pos.z + audio.smooth_time * 75.0;
 
-        // Subtle wet asphalt micro-grain texture
+        // Wet asphalt micro-grain texture
         let grain = hash2(vec2<f32>(floor(in.world_pos.x * 20.0), floor(speed_z * 20.0))) * 0.015;
         var asphalt = vec3<f32>(0.012, 0.010, 0.020) + vec3<f32>(grain);
 
@@ -102,30 +123,45 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
         let sun_refl_z = smoothstep(12.0, 220.0, in.world_pos.z);
         let sun_refl_c = vec3<f32>(1.0, 0.25, 0.45) * sun_refl_x * sun_refl_z * (0.8 + bass_pulse * 0.5);
 
-        // Brilliant Cyan Nitrous Ground Illumination (directly trailing car exhaust)
+        // Current car sway position
+        let car_sway = sin(audio.smooth_time * 0.45) * 0.35 + sin(audio.smooth_time * 0.225) * 0.15;
+        let rel_car_x = in.world_pos.x - car_sway;
         let rel_car_z = in.world_pos.z - 5.2;
+
+        // Dynamic Neon Chassis Underglow (Cyan to Neon Pink audio reactive glow)
+        let underglow_mask = smoothstep(1.9, 0.2, length(vec2<f32>(rel_car_x * 1.25, rel_car_z * 0.45)));
+        let underglow_c = mix(vec3<f32>(0.0, 0.95, 1.0), vec3<f32>(1.0, 0.04, 0.65), bass_pulse) * (2.4 + bass_pulse * 2.2);
+        let underglow = underglow_c * underglow_mask;
+
+        // Brilliant Cyan Nitrous Ground Illumination (directly trailing exhaust tips)
         var nitrous_pool = vec3<f32>(0.0);
-        if (rel_car_z < 0.0 && rel_car_z > -10.0 && dx < 1.8) {
-            let n_falloff = smoothstep(-10.0, 0.0, rel_car_z) * smoothstep(1.8, 0.0, dx);
+        if (rel_car_z < 0.0 && rel_car_z > -10.0 && abs(rel_car_x) < 1.8) {
+            let n_falloff = smoothstep(-10.0, 0.0, rel_car_z) * smoothstep(1.8, 0.0, abs(rel_car_x));
             nitrous_pool = vec3<f32>(0.0, 0.92, 1.0) * n_falloff * (1.6 + bass_pulse * 2.5);
         }
 
         // Quad Taillight Red Ground Reflection Streak
         var taillight_streak = vec3<f32>(0.0);
-        if (rel_car_z < 0.0 && rel_car_z > -22.0 && dx < 2.0) {
-            let t_falloff = smoothstep(-22.0, 0.0, rel_car_z) * smoothstep(2.0, 0.0, dx);
+        if (rel_car_z < 0.0 && rel_car_z > -22.0 && abs(rel_car_x) < 2.0) {
+            let t_falloff = smoothstep(-22.0, 0.0, rel_car_z) * smoothstep(2.0, 0.0, abs(rel_car_x));
             taillight_streak = vec3<f32>(0.99, 0.02, 0.02) * t_falloff * 1.5;
         }
 
-        // Headlight Forward Beam Cone (Soft and realistic specular falloff)
+        // Headlight Forward Beam Cone (Soft specular falloff)
         var headlight_cone = vec3<f32>(0.0);
         if (rel_car_z > 0.0 && rel_car_z < 65.0) {
             let beam_w = 2.0 + rel_car_z * 0.10;
-            let beam_f = smoothstep(beam_w, 0.0, dx) * smoothstep(65.0, 0.0, rel_car_z);
+            let beam_f = smoothstep(beam_w, 0.0, abs(rel_car_x)) * smoothstep(65.0, 0.0, rel_car_z);
             headlight_cone = vec3<f32>(0.95, 0.92, 0.80) * beam_f * 0.35;
         }
 
-        color = asphalt + yellow_line + white_line + sun_refl_c + nitrous_pool + taillight_streak + headlight_cone;
+        // Dynamic Streetlamp Light Cones streaming past the roadway
+        let lamp_period = 26.0;
+        let lamp_rel_z = ((in.world_pos.z + audio.smooth_time * 75.0 + 13.0) % lamp_period) - (lamp_period * 0.5);
+        let lamp_dist = length(vec2<f32>(in.world_pos.x - 7.5, lamp_rel_z));
+        let lamp_spot = smoothstep(6.5, 0.0, lamp_dist) * vec3<f32>(1.0, 0.92, 0.75) * 0.45;
+
+        color = asphalt + yellow_line + white_line + sun_refl_c + underglow + nitrous_pool + taillight_streak + headlight_cone + lamp_spot;
     } else if (mat_id < 0.8) {
         // =========================================================================
         // 0.5: MIDDLEGROUND SYNTHWAVE OCEAN / WATER EXPANSE (Motion Parallax)
@@ -135,10 +171,8 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
         let ground_horizon = vec3<f32>(0.14, 0.02, 0.15);
         let ground_base = mix(ground_dark, ground_horizon, smoothstep(10.0, 320.0, dist_z));
 
-        // Slow wave drift (15.0 units/sec = 20% of road speed 75.0, creating motion parallax)
+        // Wave drift
         let water_z = in.world_pos.z + audio.smooth_time * 15.0;
-        
-        // Multi-frequency smooth undulating ocean ripples (no aliased dots)
         let wave1 = sin(in.world_pos.x * 0.08 + audio.smooth_time * 1.0) * cos(water_z * 0.06);
         let wave2 = sin(in.world_pos.x * 0.20 - water_z * 0.12 + audio.smooth_time * 1.6);
         let wave_h = (wave1 * 0.6 + wave2 * 0.4);
@@ -148,7 +182,6 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
         let sunset_spec = mix(vec3<f32>(0.85, 0.05, 0.45), vec3<f32>(1.0, 0.65, 0.15), smoothstep(20.0, 240.0, dist_z));
         let ocean_sheen = sunset_spec * (0.12 + 0.35 * smoothstep(-0.2, 0.8, wave_h)) * refl_falloff * (0.8 + bass_pulse * 0.6);
 
-        // Subtle glowing magenta wave crests with distance anti-aliasing fade
         let crest_fade = smoothstep(220.0, 15.0, dist_z);
         let crest = smoothstep(0.60, 0.95, wave_h) * vec3<f32>(0.98, 0.02, 0.52) * 0.65 * crest_fade;
 
@@ -175,10 +208,10 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
         let spec = pow(max(dot(n, h), 0.0), 24.0);
         let fresnel = pow(1.0 - max(dot(n, v), 0.0), 2.5);
 
-        let body_base = vec3<f32>(0.92, 0.05, 0.03);
+        let body_base = vec3<f32>(0.94, 0.05, 0.03);
         let diffuse_term = body_base * (0.35 + diff * 0.45 + rear_light * 0.45);
-        let spec_highlight = vec3<f32>(1.0, 0.85, 0.85) * spec * 1.2;
-        let rim_glow = vec3<f32>(1.0, 0.15, 0.45) * fresnel * 0.8;
+        let spec_highlight = vec3<f32>(1.0, 0.85, 0.85) * spec * 1.25;
+        let rim_glow = vec3<f32>(1.0, 0.15, 0.45) * fresnel * (0.8 + bass_pulse * 0.4);
         color = diffuse_term + spec_highlight + rim_glow;
     } else if (mat_id < 4.5) {
         // 4.0: Cockpit Canopy Glass with Glowing Vector Green HUD
@@ -208,7 +241,8 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
         // 9.0: DUAL NITROUS EXHAUST TIPS & CYAN PLASMA FLAME BLAST
         // =========================================================================
         let flame = sin(audio.smooth_time * 65.0) * 0.25 + 0.75;
-        color = vec3<f32>(0.0, 0.95, 1.0) * (2.2 + bass_pulse * 2.5) * flame;
+        let crackle = hash1(fract(audio.smooth_time * 120.0) + in.world_pos.y) * 0.3;
+        color = vec3<f32>(0.0, 0.95, 1.0) * (2.2 + bass_pulse * 2.8 + crackle) * flame;
     } else if (mat_id < 10.8) {
         // 10.0 / 10.5: Roadside Palm Trees
         let is_crown = mat_id > 10.2;
@@ -226,17 +260,38 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
             color = vec3<f32>(0.15, 0.08, 0.22);
         }
     } else if (mat_id < 13.0) {
-        // 12.0 / 12.5: Distant Horizon Skyscrapers (.OBJ Meshes)
+        // 12.0 / 12.5: Distant Horizon Skyscrapers with Gentle, Subtle Window Lights
         let is_spire = mat_id > 12.2;
         if (is_spire) {
-            let blink = step(0.5, sin(audio.smooth_time * 4.0));
-            color = vec3<f32>(1.0, 0.05, 0.02) * blink * 3.5;
+            let blink = step(0.65, sin(audio.smooth_time * 2.5 + hash1(floor(in.world_pos.x * 0.1)) * 6.0));
+            color = vec3<f32>(1.0, 0.15, 0.08) * blink * 1.8;
         } else {
-            let win_u = fract(in.world_pos.x * 0.25);
-            let win_v = fract(in.world_pos.y * 0.25);
-            let win_lit = step(0.4, win_u) * step(0.4, win_v) * step(0.35, hash2(vec2<f32>(floor(in.world_pos.x * 0.25), floor(in.world_pos.y * 0.25))));
-            let win_col = mix(vec3<f32>(0.0, 0.85, 0.98), vec3<f32>(0.98, 0.02, 0.52), hash1(floor(in.world_pos.x * 0.3)));
-            color = vec3<f32>(0.015, 0.005, 0.03) + win_col * win_lit * 2.2;
+            // Coarse, well-defined window bays
+            let win_u = fract(in.world_pos.x * 0.18);
+            let win_v = fract(in.world_pos.y * 0.12);
+            let bldg_cell = vec2<f32>(floor(in.world_pos.x * 0.18), floor(in.world_pos.y * 0.12));
+            let rnd_win = hash2(bldg_cell);
+
+            // Soft window shape with beveled edges
+            let win_shape = smoothstep(0.18, 0.28, win_u) * smoothstep(0.82, 0.72, win_u)
+                          * smoothstep(0.18, 0.30, win_v) * smoothstep(0.82, 0.70, win_v);
+
+            // Gentle occupancy: ~55% of windows illuminated
+            let is_lit = step(0.45, rnd_win);
+
+            // Palette: Warm incandescent amber, gentle pastel cyan, soft rose
+            let col_warm = vec3<f32>(1.00, 0.86, 0.55); // Warm incandescent
+            let col_cyan = vec3<f32>(0.40, 0.88, 0.96); // Soft mint/cyan
+            let col_rose = vec3<f32>(0.96, 0.50, 0.72); // Gentle rose
+            
+            var win_col = mix(col_warm, col_cyan, step(0.65, rnd_win));
+            win_col = mix(win_col, col_rose, step(0.85, rnd_win));
+
+            // Gentle, subtle breathing variation
+            let gentle_glow = 0.55 + 0.15 * sin(audio.smooth_time * 1.2 + rnd_win * 10.0);
+            let bldg_base = vec3<f32>(0.020, 0.010, 0.035);
+
+            color = bldg_base + win_col * win_shape * is_lit * gentle_glow;
         }
     } else {
         color = vec3<f32>(0.1, 0.1, 0.1);

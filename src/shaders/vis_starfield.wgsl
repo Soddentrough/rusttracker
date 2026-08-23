@@ -61,19 +61,17 @@ fn get_star_color(temp: f32) -> vec3<f32> {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let uv = in.uv * 2.0 - 1.0;
-    let dx = dpdx(in.uv.x);
-    let dy = dpdy(in.uv.y);
-    let aspect = dy / max(dx, 0.00001);
-    let safe_aspect = select(1.0, aspect, aspect > 0.0001 || aspect < -0.0001);
-    let p = vec2<f32>(uv.x, -uv.y / safe_aspect);
+    let aspect = max(audio.aspect_ratio, 0.1);
+    let p = vec2<f32>((in.uv.x * 2.0 - 1.0) * aspect, -(in.uv.y * 2.0 - 1.0));
 
     // --- Audio analysis ---
-    let bass = max(audio.spectrum[0].x, audio.spectrum[1].x);
-    let mid = (audio.spectrum[10].x + audio.spectrum[20].x + audio.spectrum[30].x) * 0.33;
+    let bass = clamp(max(audio.spectrum[0].x, audio.spectrum[1].x) * 1.5, 0.0, 2.5);
+    let mid = clamp((audio.spectrum[10].x + audio.spectrum[20].x + audio.spectrum[30].x) * 0.33, 0.0, 2.0);
+    let treble = clamp((audio.spectrum[60].x + audio.spectrum[80].x) * 0.5, 0.0, 2.0);
 
-    // Flight speed is a smooth continuous forward motion (no judder)
-    let speed = audio.smooth_time * 0.15;
+    // Bass-driven hyperspace warp speed boost
+    let warp_boost = smoothstep(0.25, 1.6, bass);
+    let speed = audio.smooth_time * (0.14 + warp_boost * 0.40);
 
     var color = vec3<f32>(0.0);
 
@@ -81,20 +79,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let bg_t = clamp(p.y * 0.5 + 0.5, 0.0, 1.0);
     color = mix(vec3<f32>(0.002, 0.003, 0.012), vec3<f32>(0.008, 0.005, 0.018), bg_t);
 
-    // --- Nebula clouds ---
-    // Slow drifting nebula in the background with static, consistent colors
-    let neb_uv = p * 1.2 + vec2<f32>(audio.smooth_time * 0.01, audio.smooth_time * 0.015);
+    // --- Nebula clouds (reacts to mid & treble audio energy) ---
+    let neb_uv = p * 0.9 + vec2<f32>(audio.smooth_time * 0.01, audio.smooth_time * 0.015);
     let nebula_shape = fbm(neb_uv * 2.5);
-    let neb_mask = smoothstep(0.3, 0.65, nebula_shape);
+    let neb_mask = smoothstep(0.28, 0.68, nebula_shape);
 
-    let neb_col1 = vec3<f32>(0.12, 0.02, 0.15);
-    let neb_col2 = vec3<f32>(0.02, 0.05, 0.18);
-    let nebula_color = mix(neb_col1, neb_col2, smoothstep(-1.0, 1.0, p.x)) * neb_mask * 0.4;
+    let neb_col1 = vec3<f32>(0.16, 0.03, 0.24) * (1.0 + mid * 0.7);
+    let neb_col2 = vec3<f32>(0.02, 0.09, 0.28) * (1.0 + treble * 0.5);
+    let nebula_color = mix(neb_col1, neb_col2, smoothstep(-aspect, aspect, p.x)) * neb_mask * (0.35 + mid * 0.45);
     color += nebula_color;
 
     // --- 3D Flight Starfield ---
-    // Rotate the camera slowly
-    let p_rot = rotate2d(p, audio.smooth_time * 0.05);
+    let p_rot = rotate2d(p, audio.smooth_time * 0.04);
     
     let num_layers = 25.0;
     for (var i = 0.0; i < 1.0; i += 1.0 / num_layers) {
@@ -104,7 +100,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Scale UV by depth to create perspective
         let z_scale = z * 20.0 + 0.1;
         
-        // Offset each layer so grid structures don't overlap and form moiré patterns
+        // Offset each layer so grid structures don't overlap
         let layer_offset = hash22(vec2<f32>(i * 123.4, i * 567.8)) * 100.0;
         let cell_uv = p_rot * z_scale + layer_offset;
         let id = floor(cell_uv);
@@ -112,27 +108,25 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         
         // Random properties per cell
         let rnd = hash22(id + i * 133.0);
-        if (rnd.x > 0.15) { continue; } // 15% probability of a star in this cell
+        if (rnd.x > 0.16) { continue; } // Star density probability
         
-        // Fade in in the distance, fade out as they pass the camera
-        // Randomize the fade thresholds per-star so whole layers don't vanish uniformly
         let fade_offset = (rnd.x - 0.5) * 0.15;
-        let z_fade = smoothstep(0.0, 0.1 + fade_offset, z) * (1.0 - smoothstep(0.8 + fade_offset, 1.0, z));
+        let z_fade = smoothstep(0.0, 0.08 + fade_offset, z) * (1.0 - smoothstep(0.82 + fade_offset, 1.0, z));
         
-        // Position within the cell (kept away from edges to prevent clipping)
+        // Position within cell
         let star_pos = (rnd - 0.5) * 0.5;
-        let dist = length(gv - star_pos);
         
-        // Audio reactive size & glow
+        // Hyperspace warp stretch: stars stretch into radial streaks on heavy bass hits
+        let streak_len = 1.0 + warp_boost * 3.2 * (1.0 - z);
+        let d_vec = gv - star_pos;
+        let dist = length(vec2<f32>(d_vec.x, d_vec.y / streak_len));
+        
+        // Audio reactive size & glow per instrument channel
         let rnd_z = hash21(id + i * 77.0);
         var ch_vu = 0.0;
         
-        if (rnd_z > 0.5) {
-            // 50% of stars react violently to specific instrument channels
+        if (rnd_z > 0.45) {
             let num_ch = max(audio.num_channels, 1u);
-            
-            // For tracker files, skip the L and R master peak channels (index 0 and last)
-            // so we ONLY pick distinct instrument tracks.
             var num_inst = num_ch;
             var start_idx = 0u;
             if (num_ch > 2u) {
@@ -151,41 +145,28 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             else if comp == 2u { ch_vu = v_vec.z; }
             else { ch_vu = v_vec.w; }
             
-            // High threshold so stars only flash on distinct instrument hits
-            ch_vu = smoothstep(0.3, 0.9, ch_vu) * 2.0; 
-        } else {
-            // The other 50% are perfectly static
-            ch_vu = 0.0;
+            ch_vu = smoothstep(0.25, 0.85, ch_vu) * 2.2; 
         }
 
-        let pulse = 1.0 + ch_vu;
-        let base_size = 0.01 + rnd.y * 0.015;
-        let size = clamp(base_size * pulse, 0.0, 0.1); // Ensure size never exceeds cell bounds!
+        let pulse = 1.0 + ch_vu + warp_boost * 0.5;
+        let base_size = 0.012 + rnd.y * 0.016;
+        let size = clamp(base_size * pulse, 0.0, 0.12);
         
-        // Core and subtle glow
+        // Core and glow
         let core = 1.0 - smoothstep(size * 0.1, size, dist);
         
-        // Base glow + bright flash when channel plays
-        let base_glow = 0.0001 / (dist * dist + 0.0005);
-        let flash_glow = (ch_vu * 0.0005) / (dist * dist + 0.0002);
+        let base_glow = 0.00012 / (dist * dist + 0.0004);
+        let flash_glow = ((ch_vu + warp_boost * 0.8) * 0.0006) / (dist * dist + 0.0002);
         let glow = base_glow + flash_glow;
         
-        // Fade the glow out completely before hitting the cell boundary to eliminate hard square edges
         let cell_mask = (1.0 - smoothstep(0.25, 0.5, abs(gv.x))) * (1.0 - smoothstep(0.25, 0.5, abs(gv.y)));
-        
         let star_col = get_star_color(hash21(id + 30.0));
         
-        // Maintain consistent base brightness, no perspective-brightening multiplier
         let brightness = (core + glow) * cell_mask * z_fade;
-        
         color += star_col * brightness;
     }
 
-
-
-    // ACES tonemapping
+    // ACES tonemapping for crisp HDR star cores
     var final_col = aces_tonemap(color);
-    final_col = max(final_col, vec3<f32>(0.0));
-
     return vec4<f32>(final_col, 1.0);
 }

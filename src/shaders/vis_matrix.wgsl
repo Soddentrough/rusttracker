@@ -31,7 +31,6 @@ fn bellrand(seed: f32, range: f32) -> f32 {
 
 // --- Procedural 3x5 Bitmap Font Table ---
 // Authentic Matrix rain character set: half-width katakana + digits.
-// (At 3x5 resolution ﾖ/3 and ﾛ/0 share shapes, as they do in the film's font.)
 
 fn matrix_glyph_bitmap(ch: u32) -> u32 {
     switch ch {
@@ -95,8 +94,8 @@ fn matrix_glyph_bitmap(ch: u32) -> u32 {
 }
 
 fn draw_matrix_char(glyph_idx: u32, cell_frac: vec2<f32>) -> f32 {
-    let margin_x = 0.15;
-    let margin_y = 0.15;
+    let margin_x = 0.12;
+    let margin_y = 0.12;
     if cell_frac.x < margin_x || cell_frac.x > 1.0 - margin_x || cell_frac.y < margin_y || cell_frac.y > 1.0 - margin_y {
         return 0.0;
     }
@@ -108,7 +107,18 @@ fn draw_matrix_char(glyph_idx: u32, cell_frac: vec2<f32>) -> f32 {
     return f32((matrix_glyph_bitmap(glyph_idx) >> bit) & 1u);
 }
 
-// --- Active Channel VU Meter Lookup ---
+// --- Audio Data Sampling Helpers ---
+
+fn get_spectrum_bin(bin_idx: u32) -> f32 {
+    let safe_idx = min(bin_idx, 1023u);
+    let vec_idx = safe_idx / 4u;
+    let comp = safe_idx % 4u;
+    let v = audio.spectrum[vec_idx];
+    if comp == 0u { return v.x; }
+    if comp == 1u { return v.y; }
+    if comp == 2u { return v.z; }
+    return v.w;
+}
 
 fn get_channel_vu(ch_idx: u32) -> f32 {
     let vec_idx = ch_idx / 4u;
@@ -121,185 +131,207 @@ fn get_channel_vu(ch_idx: u32) -> f32 {
     return v.w;
 }
 
-fn get_channel_phase(ch_idx: u32) -> f32 {
-    let vec_idx = ch_idx / 4u;
-    let comp_idx = ch_idx % 4u;
-    if vec_idx >= 8u { return 0.0; }
-    let v = audio.channel_phases[vec_idx];
-    if comp_idx == 0u { return v.x; }
-    if comp_idx == 1u { return v.y; }
-    if comp_idx == 2u { return v.z; }
-    return v.w;
+fn get_column_energy(norm_x: f32, col_i: u32) -> f32 {
+    // Map normalized screen X (0..1) logarithmically across spectrum bins (1..180)
+    let bin_f = pow(norm_x, 1.25) * 160.0 + 1.0;
+    let bin0 = u32(clamp(floor(bin_f), 0.0, 255.0));
+    let bin1 = bin0 + 1u;
+    let frac = fract(bin_f);
+    let spec_val = mix(get_spectrum_bin(bin0), get_spectrum_bin(bin1), frac);
+
+    // If tracker/spatial multichannel is playing, also blend corresponding channel VU
+    var energy = spec_val * 0.9;
+    if audio.num_channels > 2u {
+        let ch_idx = col_i % audio.num_channels;
+        let ch_vu = get_channel_vu(ch_idx);
+        energy = mix(energy, ch_vu * 2.5, 0.45);
+    } else if audio.num_channels == 2u {
+        let ch_idx = select(0u, 1u, norm_x > 0.5);
+        let ch_vu = get_channel_vu(ch_idx);
+        energy = mix(energy, ch_vu * 2.0, 0.35);
+    }
+    return clamp(energy, 0.0, 3.5);
 }
 
-// --- Constants ---
-
-const CELL_ASPECT: f32 = 1.5; // Taller than wide (height / width)
+const CELL_ASPECT: f32 = 1.45; // Height-to-width ratio for code cells
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    // Audio reactivities
-    let bass = max(audio.spectrum[0].x, audio.spectrum[1].x) * 1.5;
-    let mid = (audio.spectrum[8].x + audio.spectrum[16].x + audio.spectrum[24].x) * 0.5;
-    let treble = max(audio.spectrum[32].x, audio.spectrum[64].x) * 2.0;
+    let aspect = max(audio.aspect_ratio, 0.1);
+    let time = audio.smooth_time;
 
-    let time = audio.smooth_time * 0.8;
-    var color = vec3<f32>(0.0);
+    // --- Global Frequency Analysis ---
+    let bass = clamp(max(get_spectrum_bin(0u), get_spectrum_bin(1u)) * 1.3 + get_spectrum_bin(2u) * 0.7, 0.0, 2.5);
+    let mid = clamp((get_spectrum_bin(8u) + get_spectrum_bin(16u) + get_spectrum_bin(28u)) * 0.4, 0.0, 2.0);
+    let treble = clamp(max(get_spectrum_bin(48u), get_spectrum_bin(80u)) * 1.6, 0.0, 2.5);
 
-    // Loop over 3 depth layers (Background, Midground, Foreground) to simulate 3D depth
-    // with strictly controlled column density to prevent overlapping character clutter.
+    // --- Ambient Cyberspace Background & Sub-Bass Depth Haze ---
+    let center_uv = in.uv - vec2<f32>(0.5, 0.5);
+    let center_dist = length(center_uv * vec2<f32>(aspect, 1.0));
+    let vignette = smoothstep_r(1.6, 0.2, center_dist);
+
+    var ambient_bg = vec3<f32>(0.003, 0.018, 0.008) * (1.0 + bass * 0.8) * vignette;
+
+    // Floor impact bounce glow (bottom of screen)
+    let floor_glow = smoothstep(0.75, 1.0, in.uv.y) * vec3<f32>(0.01, 0.06, 0.02) * (1.0 + bass * 1.5);
+    ambient_bg += floor_glow;
+
+    var total_color = ambient_bg;
+
+    // --- 3-Layer Parallax Digital Rain Curtain ---
+    // Layer 0: Distant background (dense, small, slow drift, soft emerald)
+    // Layer 1: Midground (medium, balanced speed, strong frequency response)
+    // Layer 2: Foreground (large, fast, white-hot laser heads, intense bloom)
     for (var layer = 0; layer < 3; layer = layer + 1) {
-        var scale = 1.0;
-        var layer_density = 0.05;
-        var layer_audio_mult = 1.0;
-        var color_tint = vec3<f32>(0.05, 1.0, 0.05);
+        var base_cols = 40.0;
+        var layer_density = 0.55;
+        var layer_speed_base = 3.5;
+        var layer_speed_react = 4.0;
+        var layer_alpha_mult = 1.0;
+        var color_tint = vec3<f32>(0.04, 0.85, 0.15);
 
         if layer == 0 {
-            // Background: tiny, dense, reacts to treble/high frequencies
-            scale = 1.8; // 45 columns
-            layer_density = 0.07;
-            layer_audio_mult = 0.3 + treble * 1.2;
-            color_tint = vec3<f32>(0.02, 0.8, 0.02);
+            // Distant Background
+            base_cols = 60.0;
+            layer_density = 0.65;
+            layer_speed_base = 2.0;
+            layer_speed_react = 2.0;
+            layer_alpha_mult = 0.35;
+            color_tint = vec3<f32>(0.015, 0.40, 0.08);
         } else if layer == 1 {
-            // Midground: medium, reacts to mid frequencies (vocals/melody)
-            scale = 1.4; // 35 columns
-            layer_density = 0.05;
-            layer_audio_mult = 0.5 + mid * 1.0;
-            color_tint = vec3<f32>(0.04, 0.95, 0.04);
+            // Midground
+            base_cols = 44.0;
+            layer_density = 0.55;
+            layer_speed_base = 3.8;
+            layer_speed_react = 4.5;
+            layer_alpha_mult = 0.70;
+            color_tint = vec3<f32>(0.05, 0.88, 0.18);
         } else {
-            // Foreground: larger, sparse, reacts to bass hits
-            scale = 1.0; // 25 columns
-            layer_density = 0.03;
-            layer_audio_mult = 0.6 + bass * 1.5;
-            color_tint = vec3<f32>(0.08, 1.0, 0.08);
+            // Foreground Focus
+            base_cols = 28.0;
+            layer_density = 0.40;
+            layer_speed_base = 6.0;
+            layer_speed_react = 7.0;
+            layer_alpha_mult = 1.0;
+            color_tint = vec3<f32>(0.12, 1.0, 0.28);
         }
 
-        // Adapt grid to screen size so columns aren't stretched
-        let num_cols = floor(25.0 * scale * audio.aspect_ratio);
-        let num_rows = max(8.0, floor(num_cols / (audio.aspect_ratio * CELL_ASPECT)));
+        let num_cols = floor(base_cols * aspect);
+        let num_rows = max(10.0, floor(num_cols / (aspect * CELL_ASPECT)));
 
-        // Compute layer UV coordinates
-        var layer_uv = in.uv;
-        let layer_offset_x = hash11(f32(layer) * 73.17) * 0.5;
-        let layer_offset_y = hash11(f32(layer) * 91.31) * 0.3;
-        layer_uv.x = (layer_uv.x - 0.5) * num_cols + num_cols * 0.5 + layer_offset_x;
-        layer_uv.y = (layer_uv.y - 0.5) * num_rows + num_rows * 0.5 + layer_offset_y;
+        // Grid coordinates with sub-layer parallax offsets
+        let offset_x = hash11(f32(layer) * 51.37) * 0.7;
+        let offset_y = hash11(f32(layer) * 83.19) * 0.5;
+        let grid_x = in.uv.x * num_cols + offset_x;
+        let grid_y = in.uv.y * num_rows + offset_y;
 
-        let col = floor(layer_uv.x);
-        let row = floor(layer_uv.y);
-        let cell_frac = fract(layer_uv);
+        let col_i = u32(floor(grid_x));
+        let row_i = floor(grid_y);
+        let cell_frac = vec2<f32>(fract(grid_x), fract(grid_y));
 
-        // Procedural column hash seed
-        let col_seed = col * 127.1 + f32(layer) * 311.7;
+        let norm_col_x = clamp(f32(col_i) / num_cols, 0.0, 1.0);
+        let col_energy = get_column_energy(norm_col_x, col_i);
 
-        // Density Check
-        let col_active = hash11(col_seed + 0.5);
-        if col_active > layer_density { continue; }
+        let col_seed = f32(col_i) * 137.19 + f32(layer) * 283.41;
 
-        // Associate column with a tracker channel (guard: no channels when no file loaded)
-        let ch_idx = u32(abs(col)) % max(audio.num_channels, 1u);
-        let ch_vu = get_channel_vu(ch_idx);
-
-        // Falling speed: must be strictly constant to prevent vertical jitter
-        let strip_speed = 2.0 + bellrand(col_seed + 1.0, 6.0);
-        let strip_offset = hash11(col_seed + 2.0) * 200.0;
-
-        // Cycle phases (draw, erase, gap)
-        let draw_length = num_rows;
-        let erase_speed_ratio = 0.5;
-        let erase_length = num_rows / erase_speed_ratio;
-        let gap_length = 4.0 + hash11(col_seed + 5.0) * 20.0;
-        let cycle_length = draw_length + erase_length + gap_length;
-
-        // Linear progression over time using per-channel CPU phase integration
-        let ch_phase = get_channel_phase(ch_idx) * 0.8;
-        let cycle_pos = (ch_phase * strip_speed + strip_offset) % cycle_length;
-
-        var spinner_y = 0.0;
-        var visible = false;
-        var is_spinner = false;
-
-        if cycle_pos < draw_length {
-            spinner_y = cycle_pos;
-            visible = row >= 0.0 && row <= spinner_y && row < num_rows;
-            is_spinner = abs(row - floor(spinner_y)) < 1.0;
-        } else if cycle_pos < draw_length + erase_length {
-            let erase_pos = (cycle_pos - draw_length) * erase_speed_ratio;
-            spinner_y = erase_pos;
-            visible = row >= 0.0 && row > erase_pos && row < num_rows;
-            is_spinner = false;
+        // Density check: audio energy dynamically excites dormant columns
+        let col_active_thresh = hash11(col_seed + 0.3);
+        let active_boost = col_energy * 0.25 + bass * 0.15;
+        if col_active_thresh > (layer_density + active_boost) {
+            continue;
         }
 
-        if !visible { continue; }
+        // Drop fall timing & speed
+        let col_speed_rand = bellrand(col_seed + 1.7, 3.5);
+        let drop_speed = layer_speed_base + col_speed_rand + col_energy * layer_speed_react;
+        let drop_offset = hash11(col_seed + 3.1) * 300.0;
 
-        // Glyph selection
+        // Stream cycle loop (falling down the screen)
+        let trail_len = 6.0 + hash11(col_seed + 5.9) * 8.0 + col_energy * 8.0 + bass * 3.0;
+        let cycle_len = num_rows + trail_len + 4.0;
+        let stream_head = (time * drop_speed + drop_offset) % cycle_len;
+
+        let head_y = stream_head - 2.0;
+        let dist_to_head = head_y - row_i;
+
+        // Visibility test for stream
+        if dist_to_head < 0.0 || dist_to_head > trail_len || row_i < 0.0 || row_i >= num_rows {
+            continue;
+        }
+
+        let is_lead_head = dist_to_head < 1.0;
+
+        // --- Glyph Selection & Audio Glitch / Cipher Scramble ---
         var glyph_idx = 0u;
-
-        if is_spinner {
-            // Leading spinner glyph cycles rapidly, glitching on treble transients
-            let spin_time = time * 15.0 + treble * 8.0;
-            let glyph_hash = hash31(vec3<f32>(col, f32(layer), floor(spin_time)));
-            glyph_idx = u32(glyph_hash * 55.0);
+        if is_lead_head {
+            // Rapidly spinning lead glyph
+            let head_spin_rate = 12.0 + col_energy * 10.0 + treble * 15.0;
+            let spin_step = floor(time * head_spin_rate);
+            let g_hash = hash31(vec3<f32>(f32(col_i), f32(layer), spin_step));
+            glyph_idx = u32(g_hash * 55.0);
         } else {
-            // Mostly static, but occasional slow flips
-            let spin_chance = hash21(vec2<f32>(col * 17.3 + row * 31.7, f32(layer)));
-            if spin_chance < 0.04 {
-                let spin_rate = 2.0 + hash21(vec2<f32>(col, row + f32(layer) * 100.0)) * 4.0;
-                let spin_time = time * spin_rate;
-                let glyph_hash = hash31(vec3<f32>(col, row, floor(spin_time) + f32(layer)));
-                glyph_idx = u32(glyph_hash * 55.0);
+            // Stable trailing glyph with cipher scramble on treble transients
+            let scramble_chance = hash21(vec2<f32>(f32(col_i) * 11.3 + row_i * 29.7, f32(layer)));
+            let is_scrambling = (treble > 0.6 && col_energy > 0.8) || (scramble_chance < 0.03);
+
+            if is_scrambling {
+                let spin_rate = 8.0 + hash11(col_seed + 9.1) * 12.0;
+                let spin_step = floor(time * spin_rate);
+                let g_hash = hash31(vec3<f32>(f32(col_i), row_i, spin_step + f32(layer) * 13.0));
+                glyph_idx = u32(g_hash * 55.0);
             } else {
-                let cycle = floor((ch_phase * strip_speed + strip_offset) / cycle_length);
-                let glyph_hash = hash31(vec3<f32>(col, row, cycle + f32(layer) * 7.0));
-                glyph_idx = u32(glyph_hash * 55.0);
+                let stream_cycle = floor((time * drop_speed + drop_offset) / cycle_len);
+                let g_hash = hash31(vec3<f32>(f32(col_i), row_i, stream_cycle * 17.0 + f32(layer) * 31.0));
+                glyph_idx = u32(g_hash * 55.0);
             }
         }
 
-        // Draw glyph shape
+        // Draw glyph shape from procedural font bitmap
         let glyph_shape = draw_matrix_char(glyph_idx, cell_frac);
-        if glyph_shape < 0.05 { continue; }
 
-        // Brightness and decay calculation
-        var brightness = 1.0;
+        // Soft phosphor glow inside the character cell
+        let cell_center_dist = length(cell_frac - vec2<f32>(0.5, 0.5));
+        let cell_halo = smoothstep_r(0.65, 0.0, cell_center_dist) * 0.18;
 
-        // Tail decay relative to drawing head position
-        let head_y = select(cycle_pos, num_rows, cycle_pos >= draw_length);
-        if is_spinner {
-            // Audio intensity only affects the leading spinner head, keeping the trails stable
-            let spinner_reactive = 1.0 + ch_vu * 1.5 + (layer_audio_mult - 1.0) * 1.2;
-            brightness = brightness * 1.8 * spinner_reactive;
+        // --- Luminance & Reactive Color Output ---
+        var cell_emission = vec3<f32>(0.0);
+
+        if is_lead_head {
+            // White-hot HDR lead laser head flaring intensely with audio energy
+            let head_intensity = (2.2 + col_energy * 3.5 + bass * 1.5) * layer_alpha_mult;
+            let head_color = mix(
+                vec3<f32>(0.7, 1.0, 0.75),
+                vec3<f32>(2.2, 3.2, 2.2),
+                clamp(col_energy * 0.6 + bass * 0.4, 0.0, 1.0)
+            );
+            cell_emission = head_color * (glyph_shape * 1.2 + cell_halo * 1.8) * head_intensity;
         } else {
-            let dist_to_head = head_y - row;
-            if dist_to_head > 0.0 {
-                // Static decay rate to keep trailing characters consistently green without oversaturating to white
-                brightness = brightness * exp(-dist_to_head * 0.15);
-            }
+            // Exponential trail decay with vibrant audio-driven illumination pulses
+            let decay_rate = 0.16 / (1.0 + col_energy * 0.4);
+            let trail_decay = exp(-dist_to_head * decay_rate);
+            let trail_pulse = (1.0 + col_energy * 1.4 + bass * 0.6) * layer_alpha_mult;
+
+            let trail_brightness = (glyph_shape + cell_halo * trail_decay) * trail_decay * trail_pulse;
+            cell_emission = color_tint * trail_brightness * 1.6;
         }
 
-        let alpha = glyph_shape * brightness;
-
-        var cell_color = vec3<f32>(0.0);
-        if is_spinner {
-            // White-hot lead head reacting to beats
-            cell_color = vec3<f32>(0.7, 1.0, 0.7) * alpha;
-        } else {
-            // Classic decaying green trail (completely stable and clean)
-            cell_color = color_tint * alpha;
-        }
-
-        color = color + cell_color;
+        total_color += cell_emission;
     }
 
-    // Clamp values before post-processing
-    color = min(color, vec3<f32>(1.0));
+    // --- High-Quality ACES Tonemapping (Soft HDR to SDR mapping) ---
+    var final_color = aces_tonemap(total_color);
 
-    // Apply retro CRT post-processing (scanlines, vignette, screen noise)
+    // --- CRT Scanlines, Phosphor Noise & Vignette Post-Processing ---
     var crt_settings = get_default_crt();
-    crt_settings.scanline_intensity = 0.25;
-    crt_settings.noise_intensity = 0.015;
-    crt_settings.flicker_intensity = 0.02;
+    crt_settings.scanline_intensity = 0.20;
+    crt_settings.noise_intensity = 0.012;
+    crt_settings.flicker_intensity = 0.015;
+    crt_settings.vignette_scale = 1.35;
+    crt_settings.vignette_softness = 0.75;
+    crt_settings.phosphor_tint = vec3<f32>(0.92, 1.05, 0.95);
 
-    color = apply_crt_effects(color, in.uv, in.clip_position.xy, audio.smooth_time, crt_settings);
+    final_color = apply_crt_effects(final_color, in.uv, in.clip_position.xy, audio.smooth_time, crt_settings);
 
-    return vec4<f32>(color, 1.0);
+    return vec4<f32>(final_color, 1.0);
 }
+

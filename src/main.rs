@@ -42,7 +42,7 @@ struct Args {
     #[arg(long, default_value_t = false)]
     fullscreen: bool,
 
-    #[arg(long)]
+    #[arg(long, num_args = 0..=1, default_missing_value = "")]
     vis: Option<String>,
 
     #[arg(long, default_value_t = false)]
@@ -111,10 +111,16 @@ fn main() -> Result<(), Box<dyn Error>> {
     }));
 
     let args = Args::parse();
-    if args.list_vis {
+    let should_list_vis = args.list_vis || match args.vis.as_deref() {
+        Some("") | Some("list") | Some("help") => true,
+        _ => false,
+    };
+    if should_list_vis {
         println!("{:<4} {:<24} {:<28} {}", "ID", "Short Name", "Name", "Description");
         println!("{}", "-".repeat(90));
-        for v in crate::state::VISUALIZERS {
+        let mut visualizers: Vec<_> = crate::state::VISUALIZERS.iter().collect();
+        visualizers.sort_by_key(|v| v.id);
+        for v in visualizers {
             let short_name = v.filename
                 .strip_prefix("vis_")
                 .unwrap_or(v.filename)

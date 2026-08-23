@@ -301,7 +301,7 @@ pub fn find_sidecar_lrc_path(audio_path: &str) -> Option<PathBuf> {
         }
     }
 
-    // Candidate 5: Directory scans with stem matching
+    // Candidate 5: Directory scans in media folder and local lyrics/ subfolder
     if let (Some(parent), Some(stem)) = (path.parent(), path.file_stem()) {
         let stem_raw = stem.to_string_lossy();
         let stem_clean = clean_song_stem(&stem_raw);
@@ -310,12 +310,9 @@ pub fn find_sidecar_lrc_path(audio_path: &str) -> Option<PathBuf> {
             parent.to_path_buf(),
             parent.join("lyrics"),
             parent.join("Lyrics"),
-            parent.join("karaoke"),
-            parent.join("Karaoke"),
-            PathBuf::from("/home/naoki/src/ComfyUI/output/karaoke_package"),
         ];
 
-        for dir in search_dirs {
+        for dir in &search_dirs {
             if let Ok(entries) = fs::read_dir(dir) {
                 for entry in entries.flatten() {
                     let entry_path = entry.path();
@@ -442,33 +439,22 @@ mod tests {
 
     #[test]
     fn test_karaoke_directory_sidecar_loading() {
-        let sample_flac = "/home/naoki/src/ComfyUI/output/karaoke_package/Tom Odell - Another Love.flac";
-        if std::path::Path::new(sample_flac).exists() {
-            let lyrics = load_lyrics_for_file(sample_flac);
-            assert!(lyrics.is_some(), "Failed to load sidecar lyrics for sample FLAC");
-            let lyrics = lyrics.unwrap();
-            assert!(!lyrics.lines.is_empty(), "Lyrics lines should not be empty");
-            println!("Successfully loaded {} lyric lines for {}", lyrics.lines.len(), sample_flac);
-        }
+        let temp_dir = std::env::temp_dir().join(format!("rusttracker_test_{}", std::process::id()));
+        let _ = fs::create_dir_all(&temp_dir);
+        let flac_path = temp_dir.join("Test Artist - Test Song (Karaoke).flac");
+        let lrc_path = temp_dir.join("Test Artist - Test Song.lrc");
+        let _ = fs::write(&flac_path, b"dummy audio content");
+        let _ = fs::write(&lrc_path, "[00:10.00] Test line\n[00:20.00] Second line\n");
 
-        let dir = "/home/naoki/src/ComfyUI/output/karaoke_package";
-        if let Ok(entries) = std::fs::read_dir(dir) {
-            let mut checked_count = 0;
-            for entry in entries.flatten() {
-                let p = entry.path();
-                if let Some(ext) = p.extension() {
-                    if ext.eq_ignore_ascii_case("flac") {
-                        let path_str = p.to_string_lossy();
-                        if let Some(lyrics) = load_lyrics_for_file(&path_str) {
-                            assert!(!lyrics.lines.is_empty());
-                            checked_count += 1;
-                        }
-                    }
-                }
-            }
-            println!("Verified sidecar lyrics loading for {} FLAC files in {}", checked_count, dir);
-            assert!(checked_count > 0);
-        }
+        let lyrics = load_lyrics_for_file(&flac_path.to_string_lossy());
+        assert!(lyrics.is_some(), "Failed to load sidecar lyrics for temp file");
+        let lyrics = lyrics.unwrap();
+        assert_eq!(lyrics.lines.len(), 2);
+        assert_eq!(lyrics.lines[0].text, "Test line");
+
+        let _ = fs::remove_file(&flac_path);
+        let _ = fs::remove_file(&lrc_path);
+        let _ = fs::remove_dir(&temp_dir);
     }
 
     #[test]
