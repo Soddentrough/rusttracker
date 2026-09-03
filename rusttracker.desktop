@@ -7,4 +7,4 @@ Icon=rusttracker
 Terminal=false
 Type=Application
 Categories=AudioVideo;Audio;
-MimeType=audio/x-mod;audio/x-s3m;audio/x-xm;audio/x-it;
+MimeType=audio/x-mod;audio/x-s3m;audio/x-xm;audio/x-it;audio/x-stm;audio/x-669;audio/x-med;audio/x-okt;audio/x-mptm;audio/flac;audio/x-flac;audio/mpeg;audio/mp3;audio/x-wav;audio/wav;audio/ogg;audio/x-ogg;audio/opus;audio/x-opus;audio/aac;audio/mp4;audio/x-m4a;audio/midi;audio/x-midi;audio/x-aiff;audio/x-ms-wma;video/mp4;video/x-matroska;video/webm;video/x-msvideo;video/quicktime;audio/x-scpls;audio/x-mpegurl;application/vnd.apple.mpegurl;

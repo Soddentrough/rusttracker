@@ -150,36 +150,19 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     let wave_height = clamp(abs(in.hit_val) * 2.0, 0.0, 1.0);
     let bloom_boost = 1.0 + wave_height * 0.8;
 
-    // Red/blue chromatic aberration coordinate offsets
-    let offset_r = vec2<f32>(0.0005, 0.0003);
-    let offset_b = vec2<f32>(-0.0005, -0.0003);
-
-    let fwidth_uv = fwidth(uv_g * grid_res) + 0.0001;
+    // Clamp derivative to avoid singularities/aliasing across steep peak triangle facets
+    let fwidth_uv = max(fwidth(uv_g * grid_res), vec2<f32>(0.0005, 0.0005));
 
     // Precalculate inverse circle of confusion terms
     let inv_coc_05 = 1.0 / (1.0 + total_coc * 0.5);
     let inv_coc_02 = 1.0 / (1.0 + total_coc * 0.2);
     let inv_coc_01 = 1.0 / (1.0 + total_coc * 0.1);
 
-    // Red Channel Grid
-    let uv_r = uv_g + offset_r;
-    let grid_r = abs(fract(uv_r * grid_res - 0.5) - 0.5) / fwidth_uv;
-    let line_r = min(grid_r.x, grid_r.y) / (1.0 + total_coc);
-    let wire_r = get_wire(line_r, inv_coc_05, inv_coc_02, inv_coc_01, bloom_boost);
-
-    // Green/Amber Channel Grid (center)
-    let grid_g = abs(fract(uv_g * grid_res - 0.5) - 0.5) / fwidth_uv;
-    let line_g = min(grid_g.x, grid_g.y) / (1.0 + total_coc);
-    let wire_g = get_wire(line_g, inv_coc_05, inv_coc_02, inv_coc_01, bloom_boost);
-
-    // Blue Channel Grid
-    let uv_b = uv_g + offset_b;
-    let grid_b = abs(fract(uv_b * grid_res - 0.5) - 0.5) / fwidth_uv;
-    let line_b = min(grid_b.x, grid_b.y) / (1.0 + total_coc);
-    let wire_b = get_wire(line_b, inv_coc_05, inv_coc_02, inv_coc_01, bloom_boost);
-
-    // Combine channels to get a shifted sub-pixel wireframe vector
-    let base_wire = vec3<f32>(wire_r, wire_g, wire_b);
+    // Continuous anti-aliased wireframe calculation
+    let grid = abs(fract(uv_g * grid_res - 0.5) - 0.5) / fwidth_uv;
+    let line_dist = min(grid.x, grid.y) / (1.0 + total_coc);
+    let wire = get_wire(line_dist, inv_coc_05, inv_coc_02, inv_coc_01, bloom_boost);
+    let base_wire = vec3<f32>(wire);
 
     // Warm amber phosphor color palette
     let amber_lo = vec3<f32>(0.6, 0.18, 0.02);
@@ -197,32 +180,14 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     let front_fade = 1.0 - smoothstep(0.80, 1.0, in.uv.y);
     let boundary_fade = edge_fade * depth_fade * front_fade;
 
-    // Base color with glowing wireframe (and chromatic aberration)
+    // Base color with glowing wireframe
     var color = line_amber * base_wire * age_fade * boundary_fade * 1.6;
 
     // Ambient CRT screen glow (phosphor background glow)
     let ambient_glow = vec3<f32>(0.02, 0.01, 0.003) * bezel * boundary_fade;
     color += ambient_glow;
 
-    // Scanlines (wider 3-pixel period scanlines, reactive to brightness)
-    let brightness = dot(color, vec3<f32>(0.299, 0.587, 0.114));
-    let scanline_strength = mix(0.24, 0.03, clamp(brightness * 2.0, 0.0, 1.0));
-    let scanline = 1.0 - scanline_strength + scanline_strength * cos(in.clip_position.y * (3.14159 / 1.5));
-    color *= scanline;
-
-    // Aperture grille sub-pixel phosphor mask
-    let mask_x = i32(in.clip_position.x) % 3;
-    var phosphor_mask = vec3<f32>(0.75, 0.75, 0.75);
-    if (mask_x == 0) {
-        phosphor_mask = vec3<f32>(1.2, 0.8, 0.8);
-    } else if (mask_x == 1) {
-        phosphor_mask = vec3<f32>(0.8, 1.2, 0.8);
-    } else {
-        phosphor_mask = vec3<f32>(0.8, 0.8, 1.2);
-    }
-    color *= phosphor_mask;
-
-    // Realistic CRT glass reflection overlay (added after scanlines/phosphor mask)
+    // Realistic CRT glass reflection overlay
     let norm = normalize(vec3<f32>(crt_uv * 0.18, 1.0));
     let light_source = normalize(vec3<f32>(-0.4, 0.7, -0.6));
     let reflection_spec = pow(max(dot(norm, light_source), 0.0), 32.0) * 0.08;
@@ -233,9 +198,9 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     // Bezel fade
     color *= bezel;
 
-    // Analog noise (vignetted by bezel and boundary_fade)
-    let noise_val = hash12(in.clip_position.xy + fract(audio.smooth_time) * 100.0);
-    let noise_color = vec3<f32>(0.8, 0.35, 0.05) * noise_val * 0.025 * bezel * boundary_fade;
+    // Subtle analog noise
+    let noise_val = hash12(in.clip_position.xy);
+    let noise_color = vec3<f32>(0.8, 0.35, 0.05) * noise_val * 0.008 * bezel * boundary_fade;
     color += noise_color;
 
     // Tonemapping

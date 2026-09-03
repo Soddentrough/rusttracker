@@ -111,12 +111,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     }));
 
     let args = Args::parse();
-    let should_list_vis = args.list_vis || match args.vis.as_deref() {
-        Some("") | Some("list") | Some("help") => true,
-        _ => false,
-    };
+    let should_list_vis = args.list_vis || matches!(args.vis.as_deref(), Some("") | Some("list") | Some("help"));
     if should_list_vis {
-        println!("{:<4} {:<24} {:<28} {}", "ID", "Short Name", "Name", "Description");
+        println!("{:<4} {:<24} {:<28} Description", "ID", "Short Name", "Name");
         println!("{}", "-".repeat(90));
         let mut visualizers: Vec<_> = crate::state::VISUALIZERS.iter().collect();
         visualizers.sort_by_key(|v| v.id);
@@ -146,11 +143,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         
         let mut history_changed = false;
         for path in &args.file {
-            if path.starts_with("http") {
-                if !state.url_history.iter().any(|(u, _)| u == path) {
-                    state.url_history.push((path.clone(), "Network Stream".to_string()));
-                    history_changed = true;
-                }
+            if path.starts_with("http")
+                && !state.url_history.iter().any(|(u, _)| u == path) {
+                state.url_history.push((path.clone(), "Network Stream".to_string()));
+                history_changed = true;
             }
         }
         if history_changed {
@@ -220,14 +216,14 @@ fn main() -> Result<(), Box<dyn Error>> {
             eprintln!("App error: {:?}", err);
         }
     } else {
-        pollster::block_on(run_gui(app_state, initial_stream, args.fullscreen, args.gpu_fft, args.bench, args.mic));
+        pollster::block_on(run_gui(app_state, initial_stream, args.fullscreen, args.gpu_fft, args.bench, args.mic))?;
     }
 
     Ok(())
 }
 
 #[allow(unused_variables, unused_assignments)]
-async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audio::PlaybackHandle>, is_fullscreen: bool, use_gpu_fft: bool, bench: Option<u32>, is_mic_launch: bool) {
+async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audio::PlaybackHandle>, is_fullscreen: bool, use_gpu_fft: bool, bench: Option<u32>, is_mic_launch: bool) -> Result<(), Box<dyn Error>> {
     if use_gpu_fft {
         let mut state = app_state.lock().unwrap();
         state.gpu_fft = true;
@@ -247,7 +243,22 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
             event_loop_builder.with_x11();
         }
     }
-    let event_loop = event_loop_builder.build().unwrap();
+    let event_loop = match event_loop_builder.build() {
+        Ok(el) => el,
+        Err(err) => {
+            #[cfg(target_os = "linux")]
+            {
+                eprintln!("[warn] Failed to initialize display backend ({:?}). Retrying default display backend...", err);
+                EventLoop::builder().build().map_err(|e| {
+                    anyhow::anyhow!("Failed to initialize GUI display/window event loop: {:?}. Make sure a graphical display (X11 or Wayland) is available, or use a virtual display (e.g. xvfb-run).", e)
+                })?
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                return Err(anyhow::anyhow!("Failed to initialize window event loop: {:?}", err).into());
+            }
+        }
+    };
     
     let (icon_rgba, icon_width, icon_height) = {
         let image = image::load_from_memory(include_bytes!("../icon.png"))
@@ -375,11 +386,11 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                 };
 
                 // Process global hotkeys unless user is actively typing in a text dialog
-                if !is_typing {
-                    if let WindowEvent::KeyboardInput { event: kb_event, .. } = &event {
-                        if kb_event.state == ElementState::Pressed {
-                        if let PhysicalKey::Code(keycode) = kb_event.physical_key {
-                            match keycode {
+                if !is_typing
+                    && let WindowEvent::KeyboardInput { event: kb_event, .. } = &event
+                    && kb_event.state == ElementState::Pressed
+                    && let PhysicalKey::Code(keycode) = kb_event.physical_key {
+                    match keycode {
                                 WinitKeyCode::ArrowRight | WinitKeyCode::ArrowLeft | WinitKeyCode::Comma | WinitKeyCode::Period => {
                                     let mut state = app_state.lock().unwrap();
                                     let duration = state.duration_seconds.max(0.1);
@@ -665,9 +676,6 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                     }
                                 }
                             }
-                        }
-                        }
-                    }
                 }
 
                 if let WindowEvent::DroppedFile(path) = &event {
@@ -761,15 +769,14 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                             }
                         }
                         
-                        if state.track_ended {
-                            if state.load_request.is_none() {
-                                if state.playlist_index + 1 < state.playlist.len() {
-                                    state.track_ended = false;
-                                    state.playlist_index += 1;
-                                    state.load_request = Some(state.playlist[state.playlist_index].clone());
-                                } else {
-                                    state.is_paused = true;
-                                }
+                        if state.track_ended
+                            && state.load_request.is_none() {
+                            if state.playlist_index + 1 < state.playlist.len() {
+                                state.track_ended = false;
+                                state.playlist_index += 1;
+                                state.load_request = Some(state.playlist[state.playlist_index].clone());
+                            } else {
+                                state.is_paused = true;
                             }
                         }
                         
@@ -1087,7 +1094,7 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                 state.scrub_target_seconds = Some(target);
                                 
                                 if delta != 0.0 {
-                                    if state.osd_timer > 0.0 && state.osd_text.as_ref().map_or(false, |s| s.starts_with("Scrubbing")) {
+                                    if state.osd_timer > 0.0 && state.osd_text.as_ref().is_some_and(|s| s.starts_with("Scrubbing")) {
                                         state.cumulative_scrub += delta;
                                     } else {
                                         state.cumulative_scrub = delta;
@@ -1366,20 +1373,18 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                     }
                     
                     // Optional FPS limiter via RUSTTRACKER_FPS_LIMIT
-                    if let Ok(limit_str) = std::env::var("RUSTTRACKER_FPS_LIMIT") {
-                        if let Ok(target_fps) = limit_str.parse::<f32>() {
-                            if target_fps > 0.0 {
-                                let target_frame_time = Duration::from_secs_f32(1.0 / target_fps);
-                                let elapsed = now.elapsed();
-                                if elapsed < target_frame_time {
-                                    let sleep_time = target_frame_time.saturating_sub(elapsed);
-                                    if sleep_time > Duration::from_millis(1) {
-                                        std::thread::sleep(sleep_time - Duration::from_millis(1));
-                                    }
-                                    while now.elapsed() < target_frame_time {
-                                        std::hint::spin_loop();
-                                    }
-                                }
+                    if let Ok(limit_str) = std::env::var("RUSTTRACKER_FPS_LIMIT")
+                        && let Ok(target_fps) = limit_str.parse::<f32>()
+                        && target_fps > 0.0 {
+                        let target_frame_time = Duration::from_secs_f32(1.0 / target_fps);
+                        let elapsed = now.elapsed();
+                        if elapsed < target_frame_time {
+                            let sleep_time = target_frame_time.saturating_sub(elapsed);
+                            if sleep_time > Duration::from_millis(1) {
+                                std::thread::sleep(sleep_time - Duration::from_millis(1));
+                            }
+                            while now.elapsed() < target_frame_time {
+                                std::hint::spin_loop();
                             }
                         }
                     }
@@ -1421,7 +1426,7 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                         }
                     }
                     
-                    while let Some(gilrs::Event { id: _, event: g_event, time: _, .. }) = gilrs.next_event() {
+                    while let Some(gilrs::Event { event: g_event, .. }) = gilrs.next_event() {
                     let is_pressed = matches!(g_event, gilrs::EventType::ButtonPressed(_, _));
                     let is_repeated = matches!(g_event, gilrs::EventType::ButtonRepeated(_, _));
                     if is_pressed || is_repeated {
@@ -1713,6 +1718,7 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
             _ => {}
         }
     });
+    Ok(())
 }
 
 #[allow(unused_variables, unused_assignments)]
@@ -1920,8 +1926,8 @@ where std::io::Error: From<<B as Backend>::Error>
             .checked_sub(last_tick.elapsed())
             .unwrap_or_else(|| Duration::from_secs(0));
 
-        if crossterm::event::poll(timeout)? {
-            if let CEvent::Key(key) = event::read()? {
+        if crossterm::event::poll(timeout)?
+            && let CEvent::Key(key) = event::read()? {
                 let show_picker = { app_state.lock().unwrap().show_tui_device_picker };
                 if show_picker {
                     match key.code {
@@ -1967,10 +1973,9 @@ where std::io::Error: From<<B as Backend>::Error>
                             let mut state = app_state.lock().unwrap();
                             state.show_tui_device_picker = true;
                             state.tui_device_picker_cursor = 0;
-                            if let Some(ref current) = state.selected_audio_device {
-                                if let Some(idx) = state.available_audio_devices.iter().position(|d| d == current) {
-                                    state.tui_device_picker_cursor = idx;
-                                }
+                            if let Some(ref current) = state.selected_audio_device
+                                && let Some(idx) = state.available_audio_devices.iter().position(|d| d == current) {
+                                state.tui_device_picker_cursor = idx;
                             }
                         }
                         KeyCode::Char('n') => {
@@ -2037,7 +2042,6 @@ where std::io::Error: From<<B as Backend>::Error>
                     }
                 }
             }
-        }
 
         if last_tick.elapsed() >= tick_rate {
             last_tick = Instant::now();

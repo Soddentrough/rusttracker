@@ -18,3 +18,15 @@ fn test_ffmpeg() {
     println!("Audio stream: {}", audio_stream.is_some());
 }
 
+#[test]
+fn test_aac_5_1_downmix() {
+    let file_path = "audio_tests/AAC 5.1.mp4";
+    let mut source = rusttracker::audio::load_audio_source(file_path).expect("Failed to load AAC 5.1.mp4");
+    assert_eq!(source.get_num_channels(), 6);
+
+    let mut stereo_buf = vec![0.0f32; 1024 * 2];
+    let frames = source.read_frames(2, 48000, &mut stereo_buf);
+    assert!(frames > 0, "Expected frames read > 0");
+    assert!(stereo_buf.iter().any(|&s| s.abs() > 0.0), "Expected non-silent downmixed stereo audio");
+}
+

@@ -15,10 +15,10 @@ fn main() {
     for entry in entries {
         let entry = entry.expect("Failed to read entry");
         let path = entry.path();
-        if path.is_file() {
-            if let Some(ext) = path.extension() {
-                if ext == "wgsl" {
-                    let filename = path.file_name().unwrap().to_string_lossy().into_owned();
+        if path.is_file()
+            && let Some(ext) = path.extension()
+            && ext == "wgsl" {
+            let filename = path.file_name().unwrap().to_string_lossy().into_owned();
                     // Skip the helper header files themselves as they are incomplete standalone WGSL
                     if filename.starts_with('_') {
                         continue;
@@ -55,8 +55,6 @@ fn main() {
                             failed = true;
                         }
                     }
-                }
-            }
         }
     }
 

@@ -144,12 +144,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Each layer has different scale, speed, and brightness
         let scale_x = 30.0 + f_layer * 15.0;    // columns get denser with depth
         let scale_y = 3.0 + f_layer * 1.5;       // vertical tiling
-        let speed = 8.0 + f_layer * 3.0;          // faster = closer
+        let speed = 2.8 + f_layer * 1.0;          // natural cinematic fall speed (~1.1s screen traversal)
         let opacity = 1.0 / (1.0 + f_layer * 0.6); // closer layers are brighter
 
         // Rain falls with a constant slant, while wind gently sways the entire field horizontally
         let wind_slant = 0.05;
-        let wind_sway = sin(audio.smooth_time * 0.3) * 1.5;
+        let wind_sway = sin(audio.smooth_time * 0.12) * 0.8;
         var rain_uv = vec2<f32>(
             p.x * scale_x + f_layer * 13.7 + p.y * wind_slant * scale_x + wind_sway,
             p.y * scale_y + audio.smooth_time * speed
@@ -164,7 +164,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Random per-cell: x-offset within cell, visibility, length
         let rnd = hash22(cell_id + f_layer * 100.0);
         let drop_x = (rnd.x - 0.5) * 0.6;
-        let visible = step(0.45, rnd.y);  // ~55% of cells have drops
+        let visible = step(0.62, rnd.y);  // ~38% of cells have drops for clean atmospheric depth
 
         // Streak shape: narrow horizontal, elongated vertical
         let dx_drop = abs(cell_uv.x - drop_x);
@@ -172,7 +172,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let streak = smoothstep_r(streak_width, 0.0, dx_drop);
 
         // Teardrop shape: sharp bright head at the bottom, fading trail extending upwards
-        let drop_length = 0.3 + rnd.x * 0.15;
+        let drop_length = 0.35 + rnd.x * 0.2;
         let head = smoothstep(-drop_length, -drop_length + 0.05, cell_uv.y);
         let tail = smoothstep_r(drop_length, -drop_length, cell_uv.y);
         let vert = head * tail;

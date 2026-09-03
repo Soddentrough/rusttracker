@@ -112,7 +112,7 @@ pub fn start_bitstream_thread(
 
         let decoder_rate = decoder.rate() as f32;
         let window_size = (((decoder_rate * 0.185).round() as usize) / 2) * 2;
-        let window_size = window_size.max(2048).min(65536);
+        let window_size = window_size.clamp(2048, 65536);
         let update_interval = (decoder_rate / 240.0).ceil() as usize;
         let mut accumulator: Vec<Vec<f32>> = Vec::new();
         let mut samples_since_last_send = 0;
@@ -148,30 +148,29 @@ pub fn start_bitstream_thread(
                             }
                             
                             let mut fresh_samples = 0;
-                            for p in 0..planes {
+                            for (p, acc) in accumulator.iter_mut().enumerate().take(planes) {
                                 let data = resampled.plane::<f32>(p);
                                 if p == 0 { fresh_samples = data.len(); }
-                                accumulator[p].extend_from_slice(data);
-                                let excess = accumulator[p].len().saturating_sub(window_size);
+                                acc.extend_from_slice(data);
+                                let excess = acc.len().saturating_sub(window_size);
                                 if excess > 0 {
-                                    accumulator[p].drain(0..excess);
+                                    acc.drain(0..excess);
                                 }
                             }
                             
                             samples_since_last_send += fresh_samples;
                             
-                            if accumulator.get(0).map(|a| a.len()).unwrap_or(0) == window_size && samples_since_last_send >= update_interval {
+                            if accumulator.first().map(|a| a.len()).unwrap_or(0) == window_size && samples_since_last_send >= update_interval {
                                 samples_since_last_send = 0;
                                 let mut channel_audio_data = Vec::with_capacity(planes);
                                 let mut channel_vus = Vec::with_capacity(planes);
                                 
-                                for p in 0..planes {
-                                    let window = accumulator[p].clone();
+                                for window in &accumulator {
                                     let mut sum_sq = 0.0;
-                                    for &s in &window { sum_sq += s * s; }
+                                    for &s in window { sum_sq += s * s; }
                                     let rms = (sum_sq / window.len() as f32).sqrt();
                                     channel_vus.push(rms);
-                                    channel_audio_data.push(window);
+                                    channel_audio_data.push(window.clone());
                                 }
                                 
                                 let _ = tx.try_send(crate::audio::DspMessage {
@@ -342,35 +341,22 @@ mod macos_bitstream {
                 status
             ));
         }
-        println!("[bitstream] CoreAudio Hog Mode successfully acquired!");
 
-        let stop_token_clone = stop_token.clone();
-        let handle = std::thread::spawn(move || {
-            println!("[bitstream] macOS CoreAudio playback thread running.");
-            while !stop_token_clone.load(std::sync::atomic::Ordering::Relaxed) {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-
-            println!("[bitstream] Releasing CoreAudio Hog Mode...");
-            let release_pid: i32 = -1;
-            let status = unsafe {
-                AudioObjectSetPropertyData(
-                    device_id,
-                    &hog_address,
-                    0,
-                    ptr::null(),
-                    mem::size_of::<i32>() as u32,
-                    &release_pid as *const _ as *const std::ffi::c_void,
-                )
-            };
-            if status != 0 {
-                println!("[bitstream] Warning: Failed to release Hog Mode (OSStatus: {})", status);
-            } else {
-                println!("[bitstream] CoreAudio Hog Mode successfully released.");
-            }
-        });
-
-        Ok((handle, decoder_sample_rate as u32, format!("{} (CoreAudio Hog Mode)", codec_name), has_video))
+        // Release Hog Mode immediately and return clean informative error
+        let release_pid: i32 = -1;
+        unsafe {
+            let _ = AudioObjectSetPropertyData(
+                device_id,
+                &hog_address,
+                0,
+                ptr::null(),
+                mem::size_of::<i32>() as u32,
+                &release_pid as *const _ as *const std::ffi::c_void,
+            );
+        };
+        Err(anyhow::anyhow!(
+            "macOS CoreAudio bitstream HAL packetization (IEC 61937) is currently under active development. Standard decoded PCM playback is recommended on macOS."
+        ))
     }
 }
 

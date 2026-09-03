@@ -307,7 +307,7 @@ fn triangulate_glyph_contours(contours: &[Vec<[f32; 2]>]) -> (Vec<[f32; 2]>, Vec
     for outer in &outers {
         let matching_holes: Vec<Vec<[f32; 2]>> = holes
             .iter()
-            .filter(|h| h.first().map_or(false, |p| point_in_polygon(*p, outer)))
+            .filter(|h| h.first().is_some_and(|p| point_in_polygon(*p, outer)))
             .cloned()
             .collect();
 
@@ -411,7 +411,7 @@ fn generate_3d_glyph_mesh(face: &ttf_parser::Face, ch: char, depth: f32, bevel: 
 
             // Top Chamfer quad (+Z)
             let start_c1 = vertices.len() as u32;
-            let norm_c1 = [nx * 0.7071, ny * 0.7071, 0.7071];
+            let norm_c1 = [nx * std::f32::consts::FRAC_1_SQRT_2, ny * std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2];
             vertices.push([p0[0], p0[1], hz - bevel]); normals.push(norm_c1);
             vertices.push([p1[0], p1[1], hz - bevel]); normals.push(norm_c1);
             vertices.push([p1[0] - nx * bevel, p1[1] - ny * bevel, hz]); normals.push(norm_c1);
@@ -421,7 +421,7 @@ fn generate_3d_glyph_mesh(face: &ttf_parser::Face, ch: char, depth: f32, bevel: 
 
             // Bot Chamfer quad (-Z)
             let start_c2 = vertices.len() as u32;
-            let norm_c2 = [nx * 0.7071, ny * 0.7071, -0.7071];
+            let norm_c2 = [nx * std::f32::consts::FRAC_1_SQRT_2, ny * std::f32::consts::FRAC_1_SQRT_2, -std::f32::consts::FRAC_1_SQRT_2];
             vertices.push([p0[0] - nx * bevel, p0[1] - ny * bevel, -hz]); normals.push(norm_c2);
             vertices.push([p1[0] - nx * bevel, p1[0] - ny * bevel, -hz]); normals.push(norm_c2);
             vertices.push([p1[0], p1[1], -hz + bevel]); normals.push(norm_c2);
@@ -645,7 +645,7 @@ fn render_phrase_preview(font_path: &str, output_path: &str, phrase: &str) {
 
                             // Top Chamfer quad (+Z)
                             let start_c1 = vertices.len() as u32;
-                            let norm_c1 = [nx * 0.7071, ny * 0.7071, 0.7071];
+                            let norm_c1 = [nx * std::f32::consts::FRAC_1_SQRT_2, ny * std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2];
                             vertices.push([p0[0], p0[1], hz - bevel]); normals.push(norm_c1);
                             vertices.push([p1[0], p1[1], hz - bevel]); normals.push(norm_c1);
                             vertices.push([p1[0] - nx * bevel, p1[1] - ny * bevel, hz]); normals.push(norm_c1);

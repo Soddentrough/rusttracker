@@ -300,6 +300,7 @@ pub struct VulkanEngine {
     smooth_dt: f64,
     last_history_push_count: u64,
     time_since_last_push: f64,
+    measured_push_interval: f64,
     vu_needle_angles: Vec<f32>,
     vu_needle_velocities: Vec<f32>,
     channel_phases: [f32; 32],
@@ -398,6 +399,7 @@ pub(crate) fn generate_lamp_mesh() -> (Vec<Vertex>, Vec<u32>) {
     (vertices, indices)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn room_add_quad(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>, p0: [f32; 3], p1: [f32; 3], p2: [f32; 3], p3: [f32; 3], normal: [f32; 3], ch: f32, mat: f32) {
     let start = vertices.len() as u32;
     vertices.push(Vertex { position: p0, normal, tex_coords: [ch, mat] });
@@ -463,6 +465,7 @@ fn room_add_box(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>, center: [f32
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn room_add_cone(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>, center: [f32; 3], radius: f32, depth: f32, rot_y: f32, ch: f32, mat: f32) {
     let segs = 14;
     let cos_r = rot_y.cos();
@@ -692,6 +695,7 @@ pub(crate) fn generate_neon_room_mesh() -> (Vec<Vertex>, Vec<u32>) {
     (vertices, indices)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn glass_add_quad(
     vertices: &mut Vec<Vertex>,
     indices: &mut Vec<u32>,
@@ -1014,7 +1018,7 @@ fn glass_triangulate_contours(contours: &[Vec<[f32; 2]>]) -> (Vec<[f32; 2]>, Vec
     for outer in &outers {
         let matching_holes: Vec<Vec<[f32; 2]>> = holes
             .iter()
-            .filter(|h| h.first().map_or(false, |p| point_in_polygon(*p, outer)))
+            .filter(|h| h.first().is_some_and(|p| point_in_polygon(*p, outer)))
             .cloned()
             .collect();
 
@@ -1153,7 +1157,7 @@ pub(crate) fn generate_glass_lyrics_mesh(text: &str) -> (Vec<Vertex>, Vec<u32>) 
 
                                 // Top Chamfer quad (+Z)
                                 let start_c1 = vertices.len() as u32;
-                                let norm_c1 = [nx * 0.7071, ny * 0.7071, 0.7071];
+                                let norm_c1 = [nx * std::f32::consts::FRAC_1_SQRT_2, ny * std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2];
                                 vertices.push(Vertex { position: [p0[0], p0[1], hz - bevel], normal: norm_c1, tex_coords: [ch_idx as f32, 1.0] });
                                 vertices.push(Vertex { position: [p1[0], p1[1], hz - bevel], normal: norm_c1, tex_coords: [ch_idx as f32, 1.0] });
                                 vertices.push(Vertex { position: [p1[0] - nx * bevel, p1[1] - ny * bevel, hz], normal: norm_c1, tex_coords: [ch_idx as f32, 1.0] });
@@ -1162,7 +1166,7 @@ pub(crate) fn generate_glass_lyrics_mesh(text: &str) -> (Vec<Vertex>, Vec<u32>) 
 
                                 // Bot Chamfer quad (-Z)
                                 let start_c2 = vertices.len() as u32;
-                                let norm_c2 = [nx * 0.7071, ny * 0.7071, -0.7071];
+                                let norm_c2 = [nx * std::f32::consts::FRAC_1_SQRT_2, ny * std::f32::consts::FRAC_1_SQRT_2, -std::f32::consts::FRAC_1_SQRT_2];
                                 vertices.push(Vertex { position: [p0[0] - nx * bevel, p0[1] - ny * bevel, -hz], normal: norm_c2, tex_coords: [ch_idx as f32, 1.0] });
                                 vertices.push(Vertex { position: [p1[0] - nx * bevel, p1[1] - ny * bevel, -hz], normal: norm_c2, tex_coords: [ch_idx as f32, 1.0] });
                                 vertices.push(Vertex { position: [p1[0], p1[1], -hz + bevel], normal: norm_c2, tex_coords: [ch_idx as f32, 1.0] });
@@ -1233,6 +1237,7 @@ pub(crate) fn generate_glass_lyrics_mesh(text: &str) -> (Vec<Vertex>, Vec<u32>) 
     (vertices, indices)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cyber_add_quad(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>, p0: [f32; 3], p1: [f32; 3], p2: [f32; 3], p3: [f32; 3], normal: [f32; 3], mat: f32, uv_y: f32) {
     let start = vertices.len() as u32;
     vertices.push(Vertex { position: p0, normal, tex_coords: [mat, uv_y] });
@@ -1268,34 +1273,22 @@ fn cyber_add_box(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>, center: [f3
     cyber_add_quad(vertices, indices, rotate_pt([-hx, -hy, -hz]), rotate_pt([hx, -hy, -hz]), rotate_pt([hx, -hy, hz]), rotate_pt([-hx, -hy, hz]), rotate_norm([0.0, -1.0, 0.0]), mat, center[1] - hy);
 }
 
-fn load_obj_mesh(
-    vertices: &mut Vec<Vertex>,
-    indices: &mut Vec<u32>,
-    obj_src: &str,
-    translation: [f32; 3],
-    scale: [f32; 3],
-    rot_y: f32,
-    default_mat: f32,
-) {
+struct ObjFaceTri {
+    verts: [(usize, usize); 3],
+    mat: f32,
+}
+
+struct ParsedObjTemplate {
+    positions: Vec<[f32; 3]>,
+    normals: Vec<[f32; 3]>,
+    tris: Vec<ObjFaceTri>,
+}
+
+fn parse_obj_template(obj_src: &str, default_mat: f32) -> ParsedObjTemplate {
     let mut raw_positions: Vec<[f32; 3]> = Vec::new();
     let mut raw_normals: Vec<[f32; 3]> = Vec::new();
+    let mut tris = Vec::new();
     let mut current_mat = default_mat;
-
-    let cos_r = rot_y.cos();
-    let sin_r = rot_y.sin();
-    let transform_pos = |p: [f32; 3]| -> [f32; 3] {
-        let sx = p[0] * scale[0];
-        let sy = p[1] * scale[1];
-        let sz = p[2] * scale[2];
-        let rx = sx * cos_r + sz * sin_r;
-        let rz = -sx * sin_r + sz * cos_r;
-        [rx + translation[0], sy + translation[1], rz + translation[2]]
-    };
-    let transform_norm = |n: [f32; 3]| -> [f32; 3] {
-        let rx = n[0] * cos_r + n[2] * sin_r;
-        let rz = -n[0] * sin_r + n[2] * cos_r;
-        [rx, n[1], rz]
-    };
 
     for line in obj_src.lines() {
         let trimmed = line.trim();
@@ -1305,17 +1298,15 @@ fn load_obj_mesh(
 
         if let Some(rest) = trimmed.strip_prefix("v ") {
             let parts: Vec<&str> = rest.split_whitespace().collect();
-            if parts.len() >= 3 {
-                if let (Ok(x), Ok(y), Ok(z)) = (parts[0].parse::<f32>(), parts[1].parse::<f32>(), parts[2].parse::<f32>()) {
-                    raw_positions.push([x, y, z]);
-                }
+            if parts.len() >= 3
+                && let (Ok(x), Ok(y), Ok(z)) = (parts[0].parse::<f32>(), parts[1].parse::<f32>(), parts[2].parse::<f32>()) {
+                raw_positions.push([x, y, z]);
             }
         } else if let Some(rest) = trimmed.strip_prefix("vn ") {
             let parts: Vec<&str> = rest.split_whitespace().collect();
-            if parts.len() >= 3 {
-                if let (Ok(x), Ok(y), Ok(z)) = (parts[0].parse::<f32>(), parts[1].parse::<f32>(), parts[2].parse::<f32>()) {
-                    raw_normals.push([x, y, z]);
-                }
+            if parts.len() >= 3
+                && let (Ok(x), Ok(y), Ok(z)) = (parts[0].parse::<f32>(), parts[1].parse::<f32>(), parts[2].parse::<f32>()) {
+                raw_normals.push([x, y, z]);
             }
         } else if let Some(rest) = trimmed.strip_prefix("g ") {
             let group_name = rest.trim();
@@ -1376,25 +1367,75 @@ fn load_obj_mesh(
                 let face_verts: Vec<(usize, usize)> = parts.iter().filter_map(|p| parse_vert(p)).collect();
                 if face_verts.len() >= 3 {
                     for i in 1..face_verts.len() - 1 {
-                        let tri = [face_verts[0], face_verts[i], face_verts[i + 1]];
-                        let start_idx = vertices.len() as u32;
-                        for &(v_i, vn_i) in &tri {
-                            let pos = if v_i < raw_positions.len() { raw_positions[v_i] } else { [0.0, 0.0, 0.0] };
-                            let norm = if vn_i < raw_normals.len() { raw_normals[vn_i] } else { [0.0, 1.0, 0.0] };
-                            let world_p = transform_pos(pos);
-                            let world_n = transform_norm(norm);
-                            vertices.push(Vertex {
-                                position: world_p,
-                                normal: world_n,
-                                tex_coords: [current_mat, translation[2]],
-                            });
-                        }
-                        indices.extend_from_slice(&[start_idx, start_idx + 1, start_idx + 2]);
+                        tris.push(ObjFaceTri {
+                            verts: [face_verts[0], face_verts[i], face_verts[i + 1]],
+                            mat: current_mat,
+                        });
                     }
                 }
             }
         }
     }
+
+    ParsedObjTemplate {
+        positions: raw_positions,
+        normals: raw_normals,
+        tris,
+    }
+}
+
+fn instantiate_obj_template(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    template: &ParsedObjTemplate,
+    translation: [f32; 3],
+    scale: [f32; 3],
+    rot_y: f32,
+) {
+    let cos_r = rot_y.cos();
+    let sin_r = rot_y.sin();
+    let transform_pos = |p: [f32; 3]| -> [f32; 3] {
+        let sx = p[0] * scale[0];
+        let sy = p[1] * scale[1];
+        let sz = p[2] * scale[2];
+        let rx = sx * cos_r + sz * sin_r;
+        let rz = -sx * sin_r + sz * cos_r;
+        [rx + translation[0], sy + translation[1], rz + translation[2]]
+    };
+    let transform_norm = |n: [f32; 3]| -> [f32; 3] {
+        let rx = n[0] * cos_r + n[2] * sin_r;
+        let rz = -n[0] * sin_r + n[2] * cos_r;
+        [rx, n[1], rz]
+    };
+
+    for tri in &template.tris {
+        let start_idx = vertices.len() as u32;
+        for &(v_i, vn_i) in &tri.verts {
+            let pos = if v_i < template.positions.len() { template.positions[v_i] } else { [0.0, 0.0, 0.0] };
+            let norm = if vn_i < template.normals.len() { template.normals[vn_i] } else { [0.0, 1.0, 0.0] };
+            let world_p = transform_pos(pos);
+            let world_n = transform_norm(norm);
+            vertices.push(Vertex {
+                position: world_p,
+                normal: world_n,
+                tex_coords: [tri.mat, translation[2]],
+            });
+        }
+        indices.extend_from_slice(&[start_idx, start_idx + 1, start_idx + 2]);
+    }
+}
+
+fn load_obj_mesh(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    obj_src: &str,
+    translation: [f32; 3],
+    scale: [f32; 3],
+    rot_y: f32,
+    default_mat: f32,
+) {
+    let template = parse_obj_template(obj_src, default_mat);
+    instantiate_obj_template(vertices, indices, &template, translation, scale, rot_y);
 }
 
 pub(crate) fn generate_synthwave_racer_mesh() -> (Vec<Vertex>, Vec<u32>) {
@@ -1466,41 +1507,41 @@ pub(crate) fn generate_synthwave_racer_mesh() -> (Vec<Vertex>, Vec<u32>) {
     cyber_add_box(&mut vertices, &mut indices, [0.0, 0.44, 4.8], [1.30, 0.16, 1.8], 0.0, 8.0);
 
     // 4. Roadside Streetlamps & Palm Trees (.OBJ Meshes)
+    let palm_template = parse_obj_template(include_str!("assets/models/palm_tree.obj"), 10.0);
+    let streetlamp_template = parse_obj_template(include_str!("assets/models/streetlamp.obj"), 11.0);
     for i in 0..12 {
         let pz = 18.0 + (i as f32) * 26.0;
         // Left Palm Tree
-        load_obj_mesh(
+        instantiate_obj_template(
             &mut vertices, &mut indices,
-            include_str!("assets/models/palm_tree.obj"),
+            &palm_template,
             [-road_half_w - 3.8, 0.0, pz],
             [1.0, 1.0, 1.0],
             (i as f32) * 0.8,
-            10.0
         );
         // Right Cobra-Head Streetlamp
-        load_obj_mesh(
+        instantiate_obj_template(
             &mut vertices, &mut indices,
-            include_str!("assets/models/streetlamp.obj"),
+            &streetlamp_template,
             [road_half_w + 2.4, 0.0, pz + 13.0],
             [1.0, 1.0, 1.0],
             std::f32::consts::PI,
-            11.0
         );
     }
 
     // 5. Distant Horizon Skyscrapers (.OBJ Meshes)
+    let skyscraper_template = parse_obj_template(include_str!("assets/models/skyscraper.obj"), 12.0);
     for i in 0..16 {
         let ang = (i as f32) * 0.38 - 3.0;
         let tx = ang * 46.0;
         let tz = 260.0 + ((i * 7) % 5) as f32 * 14.0;
         let s = 0.75 + ((i * 3) % 4) as f32 * 0.15;
-        load_obj_mesh(
+        instantiate_obj_template(
             &mut vertices, &mut indices,
-            include_str!("assets/models/skyscraper.obj"),
+            &skyscraper_template,
             [tx, -2.0, tz],
             [s, s, s],
             (i as f32) * 0.5,
-            12.0
         );
     }
 
@@ -1541,7 +1582,7 @@ pub(crate) fn generate_storm_rain_volume_mesh() -> (Vec<Vertex>, Vec<u32>) {
     
     // Pure 3D Instanced Falling Raindrops across viewing frustum (mat = 3.0)
     for i in 0..2500 {
-        let seed = (i as f32) * 1.6180339887;
+        let seed = (i as f32) * 1.618_034;
         let rx = (((seed * 17.3).fract()) - 0.5) * 44.0;
         let ry = ((seed * 29.1).fract()) * 30.0;
         let rz = 2.0 + ((seed * 43.7).fract()) * 110.0;
@@ -1597,6 +1638,12 @@ impl VulkanEngine {
         if adapter.features().contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM) {
             required_features |= wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
         }
+        let pipeline_cache_enabled = std::env::var("RUSTTRACKER_PIPELINE_CACHE")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+        if pipeline_cache_enabled && adapter.features().contains(wgpu::Features::PIPELINE_CACHE) {
+            required_features |= wgpu::Features::PIPELINE_CACHE;
+        }
 
         let (device, queue) = adapter.request_device(
             &wgpu::DeviceDescriptor {
@@ -1631,14 +1678,9 @@ impl VulkanEngine {
         // `fallback: true` ensures a fresh empty cache is created if the stored
         // data is rejected (e.g. driver/version change).
         //
-        // NOTE: pipeline caching is opt-in via the RUSTTRACKER_PIPELINE_CACHE=1
-        // environment variable. Some driver/backend combinations report a cache as
-        // created yet mark pipelines that reference it invalid at submit time, so
-        // the safe default is to NOT attach a cache (pass `cache: None`).
-        let pipeline_cache_enabled = std::env::var("RUSTTRACKER_PIPELINE_CACHE")
-            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        let pipeline_cache = if pipeline_cache_enabled {
+        // Pipeline caching is enabled by default to eliminate shader recompilation hitches,
+        // with opt-out via RUSTTRACKER_PIPELINE_CACHE=0.
+        let pipeline_cache = if pipeline_cache_enabled && device.features().contains(wgpu::Features::PIPELINE_CACHE) {
             Some(unsafe {
                 device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
                     label: Some("RustTracker Pipeline Cache"),
@@ -3223,6 +3265,17 @@ impl VulkanEngine {
                     }
                     (vertices, indices)
                 }
+                crate::state::Geometry::UnitQuad => {
+                    let mut vertices = Vec::new();
+                    let mut indices = Vec::new();
+                    let start_idx = 0;
+                    vertices.push(Vertex { position: [-0.5, -0.5, 0.0], normal: [0.0, 0.0, 1.0], tex_coords: [0.0, 0.0] });
+                    vertices.push(Vertex { position: [ 0.5, -0.5, 0.0], normal: [0.0, 0.0, 1.0], tex_coords: [1.0, 0.0] });
+                    vertices.push(Vertex { position: [ 0.5,  0.5, 0.0], normal: [0.0, 0.0, 1.0], tex_coords: [1.0, 1.0] });
+                    vertices.push(Vertex { position: [-0.5,  0.5, 0.0], normal: [0.0, 0.0, 1.0], tex_coords: [0.0, 1.0] });
+                    indices.extend_from_slice(&[start_idx, start_idx + 1, start_idx + 2, start_idx, start_idx + 2, start_idx + 3]);
+                    (vertices, indices)
+                }
                 crate::state::Geometry::UnitBox => {
                     let mut vertices = Vec::new();
                     let mut indices = Vec::new();
@@ -3361,14 +3414,12 @@ impl VulkanEngine {
 
         // Persist the pipeline cache back to disk atomically so the next launch
         // can skip recompiling all visualizer/compute pipelines.
-        if pipeline_cache_enabled {
-            if let (Some(path), Some(cache)) = (&pipeline_cache_path, &pipeline_cache) {
-                if let Some(data) = cache.get_data() {
-                    let tmp = path.with_extension("tmp");
-                    if std::fs::write(&tmp, &data).is_ok() {
-                        let _ = std::fs::rename(&tmp, path);
-                    }
-                }
+        if pipeline_cache_enabled
+            && let (Some(path), Some(cache)) = (&pipeline_cache_path, &pipeline_cache)
+            && let Some(data) = cache.get_data() {
+            let tmp = path.with_extension("tmp");
+            if std::fs::write(&tmp, &data).is_ok() {
+                let _ = std::fs::rename(&tmp, path);
             }
         }
 
@@ -3458,6 +3509,7 @@ impl VulkanEngine {
             smooth_dt: 1.0f64 / 60.0f64,
             last_history_push_count: 0,
             time_since_last_push: 0.0,
+            measured_push_interval: 1.0f64 / 144.0f64,
             vu_needle_angles: vec![0.0; 32],
             vu_needle_velocities: vec![0.0; 32],
             channel_phases: [0.0; 32],
@@ -3522,6 +3574,14 @@ impl VulkanEngine {
             let diff = state.waveform_history_push_count.saturating_sub(self.last_history_push_count);
             steps = diff as u32;
             self.heatmap_row = (self.heatmap_row + steps) % 1024;
+            
+            // Measure the actual elapsed time between buffer pushes to stay in perfect
+            // phase with the audio callback cadence (e.g. PipeWire/ALSA vs WASAPI)
+            if self.time_since_last_push > 0.002 && self.time_since_last_push < 0.25 {
+                let interval_per_step = self.time_since_last_push / (steps as f64).max(1.0);
+                self.measured_push_interval = self.measured_push_interval * 0.8 + interval_per_step * 0.2;
+            }
+            
             self.time_since_last_push = 0.0;
             self.last_history_push_count = state.waveform_history_push_count;
         } else if !state.is_paused && state.file_loaded && !state.track_ended {
@@ -3531,8 +3591,10 @@ impl VulkanEngine {
             self.time_since_last_push += (dt as f64).clamp(0.0, 0.1);
         }
 
-        // Target interval between pushes
-        let push_interval = if state.target_fps > 0 {
+        // Target interval between pushes: use measured cadence with fallback to target_fps
+        let push_interval = if self.measured_push_interval > 0.002 && self.measured_push_interval < 0.25 {
+            self.measured_push_interval
+        } else if state.target_fps > 0 {
             1.0 / state.target_fps as f64
         } else {
             1.0 / 60.0
@@ -3564,7 +3626,7 @@ impl VulkanEngine {
         // World-Z camera position locked to history rows (0.5 units/row), used by
         // visualizers that scroll with the waveform/spectrum history ring buffer.
         self.last_history_cam_z = (self.last_history_push_count as f64 + step_fraction as f64) * 0.5;
-        let frame_dt = (dt as f32).clamp(0.0005, 0.1);
+        let frame_dt = dt.clamp(0.0005, 0.1);
         let mut uniforms = AudioUniforms {
             spectrum: [0.0; 1024],
             fire_heat: [0.0; 1024],
@@ -3753,7 +3815,13 @@ impl VulkanEngine {
             };
 
             let slam_t = self.lyric_slam_timer;
-            // Calculate exact slam vertical drop and spring damping
+            let bass = if state.spectrum_data.len() > 4 {
+                state.spectrum_data[1..5].iter().copied().fold(0.0f32, f32::max)
+            } else {
+                0.0
+            };
+
+            // Calculate exact slam vertical drop, water plunge, and continuous fluid buoyancy
             let slam_y = if slam_t < 0.28 {
                 // Gravity drop from y = 3.5 down to 0.0
                 let t_norm = (slam_t / 0.28).clamp(0.0, 1.0);
@@ -3761,13 +3829,12 @@ impl VulkanEngine {
             } else {
                 // Water impact, plunge and damped spring bobbing
                 let dt_impact = slam_t - 0.28;
-                -0.32 * (-3.6 * dt_impact).exp() * (9.5 * dt_impact).cos()
-            };
-
-            let bass = if state.spectrum_data.len() > 4 {
-                state.spectrum_data[1..5].iter().copied().fold(0.0f32, f32::max)
-            } else {
-                0.0
+                let impact_spring = -0.32 * (-3.6 * dt_impact).exp() * (9.5 * dt_impact).cos();
+                // Gentle continuous idle buoyancy on the water surface after impact settles
+                let settle = 1.0 - (-2.0 * dt_impact).exp();
+                let idle_bob = ((slam_t * 1.6).sin() * 0.022 + (slam_t * 0.85).cos() * 0.014) * settle;
+                let bass_swell = bass * 0.03 * settle;
+                impact_spring + idle_bob + bass_swell
             };
 
             let char_count = char_bytes.len().min(64);
@@ -3780,6 +3847,7 @@ impl VulkanEngine {
             uniforms.fire_heat[4] = line_duration;
             uniforms.fire_heat[5] = is_instrumental;
             uniforms.fire_heat[6] = bass;
+            uniforms.fire_heat[7] = ((char_count as f32) * 0.28).clamp(1.5, 5.0); // Estimated text half-width
 
             for (i, &b) in char_bytes.iter().take(64).enumerate() {
                 uniforms.fire_heat[16 + i] = b as f32;
@@ -3817,7 +3885,7 @@ impl VulkanEngine {
             }
         }
 
-        let vis_width = state.visual_width.max(128).min(2048) as u32;
+        let vis_width = state.visual_width.clamp(128, 2048);
         uniforms.waveform_resolution = vis_width;
         uniforms.waveform_history_size = state.waveform_history.len().min(144) as u32;
         uniforms.step_fraction = step_fraction;
@@ -3874,7 +3942,7 @@ impl VulkanEngine {
             for i in 512..1024 { highs_sum += uniforms.fire_heat[i]; }
             let highs = (highs_sum / 512.0 / 100.0).min(1.0);
             
-            let n_ch = state.channel_vus.len().max(1).min(32);
+            let n_ch = state.channel_vus.len().clamp(1, 32);
             let lfe_idx = if (n_ch == 6 || n_ch == 8 || n_ch == 16) && state.tracker_channels.is_none() { 3 } else { 999 };
             
             let mut fire_params = FireParams {
@@ -3907,27 +3975,25 @@ impl VulkanEngine {
         // GPU spectrum is consumed only by the firesim compute (id 6) and the
         // resynth compute (requires_resynth, id 8) — skip the 256KB upload otherwise,
         // and only upload when new audio FFT data arrived (history_dirty)
-        if state.gpu_fft && (vis_def.id == 6 || vis_def.requires_resynth) {
-            if !state.gpu_spectrum_data.is_empty() && history_dirty {
-                self.queue.write_buffer(&self._gpu_spectrum_buffer, 0, bytemuck::cast_slice(&state.gpu_spectrum_data));
-            }
+        if state.gpu_fft && (vis_def.id == 6 || vis_def.requires_resynth)
+            && !state.gpu_spectrum_data.is_empty() && history_dirty {
+            self.queue.write_buffer(&self._gpu_spectrum_buffer, 0, bytemuck::cast_slice(&state.gpu_spectrum_data));
         }
         
         if let Some(rx) = &state.video_frame_rx {
             let mut latest_frame = None;
             while let Ok(frame) = rx.try_recv() {
-                if let Some(old_frame) = latest_frame.take() {
-                    if let Some(tx) = &state.free_video_frame_tx {
-                        let _ = tx.try_send(old_frame);
-                    }
+                if let Some(old_frame) = latest_frame.take()
+                    && let Some(tx) = &state.free_video_frame_tx {
+                    let _ = tx.try_send(old_frame);
                 }
                 latest_frame = Some(frame);
             }
             
             if let Some(frame) = latest_frame {
                 if frame.width >= 2 && frame.height >= 2 {
-                    let needs_init = self.video_state.as_ref().map_or(true, |vs| vs.width != frame.width || vs.height != frame.height || vs.bit_depth != frame.bit_depth as u32);
-                    if needs_init {
+                    let needs_init = !self.video_state.as_ref().is_some_and(|vs| vs.width == frame.width && vs.height == frame.height && vs.bit_depth == frame.bit_depth as u32);
+                if needs_init {
                     let tex_format = if frame.bit_depth > 8 { wgpu::TextureFormat::R16Unorm } else { wgpu::TextureFormat::R8Unorm };
                     let y_texture = self.device.create_texture(&wgpu::TextureDescriptor {
                         label: Some("Video Y Texture"),
@@ -4077,6 +4143,7 @@ impl VulkanEngine {
         
     }
 
+    #[allow(clippy::type_complexity)]
     pub fn render(
         &mut self,
         window: &winit::window::Window,
@@ -4112,8 +4179,8 @@ impl VulkanEngine {
             // Non-blocking poll to process any completed GPU work
             let _ = self.device.poll(wgpu::PollType::Poll);
             
-            if self.timestamp_map_complete.load(Ordering::Acquire) {
-                if let Some(read_buffer) = &self.query_read_buffer {
+            if self.timestamp_map_complete.load(Ordering::Acquire)
+                && let Some(read_buffer) = &self.query_read_buffer {
                     let slice = read_buffer.slice(..);
                     let data = slice.get_mapped_range();
                     
@@ -4144,7 +4211,6 @@ impl VulkanEngine {
                     drop(data);
                     read_buffer.unmap();
                     self.timestamp_mapping_active = false;
-                }
             }
             // If mapping not yet complete, we use cached values from last successful read
         }
@@ -4208,10 +4274,9 @@ impl VulkanEngine {
                         ui.add_space(10.0);
                         ui.horizontal(|ui| {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                if ui.add_sized([80.0, 30.0], egui::Button::new("Open")).clicked() || (text_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
-                                    if !url_text.is_empty() {
-                                        engine_action = EngineAction::LoadUrl(url_text);
-                                    }
+                                if (ui.add_sized([80.0, 30.0], egui::Button::new("Open")).clicked() || (text_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))))
+                                    && !url_text.is_empty() {
+                                    engine_action = EngineAction::LoadUrl(url_text);
                                 }
                                 if ui.add_sized([80.0, 30.0], egui::Button::new("Cancel")).clicked() {
                                     engine_action = EngineAction::CloseUrlDialog;
@@ -5453,8 +5518,8 @@ impl VulkanEngine {
                                         }
                                     }
                                 } else if !state.tracker_patterns_by_order.is_empty() {
-                                    let current_order = state.current_tracker_order as i32;
-                                    let current_row = state.current_tracker_row as i32;
+                                    let current_order = state.current_tracker_order;
+                                    let current_row = state.current_tracker_row;
                                     let center_y = hm_rect.top() + hm_rect.height() / 2.0;
                                     let row_height = 16.0;
                                     let num_rows_to_draw = (hm_rect.height() / row_height) as i32;
@@ -5774,7 +5839,7 @@ impl VulkanEngine {
                                                             .stroke(if is_in_mix { egui::Stroke::new(1.0_f32, color) } else { egui::Stroke::NONE });
                                                         
                                                         let btn_w = if is_in_mix {
-                                                            (ui.available_width() - 110.0).max(110.0).min(180.0)
+                                                            (ui.available_width() - 110.0).clamp(110.0, 180.0)
                                                         } else {
                                                             ui.available_width()
                                                         };
@@ -6056,14 +6121,13 @@ impl VulkanEngine {
                     if response.hovered() || response.dragged() {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
                     }
-                    if response.dragged() {
-                        if let Some(mouse_pos) = response.interact_pointer_pos() {
-                            let min_h = 220.0f32;
-                            let min_r = min_h / total_height;
-                            let max_r = (total_height - min_h) / total_height;
-                            let new_ratio = mouse_pos.y / total_height;
-                            engine_action = EngineAction::SetSplitRatio(new_ratio.clamp(min_r.min(max_r), min_r.max(max_r)));
-                        }
+                    if response.dragged()
+                        && let Some(mouse_pos) = response.interact_pointer_pos() {
+                        let min_h = 220.0f32;
+                        let min_r = min_h / total_height;
+                        let max_r = (total_height - min_h) / total_height;
+                        let new_ratio = mouse_pos.y / total_height;
+                        engine_action = EngineAction::SetSplitRatio(new_ratio.clamp(min_r.min(max_r), min_r.max(max_r)));
                     }
                 });
         }
@@ -6074,9 +6138,9 @@ impl VulkanEngine {
                 central_rect = rect;
                 
                 // Draw OSD text from keyboard/gamepad/touch actions
-                if let Some(osd) = &state.osd_text {
-                    if state.osd_timer > 0.0 {
-                        let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("osd_notification")));
+                if let Some(osd) = &state.osd_text
+                    && state.osd_timer > 0.0 {
+                    let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("osd_notification")));
                         let alpha = (state.osd_timer.min(0.5) * 2.0 * 255.0) as u8;
                         let screen = ui.ctx().viewport_rect();
                         let is_portrait = screen.width() < screen.height();
@@ -6131,7 +6195,6 @@ impl VulkanEngine {
                         
                         painter.galley(galley_pos, galley, text_color);
                     }
-                }
                 
                 if state.visualizer_mode == 0 && state.show_hud && state.video_mode != 3 {
                     let painter = ui.painter();
@@ -6728,11 +6791,10 @@ impl VulkanEngine {
         // ONLY do this when no mapping is pending — wgpu will panic if we copy to a buffer
         // that has an active or pending map operation.
         let should_start_mapping = !self.timestamp_mapping_active && self.query_set.is_some();
-        if should_start_mapping {
-            if let (Some(qs), Some(res_buf), Some(read_buf)) = (&self.query_set, &self.query_resolve_buffer, &self.query_read_buffer) {
-                encoder.resolve_query_set(qs, 0..6, res_buf, 0);
-                encoder.copy_buffer_to_buffer(res_buf, 0, read_buf, 0, 48);
-            }
+        if should_start_mapping
+            && let (Some(qs), Some(res_buf), Some(read_buf)) = (&self.query_set, &self.query_resolve_buffer, &self.query_read_buffer) {
+            encoder.resolve_query_set(qs, 0..6, res_buf, 0);
+            encoder.copy_buffer_to_buffer(res_buf, 0, read_buf, 0, 48);
         }
 
         let capture_frame = if let Ok(bf_str) = std::env::var("BENCH_FRAMES") {
@@ -6740,7 +6802,9 @@ impl VulkanEngine {
         } else {
             180
         };
-        let do_capture = std::env::var("CAPTURE_FRAME").is_ok() && self.frame_count == capture_frame;
+        let capture_count = std::env::var("CAPTURE_FRAMES_COUNT").ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(1);
+        let capture_start = if capture_count > 1 { capture_frame.saturating_sub(capture_count.saturating_sub(1)) } else { capture_frame };
+        let do_capture = std::env::var("CAPTURE_FRAME").is_ok() && self.frame_count >= capture_start && self.frame_count <= capture_frame;
 
         let mut readback_buffer = None;
         if do_capture {
@@ -6763,18 +6827,17 @@ impl VulkanEngine {
         
 
         // Start async timestamp mapping AFTER submit (non-blocking)
-        if should_start_mapping {
-            if let Some(read_buf) = &self.query_read_buffer {
-                let flag = self.timestamp_map_complete.clone();
-                flag.store(false, Ordering::Release);
-                let slice = read_buf.slice(..);
-                slice.map_async(wgpu::MapMode::Read, move |result| {
-                    if result.is_ok() {
-                        flag.store(true, Ordering::Release);
-                    }
-                });
-                self.timestamp_mapping_active = true;
-            }
+        if should_start_mapping
+            && let Some(read_buf) = &self.query_read_buffer {
+            let flag = self.timestamp_map_complete.clone();
+            flag.store(false, Ordering::Release);
+            let slice = read_buf.slice(..);
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                if result.is_ok() {
+                    flag.store(true, Ordering::Release);
+                }
+            });
+            self.timestamp_mapping_active = true;
         }
         
         if let Some(rb) = readback_buffer {
@@ -6796,11 +6859,20 @@ impl VulkanEngine {
                         img.put_pixel(x, y, image::Rgba([r, g, b, 255])); // Ignore A to force fully opaque screenshot
                     }
                 }
-                let capture_path = std::env::var("CAPTURE_PATH").unwrap_or_else(|_| "screenshot.png".to_string());
+                let base_capture_path = std::env::var("CAPTURE_PATH").unwrap_or_else(|_| "screenshot.png".to_string());
+                let capture_path = if capture_count > 1 {
+                    if let Some(pos) = base_capture_path.rfind('.') {
+                        format!("{}_{:03}{}", &base_capture_path[..pos], self.frame_count, &base_capture_path[pos..])
+                    } else {
+                        format!("{}_{:03}.png", base_capture_path, self.frame_count)
+                    }
+                } else {
+                    base_capture_path
+                };
                 img.save(&capture_path).unwrap();
                 println!("Screenshot saved to {}", capture_path);
             }
-            if std::env::var("BENCH_FRAMES").is_err() {
+            if std::env::var("BENCH_FRAMES").is_err() && self.frame_count == capture_frame {
                 std::process::exit(0);
             }
         }
@@ -6841,7 +6913,7 @@ mod tests {
             .next()
             .expect("Could not find end of struct AudioUniforms");
 
-        let mut offset = 0;
+        let mut offset: usize = 0;
         for line in struct_content.lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with("//") {
@@ -6873,12 +6945,12 @@ mod tests {
             };
 
             // Align the offset
-            offset = (offset + align - 1) / align * align;
+            offset = offset.div_ceil(align) * align;
             offset += size;
         }
 
         // Align struct size to maximum alignment (16)
-        let wgsl_size = (offset + 15) / 16 * 16;
+        let wgsl_size = offset.div_ceil(16) * 16;
         assert_eq!(wgsl_size, 8832, "WGSL AudioUniforms size is not 8832 bytes (actual: {})", wgsl_size);
         assert_eq!(rust_size, wgsl_size, "Size mismatch: Rust AudioUniforms is {}, WGSL is {}", rust_size, wgsl_size);
     }
@@ -6989,18 +7061,18 @@ mod tests {
     #[test]
     fn test_view_mode_rotation() {
         let mut state = crate::state::AppState::new("Test App".to_string());
-        assert_eq!(state.show_hud, true);
+        assert!(state.show_hud);
         assert_eq!(state.video_mode, 0);
 
         // Press 'v' in audio mode -> Toggle HUD off (Full Screen Visualizer)
         state.show_hud = !state.show_hud;
         state.video_mode = 0;
-        assert_eq!(state.show_hud, false);
+        assert!(!state.show_hud);
 
         // Press 'v' again -> Toggle HUD back on (Standard View)
         state.show_hud = !state.show_hud;
         state.video_mode = 0;
-        assert_eq!(state.show_hud, true);
+        assert!(state.show_hud);
     }
 
     #[test]

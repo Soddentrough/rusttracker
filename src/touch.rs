@@ -234,11 +234,10 @@ impl TouchGestureController {
 
     /// Check if a pending single tap has expired
     pub fn update_pending_tap(&mut self) -> Option<TouchGesture> {
-        if let Some(((x, y), tap_time)) = self.pending_single_tap {
-            if tap_time.elapsed() >= Duration::from_millis(250) {
-                self.pending_single_tap = None;
-                return Some(TouchGesture::SingleTap { x, y });
-            }
+        if let Some(((x, y), tap_time)) = self.pending_single_tap
+            && tap_time.elapsed() >= Duration::from_millis(250) {
+            self.pending_single_tap = None;
+            return Some(TouchGesture::SingleTap { x, y });
         }
         None
     }

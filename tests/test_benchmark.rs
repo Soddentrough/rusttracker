@@ -17,7 +17,7 @@ fn test_visualizer_benchmark() {
 
     for vis in visualizers {
         let output = Command::new("cargo")
-            .args(&[
+            .args([
                 "run",
                 "--release",
                 "--",

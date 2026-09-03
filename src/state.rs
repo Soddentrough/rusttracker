@@ -100,6 +100,7 @@ impl std::fmt::Debug for VideoFrame {
 pub enum Geometry {
     Grid { width: u32, depth: u32 },
     UnitBox,
+    UnitQuad,
     NeonRoom,
     SynthwaveRacerScene,
     VuMeterRack,
@@ -147,7 +148,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
     VisualizerDef { id: 14, name: "Synthwave 3D Racer", filename: "vis_synthwave_racer_3d.wgsl", description: "Multi-pass 3D low-poly sports car, highway & infinite horizon sky", pipeline_type: PipelineType::Mesh3D { geometry: Geometry::SynthwaveRacerScene, instances: 1 }, requires_history: true, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 16, name: "Midnight Storm", filename: "vis_rain.wgsl", description: "Cinematic atmospheric dark sky, falling rain & branching lightning", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 19, name: "Retro VU Meters", filename: "vis_vumeters_3d.wgsl", description: "3D vintage Hi-Fi master rack with physical analog needles & warm glow", pipeline_type: PipelineType::Mesh3D { geometry: Geometry::VuMeterRack, instances: 1 }, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
-    VisualizerDef { id: 20, name: "Bioluminescent Waves", filename: "vis_bioluminescence.wgsl", description: "GPU compute-driven bioluminescent particle waves", pipeline_type: PipelineType::Mesh3D { geometry: Geometry::UnitBox, instances: 65536 }, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
+    VisualizerDef { id: 20, name: "Bioluminescent Waves", filename: "vis_bioluminescence.wgsl", description: "GPU compute-driven bioluminescent particle waves", pipeline_type: PipelineType::Mesh3D { geometry: Geometry::UnitQuad, instances: 65536 }, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 22, name: "Neon Spatial Room", filename: "vis_neon_room.wgsl", description: "3D interactive spatial listening room with multi-channel speakers", pipeline_type: PipelineType::Mesh3D { geometry: Geometry::NeonRoom, instances: 1 }, requires_history: false, requires_fire: true, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 23, name: "3D Glass Water Lyrics", filename: "vis_lyrics.wgsl", description: "Chunky 3D glass letters in dark reflective water with kinetic slam & splashes", pipeline_type: PipelineType::Mesh3D { geometry: Geometry::GlassLyricsScene, instances: 1 }, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
 ];
@@ -346,10 +347,9 @@ impl AppState {
         let mut url_history = Vec::new();
         if let Ok(data) = std::fs::read_to_string(get_history_file_path()) {
             for line in data.lines() {
-                if let Some((url, title)) = line.split_once('|') {
-                    if !url_history.iter().any(|(u, _)| u == url) {
-                        url_history.push((url.to_string(), title.to_string()));
-                    }
+                if let Some((url, title)) = line.split_once('|')
+                    && !url_history.iter().any(|(u, _)| u == url) {
+                    url_history.push((url.to_string(), title.to_string()));
                 }
             }
         }
@@ -514,7 +514,7 @@ impl AppState {
             tracker_row_history: self.tracker_row_history.clone(),
             current_tracker_row_string: self.current_tracker_row_string.clone(),
             tracker_patterns_by_order: self.tracker_patterns_by_order.clone(),
-            tracker_channels: self.tracker_channels.clone(),
+            tracker_channels: self.tracker_channels,
             load_request: None,
             video_mode: self.video_mode,
             has_video_stream: self.has_video_stream,

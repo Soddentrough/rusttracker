@@ -238,12 +238,11 @@ pub fn normalize_path_str(raw: &str) -> String {
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len() {
-            if let Ok(val) = u8::from_str_radix(std::str::from_utf8(&bytes[i+1..i+3]).unwrap_or(""), 16) {
-                decoded.push(val as char);
-                i += 3;
-                continue;
-            }
+        if bytes[i] == b'%' && i + 2 < bytes.len()
+            && let Ok(val) = u8::from_str_radix(std::str::from_utf8(&bytes[i+1..i+3]).unwrap_or(""), 16) {
+            decoded.push(val as char);
+            i += 3;
+            continue;
         }
         decoded.push(bytes[i] as char);
         i += 1;
@@ -253,7 +252,7 @@ pub fn normalize_path_str(raw: &str) -> String {
 
 fn clean_song_stem(stem: &str) -> String {
     let mut s = stem.to_lowercase();
-    s = s.replace('_', " ").replace('-', " ").replace('.', " ");
+    s = s.replace(['_', '-', '.'], " ");
     for tag in &["(instrumental)", "(vocals)", "(karaoke)", "(official)", "[flac]", "[mp3]", "(audio)", "(lyrics)"] {
         s = s.replace(tag, "");
     }
@@ -316,11 +315,10 @@ pub fn find_sidecar_lrc_path(audio_path: &str) -> Option<PathBuf> {
             if let Ok(entries) = fs::read_dir(dir) {
                 for entry in entries.flatten() {
                     let entry_path = entry.path();
-                    if entry_path.is_file() {
-                        if let Some(ext) = entry_path.extension() {
-                            if ext.eq_ignore_ascii_case("lrc") {
-                                if let Some(entry_stem) = entry_path.file_stem() {
-                                    let entry_stem_raw = entry_stem.to_string_lossy();
+                    if entry_path.is_file()
+                        && entry_path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("lrc"))
+                        && let Some(entry_stem) = entry_path.file_stem() {
+                        let entry_stem_raw = entry_stem.to_string_lossy();
                                     let entry_stem_clean = clean_song_stem(&entry_stem_raw);
                                     if entry_stem_raw.eq_ignore_ascii_case(&stem_raw)
                                         || (!stem_clean.is_empty() && entry_stem_clean == stem_clean)
@@ -329,9 +327,6 @@ pub fn find_sidecar_lrc_path(audio_path: &str) -> Option<PathBuf> {
                                         return Some(entry_path);
                                     }
                                 }
-                            }
-                        }
-                    }
                 }
             }
         }

@@ -89,7 +89,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
             };
 
             let padded_symbol = match chars_per_vu {
-                1 => format!("{}", symbol),
+                1 => symbol.to_string(),
                 2 => format!("{} ", symbol),
                 _ => format!(" {}{}", symbol, " ".repeat(chars_per_vu - 2)),
             };
@@ -451,7 +451,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
             };
 
             let padded_symbol = match chars_per_spec {
-                1 => format!("{}", symbol),
+                1 => symbol.to_string(),
                 2 => format!("{} ", symbol),
                 _ => format!(" {}{}", symbol, " ".repeat(chars_per_spec.saturating_sub(2))),
             };

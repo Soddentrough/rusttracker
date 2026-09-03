@@ -36,10 +36,9 @@ fn vs_main_3d(in: VertexInput, @builtin(instance_index) inst_idx: u32) -> Vertex
     
     let p = particles[inst_idx];
     
-    // Discard/hide particle if life is finished, energy is extremely low,
-    // or if this is not the front face of the cube (to render as a single billboarded quad)
-    if (p.pos.w <= 0.0 || p.vel.w < 0.001 || in.normal.z < 0.9) {
-        out.clip_position = vec4<f32>(0.0, 0.0, -10.0, 1.0); // behind the camera
+    // Discard/hide particle if life is finished or energy is extremely low
+    if (p.pos.w <= 0.0 || p.vel.w < 0.001) {
+        out.clip_position = vec4<f32>(0.0, 0.0, 0.0, 0.0);
         out.uv = vec2<f32>(0.0);
         out.energy = 0.0;
         out.depth = 0.0;
@@ -59,7 +58,7 @@ fn vs_main_3d(in: VertexInput, @builtin(instance_index) inst_idx: u32) -> Vertex
     
     // Discard/hide particle if it is behind or too close to the camera to prevent huge screen-filling discs
     if (depth < 1.2) {
-        out.clip_position = vec4<f32>(0.0, 0.0, -10.0, 1.0); // behind the camera
+        out.clip_position = vec4<f32>(0.0, 0.0, 0.0, 0.0);
         out.uv = vec2<f32>(0.0);
         out.energy = 0.0;
         out.depth = 0.0;

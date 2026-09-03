@@ -38,15 +38,15 @@ gdb_output.txt
 
 # Scratch / Temp files
 scratch.*
-test_*.rs
-test_*.c
-test_*.sh
+/test_*.rs
+/test_*.c
+/test_*.sh
 test_load
 test_sort
 screenshot*
 scratch/
-scratch_bitstream/target/
-scratch_bitstream_windows/target/
+scratch_bitstream/
+scratch_bitstream_windows/
 /test.rs
 /test_*
 test_*.png
