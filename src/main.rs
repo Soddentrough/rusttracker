@@ -397,10 +397,10 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                     let mut delta = 0.0;
                                     match keycode {
                                         WinitKeyCode::ArrowRight => {
-                                            delta = if modifiers.control_key() { duration * 0.01 } else { duration * 0.001 };
+                                            delta = if modifiers.control_key() || modifiers.super_key() { duration * 0.01 } else { duration * 0.001 };
                                         },
                                         WinitKeyCode::ArrowLeft => {
-                                            delta = if modifiers.control_key() { -(duration * 0.01) } else { -(duration * 0.001) };
+                                            delta = if modifiers.control_key() || modifiers.super_key() { -(duration * 0.01) } else { -(duration * 0.001) };
                                         },
                                         WinitKeyCode::Comma => delta = -1.0 / 60.0, // ~1 frame at 60fps
                                         WinitKeyCode::Period => delta = 1.0 / 60.0,
