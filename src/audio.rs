@@ -430,7 +430,7 @@ pub trait AudioSource: Send {
     #[cfg(not(target_os = "android"))]
     fn attach_video_queue(&mut self, _tx: crossbeam_channel::Sender<(u64, ffmpeg_next::Packet)>) {}
     #[cfg(not(target_os = "android"))]
-    fn take_video_parameters(&mut self) -> Option<(ffmpeg_next::codec::Parameters, ffmpeg_next::Rational)> { None }
+    fn take_video_parameters(&mut self) -> Option<(ffmpeg_next::codec::Parameters, ffmpeg_next::Rational, u32)> { None }
     fn get_bitrate(&mut self) -> Option<u32> { None }
     fn get_audio_tracks(&self) -> Vec<crate::state::AudioTrackInfo> { Vec::new() }
     fn get_selected_audio_track(&self) -> usize { 0 }
@@ -1272,6 +1272,7 @@ struct FfmpegSource {
     video_epoch: u64,
     video_params: Option<ffmpeg_next::codec::Parameters>,
     video_time_base: Option<ffmpeg_next::Rational>,
+    video_rotation: u32,
 
     audio_tracks: Vec<crate::state::AudioTrackInfo>,
     selected_track_idx: usize,
@@ -1597,9 +1598,9 @@ impl AudioSource for FfmpegSource {
         self.video_tx = Some(tx);
     }
     
-    fn take_video_parameters(&mut self) -> Option<(ffmpeg_next::codec::Parameters, ffmpeg_next::Rational)> {
+    fn take_video_parameters(&mut self) -> Option<(ffmpeg_next::codec::Parameters, ffmpeg_next::Rational, u32)> {
         if let (Some(p), Some(tb)) = (self.video_params.take(), self.video_time_base.take()) {
-            return Some((p, tb));
+            return Some((p, tb, self.video_rotation));
         }
         None
     }
@@ -1659,6 +1660,7 @@ struct VideoOnlySource {
     video_epoch: u64,
     video_params: Option<ffmpeg_next::codec::Parameters>,
     video_time_base: Option<ffmpeg_next::Rational>,
+    video_rotation: u32,
     current_time: f64,
     duration: f64,
     video_info: Option<String>,
@@ -1766,9 +1768,9 @@ impl AudioSource for VideoOnlySource {
         self.video_tx = Some(tx);
     }
     
-    fn take_video_parameters(&mut self) -> Option<(ffmpeg_next::codec::Parameters, ffmpeg_next::Rational)> {
+    fn take_video_parameters(&mut self) -> Option<(ffmpeg_next::codec::Parameters, ffmpeg_next::Rational, u32)> {
         if let (Some(p), Some(tb)) = (self.video_params.take(), self.video_time_base.take()) {
-            Some((p, tb))
+            Some((p, tb, self.video_rotation))
         } else {
             None
         }
@@ -1816,13 +1818,48 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
     let mut video_stream_index = None;
     let mut video_params = None;
     let mut video_tb = None;
+    let mut video_rotation = 0u32;
     if let Some(v_stream) = ictx.streams().best(ffmpeg_next::media::Type::Video) {
         video_stream_index = Some(v_stream.index());
         video_params = Some(v_stream.parameters());
         video_tb = Some(v_stream.time_base());
+
+        // 1. Check metadata dictionary for "rotate" tag
+        if let Some(rot_str) = v_stream.metadata().get("rotate")
+            && let Ok(rot_deg) = rot_str.parse::<i32>() {
+            let norm = ((rot_deg % 360) + 360) % 360;
+            if norm == 90 || norm == 180 || norm == 270 {
+                video_rotation = norm as u32;
+            }
+        }
+        // 2. Check stream side data for DisplayMatrix
+        if video_rotation == 0 {
+            for sd in v_stream.side_data() {
+                if sd.kind() == ffmpeg_next::codec::packet::side_data::Type::DisplayMatrix {
+                    let data = sd.data();
+                    if data.len() >= 36 {
+                        let m0 = i32::from_ne_bytes([data[0], data[1], data[2], data[3]]);
+                        let m1 = i32::from_ne_bytes([data[4], data[5], data[6], data[7]]);
+                        let a = m0 as f64 / 65536.0;
+                        let b = m1 as f64 / 65536.0;
+                        let rot_deg = (-b.atan2(a).to_degrees()).round() as i32;
+                        let norm = ((rot_deg % 360) + 360) % 360;
+                        if norm == 90 || norm == 180 || norm == 270 {
+                            video_rotation = norm as u32;
+                        }
+                    }
+                }
+            }
+        }
+
         if let Ok(v_ctx) = ffmpeg_next::codec::context::Context::from_parameters(v_stream.parameters()) {
             if let Ok(v_dec) = v_ctx.decoder().video() {
-                video_info = Some(format!("{} ({}x{})", v_dec.codec().map(|c| c.name().to_string()).unwrap_or("H264".to_string()).to_uppercase(), v_dec.width(), v_dec.height()));
+                let (disp_w, disp_h) = if video_rotation == 90 || video_rotation == 270 {
+                    (v_dec.height(), v_dec.width())
+                } else {
+                    (v_dec.width(), v_dec.height())
+                };
+                video_info = Some(format!("{} ({}x{})", v_dec.codec().map(|c| c.name().to_string()).unwrap_or("H264".to_string()).to_uppercase(), disp_w, disp_h));
             } else {
                 video_info = Some("Unsupported Codec".to_string());
             }
@@ -1907,6 +1944,7 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
                 video_epoch: 0,
                 video_params,
                 video_time_base: video_tb,
+                video_rotation,
                 current_time: 0.0,
                 duration,
                 video_info,
@@ -1988,6 +2026,7 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
         video_epoch: 0,
         video_params,
         video_time_base: video_tb,
+        video_rotation,
         audio_tracks,
         selected_track_idx,
         output_sample_rate: sample_rate,
@@ -2847,7 +2886,7 @@ fn run_dummy(
     }
     
     #[cfg(not(target_os = "android"))]
-    if let Some((params, time_base)) = audio_source.take_video_parameters() {
+    if let Some((params, time_base, rotation)) = audio_source.take_video_parameters() {
         let (video_frame_tx, video_frame_rx) = bounded::<crate::state::VideoFrame>(16);
         let (free_video_frame_tx, free_video_frame_rx) = unbounded::<crate::state::VideoFrame>();
         
@@ -2856,6 +2895,7 @@ fn run_dummy(
                 pts: 0.0,
                 width: 0,
                 height: 0,
+                rotation,
                 y_plane: Vec::new(),
                 u_plane: Vec::new(),
                 v_plane: Vec::new(),
@@ -2996,6 +3036,7 @@ fn run_dummy(
                                             frame.pts = pts;
                                             frame.width = decoded.width();
                                             frame.height = decoded.height();
+                                            frame.rotation = rotation;
                                             
                                             let format_name = format!("{:?}", decoded.format());
                                             frame.bit_depth = if format_name.contains("10LE") { 10 } else if format_name.contains("12LE") { 12 } else { 8 };
@@ -3683,7 +3724,7 @@ where
     }
     
     #[cfg(not(target_os = "android"))]
-    if let Some((params, time_base)) = audio_source.take_video_parameters() {
+    if let Some((params, time_base, rotation)) = audio_source.take_video_parameters() {
         let (video_frame_tx, video_frame_rx) = bounded::<crate::state::VideoFrame>(16);
         let (free_video_frame_tx, free_video_frame_rx) = unbounded::<crate::state::VideoFrame>();
         
@@ -3692,6 +3733,7 @@ where
                 pts: 0.0,
                 width: 0,
                 height: 0,
+                rotation,
                 y_plane: Vec::new(),
                 u_plane: Vec::new(),
                 v_plane: Vec::new(),
@@ -3832,6 +3874,7 @@ where
                                             frame.pts = pts;
                                             frame.width = decoded.width();
                                             frame.height = decoded.height();
+                                            frame.rotation = rotation;
                                             
                                             let format_name = format!("{:?}", decoded.format());
                                             frame.bit_depth = if format_name.contains("10LE") { 10 } else if format_name.contains("12LE") { 12 } else { 8 };

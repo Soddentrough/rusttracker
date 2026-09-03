@@ -68,6 +68,7 @@ pub struct VideoFrame {
     pub pts: f64,
     pub width: u32,
     pub height: u32,
+    pub rotation: u32,
     pub y_plane: Vec<u8>,
     pub u_plane: Vec<u8>,
     pub v_plane: Vec<u8>,
@@ -88,6 +89,7 @@ impl std::fmt::Debug for VideoFrame {
             .field("pts", &self.pts)
             .field("width", &self.width)
             .field("height", &self.height)
+            .field("rotation", &self.rotation)
             .field("bit_depth", &self.bit_depth)
             .field("color_space", &self.color_space)
             .field("color_range", &self.color_range)

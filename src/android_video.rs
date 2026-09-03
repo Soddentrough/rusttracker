@@ -76,6 +76,7 @@ pub mod decoder {
                 pts: 0.0,
                 width: 0,
                 height: 0,
+                rotation: 0,
                 y_plane: Vec::new(),
                 u_plane: Vec::new(),
                 v_plane: Vec::new(),
@@ -128,6 +129,7 @@ pub mod decoder {
                     let mut codec = ptr::null_mut();
                     let mut vid_w = 1920i32;
                     let mut vid_h = 1080i32;
+                    let mut vid_rot = 0u32;
 
                     let mime_key = CStr::from_bytes_with_nul(b"mime\0").unwrap();
                     let width_key = CStr::from_bytes_with_nul(b"width\0").unwrap();
@@ -135,6 +137,7 @@ pub mod decoder {
                     let stride_key = CStr::from_bytes_with_nul(b"stride\0").unwrap();
                     let slice_height_key = CStr::from_bytes_with_nul(b"slice-height\0").unwrap();
                     let color_format_key = CStr::from_bytes_with_nul(b"color-format\0").unwrap();
+                    let rotation_key = CStr::from_bytes_with_nul(b"rotation-degrees\0").unwrap();
 
                     for i in 0..track_count {
                         let format = AMediaExtractor_getTrackFormat(extractor, i);
@@ -148,6 +151,15 @@ pub mod decoder {
                                     video_track_idx = Some(i);
                                     AMediaFormat_getInt32(format, width_key.as_ptr(), &mut vid_w);
                                     AMediaFormat_getInt32(format, height_key.as_ptr(), &mut vid_h);
+                                    let mut track_rot: i32 = 0;
+                                    if AMediaFormat_getInt32(format, rotation_key.as_ptr(), &mut track_rot) {
+                                        let norm = ((track_rot % 360) + 360) % 360;
+                                        vid_rot = match norm {
+                                            90 | 180 | 270 => norm as u32,
+                                            _ => 0,
+                                        };
+                                        crate::android::log_android(3, &format!("[RustTracker Video] Detected track rotation: {} degrees", vid_rot));
+                                    }
                                     // Request COLOR_FormatYUV420SemiPlanar (21) for standard CPU memory readable buffers
                                     AMediaFormat_setInt32(format, color_format_key.as_ptr(), 21);
 
@@ -157,7 +169,7 @@ pub mod decoder {
                                         if status == 0 && AMediaCodec_start(codec) == 0 {
                                             AMediaExtractor_selectTrack(extractor, i);
                                             AMediaFormat_delete(format);
-                                            crate::android::log_android(3, &format!("[RustTracker Video] Hardware decoder started for track {} ({} {}x{})", i, mime_str, vid_w, vid_h));
+                                            crate::android::log_android(3, &format!("[RustTracker Video] Hardware decoder started for track {} ({} {}x{} rot={}deg)", i, mime_str, vid_w, vid_h, vid_rot));
                                             break;
                                         } else {
                                             AMediaCodec_delete(codec);
@@ -179,7 +191,9 @@ pub mod decoder {
 
                     if let Ok(mut state) = state_for_video.lock() {
                         state.has_video_stream = true;
-                        state.video_info = Some(format!("Video Stream: {}x{} H.264 (Hardware)", vid_w, vid_h));
+                        state.mobile_hud_tab = crate::state::MobileHudTab::Video;
+                        let (disp_w, disp_h) = if vid_rot == 90 || vid_rot == 270 { (vid_h, vid_w) } else { (vid_w, vid_h) };
+                        state.video_info = Some(format!("Video Stream: {}x{} H.264 (Hardware)", disp_w, disp_h));
                     }
 
                     let mut local_epoch = 0;
@@ -259,6 +273,7 @@ pub mod decoder {
                                             pts: pts_sec,
                                             width: w as u32,
                                             height: h as u32,
+                                            rotation: vid_rot,
                                             y_plane: Vec::new(),
                                             u_plane: Vec::new(),
                                             v_plane: Vec::new(),
@@ -275,6 +290,7 @@ pub mod decoder {
                                     frame.pts = pts_sec;
                                     frame.width = w as u32;
                                     frame.height = h as u32;
+                                    frame.rotation = vid_rot;
                                     frame.y_stride = w;
                                     frame.u_stride = half_w;
                                     frame.v_stride = half_w;
@@ -332,12 +348,20 @@ pub mod decoder {
                                 AMediaFormat_getInt32(out_format, height_key.as_ptr(), &mut new_h);
                                 AMediaFormat_getInt32(out_format, stride_key.as_ptr(), &mut new_stride);
                                 AMediaFormat_getInt32(out_format, slice_height_key.as_ptr(), &mut new_slice_h);
+                                let mut out_rot: i32 = 0;
+                                if AMediaFormat_getInt32(out_format, rotation_key.as_ptr(), &mut out_rot) && out_rot != 0 {
+                                    let norm = ((out_rot % 360) + 360) % 360;
+                                    vid_rot = match norm {
+                                        90 | 180 | 270 => norm as u32,
+                                        _ => 0,
+                                    };
+                                }
                                 
                                 vid_w = new_w;
                                 vid_h = new_h;
                                 out_stride = if new_stride > 0 { new_stride as usize } else { new_w as usize };
                                 out_slice_h = if new_slice_h > 0 { new_slice_h as usize } else { new_h as usize };
-                                crate::android::log_android(3, &format!("[RustTracker Video] Output format changed: {}x{}, stride={}, slice_h={}", vid_w, vid_h, out_stride, out_slice_h));
+                                crate::android::log_android(3, &format!("[RustTracker Video] Output format changed: {}x{} rot={}deg, stride={}, slice_h={}", vid_w, vid_h, vid_rot, out_stride, out_slice_h));
                                 AMediaFormat_delete(out_format);
                             }
                         } else if out_idx == AMEDIACODEC_INFO_TRY_AGAIN_LATER {

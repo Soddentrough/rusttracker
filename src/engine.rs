@@ -146,6 +146,10 @@ pub struct VideoParams {
     pub viewport_height: f32,
     pub video_width: f32,
     pub video_height: f32,
+    pub rotation: u32,
+    pub _pad1: f32,
+    pub _pad2: f32,
+    pub _pad3: f32,
 }
 
 pub struct VideoState {
@@ -156,6 +160,7 @@ pub struct VideoState {
     pub params_buffer: wgpu::Buffer,
     pub width: u32,
     pub height: u32,
+    pub rotation: u32,
     pub color_space: u32,
     pub color_range: u32,
     pub bit_depth: u32,
@@ -4053,12 +4058,14 @@ impl VulkanEngine {
                     self.video_state = Some(VideoState { 
                         y_texture, u_texture, v_texture, bind_group, params_buffer, 
                         width: frame.width, height: frame.height,
+                        rotation: frame.rotation,
                         color_space: frame.color_space,
                         color_range: frame.color_range,
                         bit_depth: frame.bit_depth as u32,
                         color_trc: frame.color_trc,
                     });
                 } else if let Some(vs) = &mut self.video_state {
+                    vs.rotation = frame.rotation;
                     vs.color_space = frame.color_space;
                     vs.color_range = frame.color_range;
                     vs.bit_depth = frame.bit_depth as u32;
@@ -4130,6 +4137,10 @@ impl VulkanEngine {
                         viewport_height: self.config.height as f32,
                         video_width: frame.width as f32,
                         video_height: frame.height as f32,
+                        rotation: frame.rotation,
+                        _pad1: 0.0,
+                        _pad2: 0.0,
+                        _pad3: 0.0,
                     };
                     self.queue.write_buffer(&vs.params_buffer, 0, bytemuck::cast_slice(&[params]));
                 }
@@ -4245,7 +4256,8 @@ impl VulkanEngine {
                 2 => "Full Range",
                 _ => "Limited Range",
             };
-            video_info_str = Some(format!("{}x{} | {} {}-bit {}", vs.width, vs.height, cs, vs.bit_depth, cr));
+            let (disp_w, disp_h) = if vs.rotation == 90 || vs.rotation == 270 { (vs.height, vs.width) } else { (vs.width, vs.height) };
+            video_info_str = Some(format!("{}x{} | {} {}-bit {}", disp_w, disp_h, cs, vs.bit_depth, cr));
         }
         
         let full_output = egui_ctx.run_ui(raw_input, |ctx| {
@@ -6714,6 +6726,10 @@ impl VulkanEngine {
                         viewport_height: v_vp_h,
                         video_width: vs.width as f32,
                         video_height: vs.height as f32,
+                        rotation: vs.rotation,
+                        _pad1: 0.0,
+                        _pad2: 0.0,
+                        _pad3: 0.0,
                     };
                     self.queue.write_buffer(&vs.params_buffer, 0, bytemuck::cast_slice(&[params]));
                     render_pass.set_pipeline(&self.video_pipeline);

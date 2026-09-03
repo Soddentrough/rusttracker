@@ -22,6 +22,10 @@ struct VideoParams {
     viewport_height: f32,
     video_width: f32,
     video_height: f32,
+    rotation: u32,
+    _pad1: f32,
+    _pad2: f32,
+    _pad3: f32,
 }
 
 @group(0) @binding(0) var t_y: texture_2d<f32>;
@@ -30,10 +34,24 @@ struct VideoParams {
 @group(0) @binding(3) var s_smp: sampler;
 @group(0) @binding(4) var<uniform> params: VideoParams;
 
+fn transform_uv(display_uv: vec2<f32>, rotation: u32) -> vec2<f32> {
+    if (rotation == 90u) {
+        return vec2<f32>(display_uv.y, 1.0 - display_uv.x);
+    } else if (rotation == 180u) {
+        return vec2<f32>(1.0 - display_uv.x, 1.0 - display_uv.y);
+    } else if (rotation == 270u) {
+        return vec2<f32>(1.0 - display_uv.y, display_uv.x);
+    }
+    return display_uv;
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let vp_aspect = params.viewport_width / params.viewport_height;
-    let vid_aspect = params.video_width / params.video_height;
+    var vid_aspect = params.video_width / params.video_height;
+    if (params.rotation == 90u || params.rotation == 270u) {
+        vid_aspect = params.video_height / params.video_width;
+    }
     
     var uv = in.uv;
     var is_edge = false;
@@ -54,10 +72,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
     
     var sample_uv = vec2<f32>(clamp(uv.x, 0.0, 1.0), clamp(uv.y, 0.0, 1.0));
+    let tex_uv = transform_uv(sample_uv, params.rotation);
 
-    var y = textureSample(t_y, s_smp, sample_uv).r;
-    var u = textureSample(t_u, s_smp, sample_uv).r;
-    var v = textureSample(t_v, s_smp, sample_uv).r;
+    var y = textureSample(t_y, s_smp, tex_uv).r;
+    var u = textureSample(t_u, s_smp, tex_uv).r;
+    var v = textureSample(t_v, s_smp, tex_uv).r;
 
     if (is_edge) {
         y = 0.0;
@@ -100,9 +119,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let t = f32(i) / f32(half_s);
             let weight = exp(-t * t * 3.0);
             
-            y += textureSample(t_y, s_smp, s_uv).r * weight;
-            u += textureSample(t_u, s_smp, s_uv).r * weight;
-            v += textureSample(t_v, s_smp, s_uv).r * weight;
+            let b_uv = transform_uv(s_uv, params.rotation);
+            y += textureSample(t_y, s_smp, b_uv).r * weight;
+            u += textureSample(t_u, s_smp, b_uv).r * weight;
+            v += textureSample(t_v, s_smp, b_uv).r * weight;
             weight_sum += weight;
         }
         
