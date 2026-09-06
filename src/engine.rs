@@ -77,6 +77,7 @@ pub enum EngineAction {
     SetAudioMixTracks(Vec<(usize, f32)>),
     #[allow(dead_code)]
     SetMobileHudTab(crate::state::MobileHudTab),
+    ToggleVisPicker,
 }
 
 #[repr(C)]
@@ -231,6 +232,7 @@ pub struct VulkanEngine {
     pub fire_uv_rect: [f32; 4],
     
     // GPU compute fire simulation
+    #[allow(dead_code)] // preserved for standalone GPU fire compute / testing
     fire_compute_pipeline: wgpu::ComputePipeline,
     firesim_compute_pipeline: wgpu::ComputePipeline,
     fire_buffer_a: wgpu::Buffer,
@@ -241,6 +243,11 @@ pub struct VulkanEngine {
     fire_bind_group_a: wgpu::BindGroup, // reads A, writes B
     fire_bind_group_b: wgpu::BindGroup, // reads B, writes A
     fire_ping: bool,
+    
+    // Authentic DOOM Fire simulation state (visualizer ID 5: Retro Fire)
+    retro_fire_cells: Box<[u8; 320 * 180]>,
+    retro_fire_upload: Vec<f32>,
+    retro_fire_rng: u32,
     
     pub heatmap_row: u32,
     heatmap_compute_pipeline: wgpu::ComputePipeline,
@@ -3463,6 +3470,9 @@ impl VulkanEngine {
             fire_bind_group_a,
             fire_bind_group_b,
             fire_ping: true,
+            retro_fire_cells: Box::new([0u8; 320 * 180]),
+            retro_fire_upload: vec![0.0f32; 1024 * 576],
+            retro_fire_rng: 0x12345678,
             heatmap_row: 0,
             heatmap_compute_pipeline,
             heatmap_bind_group,
@@ -3553,6 +3563,184 @@ impl VulkanEngine {
 
     pub fn clear_video_state(&mut self) {
         self.video_state = None;
+    }
+
+    pub fn update_retro_fire_grid(
+        cells: &mut [u8; 320 * 180],
+        rng: &mut u32,
+        intensity: f32,
+        state: &crate::state::AppState,
+    ) {
+        const W: usize = 320;
+        const H: usize = 180;
+
+        if intensity < 0.001 {
+            // Decay towards 0 when stopped
+            let mut all_zero = true;
+            for cell in cells.iter_mut() {
+                if *cell > 0 {
+                    *cell = cell.saturating_sub(1);
+                    all_zero = false;
+                }
+            }
+            if all_zero {
+                return;
+            }
+        } else {
+            // 1. Audio Analysis: Bass transient detection and column energy mapping
+            let bass_raw = if state.spectrum_data.len() >= 16 {
+                state.spectrum_data[1..16].iter().copied().fold(0.0f32, f32::max)
+            } else {
+                0.0
+            };
+            let bass = (bass_raw / 60.0).clamp(0.0, 1.5);
+
+            let mut col_energies = [0.0f32; W];
+            if let Some(num_tracks) = state.tracker_channels.filter(|&n| n > 0) {
+                let n_ch = (num_tracks as usize).min(64);
+                let spec_len = state.spectrum_data.len();
+                // For tracker files, state.channel_vus is [Left_peak, Track1..N, Right_peak]
+                for x in 0..W {
+                    let track_idx = (x * n_ch) / W;
+                    let track_vu = state.channel_vus.get(1 + track_idx).copied().unwrap_or(0.0);
+
+                    // Blend fine-grained FFT frequency detail across the track column:
+                    let spec_idx = if spec_len > 0 {
+                        ((x * 512) / W).min(spec_len.saturating_sub(1))
+                    } else {
+                        0
+                    };
+                    let spec_val = state.spectrum_data.get(spec_idx).copied().unwrap_or(0.0) / 60.0;
+
+                    col_energies[x] = (track_vu * 0.70 + spec_val * 0.30).clamp(0.0, 1.5);
+                }
+            } else {
+                // Non-tracker audio (Stereo MP3, FLAC, AAC, WAV, Radio Stream):
+                let spec_len = state.spectrum_data.len();
+                let left_vu = state.channel_vus.first().copied().unwrap_or(0.0);
+                let right_vu = state.channel_vus.get(1).copied().unwrap_or(left_vu);
+
+                for x in 0..W {
+                    let frac = x as f32 / W as f32;
+                    let bin = if spec_len > 1 {
+                        ((frac.powf(1.6) * 512.0) as usize).clamp(1, spec_len.saturating_sub(1))
+                    } else {
+                        0
+                    };
+                    let spec_val = state.spectrum_data.get(bin).copied().unwrap_or(0.0) / 60.0;
+
+                    let pan_vu = left_vu * (1.0 - frac) + right_vu * frac;
+                    col_energies[x] = (spec_val * 0.70 + pan_vu * 0.30).clamp(0.0, 1.5);
+                }
+            }
+
+            let bottom_offset = (H - 1) * W;
+            let hearth_offset = (H - 2) * W;
+
+            // 2. Multi-step cellular automaton (2 sub-steps per frame for snappy transient physics)
+            for _ in 0..2 {
+                // Combustion Hearth Row
+                for x in 0..W {
+                    let col_e = (col_energies[x] * 0.75 + bass * 0.25) * intensity;
+
+                    // Bottom heat scales from quiet ember (11) up to incandescent white-hot (36):
+                    let base_heat = 11.0 + col_e * 25.0;
+
+                    *rng ^= *rng << 13;
+                    *rng ^= *rng >> 17;
+                    *rng ^= *rng << 5;
+                    let crackle = (*rng % 5) as i32 - 2;
+
+                    let heat = ((base_heat as i32 + crackle) as u8).clamp(6, 36);
+                    cells[bottom_offset + x] = heat;
+                    cells[hearth_offset + x] = heat.saturating_sub((*rng % 2) as u8);
+                }
+
+                // In-place DOOM fire propagation across columns
+                for x in 0..W {
+                    let col_e = (col_energies[x] * 0.75 + bass * 0.25) * intensity;
+
+                    // High decay when quiet (0.68), low decay when energetic (0.20):
+                    let decay_prob = (0.68 - col_e * 0.44).clamp(0.20, 0.72);
+                    let thresh = (decay_prob * 1000.0) as u32;
+
+                    // Dynamic vertical convection on strong transients:
+                    *rng ^= *rng << 13;
+                    *rng ^= *rng >> 17;
+                    *rng ^= *rng << 5;
+                    let dy = if col_e > 0.70 && (*rng % 4 != 0) { 2 } else { 1 };
+
+                    for y in dy..H {
+                        let from = y * W + x;
+                        let pixel = cells[from];
+                        if pixel == 0 {
+                            cells[from - W * dy] = 0;
+                        } else {
+                            *rng ^= *rng << 13;
+                            *rng ^= *rng >> 17;
+                            *rng ^= *rng << 5;
+                            let rnd = (*rng & 3) as usize;
+
+                            let to = from.wrapping_sub(W * dy).wrapping_sub(rnd).wrapping_add(1);
+                            if to < W * H {
+                                // Altitude cooling: taper smoke above 60% screen height so flame tips dance naturally
+                                let alt_decay = if y < 70 && ((*rng >> 8) % 100 < 35) { 1 } else { 0 };
+                                let decay = if ((*rng >> 4) % 1000) < thresh { 1 } else { 0 };
+                                let total_decay = decay.max(alt_decay);
+                                cells[to] = pixel.saturating_sub(total_decay);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn update_retro_fire(&mut self, state: &crate::state::AppState, _uniforms: &AudioUniforms) {
+        Self::update_retro_fire_grid(
+            &mut self.retro_fire_cells,
+            &mut self.retro_fire_rng,
+            self.fire_intensity,
+            state,
+        );
+
+        // Fast upload to 1024x576 fire_grid_texture using precomputed coordinate maps:
+        const PAL_FLOAT: [f32; 37] = {
+            let mut p = [0.0f32; 37];
+            let mut i = 0;
+            while i <= 36 {
+                p[i] = i as f32 / 36.0;
+                i += 1;
+            }
+            p
+        };
+
+        for py in 0..576 {
+            let sy = (py * 180) / 576;
+            let row_offset = py * 1024;
+            let sim_offset = sy * 320;
+            for px in 0..1024 {
+                let sx = (px * 320) / 1024;
+                let heat_idx = self.retro_fire_cells[sim_offset + sx] as usize;
+                self.retro_fire_upload[row_offset + px] = PAL_FLOAT[heat_idx.min(36)];
+            }
+        }
+
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.fire_grid_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&self.retro_fire_upload),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(1024 * 4),
+                rows_per_image: Some(576),
+            },
+            wgpu::Extent3d { width: 1024, height: 576, depth_or_array_layers: 1 },
+        );
     }
 
     #[allow(dead_code)]
@@ -3937,44 +4125,51 @@ impl VulkanEngine {
         }
         
         if vis_def.requires_fire {
-            let mut bass_sum = 0.0;
-            let mut mids_sum = 0.0;
-            let mut highs_sum = 0.0;
-            for i in 0..64 { bass_sum += uniforms.fire_heat[i]; }
-            let bass = (bass_sum / 64.0 / 100.0).min(1.0);
-            for i in 64..512 { mids_sum += uniforms.fire_heat[i]; }
-            let mids = (mids_sum / 448.0 / 100.0).min(1.0);
-            for i in 512..1024 { highs_sum += uniforms.fire_heat[i]; }
-            let highs = (highs_sum / 512.0 / 100.0).min(1.0);
-            
-            let n_ch = state.channel_vus.len().clamp(1, 32);
-            let lfe_idx = if (n_ch == 6 || n_ch == 8 || n_ch == 16) && state.tracker_channels.is_none() { 3 } else { 999 };
-            
-            let mut fire_params = FireParams {
-                bass,
-                mids,
-                highs,
-                time: self.play_time as f32,
-                cooling_factor: 1.0 - mids * 0.5,
-                turb_spread_f: 1.0 + highs * 3.0,
-                width: 1024,
-                height: 576,
-                num_channels: ch_len as u32,
-                lfe_idx: lfe_idx as u32,
-                fft_channels: state.raw_audio_channels.len() as u32,
-                dt: frame_dt,
-                display_order: [0; 16],
-                channels: [[0.0; 4]; 8],
-            };
-            
-            for i in 0..16 {
-                fire_params.display_order[i] = uniforms.display_order[i];
+            if vis_def.id == 5 {
+                let start_sim = std::time::Instant::now();
+                self.update_retro_fire(state, &uniforms);
+                let elapsed_us = start_sim.elapsed().as_micros() as f32;
+                self.cached_fire_us = Some(elapsed_us);
+            } else {
+                let mut bass_sum = 0.0;
+                let mut mids_sum = 0.0;
+                let mut highs_sum = 0.0;
+                for i in 0..64 { bass_sum += uniforms.fire_heat[i]; }
+                let bass = (bass_sum / 64.0 / 100.0).min(1.0);
+                for i in 64..512 { mids_sum += uniforms.fire_heat[i]; }
+                let mids = (mids_sum / 448.0 / 100.0).min(1.0);
+                for i in 512..1024 { highs_sum += uniforms.fire_heat[i]; }
+                let highs = (highs_sum / 512.0 / 100.0).min(1.0);
+                
+                let n_ch = state.channel_vus.len().clamp(1, 32);
+                let lfe_idx = if (n_ch == 6 || n_ch == 8 || n_ch == 16) && state.tracker_channels.is_none() { 3 } else { 999 };
+                
+                let mut fire_params = FireParams {
+                    bass,
+                    mids,
+                    highs,
+                    time: self.play_time as f32,
+                    cooling_factor: 1.0 - mids * 0.5,
+                    turb_spread_f: self.fire_intensity,
+                    width: 1024,
+                    height: 576,
+                    num_channels: ch_len as u32,
+                    lfe_idx: lfe_idx as u32,
+                    fft_channels: state.raw_audio_channels.len() as u32,
+                    dt: frame_dt,
+                    display_order: [0; 16],
+                    channels: [[0.0; 4]; 8],
+                };
+                
+                for i in 0..16 {
+                    fire_params.display_order[i] = uniforms.display_order[i];
+                }
+                for i in 0..n_ch {
+                    fire_params.channels[i / 4][i % 4] = uniforms.channels[i];
+                }
+                
+                self.queue.write_buffer(&self.fire_params_buffer, 0, bytemuck::cast_slice(&[fire_params]));
             }
-            for i in 0..n_ch {
-                fire_params.channels[i / 4][i % 4] = uniforms.channels[i];
-            }
-            
-            self.queue.write_buffer(&self.fire_params_buffer, 0, bytemuck::cast_slice(&[fire_params]));
         }
         
         // GPU spectrum is consumed only by the firesim compute (id 6) and the
@@ -5815,6 +6010,19 @@ impl VulkanEngine {
                                                         render_smooth_marquee(ui, lrc_name, 14.0, false);
                                                         ui.end_row();
                                                     }
+
+                                                    // 9. Active Visualizer Module
+                                                    let vis_name = crate::state::VISUALIZERS
+                                                        .get(state.current_visualizer_idx)
+                                                        .map(|v| v.name)
+                                                        .unwrap_or("Unknown");
+                                                    ui.label(egui::RichText::new("Visualizer:").color(egui::Color32::from_rgb(160, 180, 200)));
+                                                    let vis_link = ui.link(egui::RichText::new(vis_name).color(egui::Color32::from_rgb(255, 215, 0)).strong());
+                                                    if vis_link.clicked() {
+                                                        *engine_action = EngineAction::ToggleVisPicker;
+                                                    }
+                                                    vis_link.on_hover_text("Click to open Visualization Modules selector (Shortcut: 'm')");
+                                                    ui.end_row();
                                                 });
 
                                             if state.audio_tracks.len() > 1 {
@@ -6409,44 +6617,55 @@ impl VulkanEngine {
         // GPU fire compute: dispatch simulation + copy result to texture
         let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
         if vis_def.requires_fire {
-            {
-                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Fire Compute"),
-                    timestamp_writes: self.query_set.as_ref().map(|qs| wgpu::ComputePassTimestampWrites {
-                        query_set: qs,
-                        beginning_of_pass_write_index: Some(2),
-                        end_of_pass_write_index: Some(3),
-                    }),
-                });
-                if vis_def.id == 5 {
-                    compute_pass.set_pipeline(&self.fire_compute_pipeline);
-                } else {
+            if vis_def.id == 6 {
+                {
+                    let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("Fire Compute"),
+                        timestamp_writes: self.query_set.as_ref().map(|qs| wgpu::ComputePassTimestampWrites {
+                            query_set: qs,
+                            beginning_of_pass_write_index: Some(2),
+                            end_of_pass_write_index: Some(3),
+                        }),
+                    });
                     compute_pass.set_pipeline(&self.firesim_compute_pipeline);
+                    let bg = if self.fire_ping { &self.fire_bind_group_a } else { &self.fire_bind_group_b };
+                    compute_pass.set_bind_group(0, Some(bg), &[]);
+                    compute_pass.dispatch_workgroups(64, 36, 1); // 1024/16=64, 576/16=36
                 }
-                let bg = if self.fire_ping { &self.fire_bind_group_a } else { &self.fire_bind_group_b };
-                compute_pass.set_bind_group(0, Some(bg), &[]);
-                compute_pass.dispatch_workgroups(64, 36, 1); // 1024/16=64, 576/16=36
-            }
-            // Copy output buffer to fire_grid_texture
-            let output_buffer = if self.fire_ping { &self.fire_buffer_b } else { &self.fire_buffer_a };
-            encoder.copy_buffer_to_texture(
-                wgpu::TexelCopyBufferInfo {
-                    buffer: output_buffer,
-                    layout: wgpu::TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(1024 * 4),
-                        rows_per_image: Some(576),
+                // Copy output buffer to fire_grid_texture
+                let output_buffer = if self.fire_ping { &self.fire_buffer_b } else { &self.fire_buffer_a };
+                encoder.copy_buffer_to_texture(
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: output_buffer,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(1024 * 4),
+                            rows_per_image: Some(576),
+                        },
                     },
-                },
-                wgpu::TexelCopyTextureInfo {
-                    texture: &self.fire_grid_texture,
-                    mip_level: 0,
-                    origin: wgpu::Origin3d::ZERO,
-                    aspect: wgpu::TextureAspect::All,
-                },
-                wgpu::Extent3d { width: 1024, height: 576, depth_or_array_layers: 1 },
-            );
-            self.fire_ping = !self.fire_ping;
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &self.fire_grid_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d { width: 1024, height: 576, depth_or_array_layers: 1 },
+                );
+                self.fire_ping = !self.fire_ping;
+            } else {
+                // Retro Fire (ID 5) cellular automaton already ran on CPU and uploaded to fire_grid_texture.
+                // Run dummy timestamp compute pass to satisfy Vulkan validation timestamp queries:
+                if let Some(qs) = &self.query_set {
+                    encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("Dummy Fire Pass"),
+                        timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                            query_set: qs,
+                            beginning_of_pass_write_index: Some(2),
+                            end_of_pass_write_index: Some(3),
+                        }),
+                    });
+                }
+            }
         } else {
             // Write dummy timestamps to satisfy Vulkan validation
             if let Some(qs) = &self.query_set {
@@ -6552,9 +6771,13 @@ impl VulkanEngine {
             self.queue.write_buffer(&self.uniform_buffer, ASPECT_RATIO_OFFSET, bytemuck::cast_slice(&[aspect as f32]));
 
             // Adapt FOV when aspect ratio is square or portrait (< 1.0) so 3D scenes fit without horizontal clipping
-            let base_fov = 48.0_f32.to_radians();
+            let base_fov = if state.visualizer_mode == 22 {
+                64.0_f32.to_radians()
+            } else {
+                48.0_f32.to_radians()
+            };
             let fov_y = if aspect < 1.0 {
-                (base_fov / aspect.clamp(0.65, 1.0)).min(75.0_f32.to_radians())
+                (base_fov / aspect.clamp(0.65, 1.0)).min(if state.visualizer_mode == 22 { 85.0_f32.to_radians() } else { 75.0_f32.to_radians() })
             } else {
                 base_fov
             };
@@ -6599,6 +6822,18 @@ impl VulkanEngine {
                 glam::Mat4::look_at_rh(
                     glam::Vec3::new(0.0, 1.4, 4.2),
                     glam::Vec3::new(0.0, 0.45, 0.0),
+                    glam::Vec3::new(0.0, 1.0, 0.0),
+                )
+            } else if state.visualizer_mode == 22 {
+                // 3D Neon Spatial Listening Room: Orbiting camera focused on center stage
+                let t_cam = self.play_time as f32 * 0.18;
+                let cam_radius = 9.8f32;
+                let cam_h = 2.4f32 + (t_cam * 0.7).sin() * 0.6f32;
+                let cam_x = t_cam.sin() * cam_radius * 0.55f32;
+                let cam_z = -t_cam.cos() * cam_radius * 0.6f32 - 2.8f32;
+                glam::Mat4::look_at_rh(
+                    glam::Vec3::new(cam_x, cam_h, cam_z),
+                    glam::Vec3::new(0.0, 0.4, 2.5),
                     glam::Vec3::new(0.0, 1.0, 0.0),
                 )
             } else {
@@ -7108,6 +7343,45 @@ mod tests {
     }
 
     #[test]
+    fn test_fire_visualizers_registration() {
+        use std::collections::HashSet;
+
+        // Ensure all visualizer IDs are unique
+        let mut ids = HashSet::new();
+        for v in crate::state::VISUALIZERS {
+            assert!(ids.insert(v.id), "Duplicate visualizer ID found: {}", v.id);
+        }
+
+        // Verify Retro Fire (ID 5)
+        let retro_fire = crate::state::VISUALIZERS.iter().find(|v| v.id == 5)
+            .expect("Visualizer ID 5 (Retro Fire) must be registered in VISUALIZERS");
+        assert_eq!(retro_fire.name, "Retro Fire");
+        assert_eq!(retro_fire.filename, "vis_flame.wgsl");
+        assert!(retro_fire.requires_fire, "Retro Fire requires fire compute");
+
+        // Verify Fire Simulation (ID 6)
+        let firesim = crate::state::VISUALIZERS.iter().find(|v| v.id == 6)
+            .expect("Visualizer ID 6 (Fire Simulation) must be registered in VISUALIZERS");
+        assert_eq!(firesim.name, "Fire Simulation");
+        assert_eq!(firesim.filename, "vis_firesim.wgsl");
+
+        // Verify ID 26 (DOOM Fire) is removed
+        assert!(crate::state::VISUALIZERS.iter().all(|v| v.id != 26), "ID 26 should no longer exist");
+
+        // Verify default enablement states in AppState
+        let state = crate::state::AppState::new("Test App".to_string());
+        let retro_fire_idx = crate::state::VISUALIZERS.iter().position(|v| v.id == 5).unwrap();
+        let firesim_idx = crate::state::VISUALIZERS.iter().position(|v| v.id == 6).unwrap();
+        assert!(state.vis_enabled[retro_fire_idx], "Retro Fire should be enabled by default");
+        assert!(!state.vis_enabled[firesim_idx], "Fire Simulation should be disabled by default");
+
+        // Verify vis_flame.wgsl contains DOOM palette and CRT post-processing
+        let flame_source = include_str!("shaders/vis_flame.wgsl");
+        assert!(flame_source.contains("doom_palette"));
+        assert!(flame_source.contains("apply_crt_effects"));
+    }
+
+    #[test]
     fn test_progress_fire_decay_when_stopped() {
         let mut state = crate::state::AppState::new("Test App".to_string());
         state.file_loaded = true;
@@ -7178,5 +7452,135 @@ mod tests {
             }
         }
         assert_eq!(fire_intensity, 0.0, "Fire intensity should die off completely (0.0) when end of song is reached");
+    }
+
+    #[test]
+    fn test_retro_fire_audio_reactivity() {
+        let mut state = crate::state::AppState::new("Test App".to_string());
+        state.file_loaded = true;
+        state.is_paused = false;
+        state.track_ended = false;
+
+        const W: usize = 320;
+        const H: usize = 180;
+        let mut cells = [0u8; W * H];
+        let mut rng = 0x12345678u32;
+
+        // 1. In silence / quiet passages: hearth is low embers (< 18), flames stay in bottom region
+        state.spectrum_data = vec![0.0; 1024];
+        state.channel_vus = vec![0.0; 2];
+        for _ in 0..40 {
+            VulkanEngine::update_retro_fire_grid(&mut cells, &mut rng, 1.0, &state);
+        }
+
+        let bottom_row = (H - 1) * W;
+        let mut quiet_hearth_sum = 0u32;
+        for x in 0..W {
+            quiet_hearth_sum += cells[bottom_row + x] as u32;
+        }
+        let quiet_hearth_avg = quiet_hearth_sum as f32 / W as f32;
+        assert!(
+            quiet_hearth_avg <= 18.0,
+            "Quiet hearth should be low embers (<= 18), got average {:.2}",
+            quiet_hearth_avg
+        );
+
+        // In quiet passages, flames must not reach upper half of the screen
+        let upper_heat_count: usize = cells[..90 * W].iter().filter(|&&c| c > 0).count();
+        assert_eq!(
+            upper_heat_count, 0,
+            "Quiet audio should not produce flames in upper half of screen"
+        );
+
+        // 2. On a loud bass kick: bass columns (x in 0..40) erupt to white-hot (>= 34),
+        // and full-spectrum chorus drives the entire hearth to white-hot (>= 33)
+        for i in 1..16 {
+            state.spectrum_data[i] = 90.0; // Heavy bass transient
+        }
+        state.channel_vus = vec![1.0; 2];
+        for _ in 0..60 {
+            VulkanEngine::update_retro_fire_grid(&mut cells, &mut rng, 1.0, &state);
+        }
+
+        let mut bass_col_sum = 0u32;
+        let mut loud_hearth_sum = 0u32;
+        for x in 0..W {
+            let heat = cells[bottom_row + x] as u32;
+            loud_hearth_sum += heat;
+            if x < 40 {
+                bass_col_sum += heat;
+            }
+        }
+        let bass_col_avg = bass_col_sum as f32 / 40.0;
+        let loud_hearth_avg = loud_hearth_sum as f32 / W as f32;
+        assert!(
+            bass_col_avg >= 34.0,
+            "Bass columns should be incandescent white-hot (>= 34), got average {:.2}",
+            bass_col_avg
+        );
+        assert!(
+            loud_hearth_avg >= 25.0,
+            "Overall hearth on loud beat should be >= 25.0 (quiet was {:.2}), got average {:.2}",
+            quiet_hearth_avg,
+            loud_hearth_avg
+        );
+
+        // Now test full-spectrum chorus
+        state.spectrum_data.fill(70.0);
+        for _ in 0..60 {
+            VulkanEngine::update_retro_fire_grid(&mut cells, &mut rng, 1.0, &state);
+        }
+        let full_hearth_sum: u32 = (0..W).map(|x| cells[bottom_row + x] as u32).sum();
+        let full_hearth_avg = full_hearth_sum as f32 / W as f32;
+        assert!(
+            full_hearth_avg >= 33.0,
+            "Full spectrum chorus hearth should be white-hot (>= 33), got average {:.2}",
+            full_hearth_avg
+        );
+
+        // Flames must now reach into the upper half of screen
+        let loud_upper_heat_count: usize = cells[..90 * W].iter().filter(|&&c| c > 0).count();
+        assert!(
+            loud_upper_heat_count > 100,
+            "Loud beat should push flames well into the upper half of screen, got {} pixels",
+            loud_upper_heat_count
+        );
+
+        // 3. Tracker channel separation: Active Track 1 vs Silent Track 2
+        state.tracker_channels = Some(4);
+        state.spectrum_data = vec![0.0; 1024];
+        // [Left_peak, Track1, Track2, Track3, Track4, Right_peak]
+        state.channel_vus = vec![0.5, 1.0, 0.0, 0.8, 0.0, 0.5];
+        for _ in 0..50 {
+            VulkanEngine::update_retro_fire_grid(&mut cells, &mut rng, 1.0, &state);
+        }
+
+        // Track 1 column band: x in 0..80. Track 2 column band: x in 80..160
+        let mut track1_heat = 0u32;
+        let mut track2_heat = 0u32;
+        for y in 0..H {
+            for x in 0..80 {
+                track1_heat += cells[y * W + x] as u32;
+            }
+            for x in 80..160 {
+                track2_heat += cells[y * W + x] as u32;
+            }
+        }
+        assert!(
+            track1_heat > track2_heat * 2,
+            "Active tracker channel should have vastly higher energy than silent channel (Track1: {}, Track2: {})",
+            track1_heat,
+            track2_heat
+        );
+
+        // 4. Decay to zero when stopped
+        for _ in 0..50 {
+            VulkanEngine::update_retro_fire_grid(&mut cells, &mut rng, 0.0, &state);
+        }
+        let remaining_heat: u32 = cells.iter().map(|&c| c as u32).sum();
+        assert_eq!(
+            remaining_heat, 0,
+            "Cells should completely decay to 0 when stopped"
+        );
     }
 }

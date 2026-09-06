@@ -10,15 +10,43 @@ license = "GPL-3.0-or-later"
 assets = [
     { source = "target/release/rusttracker", dest = "/usr/bin/rusttracker", mode = "755" },
     { source = "rusttracker.desktop", dest = "/usr/share/applications/rusttracker.desktop", mode = "644" },
-    { source = "icon.png", dest = "/usr/share/icons/hicolor/256x256/apps/rusttracker.png", mode = "644" },
+    { source = "com.soddentrough.rusttracker.metainfo.xml", dest = "/usr/share/metainfo/com.soddentrough.rusttracker.metainfo.xml", mode = "644" },
+    { source = "assets/icons/hicolor/16x16/apps/rusttracker.png", dest = "/usr/share/icons/hicolor/16x16/apps/rusttracker.png", mode = "644" },
+    { source = "assets/icons/hicolor/24x24/apps/rusttracker.png", dest = "/usr/share/icons/hicolor/24x24/apps/rusttracker.png", mode = "644" },
+    { source = "assets/icons/hicolor/32x32/apps/rusttracker.png", dest = "/usr/share/icons/hicolor/32x32/apps/rusttracker.png", mode = "644" },
+    { source = "assets/icons/hicolor/48x48/apps/rusttracker.png", dest = "/usr/share/icons/hicolor/48x48/apps/rusttracker.png", mode = "644" },
+    { source = "assets/icons/hicolor/64x64/apps/rusttracker.png", dest = "/usr/share/icons/hicolor/64x64/apps/rusttracker.png", mode = "644" },
+    { source = "assets/icons/hicolor/128x128/apps/rusttracker.png", dest = "/usr/share/icons/hicolor/128x128/apps/rusttracker.png", mode = "644" },
+    { source = "assets/icons/hicolor/256x256/apps/rusttracker.png", dest = "/usr/share/icons/hicolor/256x256/apps/rusttracker.png", mode = "644" },
+    { source = "assets/icons/hicolor/512x512/apps/rusttracker.png", dest = "/usr/share/icons/hicolor/512x512/apps/rusttracker.png", mode = "644" },
+    { source = "assets/icons/pixmaps/rusttracker.png", dest = "/usr/share/pixmaps/rusttracker.png", mode = "644" },
     { source = "assets/soundfont.sf2", dest = "/usr/share/rusttracker/assets/soundfont.sf2", mode = "644" }
 ]
+post_install_script = """
+/usr/bin/gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor || true
+/usr/bin/update-desktop-database -q || true
+/usr/bin/update-mime-database /usr/share/mime || true
+"""
+post_uninstall_script = """
+/usr/bin/gtk-update-icon-cache -q -t -f /usr/share/icons/hicolor || true
+/usr/bin/update-desktop-database -q || true
+/usr/bin/update-mime-database /usr/share/mime || true
+"""
 
 [package.metadata.deb]
 assets = [
     ["target/release/rusttracker", "usr/bin/", "755"],
     ["rusttracker.desktop", "usr/share/applications/", "644"],
-    ["icon.png", "usr/share/icons/hicolor/256x256/apps/rusttracker.png", "644"],
+    ["com.soddentrough.rusttracker.metainfo.xml", "usr/share/metainfo/", "644"],
+    ["assets/icons/hicolor/16x16/apps/rusttracker.png", "usr/share/icons/hicolor/16x16/apps/rusttracker.png", "644"],
+    ["assets/icons/hicolor/24x24/apps/rusttracker.png", "usr/share/icons/hicolor/24x24/apps/rusttracker.png", "644"],
+    ["assets/icons/hicolor/32x32/apps/rusttracker.png", "usr/share/icons/hicolor/32x32/apps/rusttracker.png", "644"],
+    ["assets/icons/hicolor/48x48/apps/rusttracker.png", "usr/share/icons/hicolor/48x48/apps/rusttracker.png", "644"],
+    ["assets/icons/hicolor/64x64/apps/rusttracker.png", "usr/share/icons/hicolor/64x64/apps/rusttracker.png", "644"],
+    ["assets/icons/hicolor/128x128/apps/rusttracker.png", "usr/share/icons/hicolor/128x128/apps/rusttracker.png", "644"],
+    ["assets/icons/hicolor/256x256/apps/rusttracker.png", "usr/share/icons/hicolor/256x256/apps/rusttracker.png", "644"],
+    ["assets/icons/hicolor/512x512/apps/rusttracker.png", "usr/share/icons/hicolor/512x512/apps/rusttracker.png", "644"],
+    ["assets/icons/pixmaps/rusttracker.png", "usr/share/pixmaps/rusttracker.png", "644"],
     ["assets/soundfont.sf2", "usr/share/rusttracker/assets/", "644"]
 ]
 extended-description = "A high-performance, real-time audio visualizer and tracker module player."
@@ -72,7 +100,7 @@ jni = "0.21.1"
 winres = "0.1.12"
 
 [target."cfg(windows)".dependencies]
-windows = { version = "0.62.2", features = ["Win32_System_Com", "Win32_Media_Audio", "Win32_Foundation", "Win32_System_Threading", "Win32_System_Pipes"] }
+windows = { version = "0.62.2", features = ["Win32_System_Com", "Win32_Media_Audio", "Win32_Foundation", "Win32_System_Threading", "Win32_System_Pipes", "Win32_UI_Shell"] }
 
 [target."cfg(target_os = \"macos\")".dependencies]
 objc2 = "0.6.4"

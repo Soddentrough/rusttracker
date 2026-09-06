@@ -141,7 +141,8 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
     VisualizerDef { id: 1, name: "CRT Oscilloscope", filename: "vis_oscilloscope.wgsl", description: "2D glowing CRT wave trace", pipeline_type: PipelineType::FullscreenQuad, requires_history: true, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 3, name: "3D Oscilloscope", filename: "vis_3doscilloscope_raster.wgsl", description: "Rasterized 3D waterfall grid of waveform history", pipeline_type: PipelineType::Mesh3D { geometry: Geometry::Grid { width: 256, depth: 143 }, instances: 1 }, requires_history: true, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 4, name: "3D Freq Oscilloscope", filename: "vis_3doscilloscope_freq.wgsl", description: "3D topographical frequency view", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: false, requires_resynth: true, requires_ferrofluidsim: false },
-    VisualizerDef { id: 5, name: "Retro Fire", filename: "vis_flame.wgsl", description: "Demoscene pixel fire with CRT filter", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: true, requires_resynth: false, requires_ferrofluidsim: false },
+    VisualizerDef { id: 5, name: "Retro Fire", filename: "vis_flame.wgsl", description: "Classic DOOM 2D fire simulation with CRT post-processing", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: true, requires_resynth: false, requires_ferrofluidsim: false },
+    VisualizerDef { id: 6, name: "Fire Simulation", filename: "vis_firesim.wgsl", description: "Multi-channel procedural fire simulation (experimental)", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: true, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 7, name: "Solar Flare", filename: "vis_solar.wgsl", description: "Audio-reactive raymarched sun", pipeline_type: PipelineType::FullscreenQuad, requires_history: true, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 8, name: "Spatial Vectors", filename: "vis_spatial.wgsl", description: "Multi-channel spatial audio map", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 9, name: "Chrome Ferrofluid", filename: "vis_ferrofluid.wgsl", description: "Raymarched liquid metal simulation", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
@@ -151,7 +152,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
     VisualizerDef { id: 16, name: "Midnight Storm", filename: "vis_rain.wgsl", description: "Cinematic atmospheric dark sky, falling rain & branching lightning", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 19, name: "Retro VU Meters", filename: "vis_vumeters_3d.wgsl", description: "3D vintage Hi-Fi master rack with physical analog needles & warm glow", pipeline_type: PipelineType::Mesh3D { geometry: Geometry::VuMeterRack, instances: 1 }, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 20, name: "Bioluminescent Waves", filename: "vis_bioluminescence.wgsl", description: "GPU compute-driven bioluminescent particle waves", pipeline_type: PipelineType::Mesh3D { geometry: Geometry::UnitQuad, instances: 65536 }, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
-    VisualizerDef { id: 22, name: "Neon Spatial Room", filename: "vis_neon_room.wgsl", description: "3D interactive spatial listening room with multi-channel speakers", pipeline_type: PipelineType::Mesh3D { geometry: Geometry::NeonRoom, instances: 1 }, requires_history: false, requires_fire: true, requires_resynth: false, requires_ferrofluidsim: false },
+    VisualizerDef { id: 22, name: "Neon Spatial Room", filename: "vis_neon_room.wgsl", description: "3D interactive spatial listening room with multi-channel speakers", pipeline_type: PipelineType::Mesh3D { geometry: Geometry::NeonRoom, instances: 1 }, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
     VisualizerDef { id: 23, name: "3D Glass Water Lyrics", filename: "vis_lyrics.wgsl", description: "Chunky 3D glass letters in dark reflective water with kinetic slam & splashes", pipeline_type: PipelineType::Mesh3D { geometry: Geometry::GlassLyricsScene, instances: 1 }, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
 ];
 
@@ -306,6 +307,11 @@ impl AppState {
         
         // Solar Flare (ID 7): disabled on all systems due to computational cost and visual quality
         if let Some(idx) = VISUALIZERS.iter().position(|v| v.id == 7) {
+            vis_enabled[idx] = false;
+        }
+
+        // Fire Simulation (ID 6): preserved for future development, disabled by default
+        if let Some(idx) = VISUALIZERS.iter().position(|v| v.id == 6) {
             vis_enabled[idx] = false;
         }
 

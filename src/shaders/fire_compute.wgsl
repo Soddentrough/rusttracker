@@ -4,7 +4,7 @@ struct FireParams {
     highs: f32,
     time: f32,
     cooling_factor: f32,
-    turb_spread_f: f32,
+    turb_spread_f: f32, // fire_intensity: 1.0 when playing, decays to 0.0 when stopped/paused
     width: u32,
     height: u32,
     num_channels: u32,
@@ -26,162 +26,134 @@ fn pcg_hash(input: u32) -> u32 {
     return (word >> 22u) ^ word;
 }
 
-fn hash22(p: vec2<f32>) -> vec2<f32> {
-    var q = vec2<f32>(dot(p, vec2<f32>(127.1, 311.7)),
-                      dot(p, vec2<f32>(269.5, 183.3)));
-    return fract(sin(q) * 43758.5453) * 2.0 - 1.0;
+fn read_channel(idx: u32) -> f32 {
+    let vec_idx = idx / 4u;
+    let comp_idx = idx % 4u;
+    if (vec_idx >= 8u) { return 0.0; }
+    let v = params.channels[vec_idx];
+    if (comp_idx == 0u) { return v.x; }
+    if (comp_idx == 1u) { return v.y; }
+    if (comp_idx == 2u) { return v.z; }
+    return v.w;
 }
 
-fn perlin_noise(p: vec2<f32>) -> f32 {
-    let i = floor(p);
-    let f = fract(p);
-    let u = f * f * (3.0 - 2.0 * f);
-    
-    let a = dot(hash22(i + vec2<f32>(0.0, 0.0)), f - vec2<f32>(0.0, 0.0));
-    let b = dot(hash22(i + vec2<f32>(1.0, 0.0)), f - vec2<f32>(1.0, 0.0));
-    let c = dot(hash22(i + vec2<f32>(0.0, 1.0)), f - vec2<f32>(0.0, 1.0));
-    let d = dot(hash22(i + vec2<f32>(1.0, 1.0)), f - vec2<f32>(1.0, 1.0));
-    
-    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+fn get_channel_energy(norm_x: f32) -> f32 {
+    let n_ch = params.num_channels;
+    if (n_ch <= 1u) {
+        return read_channel(0u);
+    }
+    let fx = norm_x * f32(n_ch) - 0.5;
+    let i0 = clamp(i32(floor(fx)), 0, i32(n_ch) - 1);
+    let i1 = clamp(i0 + 1, 0, i32(n_ch) - 1);
+    let frac = fract(fx);
+    let v0 = read_channel(u32(i0));
+    let v1 = read_channel(u32(i1));
+    return mix(v0, v1, smoothstep(0.0, 1.0, frac));
 }
 
 @compute @workgroup_size(16, 16)
 fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let x = id.x;
     let y = id.y;
-    if (x >= params.width || y >= params.height) { return; }
+    let W = params.width;
+    let H = params.height;
+    if (x >= W || y >= H) { return; }
 
-    let w = params.width;
-    let bottom = params.height - 1u;
-    let idx = y * w + x;
+    let idx = y * W + x;
 
-    // Rates below were tuned per-frame at 144fps; scale by real dt so the
-    // simulation evolves identically at any refresh rate.
-    let dt_scale = params.dt * 144.0;
+    // Simulation grid dimensions (authentic DOOM resolution: 320 x 180)
+    let SIM_W = 320u;
+    let SIM_H = 180u;
+    let cx = (x * SIM_W) / W;
+    let cy = (y * SIM_H) / H;
 
-    // === Bottom row: update coal bed with thermal inertia ===
-    if (y == bottom) {
-        var activity = 0.0;
-        let n_ch = params.num_channels;
-        let lfe_idx = params.lfe_idx;
-        var n_spatial_ch = n_ch;
-        if lfe_idx < n_ch {
-            n_spatial_ch = n_ch - 1u;
-        }
-        let channel_width = f32(params.width) / f32(max(n_spatial_ch, 1u));
-        var sigma_scale = 0.18;
-        if n_spatial_ch <= 2u {
-            sigma_scale = 0.4;
-        }
-        
-        var spatial_idx = 0u;
-        for (var i = 0u; i < n_ch; i = i + 1u) {
-            let raw_ch = params.display_order[i / 4u][i % 4u];
-            if raw_ch == lfe_idx { continue; }
-            let center_x = (f32(spatial_idx) + 0.5) * channel_width;
-            let dist = f32(x) - center_x;
-            let sigma = channel_width * sigma_scale;
-            let influence = exp(-(dist * dist) / (2.0 * sigma * sigma));
-            
-            let vec_idx = i / 4u;
-            let comp_idx = i % 4u;
-            var ch_val = params.channels[vec_idx].x;
-            if comp_idx == 1u { ch_val = params.channels[vec_idx].y; }
-            else if comp_idx == 2u { ch_val = params.channels[vec_idx].z; }
-            else if comp_idx == 3u { ch_val = params.channels[vec_idx].w; }
-            
-            activity += pow(ch_val, 1.5) * influence;
-            spatial_idx += 1u;
-        }
-        if lfe_idx < n_ch {
-            let lfe_dist = f32(x) - f32(params.width) * 0.5;
-            let lfe_influence = exp(-(lfe_dist * lfe_dist) / (2.0 * 90.0 * 90.0));
-            var lfe_disp_idx = 999u;
-            for (var i = 0u; i < n_ch; i = i + 1u) {
-                if params.display_order[i / 4u][i % 4u] == lfe_idx {
-                    lfe_disp_idx = i;
-                    break;
-                }
-            }
-            if lfe_disp_idx < n_ch {
-                let vec_idx = lfe_disp_idx / 4u;
-                let comp_idx = lfe_disp_idx % 4u;
-                var lfe_val = params.channels[vec_idx].x;
-                if comp_idx == 1u { lfe_val = params.channels[vec_idx].y; }
-                else if comp_idx == 2u { lfe_val = params.channels[vec_idx].z; }
-                else if comp_idx == 3u { lfe_val = params.channels[vec_idx].w; }
-                
-                activity += lfe_val * lfe_influence * 0.6;
-            }
-        }
+    // Frame-rate scaling (calibrated for 60fps)
+    let dt_scale = clamp(params.dt * 60.0, 0.5, 2.0);
+    let intensity = clamp(params.turb_spread_f, 0.0, 1.0);
 
-        // Use exponential soft-clipping for AGC (Automatic Gain Control)
-        // This ensures quiet tracks still generate nice flames, while brickwalled tracks smoothly approach 1.0 without hard clipping.
-        let coal_target = 1.0 - exp(-(params.bass * 0.5 + activity * 3.0));
-        let current = coal_bed[x];
-        if (coal_target > current) {
-            coal_bed[x] = current + (coal_target - current) * min(0.18 * dt_scale, 1.0);
-        } else {
-            coal_bed[x] = current + (coal_target - current) * min(0.008 * dt_scale, 1.0);
-        }
-        
-        // Use lower frequency noise to create wide, organic hotspots rather than single-pixel static
-        let jitter = (perlin_noise(vec2<f32>(f32(x) * 0.05, params.time * 10.0)) + 1.0) * 0.5;
-        output_grid[idx] = min(coal_bed[x] * (0.7 + 0.3 * jitter), 1.0);
+    // If completely stopped and cold, decay to black and return
+    if (intensity < 0.001) {
+        output_grid[idx] = max(input_grid[idx] - 0.05 * dt_scale, 0.0);
+        if (y == H - 1u) { coal_bed[x] = 0.0; }
         return;
     }
 
-    // === Hearth rows: inject coal heat ===
-    if (y >= bottom - 2u) {
-        let coal_heat = min(coal_bed[x], 1.0);
-        let jitter = (perlin_noise(vec2<f32>(f32(x) * 0.05, params.time * 10.0)) + 1.0) * 0.5;
-        
-        if (y == bottom - 1u) {
-            output_grid[idx] = coal_heat * (0.85 + 0.15 * jitter);
+    let norm_x = (f32(cx) + 0.5) / f32(SIM_W);
+    let ch_energy = get_channel_energy(norm_x);
+
+    // === Bottom rows: Combustion source bed across the full width ===
+    if (cy >= SIM_H - 2u) {
+        // High-frequency boiling combustion noise per column
+        let seed_base = cx + u32(params.time * 80.0) * 8191u;
+        let crackle_h = pcg_hash(seed_base);
+        let crackle = (f32(crackle_h % 1000u) / 1000.0 - 0.5) * 0.12;
+
+        // Roaring baseline bed across the entire width:
+        // Baseline combustion is ALWAYS incandescent white-hot (1.0 / palette 36)
+        // during active playback across the full screen width.
+        let white_bed = clamp(1.0 + crackle, 0.90, 1.0) * intensity;
+
+        if (cy == SIM_H - 1u) {
+            output_grid[idx] = white_bed;
+            if (y == H - 1u) { coal_bed[x] = white_bed; }
         } else {
-            output_grid[idx] = coal_heat * (0.7 + 0.15 * jitter);
+            let hearth = clamp(0.95 * intensity + crackle * 0.8, 0.80 * intensity, 1.0);
+            output_grid[idx] = hearth;
         }
         return;
     }
 
-    // === Normal propagation: Cellular Automaton Simulation ===
-    
-    // Base turbulence coordinates
-    let p1 = vec2<f32>(f32(x), f32(y)) * 0.02;
-    
-    // Spread heat randomly but coherently to form organic flame tongues
-    let spread_noise = perlin_noise(p1 * 1.5 + vec2<f32>(params.time * 4.0, -params.time * 10.0));
-    let spread = i32(spread_noise * (1.5 + params.highs * 1.5));
-    
-    // Global wind swaying the fire
-    let wind = i32(sin(params.time * 1.5 + f32(x) * 0.003) * params.highs * 2.0);
-    
-    // Classic DOS fire averaging: blend adjacent pixels to allow heat to diffuse into organic shapes
-    let src_x = clamp(i32(x) + spread + wind, 0i, i32(w) - 1);
-    let xl = max(src_x - 1, 0i);
-    let xr = min(src_x + 1, i32(w) - 1);
-    
-    let h1 = input_grid[(y + 1u) * w + u32(xl)];
-    let h2 = input_grid[(y + 1u) * w + u32(src_x)];
-    let h3 = input_grid[(y + 1u) * w + u32(xr)];
-    
-    // Weighted horizontal blur favors the center pixel
-    let heat = (h1 + h2 * 2.0 + h3) / 4.0;
+    // === Cellular Automaton Flame Propagation (Authentic DOOM Fire Algorithm) ===
+    let seed = cx + cy * SIM_W + u32(params.time * 60.0) * 1973u;
+    let r_hash = pcg_hash(seed);
+    let rand_idx = r_hash & 3u; // 0, 1, 2, 3
 
-    // Cooling varies spatially to create uneven tips and licks
-    // Stretch the noise vertically and move it upwards to simulate rising flame tongues
-    let p_cool = vec2<f32>(f32(x) * 0.015, f32(y) * 0.03);
-    let cool_noise = perlin_noise(p_cool + vec2<f32>(0.0, params.time * 6.0));
-    
-    // Higher variance in cooling forces the flame to tear into distinct licks
-    let base_cooling = (0.0015 + (cool_noise + 1.0) * 0.0015) * dt_scale;
+    // Wind / flutter swaying flames horizontally, modulated by treble/highs
+    let wind = i32(sin(params.time * 1.5) * (0.8 + params.highs * 1.5));
+    let offset = (i32(rand_idx) - 1) + wind;
+    let src_cx = clamp(i32(cx) + offset, 0, i32(SIM_W) - 1);
+    let src_cy = cy + 1u; // row directly below
 
-    // Occasional sparks (holes in the flame) for realism, clumped by noise
-    // (threshold 0.55: this perlin gradient noise peaks around +/-0.7, so 0.8 was unreachable)
-    let spark = select(0.0, 0.06 * dt_scale, cool_noise > 0.55 && y > 100u);
+    // Read source cell from input_grid (sampled at cell center)
+    let src_sample_x = (u32(src_cx) * W) / SIM_W + (W / SIM_W / 2u);
+    let src_sample_y = (src_cy * H) / SIM_H + (H / SIM_H / 2u);
+    let src_val = input_grid[src_sample_y * W + src_sample_x];
 
-    // Normalize the cooling factor so heavily compressed tracks don't turn off cooling entirely
-    let dynamic_cooling = mix(0.6, 1.0, params.cooling_factor);
+    // Read previous frame value at (cx, cy) for persistence
+    let prev_sample_x = (cx * W) / SIM_W + (W / SIM_W / 2u);
+    let prev_sample_y = (cy * H) / SIM_H + (H / SIM_H / 2u);
+    let prev_val = input_grid[prev_sample_y * W + prev_sample_x];
 
-    output_grid[idx] = max(heat - base_cooling * dynamic_cooling - spark, 0.0);
+    // Arrival probability (scatter hit chance)
+    let hit_rand = (r_hash >> 2u) & 255u;
+    let is_hit = hit_rand < 215u;
+
+    // Gentle altitude factor (only active above 50% screen height to taper smoke)
+    let let_alt = max(0.0, f32(SIM_H - cy) / f32(SIM_H) - 0.5) * 0.20;
+
+    // Dynamic cooling:
+    // Low cooling near the base and active channels so flame tongues leap high (80-85% screen),
+    // higher cooling in quiet zones to create deep valleys and dancing spires.
+    let cool_rate = (0.32 - params.bass * 0.14 - ch_energy * 0.18 + let_alt) * dt_scale;
+    let cool_threshold = u32(clamp(cool_rate * 255.0, 15.0, 245.0));
+    let cool_rand = (r_hash >> 10u) & 255u;
+
+    // Palette unit in normalized float: 1.0 / 36.0 ≈ 0.027778
+    let pal_unit = 1.0 / 36.0;
+
+    var new_heat = 0.0;
+    if (is_hit && src_val > 0.001) {
+        let decay = select(0.0, pal_unit, cool_rand < cool_threshold);
+        new_heat = max(src_val - decay, 0.0);
+    } else {
+        new_heat = max(prev_val - pal_unit * 0.4 * dt_scale, 0.0);
+    }
+
+    // Occasional spark voids / turbulent tears in hot zones
+    let spark_rand = (r_hash >> 18u) & 255u;
+    if (spark_rand == 0u && new_heat > 0.45) {
+        new_heat = max(new_heat - pal_unit * 2.0, 0.0);
+    }
+
+    output_grid[idx] = new_heat;
 }

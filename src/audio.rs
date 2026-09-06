@@ -2256,9 +2256,9 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
         
     let video_info = None; // Symphonia doesn't do video
 
-    // 1. Prioritize FFmpeg for video containers (MKV, MP4) on desktop to ensure video streams are processed.
+    // 1. Prioritize FFmpeg for video containers (MKV, MP4, WEBM, MOV, AVI) on desktop to ensure video streams are processed.
     #[cfg(not(target_os = "android"))]
-    if ext == "mkv" || ext == "mp4" {
+    if ext == "mkv" || ext == "mp4" || ext == "webm" || ext == "mov" || ext == "avi" {
         match try_ffmpeg(file_path, false) {
             Ok(source) => return Ok(source),
             Err(err) => {
@@ -2267,17 +2267,11 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
         }
     }
 
-    // 2. Try Symphonia for all supported audio and container formats (FLAC, MP3, WAV, AAC, M4A, OGG, OPUS, etc.)
-    if let Ok(file) = File::open(file_path) {
-        match try_symphonia(file, &ext, &ext, video_info.clone(), Some(file_path)) {
-            Ok(source) => return Ok(source),
-            Err(e) => eprintln!("[RustTracker] Symphonia load failed for {}: {:?}", file_path, e),
-        }
-    }
-
-    // 3. Try OpenMPT Tracker module ONLY for likely tracker files on desktop
+    // 2. Try OpenMPT Tracker module FIRST for tracker module files on desktop
     #[cfg(not(target_os = "android"))]
-    if (ext == "mod" || ext == "s3m" || ext == "xm" || ext == "it" || ext == "mptm")
+    if (ext == "mod" || ext == "s3m" || ext == "xm" || ext == "it" || ext == "mptm"
+        || ext == "stm" || ext == "med" || ext == "okt" || ext == "669" || ext == "mtm"
+        || ext == "far" || ext == "ult" || ext == "amf" || ext == "dsm")
         && let Ok(mut file) = File::open(file_path) {
         let mut data = Vec::new();
         if file.read_to_end(&mut data).is_ok() {
@@ -2292,7 +2286,7 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
         }
     }
 
-    // 4. Try MIDI
+    // 3. Try MIDI FIRST for MIDI files
     if ext == "mid" || ext == "midi" {
         // Look for soundfont in project dir, then fallback to executable-relative paths, system-wide paths, and macOS Resources bundle
         let mut sf_path = "assets/soundfont.sf2".to_string();
@@ -2350,13 +2344,27 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
         }
     }
 
-    // 5. Try FFmpeg native bindings on desktop
+    // 4. Try Symphonia for supported audio and container formats (FLAC, MP3, WAV, AAC, M4A, OGG, OPUS, etc.)
+    let mut symphonia_error = None;
+    if let Ok(file) = File::open(file_path) {
+        match try_symphonia(file, &ext, &ext, video_info.clone(), Some(file_path)) {
+            Ok(source) => return Ok(source),
+            Err(e) => {
+                symphonia_error = Some(e);
+            }
+        }
+    }
+
+    // 5. Try FFmpeg native bindings on desktop as universal fallback
     #[cfg(not(target_os = "android"))]
     {
         let ffmpeg_result = try_ffmpeg(file_path, false);
         if let Ok(source) = ffmpeg_result {
             return Ok(source);
         } else if let Err(ref err) = ffmpeg_result {
+            if let Some(se) = symphonia_error {
+                eprintln!("[RustTracker] Symphonia load failed for {}: {:?}", file_path, se);
+            }
             eprintln!("FFmpeg fallback load failed for {}: {:?}", file_path, err);
         }
 

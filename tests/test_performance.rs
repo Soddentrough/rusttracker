@@ -557,6 +557,8 @@ async fn run_perf_test() {
             21 => include_str!("../src/shaders/vis_matrix.wgsl"),
             22 => include_str!("../src/shaders/vis_neon_room.wgsl"),
             23 => include_str!("../src/shaders/vis_lyrics.wgsl"),
+            24 => include_str!("../src/shaders/vis_tape_head.wgsl"),
+            25 => include_str!("../src/shaders/vis_spectrum_led.wgsl"),
             _ => include_str!("../src/shaders/vis_spectrum.wgsl"),
         }
     };
@@ -971,4 +973,65 @@ fn test_heatmap_compute_pipeline_creation() {
         assert!(!error_caught.load(std::sync::atomic::Ordering::SeqCst), "Validation error was triggered!");
     });
 }
+
+#[test]
+fn test_render_retro_fire_snapshot() {
+    const W: usize = 320;
+    const H: usize = 180;
+    let mut cells = [0u8; W * H];
+    let mut rng = 0x98765432u32;
+
+    let mut state = state::AppState::new("Test App".to_string());
+    state.file_loaded = true;
+    state.is_paused = false;
+    state.track_ended = false;
+    state.tracker_channels = Some(4);
+    state.spectrum_data = vec![0.0; 1024];
+
+    // Tracker module playing:
+    // Track 1 (kick): 1.0, Track 2 (snare): 0.8, Track 3 (silent rest): 0.05, Track 4 (lead): 0.95
+    state.channel_vus = vec![0.5, 1.0, 0.8, 0.05, 0.95, 0.5];
+    for i in 1..16 {
+        state.spectrum_data[i] = 85.0;
+    }
+    for i in 250..350 {
+        state.spectrum_data[i] = 60.0;
+    }
+
+    for _ in 0..90 {
+        engine::VulkanEngine::update_retro_fire_grid(&mut cells, &mut rng, 1.0, &state);
+    }
+
+    const DOOM_PAL: [(u8, u8, u8); 37] = [
+        (0x07, 0x07, 0x07), (0x1f, 0x07, 0x07), (0x2f, 0x0f, 0x07), (0x47, 0x0f, 0x07),
+        (0x57, 0x17, 0x07), (0x67, 0x1f, 0x07), (0x77, 0x1f, 0x07), (0x8f, 0x27, 0x07),
+        (0x9f, 0x2f, 0x07), (0xaf, 0x3f, 0x07), (0xbf, 0x47, 0x07), (0xc7, 0x47, 0x07),
+        (0xdf, 0x4f, 0x07), (0xdf, 0x57, 0x07), (0xdf, 0x57, 0x07), (0xd7, 0x5f, 0x07),
+        (0xd7, 0x5f, 0x07), (0xd7, 0x67, 0x0f), (0xcf, 0x6f, 0x0f), (0xcf, 0x77, 0x0f),
+        (0xcf, 0x7f, 0x0f), (0xcf, 0x87, 0x17), (0xc7, 0x87, 0x17), (0xc7, 0x8f, 0x17),
+        (0xc7, 0x97, 0x1f), (0xbf, 0x9f, 0x1f), (0xbf, 0x9f, 0x1f), (0xbf, 0xa7, 0x27),
+        (0xbf, 0xa7, 0x27), (0xbf, 0xaf, 0x2f), (0xb7, 0xaf, 0x2f), (0xb7, 0xb7, 0x2f),
+        (0xb7, 0xb7, 0x37), (0xcf, 0xcf, 0x6f), (0xdf, 0xdf, 0x9f), (0xef, 0xef, 0xc7),
+        (0xff, 0xff, 0xff)
+    ];
+
+    let scale = 3;
+    let mut img = image::ImageBuffer::new((W * scale) as u32, (H * scale) as u32);
+    for y in 0..H {
+        for x in 0..W {
+            let heat = cells[y * W + x].min(36) as usize;
+            let (r, g, b) = DOOM_PAL[heat];
+            for sy in 0..scale {
+                for sx in 0..scale {
+                    let px = (x * scale + sx) as u32;
+                    let py = (y * scale + sy) as u32;
+                    img.put_pixel(px, py, image::Rgb([r, g, b]));
+                }
+            }
+        }
+    }
+    let out_path = "/home/naoki/.gemini/antigravity/brain/f036cefe-b10f-4714-a204-0b6d1a193740/scratch/actual_retro_fire_reactive.png";
+    img.save(out_path).expect("Failed to save snapshot");
+}
+
 

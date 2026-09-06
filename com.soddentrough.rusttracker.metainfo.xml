@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>com.soddentrough.rusttracker</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-or-later</project_license>
+  <name>RustTracker</name>
+  <summary>High-Performance Vulkan Tracker Module Visualizer</summary>
+  
+  <description>
+    <p>
+      RustTracker is a high-performance, real-time audio visualizer, video player, and tracker module player built in Rust with Vulkan/WGPU hardware acceleration.
+    </p>
+    <p>
+      It features over 24 cinematic compute and fragment shader visualizers (Ferrofluid, 3D Fire, Synthwave Racer, CRT Oscilloscope, Bioluminescence, and more), low-latency 3-thread DSP architecture, support for classic tracker modules (.MOD, .XM, .S3M, .IT), lossless and compressed audio (FLAC, MP3, WAV, OGG, Opus), multi-track video playback, and real-time lyrics synchronization.
+    </p>
+  </description>
+  
+  <launchable type="desktop-id">rusttracker.desktop</launchable>
+  
+  <provides>
+    <binary>rusttracker</binary>
+  </provides>
+  
+  <url type="homepage">https://github.com/Soddentrough/rusttracker</url>
+  <url type="bugtracker">https://github.com/Soddentrough/rusttracker/issues</url>
+  <url type="vcs-browser">https://github.com/Soddentrough/rusttracker</url>
+  
+  <developer id="com.soddentrough">
+    <name>Soddentrough</name>
+  </developer>
+  
+  <categories>
+    <category>AudioVideo</category>
+    <category>Audio</category>
+    <category>Player</category>
+    <category>Music</category>
+  </categories>
+  
+  <keywords>
+    <keyword>tracker</keyword>
+    <keyword>visualizer</keyword>
+    <keyword>vulkan</keyword>
+    <keyword>audio</keyword>
+    <keyword>music</keyword>
+    <keyword>player</keyword>
+    <keyword>mod</keyword>
+    <keyword>chiptune</keyword>
+  </keywords>
+  
+  <screenshots>
+    <screenshot type="default">
+      <caption>Frequency Spectrum Visualizer</caption>
+      <image>https://raw.githubusercontent.com/Soddentrough/rusttracker/master/assets/screenshot_spectrum.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>Photorealistic Ferrofluid Visualizer</caption>
+      <image>https://raw.githubusercontent.com/Soddentrough/rusttracker/master/assets/screenshot_ferrofluid.png</image>
+    </screenshot>
+    <screenshot>
+      <caption>3D Multi-Channel Fire Visualizer</caption>
+      <image>https://raw.githubusercontent.com/Soddentrough/rusttracker/master/assets/screenshot_3dfire.png</image>
+    </screenshot>
+  </screenshots>
+  
+  <content_rating type="oars-1.1" />
+  
+  <releases>
+    <release version="0.9.19" date="2026-09-05">
+      <description>
+        <p>Comprehensive desktop integration release with single-instance IPC, recursive folder loading, hicolor icon hierarchy, and power management improvements.</p>
+      </description>
+    </release>
+  </releases>
+</component>

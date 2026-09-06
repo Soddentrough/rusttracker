@@ -13,7 +13,7 @@ windows_release/
 AppDir/
 target_appimage/
 extracted_deb/
-rusttracker.png
+/rusttracker.png
 macos_release/
 release_artifacts/
 release_artifacts_*/
@@ -35,6 +35,7 @@ audio_tests/
 *.log
 gdb_output.txt
 *.txt
+gpubench_results_*.json
 
 # Scratch / Temp files
 scratch.*

@@ -91,40 +91,7 @@ fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
     out.material_id = mat_id;
     out.energy = ch_energy;
     
-    // Interactive dynamic camera
-    let t_cam = audio.smooth_time * 0.18;
-    let cam_radius = 9.8;
-    let cam_h = 2.4 + sin(t_cam * 0.7) * 0.6;
-    let cam_x = sin(t_cam) * cam_radius * 0.55;
-    let cam_z = -cos(t_cam) * cam_radius * 0.6 - 2.8;
-    let ro = vec3<f32>(cam_x, cam_h, cam_z);
-    let ta = vec3<f32>(0.0, 0.4, 2.5); // Focus toward stage center
-    
-    let cw = normalize(ta - ro);
-    let cu = normalize(cross(cw, vec3<f32>(0.0, 1.0, 0.0)));
-    let cv = cross(cu, cw);
-    
-    let view_matrix = mat4x4<f32>(
-        vec4<f32>(cu.x, cv.x, -cw.x, 0.0),
-        vec4<f32>(cu.y, cv.y, -cw.y, 0.0),
-        vec4<f32>(cu.z, cv.z, -cw.z, 0.0),
-        vec4<f32>(-dot(cu, ro), -dot(cv, ro), dot(cw, ro), 1.0)
-    );
-    
-    let aspect = max(audio.aspect_ratio, 0.01);
-    let fov_y = 1.15; // ~66 degree vertical FOV
-    let f = 1.0 / tan(fov_y * 0.5);
-    let z_near = 0.2;
-    let z_far = 80.0;
-    
-    let proj_matrix = mat4x4<f32>(
-        vec4<f32>(f / aspect, 0.0, 0.0, 0.0),
-        vec4<f32>(0.0, f, 0.0, 0.0),
-        vec4<f32>(0.0, 0.0, z_far / (z_near - z_far), -1.0),
-        vec4<f32>(0.0, 0.0, (z_near * z_far) / (z_near - z_far), 0.0)
-    );
-    
-    out.clip_position = proj_matrix * view_matrix * vec4<f32>(displaced_pos, 1.0);
+    out.clip_position = camera.proj_matrix * camera.view_matrix * vec4<f32>(displaced_pos, 1.0);
     return out;
 }
 
@@ -144,23 +111,27 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     let ro = vec3<f32>(cam_x, 2.4 + sin(t_cam * 0.7) * 0.6, cam_z);
     let V = normalize(ro - P);
     
-    // Speaker source positions in room (for point light calculation)
-    var speaker_pos = array<vec3<f32>, 8>(
-        vec3<f32>(-3.8, 0.2, 5.5),  // FL (0)
-        vec3<f32>( 3.8, 0.2, 5.5),  // FR (1)
-        vec3<f32>( 0.0, -0.6, 6.8), // C (2)
-        vec3<f32>( 0.0, -1.0, 5.2), // Sub (3)
-        vec3<f32>(-6.2, 0.5, 0.5),  // SL (4)
-        vec3<f32>( 6.2, 0.5, 0.5),  // SR (5)
-        vec3<f32>(-4.2, 0.2, -4.5), // RL (6)
-        vec3<f32>( 4.2, 0.2, -4.5)  // RR (7)
+    // Speaker source positions in room (7.1.4 Dolby Atmos spatial layout)
+    var speaker_pos = array<vec3<f32>, 12>(
+        vec3<f32>(-3.8, 0.2, 5.5),   // FL (0)
+        vec3<f32>( 3.8, 0.2, 5.5),   // FR (1)
+        vec3<f32>( 0.0, -0.6, 6.8),  // C (2)
+        vec3<f32>( 0.0, -1.0, 5.2),  // Sub (3)
+        vec3<f32>(-6.2, 0.5, 0.5),   // SL (4)
+        vec3<f32>( 6.2, 0.5, 0.5),   // SR (5)
+        vec3<f32>(-4.2, 0.2, -4.5),  // RL (6)
+        vec3<f32>( 4.2, 0.2, -4.5),  // RR (7)
+        vec3<f32>(-3.2, 4.05, 3.5),  // TFL (8) - Top Front Left
+        vec3<f32>( 3.2, 4.05, 3.5),  // TFR (9) - Top Front Right
+        vec3<f32>(-3.2, 4.05, -2.5), // TRL (10) - Top Rear Left
+        vec3<f32>( 3.2, 4.05, -2.5)  // TRR (11) - Top Rear Right
     );
     
-    // Dynamic multi-point lighting accumulated from active speakers
+    // Dynamic multi-point lighting accumulated from all active speakers (including height Atmos channels)
     var point_light_diffuse = vec3<f32>(0.0);
     var point_light_specular = vec3<f32>(0.0);
     
-    for (var i = 0u; i < 8u; i = i + 1u) {
+    for (var i = 0u; i < 12u; i = i + 1u) {
         let s_pos = speaker_pos[i];
         let s_col = get_spatial_color(i);
         let s_energy = get_channel_level(i);
@@ -195,8 +166,8 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
         albedo = mix(floor_base, floor_grid_col, grid_line * 0.7);
         roughness = 0.25;
         
-        // Acoustic wavefront rings expanding across the floor
-        for (var i = 0u; i < 4u; i = i + 1u) {
+        // Acoustic wavefront rings expanding across the floor from active stage & surround speakers
+        for (var i = 0u; i < 8u; i = i + 1u) {
             let s_pos = speaker_pos[i];
             let s_col = get_spatial_color(i);
             let s_energy = get_channel_level(i);

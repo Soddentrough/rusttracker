@@ -1,6 +1,8 @@
 pub mod audio;
 pub mod lyrics;
 pub mod engine;
+pub mod playlist;
+pub mod ipc;
 pub mod state;
 pub mod touch;
 #[cfg(not(target_os = "android"))]

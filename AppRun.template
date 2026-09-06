@@ -2,9 +2,16 @@
 # Automatically discover the directory this script is in
 APPDIR="$(dirname "$(readlink -f "$0")")"
 
-# Force winit to use Wayland natively to bypass the SteamOS X11 xkbcommon bug
-export WINIT_UNIX_BACKEND=wayland
-export XKB_DEFAULT_LAYOUT=us
+# Set library search paths so bundled libraries (FFmpeg, libopenmpt, etc.) can be located
+export LD_LIBRARY_PATH="$APPDIR/usr/lib:$APPDIR/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+export XDG_DATA_DIRS="$APPDIR/usr/share${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
+
+# Detect if running under Gamescope (Steam Deck Gaming Mode) or native Wayland
+if [ "$XDG_CURRENT_DESKTOP" = "gamescope" ] || [ -n "$STEAM_DECK" ] || [ -n "$WAYLAND_DISPLAY" ]; then
+    # Force winit to use Wayland natively to bypass the SteamOS X11 xkbcommon bug
+    export WINIT_UNIX_BACKEND=wayland
+    export XKB_DEFAULT_LAYOUT=us
+fi
 
 # Execute the actual binary directly from the mounted AppDir
 exec "$APPDIR/usr/bin/rusttracker" "$@"

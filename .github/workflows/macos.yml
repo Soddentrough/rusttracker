@@ -85,6 +85,8 @@ jobs:
               <string>com.soddentrough.rusttracker</string>
               <key>CFBundleName</key>
               <string>RustTracker</string>
+              <key>CFBundleDisplayName</key>
+              <string>RustTracker</string>
               <key>CFBundleIconFile</key>
               <string>AppIcon</string>
               <key>CFBundleShortVersionString</key>
@@ -96,6 +98,8 @@ jobs:
               <key>LSMinimumSystemVersion</key>
               <string>10.15</string>
               <key>NSHighResolutionCapable</key>
+              <true/>
+              <key>NSSupportsAutomaticGraphicsSwitching</key>
               <true/>
               <key>LSApplicationCategoryType</key>
               <string>public.app-category.music</string>

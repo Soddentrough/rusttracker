@@ -26,9 +26,9 @@ Source: "release\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs creat
 Source: "icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{group}\RustTracker"; Filename: "{app}\rusttracker.exe"; IconFilename: "{app}\icon.ico"
+Name: "{group}\RustTracker"; Filename: "{app}\rusttracker.exe"; IconFilename: "{app}\icon.ico"; AppUserModelID: "Soddentrough.RustTracker"
 Name: "{group}\Uninstall RustTracker"; Filename: "{uninstallexe}"; IconFilename: "{app}\icon.ico"
-Name: "{autodesktop}\RustTracker"; Filename: "{app}\rusttracker.exe"; IconFilename: "{app}\icon.ico"; Tasks: desktopicon
+Name: "{autodesktop}\RustTracker"; Filename: "{app}\rusttracker.exe"; IconFilename: "{app}\icon.ico"; Tasks: desktopicon; AppUserModelID: "Soddentrough.RustTracker"
 
 [Registry]
 ; Application Capabilities and Open With / SupportedTypes Registration

@@ -20,6 +20,8 @@ use winit::platform::x11::{WindowAttributesExtX11, EventLoopBuilderExtX11};
 
 pub mod audio;
 pub mod lyrics;
+pub mod playlist;
+pub mod ipc;
 mod engine;
 mod state;
 mod ui;
@@ -110,7 +112,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let _ = std::fs::write("rusttracker_crash.log", format!("RustTracker Panic at {}:\n{}\n\nBacktrace:\n{}", location, msg, backtrace));
     }));
 
-    let args = Args::parse();
+    let mut args = Args::parse();
     let should_list_vis = args.list_vis || matches!(args.vis.as_deref(), Some("") | Some("list") | Some("help"));
     if should_list_vis {
         println!("{:<4} {:<24} {:<28} Description", "ID", "Short Name", "Name");
@@ -126,6 +128,20 @@ fn main() -> Result<(), Box<dyn Error>> {
             println!("{:<4} {:<24} {:<28} {}", v.id, short_name, v.name, v.description);
         }
         return Ok(());
+    }
+
+    // Single-instance forwarding: if not in TUI mode and files were specified, attempt to forward to running instance
+    if !args.tui && !args.file.is_empty() && crate::ipc::try_forward_to_existing_instance(&args.file) {
+        println!("[ipc] Forwarded file(s) to existing RustTracker instance.");
+        return Ok(());
+    }
+
+    // Expand directories and playlists (.m3u, .pls) into individual track paths
+    args.file = crate::playlist::expand_input_paths(&args.file);
+
+    let (ipc_tx, ipc_rx) = crossbeam_channel::unbounded::<Vec<String>>();
+    if !args.tui {
+        crate::ipc::start_ipc_server(ipc_tx.clone());
     }
 
     let title = if args.mic {
@@ -159,6 +175,10 @@ fn main() -> Result<(), Box<dyn Error>> {
         
         if let Some(vis) = &args.vis {
             let vis_lower = vis.to_lowercase();
+            let normalize = |s: &str| -> String {
+                s.chars().filter(|c| c.is_alphanumeric()).collect::<String>().to_lowercase()
+            };
+            let vis_norm = normalize(&vis_lower);
             let matched_idx = crate::state::VISUALIZERS.iter().enumerate().position(|(i, v)| {
                 let short_name = v.filename
                     .strip_prefix("vis_")
@@ -166,15 +186,23 @@ fn main() -> Result<(), Box<dyn Error>> {
                     .strip_suffix(".wgsl")
                     .unwrap_or(v.filename)
                     .to_lowercase();
+                let name_norm = normalize(v.name);
+                let short_norm = normalize(&short_name);
+
                 v.id.to_string() == vis_lower
                     || i.to_string() == vis_lower
                     || v.name.to_lowercase() == vis_lower
                     || short_name == vis_lower
+                    || name_norm == vis_norm
+                    || short_norm == vis_norm
+                    || (v.id == 5 && (vis_norm == "retrofire" || vis_norm == "retro_fire" || vis_norm == "flame" || vis_norm == "fire" || vis_norm == "doom" || vis_norm == "doomfire" || vis_norm == "doom_fire" || vis_norm == "psxfire"))
+                    || (v.id == 6 && (vis_norm == "firesim" || vis_norm == "firesimulation"))
             });
 
             if let Some(idx) = matched_idx {
                 state.current_visualizer_idx = idx;
                 state.visualizer_mode = crate::state::VISUALIZERS[idx].id;
+                state.vis_enabled[idx] = true;
             } else {
                 eprintln!("Warning: Visualizer '{}' not found. Launching with default visualizer.", vis);
             }
@@ -216,14 +244,22 @@ fn main() -> Result<(), Box<dyn Error>> {
             eprintln!("App error: {:?}", err);
         }
     } else {
-        pollster::block_on(run_gui(app_state, initial_stream, args.fullscreen, args.gpu_fft, args.bench, args.mic))?;
+        pollster::block_on(run_gui(app_state, initial_stream, args.fullscreen, args.gpu_fft, args.bench, args.mic, ipc_rx))?;
     }
 
     Ok(())
 }
 
 #[allow(unused_variables, unused_assignments)]
-async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audio::PlaybackHandle>, is_fullscreen: bool, use_gpu_fft: bool, bench: Option<u32>, is_mic_launch: bool) -> Result<(), Box<dyn Error>> {
+async fn run_gui(
+    app_state: Arc<Mutex<AppState>>,
+    mut active_stream: Option<audio::PlaybackHandle>,
+    is_fullscreen: bool,
+    use_gpu_fft: bool,
+    bench: Option<u32>,
+    is_mic_launch: bool,
+    ipc_rx: crossbeam_channel::Receiver<Vec<String>>,
+) -> Result<(), Box<dyn Error>> {
     if use_gpu_fft {
         let mut state = app_state.lock().unwrap();
         state.gpu_fft = true;
@@ -270,10 +306,32 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
     };
     let window_icon = winit::window::Icon::from_rgba(icon_rgba, icon_width, icon_height).unwrap();
 
+    #[cfg(windows)]
+    unsafe {
+        use windows::core::w;
+        use windows::Win32::UI::Shell::SetCurrentProcessExplicitAppUserModelID;
+        let _ = SetCurrentProcessExplicitAppUserModelID(w!("Soddentrough.RustTracker"));
+    }
+
+    let is_steam_deck = std::fs::read_to_string("/sys/class/dmi/id/sys_vendor")
+        .map(|s| s.trim().to_lowercase().contains("valve"))
+        .unwrap_or(false);
+    let is_game_mode = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_lowercase() == "gamescope" || 
+                       std::env::var("XDG_SESSION_DESKTOP").unwrap_or_default().to_lowercase() == "gamescope" ||
+                       std::env::var("STEAM_DECK").is_ok() ||
+                       is_steam_deck;
+
+    let initial_size = if is_game_mode {
+        winit::dpi::LogicalSize::new(1280.0, 800.0)
+    } else {
+        winit::dpi::LogicalSize::new(1440.0, 840.0)
+    };
+
     #[allow(unused_mut)]
     let mut attrs = winit::window::Window::default_attributes()
         .with_title("RustTracker Vulkan Visualizer")
-        .with_inner_size(winit::dpi::LogicalSize::new(1440.0, 840.0))
+        .with_theme(Some(winit::window::Theme::Dark))
+        .with_inner_size(initial_size)
         .with_min_inner_size(winit::dpi::LogicalSize::new(1024.0, 600.0))
         .with_window_icon(Some(window_icon));
         
@@ -324,9 +382,7 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
 
     let mut gilrs = gilrs::Gilrs::new().unwrap_or_else(|_| gilrs::GilrsBuilder::new().build().unwrap());
 
-    let is_game_mode = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_lowercase() == "gamescope" || 
-                       std::env::var("XDG_SESSION_DESKTOP").unwrap_or_default().to_lowercase() == "gamescope" ||
-                       std::env::var("STEAM_DECK").is_ok();
+    // is_game_mode already detected above
 
     #[cfg(windows)]
     let initial_dir = std::path::PathBuf::from(std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".to_string()));
@@ -423,13 +479,96 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                 _ => {
                                     if !kb_event.repeat {
                                         match keycode {
-                                            WinitKeyCode::Escape | WinitKeyCode::KeyQ => {
+                                            WinitKeyCode::Escape => {
                                                 let picker_open = app_state.lock().unwrap().show_vis_picker;
                                                 if picker_open {
                                                     app_state.lock().unwrap().show_vis_picker = false;
                                                 } else {
                                                     elwt.exit();
                                                 }
+                                            },
+                                            WinitKeyCode::KeyQ => {
+                                                // Only quit on KeyQ if Ctrl or Cmd (Super) is held to prevent accidental quits
+                                                if modifiers.control_key() || modifiers.super_key() {
+                                                    elwt.exit();
+                                                }
+                                            },
+                                            WinitKeyCode::MediaPlayPause => {
+                                                let mut state = app_state.lock().unwrap();
+                                                state.is_paused = !state.is_paused;
+                                                state.osd_text = Some(if state.is_paused { "Paused".to_string() } else { "Playing".to_string() });
+                                                state.osd_timer = 2.0;
+                                            },
+                                            WinitKeyCode::MediaTrackNext => {
+                                                let mut state = app_state.lock().unwrap();
+                                                if !state.playlist.is_empty() && state.playlist_index + 1 < state.playlist.len() {
+                                                    state.playlist_index += 1;
+                                                    state.load_request = Some(state.playlist[state.playlist_index].clone());
+                                                    state.is_paused = false;
+                                                    state.osd_text = Some("Next Track".to_string());
+                                                    state.osd_timer = 2.0;
+                                                }
+                                            },
+                                            WinitKeyCode::MediaTrackPrevious => {
+                                                let mut state = app_state.lock().unwrap();
+                                                if !state.playlist.is_empty() && state.playlist_index > 0 {
+                                                    state.playlist_index -= 1;
+                                                    state.load_request = Some(state.playlist[state.playlist_index].clone());
+                                                    state.is_paused = false;
+                                                    state.osd_text = Some("Previous Track".to_string());
+                                                    state.osd_timer = 2.0;
+                                                }
+                                            },
+                                            WinitKeyCode::MediaStop => {
+                                                let mut state = app_state.lock().unwrap();
+                                                state.is_paused = true;
+                                                state.seek_request = Some(0.0);
+                                                state.osd_text = Some("Stopped".to_string());
+                                                state.osd_timer = 2.0;
+                                            },
+                                            WinitKeyCode::AudioVolumeUp => {
+                                                let mut state = app_state.lock().unwrap();
+                                                let num_tracks = state.audio_tracks.len().max(1);
+                                                if state.audio_track_volumes.len() != num_tracks {
+                                                    state.audio_track_volumes = vec![1.0; num_tracks];
+                                                }
+                                                for vol in &mut state.audio_track_volumes {
+                                                    *vol = (*vol + 0.05).clamp(0.0, 1.0);
+                                                }
+                                                let current_vol = state.audio_track_volumes.first().copied().unwrap_or(1.0);
+                                                let mix: Vec<(usize, f32)> = state.active_audio_tracks.iter().map(|&idx| (idx, state.audio_track_volumes.get(idx).copied().unwrap_or(1.0))).collect();
+                                                state.audio_mix_request = Some(mix);
+                                                state.osd_text = Some(format!("Volume: {}%", (current_vol * 100.0).round() as u32));
+                                                state.osd_timer = 2.0;
+                                            },
+                                            WinitKeyCode::AudioVolumeDown => {
+                                                let mut state = app_state.lock().unwrap();
+                                                let num_tracks = state.audio_tracks.len().max(1);
+                                                if state.audio_track_volumes.len() != num_tracks {
+                                                    state.audio_track_volumes = vec![1.0; num_tracks];
+                                                }
+                                                for vol in &mut state.audio_track_volumes {
+                                                    *vol = (*vol - 0.05).clamp(0.0, 1.0);
+                                                }
+                                                let current_vol = state.audio_track_volumes.first().copied().unwrap_or(1.0);
+                                                let mix: Vec<(usize, f32)> = state.active_audio_tracks.iter().map(|&idx| (idx, state.audio_track_volumes.get(idx).copied().unwrap_or(1.0))).collect();
+                                                state.audio_mix_request = Some(mix);
+                                                state.osd_text = Some(format!("Volume: {}%", (current_vol * 100.0).round() as u32));
+                                                state.osd_timer = 2.0;
+                                            },
+                                            WinitKeyCode::AudioVolumeMute => {
+                                                let mut state = app_state.lock().unwrap();
+                                                let num_tracks = state.audio_tracks.len().max(1);
+                                                if state.audio_track_volumes.len() != num_tracks {
+                                                    state.audio_track_volumes = vec![1.0; num_tracks];
+                                                }
+                                                let is_currently_zero = state.audio_track_volumes.iter().all(|&v| v == 0.0);
+                                                let new_vol = if is_currently_zero { 1.0 } else { 0.0 };
+                                                state.audio_track_volumes.fill(new_vol);
+                                                let mix: Vec<(usize, f32)> = state.active_audio_tracks.iter().map(|&idx| (idx, state.audio_track_volumes.get(idx).copied().unwrap_or(1.0))).collect();
+                                                state.audio_mix_request = Some(mix);
+                                                state.osd_text = Some(if new_vol == 0.0 { "Muted".to_string() } else { "Unmuted".to_string() });
+                                                state.osd_timer = 2.0;
                                             },
                                             WinitKeyCode::BracketLeft => {
                                                 let mut state = app_state.lock().unwrap();
@@ -579,6 +718,8 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                                 if state.show_vis_picker {
                                                     state.current_visualizer_idx = state.vis_picker_cursor;
                                                     state.visualizer_mode = crate::state::VISUALIZERS[state.vis_picker_cursor].id;
+                                                    state.osd_text = Some(crate::state::VISUALIZERS[state.vis_picker_cursor].name.to_string());
+                                                    state.osd_timer = 2.0;
                                                     state.show_vis_picker = false;
                                                 }
                                             },
@@ -601,6 +742,8 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                                     }
                                                     state.current_visualizer_idx = idx;
                                                     state.visualizer_mode = crate::state::VISUALIZERS[idx].id;
+                                                    state.osd_text = Some(crate::state::VISUALIZERS[idx].name.to_string());
+                                                    state.osd_timer = 2.0;
                                                 }
                                             },
                                             WinitKeyCode::ArrowDown => {
@@ -618,6 +761,8 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                                     }
                                                     state.current_visualizer_idx = idx;
                                                     state.visualizer_mode = crate::state::VISUALIZERS[idx].id;
+                                                    state.osd_text = Some(crate::state::VISUALIZERS[idx].name.to_string());
+                                                    state.osd_timer = 2.0;
                                                 }
                                             },
                                             WinitKeyCode::Digit1 | WinitKeyCode::Numpad1 |
@@ -682,30 +827,37 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                     let mut state = app_state.lock().unwrap();
                     state.hovered_file = None;
                     let path_str = crate::lyrics::normalize_path_str(&path.to_string_lossy());
-                    let is_over_ti = if let (Some(c_pos), Some(ti_rect)) = (last_cursor_pos, state.track_info_rect) {
-                        c_pos.x >= ti_rect[0] && c_pos.x <= ti_rect[2] && c_pos.y >= ti_rect[1] && c_pos.y <= ti_rect[3]
-                    } else {
-                        false
-                    };
+                    let expanded = crate::playlist::expand_input_paths(&[path_str]);
+                    if !expanded.is_empty() {
+                        let is_over_ti = if let (Some(c_pos), Some(ti_rect)) = (last_cursor_pos, state.track_info_rect) {
+                            c_pos.x >= ti_rect[0] && c_pos.x <= ti_rect[2] && c_pos.y >= ti_rect[1] && c_pos.y <= ti_rect[3]
+                        } else {
+                            false
+                        };
 
-                    if !state.file_loaded {
-                        // Use case 1: Splash screen -> Play immediately
-                        state.playlist = vec![path_str.clone()];
-                        state.playlist_index = 0;
-                        state.load_request = Some(path_str);
-                        state.file_loaded = true;
-                    } else if is_over_ti {
-                        // Use case 3: Track Info pane -> Add to playlist (play immediately if no song playing)
-                        state.playlist.push(path_str.clone());
-                        let file_name = std::path::Path::new(&path_str).file_name().unwrap_or_default().to_string_lossy().into_owned();
-                        state.osd_text = Some(format!("Added to Playlist: {}", file_name));
-                        state.osd_timer = 3.0;
-                    } else {
-                        // Use case 2: Main player view (outside Track Info) -> Play immediately
-                        state.playlist = vec![path_str.clone()];
-                        state.playlist_index = 0;
-                        state.load_request = Some(path_str);
-                        state.file_loaded = true;
+                        if !state.file_loaded || state.playlist.is_empty() {
+                            // Use case 1: Splash screen -> Play immediately
+                            state.playlist = expanded.clone();
+                            state.playlist_index = 0;
+                            state.load_request = Some(state.playlist[0].clone());
+                            state.file_loaded = true;
+                        } else if is_over_ti {
+                            // Use case 3: Track Info pane -> Add to playlist
+                            state.playlist.extend(expanded.clone());
+                            let file_name = std::path::Path::new(&expanded[0]).file_name().unwrap_or_default().to_string_lossy().into_owned();
+                            if expanded.len() == 1 {
+                                state.osd_text = Some(format!("Added to Playlist: {}", file_name));
+                            } else {
+                                state.osd_text = Some(format!("Added {} tracks to Playlist", expanded.len()));
+                            }
+                            state.osd_timer = 3.0;
+                        } else {
+                            // Use case 2: Main player view (outside Track Info) -> Play immediately
+                            state.playlist = expanded.clone();
+                            state.playlist_index = 0;
+                            state.load_request = Some(state.playlist[0].clone());
+                            state.file_loaded = true;
+                        }
                     }
                     window.request_redraw();
                 }
@@ -1019,6 +1171,19 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                     };
                     let phase_snapshot_us = snapshot_timer.elapsed().as_micros() as f32;
 
+                    // Update power management / idle sleep inhibition
+                    let is_playing = !state_copy.is_paused && state_copy.file_loaded && !state_copy.track_ended;
+                    let needs_keepawake = is_playing || is_fullscreen;
+                    if needs_keepawake && keep_awake.is_none() {
+                        keep_awake = keepawake::Builder::default()
+                            .display(is_fullscreen || state_copy.visualizer_mode != 0 || state_copy.video_frame_rx.is_some())
+                            .idle(true)
+                            .create()
+                            .ok();
+                    } else if !needs_keepawake && keep_awake.is_some() {
+                        keep_awake = None;
+                    }
+
                     let mut action = EngineAction::None;
                     let mut ui_time = 0.0;
                     let mut render_time = 0.0;
@@ -1256,7 +1421,16 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                             EngineAction::VisPickerSelect(idx) => {
                                 state.current_visualizer_idx = idx;
                                 state.visualizer_mode = crate::state::VISUALIZERS[idx].id;
+                                state.osd_text = Some(crate::state::VISUALIZERS[idx].name.to_string());
+                                state.osd_timer = 2.0;
                                 state.show_vis_picker = false;
+                            }
+                            EngineAction::ToggleVisPicker => {
+                                state.show_vis_picker = !state.show_vis_picker;
+                                if state.show_vis_picker {
+                                    state.vis_picker_cursor = state.current_visualizer_idx;
+                                    state.vis_picker_scroll_to_cursor = true;
+                                }
                             }
                             EngineAction::VisPickerToggleEnabled(idx) => {
                                 if idx != 0 { // Frequency Spectrum always enabled
@@ -1354,16 +1528,52 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                         if let Ok(paths) = rfd_rx.try_recv() {
                             rfd_pending = false;
                             if !paths.is_empty() {
+                                let expanded = crate::playlist::expand_input_paths(&paths);
                                 let append = state.append_to_playlist;
                                 if append && !state.playlist.is_empty() {
-                                    state.playlist.extend(paths);
-                                } else {
-                                    state.playlist = paths;
+                                    state.playlist.extend(expanded);
+                                } else if !expanded.is_empty() {
+                                    state.playlist = expanded;
                                     state.playlist_index = 0;
                                     state.load_request = Some(state.playlist[0].clone());
+                                    state.file_loaded = true;
                                 }
-                                state.file_loaded = true;
                                 state.is_file_picker_open = false;
+                            }
+                        }
+
+                        // Poll IPC incoming paths (from secondary instances)
+                        if let Ok(raw_paths) = ipc_rx.try_recv() {
+                            if !raw_paths.is_empty() {
+                                let expanded = crate::playlist::expand_input_paths(&raw_paths);
+                                if !expanded.is_empty() {
+                                    if !state.file_loaded || state.playlist.is_empty() {
+                                        state.playlist = expanded.clone();
+                                        state.playlist_index = 0;
+                                        state.load_request = Some(state.playlist[0].clone());
+                                        state.file_loaded = true;
+                                    } else {
+                                        let first_new_idx = state.playlist.len();
+                                        state.playlist.extend(expanded.clone());
+                                        state.playlist_index = first_new_idx;
+                                        state.load_request = Some(state.playlist[first_new_idx].clone());
+                                        state.is_paused = false;
+                                        let file_name = std::path::Path::new(&expanded[0]).file_name().unwrap_or_default().to_string_lossy().into_owned();
+                                        if expanded.len() == 1 {
+                                            state.osd_text = Some(format!("Now Playing: {}", file_name));
+                                        } else {
+                                            state.osd_text = Some(format!("Added {} tracks (Playing {})", expanded.len(), file_name));
+                                        }
+                                        state.osd_timer = 3.0;
+                                    }
+                                    window.set_minimized(false);
+                                    window.focus_window();
+                                    window.request_redraw();
+                                }
+                            } else {
+                                window.set_minimized(false);
+                                window.focus_window();
+                                window.request_redraw();
                             }
                         }
                     }
@@ -1656,6 +1866,8 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                         }
                                         state.current_visualizer_idx = idx;
                                         state.visualizer_mode = crate::state::VISUALIZERS[idx].id;
+                                        state.osd_text = Some(crate::state::VISUALIZERS[idx].name.to_string());
+                                        state.osd_timer = 2.0;
                                     }
                                 }
                                 gilrs::Button::DPadDown => {
@@ -1672,6 +1884,8 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                         }
                                         state.current_visualizer_idx = idx;
                                         state.visualizer_mode = crate::state::VISUALIZERS[idx].id;
+                                        state.osd_text = Some(crate::state::VISUALIZERS[idx].name.to_string());
+                                        state.osd_timer = 2.0;
                                     }
                                 }
                                 gilrs::Button::South => {
@@ -1679,6 +1893,8 @@ async fn run_gui(app_state: Arc<Mutex<AppState>>, mut active_stream: Option<audi
                                     if state.show_vis_picker {
                                         state.current_visualizer_idx = state.vis_picker_cursor;
                                         state.visualizer_mode = crate::state::VISUALIZERS[state.vis_picker_cursor].id;
+                                        state.osd_text = Some(crate::state::VISUALIZERS[state.vis_picker_cursor].name.to_string());
+                                        state.osd_timer = 2.0;
                                         state.show_vis_picker = false;
                                     } else if state.track_ended || (state.current_seconds >= state.duration_seconds - 0.1 && state.duration_seconds > 0.0) {
                                          state.track_ended = false;
