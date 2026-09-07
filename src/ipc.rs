@@ -117,16 +117,16 @@ mod windows_ipc {
     use std::io::{BufRead, BufReader, Write};
     use crossbeam_channel::Sender;
     use windows::core::w;
-    use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
+    use windows::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows::Win32::Storage::FileSystem::{
-        CreateFileW, FILE_GENERIC_READ, FILE_GENERIC_WRITE, OPEN_EXISTING,
+        CreateFileW, FILE_GENERIC_READ, FILE_GENERIC_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
     };
     use windows::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_ACCESS_DUPLEX,
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe,
         PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
 
-    const PIPE_NAME: &windows::core::PCWSTR = w!(r"\\.\pipe\RustTracker-SingleInstance");
+    const PIPE_NAME: windows::core::PCWSTR = w!(r"\\.\pipe\RustTracker-SingleInstance");
 
     pub fn try_forward(paths: &[String]) -> bool {
         // Attempt to connect to the existing named pipe
@@ -138,7 +138,7 @@ mod windows_ipc {
                 None,
                 OPEN_EXISTING,
                 windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES(0),
-                HANDLE::default(),
+                None,
             )
         };
 

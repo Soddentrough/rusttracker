@@ -4,7 +4,7 @@ pub fn start_bitstream_thread(
     _shared_state: std::sync::Arc<std::sync::Mutex<crate::state::AppState>>,
     tx: crossbeam_channel::Sender<crate::audio::DspMessage>,
     stop_token: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> anyhow::Result<(std::thread::JoinHandle<()>, u32, String, bool)> {
+) -> anyhow::Result<(std::thread::JoinHandle<()>, u32, u16, String, bool)> {
     use anyhow::Context;
 
     println!("[bitstream] Probing codec via ffmpeg-next on Linux...");
@@ -197,7 +197,7 @@ pub fn start_bitstream_thread(
         println!("[bitstream] FFmpeg thread finished on Linux.");
     });
 
-    Ok((ffmpeg_thread, decoder_sample_rate as u32, codec_name, has_video))
+    Ok((ffmpeg_thread, decoder_sample_rate as u32, 8u16, codec_name, has_video))
 }
 
 #[cfg(target_os = "macos")]
@@ -257,7 +257,7 @@ mod macos_bitstream {
         _shared_state: Arc<Mutex<AppState>>,
         _tx: Sender<DspMessage>,
         stop_token: Arc<AtomicBool>,
-    ) -> Result<(std::thread::JoinHandle<()>, u32, String, bool)> {
+    ) -> Result<(std::thread::JoinHandle<()>, u32, u16, String, bool)> {
         println!("[bitstream] Initializing macOS CoreAudio passthrough (Hog Mode)...");
 
         println!("[bitstream] Probing audio stream via ffmpeg-next...");
@@ -369,7 +369,7 @@ pub fn start_bitstream_thread(
     _shared_state: std::sync::Arc<std::sync::Mutex<crate::state::AppState>>,
     _tx: crossbeam_channel::Sender<crate::audio::DspMessage>,
     _stop_token: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> anyhow::Result<(std::thread::JoinHandle<()>, u32, String, bool)> {
+) -> anyhow::Result<(std::thread::JoinHandle<()>, u32, u16, String, bool)> {
     Err(anyhow::anyhow!("Bitstream passthrough is not supported on this platform."))
 }
 #[cfg(windows)]
@@ -382,7 +382,7 @@ mod wasapi_bitstream {
     use crate::state::AppState;
     use crate::audio::DspMessage;
     use anyhow::{Context, Result};
-    use std::io::Read;
+    use std::io::{Read, Write};
     use std::ptr;
     use windows::core::GUID;
     use windows::Win32::Media::Audio::*;
@@ -392,8 +392,18 @@ mod wasapi_bitstream {
 
     const WAIT_OBJECT_0: u32 = 0;
 
-    // ─── IEC 61937 WASAPI SubFormat GUIDs ────────────────────────────
+    // ─── Standard PCM & IEEE Float WASAPI SubFormat GUIDs ──────────
+    const KSDATAFORMAT_SUBTYPE_PCM: GUID = GUID {
+        data1: 0x00000001, data2: 0x0000, data3: 0x0010,
+        data4: [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
+    };
 
+    const KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: GUID = GUID {
+        data1: 0x00000003, data2: 0x0000, data3: 0x0010,
+        data4: [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
+    };
+
+    // ─── IEC 61937 WASAPI SubFormat GUIDs ────────────────────────────
     const KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_DIGITAL: GUID = GUID {
         data1: 0x00000092, data2: 0x0000, data3: 0x0010,
         data4: [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
@@ -424,59 +434,210 @@ mod wasapi_bitstream {
         data4: [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
     };
 
-    #[derive(Debug, Clone)]
-    struct Iec61937Profile {
-        name: &'static str,
-        channels: u16,
-        rate: u32,
-        sub_format: GUID,
+    const PKEY_DEVICE_FRIENDLY_NAME: windows::Win32::Foundation::PROPERTYKEY = windows::Win32::Foundation::PROPERTYKEY {
+        fmtid: windows::core::GUID::from_u128(0xa45c254e_df1c_4efd_8020_67d146a850e0),
+        pid: 14,
+    };
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum WasapiStreamType {
+        CompressedBitstream,
+        Lpcm,
     }
 
-    fn detect_codec_profile(codec_name: &str) -> Vec<Iec61937Profile> {
-        if codec_name.contains("truehd") {
-            vec![
-                Iec61937Profile {
-                    name: "TrueHD / Dolby Atmos (MAT 2.0 HBR)",
-                    channels: 8, rate: 192000,
-                    sub_format: KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_MAT20,
-                },
-                Iec61937Profile {
-                    name: "TrueHD / Dolby Atmos (MLP HBR)",
-                    channels: 8, rate: 192000,
-                    sub_format: KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_MLP,
+    #[derive(Debug, Clone)]
+    struct AudioProfile {
+        name: String,
+        stream_type: WasapiStreamType,
+        channels: u16,
+        rate: u32,
+        valid_bits: u16,
+        container_bits: u16,
+        channel_mask: u32,
+        sub_format: GUID,
+        sample_format: ffmpeg_next::format::sample::Sample,
+    }
+
+    fn get_device_name(device: &IMMDevice) -> Option<String> {
+        unsafe {
+            let store = device.OpenPropertyStore(windows::Win32::System::Com::STGM_READ).ok()?;
+            let propvar = store.GetValue(&PKEY_DEVICE_FRIENDLY_NAME).ok()?;
+            if propvar.Anonymous.Anonymous.vt == windows::Win32::System::Variant::VT_LPWSTR {
+                let pwstr = propvar.Anonymous.Anonymous.Anonymous.pwszVal;
+                if !pwstr.is_null() {
+                    pwstr.to_string().ok()
+                } else {
+                    None
                 }
-            ]
-        } else if codec_name.contains("eac3") || codec_name.contains("ec-3") {
-            vec![Iec61937Profile {
-                name: "E-AC3 / Dolby Digital Plus",
-                channels: 2, rate: 192000,
-                sub_format: KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_DIGITAL_PLUS,
-            }]
-        } else if codec_name.contains("dts") || codec_name.contains("dca") {
-            vec![
-                Iec61937Profile {
-                    name: "DTS-HD MA (HBR)",
-                    channels: 8, rate: 192000,
-                    sub_format: KSDATAFORMAT_SUBTYPE_IEC61937_DTS_HD,
-                },
-                Iec61937Profile {
-                    name: "DTS Core (fallback)",
-                    channels: 2, rate: 48000,
-                    sub_format: KSDATAFORMAT_SUBTYPE_IEC61937_DTS,
-                },
-            ]
-        } else if codec_name.contains("ac3") {
-            vec![Iec61937Profile {
-                name: "AC3 / Dolby Digital",
-                channels: 2, rate: 48000,
-                sub_format: KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_DIGITAL,
-            }]
-        } else {
-            vec![Iec61937Profile {
-                name: "Unknown (AC3 fallback)",
-                channels: 2, rate: 48000,
-                sub_format: KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_DIGITAL,
-            }]
+            } else {
+                let s = propvar.to_string();
+                if s.is_empty() { None } else { Some(s) }
+            }
+        }
+    }
+
+    fn detect_codec_profile(
+        codec_id: ffmpeg_next::codec::Id,
+        src_channels: u16,
+        src_rate: u32,
+    ) -> Result<(String, WasapiStreamType, Vec<AudioProfile>)> {
+        match codec_id {
+            ffmpeg_next::codec::Id::TRUEHD => Ok((
+                "truehd".to_string(),
+                WasapiStreamType::CompressedBitstream,
+                vec![
+                    AudioProfile {
+                        name: "TrueHD / Dolby Atmos (MAT 2.0 HBR)".to_string(),
+                        stream_type: WasapiStreamType::CompressedBitstream,
+                        channels: 8,
+                        rate: 192000,
+                        valid_bits: 16,
+                        container_bits: 16,
+                        channel_mask: 0x63F,
+                        sub_format: KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_MAT20,
+                        sample_format: ffmpeg_next::format::sample::Sample::None,
+                    },
+                    AudioProfile {
+                        name: "TrueHD / Dolby Atmos (MLP HBR)".to_string(),
+                        stream_type: WasapiStreamType::CompressedBitstream,
+                        channels: 8,
+                        rate: 192000,
+                        valid_bits: 16,
+                        container_bits: 16,
+                        channel_mask: 0x63F,
+                        sub_format: KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_MLP,
+                        sample_format: ffmpeg_next::format::sample::Sample::None,
+                    },
+                ],
+            )),
+            ffmpeg_next::codec::Id::EAC3 => Ok((
+                "eac3".to_string(),
+                WasapiStreamType::CompressedBitstream,
+                vec![AudioProfile {
+                    name: "E-AC3 / Dolby Digital Plus".to_string(),
+                    stream_type: WasapiStreamType::CompressedBitstream,
+                    channels: 2,
+                    rate: 192000,
+                    valid_bits: 16,
+                    container_bits: 16,
+                    channel_mask: 0x3,
+                    sub_format: KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_DIGITAL_PLUS,
+                    sample_format: ffmpeg_next::format::sample::Sample::None,
+                }],
+            )),
+            ffmpeg_next::codec::Id::DTS => Ok((
+                "dts".to_string(),
+                WasapiStreamType::CompressedBitstream,
+                vec![
+                    AudioProfile {
+                        name: "DTS-HD MA (HBR)".to_string(),
+                        stream_type: WasapiStreamType::CompressedBitstream,
+                        channels: 8,
+                        rate: 192000,
+                        valid_bits: 16,
+                        container_bits: 16,
+                        channel_mask: 0x63F,
+                        sub_format: KSDATAFORMAT_SUBTYPE_IEC61937_DTS_HD,
+                        sample_format: ffmpeg_next::format::sample::Sample::None,
+                    },
+                    AudioProfile {
+                        name: "DTS Core (fallback)".to_string(),
+                        stream_type: WasapiStreamType::CompressedBitstream,
+                        channels: 2,
+                        rate: 48000,
+                        valid_bits: 16,
+                        container_bits: 16,
+                        channel_mask: 0x3,
+                        sub_format: KSDATAFORMAT_SUBTYPE_IEC61937_DTS,
+                        sample_format: ffmpeg_next::format::sample::Sample::None,
+                    },
+                ],
+            )),
+            ffmpeg_next::codec::Id::AC3 => Ok((
+                "ac3".to_string(),
+                WasapiStreamType::CompressedBitstream,
+                vec![AudioProfile {
+                    name: "AC3 / Dolby Digital".to_string(),
+                    stream_type: WasapiStreamType::CompressedBitstream,
+                    channels: 2,
+                    rate: 48000,
+                    valid_bits: 16,
+                    container_bits: 16,
+                    channel_mask: 0x3,
+                    sub_format: KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_DIGITAL,
+                    sample_format: ffmpeg_next::format::sample::Sample::None,
+                }],
+            )),
+            // Uncompressed Multi-Channel LPCM
+            id if id == ffmpeg_next::codec::Id::FLAC
+                || id == ffmpeg_next::codec::Id::ALAC
+                || id == ffmpeg_next::codec::Id::WAVPACK
+                || format!("{:?}", id).starts_with("PCM_")
+                || src_channels > 2 =>
+            {
+                let codec_name = match id {
+                    ffmpeg_next::codec::Id::FLAC => "flac",
+                    ffmpeg_next::codec::Id::ALAC => "alac",
+                    ffmpeg_next::codec::Id::WAVPACK => "wavpack",
+                    _ if format!("{:?}", id).starts_with("PCM_") => "pcm",
+                    _ => "multichannel_pcm",
+                }.to_string();
+
+                let mut profiles = Vec::new();
+                let rates_to_try = if src_rate != 48000 {
+                    vec![src_rate, 48000]
+                } else {
+                    vec![src_rate]
+                };
+
+                let channel_configs: Vec<(u16, u32)> = match src_channels {
+                    6 => vec![(6, 0x3F), (6, 0x60F), (8, 0x63F)],
+                    8 => vec![(8, 0x63F), (6, 0x3F)],
+                    4 => vec![(4, 0x33), (6, 0x3F)],
+                    2 => vec![(2, 0x3)],
+                    _ => vec![(src_channels, if src_channels <= 6 { 0x3F } else { 0x63F })],
+                };
+
+                for &rate in &rates_to_try {
+                    for &(ch, mask) in &channel_configs {
+                        profiles.push(AudioProfile {
+                            name: format!("Multi-Channel LPCM 24-bit ({}ch x {}Hz, mask 0x{:X})", ch, rate, mask),
+                            stream_type: WasapiStreamType::Lpcm,
+                            channels: ch,
+                            rate,
+                            valid_bits: 24,
+                            container_bits: 32,
+                            channel_mask: mask,
+                            sub_format: KSDATAFORMAT_SUBTYPE_PCM,
+                            sample_format: ffmpeg_next::format::sample::Sample::I32(ffmpeg_next::format::sample::Type::Packed),
+                        });
+                        profiles.push(AudioProfile {
+                            name: format!("Multi-Channel LPCM 32-bit Float ({}ch x {}Hz, mask 0x{:X})", ch, rate, mask),
+                            stream_type: WasapiStreamType::Lpcm,
+                            channels: ch,
+                            rate,
+                            valid_bits: 32,
+                            container_bits: 32,
+                            channel_mask: mask,
+                            sub_format: KSDATAFORMAT_SUBTYPE_IEEE_FLOAT,
+                            sample_format: ffmpeg_next::format::sample::Sample::F32(ffmpeg_next::format::sample::Type::Packed),
+                        });
+                        profiles.push(AudioProfile {
+                            name: format!("Multi-Channel LPCM 16-bit ({}ch x {}Hz, mask 0x{:X})", ch, rate, mask),
+                            stream_type: WasapiStreamType::Lpcm,
+                            channels: ch,
+                            rate,
+                            valid_bits: 16,
+                            container_bits: 16,
+                            channel_mask: mask,
+                            sub_format: KSDATAFORMAT_SUBTYPE_PCM,
+                            sample_format: ffmpeg_next::format::sample::Sample::I16(ffmpeg_next::format::sample::Type::Packed),
+                        });
+                    }
+                }
+                Ok((codec_name, WasapiStreamType::Lpcm, profiles))
+            }
+            _ => Err(anyhow::anyhow!("Unsupported codec for bitstreaming or exclusive multi-channel LPCM: {:?}", codec_id)),
         }
     }
 
@@ -488,58 +649,75 @@ mod wasapi_bitstream {
         dw_average_bytes_per_sec: u32,
     }
 
-    fn build_format(profile: &Iec61937Profile) -> Vec<u8> {
-        let block_align = profile.channels * 2;
+    fn build_format(profile: &AudioProfile) -> Vec<u8> {
+        let block_align = profile.channels * (profile.container_bits / 8);
         let avg_bytes = profile.rate * block_align as u32;
-        let channel_mask: u32 = match profile.channels {
-            2 => 0x3,
-            8 => 0x63F,
-            _ => 0x3,
-        };
 
-        let is_hbr = profile.rate > 48000;
+        match profile.stream_type {
+            WasapiStreamType::CompressedBitstream => {
+                let is_hbr = profile.rate > 48000;
+                let format_ext = WAVEFORMATEXTENSIBLE {
+                    Format: WAVEFORMATEX {
+                        wFormatTag: 0xFFFE, // WAVE_FORMAT_EXTENSIBLE
+                        nChannels: profile.channels,
+                        nSamplesPerSec: profile.rate,
+                        nAvgBytesPerSec: avg_bytes,
+                        nBlockAlign: block_align,
+                        wBitsPerSample: 16,
+                        cbSize: if is_hbr { 34 } else { 22 },
+                    },
+                    Samples: WAVEFORMATEXTENSIBLE_0 { wValidBitsPerSample: 16 },
+                    dwChannelMask: profile.channel_mask,
+                    SubFormat: profile.sub_format,
+                };
 
-        let format_ext = WAVEFORMATEXTENSIBLE {
-            Format: WAVEFORMATEX {
-                wFormatTag: 0xFFFE, // WAVE_FORMAT_EXTENSIBLE
-                nChannels: profile.channels,
-                nSamplesPerSec: profile.rate,
-                nAvgBytesPerSec: avg_bytes,
-                nBlockAlign: block_align,
-                wBitsPerSample: 16,
-                cbSize: if is_hbr { 34 } else { 22 },
-            },
-            Samples: WAVEFORMATEXTENSIBLE_0 { wValidBitsPerSample: 16 },
-            dwChannelMask: channel_mask,
-            SubFormat: profile.sub_format,
-        };
+                if is_hbr {
+                    let iec = WAVEFORMATEXTENSIBLE_IEC61937 {
+                        format_ext,
+                        dw_encoded_samples_per_sec: profile.rate,
+                        dw_encoded_channel_count: profile.channels as u32,
+                        dw_average_bytes_per_sec: avg_bytes,
+                    };
+                    unsafe {
+                        std::slice::from_raw_parts(
+                            &iec as *const _ as *const u8,
+                            std::mem::size_of::<WAVEFORMATEXTENSIBLE_IEC61937>(),
+                        ).to_vec()
+                    }
+                } else {
+                    unsafe {
+                        std::slice::from_raw_parts(
+                            &format_ext as *const _ as *const u8,
+                            std::mem::size_of::<WAVEFORMATEXTENSIBLE>(),
+                        ).to_vec()
+                    }
+                }
+            }
+            WasapiStreamType::Lpcm => {
+                let format_ext = WAVEFORMATEXTENSIBLE {
+                    Format: WAVEFORMATEX {
+                        wFormatTag: 0xFFFE, // WAVE_FORMAT_EXTENSIBLE
+                        nChannels: profile.channels,
+                        nSamplesPerSec: profile.rate,
+                        nAvgBytesPerSec: avg_bytes,
+                        nBlockAlign: block_align,
+                        wBitsPerSample: profile.container_bits,
+                        cbSize: 22,
+                    },
+                    Samples: WAVEFORMATEXTENSIBLE_0 { wValidBitsPerSample: profile.valid_bits },
+                    dwChannelMask: profile.channel_mask,
+                    SubFormat: profile.sub_format,
+                };
 
-        if is_hbr {
-            let iec = WAVEFORMATEXTENSIBLE_IEC61937 {
-                format_ext,
-                dw_encoded_samples_per_sec: profile.rate,
-                dw_encoded_channel_count: profile.channels as u32,
-                dw_average_bytes_per_sec: avg_bytes,
-            };
-            let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    &iec as *const _ as *const u8,
-                    std::mem::size_of::<WAVEFORMATEXTENSIBLE_IEC61937>(),
-                )
-            };
-            bytes.to_vec()
-        } else {
-            let bytes = unsafe {
-                std::slice::from_raw_parts(
-                    &format_ext as *const _ as *const u8,
-                    std::mem::size_of::<WAVEFORMATEXTENSIBLE>(),
-                )
-            };
-            bytes.to_vec()
+                unsafe {
+                    std::slice::from_raw_parts(
+                        &format_ext as *const _ as *const u8,
+                        std::mem::size_of::<WAVEFORMATEXTENSIBLE>(),
+                    ).to_vec()
+                }
+            }
         }
     }
-
-    // ─── Device listing (simple — just count and ID) ─────────────────
 
     #[allow(dead_code)]
     pub fn list_devices() -> Result<()> {
@@ -552,23 +730,28 @@ mod wasapi_bitstream {
 
         println!("Available audio render endpoints:\n");
         for i in 0..count {
-            let device = unsafe { collection.Item(i)? };
-            let id = unsafe { device.GetId()?.to_string()? };
-            println!("  [{}] ID: {}", i, id);
+            if let Ok(device) = unsafe { collection.Item(i) } {
+                let id = unsafe { device.GetId()?.to_string()? };
+                let name = get_device_name(&device).unwrap_or_else(|| "Unknown".to_string());
+                println!("  [{}] {} (ID: {})", i, name, id);
+            }
         }
-        println!("\nUse --device <N> to select a specific endpoint.");
+        println!("\nUse --device <N> or settings to select a specific endpoint.");
 
         unsafe { CoUninitialize(); }
         Ok(())
     }
 
-    // ─── Main bitstream pump ─────────────────────────────────────────
-
-    pub fn start_bitstream_thread(file_path: &str, _shared_state: Arc<Mutex<AppState>>, tx: Sender<DspMessage>, stop_token: Arc<AtomicBool>) -> Result<(std::thread::JoinHandle<()>, u32, String, bool)> {
+    pub fn start_bitstream_thread(
+        file_path: &str,
+        _shared_state: Arc<Mutex<AppState>>,
+        tx: Sender<DspMessage>,
+        stop_token: Arc<AtomicBool>,
+    ) -> Result<(std::thread::JoinHandle<()>, u32, u16, String, bool)> {
         unsafe { let _ = CoInitializeEx(None, COINIT_MULTITHREADED); }
 
         // ── Probe codec via ffmpeg-next ─────────────────────────────
-        println!("Probing audio stream via ffmpeg-next...");
+        println!("[bitstream] Probing audio stream via ffmpeg-next on Windows...");
         ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Quiet);
         ffmpeg_next::init().context("Failed to initialize ffmpeg-next")?;
         
@@ -582,70 +765,105 @@ mod wasapi_bitstream {
             .ok_or_else(|| anyhow::anyhow!("No audio stream found"))?;
             
         let codec_id = best_audio.parameters().id();
-        let codec_name = match codec_id {
-            ffmpeg_next::codec::Id::TRUEHD => "truehd",
-            ffmpeg_next::codec::Id::EAC3 => "eac3",
-            ffmpeg_next::codec::Id::DTS => "dts",
-            ffmpeg_next::codec::Id::AC3 => "ac3",
-            _ => return Err(anyhow::anyhow!("Unsupported codec for bitstreaming: {:?}", codec_id)),
-        }.to_string();
+        let best_audio_index = best_audio.index();
+        let parameters = best_audio.parameters();
 
+        let probe_ctx = ffmpeg_next::codec::context::Context::from_parameters(parameters.clone())
+            .context("Failed to create probe context")?;
+        let probe_decoder = probe_ctx.decoder().audio()
+            .context("Failed to create probe decoder")?;
+        let decoder_sample_rate = probe_decoder.rate();
+        let src_channels = probe_decoder.channels();
+
+        let (codec_name, stream_type, profiles) = detect_codec_profile(codec_id, src_channels, decoder_sample_rate)?;
         let has_video = ictx.streams().best(ffmpeg_next::media::Type::Video).is_some();
 
-        let profiles = detect_codec_profile(&codec_name);
-        println!("Detected codec: {}", codec_name);
+        println!("[bitstream] Detected codec: {}, Decoder Rate: {} Hz, Channels: {}", codec_name, decoder_sample_rate, src_channels);
         for p in &profiles {
-            println!("  Will try: {} ({}ch x {}Hz)", p.name, p.channels, p.rate);
+            println!("  [bitstream] Candidate profile: {} ({}ch x {}Hz)", p.name, p.channels, p.rate);
         }
 
         // ── Open device ─────────────────────────────────────────────
         let enumerator: IMMDeviceEnumerator =
             unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
 
-        let device_idx: Option<u32> = None; let device = if let Some(idx) = device_idx {
-            println!("Using device index: {}", idx);
-            let collection = unsafe { enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)? };
-            unsafe { collection.Item(idx)? }
-        } else {
-            println!("Using default audio endpoint.");
-            unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia)? }
-        };
+        let selected_device_name = _shared_state.lock().ok().and_then(|s| s.selected_audio_device.clone());
+        println!("[bitstream] Selected audio device in state: {:?}", selected_device_name);
 
-        let mut audio_client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
+        let collection = unsafe { enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)? };
+        let count = unsafe { collection.GetCount()? };
+        
+        let mut target_device: Option<IMMDevice> = None;
 
-        // ── Negotiate format ────────────────────────────────────────
-        println!("\nNegotiating WASAPI Exclusive Mode format...");
-
-        let mut accepted_profile = None;
-        let mut accepted_format = None;
-
-        for profile in &profiles {
-            let format = build_format(profile);
-            let hr = unsafe {
-                audio_client.IsFormatSupported(
-                    AUDCLNT_SHAREMODE_EXCLUSIVE,
-                    format.as_ptr() as *const _,
-                    None,
-                )
-            };
-
-            if hr.is_ok() {
-                println!("  OK: {}", profile.name);
-                accepted_profile = Some(profile.clone());
-                accepted_format = Some(format);
-                break;
-            } else {
-                println!("  REJECTED: {} (HRESULT: {:?})", profile.name, hr);
+        // 1. If user selected a device, search for it
+        if let Some(target) = &selected_device_name {
+            let target_lower = target.to_lowercase();
+            for i in 0..count {
+                if let Ok(dev) = unsafe { collection.Item(i) } {
+                    let dev_name = get_device_name(&dev).unwrap_or_default();
+                    let dev_id = unsafe { dev.GetId().ok().and_then(|id| id.to_string().ok()).unwrap_or_default() };
+                    if dev_name.to_lowercase().contains(&target_lower) || target_lower.contains(&dev_name.to_lowercase()) || dev_id == *target {
+                        println!("[bitstream] Found matching device for '{}': {}", target, dev_name);
+                        target_device = Some(dev);
+                        break;
+                    }
+                }
             }
         }
 
-        let profile = accepted_profile
-            .ok_or_else(|| anyhow::anyhow!("No passthrough format accepted by this endpoint.\n\
-                Ensure your default audio device supports bitstream output (HDMI/SPDIF to AVR)."))?;
-        let format = accepted_format.unwrap();
+        let default_device = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eMultimedia).ok() };
+
+        // Helper to test if a device accepts any of the given profiles
+        let test_device_formats = |dev: &IMMDevice, profs: &[AudioProfile]| -> Option<(IAudioClient, AudioProfile, Vec<u8>)> {
+            let client: IAudioClient = unsafe { dev.Activate(CLSCTX_ALL, None).ok()? };
+            for p in profs {
+                let fmt = build_format(p);
+                let hr = unsafe {
+                    client.IsFormatSupported(
+                        AUDCLNT_SHAREMODE_EXCLUSIVE,
+                        fmt.as_ptr() as *const _,
+                        None,
+                    )
+                };
+                if hr.is_ok() {
+                    println!("  [bitstream] Device accepted profile: {} ({}ch x {}Hz)", p.name, p.channels, p.rate);
+                    return Some((client, p.clone(), fmt));
+                }
+            }
+            None
+        };
+
+        let mut negotiated = if let Some(ref dev) = target_device {
+            println!("[bitstream] Testing selected audio device for exclusive/bitstream support...");
+            test_device_formats(dev, &profiles).map(|(c, p, f)| (dev.clone(), c, p, f))
+        } else if let Some(ref dev) = default_device {
+            println!("[bitstream] Testing default audio endpoint for exclusive/bitstream support...");
+            test_device_formats(dev, &profiles).map(|(c, p, f)| (dev.clone(), c, p, f))
+        } else {
+            None
+        };
+
+        // If target/default endpoint rejected the formats, probe other active endpoints
+        if negotiated.is_none() {
+            println!("[bitstream] Default/selected endpoint rejected formats; probing other active endpoints for AVR/HDMI...");
+            for i in 0..count {
+                if let Ok(dev) = unsafe { collection.Item(i) } {
+                    let dev_name = get_device_name(&dev).unwrap_or_default();
+                    if let Some((c, p, f)) = test_device_formats(&dev, &profiles) {
+                        println!("[bitstream] Selected capable endpoint [{}]: {}", i, dev_name);
+                        negotiated = Some((dev, c, p, f));
+                        break;
+                    }
+                }
+            }
+        }
+
+        let (device, mut audio_client, profile, format) = negotiated
+            .ok_or_else(|| anyhow::anyhow!("No exclusive/bitstream format accepted by available audio endpoints.\n\
+                Ensure your audio receiver supports multichannel LPCM or bitstream output over HDMI/SPDIF."))?;
 
         // ── Initialize ──────────────────────────────────────────────
-        println!("\nInitializing audio client...");
+        println!("\n[bitstream] Initializing audio client for {}...", profile.name);
         
         let mut default_period = 0;
         let mut min_period = 0;
@@ -673,14 +891,11 @@ mod wasapi_bitstream {
                 // AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED or E_INVALIDARG
                 println!("  Initialize rejected duration {} (HRESULT: {:?}). Attempting to align...", buffer_duration, e.code());
                 
-                // If it failed with E_INVALIDARG, we might need a new client, but let's try querying buffer size first
                 let aligned_frames = unsafe { audio_client.GetBufferSize().unwrap_or(0) };
                 if aligned_frames > 0 {
-                    // formula: duration = frames * 10_000_000 / sample_rate
                     buffer_duration = (aligned_frames as i64 * 10_000_000) / profile.rate as i64;
                     println!("  Aligned buffer duration: {}ns ({} frames)", buffer_duration * 100, aligned_frames);
                     
-                    // We actually must get a new audio_client instance if Initialize failed
                     let audio_client_new: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
                     hr = unsafe {
                         audio_client_new.Initialize(
@@ -710,14 +925,15 @@ mod wasapi_bitstream {
         unsafe { audio_client.SetEventHandle(event)?; }
 
         let buffer_frames = unsafe { audio_client.GetBufferSize()? };
-        let frame_bytes = (profile.channels * 2) as u32;
+        let bytes_per_sample = (profile.container_bits / 8) as u32;
+        let frame_bytes = profile.channels as u32 * bytes_per_sample;
         let render_client: IAudioRenderClient = unsafe { audio_client.GetService()? };
 
         println!("Buffer: {} frames ({:.1} ms)",
             buffer_frames,
             buffer_frames as f64 / profile.rate as f64 * 1000.0);
 
-        // ── Start FFmpeg spdif Muxer Pipe ───────────────────────────
+        // ── Start Named Pipe for streaming ───────────────────────────
         use windows::Win32::System::Pipes::{CreateNamedPipeA, ConnectNamedPipe, NAMED_PIPE_MODE};
         use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
         
@@ -738,130 +954,316 @@ mod wasapi_bitstream {
         };
 
         let pipe_name_clone = pipe_name.clone();
-        let best_audio_index = best_audio.index();
-        let parameters = best_audio.parameters();
         let stop_token_ffmpeg = stop_token.clone();
+        let profile_clone = profile.clone();
 
-        // Probe the decoder sample rate before spawning threads
-        let probe_ctx = ffmpeg_next::codec::context::Context::from_parameters(parameters.clone())
-            .context("Failed to create probe context")?;
-        let probe_decoder = probe_ctx.decoder().audio()
-            .context("Failed to create probe decoder")?;
-        let decoder_sample_rate = probe_decoder.rate();
-        println!("  Decoder sample rate: {} Hz", decoder_sample_rate);
+        let ffmpeg_thread = match stream_type {
+            WasapiStreamType::CompressedBitstream => {
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    println!("[bitstream] Compressed bitstream FFmpeg worker thread started.");
 
-        let ffmpeg_thread = std::thread::spawn(move || {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            println!("[bitstream] FFmpeg thread started.");
-
-            let mut octx = ffmpeg_next::format::output_as(&pipe_name_clone, "spdif").unwrap();
-            let ost_index = {
-                let mut ost = octx.add_stream(ffmpeg_next::codec::Id::None).unwrap();
-                ost.set_parameters(parameters.clone());
-                ost.index()
-            };
-            
-            let mut dict = ffmpeg_next::Dictionary::new();
-            dict.set("flush_packets", "1");
-            octx.write_header_with(dict).unwrap();
-            let ost_time_base = octx.stream(ost_index).unwrap().time_base();
-
-            // Setup Visualizer Decoder
-            let decoder_context = ffmpeg_next::codec::context::Context::from_parameters(parameters.clone()).unwrap();
-            let mut decoder = decoder_context.decoder().audio().unwrap();
-            let mut resampler = ffmpeg_next::software::resampling::context::Context::get(
-                decoder.format(), decoder.channel_layout(), decoder.rate(),
-                ffmpeg_next::format::sample::Sample::F32(ffmpeg_next::format::sample::Type::Planar),
-                decoder.channel_layout(), decoder.rate(),
-            ).unwrap();
-
-            let decoder_rate = decoder.rate() as f32;
-            let window_size = (((decoder_rate * 0.185).round() as usize) / 2) * 2;
-            let window_size = window_size.max(2048).min(65536);
-            let update_interval = (decoder_rate / 240.0).ceil() as usize;
-            let mut accumulator: Vec<Vec<f32>> = Vec::new();
-            let mut samples_since_last_send = 0;
-
-            // let mut pkts_written = 0;
-            let mut current_seconds = 0.0;
-            
-            for (stream, mut packet) in ictx.packets() {
-                if stop_token_ffmpeg.load(std::sync::atomic::Ordering::Relaxed) {
-                    break;
-                }
-                if stream.index() == best_audio_index {
-                    let vis_packet = packet.clone();
-
-                    if let Some(pts) = packet.pts() {
-                        current_seconds = pts as f64 * f64::from(stream.time_base());
+                    let mut octx = match ffmpeg_next::format::output_as(&pipe_name_clone, "spdif") {
+                        Ok(ctx) => ctx,
+                        Err(e) => {
+                            eprintln!("[bitstream] Failed to open spdif muxer: {}", e);
+                            return;
+                        }
+                    };
+                    let ost_index = {
+                        let mut ost = match octx.add_stream(ffmpeg_next::codec::Id::None) {
+                            Ok(st) => st,
+                            Err(e) => {
+                                eprintln!("[bitstream] Failed to add stream: {}", e);
+                                return;
+                            }
+                        };
+                        ost.set_parameters(parameters.clone());
+                        ost.index()
+                    };
+                    
+                    let mut dict = ffmpeg_next::Dictionary::new();
+                    dict.set("flush_packets", "1");
+                    if let Err(e) = octx.write_header_with(dict) {
+                        eprintln!("[bitstream] Failed to write header: {}", e);
+                        return;
                     }
+                    let ost_time_base = octx.stream(ost_index).unwrap().time_base();
 
-                    packet.rescale_ts(stream.time_base(), ost_time_base);
-                    packet.set_stream(ost_index);
-                    let _ = packet.write(&mut octx);
-                    // pkts_written += 1;
+                    // Setup Visualizer Decoder
+                    let decoder_context = match ffmpeg_next::codec::context::Context::from_parameters(parameters.clone()) {
+                        Ok(ctx) => ctx,
+                        Err(e) => {
+                            eprintln!("[bitstream] Failed to create visualizer decoder context: {}", e);
+                            return;
+                        }
+                    };
+                    let mut decoder = match decoder_context.decoder().audio() {
+                        Ok(dec) => dec,
+                        Err(e) => {
+                            eprintln!("[bitstream] Failed to create visualizer audio decoder: {}", e);
+                            return;
+                        }
+                    };
+                    let mut resampler = match ffmpeg_next::software::resampling::context::Context::get(
+                        decoder.format(), decoder.channel_layout(), decoder.rate(),
+                        ffmpeg_next::format::sample::Sample::F32(ffmpeg_next::format::sample::Type::Planar),
+                        decoder.channel_layout(), decoder.rate(),
+                    ) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("[bitstream] Failed to create visualizer resampler: {}", e);
+                            return;
+                        }
+                    };
 
-                    if decoder.send_packet(&vis_packet).is_ok() {
-                        let mut frame = ffmpeg_next::frame::Audio::empty();
-                        while decoder.receive_frame(&mut frame).is_ok() {
-                            let mut resampled = ffmpeg_next::frame::Audio::empty();
-                            if resampler.run(&frame, &mut resampled).is_ok() {
-                                let planes = resampled.channels() as usize;
-                                
-                                if accumulator.len() != planes {
-                                    accumulator = vec![Vec::new(); planes];
-                                }
-                                
-                                let mut fresh_samples = 0;
-                                for p in 0..planes {
-                                    let data = resampled.plane::<f32>(p);
-                                    if p == 0 { fresh_samples = data.len(); }
-                                    accumulator[p].extend_from_slice(data);
-                                    let excess = accumulator[p].len().saturating_sub(window_size);
-                                    if excess > 0 {
-                                        accumulator[p].drain(0..excess);
-                                    }
-                                }
-                                
-                                samples_since_last_send += fresh_samples;
-                                
-                                // Sliding window with 240Hz update limiter
-                                if accumulator.get(0).map(|a| a.len()).unwrap_or(0) == window_size && samples_since_last_send >= update_interval {
-                                    samples_since_last_send = 0;
-                                    let mut channel_audio_data = Vec::with_capacity(planes);
-                                    let mut channel_vus = Vec::with_capacity(planes);
-                                    
-                                    for p in 0..planes {
-                                        let window = accumulator[p].clone();
+                    let decoder_rate = decoder.rate() as f32;
+                    let window_size = (((decoder_rate * 0.185).round() as usize) / 2) * 2;
+                    let window_size = window_size.max(2048).min(65536);
+                    let update_interval = (decoder_rate / 240.0).ceil() as usize;
+                    let mut accumulator: Vec<Vec<f32>> = Vec::new();
+                    let mut samples_since_last_send = 0;
+                    let mut current_seconds = 0.0;
+                    
+                    for (stream, mut packet) in ictx.packets() {
+                        if stop_token_ffmpeg.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
+                        if stream.index() == best_audio_index {
+                            let vis_packet = packet.clone();
+
+                            if let Some(pts) = packet.pts() {
+                                current_seconds = pts as f64 * f64::from(stream.time_base());
+                            }
+
+                            packet.rescale_ts(stream.time_base(), ost_time_base);
+                            packet.set_stream(ost_index);
+                            let _ = packet.write(&mut octx);
+
+                            if decoder.send_packet(&vis_packet).is_ok() {
+                                let mut frame = ffmpeg_next::frame::Audio::empty();
+                                while decoder.receive_frame(&mut frame).is_ok() {
+                                    let mut resampled = ffmpeg_next::frame::Audio::empty();
+                                    if resampler.run(&frame, &mut resampled).is_ok() {
+                                        let planes = resampled.channels() as usize;
                                         
-                                        // Calculate RMS for VU from the window
-                                        let mut sum_sq = 0.0;
-                                        for &s in &window { sum_sq += s * s; }
-                                        let rms = (sum_sq / window.len() as f32).sqrt();
-                                        channel_vus.push(rms);
+                                        if accumulator.len() != planes {
+                                            accumulator = vec![Vec::new(); planes];
+                                        }
                                         
-                                        channel_audio_data.push(window);
+                                        let mut fresh_samples = 0;
+                                        for p in 0..planes {
+                                            let data = resampled.plane::<f32>(p);
+                                            if p == 0 { fresh_samples = data.len(); }
+                                            accumulator[p].extend_from_slice(data);
+                                            let excess = accumulator[p].len().saturating_sub(window_size);
+                                            if excess > 0 {
+                                                accumulator[p].drain(0..excess);
+                                            }
+                                        }
+                                        
+                                        samples_since_last_send += fresh_samples;
+                                        
+                                        if accumulator.first().map(|a| a.len()).unwrap_or(0) == window_size && samples_since_last_send >= update_interval {
+                                            samples_since_last_send = 0;
+                                            let mut channel_audio_data = Vec::with_capacity(planes);
+                                            let mut channel_vus = Vec::with_capacity(planes);
+                                            
+                                            for p in 0..planes {
+                                                let window = accumulator[p].clone();
+                                                let mut sum_sq = 0.0;
+                                                for &s in &window { sum_sq += s * s; }
+                                                let rms = (sum_sq / window.len() as f32).sqrt();
+                                                channel_vus.push(rms);
+                                                channel_audio_data.push(window);
+                                            }
+                                            
+                                            let _ = tx.try_send(DspMessage {
+                                                audio_data: channel_audio_data[0].clone(),
+                                                channel_vus,
+                                                current_order: 0,
+                                                current_row: 0,
+                                                bpm: 0,
+                                                speed: 0,
+                                                current_seconds,
+                                                current_row_string: String::new(),
+                                                channel_audio_data,
+                                            });
+                                        }
                                     }
-                                    
-                                    let _ = tx.try_send(DspMessage {
-                                        audio_data: channel_audio_data[0].clone(),
-                                        channel_vus,
-                                        current_order: 0,
-                                        current_row: 0,
-                                        bpm: 0,
-                                        speed: 0,
-                                        current_seconds,
-                                        current_row_string: "".to_string(),
-                                        channel_audio_data,
-                                    });
                                 }
                             }
                         }
                     }
-                }
+                    let _ = octx.write_trailer();
+                })
             }
-            let _ = octx.write_trailer();
-        });
+            WasapiStreamType::Lpcm => {
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                    println!("[bitstream] Multi-Channel LPCM FFmpeg worker thread started.");
+
+                    let mut pipe_writer = match std::fs::OpenOptions::new().write(true).open(&pipe_name_clone) {
+                        Ok(w) => w,
+                        Err(e) => {
+                            eprintln!("[bitstream] Failed to open pipe for writing: {}", e);
+                            return;
+                        }
+                    };
+
+                    let decoder_context = match ffmpeg_next::codec::context::Context::from_parameters(parameters.clone()) {
+                        Ok(ctx) => ctx,
+                        Err(e) => {
+                            eprintln!("[bitstream] Failed to create LPCM decoder context: {}", e);
+                            return;
+                        }
+                    };
+                    let mut decoder = match decoder_context.decoder().audio() {
+                        Ok(dec) => dec,
+                        Err(e) => {
+                            eprintln!("[bitstream] Failed to create LPCM audio decoder: {}", e);
+                            return;
+                        }
+                    };
+
+                    let target_channel_layout = ffmpeg_next::channel_layout::ChannelLayout::default(profile_clone.channels as i32);
+                    let mut pcm_resampler = match ffmpeg_next::software::resampling::context::Context::get(
+                        decoder.format(),
+                        decoder.channel_layout(),
+                        decoder.rate(),
+                        profile_clone.sample_format,
+                        target_channel_layout,
+                        profile_clone.rate,
+                    ) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("[bitstream] Failed to create PCM resampler: {}", e);
+                            return;
+                        }
+                    };
+
+                    let mut vis_resampler = match ffmpeg_next::software::resampling::context::Context::get(
+                        decoder.format(),
+                        decoder.channel_layout(),
+                        decoder.rate(),
+                        ffmpeg_next::format::sample::Sample::F32(ffmpeg_next::format::sample::Type::Planar),
+                        decoder.channel_layout(),
+                        decoder.rate(),
+                    ) {
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("[bitstream] Failed to create visualizer resampler: {}", e);
+                            return;
+                        }
+                    };
+
+                    let decoder_rate = decoder.rate() as f32;
+                    let window_size = (((decoder_rate * 0.185).round() as usize) / 2) * 2;
+                    let window_size = window_size.max(2048).min(65536);
+                    let update_interval = (decoder_rate / 240.0).ceil() as usize;
+                    let mut accumulator: Vec<Vec<f32>> = Vec::new();
+                    let mut samples_since_last_send = 0;
+                    let mut current_seconds = 0.0;
+
+                    for (stream, packet) in ictx.packets() {
+                        if stop_token_ffmpeg.load(std::sync::atomic::Ordering::Relaxed) {
+                            break;
+                        }
+                        if stream.index() == best_audio_index {
+                            if let Some(pts) = packet.pts() {
+                                current_seconds = pts as f64 * f64::from(stream.time_base());
+                            }
+
+                            if decoder.send_packet(&packet).is_ok() {
+                                let mut frame = ffmpeg_next::frame::Audio::empty();
+                                while decoder.receive_frame(&mut frame).is_ok() {
+                                    // 1. Output packed PCM bytes to WASAPI pipe
+                                    let mut pcm_frame = ffmpeg_next::frame::Audio::empty();
+                                    if pcm_resampler.run(&frame, &mut pcm_frame).is_ok() {
+                                        let samples = pcm_frame.samples();
+                                        let ch = pcm_frame.channels() as usize;
+                                        let bytes_per_sample = (profile_clone.container_bits / 8) as usize;
+                                        let total_bytes = samples * ch * bytes_per_sample;
+                                        if total_bytes > 0 {
+                                            let raw_bytes = pcm_frame.data(0);
+                                            let slice = &raw_bytes[..total_bytes.min(raw_bytes.len())];
+                                            if pipe_writer.write_all(slice).is_err() {
+                                                break;
+                                            }
+                                        }
+                                    }
+
+                                    // 2. Feed visualizer DSP
+                                    let mut vis_frame = ffmpeg_next::frame::Audio::empty();
+                                    if vis_resampler.run(&frame, &mut vis_frame).is_ok() {
+                                        let planes = vis_frame.channels() as usize;
+                                        if accumulator.len() != planes {
+                                            accumulator = vec![Vec::new(); planes];
+                                        }
+                                        let mut fresh_samples = 0;
+                                        for p in 0..planes {
+                                            let data = vis_frame.plane::<f32>(p);
+                                            if p == 0 { fresh_samples = data.len(); }
+                                            accumulator[p].extend_from_slice(data);
+                                            let excess = accumulator[p].len().saturating_sub(window_size);
+                                            if excess > 0 {
+                                                accumulator[p].drain(0..excess);
+                                            }
+                                        }
+                                        samples_since_last_send += fresh_samples;
+                                        if accumulator.first().map(|a| a.len()).unwrap_or(0) == window_size && samples_since_last_send >= update_interval {
+                                            samples_since_last_send = 0;
+                                            let mut channel_audio_data = Vec::with_capacity(planes);
+                                            let mut channel_vus = Vec::with_capacity(planes);
+                                            for p in 0..planes {
+                                                let window = accumulator[p].clone();
+                                                let mut sum_sq = 0.0;
+                                                for &s in &window { sum_sq += s * s; }
+                                                let rms = (sum_sq / window.len() as f32).sqrt();
+                                                channel_vus.push(rms);
+                                                channel_audio_data.push(window);
+                                            }
+                                            let _ = tx.try_send(DspMessage {
+                                                audio_data: channel_audio_data[0].clone(),
+                                                channel_vus,
+                                                current_order: 0,
+                                                current_row: 0,
+                                                bpm: 0,
+                                                speed: 0,
+                                                current_seconds,
+                                                current_row_string: String::new(),
+                                                channel_audio_data,
+                                            });
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Flush decoder
+                    let _ = decoder.send_eof();
+                    let mut frame = ffmpeg_next::frame::Audio::empty();
+                    while decoder.receive_frame(&mut frame).is_ok() {
+                        let mut pcm_frame = ffmpeg_next::frame::Audio::empty();
+                        if pcm_resampler.run(&frame, &mut pcm_frame).is_ok() {
+                            let samples = pcm_frame.samples();
+                            let ch = pcm_frame.channels() as usize;
+                            let bytes_per_sample = (profile_clone.container_bits / 8) as usize;
+                            let total_bytes = samples * ch * bytes_per_sample;
+                            if total_bytes > 0 {
+                                let raw_bytes = pcm_frame.data(0);
+                                let slice = &raw_bytes[..total_bytes.min(raw_bytes.len())];
+                                if pipe_writer.write_all(slice).is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    let _ = pipe_writer.flush();
+                })
+            }
+        };
 
         println!("[main] Connecting named pipe...");
         unsafe {
@@ -873,9 +1275,8 @@ mod wasapi_bitstream {
         let mut stdout = unsafe { std::fs::File::from_raw_handle(pipe_handle.0 as _) };
 
         // ── Pump loop ───────────────────────────────────────────────
-        println!("\n>> Bitstreaming: {} -> {}ch x {}Hz",
+        println!("\n>> Output Active: {} -> {}ch x {}Hz",
             profile.name, profile.channels, profile.rate);
-        println!("   Press Ctrl+C to stop.\n");
 
         let mut eof = false;
         let mut started = false;
@@ -945,10 +1346,10 @@ mod wasapi_bitstream {
                 CoUninitialize();
             }
             
-            println!("Bitstream thread finished.");
+            println!("Bitstream/LPCM pump thread finished.");
         });
 
-        Ok((handle, decoder_sample_rate, profile.name.to_string(), has_video))
+        Ok((handle, decoder_sample_rate, profile.channels, codec_name, has_video))
     }
 }
 

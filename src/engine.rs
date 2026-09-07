@@ -3584,7 +3584,7 @@ impl VulkanEngine {
                 }
             }
             if all_zero {
-                return;
+                // all zero, nothing further needed
             }
         } else {
             // 1. Audio Analysis: Bass transient detection and column energy mapping
@@ -3600,7 +3600,7 @@ impl VulkanEngine {
                 let n_ch = (num_tracks as usize).min(64);
                 let spec_len = state.spectrum_data.len();
                 // For tracker files, state.channel_vus is [Left_peak, Track1..N, Right_peak]
-                for x in 0..W {
+                for (x, energy) in col_energies.iter_mut().enumerate().take(W) {
                     let track_idx = (x * n_ch) / W;
                     let track_vu = state.channel_vus.get(1 + track_idx).copied().unwrap_or(0.0);
 
@@ -3612,7 +3612,7 @@ impl VulkanEngine {
                     };
                     let spec_val = state.spectrum_data.get(spec_idx).copied().unwrap_or(0.0) / 60.0;
 
-                    col_energies[x] = (track_vu * 0.70 + spec_val * 0.30).clamp(0.0, 1.5);
+                    *energy = (track_vu * 0.70 + spec_val * 0.30).clamp(0.0, 1.5);
                 }
             } else {
                 // Non-tracker audio (Stereo MP3, FLAC, AAC, WAV, Radio Stream):
@@ -3620,7 +3620,7 @@ impl VulkanEngine {
                 let left_vu = state.channel_vus.first().copied().unwrap_or(0.0);
                 let right_vu = state.channel_vus.get(1).copied().unwrap_or(left_vu);
 
-                for x in 0..W {
+                for (x, energy) in col_energies.iter_mut().enumerate().take(W) {
                     let frac = x as f32 / W as f32;
                     let bin = if spec_len > 1 {
                         ((frac.powf(1.6) * 512.0) as usize).clamp(1, spec_len.saturating_sub(1))
@@ -3630,7 +3630,7 @@ impl VulkanEngine {
                     let spec_val = state.spectrum_data.get(bin).copied().unwrap_or(0.0) / 60.0;
 
                     let pan_vu = left_vu * (1.0 - frac) + right_vu * frac;
-                    col_energies[x] = (spec_val * 0.70 + pan_vu * 0.30).clamp(0.0, 1.5);
+                    *energy = (spec_val * 0.70 + pan_vu * 0.30).clamp(0.0, 1.5);
                 }
             }
 
@@ -3640,8 +3640,8 @@ impl VulkanEngine {
             // 2. Multi-step cellular automaton (2 sub-steps per frame for snappy transient physics)
             for _ in 0..2 {
                 // Combustion Hearth Row
-                for x in 0..W {
-                    let col_e = (col_energies[x] * 0.75 + bass * 0.25) * intensity;
+                for (x, &col_energy) in col_energies.iter().enumerate().take(W) {
+                    let col_e = (col_energy * 0.75 + bass * 0.25) * intensity;
 
                     // Bottom heat scales from quiet ember (11) up to incandescent white-hot (36):
                     let base_heat = 11.0 + col_e * 25.0;
@@ -3657,8 +3657,8 @@ impl VulkanEngine {
                 }
 
                 // In-place DOOM fire propagation across columns
-                for x in 0..W {
-                    let col_e = (col_energies[x] * 0.75 + bass * 0.25) * intensity;
+                for (x, &col_energy) in col_energies.iter().enumerate().take(W) {
+                    let col_e = (col_energy * 0.75 + bass * 0.25) * intensity;
 
                     // High decay when quiet (0.68), low decay when energetic (0.20):
                     let decay_prob = (0.68 - col_e * 0.44).clamp(0.20, 0.72);
@@ -3668,7 +3668,7 @@ impl VulkanEngine {
                     *rng ^= *rng << 13;
                     *rng ^= *rng >> 17;
                     *rng ^= *rng << 5;
-                    let dy = if col_e > 0.70 && (*rng % 4 != 0) { 2 } else { 1 };
+                    let dy = if col_e > 0.70 && !(*rng).is_multiple_of(4) { 2 } else { 1 };
 
                     for y in dy..H {
                         let from = y * W + x;

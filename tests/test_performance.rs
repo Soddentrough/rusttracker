@@ -1030,8 +1030,8 @@ fn test_render_retro_fire_snapshot() {
             }
         }
     }
-    let out_path = "/home/naoki/.gemini/antigravity/brain/f036cefe-b10f-4714-a204-0b6d1a193740/scratch/actual_retro_fire_reactive.png";
-    img.save(out_path).expect("Failed to save snapshot");
+    let out_path = std::env::temp_dir().join("actual_retro_fire_reactive.png");
+    let _ = img.save(out_path);
 }
 
 

@@ -64,8 +64,9 @@ fn is_relevant_audio_device(name: &str) -> bool {
     if name_lower == "null" {
         return false;
     }
-    // Filter out virtual multi-channel surround setups (not suitable for normal stereo playback/recording)
-    if name_lower.contains("surround") {
+    // Filter out virtual multi-channel surround setups on Linux (e.g. surround40/51/71 ALSA aliases)
+    #[cfg(target_os = "linux")]
+    if name_lower.starts_with("surround4") || name_lower.starts_with("surround5") || name_lower.starts_with("surround7") {
         return false;
     }
     // Filter out internal mixer and snooping plugins
@@ -2392,21 +2393,34 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
         if passthrough {
             let (tx, rx) = bounded::<DspMessage>(32);
             let stop_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            if let Ok((handle, decoder_rate, codec_name, has_video)) = crate::bitstream::start_bitstream_thread(file_path, shared_state.clone(), tx.clone(), stop_token.clone()) {
+            if let Ok((handle, decoder_rate, channels, codec_name, has_video)) = crate::bitstream::start_bitstream_thread(file_path, shared_state.clone(), tx.clone(), stop_token.clone()) {
                 let max_frequency = shared_state.lock().unwrap().max_frequency;
                 let sample_rate = decoder_rate;
                 let window_size = calculate_power_of_two_window_size(sample_rate);
                 
+                let is_lpcm = codec_name == "flac" || codec_name == "pcm" || codec_name == "alac" || codec_name == "multichannel_pcm";
                 let display_name = match codec_name.as_str() {
                     "truehd" => "TrueHD / Dolby Atmos",
                     "eac3" => "E-AC3 / Dolby Digital Plus",
                     "dts" => "DTS",
                     "ac3" => "AC3 / Dolby Digital",
+                    "flac" => "FLAC Multi-Channel LPCM",
+                    "pcm" => "Multi-Channel LPCM",
+                    "alac" => "ALAC Multi-Channel LPCM",
                     _ => &codec_name,
                 }.to_string();
                 
                 let video_suffix = if has_video { " (Video available: 'v' to view)" } else { "" };
                 
+                let mut meta_artist = if is_lpcm { "WASAPI Exclusive LPCM".to_string() } else { "Bitstream Active".to_string() };
+                let mut meta_duration = 0.0;
+                if let Ok(mut src) = load_audio_source(file_path) {
+                    let a = src.get_artist();
+                    let d = src.get_duration_seconds();
+                    if !a.is_empty() { meta_artist = a; }
+                    if d > 0.0 { meta_duration = d; }
+                }
+
                 {
                     let mut state = shared_state.lock().unwrap();
                     state.current_seconds = 0.0;
@@ -2417,15 +2431,16 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
                     state.waveform_history.clear();
                     state.raw_waveform.fill(0.0);
                     state.track_ended = false;
-                    state.artist = "Bitstream Active".to_string();
-                    state.module_type = "Hardware Passthrough".to_string();
+                    state.artist = meta_artist;
+                    state.module_type = if is_lpcm { "Multi-Channel LPCM".to_string() } else { "Hardware Passthrough".to_string() };
                     state.stats.bitstream_active = true;
                     state.current_sample_rate = sample_rate as f32;
-                    state.duration_seconds = 0.0;
-                    state.num_channels = 8;
-                    state.hardware_channels = 8;
-                    state.channel_vus = vec![0.0; 8];
-                    state.peak_vus = vec![0.0; 8];
+                    state.duration_seconds = meta_duration;
+                    let ch = (channels as i32).max(2);
+                    state.num_channels = ch;
+                    state.hardware_channels = ch;
+                    state.channel_vus = vec![0.0; ch as usize];
+                    state.peak_vus = vec![0.0; ch as usize];
                     state.video_info = Some(format!("{}{}", display_name, video_suffix));
                 }
                 
