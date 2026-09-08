@@ -65,6 +65,11 @@
   <content_rating type="oars-1.1" />
   
   <releases>
+    <release version="0.9.21" date="2026-09-08">
+      <description>
+        <p>Fix visualizer DSP audio pipeline in multi-channel LPCM and bitstream modes: restore lookahead waveform timeline for Retro Tape Head, multi-channel downmix for CRT oscilloscope, peak VU tracking for Chrome Ferrofluid spikes and analog meters, and 60 Hz DSP rate alignment.</p>
+      </description>
+    </release>
     <release version="0.9.20" date="2026-09-08">
       <description>
         <p>Windows multi-channel LPCM exclusive mode audio streaming (5.1 / 7.1 surround for FLAC, ALAC, PCM), automatic AV receiver / HDMI endpoint matching, and visualizer DSP pipeline synchronization.</p>

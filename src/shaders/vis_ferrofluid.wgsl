@@ -24,8 +24,23 @@ var<uniform> audio: AudioUniforms;
 
 // --- Utility Functions ---
 
+fn get_num_vu_channels() -> u32 {
+    if (audio.num_spatial_channels > 0u) {
+        return min(audio.num_spatial_channels, 12u);
+    }
+    return min(audio.num_channels, 12u);
+}
+
 // Bounds-clamped channel VU accessor (consistent with vis_neon.wgsl)
 fn get_vu(i: u32) -> f32 {
+    if (audio.num_spatial_channels > 0u) {
+        let n = max(1u, audio.num_spatial_channels);
+        let idx = min(i, n - 1u);
+        let v = audio.spatial_channels[idx / 4u];
+        let c = idx % 4u;
+        if (c == 0u) { return v.x; } else if (c == 1u) { return v.y; }
+        else if (c == 2u) { return v.z; } else { return v.w; }
+    }
     let n = max(1u, audio.num_channels);
     let idx = min(i, n - 1u);
     let v = audio.channels[idx / 4u];
@@ -108,7 +123,7 @@ fn map_dist(p: vec3<f32>, full_detail: bool) -> f32 {
     // Base infinite plane thickness
     var fluid_h = 0.0;
 
-    let num_ch = min(audio.num_channels, 12u);
+    let num_ch = get_num_vu_channels();
     var total_displacement = 0.0;
 
     // Normalized xz for angle alignment
@@ -181,7 +196,7 @@ fn map(p: vec3<f32>, full_detail: bool) -> MapData {
     // Base infinite plane thickness
     var fluid_h = 0.0;
 
-    let num_ch = min(audio.num_channels, 12u);
+    let num_ch = get_num_vu_channels();
     var total_displacement = 0.0;
 
     // Normalized xz for angle alignment
@@ -301,8 +316,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let t_end = min(t_bounds.y, MAX_MARCH_DIST);
 
         // Adaptive Lipschitz step scale from the loudest channel this frame
+        let num_ch = get_num_vu_channels();
         var max_vu = 0.0;
-        for (var i = 0u; i < min(audio.num_channels, 12u); i++) {
+        for (var i = 0u; i < num_ch; i++) {
             max_vu = max(max_vu, get_vu(i));
         }
         g_step_scale = min(0.45, 1.0 / sqrt(1.0 + 20.25 * max_vu * max_vu));

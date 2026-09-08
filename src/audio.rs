@@ -268,6 +268,9 @@ pub fn spawn_dsp_thread(
                 
                 state.raw_spectrum_data.copy_from_slice(&binned_data);
                 state.gpu_spectrum_data = gpu_spectrum.clone();
+                if state.stats.bitstream_active && !msg.channel_audio_data.is_empty() {
+                    push_planar_lookahead_slices(&mut state, &msg.channel_audio_data, sample_rate, msg.current_seconds);
+                }
                 state.raw_audio_channels = msg.channel_audio_data;
                 
                 // --- Waveform extraction (Zero-Crossing Edge Trigger) ---
@@ -340,9 +343,18 @@ pub fn spawn_dsp_thread(
                 if !state.lookahead_queue.is_empty() {
                     let cur_t = msg.current_seconds;
                     let q_len = state.lookahead_queue.len();
+                    let (t_first, _) = state.lookahead_queue[0];
+                    let (t_last, _) = state.lookahead_queue[q_len - 1];
+                    let total_span = (t_last - t_first).max(0.1);
+
                     for k in 0..600 {
-                        let target_t = cur_t + (k as f64 - 100.0) * 0.01;
+                        let mut target_t = cur_t + (k as f64 - 100.0) * 0.01;
                         let off = k * 8;
+
+                        if target_t > t_last && state.stats.bitstream_active {
+                            let future_offset = target_t - t_last;
+                            target_t = t_last - (future_offset % total_span);
+                        }
                         
                         let idx = match state.lookahead_queue.binary_search_by(|(t, _)| t.partial_cmp(&target_t).unwrap_or(std::cmp::Ordering::Equal)) {
                             Ok(i) => i,
@@ -357,8 +369,8 @@ pub fn spawn_dsp_thread(
                                 state.lookahead_timeline[off..off + 8].fill(0.0);
                             }
                         } else if idx >= q_len {
-                            let (t_last, d_last) = state.lookahead_queue[q_len - 1];
-                            if (t_last - target_t).abs() < 0.15 {
+                            let (t_last_val, d_last) = state.lookahead_queue[q_len - 1];
+                            if (t_last_val - target_t).abs() < 0.15 {
                                 state.lookahead_timeline[off..off + 8].copy_from_slice(&d_last);
                             } else {
                                 state.lookahead_timeline[off..off + 8].fill(0.0);
@@ -2871,6 +2883,105 @@ fn push_chunk_lookahead_slices(
         state.lookahead_buffer_start_time += (full_slices * slice_frames) as f64 / sample_rate as f64;
     }
     
+    while state.lookahead_queue.len() > 1200 {
+        state.lookahead_queue.pop_front();
+    }
+}
+
+pub fn push_planar_lookahead_slices(
+    state: &mut AppState,
+    channels: &[Vec<f32>],
+    sample_rate: u32,
+    current_seconds: f64,
+) {
+    if channels.is_empty() || sample_rate == 0 {
+        return;
+    }
+    let left = &channels[0];
+    if left.is_empty() {
+        return;
+    }
+    let right = if channels.len() > 1 { &channels[1] } else { left };
+    let center = if channels.len() > 2 { Some(&channels[2]) } else { None };
+
+    let slice_frames = ((sample_rate as f64 * 0.01).round() as usize).max(16);
+    let total_samples = left.len();
+    let full_slices = total_samples / slice_frames;
+    if full_slices == 0 {
+        return;
+    }
+
+    let window_duration = (full_slices * slice_frames) as f64 / sample_rate as f64;
+    let window_start_time = current_seconds - window_duration;
+
+    for s in 0..full_slices {
+        let start_f = s * slice_frames;
+        let end_f = start_f + slice_frames;
+        let slice_time = window_start_time + (start_f as f64 / sample_rate as f64);
+
+        let mut min_l = 0.0f32;
+        let mut max_l = 0.0f32;
+        let mut min_r = 0.0f32;
+        let mut max_r = 0.0f32;
+        let mut sq_l = 0.0f32;
+        let mut sq_r = 0.0f32;
+        let mut bass_acc = 0.0f32;
+        let mut treb_acc = 0.0f32;
+
+        let cnt = slice_frames as f32;
+        for i in start_f..end_f {
+            let mut l = left[i];
+            let mut r = right[i];
+            if let Some(c_plane) = center {
+                let c_val = c_plane[i] * std::f32::consts::FRAC_1_SQRT_2;
+                l += c_val;
+                r += c_val;
+            }
+
+            min_l = min_l.min(l);
+            max_l = max_l.max(l);
+            min_r = min_r.min(r);
+            max_r = max_r.max(r);
+            sq_l += l * l;
+            sq_r += r * r;
+
+            let mono = (l + r) * 0.5;
+            let diff = if i > start_f {
+                let prev_l = left[i - 1];
+                (l - prev_l).abs()
+            } else {
+                0.0
+            };
+
+            bass_acc += mono.abs();
+            treb_acc += diff * 2.0;
+        }
+
+        let rms_l = (sq_l / cnt).sqrt().min(1.0);
+        let rms_r = (sq_r / cnt).sqrt().min(1.0);
+        let bass = (bass_acc / cnt * 2.0).min(1.0);
+        let treble = (treb_acc / cnt * 2.0).min(1.0);
+
+        while let Some((t, _)) = state.lookahead_queue.back() {
+            if *t >= slice_time - 0.0001 {
+                state.lookahead_queue.pop_back();
+            } else {
+                break;
+            }
+        }
+
+        state.lookahead_queue.push_back((slice_time, [
+            min_l.clamp(-1.0, 1.0),
+            max_l.clamp(-1.0, 1.0),
+            min_r.clamp(-1.0, 1.0),
+            max_r.clamp(-1.0, 1.0),
+            rms_l,
+            rms_r,
+            bass,
+            treble,
+        ]));
+    }
+
     while state.lookahead_queue.len() > 1200 {
         state.lookahead_queue.pop_front();
     }

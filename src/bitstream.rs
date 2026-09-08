@@ -111,9 +111,8 @@ pub fn start_bitstream_thread(
         ).unwrap();
 
         let decoder_rate = decoder.rate() as f32;
-        let window_size = (((decoder_rate * 0.185).round() as usize) / 2) * 2;
-        let window_size = window_size.clamp(2048, 65536);
-        let update_interval = (decoder_rate / 240.0).ceil() as usize;
+        let window_size = crate::audio::calculate_power_of_two_window_size(decoder.rate());
+        let update_interval = (decoder_rate / 60.0).ceil() as usize;
         let mut accumulator: Vec<Vec<f32>> = Vec::new();
         let mut samples_since_last_send = 0;
 
@@ -164,17 +163,32 @@ pub fn start_bitstream_thread(
                                 samples_since_last_send = 0;
                                 let mut channel_audio_data = Vec::with_capacity(planes);
                                 let mut channel_vus = Vec::with_capacity(planes);
+                                let eval_len = fresh_samples.max(update_interval).min(window_size);
                                 
-                                for window in &accumulator {
-                                    let mut sum_sq = 0.0;
-                                    for &s in window { sum_sq += s * s; }
-                                    let rms = (sum_sq / window.len() as f32).sqrt();
-                                    channel_vus.push(rms);
-                                    channel_audio_data.push(window.clone());
+                                for acc in accumulator.iter().take(planes) {
+                                    let window = acc.clone();
+                                    let mut peak = 0.0f32;
+                                    let start_idx = window.len().saturating_sub(eval_len);
+                                    for &s in &window[start_idx..] {
+                                        peak = peak.max(s.abs());
+                                    }
+                                    channel_vus.push(peak.clamp(0.0, 1.0));
+                                    channel_audio_data.push(window);
+                                }
+
+                                let mut mono_audio_data = vec![0.0f32; window_size];
+                                for acc in accumulator.iter().take(planes) {
+                                    for (i, &sample) in acc.iter().take(window_size).enumerate() {
+                                        mono_audio_data[i] += sample;
+                                    }
+                                }
+                                let inv_planes = 1.0 / planes as f32;
+                                for s in &mut mono_audio_data {
+                                    *s *= inv_planes;
                                 }
                                 
                                 let _ = tx.try_send(crate::audio::DspMessage {
-                                    audio_data: channel_audio_data[0].clone(),
+                                    audio_data: mono_audio_data,
                                     channel_vus,
                                     current_order: 0,
                                     current_row: 0,
@@ -1018,9 +1032,8 @@ mod wasapi_bitstream {
                     };
 
                     let decoder_rate = decoder.rate() as f32;
-                    let window_size = (((decoder_rate * 0.185).round() as usize) / 2) * 2;
-                    let window_size = window_size.max(2048).min(65536);
-                    let update_interval = (decoder_rate / 240.0).ceil() as usize;
+                    let window_size = crate::audio::calculate_power_of_two_window_size(decoder.rate());
+                    let update_interval = (decoder_rate / 60.0).ceil() as usize;
                     let mut accumulator: Vec<Vec<f32>> = Vec::new();
                     let mut samples_since_last_send = 0;
                     let mut current_seconds = 0.0;
@@ -1052,13 +1065,13 @@ mod wasapi_bitstream {
                                         }
                                         
                                         let mut fresh_samples = 0;
-                                        for p in 0..planes {
+                                        for (p, acc) in accumulator.iter_mut().enumerate().take(planes) {
                                             let data = resampled.plane::<f32>(p);
                                             if p == 0 { fresh_samples = data.len(); }
-                                            accumulator[p].extend_from_slice(data);
-                                            let excess = accumulator[p].len().saturating_sub(window_size);
+                                            acc.extend_from_slice(data);
+                                            let excess = acc.len().saturating_sub(window_size);
                                             if excess > 0 {
-                                                accumulator[p].drain(0..excess);
+                                                acc.drain(0..excess);
                                             }
                                         }
                                         
@@ -1068,18 +1081,32 @@ mod wasapi_bitstream {
                                             samples_since_last_send = 0;
                                             let mut channel_audio_data = Vec::with_capacity(planes);
                                             let mut channel_vus = Vec::with_capacity(planes);
+                                            let eval_len = fresh_samples.max(update_interval).min(window_size);
                                             
-                                            for p in 0..planes {
-                                                let window = accumulator[p].clone();
-                                                let mut sum_sq = 0.0;
-                                                for &s in &window { sum_sq += s * s; }
-                                                let rms = (sum_sq / window.len() as f32).sqrt();
-                                                channel_vus.push(rms);
+                                            for acc in accumulator.iter().take(planes) {
+                                                let window = acc.clone();
+                                                let mut peak = 0.0f32;
+                                                let start_idx = window.len().saturating_sub(eval_len);
+                                                for &s in &window[start_idx..] {
+                                                    peak = peak.max(s.abs());
+                                                }
+                                                channel_vus.push(peak.clamp(0.0, 1.0));
                                                 channel_audio_data.push(window);
+                                            }
+
+                                            let mut mono_audio_data = vec![0.0f32; window_size];
+                                            for acc in accumulator.iter().take(planes) {
+                                                for (i, &sample) in acc.iter().take(window_size).enumerate() {
+                                                    mono_audio_data[i] += sample;
+                                                }
+                                            }
+                                            let inv_planes = 1.0 / planes as f32;
+                                            for s in &mut mono_audio_data {
+                                                *s *= inv_planes;
                                             }
                                             
                                             let _ = tx.try_send(DspMessage {
-                                                audio_data: channel_audio_data[0].clone(),
+                                                audio_data: mono_audio_data,
                                                 channel_vus,
                                                 current_order: 0,
                                                 current_row: 0,
@@ -1158,9 +1185,8 @@ mod wasapi_bitstream {
                     };
 
                     let decoder_rate = decoder.rate() as f32;
-                    let window_size = (((decoder_rate * 0.185).round() as usize) / 2) * 2;
-                    let window_size = window_size.max(2048).min(65536);
-                    let update_interval = (decoder_rate / 240.0).ceil() as usize;
+                    let window_size = crate::audio::calculate_power_of_two_window_size(decoder.rate());
+                    let update_interval = (decoder_rate / 60.0).ceil() as usize;
                     let mut accumulator: Vec<Vec<f32>> = Vec::new();
                     let mut samples_since_last_send = 0;
                     let mut current_seconds = 0.0;
@@ -1201,13 +1227,13 @@ mod wasapi_bitstream {
                                             accumulator = vec![Vec::new(); planes];
                                         }
                                         let mut fresh_samples = 0;
-                                        for p in 0..planes {
+                                        for (p, acc) in accumulator.iter_mut().enumerate().take(planes) {
                                             let data = vis_frame.plane::<f32>(p);
                                             if p == 0 { fresh_samples = data.len(); }
-                                            accumulator[p].extend_from_slice(data);
-                                            let excess = accumulator[p].len().saturating_sub(window_size);
+                                            acc.extend_from_slice(data);
+                                            let excess = acc.len().saturating_sub(window_size);
                                             if excess > 0 {
-                                                accumulator[p].drain(0..excess);
+                                                acc.drain(0..excess);
                                             }
                                         }
                                         samples_since_last_send += fresh_samples;
@@ -1215,16 +1241,32 @@ mod wasapi_bitstream {
                                             samples_since_last_send = 0;
                                             let mut channel_audio_data = Vec::with_capacity(planes);
                                             let mut channel_vus = Vec::with_capacity(planes);
-                                            for p in 0..planes {
-                                                let window = accumulator[p].clone();
-                                                let mut sum_sq = 0.0;
-                                                for &s in &window { sum_sq += s * s; }
-                                                let rms = (sum_sq / window.len() as f32).sqrt();
-                                                channel_vus.push(rms);
+                                            let eval_len = fresh_samples.max(update_interval).min(window_size);
+
+                                            for acc in accumulator.iter().take(planes) {
+                                                let window = acc.clone();
+                                                let mut peak = 0.0f32;
+                                                let start_idx = window.len().saturating_sub(eval_len);
+                                                for &s in &window[start_idx..] {
+                                                    peak = peak.max(s.abs());
+                                                }
+                                                channel_vus.push(peak.clamp(0.0, 1.0));
                                                 channel_audio_data.push(window);
                                             }
+
+                                            let mut mono_audio_data = vec![0.0f32; window_size];
+                                            for acc in accumulator.iter().take(planes) {
+                                                for (i, &sample) in acc.iter().take(window_size).enumerate() {
+                                                    mono_audio_data[i] += sample;
+                                                }
+                                            }
+                                            let inv_planes = 1.0 / planes as f32;
+                                            for s in &mut mono_audio_data {
+                                                *s *= inv_planes;
+                                            }
+
                                             let _ = tx.try_send(DspMessage {
-                                                audio_data: channel_audio_data[0].clone(),
+                                                audio_data: mono_audio_data,
                                                 channel_vus,
                                                 current_order: 0,
                                                 current_row: 0,
