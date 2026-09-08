@@ -65,6 +65,11 @@
   <content_rating type="oars-1.1" />
   
   <releases>
+    <release version="0.9.20" date="2026-09-08">
+      <description>
+        <p>Windows multi-channel LPCM exclusive mode audio streaming (5.1 / 7.1 surround for FLAC, ALAC, PCM), automatic AV receiver / HDMI endpoint matching, and visualizer DSP pipeline synchronization.</p>
+      </description>
+    </release>
     <release version="0.9.19" date="2026-09-05">
       <description>
         <p>Comprehensive desktop integration release with single-instance IPC, recursive folder loading, hicolor icon hierarchy, and power management improvements.</p>
