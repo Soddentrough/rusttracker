@@ -180,7 +180,7 @@ fn get_slice_pos_for_px(p: f32, playhead_p: f32, max_w: f32) -> f32 {
         return clamp(20.0 + prog * 80.0, 0.0, 100.0);
     } else {
         let prog = (p - playhead_p) / (max_w - playhead_p);
-        return clamp(100.0 + prog * 450.0, 100.0, 599.0);
+        return clamp(100.0 + prog * 498.0, 100.0, 599.0);
     }
 }
 
@@ -194,8 +194,11 @@ fn hash11(p: f32) -> f32 {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    // Virtual 480x270 retro pixel grid
-    let grid_size = vec2<f32>(480.0, 270.0);
+    // Aspect-ratio-adaptive square retro pixel grid
+    let aspect = max(audio.aspect_ratio, 0.1);
+    let v_height = 270.0;
+    let v_width = max(floor(v_height * aspect), 1.0);
+    let grid_size = vec2<f32>(v_width, v_height);
     let pixel_coord = floor(in.uv * grid_size);
     let px = u32(pixel_coord.x);
     let py = u32(pixel_coord.y);
@@ -396,8 +399,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // 8. Apply CRT Effects & ACES Tonemapping
     var crt_settings = get_default_crt();
     crt_settings.scanline_intensity = 0.12;
-    crt_settings.vignette_scale = 1.35;
-    crt_settings.vignette_softness = 0.88;
+    crt_settings.vignette_scale = 1.80;     // Wide vignette preserving full-screen coverage
+    crt_settings.vignette_softness = 0.95;
     crt_settings.noise_intensity = 0.018;
 
     var final_color = apply_crt_effects(col, in.uv, in.clip_position.xy, audio.smooth_time, crt_settings);

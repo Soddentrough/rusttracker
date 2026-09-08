@@ -351,7 +351,7 @@ pub fn spawn_dsp_thread(
                         let mut target_t = cur_t + (k as f64 - 100.0) * 0.01;
                         let off = k * 8;
 
-                        if target_t > t_last && state.stats.bitstream_active {
+                        if target_t > t_last && total_span > 0.05 {
                             let future_offset = target_t - t_last;
                             target_t = t_last - (future_offset % total_span);
                         }
