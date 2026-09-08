@@ -131,13 +131,13 @@ pub mod decoder {
                     let mut vid_h = 1080i32;
                     let mut vid_rot = 0u32;
 
-                    let mime_key = CStr::from_bytes_with_nul(b"mime\0").unwrap();
-                    let width_key = CStr::from_bytes_with_nul(b"width\0").unwrap();
-                    let height_key = CStr::from_bytes_with_nul(b"height\0").unwrap();
-                    let stride_key = CStr::from_bytes_with_nul(b"stride\0").unwrap();
-                    let slice_height_key = CStr::from_bytes_with_nul(b"slice-height\0").unwrap();
-                    let color_format_key = CStr::from_bytes_with_nul(b"color-format\0").unwrap();
-                    let rotation_key = CStr::from_bytes_with_nul(b"rotation-degrees\0").unwrap();
+                    let mime_key = c"mime";
+                    let width_key = c"width";
+                    let height_key = c"height";
+                    let stride_key = c"stride";
+                    let slice_height_key = c"slice-height";
+                    let color_format_key = c"color-format";
+                    let rotation_key = c"rotation-degrees";
 
                     for i in 0..track_count {
                         let format = AMediaExtractor_getTrackFormat(extractor, i);
@@ -146,20 +146,20 @@ pub mod decoder {
                         let mut mime_ptr: *const c_char = ptr::null();
                         if AMediaFormat_getString(format, mime_key.as_ptr(), &mut mime_ptr) && !mime_ptr.is_null() {
                             let mime_cstr = CStr::from_ptr(mime_ptr);
-                            if let Ok(mime_str) = mime_cstr.to_str() {
-                                if mime_str.starts_with("video/") {
-                                    video_track_idx = Some(i);
-                                    AMediaFormat_getInt32(format, width_key.as_ptr(), &mut vid_w);
-                                    AMediaFormat_getInt32(format, height_key.as_ptr(), &mut vid_h);
-                                    let mut track_rot: i32 = 0;
-                                    if AMediaFormat_getInt32(format, rotation_key.as_ptr(), &mut track_rot) {
-                                        let norm = ((track_rot % 360) + 360) % 360;
-                                        vid_rot = match norm {
-                                            90 | 180 | 270 => norm as u32,
-                                            _ => 0,
-                                        };
-                                        crate::android::log_android(3, &format!("[RustTracker Video] Detected track rotation: {} degrees", vid_rot));
-                                    }
+                            if let Ok(mime_str) = mime_cstr.to_str()
+                                && mime_str.starts_with("video/") {
+                                video_track_idx = Some(i);
+                                AMediaFormat_getInt32(format, width_key.as_ptr(), &mut vid_w);
+                                AMediaFormat_getInt32(format, height_key.as_ptr(), &mut vid_h);
+                                let mut track_rot: i32 = 0;
+                                if AMediaFormat_getInt32(format, rotation_key.as_ptr(), &mut track_rot) {
+                                    let norm = track_rot.rem_euclid(360);
+                                    vid_rot = match norm {
+                                        90 | 180 | 270 => norm as u32,
+                                        _ => 0,
+                                    };
+                                    crate::android::log_android(3, &format!("[RustTracker Video] Detected track rotation: {} degrees", vid_rot));
+                                }
                                     // Request COLOR_FormatYUV420SemiPlanar (21) for standard CPU memory readable buffers
                                     AMediaFormat_setInt32(format, color_format_key.as_ptr(), 21);
 
@@ -178,8 +178,7 @@ pub mod decoder {
                                     }
                                 }
                             }
-                        }
-                        AMediaFormat_delete(format);
+                            AMediaFormat_delete(format);
                     }
 
                     if codec.is_null() || video_track_idx.is_none() {
@@ -204,14 +203,13 @@ pub mod decoder {
                     while !stop_token_for_video.load(Ordering::Relaxed) {
                         // Check seek
                         {
-                            if let Ok(state) = state_for_video.lock() {
-                                if state.seek_epoch > local_epoch {
-                                    let seek_us = (state.current_seconds * 1_000_000.0) as i64;
-                                    AMediaExtractor_seekTo(extractor, seek_us, AMEDIAEXTRACTOR_SEEK_PREVIOUS_SYNC);
-                                    AMediaCodec_flush(codec);
-                                    local_epoch = state.seek_epoch;
-                                    eos_input = false;
-                                }
+                            if let Ok(state) = state_for_video.lock()
+                                && state.seek_epoch > local_epoch {
+                                let seek_us = (state.current_seconds * 1_000_000.0) as i64;
+                                AMediaExtractor_seekTo(extractor, seek_us, AMEDIAEXTRACTOR_SEEK_PREVIOUS_SYNC);
+                                AMediaCodec_flush(codec);
+                                local_epoch = state.seek_epoch;
+                                eos_input = false;
                             }
                         }
 
@@ -350,7 +348,7 @@ pub mod decoder {
                                 AMediaFormat_getInt32(out_format, slice_height_key.as_ptr(), &mut new_slice_h);
                                 let mut out_rot: i32 = 0;
                                 if AMediaFormat_getInt32(out_format, rotation_key.as_ptr(), &mut out_rot) && out_rot != 0 {
-                                    let norm = ((out_rot % 360) + 360) % 360;
+                                    let norm = out_rot.rem_euclid(360);
                                     vid_rot = match norm {
                                         90 | 180 | 270 => norm as u32,
                                         _ => 0,

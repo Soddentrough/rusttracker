@@ -153,10 +153,9 @@ impl ApplicationHandler for AndroidRustTrackerApp {
         match event {
             WindowEvent::Resized(physical_size) => {
                 eprintln!("[RustTracker] Android Window Resized: {:?}", physical_size);
-                if physical_size.width > 0 && physical_size.height > 0 {
-                    if let Some(ref mut eng) = self.engine {
-                        eng.resize(physical_size);
-                    }
+                if physical_size.width > 0 && physical_size.height > 0
+                    && let Some(ref mut eng) = self.engine {
+                    eng.resize(physical_size);
                 }
             }
             WindowEvent::Touch(touch) => {
@@ -172,9 +171,8 @@ impl ApplicationHandler for AndroidRustTrackerApp {
                     }
                 }
             }
-            WindowEvent::RedrawRequested => {
-                if !self.is_suspended {
-                    let dt = self.last_frame_time.elapsed().as_secs_f32().clamp(0.001, 0.1);
+            WindowEvent::RedrawRequested if !self.is_suspended => {
+                let dt = self.last_frame_time.elapsed().as_secs_f32().clamp(0.001, 0.1);
                     self.last_frame_time = Instant::now();
 
                     let size = win.inner_size();
@@ -183,10 +181,9 @@ impl ApplicationHandler for AndroidRustTrackerApp {
                     // Check for single tap timeout
                     if let Some(gesture) = self.touch_controller.update_pending_tap() {
                         let wants_pointer = self.egui_ctx.egui_wants_pointer_input() || self.egui_ctx.is_pointer_over_egui();
-                        if !wants_pointer {
-                            if let Some(EngineAction::OpenFile) = Self::handle_gesture_static(&self.app_state, gesture, has_video, size.width as f32, size.height as f32) {
-                                trigger_android_file_picker(&self.android_app);
-                            }
+                        if !wants_pointer
+                            && let Some(EngineAction::OpenFile) = Self::handle_gesture_static(&self.app_state, gesture, has_video, size.width as f32, size.height as f32) {
+                            trigger_android_file_picker(&self.android_app);
                         }
                     }
 
@@ -328,7 +325,7 @@ impl ApplicationHandler for AndroidRustTrackerApp {
                                     state.stats.gpu_fft_us = state.stats.gpu_fft_us * 0.9 + ft * 0.1;
                                 }
 
-                                if self.frame_count % 60 == 0 {
+                                if self.frame_count.is_multiple_of(60) {
                                     let vis_name = crate::state::VISUALIZERS.get(state.current_visualizer_idx).map(|v| v.name).unwrap_or("Unknown");
                                     eprintln!("[RustTracker Vis Perf] Vis {} ({}): FPS={:.1} | Shader={:.1}us | Render={:.1}us | UI={:.1}us",
                                         state.visualizer_mode, vis_name, state.current_fps, state.stats.shader_us, state.stats.render_us, state.stats.ui_us);
@@ -360,7 +357,7 @@ impl ApplicationHandler for AndroidRustTrackerApp {
                                     let target = (state.duration_seconds * pct as f64).clamp(0.0, state.duration_seconds);
                                     state.scrub_target_seconds = Some(target);
                                     if delta != 0.0 {
-                                        if state.osd_timer > 0.0 && state.osd_text.as_ref().map_or(false, |s| s.starts_with("Scrubbing")) {
+                                        if state.osd_timer > 0.0 && state.osd_text.as_ref().is_some_and(|s| s.starts_with("Scrubbing")) {
                                             state.cumulative_scrub += delta;
                                         } else {
                                             state.cumulative_scrub = delta;
@@ -480,7 +477,6 @@ impl ApplicationHandler for AndroidRustTrackerApp {
                             eprintln!("[RustTracker] Android Render error: {:?}", err);
                         }
                     }
-                }
             }
             _ => {}
         }
@@ -819,10 +815,8 @@ pub fn init_android_stdio_redirection() {
                     use std::io::BufRead;
                     let file = std::fs::File::from_raw_fd(read_fd);
                     let reader = std::io::BufReader::new(file);
-                    for line in reader.lines() {
-                        if let Ok(l) = line {
-                            log_android(3, &l);
-                        }
+                    for l in reader.lines().map_while(Result::ok) {
+                        log_android(3, &l);
                     }
                 });
         }

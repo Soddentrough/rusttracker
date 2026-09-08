@@ -2394,6 +2394,10 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
                 duration: 0.0,
             }));
         }
+        if let Some(se) = symphonia_error {
+            crate::android::log_android(5, &format!("[RustTracker] Symphonia load failed for {}: {:?}", file_path, se));
+            return Err(anyhow::anyhow!("Unsupported or unreadable audio format ({:?}): {}", se, file_path));
+        }
         Err(anyhow::anyhow!("Unsupported or unreadable audio format: {}", file_path))
     }
 }
