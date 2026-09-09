@@ -26,21 +26,27 @@ use crossbeam_channel::{bounded, unbounded, Sender, Receiver};
 #[allow(dead_code)]
 pub enum PlaybackHandle {
     Cpal(cpal::Stream, Arc<std::sync::atomic::AtomicBool>),
-    Bitstream(std::thread::JoinHandle<()>, Arc<std::sync::atomic::AtomicBool>),
-    Dummy(std::thread::JoinHandle<()>, Arc<std::sync::atomic::AtomicBool>),
+    Bitstream(Option<std::thread::JoinHandle<()>>, Arc<std::sync::atomic::AtomicBool>),
+    Dummy(Option<std::thread::JoinHandle<()>>, Arc<std::sync::atomic::AtomicBool>),
 }
 
 impl Drop for PlaybackHandle {
     fn drop(&mut self) {
         match self {
             PlaybackHandle::Cpal(_, stop_token) => {
-                stop_token.store(true, std::sync::atomic::Ordering::Relaxed);
+                stop_token.store(true, std::sync::atomic::Ordering::SeqCst);
             }
-            PlaybackHandle::Bitstream(_, stop_token) => {
-                stop_token.store(true, std::sync::atomic::Ordering::Relaxed);
+            PlaybackHandle::Bitstream(handle_opt, stop_token) => {
+                stop_token.store(true, std::sync::atomic::Ordering::SeqCst);
+                if let Some(handle) = handle_opt.take() {
+                    let _ = handle.join();
+                }
             }
-            PlaybackHandle::Dummy(_, stop_token) => {
-                stop_token.store(true, std::sync::atomic::Ordering::Relaxed);
+            PlaybackHandle::Dummy(handle_opt, stop_token) => {
+                stop_token.store(true, std::sync::atomic::Ordering::SeqCst);
+                if let Some(handle) = handle_opt.take() {
+                    let _ = handle.join();
+                }
             }
         }
     }
@@ -2461,7 +2467,7 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
                 }
                 
                 spawn_dsp_thread(rx, shared_state.clone(), sample_rate, max_frequency, window_size);
-                return Ok(PlaybackHandle::Bitstream(handle, stop_token));
+                return Ok(PlaybackHandle::Bitstream(Some(handle), stop_token));
             }
         }
     }
@@ -3629,7 +3635,7 @@ fn run_dummy(
         }
     });
 
-    Ok(PlaybackHandle::Dummy(thread_handle, stop_token))
+    Ok(PlaybackHandle::Dummy(Some(thread_handle), stop_token))
 }
 
 

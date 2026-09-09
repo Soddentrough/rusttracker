@@ -18,11 +18,32 @@ use crate::touch::{TouchGesture, TouchGestureController};
 
 static FILE_PICKER_CHANNEL: OnceLock<(Sender<String>, Mutex<Receiver<String>>)> = OnceLock::new();
 
+#[derive(Debug)]
+pub enum AppCustomEvent {
+    Destroy,
+}
+
+static EVENT_LOOP_PROXY: OnceLock<Mutex<Option<winit::event_loop::EventLoopProxy<AppCustomEvent>>>> = OnceLock::new();
+
 fn get_file_channel() -> &'static (Sender<String>, Mutex<Receiver<String>>) {
     FILE_PICKER_CHANNEL.get_or_init(|| {
         let (tx, rx) = channel();
         (tx, Mutex::new(rx))
     })
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_rusttracker_app_MainActivity_nativeOnDestroy<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) {
+    eprintln!("[RustTracker] JNI: nativeOnDestroy invoked from Android Activity");
+    if let Some(lock) = EVENT_LOOP_PROXY.get()
+        && let Ok(guard) = lock.lock()
+        && let Some(proxy) = guard.as_ref()
+    {
+        let _ = proxy.send_event(AppCustomEvent::Destroy);
+    }
 }
 
 #[unsafe(no_mangle)]
@@ -93,7 +114,27 @@ fn create_egui_context() -> egui::Context {
     egui_ctx
 }
 
-impl ApplicationHandler for AndroidRustTrackerApp {
+impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: AppCustomEvent) {
+        match event {
+            AppCustomEvent::Destroy => {
+                eprintln!("[RustTracker] Android Lifecycle: Received Destroy event, exiting event loop...");
+                event_loop.exit();
+            }
+        }
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        eprintln!("[RustTracker] Android Lifecycle: Exiting event loop, cleaning up resources...");
+        if let Some(ref mut eng) = self.engine {
+            eng.suspend_surface();
+        }
+        self.window = None;
+        self.engine = None;
+        self.egui_state = None;
+        self.active_stream = None;
+    }
+
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         eprintln!("[RustTracker] Android Lifecycle: Resumed");
         self.is_suspended = false;
@@ -107,10 +148,9 @@ impl ApplicationHandler for AndroidRustTrackerApp {
                     let win = Arc::new(win);
                     eprintln!("[RustTracker] Created Android Native Window: {:?}", win.inner_size());
                     
-                    let eng = pollster::block_on(VulkanEngine::new(win.clone()));
-                    let egui_ctx = create_egui_context();
+                    let egui_ctx = self.egui_ctx.clone();
                     let state = egui_winit::State::new(
-                        egui_ctx.clone(),
+                        egui_ctx,
                         egui::ViewportId::ROOT,
                         &win,
                         Some(win.scale_factor() as f32),
@@ -118,9 +158,17 @@ impl ApplicationHandler for AndroidRustTrackerApp {
                         None,
                     );
 
-                    self.egui_ctx = egui_ctx;
+                    if let Some(ref mut eng) = self.engine {
+                        eprintln!("[RustTracker] Re-attaching existing VulkanEngine to resumed window...");
+                        eng.resume_surface(win.clone());
+                    } else {
+                        eprintln!("[RustTracker] Initializing VulkanEngine for the first time...");
+                        let eng = pollster::block_on(VulkanEngine::new(win.clone()));
+                        self.engine = Some(eng);
+                    }
+
+                    win.request_redraw();
                     self.window = Some(win);
-                    self.engine = Some(eng);
                     self.egui_state = Some(state);
                 }
                 Err(err) => {
@@ -133,7 +181,9 @@ impl ApplicationHandler for AndroidRustTrackerApp {
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
         eprintln!("[RustTracker] Android Lifecycle: Suspended");
         self.is_suspended = true;
-        self.engine = None;
+        if let Some(ref mut eng) = self.engine {
+            eng.suspend_surface();
+        }
         self.window = None;
         self.egui_state = None;
     }
@@ -799,8 +849,10 @@ pub fn log_android(prio: i32, msg: &str) {
     }
 }
 
+static STDIO_REDIRECTED: std::sync::Once = std::sync::Once::new();
+
 pub fn init_android_stdio_redirection() {
-    unsafe {
+    STDIO_REDIRECTED.call_once(|| unsafe {
         let mut pfd = [0i32; 2];
         if pipe(pfd.as_mut_ptr()) == 0 {
             dup2(pfd[1], 1); // redirect stdout
@@ -820,12 +872,18 @@ pub fn init_android_stdio_redirection() {
                     }
                 });
         }
-    }
+    });
 }
 
 #[unsafe(no_mangle)]
 fn android_main(app: AndroidApp) {
     init_android_stdio_redirection();
+
+    if let Some(data_path) = app.internal_data_path() {
+        unsafe {
+            std::env::set_var("RUSTTRACKER_CACHE_DIR", data_path);
+        }
+    }
 
     std::panic::set_hook(Box::new(|panic_info| {
         let msg = format!("[PANIC] {}", panic_info);
@@ -835,10 +893,13 @@ fn android_main(app: AndroidApp) {
     log_android(3, "Starting RustTracker on Android with Touch Gestures, SAF, and Audio Engine...");
     eprintln!("[RustTracker] Starting on Android with Touch Gestures, SAF, and Audio Engine...");
 
-    let event_loop = EventLoop::builder()
+    let event_loop: EventLoop<AppCustomEvent> = EventLoop::<AppCustomEvent>::with_user_event()
         .with_android_app(app.clone())
         .build()
         .expect("Failed to create Android EventLoop");
+
+    let proxy = event_loop.create_proxy();
+    *EVENT_LOOP_PROXY.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(proxy);
 
     let app_state = Arc::new(Mutex::new(AppState::new("RustTracker Mobile".to_string())));
     let egui_ctx = create_egui_context();
@@ -860,4 +921,7 @@ fn android_main(app: AndroidApp) {
     };
 
     let _ = event_loop.run_app(&mut android_app);
+
+    *EVENT_LOOP_PROXY.get_or_init(|| Mutex::new(None)).lock().unwrap() = None;
+    eprintln!("[RustTracker] android_main thread exited cleanly.");
 }

@@ -117,6 +117,7 @@ class MainActivity : GameActivity() {
         if (instance == this) {
             instance = null
         }
+        nativeOnDestroy()
         super.onDestroy()
     }
 
@@ -203,4 +204,5 @@ class MainActivity : GameActivity() {
     }
 
     private external fun nativeOnFileSelected(filePath: String)
+    private external fun nativeOnDestroy()
 }

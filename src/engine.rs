@@ -203,6 +203,8 @@ struct MeshBuffers {
 }
 
 pub struct VulkanEngine {
+    #[allow(dead_code)]
+    instance: wgpu::Instance,
     surface: Option<wgpu::Surface<'static>>,
     device: wgpu::Device,
     queue: wgpu::Queue,
@@ -1675,9 +1677,13 @@ impl VulkanEngine {
         // Keyed by the adapter so caches from different devices don't collide.
         let pipeline_cache_path: Option<std::path::PathBuf> = (|| {
             let key = wgpu::util::pipeline_cache_key(&adapter.get_info())?;
-            let dir = directories::ProjectDirs::from("com", "RustTracker", "RustTracker")?
-                .cache_dir()
-                .to_path_buf();
+            let dir = std::env::var("RUSTTRACKER_CACHE_DIR")
+                .map(std::path::PathBuf::from)
+                .ok()
+                .or_else(|| {
+                    directories::ProjectDirs::from("com", "RustTracker", "RustTracker")
+                        .map(|p| p.cache_dir().to_path_buf())
+                })?;
             let _ = std::fs::create_dir_all(&dir);
             Some(dir.join(format!("pipeline_cache_{}.bin", key)))
         })();
@@ -3436,6 +3442,7 @@ impl VulkanEngine {
         }
 
         Self {
+            instance,
             surface: Some(surface),
             device,
             queue,
@@ -3557,6 +3564,28 @@ impl VulkanEngine {
                 view_formats: &[],
             });
             self.depth_texture_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn suspend_surface(&mut self) {
+        eprintln!("[RustTracker Engine] Suspending surface...");
+        self.surface = None;
+    }
+
+    #[allow(dead_code)]
+    pub fn resume_surface(&mut self, window: Arc<Window>) {
+        let size = window.inner_size();
+        eprintln!("[RustTracker Engine] Resuming surface with size: {:?}", size);
+        match self.instance.create_surface(window) {
+            Ok(surface) => {
+                self.surface = Some(surface);
+                self.resize(size);
+                eprintln!("[RustTracker Engine] Surface successfully resumed and configured!");
+            }
+            Err(e) => {
+                eprintln!("[RustTracker Engine] Failed to create resumed surface: {:?}", e);
+            }
         }
     }
 
