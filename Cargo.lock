@@ -4255,7 +4255,7 @@ dependencies = [
 
 [[package]]
 name = "rusttracker"
-version = "0.9.22"
+version = "0.9.23"
 dependencies = [
  "android-activity",
  "anyhow",

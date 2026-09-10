@@ -65,6 +65,11 @@
   <content_rating type="oars-1.1" />
   
   <releases>
+    <release version="0.9.23" date="2026-09-10">
+      <description>
+        <p>Eliminate Windows WASAPI startup audio chirp, lazy frame-driven dynamic resampler initialization, and lockstep visualizer DSP dispatch pacing.</p>
+      </description>
+    </release>
     <release version="0.9.22" date="2026-09-10">
       <description>
         <p>Windows WASAPI Exclusive mode playback stability enhancements, zero-masked 24-in-32 bit PCM DAC screeching elimination, synchronized multi-channel visualizer dispatch, Retro Tape Head aspect-ratio adaptation, and macOS build fixes.</p>

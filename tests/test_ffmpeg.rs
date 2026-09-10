@@ -168,5 +168,3 @@ fn test_video_rotation_90() {
         assert_eq!(rotation, 90, "Expected rotation == 90 degrees for {}", file_path);
     }
 }
-
-
