@@ -980,7 +980,6 @@ println!("Buffer: {} frames ({:.1} ms)",
         }
 
         let (pcm_tx, pcm_rx) = crossbeam_channel::bounded::<AudioPacket>(16);
-        let (vis_tx, vis_rx) = crossbeam_channel::bounded::<DspMessage>(16);
 
         let stop_token_ffmpeg = stop_token.clone();
         let profile_clone = profile.clone();
@@ -1009,7 +1008,7 @@ println!("Buffer: {} frames ({:.1} ms)",
 
                 let pipe_name_clone = pipe_name.clone();
                 let stop_token_worker = stop_token.clone();
-                let vis_tx_worker = vis_tx.clone();
+                let tx_worker = tx.clone();
 
                 let ffmpeg_worker = std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1165,21 +1164,7 @@ println!("Buffer: {} frames ({:.1} ms)",
                                                 channel_audio_data,
                                             };
 
-                                            let mut pending = Some(vis_msg);
-                                            while let Some(m) = pending.take() {
-                                                if stop_token_worker.load(std::sync::atomic::Ordering::Relaxed) {
-                                                    return;
-                                                }
-                                                match vis_tx_worker.send_timeout(m, std::time::Duration::from_millis(50)) {
-                                                    Ok(()) => break,
-                                                    Err(crossbeam_channel::SendTimeoutError::Timeout(c)) => {
-                                                        pending = Some(c);
-                                                    }
-                                                    Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
-                                                        return;
-                                                    }
-                                                }
-                                            }
+                                            let _ = tx_worker.try_send(vis_msg);
                                             sample_offset += step;
                                         }
                                     }
@@ -1515,7 +1500,6 @@ println!("Buffer: {} frames ({:.1} ms)",
         };
 
         drop(pcm_tx);
-        drop(vis_tx);
 
         // ── Pump loop ───────────────────────────────────────────────
         println!("\n>> Output Active: {} -> {}ch x {}Hz",
@@ -1593,10 +1577,6 @@ println!("Buffer: {} frames ({:.1} ms)",
                     }
                 }
 
-                while let Ok(msg) = vis_rx.try_recv() {
-                    let _ = tx.try_send(msg);
-                }
-
                 if !eof && pcm_rx.is_empty() {
                     if let Err(crossbeam_channel::TryRecvError::Disconnected) = pcm_rx.try_recv() {
                         eof = true;
@@ -1649,7 +1629,6 @@ println!("Buffer: {} frames ({:.1} ms)",
             }
 
             drop(pcm_rx);
-            drop(vis_rx);
             let _ = ffmpeg_thread.join();
             unsafe {
                 let _ = audio_client.Stop();
@@ -1660,7 +1639,18 @@ println!("Buffer: {} frames ({:.1} ms)",
             println!("Bitstream/LPCM pump thread finished.");
         });
 
-        Ok((handle, profile.rate, profile.channels, codec_name, has_video))
+        let out_rate = if stream_type == WasapiStreamType::CompressedBitstream {
+            decoder_sample_rate
+        } else {
+            profile.rate
+        };
+        let out_channels = if stream_type == WasapiStreamType::CompressedBitstream {
+            src_channels.clamp(2, 8)
+        } else {
+            profile.channels
+        };
+
+        Ok((handle, out_rate, out_channels, codec_name, has_video))
     }
 }
 
