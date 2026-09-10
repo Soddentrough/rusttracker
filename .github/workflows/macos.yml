@@ -18,14 +18,14 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         
       - name: Install dependencies
-        run: brew install ffmpeg libopenmpt dylibbundler create-dmg
+        run: brew install ffmpeg@7 libopenmpt dylibbundler create-dmg && brew link --overwrite --force ffmpeg@7
         
       - name: Build executable
         env:
-          LIBRARY_PATH: /opt/homebrew/lib
-          CPATH: /opt/homebrew/include
-          PKG_CONFIG_PATH: /opt/homebrew/lib/pkgconfig:/opt/homebrew/share/pkgconfig
-          BINDGEN_EXTRA_CLANG_ARGS: "-I/opt/homebrew/include"
+          LIBRARY_PATH: /opt/homebrew/opt/ffmpeg@7/lib:/opt/homebrew/lib
+          CPATH: /opt/homebrew/opt/ffmpeg@7/include:/opt/homebrew/include
+          PKG_CONFIG_PATH: /opt/homebrew/opt/ffmpeg@7/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/share/pkgconfig
+          BINDGEN_EXTRA_CLANG_ARGS: "-I/opt/homebrew/opt/ffmpeg@7/include -I/opt/homebrew/include"
           CARGO_PROFILE_RELEASE_LTO: "true"
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
           CARGO_PROFILE_RELEASE_STRIP: "true"
@@ -200,7 +200,7 @@ jobs:
           # Copy binary, soundfont asset, and bundle libraries
           cp target/release/rusttracker RustTracker.app/Contents/MacOS/
           cp assets/soundfont.sf2 RustTracker.app/Contents/Resources/
-          dylibbundler -od -b -x RustTracker.app/Contents/MacOS/rusttracker -d RustTracker.app/Contents/Frameworks/ -p @executable_path/../Frameworks/
+          dylibbundler -od -b -x RustTracker.app/Contents/MacOS/rusttracker -d RustTracker.app/Contents/Frameworks/ -p @executable_path/../Frameworks/ -s /opt/homebrew/opt/ffmpeg@7/lib -s /opt/homebrew/lib
           
           # Codesign the application
           if [ -n "${{ secrets.MACOS_CERTIFICATE }}" ]; then

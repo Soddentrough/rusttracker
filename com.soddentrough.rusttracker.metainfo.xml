@@ -65,6 +65,11 @@
   <content_rating type="oars-1.1" />
   
   <releases>
+    <release version="0.9.22" date="2026-09-10">
+      <description>
+        <p>Windows WASAPI Exclusive mode playback stability enhancements, zero-masked 24-in-32 bit PCM DAC screeching elimination, synchronized multi-channel visualizer dispatch, Retro Tape Head aspect-ratio adaptation, and macOS build fixes.</p>
+      </description>
+    </release>
     <release version="0.9.21" date="2026-09-08">
       <description>
         <p>Fix visualizer DSP audio pipeline in multi-channel LPCM and bitstream modes: restore lookahead waveform timeline for Retro Tape Head, multi-channel downmix for CRT oscilloscope, peak VU tracking for Chrome Ferrofluid spikes and analog meters, and 60 Hz DSP rate alignment.</p>

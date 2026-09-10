@@ -1118,12 +1118,12 @@ println!("Buffer: {} frames ({:.1} ms)",
 
                                         while sample_offset < total_samples {
                                             let step = (total_samples - sample_offset).min(update_interval);
-                                            for p in 0..planes {
+                                            for (p, acc) in accumulator.iter_mut().enumerate().take(planes) {
                                                 let plane_data = vis_frame.plane::<f32>(p);
-                                                accumulator[p].extend_from_slice(&plane_data[sample_offset..sample_offset + step]);
-                                                let excess = accumulator[p].len().saturating_sub(window_size);
+                                                acc.extend_from_slice(&plane_data[sample_offset..sample_offset + step]);
+                                                let excess = acc.len().saturating_sub(window_size);
                                                 if excess > 0 {
-                                                    accumulator[p].drain(0..excess);
+                                                    acc.drain(0..excess);
                                                 }
                                             }
 
@@ -1317,18 +1317,18 @@ println!("Buffer: {} frames ({:.1} ms)",
                                             let byte_end = (sample_offset + step) * target_channels * bytes_per_sample;
                                             let mut slice = raw_pcm[byte_start..byte_end.min(raw_pcm.len())].to_vec();
                                             if profile_clone.valid_bits == 24 && profile_clone.container_bits == 32 {
-                                                for chunk in slice.chunks_exact_mut(4) {
+                                                for chunk in slice.as_chunks_mut::<4>().0 {
                                                     chunk[0] = 0;
                                                 }
                                             }
 
                                             // Feed accumulator for visualizer
-                                            for p in 0..planes {
+                                            for (p, acc) in accumulator.iter_mut().enumerate().take(planes) {
                                                 let plane_data = vis_frame.plane::<f32>(p);
-                                                accumulator[p].extend_from_slice(&plane_data[sample_offset..sample_offset + step]);
-                                                let excess = accumulator[p].len().saturating_sub(window_size);
+                                                acc.extend_from_slice(&plane_data[sample_offset..sample_offset + step]);
+                                                let excess = acc.len().saturating_sub(window_size);
                                                 if excess > 0 {
-                                                    accumulator[p].drain(0..excess);
+                                                    acc.drain(0..excess);
                                                 }
                                             }
 
@@ -1419,17 +1419,17 @@ println!("Buffer: {} frames ({:.1} ms)",
                                 let byte_end = (sample_offset + step) * target_channels * bytes_per_sample;
                                 let mut slice = raw_pcm[byte_start..byte_end.min(raw_pcm.len())].to_vec();
                                 if profile_clone.valid_bits == 24 && profile_clone.container_bits == 32 {
-                                    for chunk in slice.chunks_exact_mut(4) {
+                                    for chunk in slice.as_chunks_mut::<4>().0 {
                                         chunk[0] = 0;
                                     }
                                 }
 
-                                for p in 0..planes {
+                                for (p, acc) in accumulator.iter_mut().enumerate().take(planes) {
                                     let plane_data = vis_frame.plane::<f32>(p);
-                                    accumulator[p].extend_from_slice(&plane_data[sample_offset..sample_offset + step]);
-                                    let excess = accumulator[p].len().saturating_sub(window_size);
+                                    acc.extend_from_slice(&plane_data[sample_offset..sample_offset + step]);
+                                    let excess = acc.len().saturating_sub(window_size);
                                     if excess > 0 {
-                                        accumulator[p].drain(0..excess);
+                                        acc.drain(0..excess);
                                     }
                                 }
 
@@ -1577,10 +1577,8 @@ println!("Buffer: {} frames ({:.1} ms)",
                     }
                 }
 
-                if !eof && pcm_rx.is_empty() {
-                    if let Err(crossbeam_channel::TryRecvError::Disconnected) = pcm_rx.try_recv() {
-                        eof = true;
-                    }
+                if !eof && pcm_rx.is_empty() && matches!(pcm_rx.try_recv(), Err(crossbeam_channel::TryRecvError::Disconnected)) {
+                    eof = true;
                 }
 
                 if eof && buffer_queue.is_empty() {
