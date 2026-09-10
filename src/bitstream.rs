@@ -421,7 +421,7 @@ mod wasapi_bitstream {
     use crate::state::AppState;
     use crate::audio::DspMessage;
     use anyhow::{Context, Result};
-    use std::io::{Read, Write};
+    use std::io::Read;
     use std::ptr;
     use windows::core::GUID;
     use windows::Win32::Media::Audio::*;
@@ -1009,6 +1009,7 @@ println!("Buffer: {} frames ({:.1} ms)",
 
                 let pipe_name_clone = pipe_name.clone();
                 let stop_token_worker = stop_token.clone();
+                let vis_tx_worker = vis_tx.clone();
 
                 let ffmpeg_worker = std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_millis(50));
@@ -1102,7 +1103,7 @@ println!("Buffer: {} frames ({:.1} ms)",
                             packet.set_position(-1);
                             packet.set_stream(ost_index);
                             
-                            if let Err(e) = octx.write_packet(&mut packet) {
+                            if let Err(e) = packet.write(&mut octx) {
                                 eprintln!("[bitstream] Failed to write packet to spdif: {}", e);
                                 break;
                             }
@@ -1169,7 +1170,7 @@ println!("Buffer: {} frames ({:.1} ms)",
                                                 if stop_token_worker.load(std::sync::atomic::Ordering::Relaxed) {
                                                     return;
                                                 }
-                                                match vis_tx.send_timeout(m, std::time::Duration::from_millis(50)) {
+                                                match vis_tx_worker.send_timeout(m, std::time::Duration::from_millis(50)) {
                                                     Ok(()) => break,
                                                     Err(crossbeam_channel::SendTimeoutError::Timeout(c)) => {
                                                         pending = Some(c);
@@ -1195,11 +1196,12 @@ println!("Buffer: {} frames ({:.1} ms)",
                 }
                 println!("[main] Named pipe connected!");
 
+                let pipe_handle_raw = pipe_handle.0 as isize;
                 let pcm_tx_feeder = pcm_tx.clone();
                 let stop_token_feeder = stop_token.clone();
                 std::thread::spawn(move || {
                     use std::os::windows::io::FromRawHandle;
-                    let mut file = unsafe { std::fs::File::from_raw_handle(pipe_handle.0 as _) };
+                    let mut file = unsafe { std::fs::File::from_raw_handle(pipe_handle_raw as *mut std::ffi::c_void) };
                     let mut buf = vec![0u8; 16384];
                     while !stop_token_feeder.load(std::sync::atomic::Ordering::Relaxed) {
                         match file.read(&mut buf) {

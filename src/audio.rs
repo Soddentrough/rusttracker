@@ -52,6 +52,7 @@ impl Drop for PlaybackHandle {
     }
 }
 
+#[derive(Clone)]
 pub struct DspMessage {
     pub audio_data: Vec<f32>,
     pub channel_vus: Vec<f32>,
