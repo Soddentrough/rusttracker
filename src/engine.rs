@@ -6018,25 +6018,35 @@ impl VulkanEngine {
                                                     render_smooth_marquee(ui, &file_dir, 14.0, false);
                                                     ui.end_row();
                                                     
-                                                    // 5. Codec / Format & Bitrate
+                                                    // 5 & 6. Format, Bitrate & Channels
                                                     let format_str = if let Some(br) = state.bitrate {
                                                         format!("{} ({} kbps)", state.module_type, br)
                                                     } else {
                                                         state.module_type.clone()
                                                     };
-                                                    ui.label(egui::RichText::new("Format:").color(egui::Color32::from_rgb(160, 180, 200)));
-                                                    ui.label(format_str);
-                                                    ui.end_row();
-                                                    
-                                                    // 6. Channels & Track Info
                                                     let ch_info = if let Some(tc) = state.tracker_channels {
                                                         format!("{} hw / {} tracker", state.hardware_channels, tc)
+                                                    } else if state.num_channels == 1 {
+                                                        "1 channel".to_string()
                                                     } else {
                                                         format!("{} channels", state.num_channels)
                                                     };
-                                                    ui.label(egui::RichText::new("Channels:").color(egui::Color32::from_rgb(160, 180, 200)));
-                                                    ui.label(ch_info);
-                                                    ui.end_row();
+
+                                                    if is_portrait {
+                                                        // In mobile view: combined single line e.g. "Audio: AAC, 2 channels"
+                                                        ui.label(egui::RichText::new("Audio:").color(egui::Color32::from_rgb(160, 180, 200)));
+                                                        ui.label(format!("{}, {}", format_str, ch_info));
+                                                        ui.end_row();
+                                                    } else {
+                                                        // Desktop / Wide layout: separate lines
+                                                        ui.label(egui::RichText::new("Format:").color(egui::Color32::from_rgb(160, 180, 200)));
+                                                        ui.label(format_str);
+                                                        ui.end_row();
+                                                        
+                                                        ui.label(egui::RichText::new("Channels:").color(egui::Color32::from_rgb(160, 180, 200)));
+                                                        ui.label(ch_info);
+                                                        ui.end_row();
+                                                    }
 
                                                     // 7. Track Duration
                                                     ui.label(egui::RichText::new("Duration:").color(egui::Color32::from_rgb(160, 180, 200)));
@@ -7515,6 +7525,43 @@ mod tests {
             let chunk_total = chunk_w * 2.0 + spacing;
             assert!(chunk_total <= width + 0.01, "Chunk width {} must fit in available width {}", chunk_total, width);
         }
+    }
+
+    #[test]
+    fn test_mobile_audio_info_formatting() {
+        // Verify mobile portrait single-line audio format string e.g. "Audio: AAC, 2 channels"
+        let format_audio_line = |module_type: &str, bitrate: Option<u32>, num_channels: usize, tracker_channels: Option<usize>, hardware_channels: usize| -> (String, String) {
+            let format_str = if let Some(br) = bitrate {
+                format!("{} ({} kbps)", module_type, br)
+            } else {
+                module_type.to_string()
+            };
+            let ch_info = if let Some(tc) = tracker_channels {
+                format!("{} hw / {} tracker", hardware_channels, tc)
+            } else if num_channels == 1 {
+                "1 channel".to_string()
+            } else {
+                format!("{} channels", num_channels)
+            };
+            ("Audio:".to_string(), format!("{}, {}", format_str, ch_info))
+        };
+
+        // Case 1: AAC, 2 channels
+        let (label, val) = format_audio_line("AAC", None, 2, None, 2);
+        assert_eq!(label, "Audio:");
+        assert_eq!(val, "AAC, 2 channels");
+
+        // Case 2: FLAC, 1 channel
+        let (_, val) = format_audio_line("FLAC", None, 1, None, 1);
+        assert_eq!(val, "FLAC, 1 channel");
+
+        // Case 3: MP3 with bitrate
+        let (_, val) = format_audio_line("MP3", Some(320), 2, None, 2);
+        assert_eq!(val, "MP3 (320 kbps), 2 channels");
+
+        // Case 4: Tracker module with hardware/tracker channel breakdown
+        let (_, val) = format_audio_line("ProTracker MOD", None, 4, Some(4), 4);
+        assert_eq!(val, "ProTracker MOD, 4 hw / 4 tracker");
     }
 
     #[test]
