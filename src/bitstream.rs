@@ -976,6 +976,8 @@ println!("Buffer: {} frames ({:.1} ms)",
         #[derive(Clone)]
         struct AudioPacket {
             pcm_bytes: Vec<u8>,
+            epoch: u64,
+            is_eof: bool,
         }
 
         let (pcm_tx, pcm_rx) = crossbeam_channel::bounded::<AudioPacket>(16);
@@ -1219,6 +1221,8 @@ println!("Buffer: {} frames ({:.1} ms)",
                             Ok(n) => {
                                 let pkt = AudioPacket {
                                     pcm_bytes: buf[..n].to_vec(),
+                                    epoch: 0,
+                                    is_eof: false,
                                 };
                                 let mut pending = Some(pkt);
                                 while let Some(chunk) = pending.take() {
@@ -1239,6 +1243,11 @@ println!("Buffer: {} frames ({:.1} ms)",
                             Err(_) => break,
                         }
                     }
+                    let _ = pcm_tx_feeder.send(AudioPacket {
+                        pcm_bytes: Vec::new(),
+                        epoch: 0,
+                        is_eof: true,
+                    });
                 });
 
                 ffmpeg_worker
@@ -1247,6 +1256,8 @@ println!("Buffer: {} frames ({:.1} ms)",
                 let pcm_tx_lpcm = pcm_tx.clone();
                 let vis_tx_lpcm = vis_tx.clone();
                 let stop_token_lpcm = stop_token_ffmpeg.clone();
+                let shared_state_lpcm = shared_state.clone();
+                let stream_time_base = f64::from(best_audio.time_base());
 
                 std::thread::spawn(move || {
                     println!("[bitstream] Multi-Channel LPCM FFmpeg worker thread started.");
@@ -1281,7 +1292,7 @@ println!("Buffer: {} frames ({:.1} ms)",
                     let mut cur_in_layout = ffmpeg_next::channel_layout::ChannelLayout::default(0);
                     let mut cur_in_rate = 0;
 
-                    let mut process_frame = |frame: &ffmpeg_next::frame::Audio, current_seconds: f64| {
+                    let mut process_frame = |frame: &ffmpeg_next::frame::Audio, current_seconds: f64, epoch: u64| {
                         let frame_layout = if frame.channel_layout().channels() > 0 {
                             frame.channel_layout()
                         } else {
@@ -1388,6 +1399,8 @@ println!("Buffer: {} frames ({:.1} ms)",
 
                                     let packet = AudioPacket {
                                         pcm_bytes: slice,
+                                        epoch,
+                                        is_eof: false,
                                     };
 
                                     let mut pending = Some(packet);
@@ -1395,7 +1408,12 @@ println!("Buffer: {} frames ({:.1} ms)",
                                         if stop_token_lpcm.load(std::sync::atomic::Ordering::Relaxed) {
                                             return;
                                         }
-                                        match pcm_tx_lpcm.send_timeout(pkt, std::time::Duration::from_millis(50)) {
+                                        if let Ok(state) = shared_state_lpcm.lock() {
+                                            if state.seek_request.is_some() {
+                                                return;
+                                            }
+                                        }
+                                        match pcm_tx_lpcm.send_timeout(pkt, std::time::Duration::from_millis(20)) {
                                             Ok(()) => break,
                                             Err(crossbeam_channel::SendTimeoutError::Timeout(c)) => {
                                                 pending = Some(c);
@@ -1411,7 +1429,12 @@ println!("Buffer: {} frames ({:.1} ms)",
                                         if stop_token_lpcm.load(std::sync::atomic::Ordering::Relaxed) {
                                             return;
                                         }
-                                        match vis_tx_lpcm.send_timeout(msg, std::time::Duration::from_millis(50)) {
+                                        if let Ok(state) = shared_state_lpcm.lock() {
+                                            if state.seek_request.is_some() {
+                                                return;
+                                            }
+                                        }
+                                        match vis_tx_lpcm.send_timeout(msg, std::time::Duration::from_millis(20)) {
                                             Ok(()) => break,
                                             Err(crossbeam_channel::SendTimeoutError::Timeout(m)) => {
                                                 pending_vis = Some(m);
@@ -1428,29 +1451,96 @@ println!("Buffer: {} frames ({:.1} ms)",
                         }
                     };
 
-                    for (stream, packet) in ictx.packets() {
-                        if stop_token_lpcm.load(std::sync::atomic::Ordering::Relaxed) {
-                            break;
-                        }
-                        if stream.index() == best_audio_index {
-                            let pts = packet.pts().or_else(|| packet.dts());
-                            if let Some(p) = pts {
-                                current_seconds = p as f64 * f64::from(stream.time_base());
-                            }
+                    let mut current_seek_epoch = 0u64;
+                    let mut is_eof = false;
 
-                            if decoder.send_packet(&packet).is_ok() {
-                                let mut frame = ffmpeg_next::frame::Audio::empty();
-                                while decoder.receive_frame(&mut frame).is_ok() {
-                                    process_frame(&frame, current_seconds);
+                    while !stop_token_lpcm.load(std::sync::atomic::Ordering::Relaxed) {
+                        // 1. Check for seek request from UI
+                        let seek_req = {
+                            if let Ok(mut state) = shared_state_lpcm.lock() {
+                                if let Some(pos) = state.seek_request.take() {
+                                    state.seek_epoch += 1;
+                                    state.current_seconds = pos;
+                                    state.track_ended = false;
+                                    Some((pos, state.seek_epoch))
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        };
+
+                        if let Some((pos, epoch)) = seek_req {
+                            current_seek_epoch = epoch;
+                            is_eof = false;
+
+                            let target_pts = if stream_time_base > 0.0 { (pos / stream_time_base) as i64 } else { 0 };
+                            unsafe {
+                                let ret = ffmpeg_next::ffi::av_seek_frame(
+                                    ictx.as_mut_ptr(),
+                                    best_audio_index as i32,
+                                    target_pts,
+                                    ffmpeg_next::ffi::AVSEEK_FLAG_BACKWARD,
+                                );
+                                if ret < 0 {
+                                    let fallback_pts = (pos * ffmpeg_next::ffi::AV_TIME_BASE as f64) as i64;
+                                    ffmpeg_next::ffi::av_seek_frame(
+                                        ictx.as_mut_ptr(),
+                                        -1,
+                                        fallback_pts,
+                                        ffmpeg_next::ffi::AVSEEK_FLAG_BACKWARD,
+                                    );
                                 }
                             }
+                            let _ = decoder.flush();
+                            for acc in &mut accumulator {
+                                acc.fill(0.0);
+                            }
+                            current_seconds = pos;
                         }
-                    }
 
-                    let _ = decoder.send_eof();
-                    let mut frame = ffmpeg_next::frame::Audio::empty();
-                    while decoder.receive_frame(&mut frame).is_ok() {
-                        process_frame(&frame, current_seconds);
+                        if is_eof {
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                            continue;
+                        }
+
+                        // 2. Read next packet
+                        match ictx.packets().next() {
+                            Some((stream, packet)) => {
+                                if stream.index() == best_audio_index {
+                                    let pts = packet.pts().or_else(|| packet.dts());
+                                    if let Some(p) = pts {
+                                        current_seconds = p as f64 * stream_time_base;
+                                    }
+
+                                    if decoder.send_packet(&packet).is_ok() {
+                                        let mut frame = ffmpeg_next::frame::Audio::empty();
+                                        while decoder.receive_frame(&mut frame).is_ok() {
+                                            if let Ok(state) = shared_state_lpcm.lock() {
+                                                if state.seek_request.is_some() {
+                                                    break;
+                                                }
+                                            }
+                                            process_frame(&frame, current_seconds, current_seek_epoch);
+                                        }
+                                    }
+                                }
+                            }
+                            None => {
+                                let _ = decoder.send_eof();
+                                let mut frame = ffmpeg_next::frame::Audio::empty();
+                                while decoder.receive_frame(&mut frame).is_ok() {
+                                    process_frame(&frame, current_seconds, current_seek_epoch);
+                                }
+                                let _ = pcm_tx_lpcm.send(AudioPacket {
+                                    pcm_bytes: Vec::new(),
+                                    epoch: current_seek_epoch,
+                                    is_eof: true,
+                                });
+                                is_eof = true;
+                            }
+                        }
                     }
                 })
             }
@@ -1485,6 +1575,7 @@ println!("Buffer: {} frames ({:.1} ms)",
             let mut buffer_queue: std::collections::VecDeque<u8> = std::collections::VecDeque::with_capacity(bytes_needed * 8);
             let mut started = false;
             let mut eof = false;
+            let mut local_epoch = 0u64;
 
             // 1. Initial Prebuffering: wait until we have at least target_prebuffer (or EOF)
             let prebuffer_start = std::time::Instant::now();
@@ -1494,6 +1585,11 @@ println!("Buffer: {} frames ({:.1} ms)",
                 }
                 match pcm_rx.recv_timeout(std::time::Duration::from_millis(20)) {
                     Ok(packet) => {
+                        if packet.is_eof {
+                            eof = true;
+                            break;
+                        }
+                        local_epoch = packet.epoch;
                         buffer_queue.extend(packet.pcm_bytes);
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
@@ -1523,6 +1619,33 @@ println!("Buffer: {} frames ({:.1} ms)",
                     break;
                 }
 
+                // Check if seek occurred in shared_state
+                let seek_from_state = {
+                    if let Ok(state) = shared_state_pump.lock() {
+                        if state.seek_epoch > local_epoch {
+                            local_epoch = state.seek_epoch;
+                            Some(state.current_seconds)
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(pos) = seek_from_state {
+                    buffer_queue.clear();
+                    while pcm_rx.try_recv().is_ok() {}
+                    while vis_rx.try_recv().is_ok() {}
+                    unsafe {
+                        let _ = audio_client.Stop();
+                        let _ = audio_client.Reset();
+                    }
+                    playback_time = Some(pos);
+                    started = false;
+                    eof = false;
+                }
+
                 // If started, wait for WASAPI event indicating buffer space is ready
                 if started {
                     let wait_result = unsafe { WaitForSingleObject(event, 50) };
@@ -1538,6 +1661,25 @@ println!("Buffer: {} frames ({:.1} ms)",
                 while buffer_queue.len() < target_prebuffer && !eof {
                     match pcm_rx.try_recv() {
                         Ok(packet) => {
+                            if packet.epoch < local_epoch {
+                                continue;
+                            }
+                            if packet.epoch > local_epoch {
+                                local_epoch = packet.epoch;
+                                buffer_queue.clear();
+                                while vis_rx.try_recv().is_ok() {}
+                                unsafe {
+                                    let _ = audio_client.Stop();
+                                    let _ = audio_client.Reset();
+                                }
+                                playback_time = None;
+                                started = false;
+                                eof = false;
+                            }
+                            if packet.is_eof {
+                                eof = true;
+                                break;
+                            }
                             buffer_queue.extend(packet.pcm_bytes);
                         }
                         Err(crossbeam_channel::TryRecvError::Empty) => {
