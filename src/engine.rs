@@ -5386,7 +5386,7 @@ impl VulkanEngine {
                             }
 
                                 let is_narrow = real_avail_width < 640.0;
-                                let btn_text = if is_file_hovered { "📥 DROP TO PLAY" } else { "OPEN AUDIO FILE" };
+                                let btn_text = if is_file_hovered { "📥 DROP TO PLAY" } else { "OPEN FILE" };
                                 let btn_fill = if is_file_hovered { egui::Color32::from_rgb(0, 160, 240) } else { egui::Color32::from_rgb(0, 100, 200) };
                                 let btn_stroke = if is_file_hovered { egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(160, 240, 255)) } else { egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(80, 180, 255)) };
 
@@ -5888,7 +5888,23 @@ impl VulkanEngine {
                                         } else {
                                             "Track Info".to_string()
                                         };
-                                        col.heading(heading_text);
+                                        col.horizontal(|ui| {
+                                            ui.heading(heading_text);
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                let open_hdr_btn = egui::Button::new(
+                                                    egui::RichText::new("📂 OPEN FILE")
+                                                        .size(11.5)
+                                                        .strong()
+                                                        .color(egui::Color32::WHITE)
+                                                )
+                                                .fill(egui::Color32::from_rgb(0, 100, 200))
+                                                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(80, 200, 255)))
+                                                .corner_radius(4.0);
+                                                if ui.add(open_hdr_btn).clicked() {
+                                                    *engine_action = EngineAction::OpenFile;
+                                                }
+                                            });
+                                        });
                                         col.separator();
                                     }
                                 
@@ -6287,7 +6303,7 @@ impl VulkanEngine {
                                             }
                                             ui.add_space(6.0);
                                             let open_btn = egui::Button::new(
-                                                egui::RichText::new("📂  OPEN AUDIO FILE")
+                                                egui::RichText::new("📂  OPEN FILE")
                                                     .strong()
                                                     .size(13.5)
                                                     .color(egui::Color32::WHITE)
@@ -6308,8 +6324,62 @@ impl VulkanEngine {
                             if is_portrait {
                                 let has_video = state.has_video_stream || self.video_state.is_some();
                                 let progress_height = 20.0;
+                                let header_height = 32.0;
                                 let available_h = ui.available_height();
-                                let content_h = (available_h - progress_height).max(40.0);
+                                let content_h = (available_h - progress_height - header_height - 6.0).max(40.0);
+
+                                // Mobile Portrait Header Bar: Tab Navigation & Always-Visible [📂 OPEN FILE] Button
+                                ui.horizontal(|ui| {
+                                    ui.spacing_mut().item_spacing.x = 5.0;
+
+                                    let tab_btn = |ui: &mut egui::Ui, text: &str, active: bool| -> egui::Response {
+                                        let (fg, bg, stroke) = if active {
+                                            (egui::Color32::WHITE, egui::Color32::from_rgba_unmultiplied(0, 130, 210, 210), egui::Stroke::new(1.2_f32, egui::Color32::from_rgb(100, 210, 255)))
+                                        } else {
+                                            (egui::Color32::from_rgb(160, 175, 195), egui::Color32::from_rgba_unmultiplied(35, 40, 50, 180), egui::Stroke::NONE)
+                                        };
+                                        ui.add(
+                                            egui::Button::new(egui::RichText::new(text).size(12.0).strong().color(fg))
+                                                .fill(bg)
+                                                .stroke(stroke)
+                                                .corner_radius(4.0)
+                                                .min_size(egui::vec2(0.0, 28.0))
+                                        )
+                                    };
+
+                                    let is_chan = state.mobile_hud_tab == crate::state::MobileHudTab::Channels;
+                                    let is_heat = state.mobile_hud_tab == crate::state::MobileHudTab::Heatmap;
+                                    let is_info = state.mobile_hud_tab == crate::state::MobileHudTab::Info;
+
+                                    if tab_btn(ui, "Channels", is_chan).clicked() {
+                                        engine_action = EngineAction::SetMobileHudTab(crate::state::MobileHudTab::Channels);
+                                    }
+                                    let heat_label = if state.lyrics.is_some() { "Lyrics" } else { "Heatmap" };
+                                    if tab_btn(ui, heat_label, is_heat).clicked() {
+                                        engine_action = EngineAction::SetMobileHudTab(crate::state::MobileHudTab::Heatmap);
+                                    }
+                                    if tab_btn(ui, "Track Info", is_info).clicked() {
+                                        engine_action = EngineAction::SetMobileHudTab(crate::state::MobileHudTab::Info);
+                                    }
+
+                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                        let open_btn = egui::Button::new(
+                                            egui::RichText::new("📂 OPEN FILE")
+                                                .size(12.0)
+                                                .strong()
+                                                .color(egui::Color32::WHITE)
+                                        )
+                                        .fill(egui::Color32::from_rgb(0, 110, 210))
+                                        .stroke(egui::Stroke::new(1.2_f32, egui::Color32::from_rgb(80, 200, 255)))
+                                        .corner_radius(4.0)
+                                        .min_size(egui::vec2(86.0, 28.0));
+
+                                        if ui.add(open_btn).clicked() {
+                                            engine_action = EngineAction::OpenFile;
+                                        }
+                                    });
+                                });
+                                ui.add_space(4.0);
 
                                 ui.allocate_ui_with_layout(
                                     egui::vec2(ui.available_width(), content_h),
