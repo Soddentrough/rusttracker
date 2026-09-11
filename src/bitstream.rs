@@ -1292,7 +1292,7 @@ println!("Buffer: {} frames ({:.1} ms)",
                     let mut cur_in_layout = ffmpeg_next::channel_layout::ChannelLayout::default(0);
                     let mut cur_in_rate = 0;
 
-                    let mut process_frame = |frame: &ffmpeg_next::frame::Audio, current_seconds: f64, epoch: u64| {
+                    let mut process_frame = |frame: &ffmpeg_next::frame::Audio, current_seconds: f64, epoch: u64, accumulator: &mut [Vec<f32>]| {
                         let frame_layout = if frame.channel_layout().channels() > 0 {
                             frame.channel_layout()
                         } else {
@@ -1522,7 +1522,7 @@ println!("Buffer: {} frames ({:.1} ms)",
                                                     break;
                                                 }
                                             }
-                                            process_frame(&frame, current_seconds, current_seek_epoch);
+                                            process_frame(&frame, current_seconds, current_seek_epoch, &mut accumulator);
                                         }
                                     }
                                 }
@@ -1531,7 +1531,7 @@ println!("Buffer: {} frames ({:.1} ms)",
                                 let _ = decoder.send_eof();
                                 let mut frame = ffmpeg_next::frame::Audio::empty();
                                 while decoder.receive_frame(&mut frame).is_ok() {
-                                    process_frame(&frame, current_seconds, current_seek_epoch);
+                                    process_frame(&frame, current_seconds, current_seek_epoch, &mut accumulator);
                                 }
                                 let _ = pcm_tx_lpcm.send(AudioPacket {
                                     pcm_bytes: Vec::new(),
