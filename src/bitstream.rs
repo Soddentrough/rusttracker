@@ -4,7 +4,7 @@ pub fn start_bitstream_thread(
     _shared_state: std::sync::Arc<std::sync::Mutex<crate::state::AppState>>,
     tx: crossbeam_channel::Sender<crate::audio::DspMessage>,
     stop_token: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> anyhow::Result<(std::thread::JoinHandle<()>, u32, u16, String, bool)> {
+) -> anyhow::Result<(std::thread::JoinHandle<()>, u32, u16, String, bool, String, f64)> {
     use anyhow::Context;
 
     println!("[bitstream] Probing codec via ffmpeg-next on Linux...");
@@ -28,6 +28,16 @@ pub fn start_bitstream_thread(
         ffmpeg_next::codec::Id::AC3 => "ac3",
         _ => return Err(anyhow::anyhow!("Unsupported codec for bitstreaming: {:?}", codec_id)),
     }.to_string();
+
+    let meta_duration = if ictx.duration() > 0 {
+        ictx.duration() as f64 / ffmpeg_next::ffi::AV_TIME_BASE as f64
+    } else {
+        0.0
+    };
+    let meta_artist = {
+        let meta = ictx.metadata();
+        meta.get("artist").or_else(|| meta.get("ARTIST")).map(|s| s.to_string()).unwrap_or_default()
+    };
 
     let has_video = ictx.streams().best(ffmpeg_next::media::Type::Video).is_some();
 
@@ -236,7 +246,7 @@ pub fn start_bitstream_thread(
         println!("[bitstream] FFmpeg thread finished on Linux.");
     });
 
-    Ok((ffmpeg_thread, decoder_sample_rate as u32, 8u16, codec_name, has_video))
+    Ok((ffmpeg_thread, decoder_sample_rate as u32, 8u16, codec_name, has_video, meta_artist, meta_duration))
 }
 
 #[cfg(target_os = "macos")]
@@ -296,7 +306,7 @@ mod macos_bitstream {
         _shared_state: Arc<Mutex<AppState>>,
         _tx: Sender<DspMessage>,
         stop_token: Arc<AtomicBool>,
-    ) -> Result<(std::thread::JoinHandle<()>, u32, u16, String, bool)> {
+    ) -> Result<(std::thread::JoinHandle<()>, u32, u16, String, bool, String, f64)> {
         println!("[bitstream] Initializing macOS CoreAudio passthrough (Hog Mode)...");
 
         println!("[bitstream] Probing audio stream via ffmpeg-next...");
@@ -408,7 +418,7 @@ pub fn start_bitstream_thread(
     _shared_state: std::sync::Arc<std::sync::Mutex<crate::state::AppState>>,
     _tx: crossbeam_channel::Sender<crate::audio::DspMessage>,
     _stop_token: std::sync::Arc<std::sync::atomic::AtomicBool>,
-) -> anyhow::Result<(std::thread::JoinHandle<()>, u32, u16, String, bool)> {
+) -> anyhow::Result<(std::thread::JoinHandle<()>, u32, u16, String, bool, String, f64)> {
     Err(anyhow::anyhow!("Bitstream passthrough is not supported on this platform."))
 }
 #[cfg(windows)]
@@ -789,7 +799,7 @@ mod wasapi_bitstream {
         shared_state: Arc<Mutex<AppState>>,
         tx: Sender<DspMessage>,
         stop_token: Arc<AtomicBool>,
-    ) -> Result<(std::thread::JoinHandle<()>, u32, u16, String, bool)> {
+    ) -> Result<(std::thread::JoinHandle<()>, u32, u16, String, bool, String, f64)> {
         // ── Probe codec via ffmpeg-next (pure FFmpeg, NO COM on caller thread) ──
         println!("[bitstream] Probing audio stream via ffmpeg-next on Windows...");
         ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Quiet);
@@ -821,16 +831,27 @@ mod wasapi_bitstream {
 
         let (codec_name, stream_type, profiles) = detect_codec_profile(codec_id, src_channels, decoder_sample_rate)?;
         let has_video = ictx.streams().best(ffmpeg_next::media::Type::Video).is_some();
+        let meta_duration = if ictx.duration() > 0 {
+            ictx.duration() as f64 / ffmpeg_next::ffi::AV_TIME_BASE as f64
+        } else {
+            0.0
+        };
+        let meta_artist = {
+            let meta = ictx.metadata();
+            meta.get("artist").or_else(|| meta.get("ARTIST")).map(|s| s.to_string()).unwrap_or_default()
+        };
 
         println!("[bitstream] Detected codec: {}, Decoder Rate: {} Hz, Channels: {}", codec_name, decoder_sample_rate, src_channels);
         for p in &profiles {
             println!("  [bitstream] Candidate profile: {} ({}ch x {}Hz)", p.name, p.channels, p.rate);
         }
 
-        let (init_tx, init_rx) = crossbeam_channel::bounded::<Result<(u32, u16, String, bool)>>(1);
+        let (init_tx, init_rx) = crossbeam_channel::bounded::<Result<(u32, u16, String, bool, String, f64)>>(1);
         let stop_token_pump = stop_token.clone();
         let shared_state_pump = shared_state.clone();
         let codec_name_pump = codec_name.clone();
+        let meta_artist_pump = meta_artist.clone();
+        let meta_duration_pump = meta_duration;
 
         let handle = std::thread::spawn(move || {
             // Initialize COM strictly on this dedicated thread
@@ -1045,6 +1066,7 @@ mod wasapi_bitstream {
                         let pipe_name_clone = pipe_name.clone();
                         let stop_token_worker = stop_token_pump.clone();
                         let vis_tx_worker = vis_tx.clone();
+                        let shared_state_worker = shared_state_pump.clone();
 
                         let ffmpeg_worker = std::thread::spawn(move || {
                             println!("[bitstream] Compressed bitstream FFmpeg worker thread started.");
@@ -1201,6 +1223,9 @@ mod wasapi_bitstream {
                                                         }
 
                                                         let slice_time = current_seconds + (sample_offset as f64 / decoder.rate() as f64);
+                                                        if let Ok(mut state) = shared_state_worker.try_lock() {
+                                                            crate::audio::push_planar_lookahead_slices(&mut state, &channel_audio_data, decoder.rate(), slice_time);
+                                                        }
                                                         let vis_msg = DspMessage {
                                                             audio_data: mono_audio_data,
                                                             channel_vus,
@@ -1212,22 +1237,7 @@ mod wasapi_bitstream {
                                                             current_row_string: String::new(),
                                                             channel_audio_data,
                                                         };
-
-                                                        let mut pending = Some(vis_msg);
-                                                        while let Some(msg) = pending.take() {
-                                                            if stop_token_worker.load(std::sync::atomic::Ordering::Relaxed) {
-                                                                return;
-                                                            }
-                                                            match vis_tx_worker.send_timeout(msg, std::time::Duration::from_millis(50)) {
-                                                                Ok(()) => break,
-                                                                Err(crossbeam_channel::SendTimeoutError::Timeout(m)) => {
-                                                                    pending = Some(m);
-                                                                }
-                                                                Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
-                                                                    return;
-                                                                }
-                                                            }
-                                                        }
+                                                        let _ = vis_tx_worker.try_send(vis_msg);
                                                         sample_offset += step;
                                                     }
                                                 }
@@ -1438,6 +1448,9 @@ mod wasapi_bitstream {
                                             }
 
                                             let slice_time = current_seconds + (sample_offset as f64 / profile_clone.rate as f64);
+                                            if let Ok(mut state) = shared_state_lpcm.try_lock() {
+                                                crate::audio::push_planar_lookahead_slices(&mut state, &channel_audio_data, profile_clone.rate, slice_time);
+                                            }
                                             let vis_msg = DspMessage {
                                                 audio_data: mono_audio_data,
                                                 channel_vus,
@@ -1449,22 +1462,7 @@ mod wasapi_bitstream {
                                                 current_row_string: String::new(),
                                                 channel_audio_data,
                                             };
-
-                                            let mut pending = Some(vis_msg);
-                                            while let Some(msg) = pending.take() {
-                                                if stop_token_lpcm.load(std::sync::atomic::Ordering::Relaxed) {
-                                                    return;
-                                                }
-                                                match vis_tx_lpcm.send_timeout(msg, std::time::Duration::from_millis(50)) {
-                                                    Ok(()) => break,
-                                                    Err(crossbeam_channel::SendTimeoutError::Timeout(m)) => {
-                                                        pending = Some(m);
-                                                    }
-                                                    Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
-                                                        return;
-                                                    }
-                                                }
-                                            }
+                                            let _ = vis_tx_lpcm.try_send(vis_msg);
                                             sample_offset += step;
                                         }
                                     }
@@ -1595,7 +1593,7 @@ mod wasapi_bitstream {
                         profile.channels
                     };
 
-                    let _ = init_tx.send(Ok((out_rate, out_channels, codec_name_pump, has_video)));
+                    let _ = init_tx.send(Ok((out_rate, out_channels, codec_name_pump, has_video, meta_artist_pump, meta_duration_pump)));
 
                     println!("\n>> Output Active: {} -> {}ch x {}Hz",
                         profile.name, profile.channels, profile.rate);
@@ -1603,8 +1601,8 @@ mod wasapi_bitstream {
                     let available = buffer_frames;
                     let frame_size = frame_bytes as usize;
                     let bytes_needed = (available * frame_bytes) as usize;
-                    let target_prebuffer = (bytes_needed * 3).max(8192);
-                    let mut buffer_queue: std::collections::VecDeque<u8> = std::collections::VecDeque::with_capacity(bytes_needed * 8);
+                    let target_prebuffer = bytes_needed.max(4096);
+                    let mut buffer_queue: std::collections::VecDeque<u8> = std::collections::VecDeque::with_capacity(bytes_needed * 4);
                     let mut started = false;
                     let mut eof = false;
                     let mut local_epoch = 0u64;
@@ -1614,7 +1612,10 @@ mod wasapi_bitstream {
                         if stop_token_pump.load(std::sync::atomic::Ordering::Relaxed) {
                             break;
                         }
-                        match pcm_rx.recv_timeout(std::time::Duration::from_millis(20)) {
+                        while let Ok(msg) = vis_rx.try_recv() {
+                            let _ = tx.try_send(msg);
+                        }
+                        match pcm_rx.recv_timeout(std::time::Duration::from_millis(10)) {
                             Ok(packet) => {
                                 if packet.is_eof {
                                     eof = true;
@@ -1628,7 +1629,7 @@ mod wasapi_bitstream {
                                 break;
                             }
                             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                                if prebuffer_start.elapsed() > std::time::Duration::from_millis(2000) {
+                                if prebuffer_start.elapsed() > std::time::Duration::from_millis(100) {
                                     break;
                                 }
                             }
@@ -1835,8 +1836,8 @@ mod wasapi_bitstream {
 
         // Caller waits for pump thread initialization
         match init_rx.recv_timeout(std::time::Duration::from_millis(3000)) {
-            Ok(Ok((out_rate, out_channels, codec_name, has_video))) => {
-                Ok((handle, out_rate, out_channels, codec_name, has_video))
+            Ok(Ok((out_rate, out_channels, codec_name, has_video, artist, dur))) => {
+                Ok((handle, out_rate, out_channels, codec_name, has_video, artist, dur))
             }
             Ok(Err(e)) => {
                 let _ = handle.join();

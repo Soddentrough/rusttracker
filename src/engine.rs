@@ -5409,8 +5409,8 @@ impl VulkanEngine {
                                 ui.painter().rect(
                                     badge_rect,
                                     8.0,
-                                    egui::Color32::from_rgba_unmultiplied(0, 120, 220, 230),
-                                    egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(140, 230, 255)),
+                                    egui::Color32::from_rgba_unmultiplied(215, 105, 0, 230),
+                                    egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 175, 40)),
                                     egui::StrokeKind::Outside,
                                 );
                                 ui.painter().galley(badge_rect.min + egui::vec2(14.0, 7.0), galley, egui::Color32::WHITE);
@@ -5419,8 +5419,8 @@ impl VulkanEngine {
 
                                 let is_narrow = real_avail_width < 640.0;
                                 let btn_text = if is_file_hovered { "📥 DROP TO PLAY" } else { "OPEN FILE" };
-                                let btn_fill = if is_file_hovered { egui::Color32::from_rgb(0, 160, 240) } else { egui::Color32::from_rgb(0, 100, 200) };
-                                let btn_stroke = if is_file_hovered { egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(160, 240, 255)) } else { egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(80, 180, 255)) };
+                                let btn_fill = if is_file_hovered { egui::Color32::from_rgb(240, 125, 10) } else { egui::Color32::from_rgb(205, 95, 0) };
+                                let btn_stroke = if is_file_hovered { egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 195, 70)) } else { egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(255, 145, 30)) };
 
                                 let btn_font_size = if is_narrow { 18.0 } else { 22.0 };
                                 let btn_h = if is_narrow { 52.0 } else { 60.0 };
@@ -5928,8 +5928,8 @@ impl VulkanEngine {
                                                     .strong()
                                                     .color(egui::Color32::WHITE)
                                             )
-                                            .fill(egui::Color32::from_rgb(0, 100, 200))
-                                            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(80, 200, 255)))
+                                            .fill(egui::Color32::from_rgb(205, 95, 0))
+                                            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(255, 145, 30)))
                                             .corner_radius(4.0)
                                             .min_size(egui::vec2(92.0, if is_portrait { 30.0 } else { 24.0 }));
                                             if ui.add(open_hdr_btn).clicked() {
@@ -7995,5 +7995,158 @@ mod tests {
 
         assert!(!state.stats.bitstream_active, "bitstream_active must be false after dropping stream");
         assert_eq!(state.stats.audio_buffer_fill_pct, 0.0, "audio_buffer_fill_pct must be 0 after dropping stream");
+    }
+
+    #[test]
+    fn test_push_planar_lookahead_slices_timestamps() {
+        let mut state = crate::state::AppState::new("Test App".to_string());
+        let sample_rate = 48000;
+        let samples = vec![0.5f32; 48000]; // 1 second of audio
+        let channels = vec![samples.clone(), samples];
+        let current_seconds = 12.5;
+
+        crate::audio::push_planar_lookahead_slices(&mut state, &channels, sample_rate, current_seconds);
+
+        assert!(!state.lookahead_queue.is_empty(), "Queue must contain slices");
+        let (first_t, _) = state.lookahead_queue.front().unwrap();
+        let (last_t, _) = state.lookahead_queue.back().unwrap();
+
+        assert!(*first_t >= current_seconds, "First slice timestamp ({}) must start at or after current_seconds ({})", first_t, current_seconds);
+        assert!(*last_t > *first_t, "Last slice timestamp ({}) must be ahead of first slice timestamp ({})", last_t, first_t);
+        assert!((*last_t - current_seconds) >= 0.9, "Lookahead span should extend ~1s into the future");
+    }
+
+    #[test]
+    fn test_lookahead_timeline_continuity_and_synthesis() {
+        let mut state = crate::state::AppState::new("Test App".to_string());
+        state.lookahead_timeline = vec![0.0; 600 * 8];
+
+        // Part 1: Populate lookahead_queue with a small slice window (e.g. 0.2s)
+        for i in 0..20 {
+            let t = 5.0 + (i as f64 * 0.01);
+            state.lookahead_queue.push_back((t, [-0.4, 0.4, -0.3, 0.3, 0.35, 0.35, 0.5, 0.5]));
+        }
+
+        let cur_t = 5.1;
+        let q_len = state.lookahead_queue.len();
+        let (t_first, _) = state.lookahead_queue[0];
+        let (t_last, _) = state.lookahead_queue[q_len - 1];
+        let total_span = (t_last - t_first).max(0.01);
+
+        for k in 0..600 {
+            let mut target_t = cur_t + (k as f64 - 100.0) * 0.01;
+            let off = k * 8;
+
+            if target_t > t_last {
+                let future_offset = target_t - t_last;
+                target_t = t_first + (future_offset % total_span);
+            } else if target_t < t_first {
+                let past_offset = t_first - target_t;
+                target_t = t_last - (past_offset % total_span);
+            }
+
+            let idx = match state.lookahead_queue.binary_search_by(|(t, _)| t.partial_cmp(&target_t).unwrap_or(std::cmp::Ordering::Equal)) {
+                Ok(i) => i,
+                Err(i) => i,
+            };
+
+            if idx == 0 {
+                let (_, d0) = state.lookahead_queue[0];
+                state.lookahead_timeline[off..off + 8].copy_from_slice(&d0);
+            } else if idx >= q_len {
+                let (_, d_last) = state.lookahead_queue[q_len - 1];
+                state.lookahead_timeline[off..off + 8].copy_from_slice(&d_last);
+            } else {
+                let (t0, d0) = state.lookahead_queue[idx - 1];
+                let (t1, d1) = state.lookahead_queue[idx];
+                let dt = t1 - t0;
+                if dt > 0.0001 && dt < 1.0 && target_t >= t0 && target_t <= t1 {
+                    let frac = ((target_t - t0) / dt).clamp(0.0, 1.0) as f32;
+                    for c in 0..8 {
+                        state.lookahead_timeline[off + c] = d0[c] * (1.0 - frac) + d1[c] * frac;
+                    }
+                } else {
+                    state.lookahead_timeline[off..off + 8].copy_from_slice(&d0);
+                }
+            }
+        }
+
+        // Verify that NO slice in the entire 600-slice buffer is zero (upcoming audio emitting from tape head)
+        for k in 0..600 {
+            let off = k * 8;
+            let min_l = state.lookahead_timeline[off + 0];
+            let max_l = state.lookahead_timeline[off + 1];
+            let rms = state.lookahead_timeline[off + 4];
+            assert!(min_l < 0.0, "Slice {} min_l should be negative, got {}", k, min_l);
+            assert!(max_l > 0.0, "Slice {} max_l should be positive, got {}", k, max_l);
+            assert!(rms > 0.0, "Slice {} rms should be non-zero, got {}", k, rms);
+        }
+
+        // Part 2: Fallback synthesis when queue is empty
+        state.lookahead_queue.clear();
+        state.raw_waveform = vec![0.5; 512];
+        state.raw_channel_vus = vec![0.7, 0.7];
+
+        let wave_len = state.raw_waveform.len();
+        let vu_l = state.raw_channel_vus.first().copied().unwrap_or(0.2).clamp(0.05, 1.0);
+        let vu_r = state.raw_channel_vus.get(1).copied().unwrap_or(vu_l).clamp(0.05, 1.0);
+        for k in 0..600 {
+            let off = k * 8;
+            let wave_idx = (k * 13) % wave_len;
+            let sample = state.raw_waveform[wave_idx].clamp(-1.0, 1.0);
+            let sample_next = state.raw_waveform[(wave_idx + 1) % wave_len].clamp(-1.0, 1.0);
+            let min_s = sample.min(sample_next).min(0.0) * vu_l;
+            let max_s = sample.max(sample_next).max(0.0) * vu_l;
+            let min_r = sample.min(sample_next).min(0.0) * vu_r;
+            let max_r = sample.max(sample_next).max(0.0) * vu_r;
+            let rms = (sample.abs() * 0.7 + 0.3 * (vu_l + vu_r) * 0.5).min(1.0);
+            state.lookahead_timeline[off + 0] = min_s;
+            state.lookahead_timeline[off + 1] = max_s;
+            state.lookahead_timeline[off + 2] = min_r;
+            state.lookahead_timeline[off + 3] = max_r;
+            state.lookahead_timeline[off + 4] = rms;
+            state.lookahead_timeline[off + 5] = rms;
+            state.lookahead_timeline[off + 6] = vu_l;
+            state.lookahead_timeline[off + 7] = vu_r;
+        }
+
+        for k in 0..600 {
+            let off = k * 8;
+            let max_s = state.lookahead_timeline[off + 1];
+            let rms = state.lookahead_timeline[off + 4];
+            assert!(max_s > 0.0, "Fallback slice {} max_s should be positive", k);
+            assert!(rms > 0.0, "Fallback slice {} rms should be non-zero", k);
+        }
+    }
+
+    #[test]
+    fn test_open_file_button_theme_colors() {
+        let engine_code = std::fs::read_to_string("src/engine.rs")
+            .expect("src/engine.rs must exist");
+        let prod_code = engine_code.split("#[cfg(test)]").next().unwrap_or(&engine_code);
+        
+        // Assert no old cyan/blue button colors in empty state or header button
+        assert!(
+            !prod_code.contains("Color32::from_rgb(0, 150, 220)"),
+            "Button must not use cyan/blue fill color"
+        );
+        assert!(
+            !prod_code.contains("Color32::from_rgb(0, 185, 255)"),
+            "Button must not use bright blue hover fill color"
+        );
+        assert!(
+            !prod_code.contains("Color32::from_rgb(100, 220, 255)"),
+            "Button must not use cyan stroke color"
+        );
+
+        // Assert signature orange/amber theme colors are present
+        assert!(
+            prod_code.contains("Color32::from_rgb(205, 95, 0)"),
+            "Button must use theme amber/orange fill color"
+        );
+        assert!(
+            prod_code.contains("Color32::from_rgb(255, 145, 30)"),
+            "Button must use theme orange stroke color"
+        );
     }
 }

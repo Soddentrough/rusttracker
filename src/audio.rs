@@ -275,7 +275,7 @@ pub fn spawn_dsp_thread(
                 
                 state.raw_spectrum_data.copy_from_slice(&binned_data);
                 state.gpu_spectrum_data = gpu_spectrum.clone();
-                if state.stats.bitstream_active && !msg.channel_audio_data.is_empty() {
+                if !msg.channel_audio_data.is_empty() {
                     push_planar_lookahead_slices(&mut state, &msg.channel_audio_data, sample_rate, msg.current_seconds);
                 }
                 state.raw_audio_channels = msg.channel_audio_data;
@@ -347,58 +347,81 @@ pub fn spawn_dsp_thread(
                 if state.lookahead_timeline.len() != 600 * 8 {
                     state.lookahead_timeline = vec![0.0; 600 * 8];
                 }
+                while let Some(&(t, _)) = state.lookahead_queue.front() {
+                    if t < msg.current_seconds - 2.0 {
+                        state.lookahead_queue.pop_front();
+                    } else {
+                        break;
+                    }
+                }
                 if !state.lookahead_queue.is_empty() {
                     let cur_t = msg.current_seconds;
                     let q_len = state.lookahead_queue.len();
                     let (t_first, _) = state.lookahead_queue[0];
                     let (t_last, _) = state.lookahead_queue[q_len - 1];
-                    let total_span = (t_last - t_first).max(0.1);
+                    let total_span = (t_last - t_first).max(0.01);
 
                     for k in 0..600 {
                         let mut target_t = cur_t + (k as f64 - 100.0) * 0.01;
                         let off = k * 8;
 
-                        if target_t > t_last && total_span > 0.05 {
+                        if target_t > t_last {
                             let future_offset = target_t - t_last;
-                            target_t = t_last - (future_offset % total_span);
+                            target_t = t_first + (future_offset % total_span);
+                        } else if target_t < t_first {
+                            let past_offset = t_first - target_t;
+                            target_t = t_last - (past_offset % total_span);
                         }
-                        
+
                         let idx = match state.lookahead_queue.binary_search_by(|(t, _)| t.partial_cmp(&target_t).unwrap_or(std::cmp::Ordering::Equal)) {
                             Ok(i) => i,
                             Err(i) => i,
                         };
-                        
+
                         if idx == 0 {
-                            let (t0, d0) = state.lookahead_queue[0];
-                            if (t0 - target_t).abs() < 0.15 {
-                                state.lookahead_timeline[off..off + 8].copy_from_slice(&d0);
-                            } else {
-                                state.lookahead_timeline[off..off + 8].fill(0.0);
-                            }
+                            let (_, d0) = state.lookahead_queue[0];
+                            state.lookahead_timeline[off..off + 8].copy_from_slice(&d0);
                         } else if idx >= q_len {
-                            let (t_last_val, d_last) = state.lookahead_queue[q_len - 1];
-                            if (t_last_val - target_t).abs() < 0.15 {
-                                state.lookahead_timeline[off..off + 8].copy_from_slice(&d_last);
-                            } else {
-                                state.lookahead_timeline[off..off + 8].fill(0.0);
-                            }
+                            let (_, d_last) = state.lookahead_queue[q_len - 1];
+                            state.lookahead_timeline[off..off + 8].copy_from_slice(&d_last);
                         } else {
                             let (t0, d0) = state.lookahead_queue[idx - 1];
                             let (t1, d1) = state.lookahead_queue[idx];
                             let dt = t1 - t0;
-                            if dt > 0.0001 && dt < 0.5 && target_t >= t0 && target_t <= t1 {
+                            if dt > 0.0001 && dt < 1.0 && target_t >= t0 && target_t <= t1 {
                                 let frac = ((target_t - t0) / dt).clamp(0.0, 1.0) as f32;
                                 for c in 0..8 {
                                     state.lookahead_timeline[off + c] = d0[c] * (1.0 - frac) + d1[c] * frac;
                                 }
-                            } else if (t1 - target_t).abs() < 0.15 {
-                                state.lookahead_timeline[off..off + 8].copy_from_slice(&d1);
-                            } else if (t0 - target_t).abs() < 0.15 {
-                                state.lookahead_timeline[off..off + 8].copy_from_slice(&d0);
                             } else {
-                                state.lookahead_timeline[off..off + 8].fill(0.0);
+                                state.lookahead_timeline[off..off + 8].copy_from_slice(&d0);
                             }
                         }
+                    }
+                } else if !state.raw_waveform.is_empty() {
+                    // Fallback synthesis when lookahead_queue is empty (e.g. initial playback or live mic)
+                    // Synthesize continuous timeline envelope from raw waveform and channel VUs so tape head is never dead
+                    let wave_len = state.raw_waveform.len();
+                    let vu_l = state.raw_channel_vus.first().copied().unwrap_or(0.2).clamp(0.05, 1.0);
+                    let vu_r = state.raw_channel_vus.get(1).copied().unwrap_or(vu_l).clamp(0.05, 1.0);
+                    for k in 0..600 {
+                        let off = k * 8;
+                        let wave_idx = (k * 13) % wave_len;
+                        let sample = state.raw_waveform[wave_idx].clamp(-1.0, 1.0);
+                        let sample_next = state.raw_waveform[(wave_idx + 1) % wave_len].clamp(-1.0, 1.0);
+                        let min_s = sample.min(sample_next).min(0.0) * vu_l;
+                        let max_s = sample.max(sample_next).max(0.0) * vu_l;
+                        let min_r = sample.min(sample_next).min(0.0) * vu_r;
+                        let max_r = sample.max(sample_next).max(0.0) * vu_r;
+                        let rms = (sample.abs() * 0.7 + 0.3 * (vu_l + vu_r) * 0.5).min(1.0);
+                        state.lookahead_timeline[off + 0] = min_s;
+                        state.lookahead_timeline[off + 1] = max_s;
+                        state.lookahead_timeline[off + 2] = min_r;
+                        state.lookahead_timeline[off + 3] = max_r;
+                        state.lookahead_timeline[off + 4] = rms;
+                        state.lookahead_timeline[off + 5] = rms;
+                        state.lookahead_timeline[off + 6] = vu_l;
+                        state.lookahead_timeline[off + 7] = vu_r;
                     }
                 }
                 
@@ -2452,7 +2475,7 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
         if passthrough {
             let (tx, rx) = bounded::<DspMessage>(32);
             let stop_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            if let Ok((handle, decoder_rate, channels, codec_name, has_video)) = crate::bitstream::start_bitstream_thread(file_path, shared_state.clone(), tx.clone(), stop_token.clone()) {
+            if let Ok((handle, decoder_rate, channels, codec_name, has_video, artist, duration)) = crate::bitstream::start_bitstream_thread(file_path, shared_state.clone(), tx.clone(), stop_token.clone()) {
                 let max_frequency = shared_state.lock().unwrap().max_frequency;
                 let sample_rate = decoder_rate;
                 let window_size = calculate_power_of_two_window_size(sample_rate);
@@ -2471,14 +2494,9 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
                 
                 let video_suffix = if has_video { " (Video available: 'v' to view)" } else { "" };
                 
-                let mut meta_artist = if is_lpcm { "WASAPI Exclusive LPCM".to_string() } else { "Bitstream Active".to_string() };
-                let mut meta_duration = 0.0;
-                if let Ok(mut src) = load_audio_source(file_path) {
-                    let a = src.get_artist();
-                    let d = src.get_duration_seconds();
-                    if !a.is_empty() { meta_artist = a; }
-                    if d > 0.0 { meta_duration = d; }
-                }
+                let default_artist = if is_lpcm { "WASAPI Exclusive LPCM" } else { "Bitstream Active" };
+                let meta_artist = if !artist.is_empty() { artist } else { default_artist.to_string() };
+                let meta_duration = duration;
 
                 {
                     let mut state = shared_state.lock().unwrap();
@@ -2964,8 +2982,7 @@ pub fn push_planar_lookahead_slices(
         return;
     }
 
-    let window_duration = (full_slices * slice_frames) as f64 / sample_rate as f64;
-    let window_start_time = current_seconds - window_duration;
+    let window_start_time = current_seconds;
 
     for s in 0..full_slices {
         let start_f = s * slice_frames;

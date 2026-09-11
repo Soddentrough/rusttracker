@@ -385,9 +385,9 @@ async fn run_gui(
     // is_game_mode already detected above
 
     #[cfg(windows)]
-    let initial_dir = std::path::PathBuf::from(std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".to_string()));
+    let mut initial_dir = std::path::PathBuf::from(std::env::var("USERPROFILE").unwrap_or_else(|_| "C:\\".to_string()));
     #[cfg(not(windows))]
-    let initial_dir = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".to_string()));
+    let mut initial_dir = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".to_string()));
 
     let mut file_dialog = egui_file_dialog::FileDialog::new()
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
@@ -1531,6 +1531,9 @@ async fn run_gui(
                         if let Ok(paths) = rfd_rx.try_recv() {
                             rfd_pending = false;
                             if !paths.is_empty() {
+                                if let Some(parent) = std::path::Path::new(&paths[0]).parent() {
+                                    initial_dir = parent.to_path_buf();
+                                }
                                 let expanded = crate::playlist::expand_input_paths(&paths);
                                 let append = state.append_to_playlist;
                                 if append && !state.playlist.is_empty() {
@@ -1542,6 +1545,7 @@ async fn run_gui(
                                     state.file_loaded = true;
                                 }
                                 state.is_file_picker_open = false;
+                                window.request_redraw();
                             }
                         }
 
@@ -1608,6 +1612,29 @@ async fn run_gui(
                 }
             },
             Event::AboutToWait => {
+                    // Poll native file picker results immediately to eliminate UI latency
+                    if let Ok(paths) = rfd_rx.try_recv() {
+                        rfd_pending = false;
+                        if !paths.is_empty() {
+                            if let Some(parent) = std::path::Path::new(&paths[0]).parent() {
+                                initial_dir = parent.to_path_buf();
+                            }
+                            let expanded = crate::playlist::expand_input_paths(&paths);
+                            let mut state = app_state.lock().unwrap();
+                            let append = state.append_to_playlist;
+                            if append && !state.playlist.is_empty() {
+                                state.playlist.extend(expanded);
+                            } else if !expanded.is_empty() {
+                                state.playlist = expanded;
+                                state.playlist_index = 0;
+                                state.load_request = Some(state.playlist[0].clone());
+                                state.file_loaded = true;
+                            }
+                            state.is_file_picker_open = false;
+                            window.request_redraw();
+                        }
+                    }
+
                     let is_dialog_open = *file_dialog.state() == egui_file_dialog::DialogState::Open || {
                         let state = app_state.lock().unwrap();
                         state.is_url_dialog_open
