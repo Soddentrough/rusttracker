@@ -16,7 +16,9 @@ RUST_TARGET="aarch64-linux-android"
 BUILD_APK=false
 DO_INSTALL=false
 DO_RUN=false
+AUTO_DEPLOY=false
 DEVICE_SERIAL=""
+export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-16}"
 
 # Export Android SDK/NDK paths if not set
 export ANDROID_HOME="${ANDROID_HOME:-$HOME/Android/Sdk}"
@@ -59,6 +61,12 @@ while [[ $# -gt 0 ]]; do
             DO_INSTALL=true
             shift
             ;;
+        --auto-deploy|--deploy-if-attached)
+            BUILD_APK=true
+            DO_INSTALL=true
+            AUTO_DEPLOY=true
+            shift
+            ;;
         --run)
             BUILD_APK=true
             DO_INSTALL=true
@@ -78,6 +86,7 @@ while [[ $# -gt 0 ]]; do
             echo "  --target <abi>      Target ABI: arm64-v8a (default), x86_64, armeabi-v7a"
             echo "  --apk               Package APK using Gradle after building native library"
             echo "  --install           Build APK and install onto connected Android device"
+            echo "  --auto-deploy       Build APK and deploy only if an Android device is attached"
             echo "  --run               Build APK, install, and launch RustTracker on device"
             echo "  --device <serial>   Specify target device serial (optional)"
             echo "  -h, --help          Show this help message"
@@ -85,7 +94,7 @@ while [[ $# -gt 0 ]]; do
             ;;
         *)
             echo "Unknown argument: $1"
-            echo "Usage: $0 [--release|--debug] [--target <abi>] [--apk] [--install] [--run] [--device <serial>]"
+            echo "Usage: $0 [--release|--debug] [--target <abi>] [--apk] [--install] [--auto-deploy] [--run] [--device <serial>]"
             exit 1
             ;;
     esac
@@ -173,26 +182,38 @@ if [[ "$DO_INSTALL" = true ]]; then
     echo "==================================================="
     
     if ! command -v adb &> /dev/null; then
+        if [[ "$AUTO_DEPLOY" = true ]]; then
+            echo "Warning: adb command not found. Skipping auto-deploy."
+            exit 0
+        fi
         echo "Error: adb command not found. Ensure Android platform-tools or ~/.local/bin is installed." >&2
         exit 1
     fi
     
-    ADB_CMD=(adb)
+    TARGET_DEVICES=()
     if [[ -n "$DEVICE_SERIAL" ]]; then
-        ADB_CMD+=(-s "$DEVICE_SERIAL")
+        TARGET_DEVICES=("$DEVICE_SERIAL")
+    else
+        while IFS= read -r dev; do
+            [[ -n "$dev" ]] && TARGET_DEVICES+=("$dev")
+        done < <(adb devices 2>/dev/null | awk '$2 == "device" { print $1 }')
     fi
     
-    # Verify device connectivity
-    DEVICES_OUTPUT=$("${ADB_CMD[@]}" devices | grep -v "List of devices" | grep "device$" || true)
-    if [[ -z "$DEVICES_OUTPUT" ]]; then
+    if [[ ${#TARGET_DEVICES[@]} -eq 0 ]]; then
+        if [[ "$AUTO_DEPLOY" = true ]]; then
+            echo "No attached Android devices detected. Skipping installation."
+            exit 0
+        fi
         echo "Error: No authorized Android devices connected." >&2
-        "${ADB_CMD[@]}" devices -l
+        adb devices -l
         exit 1
     fi
     
-    echo "Installing $APK_PATH..."
-    "${ADB_CMD[@]}" install -r -d "$APK_PATH"
-    echo "Installation successful!"
+    for dev in "${TARGET_DEVICES[@]}"; do
+        echo "Installing $APK_PATH to device $dev..."
+        adb -s "$dev" install -r -d "$APK_PATH"
+        echo "Successfully installed on device $dev!"
+    done
 fi
 
 # 5. Optional: Launch application
@@ -201,11 +222,9 @@ if [[ "$DO_RUN" = true ]]; then
     echo "  Launching RustTracker on Device"
     echo "==================================================="
     
-    ADB_CMD=(adb)
-    if [[ -n "$DEVICE_SERIAL" ]]; then
-        ADB_CMD+=(-s "$DEVICE_SERIAL")
-    fi
-    
-    "${ADB_CMD[@]}" shell am start -n com.rusttracker.app/com.rusttracker.app.MainActivity
-    echo "RustTracker launched on device!"
+    for dev in "${TARGET_DEVICES[@]}"; do
+        echo "Launching RustTracker on device $dev..."
+        adb -s "$dev" shell am start -n com.rusttracker.app/com.rusttracker.app.MainActivity
+    done
+    echo "RustTracker launched successfully!"
 fi

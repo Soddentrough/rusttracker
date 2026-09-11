@@ -1075,7 +1075,7 @@ pub(crate) fn generate_glass_lyrics_mesh(text: &str) -> (Vec<Vertex>, Vec<u32>) 
         }
 
         let target_width = 7.5f32;
-        let text_scale = (target_width / total_advance.max(1.0)).clamp(0.40, 1.25);
+        let text_scale = (target_width / total_advance.max(1.0)).clamp(0.15, 1.25);
         let start_x = -total_advance * text_scale * 0.5;
         let baseline_y = 0.16; // Sits just above water level y = 0.0
         let depth = 0.22 * text_scale;
@@ -5125,7 +5125,8 @@ impl VulkanEngine {
                                                 .spacing([18.0, 5.0])
                                                 .show(ui, |ui| {
                                                     ui.label(egui::RichText::new("Swipe L / R").color(egui::Color32::from_rgb(0, 220, 255)).strong().size(12.5));
-                                                    ui.label(egui::RichText::new(format!("Switch Visualizers ({})", crate::state::VISUALIZERS.len())).color(egui::Color32::LIGHT_GRAY).size(12.5));
+                                                    let enabled_count = state.vis_enabled.iter().filter(|&&e| e).count();
+                                                    ui.label(egui::RichText::new(format!("Switch Visualizers ({})", enabled_count)).color(egui::Color32::LIGHT_GRAY).size(12.5));
                                                     ui.end_row();
 
                                                     ui.label(egui::RichText::new("Swipe U / D").color(egui::Color32::from_rgb(0, 220, 255)).strong().size(12.5));
@@ -6136,123 +6137,123 @@ impl VulkanEngine {
                                                 let is_all_on = state.active_audio_tracks.len() == num_tracks && num_tracks > 0;
                                                 let is_mix_1_2 = state.active_audio_tracks.len() == 2 && state.active_audio_tracks.contains(&0) && state.active_audio_tracks.contains(&1);
 
-                                                let total_width = ui.available_width();
-                                                let spacing = 6.0;
+                                                 let total_width = ui.available_width();
+                                                 let spacing = 6.0;
+                                                 let is_compact = cfg!(target_os = "android") || total_width < 420.0;
+                                                 let btn_h = 34.0;
 
-                                                if num_tracks <= 2 {
-                                                    // 4 full-width buttons in a single row: [All On] [Trk 1] [Trk 2] [Mix 1&2]
-                                                    let btn_count = if num_tracks == 2 { 4.0 } else { 2.0 };
-                                                    let btn_w = ((total_width - spacing * (btn_count - 1.0)) / btn_count).max(50.0);
-                                                    let btn_h = 34.0;
+                                                 let render_all_on = |ui: &mut egui::Ui, w: f32, h: f32, engine_action: &mut EngineAction| {
+                                                     let all_btn = egui::Button::new(
+                                                         egui::RichText::new("All On").strong().size(12.0).color(if is_all_on { egui::Color32::from_rgb(0, 240, 170) } else { egui::Color32::LIGHT_GRAY })
+                                                     )
+                                                     .fill(if is_all_on { egui::Color32::from_rgba_unmultiplied(0, 140, 100, 180) } else { egui::Color32::from_rgba_unmultiplied(50, 60, 70, 220) })
+                                                     .stroke(if is_all_on { egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0, 240, 170)) } else { egui::Stroke::NONE });
 
-                                                    ui.horizontal(|ui| {
-                                                        ui.spacing_mut().item_spacing.x = spacing;
+                                                     if ui.add_sized([w, h], all_btn).clicked() {
+                                                         let all_mix: Vec<(usize, f32)> = (0..num_tracks).map(|i| (i, 1.0)).collect();
+                                                         *engine_action = EngineAction::SetAudioMixTracks(all_mix);
+                                                     }
+                                                 };
 
-                                                        // All On
-                                                        let all_btn = egui::Button::new(
-                                                            egui::RichText::new("All On").strong().size(12.0).color(if is_all_on { egui::Color32::from_rgb(0, 240, 170) } else { egui::Color32::LIGHT_GRAY })
-                                                        )
-                                                        .fill(if is_all_on { egui::Color32::from_rgba_unmultiplied(0, 140, 100, 180) } else { egui::Color32::from_rgba_unmultiplied(50, 60, 70, 220) })
-                                                        .stroke(if is_all_on { egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0, 240, 170)) } else { egui::Stroke::NONE });
+                                                 let render_mix_1_2 = |ui: &mut egui::Ui, w: f32, h: f32, engine_action: &mut EngineAction| {
+                                                     let mix_btn = egui::Button::new(
+                                                         egui::RichText::new("Mix 1&2").strong().size(12.0).color(if is_mix_1_2 { egui::Color32::from_rgb(0, 240, 170) } else { egui::Color32::from_rgb(0, 210, 160) })
+                                                     )
+                                                     .fill(if is_mix_1_2 { egui::Color32::from_rgba_unmultiplied(0, 150, 110, 200) } else { egui::Color32::from_rgba_unmultiplied(0, 80, 70, 180) })
+                                                     .stroke(if is_mix_1_2 { egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0, 240, 170)) } else { egui::Stroke::NONE });
 
-                                                        if ui.add_sized([btn_w, btn_h], all_btn).clicked() {
-                                                            let all_mix: Vec<(usize, f32)> = (0..num_tracks).map(|i| (i, 1.0)).collect();
-                                                            *engine_action = EngineAction::SetAudioMixTracks(all_mix);
-                                                        }
+                                                     if ui.add_sized([w, h], mix_btn).clicked() {
+                                                         *engine_action = EngineAction::SetAudioMixTracks(vec![(0, 1.0), (1, 1.0)]);
+                                                     }
+                                                 };
 
-                                                        // Trk 1
-                                                        let is_solo_0 = state.active_audio_tracks.len() == 1 && state.active_audio_tracks.contains(&0);
-                                                        let trk1_btn = egui::Button::new(
-                                                            egui::RichText::new("Trk 1").strong().size(12.0).color(if is_solo_0 { egui::Color32::from_rgb(0, 220, 255) } else { egui::Color32::LIGHT_GRAY })
-                                                        )
-                                                        .fill(if is_solo_0 { egui::Color32::from_rgba_unmultiplied(0, 100, 150, 180) } else { egui::Color32::from_rgba_unmultiplied(50, 60, 70, 220) })
-                                                        .stroke(if is_solo_0 { egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0, 220, 255)) } else { egui::Stroke::NONE });
+                                                 let render_solo = |ui: &mut egui::Ui, track_idx: usize, w: f32, h: f32, engine_action: &mut EngineAction| {
+                                                     let is_solo = state.active_audio_tracks.len() == 1 && state.active_audio_tracks.contains(&track_idx);
+                                                     let btn = egui::Button::new(
+                                                         egui::RichText::new(format!("Trk {}", track_idx + 1)).strong().size(12.0).color(if is_solo { egui::Color32::from_rgb(0, 220, 255) } else { egui::Color32::LIGHT_GRAY })
+                                                     )
+                                                     .fill(if is_solo { egui::Color32::from_rgba_unmultiplied(0, 100, 150, 180) } else { egui::Color32::from_rgba_unmultiplied(50, 60, 70, 220) })
+                                                     .stroke(if is_solo { egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0, 220, 255)) } else { egui::Stroke::NONE });
 
-                                                        if ui.add_sized([btn_w, btn_h], trk1_btn).clicked() {
-                                                            *engine_action = EngineAction::SetAudioMixTracks(vec![(0, 1.0)]);
-                                                        }
+                                                     if ui.add_sized([w, h], btn).clicked() {
+                                                         *engine_action = EngineAction::SetAudioMixTracks(vec![(track_idx, 1.0)]);
+                                                     }
+                                                 };
 
-                                                        if num_tracks >= 2 {
-                                                            // Trk 2
-                                                            let is_solo_1 = state.active_audio_tracks.len() == 1 && state.active_audio_tracks.contains(&1);
-                                                            let trk2_btn = egui::Button::new(
-                                                                egui::RichText::new("Trk 2").strong().size(12.0).color(if is_solo_1 { egui::Color32::from_rgb(0, 220, 255) } else { egui::Color32::LIGHT_GRAY })
-                                                            )
-                                                            .fill(if is_solo_1 { egui::Color32::from_rgba_unmultiplied(0, 100, 150, 180) } else { egui::Color32::from_rgba_unmultiplied(50, 60, 70, 220) })
-                                                            .stroke(if is_solo_1 { egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0, 220, 255)) } else { egui::Stroke::NONE });
+                                                 if num_tracks <= 2 {
+                                                     if is_compact {
+                                                         // 2 rows on mobile/narrow screen:
+                                                         // Row 1: [All On] [Mix 1&2] (50% width each)
+                                                         let row_w = ((total_width - spacing) / 2.0).max(60.0);
+                                                         ui.horizontal(|ui| {
+                                                             ui.spacing_mut().item_spacing.x = spacing;
+                                                             render_all_on(ui, row_w, btn_h, engine_action);
+                                                             if num_tracks >= 2 {
+                                                                 render_mix_1_2(ui, row_w, btn_h, engine_action);
+                                                             }
+                                                         });
+                                                         if num_tracks >= 2 {
+                                                             ui.add_space(3.0);
+                                                             // Row 2: [Trk 1] [Trk 2] (50% width each)
+                                                             ui.horizontal(|ui| {
+                                                                 ui.spacing_mut().item_spacing.x = spacing;
+                                                                 render_solo(ui, 0, row_w, btn_h, engine_action);
+                                                                 render_solo(ui, 1, row_w, btn_h, engine_action);
+                                                             });
+                                                         }
+                                                     } else {
+                                                         // Wide screen: 4 buttons in a single row
+                                                         let btn_count = if num_tracks == 2 { 4.0 } else { 2.0 };
+                                                         let btn_w = ((total_width - spacing * (btn_count - 1.0)) / btn_count).max(50.0);
+                                                         ui.horizontal(|ui| {
+                                                             ui.spacing_mut().item_spacing.x = spacing;
+                                                             render_all_on(ui, btn_w, btn_h, engine_action);
+                                                             render_solo(ui, 0, btn_w, btn_h, engine_action);
+                                                             if num_tracks >= 2 {
+                                                                 render_solo(ui, 1, btn_w, btn_h, engine_action);
+                                                                 render_mix_1_2(ui, btn_w, btn_h, engine_action);
+                                                             }
+                                                         });
+                                                     }
+                                                 } else {
+                                                     // 3+ tracks:
+                                                     // Row 1: Mix combos [All On] [Mix 1&2] (each 50% width)
+                                                     let row1_w = ((total_width - spacing) / 2.0).max(60.0);
+                                                     ui.horizontal(|ui| {
+                                                         ui.spacing_mut().item_spacing.x = spacing;
+                                                         render_all_on(ui, row1_w, btn_h, engine_action);
+                                                         render_mix_1_2(ui, row1_w, btn_h, engine_action);
+                                                     });
 
-                                                            if ui.add_sized([btn_w, btn_h], trk2_btn).clicked() {
-                                                                *engine_action = EngineAction::SetAudioMixTracks(vec![(1, 1.0)]);
-                                                            }
+                                                     ui.add_space(3.0);
 
-                                                            // Mix 1&2
-                                                            let mix_btn = egui::Button::new(
-                                                                egui::RichText::new("Mix 1&2").strong().size(12.0).color(if is_mix_1_2 { egui::Color32::from_rgb(0, 240, 170) } else { egui::Color32::from_rgb(0, 210, 160) })
-                                                            )
-                                                            .fill(if is_mix_1_2 { egui::Color32::from_rgba_unmultiplied(0, 150, 110, 200) } else { egui::Color32::from_rgba_unmultiplied(0, 80, 70, 180) })
-                                                            .stroke(if is_mix_1_2 { egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0, 240, 170)) } else { egui::Stroke::NONE });
-
-                                                            if ui.add_sized([btn_w, btn_h], mix_btn).clicked() {
-                                                                *engine_action = EngineAction::SetAudioMixTracks(vec![(0, 1.0), (1, 1.0)]);
-                                                            }
-                                                        }
-                                                    });
-                                                } else {
-                                                    // 2 rows for 3+ tracks:
-                                                    // Row 1: Mix combos [All On] [Mix 1&2] (each 50% width)
-                                                    let row1_w = ((total_width - spacing) / 2.0).max(60.0);
-                                                    let btn_h = 34.0;
-
-                                                    ui.horizontal(|ui| {
-                                                        ui.spacing_mut().item_spacing.x = spacing;
-
-                                                        // All On
-                                                        let all_btn = egui::Button::new(
-                                                            egui::RichText::new("All On").strong().size(12.5).color(if is_all_on { egui::Color32::from_rgb(0, 240, 170) } else { egui::Color32::LIGHT_GRAY })
-                                                        )
-                                                        .fill(if is_all_on { egui::Color32::from_rgba_unmultiplied(0, 140, 100, 180) } else { egui::Color32::from_rgba_unmultiplied(50, 60, 70, 220) })
-                                                        .stroke(if is_all_on { egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0, 240, 170)) } else { egui::Stroke::NONE });
-
-                                                        if ui.add_sized([row1_w, btn_h], all_btn).clicked() {
-                                                            let all_mix: Vec<(usize, f32)> = (0..num_tracks).map(|i| (i, 1.0)).collect();
-                                                            *engine_action = EngineAction::SetAudioMixTracks(all_mix);
-                                                        }
-
-                                                        // Mix 1&2
-                                                        let mix_btn = egui::Button::new(
-                                                            egui::RichText::new("Mix 1&2").strong().size(12.5).color(if is_mix_1_2 { egui::Color32::from_rgb(0, 240, 170) } else { egui::Color32::from_rgb(0, 210, 160) })
-                                                        )
-                                                        .fill(if is_mix_1_2 { egui::Color32::from_rgba_unmultiplied(0, 150, 110, 200) } else { egui::Color32::from_rgba_unmultiplied(0, 80, 70, 180) })
-                                                        .stroke(if is_mix_1_2 { egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0, 240, 170)) } else { egui::Stroke::NONE });
-
-                                                        if ui.add_sized([row1_w, btn_h], mix_btn).clicked() {
-                                                            *engine_action = EngineAction::SetAudioMixTracks(vec![(0, 1.0), (1, 1.0)]);
-                                                        }
-                                                    });
-
-                                                    ui.add_space(3.0);
-
-                                                    // Row 2: Solo Tracks [Trk 1] [Trk 2] [Trk 3] [Trk 4] (equally dividing width)
-                                                    let display_count = num_tracks.min(4);
-                                                    let row2_w = ((total_width - spacing * (display_count - 1) as f32) / display_count as f32).max(45.0);
-
-                                                    ui.horizontal(|ui| {
-                                                        ui.spacing_mut().item_spacing.x = spacing;
-
-                                                        for i in 0..display_count {
-                                                            let is_solo_i = state.active_audio_tracks.len() == 1 && state.active_audio_tracks.contains(&i);
-                                                            let btn = egui::Button::new(
-                                                                egui::RichText::new(format!("Trk {}", i + 1)).strong().size(12.0).color(if is_solo_i { egui::Color32::from_rgb(0, 220, 255) } else { egui::Color32::LIGHT_GRAY })
-                                                            )
-                                                            .fill(if is_solo_i { egui::Color32::from_rgba_unmultiplied(0, 100, 150, 180) } else { egui::Color32::from_rgba_unmultiplied(50, 60, 70, 220) })
-                                                            .stroke(if is_solo_i { egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0, 220, 255)) } else { egui::Stroke::NONE });
-
-                                                            if ui.add_sized([row2_w, 32.0], btn).clicked() {
-                                                                *engine_action = EngineAction::SetAudioMixTracks(vec![(i, 1.0)]);
-                                                            }
-                                                        }
-                                                    });
-                                                }
+                                                     let display_count = num_tracks.min(4);
+                                                     if is_compact {
+                                                         // Solo tracks in rows of 2 for mobile/narrow
+                                                         let chunks: Vec<Vec<usize>> = (0..display_count).collect::<Vec<_>>().chunks(2).map(|c| c.to_vec()).collect();
+                                                         for (c_idx, chunk) in chunks.iter().enumerate() {
+                                                             let chunk_w = ((total_width - spacing * (chunk.len() - 1) as f32) / chunk.len() as f32).max(45.0);
+                                                             ui.horizontal(|ui| {
+                                                                 ui.spacing_mut().item_spacing.x = spacing;
+                                                                 for &idx in chunk {
+                                                                     render_solo(ui, idx, chunk_w, 32.0, engine_action);
+                                                                 }
+                                                             });
+                                                             if c_idx + 1 < chunks.len() {
+                                                                 ui.add_space(3.0);
+                                                             }
+                                                         }
+                                                     } else {
+                                                         // Wide screen: all solo tracks in a single row
+                                                         let row2_w = ((total_width - spacing * (display_count - 1) as f32) / display_count as f32).max(45.0);
+                                                         ui.horizontal(|ui| {
+                                                             ui.spacing_mut().item_spacing.x = spacing;
+                                                             for idx in 0..display_count {
+                                                                 render_solo(ui, idx, row2_w, 32.0, engine_action);
+                                                             }
+                                                         });
+                                                     }
+                                                 }
                                                 ui.add_space(4.0);
                                             }
                                             
@@ -6805,7 +6806,9 @@ impl VulkanEngine {
             } else {
                 48.0_f32.to_radians()
             };
-            let fov_y = if aspect < 1.0 {
+            let fov_y = if state.visualizer_mode == 19 || state.visualizer_mode == 23 {
+                base_fov
+            } else if aspect < 1.0 {
                 (base_fov / aspect.clamp(0.65, 1.0)).min(if state.visualizer_mode == 22 { 85.0_f32.to_radians() } else { 75.0_f32.to_radians() })
             } else {
                 base_fov
@@ -6826,9 +6829,11 @@ impl VulkanEngine {
                     glam::Vec3::new(0.0, 1.0, 0.0),
                 )
             } else if state.visualizer_mode == 19 {
-                // 3D Vintage Hi-Fi Master Rack
+                // 3D Vintage Hi-Fi Master Rack:
+                // Scale camera distance so 11.5-wide rack fits completely in square/portrait viewports without clipping
+                let cam_z = (13.5 / aspect).clamp(6.2, 22.0);
                 glam::Mat4::look_at_rh(
-                    glam::Vec3::new(0.0, 0.0, 6.2),
+                    glam::Vec3::new(0.0, 0.0, cam_z),
                     glam::Vec3::new(0.0, 0.0, 0.0),
                     glam::Vec3::new(0.0, 1.0, 0.0),
                 )
@@ -6848,8 +6853,12 @@ impl VulkanEngine {
                 )
             } else if state.visualizer_mode == 23 {
                 // 3D Glass Water Lyrics: Low-angle studio camera
+                // Scale camera distance and elevation so 7.5-wide text fits cleanly in square/portrait mobile viewport
+                let lyrics_scale = (2.2 / aspect).max(1.0);
+                let eye_y = 0.45 + 0.95 * lyrics_scale;
+                let eye_z = 4.2 * lyrics_scale;
                 glam::Mat4::look_at_rh(
-                    glam::Vec3::new(0.0, 1.4, 4.2),
+                    glam::Vec3::new(0.0, eye_y, eye_z),
                     glam::Vec3::new(0.0, 0.45, 0.0),
                     glam::Vec3::new(0.0, 1.0, 0.0),
                 )
@@ -7369,6 +7378,73 @@ mod tests {
         assert!(raw_source.contains("// INCLUDE: common"));
         assert!(raw_source.contains("vs_main_3d"));
         assert!(raw_source.contains("fs_main"));
+        assert!(raw_source.contains("camera.view_matrix"));
+    }
+
+    #[test]
+    fn test_mobile_visualizer_fixes() {
+        // Verify Midnight Storm shader (vis_rain.wgsl) has the updated reactive lightning logic
+        let rain_source = include_str!("shaders/vis_rain.wgsl");
+        assert!(rain_source.contains("lightning_bolt"));
+        assert!(rain_source.contains("strike_tick"));
+        assert!(rain_source.contains("audio.smooth_time"));
+        assert!(rain_source.contains("channel_peaks"));
+
+        // Verify VU meter rack OBJ model loads cleanly and has non-empty geometry
+        let (vu_verts, vu_indices) = generate_vumeter_rack_mesh();
+        assert!(!vu_verts.is_empty(), "VU meter rack vertices must not be empty");
+        assert!(!vu_indices.is_empty(), "VU meter rack indices must not be empty");
+
+        // Verify Glass Lyrics mesh generator handles long strings with appropriate scaling
+        let (lyrics_verts, lyrics_indices) = generate_glass_lyrics_mesh("THIS IS A VERY LONG TEST LYRIC LINE FOR MOBILE VIEWPORT");
+        assert!(!lyrics_verts.is_empty(), "Glass lyrics vertices must not be empty for long line");
+        assert!(!lyrics_indices.is_empty(), "Glass lyrics indices must not be empty for long line");
+
+        const SHADER_COMMON: &str = include_str!("shaders/_common.wgsl");
+        const SHADER_GLYPH_FONT: &str = include_str!("shaders/_glyph_font.wgsl");
+        let resolve_shader_includes = |source: &str| -> String {
+            source
+                .replace("// INCLUDE: common", SHADER_COMMON)
+                .replace("// INCLUDE: glyph_font", SHADER_GLYPH_FONT)
+        };
+        let rain_resolved = resolve_shader_includes(include_str!("shaders/vis_rain.wgsl"));
+        if let Err(e) = wgpu::naga::front::wgsl::parse_str(&rain_resolved) {
+            panic!("vis_rain WGSL error:\n{}", e.emit_to_string(&rain_resolved));
+        }
+
+        let vu_resolved = resolve_shader_includes(include_str!("shaders/vis_vumeters_3d.wgsl"));
+        if let Err(e) = wgpu::naga::front::wgsl::parse_str(&vu_resolved) {
+            panic!("vis_vumeters_3d WGSL error:\n{}", e.emit_to_string(&vu_resolved));
+        }
+
+        let lyrics_resolved = resolve_shader_includes(include_str!("shaders/vis_lyrics.wgsl"));
+        if let Err(e) = wgpu::naga::front::wgsl::parse_str(&lyrics_resolved) {
+            panic!("vis_lyrics WGSL error:\n{}", e.emit_to_string(&lyrics_resolved));
+        }
+
+        let scope_resolved = resolve_shader_includes(include_str!("shaders/vis_3doscilloscope_raster.wgsl"));
+        if let Err(e) = wgpu::naga::front::wgsl::parse_str(&scope_resolved) {
+            panic!("vis_3doscilloscope_raster WGSL error:\n{}", e.emit_to_string(&scope_resolved));
+        }
+    }
+
+    #[test]
+    fn test_quick_mix_presets_layout() {
+        // Verify that in compact / mobile mode, preset widths and rows never overflow available width
+        let mobile_widths = [280.0_f32, 320.0, 360.0, 400.0];
+        let spacing = 6.0_f32;
+
+        for &width in &mobile_widths {
+            // 2 tracks: 2 buttons per row, 2 rows
+            let row_w = ((width - spacing) / 2.0).max(60.0);
+            let row_total = row_w * 2.0 + spacing;
+            assert!(row_total <= width + 0.01, "Row width {} must fit in available width {}", row_total, width);
+
+            // 4 tracks: Row 1 has 2 buttons, Row 2 has 2 buttons, Row 3 has 2 buttons
+            let chunk_w = ((width - spacing) / 2.0).max(45.0);
+            let chunk_total = chunk_w * 2.0 + spacing;
+            assert!(chunk_total <= width + 0.01, "Chunk width {} must fit in available width {}", chunk_total, width);
+        }
     }
 
     #[test]

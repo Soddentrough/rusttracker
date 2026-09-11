@@ -324,6 +324,8 @@ impl AppState {
                 1,  // CRT Oscilloscope (23.8ms on mobile)
                 2,  // 3D CRT Oscilloscope (38.2ms on mobile -> replaced by 3D Oscilloscope Raster at 178 FPS)
                 4,  // 3D Freq Oscilloscope (23.3ms on mobile)
+                9,  // Chrome Ferrofluid (raymarched liquid metal is too heavy for mobile GPUs and drains battery)
+                10, // Ferrofluid Particle Sim
                 11, // Neon Corridor
                 12, // Lissajous Laser
                 17, // 3D Midnight Storm (redundant with Midnight Storm ID 16)

@@ -44,14 +44,6 @@ fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
     let u_coord = in.tex_coords.x;
     let v_coord = in.tex_coords.y;
 
-    // Physical Z-scroll: slide the entire grid smoothly in Z by step_fraction,
-    // while reading waveform data from integer-snapped history slots.
-    // This avoids interpolating between two different waveform shapes (which
-    // causes visible morphing/wobble) and instead keeps each row's shape
-    // perfectly stable as it scrolls away from the camera.
-    let row_spacing = 12.08 / f32(max(history_size - 1u, 1u)); // Z range / rows
-    let z_shift = audio.step_fraction * row_spacing;
-
     // Integer history index — no fractional interpolation
     let hist_idx = u32(round(clamp(v_coord * f32(history_size - 1u), 0.0, f32(history_size - 1u))));
 
@@ -63,11 +55,10 @@ fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
     // Scale coordinates into 3D world coordinates
     // X goes from -9.6 to 9.6 (matches the raymarched 3D CRT Oscilloscope)
     // Y (height/UP) is wave_val * 1.2
-    // Z (depth/FORWARD) goes from 9.48 (oldest/back) to -2.6 (newest/front),
-    //   offset by z_shift for smooth sub-frame physical scrolling
+    // Z (depth/FORWARD) goes from 9.48 (oldest/back) to -2.6 (newest/front)
     let x = (u_coord - 0.5) * 19.2;
     let y = wave_val * 1.2;
-    let z = mix(9.48, -2.6, v_coord) + z_shift;
+    let z = mix(9.48, -2.6, v_coord);
 
     let p3 = vec3<f32>(x, y, z);
 
@@ -143,8 +134,8 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     // Width has 128 lines, depth has 72 lines
     let grid_res = vec2<f32>(128.0, 72.0);
     
-    // Use the continuous world-space Z for the vertical grid coordinate to eliminate temporal jitter
-    let uv_g = vec2<f32>(in.uv.x, (in.world_pos.z + 2.6) / 12.08);
+    // Wireframe grid coordinate locked to mesh UVs
+    let uv_g = in.uv;
     
     // Amplitude-reactive bloom width and brightness
     let wave_height = clamp(abs(in.hit_val) * 2.0, 0.0, 1.0);
