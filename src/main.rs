@@ -974,6 +974,9 @@ async fn run_gui(
                                 state.video_frame_rx = None;
                                 state.free_video_frame_tx = None;
                                 state.video_mode = 0;
+                                state.stats.bitstream_active = false;
+                                state.stats.audio_buffer_fill_pct = 0.0;
+                                state.track_ended = false;
                             }
                             
                             // We rely entirely on DSP thread messages to update tracker string state
@@ -2035,6 +2038,12 @@ where std::io::Error: From<<B as Backend>::Error>
                 }
             } else {
                 active_stream = None; // DROP OLD STREAM FIRST
+                {
+                    let mut state = app_state.lock().unwrap();
+                    state.stats.bitstream_active = false;
+                    state.stats.audio_buffer_fill_pct = 0.0;
+                    state.track_ended = false;
+                }
                 
                 let mut loaded_stream = None;
                 let mut last_err = None;

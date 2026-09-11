@@ -1235,7 +1235,12 @@ impl AudioSource for SymphoniaSource {
             && first_idx < self.audio_tracks.len() {
             self.selected_track_idx = first_idx;
             self.primary_track_id = self.audio_tracks[first_idx].id as u32;
-            self.ext_type = self.audio_tracks[first_idx].codec.clone();
+            let container = self.ext_type.split('/').nth(1).map(|s| s.to_string());
+            if let Some(container) = container {
+                self.ext_type = format!("{}/{}", self.audio_tracks[first_idx].codec, container);
+            } else {
+                self.ext_type = self.audio_tracks[first_idx].codec.clone();
+            }
             self.channels = self.audio_tracks[first_idx].channels;
             self.intrinsic_sample_rate = Some(self.audio_tracks[first_idx].sample_rate);
             if let Some(t) = self.active_tracks.get(&self.primary_track_id) {
@@ -1659,7 +1664,12 @@ impl AudioSource for FfmpegSource {
                 let tb = s.time_base();
                 tb.numerator() as f64 / tb.denominator() as f64
             }).unwrap_or(1.0 / 44100.0);
-            self.ext_type = self.audio_tracks[first_idx].codec.clone();
+            let container = self.ext_type.split('/').nth(1).map(|s| s.to_string());
+            if let Some(container) = container {
+                self.ext_type = format!("{}/{}", self.audio_tracks[first_idx].codec, container);
+            } else {
+                self.ext_type = self.audio_tracks[first_idx].codec.clone();
+            }
             self.channel_vus = vec![0.0; self.channels as usize];
         }
         Ok(())
@@ -2497,6 +2507,12 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
                 return Ok(PlaybackHandle::Bitstream(Some(handle), stop_token));
             }
         }
+    }
+
+    {
+        let mut state = shared_state.lock().unwrap();
+        state.stats.bitstream_active = false;
+        state.stats.audio_buffer_fill_pct = 0.0;
     }
 
     let host = cpal::default_host();

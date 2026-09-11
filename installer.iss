@@ -33,7 +33,8 @@ Name: "{autodesktop}\RustTracker"; Filename: "{app}\rusttracker.exe"; IconFilena
 [Registry]
 ; Application Capabilities and Open With / SupportedTypes Registration
 Root: HKA; Subkey: "Software\Classes\Applications\rusttracker.exe"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "RustTracker"; Flags: uninsdeletekey
-Root: HKA; Subkey: "Software\Classes\Applications\rusttracker.exe\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\icon.ico,0"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\Applications\rusttracker.exe"; ValueType: string; ValueName: "ApplicationIcon"; ValueData: """{app}\rusttracker.exe"",0"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\Applications\rusttracker.exe\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: """{app}\rusttracker.exe"",0"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\Applications\rusttracker.exe\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\rusttracker.exe"" ""%1"""; Flags: uninsdeletekey
 
 ; SupportedTypes entries
@@ -73,19 +74,19 @@ Root: HKA; Subkey: "Software\Classes\Applications\rusttracker.exe\SupportedTypes
 
 ; ProgIDs Definitions
 Root: HKA; Subkey: "Software\Classes\RustTracker.TrackerModule"; ValueType: string; ValueName: ""; ValueData: "Tracker Module"; Flags: uninsdeletekey
-Root: HKA; Subkey: "Software\Classes\RustTracker.TrackerModule\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\icon.ico,0"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\RustTracker.TrackerModule\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: """{app}\rusttracker.exe"",0"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\RustTracker.TrackerModule\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\rusttracker.exe"" ""%1"""; Flags: uninsdeletekey
 
 Root: HKA; Subkey: "Software\Classes\RustTracker.AudioFile"; ValueType: string; ValueName: ""; ValueData: "Audio File"; Flags: uninsdeletekey
-Root: HKA; Subkey: "Software\Classes\RustTracker.AudioFile\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\icon.ico,0"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\RustTracker.AudioFile\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: """{app}\rusttracker.exe"",0"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\RustTracker.AudioFile\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\rusttracker.exe"" ""%1"""; Flags: uninsdeletekey
 
 Root: HKA; Subkey: "Software\Classes\RustTracker.VideoFile"; ValueType: string; ValueName: ""; ValueData: "Video File"; Flags: uninsdeletekey
-Root: HKA; Subkey: "Software\Classes\RustTracker.VideoFile\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\icon.ico,0"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\RustTracker.VideoFile\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: """{app}\rusttracker.exe"",0"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\RustTracker.VideoFile\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\rusttracker.exe"" ""%1"""; Flags: uninsdeletekey
 
 Root: HKA; Subkey: "Software\Classes\RustTracker.PlaylistFile"; ValueType: string; ValueName: ""; ValueData: "Playlist / Project File"; Flags: uninsdeletekey
-Root: HKA; Subkey: "Software\Classes\RustTracker.PlaylistFile\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: "{app}\icon.ico,0"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\RustTracker.PlaylistFile\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: """{app}\rusttracker.exe"",0"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\RustTracker.PlaylistFile\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\rusttracker.exe"" ""%1"""; Flags: uninsdeletekey
 
 ; File Association Mappings - Tracker Modules
@@ -164,13 +165,13 @@ Root: HKA; Subkey: "Software\Classes\.aaf"; ValueType: string; ValueName: ""; Va
 
 ; Context Menu Integration ("Play with RustTracker")
 Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\audio\shell\RustTracker"; ValueType: string; ValueName: ""; ValueData: "Play with RustTracker"; Flags: uninsdeletekey; Tasks: contextmenu
-Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\audio\shell\RustTracker"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\icon.ico,0"; Flags: uninsdeletekey; Tasks: contextmenu
+Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\audio\shell\RustTracker"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\rusttracker.exe"",0"; Flags: uninsdeletekey; Tasks: contextmenu
 Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\audio\shell\RustTracker\command"; ValueType: string; ValueName: ""; ValueData: """{app}\rusttracker.exe"" ""%1"""; Flags: uninsdeletekey; Tasks: contextmenu
 
 Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\video\shell\RustTracker"; ValueType: string; ValueName: ""; ValueData: "Play with RustTracker"; Flags: uninsdeletekey; Tasks: contextmenu
-Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\video\shell\RustTracker"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\icon.ico,0"; Flags: uninsdeletekey; Tasks: contextmenu
+Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\video\shell\RustTracker"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\rusttracker.exe"",0"; Flags: uninsdeletekey; Tasks: contextmenu
 Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\video\shell\RustTracker\command"; ValueType: string; ValueName: ""; ValueData: """{app}\rusttracker.exe"" ""%1"""; Flags: uninsdeletekey; Tasks: contextmenu
 
 Root: HKA; Subkey: "Software\Classes\Directory\shell\RustTracker"; ValueType: string; ValueName: ""; ValueData: "Play with RustTracker"; Flags: uninsdeletekey; Tasks: contextmenu
-Root: HKA; Subkey: "Software\Classes\Directory\shell\RustTracker"; ValueType: string; ValueName: "Icon"; ValueData: "{app}\icon.ico,0"; Flags: uninsdeletekey; Tasks: contextmenu
+Root: HKA; Subkey: "Software\Classes\Directory\shell\RustTracker"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\rusttracker.exe"",0"; Flags: uninsdeletekey; Tasks: contextmenu
 Root: HKA; Subkey: "Software\Classes\Directory\shell\RustTracker\command"; ValueType: string; ValueName: ""; ValueData: """{app}\rusttracker.exe"" ""%1"""; Flags: uninsdeletekey; Tasks: contextmenu

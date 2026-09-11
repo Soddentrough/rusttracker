@@ -230,7 +230,13 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
 
                     // Check for single tap timeout
                     if let Some(gesture) = self.touch_controller.update_pending_tap() {
-                        let wants_pointer = self.egui_ctx.egui_wants_pointer_input() || self.egui_ctx.is_pointer_over_egui();
+                        let is_track_info_open_btn = if let TouchGesture::SingleTap { x, y } = gesture {
+                            let is_portrait = size.width < size.height;
+                            is_portrait && self.app_state.lock().unwrap().mobile_hud_tab == crate::state::MobileHudTab::Info && y < 200.0 && x > (size.width as f32 * 0.70)
+                        } else {
+                            false
+                        };
+                        let wants_pointer = (self.egui_ctx.egui_wants_pointer_input() || self.egui_ctx.is_pointer_over_egui()) && !is_track_info_open_btn;
                         if !wants_pointer
                             && let Some(EngineAction::OpenFile) = Self::handle_gesture_static(&self.app_state, gesture, has_video, size.width as f32, size.height as f32) {
                             trigger_android_file_picker(&self.android_app);
@@ -684,8 +690,8 @@ impl AndroidRustTrackerApp {
             TouchGesture::SingleTap { x, y } => {
                 let is_portrait = window_width < window_height;
 
-                // Check if top right [📂 OPEN] header button was tapped
-                if is_portrait && y < 160.0 && x > window_width * 0.72 {
+                // Check if top right [📂 OPEN FILE] button was tapped in Track Info pane
+                if is_portrait && state.mobile_hud_tab == crate::state::MobileHudTab::Info && y < 200.0 && x > window_width * 0.70 {
                     return Some(EngineAction::OpenFile);
                 }
 

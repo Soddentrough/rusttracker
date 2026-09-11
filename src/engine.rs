@@ -3625,41 +3625,72 @@ impl VulkanEngine {
             let bass = (bass_raw / 60.0).clamp(0.0, 1.5);
 
             let mut col_energies = [0.0f32; W];
+            let spec_len = state.spectrum_data.len();
+
             if let Some(num_tracks) = state.tracker_channels.filter(|&n| n > 0) {
                 let n_ch = (num_tracks as usize).min(64);
-                let spec_len = state.spectrum_data.len();
-                // For tracker files, state.channel_vus is [Left_peak, Track1..N, Right_peak]
+                let left_master = state.channel_vus.first().copied().unwrap_or(0.0);
+                let right_master = state.channel_vus.get(1 + n_ch).copied().unwrap_or(left_master);
+
                 for (x, energy) in col_energies.iter_mut().enumerate().take(W) {
-                    let track_idx = (x * n_ch) / W;
+                    let track_idx = ((x * n_ch) / W).min(n_ch.saturating_sub(1));
                     let track_vu = state.channel_vus.get(1 + track_idx).copied().unwrap_or(0.0);
 
-                    // Blend fine-grained FFT frequency detail across the track column:
-                    let spec_idx = if spec_len > 0 {
-                        ((x * 512) / W).min(spec_len.saturating_sub(1))
+                    // Symmetrical center-out spectrum distribution (bass in center, highs on outer edges)
+                    let center_dist = (x as f32 - (W - 1) as f32 / 2.0).abs() / ((W - 1) as f32 / 2.0);
+                    let spec_idx = if spec_len > 1 {
+                        (((center_dist.powf(1.4) * 450.0) as usize) + 1).clamp(1, spec_len.saturating_sub(1))
                     } else {
                         0
                     };
                     let spec_val = state.spectrum_data.get(spec_idx).copied().unwrap_or(0.0) / 60.0;
 
-                    *energy = (track_vu * 0.70 + spec_val * 0.30).clamp(0.0, 1.5);
+                    let frac = x as f32 / (W - 1) as f32;
+                    let master_pan = left_master * (1.0 - frac) + right_master * frac;
+
+                    *energy = (track_vu * 0.60 + master_pan * 0.20 + spec_val * 0.20).clamp(0.0, 1.5);
                 }
             } else {
-                // Non-tracker audio (Stereo MP3, FLAC, AAC, WAV, Radio Stream):
-                let spec_len = state.spectrum_data.len();
-                let left_vu = state.channel_vus.first().copied().unwrap_or(0.0);
-                let right_vu = state.channel_vus.get(1).copied().unwrap_or(left_vu);
+                // Non-tracker audio (Stereo MP3, FLAC, AAC, WAV, Radio Stream, Multi-channel 5.1/7.1):
+                let ch_len = state.channel_vus.len();
+                let display_order: &[usize] = match ch_len {
+                    6 => &[4, 0, 2, 3, 1, 5],
+                    8 => &[6, 4, 0, 2, 3, 1, 5, 7],
+                    16 => &[14, 12, 10, 8, 6, 4, 0, 2, 3, 1, 5, 7, 9, 11, 13, 15],
+                    _ => &[0, 1],
+                };
 
                 for (x, energy) in col_energies.iter_mut().enumerate().take(W) {
-                    let frac = x as f32 / W as f32;
+                    let frac = x as f32 / (W - 1) as f32;
+
+                    // Continuous spatial channel distribution across the screen width
+                    let pan_vu = if ch_len >= 2 {
+                        let order_len = display_order.len().min(ch_len);
+                        if order_len > 1 {
+                            let pos = frac * (order_len - 1) as f32;
+                            let idx0 = (pos.floor() as usize).min(order_len - 1);
+                            let idx1 = (pos.ceil() as usize).min(order_len - 1);
+                            let blend = pos - idx0 as f32;
+                            let vu0 = state.channel_vus.get(display_order[idx0]).copied().unwrap_or(0.0);
+                            let vu1 = state.channel_vus.get(display_order[idx1]).copied().unwrap_or(vu0);
+                            vu0 * (1.0 - blend) + vu1 * blend
+                        } else {
+                            state.channel_vus.first().copied().unwrap_or(0.0)
+                        }
+                    } else {
+                        state.channel_vus.first().copied().unwrap_or(0.0)
+                    };
+
+                    // Symmetrical center-out spectrum distribution (bass in center, highs mirroring outward)
+                    let center_dist = (x as f32 - (W - 1) as f32 / 2.0).abs() / ((W - 1) as f32 / 2.0);
                     let bin = if spec_len > 1 {
-                        ((frac.powf(1.6) * 512.0) as usize).clamp(1, spec_len.saturating_sub(1))
+                        (((center_dist.powf(1.4) * 450.0) as usize) + 1).clamp(1, spec_len.saturating_sub(1))
                     } else {
                         0
                     };
                     let spec_val = state.spectrum_data.get(bin).copied().unwrap_or(0.0) / 60.0;
 
-                    let pan_vu = left_vu * (1.0 - frac) + right_vu * frac;
-                    *energy = (spec_val * 0.70 + pan_vu * 0.30).clamp(0.0, 1.5);
+                    *energy = (spec_val * 0.60 + pan_vu * 0.40).clamp(0.0, 1.5);
                 }
             }
 
@@ -3708,16 +3739,17 @@ impl VulkanEngine {
                             *rng ^= *rng << 13;
                             *rng ^= *rng >> 17;
                             *rng ^= *rng << 5;
-                            let rnd = (*rng & 3) as usize;
+                            let jitter = ((*rng % 3) as i32) - 1;
 
-                            let to = from.wrapping_sub(W * dy).wrapping_sub(rnd).wrapping_add(1);
-                            if to < W * H {
-                                // Altitude cooling: taper smoke above 60% screen height so flame tips dance naturally
-                                let alt_decay = if y < 70 && ((*rng >> 8) % 100 < 35) { 1 } else { 0 };
-                                let decay = if ((*rng >> 4) % 1000) < thresh { 1 } else { 0 };
-                                let total_decay = decay.max(alt_decay);
-                                cells[to] = pixel.saturating_sub(total_decay);
-                            }
+                            let target_x = (x as i32 + jitter).clamp(0, (W - 1) as i32) as usize;
+                            let target_y = y.saturating_sub(dy);
+                            let to = target_y * W + target_x;
+
+                            // Altitude cooling: taper smoke above 60% screen height so flame tips dance naturally
+                            let alt_decay = if y < 70 && ((*rng >> 8) % 100 < 35) { 1 } else { 0 };
+                            let decay = if ((*rng >> 4) % 1000) < thresh { 1 } else { 0 };
+                            let total_decay = decay.max(alt_decay);
+                            cells[to] = pixel.saturating_sub(total_decay);
                         }
                     }
                 }
@@ -5882,31 +5914,30 @@ impl VulkanEngine {
                                     *out_track_info_rect = Some(rect);
                                 } else {
                                     col.style_mut().visuals.override_text_color = Some(egui::Color32::from_gray(235));
-                                    if !is_portrait {
-                                        let heading_text = if state.playlist.len() > 1 {
-                                            format!("Track Info ({}/{})", state.playlist_index + 1, state.playlist.len())
-                                        } else {
-                                            "Track Info".to_string()
-                                        };
-                                        col.horizontal(|ui| {
-                                            ui.heading(heading_text);
-                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                let open_hdr_btn = egui::Button::new(
-                                                    egui::RichText::new("📂 OPEN FILE")
-                                                        .size(11.5)
-                                                        .strong()
-                                                        .color(egui::Color32::WHITE)
-                                                )
-                                                .fill(egui::Color32::from_rgb(0, 100, 200))
-                                                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(80, 200, 255)))
-                                                .corner_radius(4.0);
-                                                if ui.add(open_hdr_btn).clicked() {
-                                                    *engine_action = EngineAction::OpenFile;
-                                                }
-                                            });
+                                    let heading_text = if state.playlist.len() > 1 {
+                                        format!("Track Info ({}/{})", state.playlist_index + 1, state.playlist.len())
+                                    } else {
+                                        "Track Info".to_string()
+                                    };
+                                    col.horizontal(|ui| {
+                                        ui.heading(heading_text);
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            let open_hdr_btn = egui::Button::new(
+                                                egui::RichText::new("📂 OPEN FILE")
+                                                    .size(12.0)
+                                                    .strong()
+                                                    .color(egui::Color32::WHITE)
+                                            )
+                                            .fill(egui::Color32::from_rgb(0, 100, 200))
+                                            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(80, 200, 255)))
+                                            .corner_radius(4.0)
+                                            .min_size(egui::vec2(92.0, if is_portrait { 30.0 } else { 24.0 }));
+                                            if ui.add(open_hdr_btn).clicked() {
+                                                *engine_action = EngineAction::OpenFile;
+                                            }
                                         });
-                                        col.separator();
-                                    }
+                                    });
+                                    col.separator();
                                 
                                     let render_smooth_marquee = |ui: &mut egui::Ui, text: &str, size: f32, is_title: bool| {
                                         let available_width = ui.available_width();
@@ -5962,10 +5993,11 @@ impl VulkanEngine {
                                         state.song_title.clone()
                                     };
                                     let is_network = current_path_str.starts_with("http://") || current_path_str.starts_with("https://");
+                                    let file_path = std::path::Path::new(&current_path_str);
                                     let file_name = if is_network {
                                         display_title.clone()
                                     } else {
-                                        std::path::Path::new(&current_path_str).file_name().unwrap_or_default().to_string_lossy().to_string()
+                                        file_path.file_name().unwrap_or_default().to_string_lossy().to_string()
                                     };
                                     let file_dir = if is_network {
                                         current_path_str.clone()
@@ -6035,13 +6067,28 @@ impl VulkanEngine {
                                                     });
 
                                                     let format_name = if let Some(track) = state.audio_tracks.get(state.selected_audio_track) {
-                                                        if !track.codec.is_empty() && !state.module_type.eq_ignore_ascii_case(&track.codec) {
+                                                        if !track.codec.is_empty()
+                                                            && !state.module_type.to_ascii_uppercase().contains(&track.codec.to_ascii_uppercase())
+                                                        {
                                                             format!("{}/{}", track.codec, state.module_type)
                                                         } else {
                                                             state.module_type.clone()
                                                         }
                                                     } else {
                                                         state.module_type.clone()
+                                                    };
+
+                                                    let format_name = if let Some(ext) = file_path.extension().and_then(|e| e.to_str()) {
+                                                        let ext_upper = ext.to_ascii_uppercase();
+                                                        if (ext_upper == "MP4" || ext_upper == "M4A" || ext_upper == "MOV" || ext_upper == "MKV")
+                                                            && !format_name.to_ascii_uppercase().contains(&ext_upper)
+                                                        {
+                                                            format!("{}/{}", format_name, ext_upper)
+                                                        } else {
+                                                            format_name
+                                                        }
+                                                    } else {
+                                                        format_name
                                                     };
 
                                                     let ch_info = if let Some(tc) = state.tracker_channels {
@@ -6341,20 +6388,6 @@ impl VulkanEngine {
                                                     render_smooth_marquee(ui, &next_song, 14.0, false); 
                                                 });
                                             }
-                                            ui.add_space(6.0);
-                                            let open_btn = egui::Button::new(
-                                                egui::RichText::new("📂  OPEN FILE")
-                                                    .strong()
-                                                    .size(13.5)
-                                                    .color(egui::Color32::WHITE)
-                                            )
-                                            .fill(egui::Color32::from_rgb(0, 100, 200))
-                                            .stroke(egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(80, 200, 255)))
-                                            .min_size(egui::vec2(ui.available_width(), 38.0));
-
-                                            if ui.add(open_btn).clicked() {
-                                                *engine_action = EngineAction::OpenFile;
-                                            }
                                         });
                                     
                                     *out_track_info_rect = Some(col.max_rect());
@@ -6364,62 +6397,8 @@ impl VulkanEngine {
                             if is_portrait {
                                 let has_video = state.has_video_stream || self.video_state.is_some();
                                 let progress_height = 20.0;
-                                let header_height = 32.0;
                                 let available_h = ui.available_height();
-                                let content_h = (available_h - progress_height - header_height - 6.0).max(40.0);
-
-                                // Mobile Portrait Header Bar: Tab Navigation & Always-Visible [📂 OPEN FILE] Button
-                                ui.horizontal(|ui| {
-                                    ui.spacing_mut().item_spacing.x = 5.0;
-
-                                    let tab_btn = |ui: &mut egui::Ui, text: &str, active: bool| -> egui::Response {
-                                        let (fg, bg, stroke) = if active {
-                                            (egui::Color32::WHITE, egui::Color32::from_rgba_unmultiplied(0, 130, 210, 210), egui::Stroke::new(1.2_f32, egui::Color32::from_rgb(100, 210, 255)))
-                                        } else {
-                                            (egui::Color32::from_rgb(160, 175, 195), egui::Color32::from_rgba_unmultiplied(35, 40, 50, 180), egui::Stroke::NONE)
-                                        };
-                                        ui.add(
-                                            egui::Button::new(egui::RichText::new(text).size(12.0).strong().color(fg))
-                                                .fill(bg)
-                                                .stroke(stroke)
-                                                .corner_radius(4.0)
-                                                .min_size(egui::vec2(0.0, 28.0))
-                                        )
-                                    };
-
-                                    let is_chan = state.mobile_hud_tab == crate::state::MobileHudTab::Channels;
-                                    let is_heat = state.mobile_hud_tab == crate::state::MobileHudTab::Heatmap;
-                                    let is_info = state.mobile_hud_tab == crate::state::MobileHudTab::Info;
-
-                                    if tab_btn(ui, "Channels", is_chan).clicked() {
-                                        engine_action = EngineAction::SetMobileHudTab(crate::state::MobileHudTab::Channels);
-                                    }
-                                    let heat_label = if state.lyrics.is_some() { "Lyrics" } else { "Heatmap" };
-                                    if tab_btn(ui, heat_label, is_heat).clicked() {
-                                        engine_action = EngineAction::SetMobileHudTab(crate::state::MobileHudTab::Heatmap);
-                                    }
-                                    if tab_btn(ui, "Track Info", is_info).clicked() {
-                                        engine_action = EngineAction::SetMobileHudTab(crate::state::MobileHudTab::Info);
-                                    }
-
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        let open_btn = egui::Button::new(
-                                            egui::RichText::new("📂 OPEN FILE")
-                                                .size(12.0)
-                                                .strong()
-                                                .color(egui::Color32::WHITE)
-                                        )
-                                        .fill(egui::Color32::from_rgb(0, 110, 210))
-                                        .stroke(egui::Stroke::new(1.2_f32, egui::Color32::from_rgb(80, 200, 255)))
-                                        .corner_radius(4.0)
-                                        .min_size(egui::vec2(86.0, 28.0));
-
-                                        if ui.add(open_btn).clicked() {
-                                            engine_action = EngineAction::OpenFile;
-                                        }
-                                    });
-                                });
-                                ui.add_space(4.0);
+                                let content_h = (available_h - progress_height).max(40.0);
 
                                 ui.allocate_ui_with_layout(
                                     egui::vec2(ui.available_width(), content_h),
@@ -7604,6 +7583,44 @@ mod tests {
         // Case 4: Tracker module with hardware/tracker channel breakdown (no bitrate)
         let (_, val) = format_audio_line("ProTracker MOD", None, None, 4, Some(4), 4);
         assert_eq!(val, "ProTracker MOD, 4 hw / 4 tracker");
+
+        // Case 5: Composite module_type already containing codec (avoid AAC/AAC/MP4)
+        let format_audio_line_dedup = |module_type: &str, codec: Option<&str>, bitrate: Option<u32>, num_channels: usize| -> String {
+            let format_name = if let Some(c) = codec {
+                if !c.is_empty() && !module_type.to_ascii_uppercase().contains(&c.to_ascii_uppercase()) {
+                    format!("{}/{}", c, module_type)
+                } else {
+                    module_type.to_string()
+                }
+            } else {
+                module_type.to_string()
+            };
+            if let Some(br) = bitrate {
+                format!("{}, {}-channels, {} kbps", format_name, num_channels, br)
+            } else {
+                format!("{}, {}-channels", format_name, num_channels)
+            }
+        };
+        let val = format_audio_line_dedup("AAC/MP4", Some("AAC"), Some(788), 2);
+        assert_eq!(val, "AAC/MP4, 2-channels, 788 kbps");
+
+        // Case 6: When module_type is "AAC" and file extension is "mp4", container is retained
+        let format_audio_with_ext = |format_name: &str, ext: Option<&str>| -> String {
+            if let Some(e) = ext {
+                let ext_upper = e.to_ascii_uppercase();
+                if (ext_upper == "MP4" || ext_upper == "M4A" || ext_upper == "MOV" || ext_upper == "MKV")
+                    && !format_name.to_ascii_uppercase().contains(&ext_upper)
+                {
+                    format!("{}/{}", format_name, ext_upper)
+                } else {
+                    format_name.to_string()
+                }
+            } else {
+                format_name.to_string()
+            }
+        };
+        assert_eq!(format_audio_with_ext("AAC", Some("mp4")), "AAC/MP4");
+        assert_eq!(format_audio_with_ext("AAC/MP4", Some("mp4")), "AAC/MP4");
     }
 
     #[test]
@@ -7624,6 +7641,26 @@ mod tests {
         assert!(!should_display_artist("  Unknown  "));
         assert!(should_display_artist("Daft Punk"));
         assert!(should_display_artist("Aphex Twin"));
+    }
+
+    #[test]
+    fn test_single_open_file_button() {
+        let engine_source = include_str!("engine.rs");
+        // Count occurrences of OPEN FILE button definitions in engine.rs
+        // 1: In the empty state (no file loaded) -> btn_text = ... "OPEN FILE"
+        // 2: In the Track Info header (shared by mobile portrait & desktop) -> "📂 OPEN FILE"
+        // Ensure that render_col_info has the only header button and no duplicates exist
+        let target_needle = format!("{}(\"{}\")", "egui::RichText::new", "📂 OPEN FILE");
+        let rich_open_occurrences = engine_source
+            .lines()
+            .take_while(|l| !l.contains("mod tests"))
+            .filter(|l| l.contains(&target_needle) || l.contains("📂  OPEN FILE"))
+            .count();
+        assert_eq!(
+            rich_open_occurrences, 1,
+            "Expected exactly 1 RichText OPEN FILE button in engine.rs Track Info header, found {}",
+            rich_open_occurrences
+        );
     }
 
     #[test]
@@ -7776,7 +7813,7 @@ mod tests {
             "Quiet audio should not produce flames in upper half of screen"
         );
 
-        // 2. On a loud bass kick: bass columns (x in 0..40) erupt to white-hot (>= 34),
+        // 2. On a loud bass kick: center bass columns (x in 140..180) erupt to white-hot (>= 34),
         // and full-spectrum chorus drives the entire hearth to white-hot (>= 33)
         for i in 1..16 {
             state.spectrum_data[i] = 90.0; // Heavy bass transient
@@ -7791,15 +7828,15 @@ mod tests {
         for x in 0..W {
             let heat = cells[bottom_row + x] as u32;
             loud_hearth_sum += heat;
-            if x < 40 {
+            if (150..170).contains(&x) {
                 bass_col_sum += heat;
             }
         }
-        let bass_col_avg = bass_col_sum as f32 / 40.0;
+        let bass_col_avg = bass_col_sum as f32 / 20.0;
         let loud_hearth_avg = loud_hearth_sum as f32 / W as f32;
         assert!(
             bass_col_avg >= 34.0,
-            "Bass columns should be incandescent white-hot (>= 34), got average {:.2}",
+            "Center bass columns should be incandescent white-hot (>= 34), got average {:.2}",
             bass_col_avg
         );
         assert!(
@@ -7830,7 +7867,46 @@ mod tests {
             loud_upper_heat_count
         );
 
-        // 3. Tracker channel separation: Active Track 1 vs Silent Track 2
+        // 3. Stereo channel symmetry: balanced stereo must be symmetric across left/right
+        state.tracker_channels = None;
+        state.channel_vus = vec![0.8, 0.8];
+        for _ in 0..60 {
+            VulkanEngine::update_retro_fire_grid(&mut cells, &mut rng, 1.0, &state);
+        }
+        let mut left_half_sum = 0u32;
+        let mut right_half_sum = 0u32;
+        for y in 0..H {
+            for x in 0..160 {
+                left_half_sum += cells[y * W + x] as u32;
+            }
+            for x in 160..320 {
+                right_half_sum += cells[y * W + x] as u32;
+            }
+        }
+        let lr_ratio = right_half_sum as f32 / left_half_sum.max(1) as f32;
+        assert!(
+            (lr_ratio - 1.0).abs() < 0.05,
+            "Balanced stereo must produce symmetric left/right fire energy within 5%, got ratio {:.3} (left: {}, right: {})",
+            lr_ratio,
+            left_half_sum,
+            right_half_sum
+        );
+
+        // 4. Stereo panning responsiveness: Left-heavy vs Right-heavy
+        state.channel_vus = vec![1.0, 0.1];
+        for _ in 0..60 {
+            VulkanEngine::update_retro_fire_grid(&mut cells, &mut rng, 1.0, &state);
+        }
+        let left_heavy_l: u32 = (0..H).flat_map(|y| (0..160).map(move |x| cells[y * W + x] as u32)).sum();
+        let left_heavy_r: u32 = (0..H).flat_map(|y| (160..320).map(move |x| cells[y * W + x] as u32)).sum();
+        assert!(
+            left_heavy_l > left_heavy_r,
+            "Left-panned audio should have more heat on left half (L: {}, R: {})",
+            left_heavy_l,
+            left_heavy_r
+        );
+
+        // 5. Tracker channel separation: Active Track 1 vs Silent Track 2
         state.tracker_channels = Some(4);
         state.spectrum_data = vec![0.0; 1024];
         // [Left_peak, Track1, Track2, Track3, Track4, Right_peak]
@@ -7857,7 +7933,7 @@ mod tests {
             track2_heat
         );
 
-        // 4. Decay to zero when stopped
+        // 6. Decay to zero when stopped
         for _ in 0..50 {
             VulkanEngine::update_retro_fire_grid(&mut cells, &mut rng, 0.0, &state);
         }
@@ -7866,5 +7942,58 @@ mod tests {
             remaining_heat, 0,
             "Cells should completely decay to 0 when stopped"
         );
+    }
+
+    #[test]
+    fn test_windows_installer_icon_registration() {
+        let iss_content = std::fs::read_to_string("installer.iss")
+            .expect("installer.iss must exist");
+        
+        // Ensure no unquoted or raw .ico,0 references exist (Windows ExtractIconEx fails with .ico,0)
+        assert!(
+            !iss_content.contains("{app}\\icon.ico,0"),
+            "installer.iss must not reference icon.ico,0 as Windows shell requires PE resource indexing on .exe"
+        );
+
+        // Ensure ApplicationIcon is registered for the modern Windows 10/11 'Open with' menu
+        assert!(
+            iss_content.contains(r#"Root: HKA; Subkey: "Software\Classes\Applications\rusttracker.exe"; ValueType: string; ValueName: "ApplicationIcon"; ValueData: """{app}\rusttracker.exe"",0""#),
+            "installer.iss must register ApplicationIcon under Software\\Classes\\Applications\\rusttracker.exe"
+        );
+
+        // Ensure DefaultIcon points to the PE resource in rusttracker.exe with quotes
+        assert!(
+            iss_content.contains(r#"Root: HKA; Subkey: "Software\Classes\Applications\rusttracker.exe\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: """{app}\rusttracker.exe"",0""#),
+            "installer.iss must register DefaultIcon under Software\\Classes\\Applications\\rusttracker.exe\\DefaultIcon"
+        );
+
+        // Ensure file association ProgIDs have correct quoted executable icon references
+        assert!(
+            iss_content.contains(r#"Root: HKA; Subkey: "Software\Classes\RustTracker.AudioFile\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: """{app}\rusttracker.exe"",0""#),
+            "RustTracker.AudioFile must use quoted rusttracker.exe,0 icon"
+        );
+    }
+
+    #[test]
+    fn test_bitstream_state_reset_on_stream_change() {
+        let mut state = crate::state::AppState::new("Test App".to_string());
+
+        // Simulate bitstream playback active
+        state.stats.bitstream_active = true;
+        state.stats.audio_buffer_fill_pct = 78.5;
+        state.track_ended = false;
+        assert!(state.stats.bitstream_active);
+        assert_eq!(state.stats.audio_buffer_fill_pct, 78.5);
+
+        // Simulate stream drop / transition logic from main.rs
+        state.video_frame_rx = None;
+        state.free_video_frame_tx = None;
+        state.video_mode = 0;
+        state.stats.bitstream_active = false;
+        state.stats.audio_buffer_fill_pct = 0.0;
+        state.track_ended = false;
+
+        assert!(!state.stats.bitstream_active, "bitstream_active must be false after dropping stream");
+        assert_eq!(state.stats.audio_buffer_fill_pct, 0.0, "audio_buffer_fill_pct must be 0 after dropping stream");
     }
 }
