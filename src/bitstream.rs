@@ -801,12 +801,16 @@ mod wasapi_bitstream {
         let mut ictx = ffmpeg_next::format::input_with_dictionary(&file_path, dict)
             .context("Failed to open input file")?;
             
-        let best_audio = ictx.streams().best(ffmpeg_next::media::Type::Audio)
-            .ok_or_else(|| anyhow::anyhow!("No audio stream found"))?;
-            
-        let codec_id = best_audio.parameters().id();
-        let best_audio_index = best_audio.index();
-        let parameters = best_audio.parameters();
+        let (codec_id, best_audio_index, parameters, stream_time_base) = {
+            let best_audio = ictx.streams().best(ffmpeg_next::media::Type::Audio)
+                .ok_or_else(|| anyhow::anyhow!("No audio stream found"))?;
+            (
+                best_audio.parameters().id(),
+                best_audio.index(),
+                best_audio.parameters(),
+                f64::from(best_audio.time_base()),
+            )
+        };
 
         let probe_ctx = ffmpeg_next::codec::context::Context::from_parameters(parameters.clone())
             .context("Failed to create probe context")?;
@@ -1293,7 +1297,6 @@ mod wasapi_bitstream {
                         let vis_tx_lpcm = vis_tx.clone();
                         let stop_token_lpcm = stop_token_ffmpeg.clone();
                         let shared_state_lpcm = shared_state_pump.clone();
-                        let stream_time_base = f64::from(best_audio.time_base());
 
                         std::thread::spawn(move || {
                             println!("[bitstream] Multi-Channel LPCM FFmpeg worker thread started.");
