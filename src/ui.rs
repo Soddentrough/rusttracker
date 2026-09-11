@@ -310,11 +310,17 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         Span::styled(scroll_text(&file_name, width), Style::default().add_modifier(Modifier::BOLD))
     ]));
 
-    // 2. Artist
-    lines.push(Line::from(vec![
-        Span::raw("Artist: "),
-        Span::raw(&state.artist)
-    ]));
+    // 2. Artist (only if known)
+    let trimmed_artist = state.artist.trim();
+    if !trimmed_artist.is_empty()
+        && !trimmed_artist.eq_ignore_ascii_case("unknown")
+        && !trimmed_artist.eq_ignore_ascii_case("unknown artist")
+    {
+        lines.push(Line::from(vec![
+            Span::raw("Artist: "),
+            Span::raw(trimmed_artist)
+        ]));
+    }
 
     // 3. Path / URL (scrollable)
     let path_label = if is_network { "URL:    " } else { "Path:   " };

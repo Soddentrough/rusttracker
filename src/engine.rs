@@ -5968,7 +5968,7 @@ impl VulkanEngine {
                                         std::path::Path::new(&current_path_str).file_name().unwrap_or_default().to_string_lossy().to_string()
                                     };
                                     let file_dir = if is_network {
-                                        current_path_str
+                                        current_path_str.clone()
                                     } else {
                                         let abs_path = if std::path::Path::new(&current_path_str).is_absolute() {
                                             std::path::PathBuf::from(&current_path_str)
@@ -6001,11 +6001,16 @@ impl VulkanEngine {
                                                     render_smooth_marquee(ui, &display_title, 14.0, true);
                                                     ui.end_row();
                                                     
-                                                    // 2. Artist
-                                                    let artist_str = if state.artist.is_empty() { "Unknown" } else { &state.artist };
-                                                    ui.label(egui::RichText::new("Artist:").color(egui::Color32::from_rgb(160, 180, 200)));
-                                                    render_smooth_marquee(ui, artist_str, 14.0, false);
-                                                    ui.end_row();
+                                                    // 2. Artist (only display if known)
+                                                    let trimmed_artist = state.artist.trim();
+                                                    if !trimmed_artist.is_empty()
+                                                        && !trimmed_artist.eq_ignore_ascii_case("unknown")
+                                                        && !trimmed_artist.eq_ignore_ascii_case("unknown artist")
+                                                    {
+                                                        ui.label(egui::RichText::new("Artist:").color(egui::Color32::from_rgb(160, 180, 200)));
+                                                        render_smooth_marquee(ui, trimmed_artist, 14.0, false);
+                                                        ui.end_row();
+                                                    }
                                                     
                                                     // 3. File Name
                                                     ui.label(egui::RichText::new("File:").color(egui::Color32::from_rgb(160, 180, 200)));
@@ -6019,26 +6024,51 @@ impl VulkanEngine {
                                                     ui.end_row();
                                                     
                                                     // 5 & 6. Format, Bitrate & Channels
-                                                    let format_str = if let Some(br) = state.bitrate {
-                                                        format!("{} ({} kbps)", state.module_type, br)
+                                                    let effective_bitrate = state.bitrate.or_else(|| {
+                                                        if state.duration_seconds > 0.0 && !is_network {
+                                                            std::fs::metadata(&current_path_str)
+                                                                .ok()
+                                                                .map(|m| ((m.len() as f64 * 8.0) / (state.duration_seconds as f64 * 1000.0)).round() as u32)
+                                                        } else {
+                                                            None
+                                                        }
+                                                    });
+
+                                                    let format_name = if let Some(track) = state.audio_tracks.get(state.selected_audio_track) {
+                                                        if !track.codec.is_empty() && !state.module_type.eq_ignore_ascii_case(&track.codec) {
+                                                            format!("{}/{}", track.codec, state.module_type)
+                                                        } else {
+                                                            state.module_type.clone()
+                                                        }
                                                     } else {
                                                         state.module_type.clone()
                                                     };
+
                                                     let ch_info = if let Some(tc) = state.tracker_channels {
                                                         format!("{} hw / {} tracker", state.hardware_channels, tc)
                                                     } else if state.num_channels == 1 {
-                                                        "1 channel".to_string()
+                                                        "1-channel".to_string()
                                                     } else {
-                                                        format!("{} channels", state.num_channels)
+                                                        format!("{}-channels", state.num_channels)
                                                     };
 
                                                     if is_portrait {
-                                                        // In mobile view: combined single line e.g. "Audio: AAC, 2 channels"
+                                                        // In mobile view: "Audio: AAC/MP4, X-channels, Y bitrate"
                                                         ui.label(egui::RichText::new("Audio:").color(egui::Color32::from_rgb(160, 180, 200)));
-                                                        ui.label(format!("{}, {}", format_str, ch_info));
+                                                        let audio_val = if let Some(br) = effective_bitrate {
+                                                            format!("{}, {}, {} kbps", format_name, ch_info, br)
+                                                        } else {
+                                                            format!("{}, {}", format_name, ch_info)
+                                                        };
+                                                        ui.label(audio_val);
                                                         ui.end_row();
                                                     } else {
                                                         // Desktop / Wide layout: separate lines
+                                                        let format_str = if let Some(br) = effective_bitrate {
+                                                            format!("{} ({} kbps)", format_name, br)
+                                                        } else {
+                                                            format_name
+                                                        };
                                                         ui.label(egui::RichText::new("Format:").color(egui::Color32::from_rgb(160, 180, 200)));
                                                         ui.label(format_str);
                                                         ui.end_row();
@@ -7529,39 +7559,71 @@ mod tests {
 
     #[test]
     fn test_mobile_audio_info_formatting() {
-        // Verify mobile portrait single-line audio format string e.g. "Audio: AAC, 2 channels"
-        let format_audio_line = |module_type: &str, bitrate: Option<u32>, num_channels: usize, tracker_channels: Option<usize>, hardware_channels: usize| -> (String, String) {
-            let format_str = if let Some(br) = bitrate {
-                format!("{} ({} kbps)", module_type, br)
+        // Verify mobile portrait single-line audio format string e.g. "Audio: AAC/MP4, X-channels, Y bitrate"
+        let format_audio_line = |module_type: &str, codec: Option<&str>, bitrate: Option<u32>, num_channels: usize, tracker_channels: Option<usize>, hardware_channels: usize| -> (String, String) {
+            let format_name = if let Some(c) = codec {
+                if !c.is_empty() && !module_type.eq_ignore_ascii_case(c) {
+                    format!("{}/{}", c, module_type)
+                } else {
+                    module_type.to_string()
+                }
             } else {
                 module_type.to_string()
             };
+
             let ch_info = if let Some(tc) = tracker_channels {
                 format!("{} hw / {} tracker", hardware_channels, tc)
             } else if num_channels == 1 {
-                "1 channel".to_string()
+                "1-channel".to_string()
             } else {
-                format!("{} channels", num_channels)
+                format!("{}-channels", num_channels)
             };
-            ("Audio:".to_string(), format!("{}, {}", format_str, ch_info))
+
+            let audio_val = if let Some(br) = bitrate {
+                format!("{}, {}, {} kbps", format_name, ch_info, br)
+            } else {
+                format!("{}, {}", format_name, ch_info)
+            };
+
+            ("Audio:".to_string(), audio_val)
         };
 
-        // Case 1: AAC, 2 channels
-        let (label, val) = format_audio_line("AAC", None, 2, None, 2);
+        // Case 1: AAC in MP4 container with bitrate
+        let (label, val) = format_audio_line("MP4", Some("AAC"), Some(256), 2, None, 2);
         assert_eq!(label, "Audio:");
-        assert_eq!(val, "AAC, 2 channels");
+        assert_eq!(val, "AAC/MP4, 2-channels, 256 kbps");
 
-        // Case 2: FLAC, 1 channel
-        let (_, val) = format_audio_line("FLAC", None, 1, None, 1);
-        assert_eq!(val, "FLAC, 1 channel");
+        // Case 2: FLAC, 1-channel with bitrate
+        let (_, val) = format_audio_line("FLAC", Some("FLAC"), Some(98), 1, None, 1);
+        assert_eq!(val, "FLAC, 1-channel, 98 kbps");
 
         // Case 3: MP3 with bitrate
-        let (_, val) = format_audio_line("MP3", Some(320), 2, None, 2);
-        assert_eq!(val, "MP3 (320 kbps), 2 channels");
+        let (_, val) = format_audio_line("MP3", None, Some(320), 2, None, 2);
+        assert_eq!(val, "MP3, 2-channels, 320 kbps");
 
-        // Case 4: Tracker module with hardware/tracker channel breakdown
-        let (_, val) = format_audio_line("ProTracker MOD", None, 4, Some(4), 4);
+        // Case 4: Tracker module with hardware/tracker channel breakdown (no bitrate)
+        let (_, val) = format_audio_line("ProTracker MOD", None, None, 4, Some(4), 4);
         assert_eq!(val, "ProTracker MOD, 4 hw / 4 tracker");
+    }
+
+    #[test]
+    fn test_artist_unknown_omission() {
+        let should_display_artist = |artist: &str| -> bool {
+            let trimmed = artist.trim();
+            !trimmed.is_empty()
+                && !trimmed.eq_ignore_ascii_case("unknown")
+                && !trimmed.eq_ignore_ascii_case("unknown artist")
+        };
+
+        assert!(!should_display_artist(""));
+        assert!(!should_display_artist("   "));
+        assert!(!should_display_artist("Unknown"));
+        assert!(!should_display_artist("unknown"));
+        assert!(!should_display_artist("UNKNOWN"));
+        assert!(!should_display_artist("Unknown Artist"));
+        assert!(!should_display_artist("  Unknown  "));
+        assert!(should_display_artist("Daft Punk"));
+        assert!(should_display_artist("Aphex Twin"));
     }
 
     #[test]

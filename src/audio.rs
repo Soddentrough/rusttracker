@@ -1025,6 +1025,7 @@ struct SymphoniaSource {
     audio_tracks: Vec<crate::state::AudioTrackInfo>,
     selected_track_idx: usize,
     has_video: bool,
+    bitrate: Option<u32>,
 }
 
 impl AudioSource for SymphoniaSource {
@@ -1250,6 +1251,10 @@ impl AudioSource for SymphoniaSource {
 
     fn has_video_stream(&self) -> bool {
         self.has_video
+    }
+
+    fn get_bitrate(&mut self) -> Option<u32> {
+        self.bitrate
     }
 }
 
@@ -2208,6 +2213,26 @@ fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(
         }
     }
 
+    let bitrate = if let Some(path) = file_path
+        && let Ok(meta) = std::fs::metadata(path)
+        && duration > 0.0
+    {
+        let bytes = meta.len();
+        let kbps = ((bytes as f64 * 8.0) / (duration * 1000.0)).round() as u32;
+        if kbps > 0 { Some(kbps) } else { None }
+    } else {
+        None
+    };
+
+    let ext_type = if display_ext.eq_ignore_ascii_case("mp4") || display_ext.eq_ignore_ascii_case("m4a") || display_ext.eq_ignore_ascii_case("mov") {
+        let first_codec = audio_tracks.first().map(|t| t.codec.as_str()).unwrap_or("AAC");
+        format!("{}/{}", first_codec, display_ext.to_uppercase())
+    } else if display_ext.is_empty() {
+        "UNKNOWN".to_string()
+    } else {
+        display_ext.to_uppercase()
+    };
+
     Ok(Box::new(SymphoniaSource {
         format,
         active_tracks,
@@ -2218,12 +2243,13 @@ fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(
         channels,
         channel_vus: vec![0.0; channels as usize],
         artist: "Unknown".to_string(),
-        ext_type: if display_ext.is_empty() { "UNKNOWN".to_string() } else { display_ext.to_uppercase() },
+        ext_type,
         intrinsic_sample_rate: Some(intrinsic_sample_rate),
         video_info,
         audio_tracks,
         selected_track_idx,
         has_video,
+        bitrate,
     }))
 }
 
