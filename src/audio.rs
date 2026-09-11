@@ -275,9 +275,6 @@ pub fn spawn_dsp_thread(
                 
                 state.raw_spectrum_data.copy_from_slice(&binned_data);
                 state.gpu_spectrum_data = gpu_spectrum.clone();
-                if !msg.channel_audio_data.is_empty() {
-                    push_planar_lookahead_slices(&mut state, &msg.channel_audio_data, sample_rate, msg.current_seconds);
-                }
                 state.raw_audio_channels = msg.channel_audio_data;
                 
                 // --- Waveform extraction (Zero-Crossing Edge Trigger) ---
@@ -357,44 +354,48 @@ pub fn spawn_dsp_thread(
                 if !state.lookahead_queue.is_empty() {
                     let cur_t = msg.current_seconds;
                     let q_len = state.lookahead_queue.len();
-                    let (t_first, _) = state.lookahead_queue[0];
-                    let (t_last, _) = state.lookahead_queue[q_len - 1];
-                    let total_span = (t_last - t_first).max(0.01);
+                    let (t_first, d_first) = state.lookahead_queue[0];
+                    let (t_last, d_last) = state.lookahead_queue[q_len - 1];
 
                     for k in 0..600 {
-                        let mut target_t = cur_t + (k as f64 - 100.0) * 0.01;
+                        let target_t = cur_t + (k as f64 - 100.0) * 0.01;
                         let off = k * 8;
 
-                        if target_t > t_last {
-                            let future_offset = target_t - t_last;
-                            target_t = t_first + (future_offset % total_span);
-                        } else if target_t < t_first {
-                            let past_offset = t_first - target_t;
-                            target_t = t_last - (past_offset % total_span);
-                        }
-
-                        let idx = match state.lookahead_queue.binary_search_by(|(t, _)| t.partial_cmp(&target_t).unwrap_or(std::cmp::Ordering::Equal)) {
-                            Ok(i) => i,
-                            Err(i) => i,
-                        };
-
-                        if idx == 0 {
-                            let (_, d0) = state.lookahead_queue[0];
-                            state.lookahead_timeline[off..off + 8].copy_from_slice(&d0);
-                        } else if idx >= q_len {
-                            let (_, d_last) = state.lookahead_queue[q_len - 1];
-                            state.lookahead_timeline[off..off + 8].copy_from_slice(&d_last);
+                        if target_t < t_first {
+                            // Prior to available history buffer: smooth fade out to first slice
+                            let fade = (1.0 - ((t_first - target_t) / 0.5)).max(0.0) as f32;
+                            for c in 0..8 {
+                                state.lookahead_timeline[off + c] = d_first[c] * fade;
+                            }
+                        } else if target_t > t_last {
+                            // Beyond decoded lookahead horizon (e.g. at end of track or initial buffering):
+                            // Smooth fade out to silence - NEVER wrap or repeat to avoid banding/seam artifacts!
+                            let fade = (1.0 - ((target_t - t_last) / 0.5)).max(0.0) as f32;
+                            for c in 0..8 {
+                                state.lookahead_timeline[off + c] = d_last[c] * fade;
+                            }
                         } else {
-                            let (t0, d0) = state.lookahead_queue[idx - 1];
-                            let (t1, d1) = state.lookahead_queue[idx];
-                            let dt = t1 - t0;
-                            if dt > 0.0001 && dt < 1.0 && target_t >= t0 && target_t <= t1 {
-                                let frac = ((target_t - t0) / dt).clamp(0.0, 1.0) as f32;
-                                for c in 0..8 {
-                                    state.lookahead_timeline[off + c] = d0[c] * (1.0 - frac) + d1[c] * frac;
-                                }
+                            let idx = match state.lookahead_queue.binary_search_by(|(t, _)| t.partial_cmp(&target_t).unwrap_or(std::cmp::Ordering::Equal)) {
+                                Ok(i) => i,
+                                Err(i) => i,
+                            };
+
+                            if idx == 0 {
+                                state.lookahead_timeline[off..off + 8].copy_from_slice(&d_first);
+                            } else if idx >= q_len {
+                                state.lookahead_timeline[off..off + 8].copy_from_slice(&d_last);
                             } else {
-                                state.lookahead_timeline[off..off + 8].copy_from_slice(&d0);
+                                let (t0, d0) = state.lookahead_queue[idx - 1];
+                                let (t1, d1) = state.lookahead_queue[idx];
+                                let dt = t1 - t0;
+                                if dt > 0.0001 && dt < 1.0 && target_t >= t0 && target_t <= t1 {
+                                    let frac = ((target_t - t0) / dt).clamp(0.0, 1.0) as f32;
+                                    for c in 0..8 {
+                                        state.lookahead_timeline[off + c] = d0[c] * (1.0 - frac) + d1[c] * frac;
+                                    }
+                                } else {
+                                    state.lookahead_timeline[off..off + 8].copy_from_slice(&d0);
+                                }
                             }
                         }
                     }
@@ -2954,7 +2955,7 @@ fn push_chunk_lookahead_slices(
         state.lookahead_buffer_start_time += (full_slices * slice_frames) as f64 / sample_rate as f64;
     }
     
-    while state.lookahead_queue.len() > 1200 {
+    while state.lookahead_queue.len() > 1800 {
         state.lookahead_queue.pop_front();
     }
 }
@@ -3052,7 +3053,7 @@ pub fn push_planar_lookahead_slices(
         ]));
     }
 
-    while state.lookahead_queue.len() > 1200 {
+    while state.lookahead_queue.len() > 1800 {
         state.lookahead_queue.pop_front();
     }
 }
@@ -3069,7 +3070,7 @@ fn run_dummy(
     let stop_token_clone = stop_token.clone();
     let hardware_channels = 2;
     let chunk_frames = 1024;
-    let pool_size = 256; 
+    let pool_size = ((sample_rate as usize * 8) / chunk_frames).clamp(384, 1024); 
     
     let (ready_tx, ready_rx) = bounded::<AudioChunk>(pool_size);
     let (free_tx, free_rx) = unbounded::<AudioChunk>();
@@ -3735,7 +3736,7 @@ where
     let hardware_channels = config.channels as usize;
     
     let chunk_frames = 1024;
-    let pool_size = 256; 
+    let pool_size = ((sample_rate as usize * 8) / chunk_frames).clamp(384, 1024); 
     
     let (ready_tx, ready_rx) = bounded::<AudioChunk>(pool_size);
     let (free_tx, free_rx) = unbounded::<AudioChunk>();

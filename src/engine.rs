@@ -8021,65 +8021,66 @@ mod tests {
         let mut state = crate::state::AppState::new("Test App".to_string());
         state.lookahead_timeline = vec![0.0; 600 * 8];
 
-        // Part 1: Populate lookahead_queue with a small slice window (e.g. 0.2s)
-        for i in 0..20 {
+        // Part 1: Full 7-second decoded lookahead buffer (normal playback)
+        for i in 0..700 {
             let t = 5.0 + (i as f64 * 0.01);
-            state.lookahead_queue.push_back((t, [-0.4, 0.4, -0.3, 0.3, 0.35, 0.35, 0.5, 0.5]));
+            let s = (i as f32 * 0.05).sin() * 0.4;
+            state.lookahead_queue.push_back((t, [-s.abs(), s.abs(), -s.abs(), s.abs(), 0.35, 0.35, 0.5, 0.5]));
         }
 
-        let cur_t = 5.1;
+        let cur_t = 6.0;
         let q_len = state.lookahead_queue.len();
-        let (t_first, _) = state.lookahead_queue[0];
-        let (t_last, _) = state.lookahead_queue[q_len - 1];
-        let total_span = (t_last - t_first).max(0.01);
+        let (t_first, d_first) = state.lookahead_queue[0];
+        let (t_last, d_last) = state.lookahead_queue[q_len - 1];
 
         for k in 0..600 {
-            let mut target_t = cur_t + (k as f64 - 100.0) * 0.01;
+            let target_t = cur_t + (k as f64 - 100.0) * 0.01;
             let off = k * 8;
 
-            if target_t > t_last {
-                let future_offset = target_t - t_last;
-                target_t = t_first + (future_offset % total_span);
-            } else if target_t < t_first {
-                let past_offset = t_first - target_t;
-                target_t = t_last - (past_offset % total_span);
-            }
-
-            let idx = match state.lookahead_queue.binary_search_by(|(t, _)| t.partial_cmp(&target_t).unwrap_or(std::cmp::Ordering::Equal)) {
-                Ok(i) => i,
-                Err(i) => i,
-            };
-
-            if idx == 0 {
-                let (_, d0) = state.lookahead_queue[0];
-                state.lookahead_timeline[off..off + 8].copy_from_slice(&d0);
-            } else if idx >= q_len {
-                let (_, d_last) = state.lookahead_queue[q_len - 1];
-                state.lookahead_timeline[off..off + 8].copy_from_slice(&d_last);
+            if target_t < t_first {
+                let fade = (1.0 - ((t_first - target_t) / 0.5)).max(0.0) as f32;
+                for c in 0..8 {
+                    state.lookahead_timeline[off + c] = d_first[c] * fade;
+                }
+            } else if target_t > t_last {
+                let fade = (1.0 - ((target_t - t_last) / 0.5)).max(0.0) as f32;
+                for c in 0..8 {
+                    state.lookahead_timeline[off + c] = d_last[c] * fade;
+                }
             } else {
-                let (t0, d0) = state.lookahead_queue[idx - 1];
-                let (t1, d1) = state.lookahead_queue[idx];
-                let dt = t1 - t0;
-                if dt > 0.0001 && dt < 1.0 && target_t >= t0 && target_t <= t1 {
-                    let frac = ((target_t - t0) / dt).clamp(0.0, 1.0) as f32;
-                    for c in 0..8 {
-                        state.lookahead_timeline[off + c] = d0[c] * (1.0 - frac) + d1[c] * frac;
-                    }
+                let idx = match state.lookahead_queue.binary_search_by(|(t, _)| t.partial_cmp(&target_t).unwrap_or(std::cmp::Ordering::Equal)) {
+                    Ok(i) => i,
+                    Err(i) => i,
+                };
+
+                if idx == 0 {
+                    state.lookahead_timeline[off..off + 8].copy_from_slice(&d_first);
+                } else if idx >= q_len {
+                    state.lookahead_timeline[off..off + 8].copy_from_slice(&d_last);
                 } else {
-                    state.lookahead_timeline[off..off + 8].copy_from_slice(&d0);
+                    let (t0, d0) = state.lookahead_queue[idx - 1];
+                    let (t1, d1) = state.lookahead_queue[idx];
+                    let dt = t1 - t0;
+                    if dt > 0.0001 && dt < 1.0 && target_t >= t0 && target_t <= t1 {
+                        let frac = ((target_t - t0) / dt).clamp(0.0, 1.0) as f32;
+                        for c in 0..8 {
+                            state.lookahead_timeline[off + c] = d0[c] * (1.0 - frac) + d1[c] * frac;
+                        }
+                    } else {
+                        state.lookahead_timeline[off..off + 8].copy_from_slice(&d0);
+                    }
                 }
             }
         }
 
-        // Verify that NO slice in the entire 600-slice buffer is zero (upcoming audio emitting from tape head)
-        for k in 0..600 {
-            let off = k * 8;
-            let min_l = state.lookahead_timeline[off + 0];
-            let max_l = state.lookahead_timeline[off + 1];
-            let rms = state.lookahead_timeline[off + 4];
-            assert!(min_l < 0.0, "Slice {} min_l should be negative, got {}", k, min_l);
-            assert!(max_l > 0.0, "Slice {} max_l should be positive, got {}", k, max_l);
-            assert!(rms > 0.0, "Slice {} rms should be non-zero, got {}", k, rms);
+        // Verify that lookahead is continuous with NO step discontinuities / banding across adjacent slices
+        for k in 0..599 {
+            let off0 = k * 8;
+            let off1 = (k + 1) * 8;
+            let max0 = state.lookahead_timeline[off0 + 1];
+            let max1 = state.lookahead_timeline[off1 + 1];
+            let diff = (max1 - max0).abs();
+            assert!(diff < 0.05, "Adjacent slices {} and {} must be continuous (diff: {})", k, k + 1, diff);
         }
 
         // Part 2: Fallback synthesis when queue is empty

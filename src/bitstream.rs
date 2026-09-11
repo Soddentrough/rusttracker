@@ -1027,7 +1027,7 @@ mod wasapi_bitstream {
                     is_eof: bool,
                 }
 
-                let (pcm_tx, pcm_rx) = crossbeam_channel::bounded::<AudioPacket>(16);
+                let (pcm_tx, pcm_rx) = crossbeam_channel::bounded::<AudioPacket>(256);
                 let (vis_tx, vis_rx) = crossbeam_channel::bounded::<DspMessage>(128);
 
                 let stop_token_ffmpeg = stop_token_pump.clone();
