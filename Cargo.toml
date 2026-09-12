@@ -130,5 +130,13 @@ lto = "thin"
 strip = false
 debug = 1
 
+# Strip heavy debug symbols from external dependencies to keep target/debug/deps lightweight
+[profile.dev.package."*"]
+debug = 0
+
+# Split debuginfo out of rlibs to minimize archive sizes
+[profile.dev]
+split-debuginfo = "unpacked"
+
 
 

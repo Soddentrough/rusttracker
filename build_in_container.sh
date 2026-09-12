@@ -55,4 +55,7 @@ VERSION=$(grep -m 1 '^version = ' Cargo.toml | sed 's/version = "\(.*\)"/\1/')
 TAG="v$VERSION"
 APPIMAGE_EXTRACT_AND_RUN=1 ./appimagetool-x86_64.AppImage AppDir RustTracker-SteamDeck-$TAG.AppImage
 
+echo 'Cleaning up intermediate build artifacts...'
+rm -rf target_appimage AppDir rusttracker.png
+
 echo 'Done!'
