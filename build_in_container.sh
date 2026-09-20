@@ -12,7 +12,7 @@ source $HOME/.cargo/env
 
 # Build RustTracker natively against Ubuntu 22.04 ffmpeg libraries
 echo 'Building RustTracker...'
-cargo build --release --target-dir target_appimage
+cargo build --release -j16 --target-dir target_appimage
 
 # Resize icon to 512x512 to appease linuxdeploy, and name it to match the desktop file
 convert icon.png -resize 512x512! rusttracker.png
