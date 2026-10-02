@@ -84,6 +84,12 @@ class MainActivity : GameActivity() {
         val insetsController = WindowCompat.getInsetsController(window, window.decorView)
         insetsController.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
 
+        onBackPressedDispatcher.addCallback(this, object : androidx.activity.OnBackPressedCallback(true) {
+            override fun handleOnBackPressed() {
+                finish()
+            }
+        })
+
         intent?.data?.let { uri ->
             handleSelectedUri(uri)
         }
@@ -119,6 +125,7 @@ class MainActivity : GameActivity() {
         }
         nativeOnDestroy()
         super.onDestroy()
+        android.os.Process.killProcess(android.os.Process.myPid())
     }
 
     fun openFilePicker() {

@@ -224,6 +224,7 @@ if [[ "$DO_RUN" = true ]]; then
     
     for dev in "${TARGET_DEVICES[@]}"; do
         echo "Launching RustTracker on device $dev..."
+        adb -s "$dev" shell am force-stop com.rusttracker.app
         adb -s "$dev" shell am start -n com.rusttracker.app/com.rusttracker.app.MainActivity
     done
     echo "RustTracker launched successfully!"

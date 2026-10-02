@@ -5,8 +5,9 @@ use jni::objects::{JClass, JString};
 use jni::JNIEnv;
 use winit::{
     application::ApplicationHandler,
-    event::WindowEvent,
+    event::{ElementState, KeyEvent, WindowEvent},
     event_loop::{ActiveEventLoop, ControlFlow, EventLoop},
+    keyboard::{Key, NamedKey},
     platform::android::activity::AndroidApp,
     platform::android::EventLoopBuilderExtAndroid,
     window::{Window, WindowId},
@@ -188,7 +189,7 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
         self.egui_state = None;
     }
 
-    fn window_event(&mut self, _event_loop: &ActiveEventLoop, window_id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, window_id: WindowId, event: WindowEvent) {
         let Some(win) = self.window.clone() else {
             return;
         };
@@ -201,6 +202,18 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
         }
 
         match event {
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Named(NamedKey::BrowserBack) | Key::Named(NamedKey::Escape),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } => {
+                eprintln!("[RustTracker] Back/Escape key pressed, exiting event loop...");
+                event_loop.exit();
+            }
             WindowEvent::Resized(physical_size) => {
                 eprintln!("[RustTracker] Android Window Resized: {:?}", physical_size);
                 if physical_size.width > 0 && physical_size.height > 0
@@ -442,11 +455,13 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                                     if state.audio_tracks.len() > 1 && track_idx < state.audio_tracks.len() {
                                         state.selected_audio_track = track_idx;
                                         state.active_audio_tracks = vec![track_idx];
+                                        state.multi_track_mix_mode = false;
                                         if state.audio_track_volumes.len() != state.audio_tracks.len() {
                                             state.audio_track_volumes = vec![1.0; state.audio_tracks.len()];
                                         }
                                         state.audio_track_request = Some(track_idx);
                                         state.audio_mix_request = Some(vec![(track_idx, 1.0)]);
+                                        crate::android::log_android(3, &format!("[RustTracker] SetAudioTrack: track_idx={}", track_idx));
                                     }
                                 }
                                 EngineAction::ToggleAudioTrackInMix(track_idx) => {
@@ -463,11 +478,13 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                                             state.active_audio_tracks.push(track_idx);
                                             state.active_audio_tracks.sort();
                                         }
+                                        state.multi_track_mix_mode = state.active_audio_tracks.len() > 1;
                                         if state.audio_track_volumes.len() != state.audio_tracks.len() {
                                             state.audio_track_volumes = vec![1.0; state.audio_tracks.len()];
                                         }
                                         let mix: Vec<(usize, f32)> = state.active_audio_tracks.iter().map(|&idx| (idx, state.audio_track_volumes.get(idx).copied().unwrap_or(1.0))).collect();
-                                        state.audio_mix_request = Some(mix);
+                                        state.audio_mix_request = Some(mix.clone());
+                                        crate::android::log_android(3, &format!("[RustTracker] ToggleAudioTrackInMix: track_idx={}, active={:?}", track_idx, state.active_audio_tracks));
                                     }
                                 }
                                 EngineAction::SetAudioTrackVolume(track_idx, volume) => {
@@ -493,7 +510,7 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                                 }
                                 EngineAction::SetAudioMixTracks(tracks) => {
                                     let mut state = self.app_state.lock().unwrap();
-                                    state.multi_track_mix_mode = true;
+                                    state.multi_track_mix_mode = tracks.len() > 1;
                                     state.active_audio_tracks = tracks.iter().map(|(idx, _)| *idx).collect();
                                     if state.audio_track_volumes.len() != state.audio_tracks.len() {
                                         state.audio_track_volumes = vec![1.0; state.audio_tracks.len()];
@@ -505,6 +522,9 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                                     }
                                     if let Some(&(first_idx, _)) = tracks.first() {
                                         state.selected_audio_track = first_idx;
+                                        if tracks.len() == 1 {
+                                            state.audio_track_request = Some(first_idx);
+                                        }
                                     }
                                     let mix_desc = if tracks.len() > 1 {
                                         let track_nums: Vec<String> = tracks.iter().map(|(idx, _)| (idx + 1).to_string()).collect();
@@ -517,6 +537,7 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                                     };
                                     state.osd_text = Some(mix_desc);
                                     state.osd_timer = 2.0;
+                                    crate::android::log_android(3, &format!("[RustTracker] SetAudioMixTracks: tracks={:?}", tracks));
                                     state.audio_mix_request = Some(tracks);
                                 }
                                 _ => {}
@@ -736,8 +757,9 @@ impl AndroidRustTrackerApp {
                     } else {
                         format!("Track {}: {}", next_track + 1, track_title)
                     };
-                    state.osd_text = Some(title_display);
+                    state.osd_text = Some(title_display.clone());
                     state.osd_timer = 2.0;
+                    crate::android::log_android(3, &format!("[RustTracker] TwoFingerTap: Switched to track {} ({})", next_track, title_display));
                 } else {
                     state.osd_text = Some("1 Audio Track Present".to_string());
                     state.osd_timer = 1.5;
@@ -899,10 +921,18 @@ fn android_main(app: AndroidApp) {
     log_android(3, "Starting RustTracker on Android with Touch Gestures, SAF, and Audio Engine...");
     eprintln!("[RustTracker] Starting on Android with Touch Gestures, SAF, and Audio Engine...");
 
-    let event_loop: EventLoop<AppCustomEvent> = EventLoop::<AppCustomEvent>::with_user_event()
+    let event_loop: EventLoop<AppCustomEvent> = match EventLoop::<AppCustomEvent>::with_user_event()
         .with_android_app(app.clone())
         .build()
-        .expect("Failed to create Android EventLoop");
+    {
+        Ok(el) => el,
+        Err(e) => {
+            let err_msg = format!("[RustTracker] EventLoop creation failed: {:?}. Exiting process to allow clean restart.", e);
+            log_android(6, &err_msg);
+            eprintln!("{}", err_msg);
+            std::process::exit(0);
+        }
+    };
 
     let proxy = event_loop.create_proxy();
     *EVENT_LOOP_PROXY.get_or_init(|| Mutex::new(None)).lock().unwrap() = Some(proxy);
@@ -929,5 +959,6 @@ fn android_main(app: AndroidApp) {
     let _ = event_loop.run_app(&mut android_app);
 
     *EVENT_LOOP_PROXY.get_or_init(|| Mutex::new(None)).lock().unwrap() = None;
-    eprintln!("[RustTracker] android_main thread exited cleanly.");
+    eprintln!("[RustTracker] android_main thread exited cleanly, terminating process.");
+    std::process::exit(0);
 }
