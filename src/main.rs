@@ -1345,6 +1345,7 @@ async fn run_gui(
                                 if state.audio_tracks.len() > 1 && track_idx < state.audio_tracks.len() {
                                     state.selected_audio_track = track_idx;
                                     state.active_audio_tracks = vec![track_idx];
+                                    state.multi_track_mix_mode = false;
                                     if state.audio_track_volumes.len() != state.audio_tracks.len() {
                                         state.audio_track_volumes = vec![1.0; state.audio_tracks.len()];
                                     }
@@ -1365,6 +1366,7 @@ async fn run_gui(
                                         state.active_audio_tracks.push(track_idx);
                                         state.active_audio_tracks.sort();
                                     }
+                                    state.multi_track_mix_mode = state.active_audio_tracks.len() > 1;
                                     if state.audio_track_volumes.len() != state.audio_tracks.len() {
                                         state.audio_track_volumes = vec![1.0; state.audio_tracks.len()];
                                     }
@@ -1392,7 +1394,7 @@ async fn run_gui(
                                 }
                             }
                             EngineAction::SetAudioMixTracks(tracks) => {
-                                state.multi_track_mix_mode = true;
+                                state.multi_track_mix_mode = tracks.len() > 1;
                                 state.active_audio_tracks = tracks.iter().map(|(idx, _)| *idx).collect();
                                 if state.audio_track_volumes.len() != state.audio_tracks.len() {
                                     state.audio_track_volumes = vec![1.0; state.audio_tracks.len()];
@@ -1404,6 +1406,9 @@ async fn run_gui(
                                 }
                                 if let Some(&(first_idx, _)) = tracks.first() {
                                     state.selected_audio_track = first_idx;
+                                    if tracks.len() == 1 {
+                                        state.audio_track_request = Some(first_idx);
+                                    }
                                 }
                                 let mix_desc = if tracks.len() > 1 {
                                     let track_nums: Vec<String> = tracks.iter().map(|(idx, _)| (idx + 1).to_string()).collect();

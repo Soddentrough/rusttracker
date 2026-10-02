@@ -6166,6 +6166,17 @@ impl VulkanEngine {
                                                 ui.add_space(3.0);
 
                                                 // Multi-Track Mix Interface
+                                                let total_avail_w = ui.available_width();
+                                                // Fixed controls width:
+                                                // Checkbox: 24.0
+                                                // 5 gaps of 4.0: 20.0
+                                                // Slider rail: 55.0
+                                                // Percentage text: 28.0
+                                                // Mute button [M]: 22.0
+                                                // Solo button [S]: 22.0
+                                                // Total non-title = 24.0 + 20.0 + 55.0 + 28.0 + 22.0 + 22.0 = 171.0
+                                                let title_w = (total_avail_w - 171.0).max(60.0);
+
                                                 for (idx, track) in state.audio_tracks.iter().enumerate() {
                                                     let is_in_mix = state.active_audio_tracks.contains(&idx);
                                                     let lower = track.title.to_lowercase();
@@ -6180,52 +6191,119 @@ impl VulkanEngine {
                                                     let mut current_vol = state.audio_track_volumes.get(idx).copied().unwrap_or(1.0);
 
                                                     ui.horizontal(|ui| {
-                                                        // Checkbox / Toggle Button
-                                                        let check_label = if is_in_mix {
-                                                            format!("☑ 🔗 {} {}", icon, track.title)
-                                                        } else {
-                                                            format!("☐   {} {}", icon, track.title)
-                                                        };
-                                                        let btn_color = if is_in_mix { color } else { egui::Color32::GRAY };
-                                                        let chk_btn = egui::Button::new(egui::RichText::new(check_label).color(btn_color).size(12.0))
-                                                            .fill(if is_in_mix { egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 35) } else { egui::Color32::from_rgba_unmultiplied(40, 40, 45, 160) })
-                                                            .stroke(if is_in_mix { egui::Stroke::new(1.0_f32, color) } else { egui::Stroke::NONE });
-                                                        
-                                                        let btn_w = if is_in_mix {
-                                                            (ui.available_width() - 110.0).clamp(110.0, 180.0)
-                                                        } else {
-                                                            ui.available_width()
-                                                        };
+                                                        ui.spacing_mut().item_spacing.x = 4.0;
 
-                                                        if ui.add_sized([btn_w, 28.0], chk_btn).clicked() {
+                                                        // 1. Checkbox button to toggle track into/out of mix
+                                                        let chk_label = if is_in_mix { "☑" } else { "☐" };
+                                                        let chk_btn = egui::Button::new(
+                                                            egui::RichText::new(chk_label)
+                                                                .color(if is_in_mix { color } else { egui::Color32::GRAY })
+                                                                .size(14.0)
+                                                                .strong(),
+                                                        )
+                                                        .fill(if is_in_mix {
+                                                            egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 35)
+                                                        } else {
+                                                            egui::Color32::from_rgba_unmultiplied(40, 40, 45, 160)
+                                                        })
+                                                        .stroke(if is_in_mix {
+                                                            egui::Stroke::new(1.0_f32, color)
+                                                        } else {
+                                                            egui::Stroke::NONE
+                                                        });
+                                                        if ui.add_sized([24.0, 26.0], chk_btn).clicked() {
                                                             *engine_action = EngineAction::ToggleAudioTrackInMix(idx);
                                                         }
 
-                                                        // Inline Controls when track is active in mix
-                                                        if is_in_mix {
-                                                            let vol_text = format!("{:.0}%", current_vol * 100.0);
-                                                            let slider = egui::Slider::new(&mut current_vol, 0.0..=1.0)
-                                                                .show_value(false)
-                                                                .text(vol_text);
-                                                            if ui.add(slider).changed() {
-                                                                *engine_action = EngineAction::SetAudioTrackVolume(idx, current_vol);
-                                                            }
+                                                        // 2. Track Title Button - tapping solos this track!
+                                                        let title_label = format!("{} {}", icon, track.title);
+                                                        let title_btn_resp = ui.allocate_ui_with_layout(
+                                                            egui::vec2(title_w, 26.0),
+                                                            egui::Layout::left_to_right(egui::Align::Center).with_main_align(egui::Align::Min),
+                                                            |ui| {
+                                                                let title_btn = egui::Button::new(
+                                                                    egui::RichText::new(title_label)
+                                                                        .color(if is_in_mix { color } else { egui::Color32::from_gray(160) })
+                                                                        .size(12.0),
+                                                                )
+                                                                .truncate()
+                                                                .min_size(egui::vec2(title_w, 26.0))
+                                                                .fill(if is_in_mix {
+                                                                    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 25)
+                                                                } else {
+                                                                    egui::Color32::from_rgba_unmultiplied(40, 40, 45, 160)
+                                                                })
+                                                                .stroke(if is_in_mix {
+                                                                    egui::Stroke::new(1.0_f32, color)
+                                                                } else {
+                                                                    egui::Stroke::NONE
+                                                                });
+                                                                ui.add(title_btn)
+                                                            },
+                                                        ).inner;
+                                                        if title_btn_resp.clicked() {
+                                                            *engine_action = EngineAction::SetAudioMixTracks(vec![(idx, 1.0)]);
+                                                        }
 
-                                                            // Mute button [M]
-                                                            let is_muted = current_vol == 0.0;
-                                                            let m_btn = egui::Button::new(egui::RichText::new("M").strong().color(if is_muted { egui::Color32::RED } else { egui::Color32::LIGHT_GRAY }).size(11.0))
-                                                                .fill(if is_muted { egui::Color32::from_rgba_unmultiplied(200, 50, 50, 80) } else { egui::Color32::from_rgba_unmultiplied(50, 50, 55, 180) });
-                                                            if ui.add_sized([22.0, 24.0], m_btn).clicked() {
-                                                                let new_vol = if is_muted { 1.0 } else { 0.0 };
-                                                                *engine_action = EngineAction::SetAudioTrackVolume(idx, new_vol);
-                                                            }
+                                                        // 3. Track Volume Slider (55 pt rail)
+                                                        ui.spacing_mut().slider_width = 55.0;
+                                                        let slider = egui::Slider::new(&mut current_vol, 0.0..=1.0).show_value(false);
+                                                        let slider_resp = ui.add_enabled(is_in_mix, slider);
+                                                        if slider_resp.changed() {
+                                                            *engine_action = EngineAction::SetAudioTrackVolume(idx, current_vol);
+                                                        }
 
-                                                            // Solo button [S]
-                                                            let s_btn = egui::Button::new(egui::RichText::new("S").strong().color(egui::Color32::YELLOW).size(11.0))
-                                                                .fill(egui::Color32::from_rgba_unmultiplied(50, 50, 55, 180));
-                                                            if ui.add_sized([22.0, 24.0], s_btn).clicked() {
-                                                                *engine_action = EngineAction::SetAudioMixTracks(vec![(idx, 1.0)]);
-                                                            }
+                                                        // 4. Volume Percentage Label (dedicated 28 pt column, never jitters or overflows)
+                                                        let vol_pct = format!("{:>3.0}%", (current_vol * 100.0).round());
+                                                        let vol_lbl = egui::Label::new(
+                                                            egui::RichText::new(vol_pct)
+                                                                .monospace()
+                                                                .size(11.0)
+                                                                .color(if is_in_mix { egui::Color32::WHITE } else { egui::Color32::from_gray(120) }),
+                                                        );
+                                                        ui.add_sized([28.0, 26.0], vol_lbl);
+
+                                                        // 5. Mute button [M]
+                                                        let is_muted = current_vol == 0.0;
+                                                        let m_btn = egui::Button::new(
+                                                            egui::RichText::new("M")
+                                                                .strong()
+                                                                .color(if !is_in_mix {
+                                                                    egui::Color32::from_gray(100)
+                                                                } else if is_muted {
+                                                                    egui::Color32::RED
+                                                                } else {
+                                                                    egui::Color32::LIGHT_GRAY
+                                                                })
+                                                                .size(11.0),
+                                                        )
+                                                        .fill(if !is_in_mix {
+                                                            egui::Color32::from_rgba_unmultiplied(35, 35, 40, 120)
+                                                        } else if is_muted {
+                                                            egui::Color32::from_rgba_unmultiplied(200, 50, 50, 80)
+                                                        } else {
+                                                            egui::Color32::from_rgba_unmultiplied(50, 50, 55, 180)
+                                                        });
+                                                        if ui.add_enabled(is_in_mix, m_btn).clicked() {
+                                                            let new_vol = if is_muted { 1.0 } else { 0.0 };
+                                                            *engine_action = EngineAction::SetAudioTrackVolume(idx, new_vol);
+                                                        }
+
+                                                        // 6. Solo button [S] (always clickable to solo any track)
+                                                        let is_solo = state.active_audio_tracks.len() == 1 && state.active_audio_tracks.contains(&idx);
+                                                        let s_btn = egui::Button::new(
+                                                            egui::RichText::new("S")
+                                                                .strong()
+                                                                .color(if is_solo { egui::Color32::BLACK } else { egui::Color32::YELLOW })
+                                                                .size(11.0),
+                                                        )
+                                                        .fill(if is_solo {
+                                                            egui::Color32::YELLOW
+                                                        } else {
+                                                            egui::Color32::from_rgba_unmultiplied(50, 50, 55, 180)
+                                                        });
+                                                        if ui.add_sized([22.0, 26.0], s_btn).clicked() {
+                                                            *engine_action = EngineAction::SetAudioMixTracks(vec![(idx, 1.0)]);
                                                         }
                                                     });
                                                     ui.add_space(2.0);
@@ -6272,8 +6350,21 @@ impl VulkanEngine {
 
                                                  let render_solo = |ui: &mut egui::Ui, track_idx: usize, w: f32, h: f32, engine_action: &mut EngineAction| {
                                                      let is_solo = state.active_audio_tracks.len() == 1 && state.active_audio_tracks.contains(&track_idx);
+                                                     let label = if num_tracks == 2 {
+                                                         let t_opt = state.audio_tracks.get(track_idx);
+                                                         let t_lower = t_opt.map(|t| t.title.to_lowercase()).unwrap_or_default();
+                                                         if track_idx == 0 && (t_lower.contains("instrumental") || t_lower.contains("karaoke") || t_lower.contains("music")) {
+                                                             "Trk 1 (Music)".to_string()
+                                                         } else if track_idx == 1 && (t_lower.contains("vocal") || t_lower.contains("guide") || t_lower.contains("full mix") || t_lower.contains("fullmix")) {
+                                                             "Trk 2 (Vocals)".to_string()
+                                                         } else {
+                                                             format!("Trk {}", track_idx + 1)
+                                                         }
+                                                     } else {
+                                                         format!("Trk {}", track_idx + 1)
+                                                     };
                                                      let btn = egui::Button::new(
-                                                         egui::RichText::new(format!("Trk {}", track_idx + 1)).strong().size(12.0).color(if is_solo { egui::Color32::from_rgb(0, 220, 255) } else { egui::Color32::LIGHT_GRAY })
+                                                         egui::RichText::new(label).strong().size(12.0).color(if is_solo { egui::Color32::from_rgb(0, 220, 255) } else { egui::Color32::LIGHT_GRAY })
                                                      )
                                                      .fill(if is_solo { egui::Color32::from_rgba_unmultiplied(0, 100, 150, 180) } else { egui::Color32::from_rgba_unmultiplied(50, 60, 70, 220) })
                                                      .stroke(if is_solo { egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0, 220, 255)) } else { egui::Stroke::NONE });

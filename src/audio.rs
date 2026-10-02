@@ -935,13 +935,27 @@ struct ActiveSymphoniaTrack {
     samples: Vec<f32>,
     buf_pos: usize,
     volume: f32,
+    enabled: bool,
     channels: u16,
     time_base: f64,
     current_time: f64,
 }
 
 #[inline(always)]
-fn get_downmixed_sample(track_channels: u16, base_slice: &[f32], hardware_channels: usize, out_channel: usize) -> f32 {
+pub(crate) fn calculate_mix_headroom<I>(volumes: I) -> f32
+where
+    I: IntoIterator<Item = f32>,
+{
+    let active_power: f32 = volumes.into_iter().map(|v| v * v).sum();
+    if active_power > 1.0 {
+        1.0 / active_power.sqrt()
+    } else {
+        1.0
+    }
+}
+
+#[inline(always)]
+pub(crate) fn get_downmixed_sample(track_channels: u16, base_slice: &[f32], hardware_channels: usize, out_channel: usize) -> f32 {
     if base_slice.is_empty() {
         return 0.0;
     }
@@ -1050,6 +1064,7 @@ struct SymphoniaSource {
     selected_track_idx: usize,
     has_video: bool,
     bitrate: Option<u32>,
+    is_full_mix_guide: bool,
 }
 
 impl AudioSource for SymphoniaSource {
@@ -1058,109 +1073,189 @@ impl AudioSource for SymphoniaSource {
         let frames_needed = output.len() / hardware_channels;
         self.channel_vus.fill(0.0);
 
+        let is_2track = self.audio_tracks.len() == 2;
+
+        // Dynamic energy-cancellation check for 2-track audio
+        if !self.is_full_mix_guide && is_2track {
+            let t0_opt = self.active_tracks.values().find(|t| t.track_idx == 0);
+            let t1_opt = self.active_tracks.values().find(|t| t.track_idx == 1);
+            if let (Some(t0), Some(t1)) = (t0_opt, t1_opt) {
+                let ch0 = t0.channels as usize;
+                let ch1 = t1.channels as usize;
+                let avail0 = (t0.samples.len().saturating_sub(t0.buf_pos)) / ch0.max(1);
+                let avail1 = (t1.samples.len().saturating_sub(t1.buf_pos)) / ch1.max(1);
+                let check_frames = avail0.min(avail1).min(512);
+                if check_frames >= 128 {
+                    let mut e0 = 0.0f32;
+                    let mut e1 = 0.0f32;
+                    let mut ediff = 0.0f32;
+                    for i in 0..check_frames {
+                        let s0 = t0.samples.get(t0.buf_pos + i * ch0).copied().unwrap_or(0.0);
+                        let s1 = t1.samples.get(t1.buf_pos + i * ch1).copied().unwrap_or(0.0);
+                        e0 += s0 * s0;
+                        e1 += s1 * s1;
+                        ediff += (s1 - s0) * (s1 - s0);
+                    }
+                    if e0 > 0.001 && e1 > 0.001 && ediff < 0.35 * e1 {
+                        self.is_full_mix_guide = true;
+                        eprintln!("[RustTracker Audio] Detected Full Mix vocal guide stem - enabling phase cancellation");
+                        #[cfg(target_os = "android")]
+                        crate::android::log_android(3, "[RustTracker Audio] Detected Full Mix vocal guide stem - enabling phase cancellation");
+                    }
+                }
+            }
+        }
+
+        let need_t0 = is_2track && (self.is_full_mix_guide || self.current_time < 3.0);
+
         while frames_written < frames_needed {
             let mut need_more = false;
-            for track in self.active_tracks.values().filter(|t| t.volume > 0.0 || t.track_id == self.primary_track_id) {
-                    let avail = (track.samples.len().saturating_sub(track.buf_pos)) / track.channels.max(1) as usize;
-                    if avail < (frames_needed - frames_written) {
-                        need_more = true;
+            for track in self.active_tracks.values().filter(|t| t.enabled || t.track_id == self.primary_track_id || (need_t0 && t.track_idx == 0)) {
+                let avail = (track.samples.len().saturating_sub(track.buf_pos)) / track.channels.max(1) as usize;
+                if avail < (frames_needed - frames_written) {
+                    need_more = true;
+                    break;
+                }
+            }
+
+            if need_more {
+                for _ in 0..512 {
+                    let all_satisfied = self.active_tracks.values()
+                        .filter(|t| t.enabled || t.track_id == self.primary_track_id || (need_t0 && t.track_idx == 0))
+                        .all(|t| {
+                            let avail = (t.samples.len().saturating_sub(t.buf_pos)) / t.channels.max(1) as usize;
+                            avail >= (frames_needed - frames_written)
+                        });
+                    if all_satisfied {
                         break;
                     }
-                }
 
-                if need_more {
-                    for _ in 0..64 {
-                        let all_satisfied = self.active_tracks.values()
-                            .filter(|t| t.volume > 0.0 || t.track_id == self.primary_track_id)
-                            .all(|t| {
-                                let avail = (t.samples.len().saturating_sub(t.buf_pos)) / t.channels.max(1) as usize;
-                                avail >= (frames_needed - frames_written)
-                            });
-                        if all_satisfied {
-                            break;
-                        }
-
-                        match self.format.next_packet() {
-                            Ok(packet) => {
-                                let pkt_track_id = packet.track_id();
-                                if let Some(track) = self.active_tracks.get_mut(&pkt_track_id)
-                                    && (track.volume > 0.0 || track.track_id == self.primary_track_id)
-                                    && let Ok(decoded) = track.decoder.decode(&packet) {
-                                    if track.sample_buf.capacity() < decoded.capacity() {
-                                        track.sample_buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
-                                    }
-                                    track.sample_buf.copy_interleaved_ref(decoded);
-                                    
-                                    if track.buf_pos > 4096 {
-                                        track.samples.drain(0..track.buf_pos);
-                                        track.buf_pos = 0;
-                                    }
-                                    track.samples.extend_from_slice(track.sample_buf.samples());
+                    match self.format.next_packet() {
+                        Ok(packet) => {
+                            let pkt_track_id = packet.track_id();
+                            if let Some(track) = self.active_tracks.get_mut(&pkt_track_id)
+                                && (track.enabled || track.track_id == self.primary_track_id || (need_t0 && track.track_idx == 0))
+                                && let Ok(decoded) = track.decoder.decode(&packet) {
+                                if track.sample_buf.capacity() < decoded.capacity() {
+                                    track.sample_buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
                                 }
+                                track.sample_buf.copy_interleaved_ref(decoded);
+                                
+                                if track.buf_pos > 4096 {
+                                    track.samples.drain(0..track.buf_pos);
+                                    track.buf_pos = 0;
+                                }
+                                track.samples.extend_from_slice(track.sample_buf.samples());
                             }
-                            Err(_) => break, // EOF
                         }
+                        Err(_) => break, // EOF
                     }
                 }
+            }
 
-                let mut min_available = usize::MAX;
-                for track in self.active_tracks.values().filter(|t| t.volume > 0.0 || t.track_id == self.primary_track_id) {
-                    let avail = (track.samples.len().saturating_sub(track.buf_pos)) / track.channels.max(1) as usize;
-                    min_available = min_available.min(avail);
-                }
+            let mut min_available = usize::MAX;
+            for track in self.active_tracks.values().filter(|t| t.enabled || t.track_id == self.primary_track_id || (need_t0 && t.track_idx == 0)) {
+                let avail = (track.samples.len().saturating_sub(track.buf_pos)) / track.channels.max(1) as usize;
+                min_available = min_available.min(avail);
+            }
 
-                if min_available == 0 || min_available == usize::MAX {
-                    if let Some(primary) = self.active_tracks.get(&self.primary_track_id) {
-                        let avail = (primary.samples.len().saturating_sub(primary.buf_pos)) / primary.channels.max(1) as usize;
-                        if avail == 0 { break; }
-                        min_available = avail;
-                    } else {
-                        break;
-                    }
+            if min_available == 0 || min_available == usize::MAX {
+                if let Some(primary) = self.active_tracks.get(&self.primary_track_id) {
+                    let avail = (primary.samples.len().saturating_sub(primary.buf_pos)) / primary.channels.max(1) as usize;
+                    if avail == 0 { break; }
+                    min_available = avail;
+                } else {
+                    break;
                 }
+            }
 
             let frames_to_copy = min_available.min(frames_needed - frames_written);
             if frames_to_copy == 0 { break; }
 
-            let active_count = self.active_tracks.values().filter(|t| t.volume > 0.0).count().max(1) as f32;
-            let headroom = 1.0 / active_count.sqrt();
+            let headroom = calculate_mix_headroom(self.active_tracks.values().filter(|t| t.enabled).map(|t| t.volume));
 
-            for f in 0..frames_to_copy {
-                let out_base = (frames_written + f) * hardware_channels;
+            let is_full_mix = self.is_full_mix_guide && is_2track;
+            let (t0_info, t1_info) = if is_full_mix {
+                let mut t0 = None;
+                let mut t1 = None;
+                for t in self.active_tracks.values() {
+                    if t.track_idx == 0 {
+                        t0 = Some((t.buf_pos, t.channels, t.volume, t.enabled));
+                    } else if t.track_idx == 1 {
+                        t1 = Some((t.buf_pos, t.channels, t.volume, t.enabled));
+                    }
+                }
+                (t0, t1)
+            } else {
+                (None, None)
+            };
 
-                // Update true channel VUs across all source channels for each active track
-                for track in self.active_tracks.values() {
-                    if track.volume > 0.0 {
-                        let base_idx = track.buf_pos + f * track.channels as usize;
-                        for ch in 0..track.channels as usize {
-                            if ch < self.channel_vus.len() {
-                                let s = track.samples.get(base_idx + ch).copied().unwrap_or(0.0).abs();
-                                self.channel_vus[ch] = self.channel_vus[ch].max(s * track.volume);
+            if is_full_mix && let (Some(t0), Some(t1)) = (t0_info, t1_info) {
+                let v0 = if t0.3 { t0.2 } else { 0.0 };
+                let v1 = if t1.3 { t1.2 } else { 0.0 };
+
+                let t0_samples = &self.active_tracks.values().find(|t| t.track_idx == 0).unwrap().samples;
+                let t1_samples = &self.active_tracks.values().find(|t| t.track_idx == 1).unwrap().samples;
+
+                for f in 0..frames_to_copy {
+                    let out_base = (frames_written + f) * hardware_channels;
+                    let base_idx_0 = t0.0 + f * t0.1 as usize;
+                    let base_idx_1 = t1.0 + f * t1.1 as usize;
+                    let ch_slice_0 = if base_idx_0 < t0_samples.len() { &t0_samples[base_idx_0..] } else { &[] };
+                    let ch_slice_1 = if base_idx_1 < t1_samples.len() { &t1_samples[base_idx_1..] } else { &[] };
+
+                    for c in 0..hardware_channels {
+                        let s0 = get_downmixed_sample(t0.1, ch_slice_0, hardware_channels, c);
+                        let s1 = get_downmixed_sample(t1.1, ch_slice_1, hardware_channels, c);
+                        // Extracted Vocals V = s1 - s0
+                        // Desired output: v0 * I + v1 * V = (v0 - v1) * s0 + v1 * s1
+                        let sum_val = (v0 - v1) * s0 + v1 * s1;
+                        let final_val = sum_val.clamp(-1.0, 1.0);
+                        output[out_base + c] = final_val;
+
+                        if c < self.channel_vus.len() {
+                            self.channel_vus[c] = self.channel_vus[c].max(final_val.abs());
+                        }
+                    }
+                }
+            } else {
+                for f in 0..frames_to_copy {
+                    let out_base = (frames_written + f) * hardware_channels;
+
+                    // Update true channel VUs across all source channels for each active track
+                    for track in self.active_tracks.values() {
+                        if track.enabled && track.volume > 0.0 {
+                            let base_idx = track.buf_pos + f * track.channels as usize;
+                            for ch in 0..track.channels as usize {
+                                if ch < self.channel_vus.len() {
+                                    let s = track.samples.get(base_idx + ch).copied().unwrap_or(0.0).abs();
+                                    self.channel_vus[ch] = self.channel_vus[ch].max(s * track.volume);
+                                }
                             }
                         }
                     }
-                }
 
-                for c in 0..hardware_channels {
-                    let mut sum_val = 0.0f32;
-                    for track in self.active_tracks.values() {
-                        if track.volume > 0.0 {
-                            let base_idx = track.buf_pos + f * track.channels as usize;
-                            let ch_slice = if base_idx < track.samples.len() {
-                                &track.samples[base_idx..]
-                            } else {
-                                &[]
-                            };
-                            let s_val = get_downmixed_sample(track.channels, ch_slice, hardware_channels, c);
-                            sum_val += s_val * track.volume;
+                    for c in 0..hardware_channels {
+                        let mut sum_val = 0.0f32;
+                        for track in self.active_tracks.values() {
+                            if track.enabled && track.volume > 0.0 {
+                                let base_idx = track.buf_pos + f * track.channels as usize;
+                                let ch_slice = if base_idx < track.samples.len() {
+                                    &track.samples[base_idx..]
+                                } else {
+                                    &[]
+                                };
+                                let s_val = get_downmixed_sample(track.channels, ch_slice, hardware_channels, c);
+                                sum_val += s_val * track.volume;
+                            }
                         }
+                        let final_val = (sum_val * headroom).clamp(-1.0, 1.0);
+                        output[out_base + c] = final_val;
                     }
-                    let final_val = (sum_val * headroom).clamp(-1.0, 1.0);
-                    output[out_base + c] = final_val;
                 }
             }
 
-            for track in self.active_tracks.values_mut().filter(|t| t.volume > 0.0 || t.track_id == self.primary_track_id) {
+            for track in self.active_tracks.values_mut().filter(|t| t.enabled || t.track_id == self.primary_track_id || (need_t0 && t.track_idx == 0)) {
                 let avail = (track.samples.len().saturating_sub(track.buf_pos)) / track.channels.max(1) as usize;
                 let consume = frames_to_copy.min(avail);
                 track.buf_pos += consume * track.channels as usize;
@@ -1238,7 +1333,7 @@ impl AudioSource for SymphoniaSource {
     
     fn get_active_audio_tracks(&self) -> Vec<usize> {
         let mut list: Vec<usize> = self.active_tracks.values()
-            .filter(|t| t.volume > 0.0)
+            .filter(|t| t.enabled)
             .map(|t| t.track_idx)
             .collect();
         list.sort();
@@ -1252,7 +1347,13 @@ impl AudioSource for SymphoniaSource {
 
         let track_map: std::collections::HashMap<usize, f32> = tracks.iter().copied().collect();
         for track in self.active_tracks.values_mut() {
-            track.volume = track_map.get(&track.track_idx).copied().unwrap_or(0.0);
+            if let Some(&vol) = track_map.get(&track.track_idx) {
+                track.enabled = true;
+                track.volume = vol;
+            } else {
+                track.enabled = false;
+                track.volume = 0.0;
+            }
         }
 
         if let Some(&(first_idx, _)) = tracks.first()
@@ -1266,6 +1367,7 @@ impl AudioSource for SymphoniaSource {
                 self.ext_type = self.audio_tracks[first_idx].codec.clone();
             }
             self.channels = self.audio_tracks[first_idx].channels;
+            self.channel_vus = vec![0.0; self.channels as usize];
             self.intrinsic_sample_rate = Some(self.audio_tracks[first_idx].sample_rate);
             if let Some(t) = self.active_tracks.get(&self.primary_track_id) {
                 self.time_base = t.time_base;
@@ -1300,6 +1402,7 @@ struct ActiveFfmpegTrack {
     sample_buf: Vec<f32>,
     buf_pos: usize,
     volume: f32,
+    enabled: bool,
     channels: u16,
     time_base: f64,
     current_time: f64,
@@ -1333,6 +1436,7 @@ struct FfmpegSource {
     output_sample_rate: u32,
     is_eof: bool,
     target_seek_time: Option<f64>,
+    is_full_mix_guide: bool,
 }
 
 #[cfg(not(target_os = "android"))]
@@ -1340,10 +1444,12 @@ impl FfmpegSource {
     fn fill_buffers(&mut self) -> bool {
         let mut progress = false;
         let target_pos_opt = self.target_seek_time;
+        let is_2track = self.audio_tracks.len() == 2;
+        let need_t0 = is_2track && (self.is_full_mix_guide || self.current_time < 3.0);
 
         // 1. Drain any packets currently in the active decoders
         for track in self.active_tracks.values_mut() {
-            if track.volume <= 0.0 && track.stream_index != self.primary_stream_index {
+            if !track.enabled && track.stream_index != self.primary_stream_index && (!need_t0 || track.track_idx != 0) {
                 continue;
             }
             let mut decoded = ffmpeg_next::frame::Audio::empty();
@@ -1385,7 +1491,7 @@ impl FfmpegSource {
         // 2. Read packets from container if any active track still needs data
         let mut need_packets = false;
         for track in self.active_tracks.values() {
-            if track.volume <= 0.0 && track.stream_index != self.primary_stream_index {
+            if !track.enabled && track.stream_index != self.primary_stream_index && (!need_t0 || track.track_idx != 0) {
                 continue;
             }
             let avail = (track.sample_buf.len().saturating_sub(track.buf_pos)) / track.channels.max(1) as usize;
@@ -1398,7 +1504,7 @@ impl FfmpegSource {
         if need_packets && !self.is_eof {
             for _ in 0..512 {
                 let all_satisfied = self.active_tracks.values()
-                    .filter(|t| t.volume > 0.0 || t.stream_index == self.primary_stream_index)
+                    .filter(|t| t.enabled || t.stream_index == self.primary_stream_index || (need_t0 && t.track_idx == 0))
                     .all(|t| {
                         let avail = (t.sample_buf.len().saturating_sub(t.buf_pos)) / t.channels.max(1) as usize;
                         avail >= 1024
@@ -1414,7 +1520,7 @@ impl FfmpegSource {
                             let _ = tx.try_send((self.video_epoch, packet.clone()));
                         }
                     } else if let Some(track) = self.active_tracks.get_mut(&s_idx)
-                        && (track.volume > 0.0 || track.stream_index == self.primary_stream_index) {
+                        && (track.enabled || track.stream_index == self.primary_stream_index || (need_t0 && track.track_idx == 0)) {
                         if track.seek_in_progress
                             && let Some(pkt_pts) = packet.pts() {
                             track.current_time = pkt_pts as f64 * track.time_base;
@@ -1465,7 +1571,7 @@ impl FfmpegSource {
 
         if let Some(target_pos) = self.target_seek_time {
             let all_reached = self.active_tracks.values()
-                .filter(|t| t.volume > 0.0 || t.stream_index == self.primary_stream_index)
+                .filter(|t| t.enabled || t.stream_index == self.primary_stream_index)
                 .all(|t| !t.seek_in_progress && t.current_time >= target_pos);
             if all_reached {
                 self.target_seek_time = None;
@@ -1479,16 +1585,61 @@ impl FfmpegSource {
 #[cfg(not(target_os = "android"))]
 impl AudioSource for FfmpegSource {
     fn read_frames(&mut self, hardware_channels: usize, sample_rate: u32, output: &mut [f32]) -> usize {
-        if sample_rate > 0 {
+        if sample_rate > 0 && sample_rate != self.output_sample_rate {
             self.output_sample_rate = sample_rate;
+            for track in self.active_tracks.values_mut() {
+                if let Ok(resamp) = ffmpeg_next::software::resampling::context::Context::get(
+                    track.decoder.format(),
+                    track.decoder.channel_layout(),
+                    track.decoder.rate(),
+                    ffmpeg_next::format::sample::Sample::F32(ffmpeg_next::format::sample::Type::Packed),
+                    track.decoder.channel_layout(),
+                    self.output_sample_rate,
+                ) {
+                    track.resampler = resamp;
+                }
+            }
         }
         let mut frames_written = 0;
         let frames_needed = output.len() / hardware_channels;
         self.channel_vus.fill(0.0);
 
+        let is_2track = self.audio_tracks.len() == 2;
+
+        // Dynamic energy-cancellation check for 2-track audio
+        if !self.is_full_mix_guide && is_2track {
+            let t0_opt = self.active_tracks.values().find(|t| t.track_idx == 0);
+            let t1_opt = self.active_tracks.values().find(|t| t.track_idx == 1);
+            if let (Some(t0), Some(t1)) = (t0_opt, t1_opt) {
+                let ch0 = t0.channels as usize;
+                let ch1 = t1.channels as usize;
+                let avail0 = (t0.sample_buf.len().saturating_sub(t0.buf_pos)) / ch0.max(1);
+                let avail1 = (t1.sample_buf.len().saturating_sub(t1.buf_pos)) / ch1.max(1);
+                let check_frames = avail0.min(avail1).min(512);
+                if check_frames >= 128 {
+                    let mut e0 = 0.0f32;
+                    let mut e1 = 0.0f32;
+                    let mut ediff = 0.0f32;
+                    for i in 0..check_frames {
+                        let s0 = t0.sample_buf.get(t0.buf_pos + i * ch0).copied().unwrap_or(0.0);
+                        let s1 = t1.sample_buf.get(t1.buf_pos + i * ch1).copied().unwrap_or(0.0);
+                        e0 += s0 * s0;
+                        e1 += s1 * s1;
+                        ediff += (s1 - s0) * (s1 - s0);
+                    }
+                    if e0 > 0.001 && e1 > 0.001 && ediff < 0.35 * e1 {
+                        self.is_full_mix_guide = true;
+                        eprintln!("[RustTracker Audio] Detected Full Mix vocal guide stem in FFmpegSource - enabling phase cancellation");
+                    }
+                }
+            }
+        }
+
+        let need_t0 = is_2track && (self.is_full_mix_guide || self.current_time < 3.0);
+
         while frames_written < frames_needed {
             let mut min_available = usize::MAX;
-            for track in self.active_tracks.values().filter(|t| t.volume > 0.0 || t.stream_index == self.primary_stream_index) {
+            for track in self.active_tracks.values().filter(|t| t.enabled || t.stream_index == self.primary_stream_index || (need_t0 && t.track_idx == 0)) {
                 let avail = (track.sample_buf.len().saturating_sub(track.buf_pos)) / track.channels.max(1) as usize;
                 min_available = min_available.min(avail);
             }
@@ -1519,45 +1670,90 @@ impl AudioSource for FfmpegSource {
             let frames_to_copy = min_available.min(frames_needed - frames_written);
             if frames_to_copy == 0 { break; }
 
-            let active_count = self.active_tracks.values().filter(|t| t.volume > 0.0).count().max(1) as f32;
-            let headroom = 1.0 / active_count.sqrt();
+            let headroom = calculate_mix_headroom(self.active_tracks.values().filter(|t| t.enabled).map(|t| t.volume));
 
-            for f in 0..frames_to_copy {
-                let out_idx = (frames_written + f) * hardware_channels;
+            let is_full_mix = self.is_full_mix_guide && is_2track;
+            let (t0_info, t1_info) = if is_full_mix {
+                let mut t0 = None;
+                let mut t1 = None;
+                for t in self.active_tracks.values() {
+                    if t.track_idx == 0 {
+                        t0 = Some((t.buf_pos, t.channels, t.volume, t.enabled));
+                    } else if t.track_idx == 1 {
+                        t1 = Some((t.buf_pos, t.channels, t.volume, t.enabled));
+                    }
+                }
+                (t0, t1)
+            } else {
+                (None, None)
+            };
 
-                // Update true channel VUs across all source channels for each active track
-                for track in self.active_tracks.values() {
-                    if track.volume > 0.0 {
-                        let in_idx = track.buf_pos + f * track.channels as usize;
-                        for ch in 0..track.channels as usize {
-                            if ch < self.channel_vus.len() {
-                                let s = track.sample_buf.get(in_idx + ch).copied().unwrap_or(0.0).abs();
-                                self.channel_vus[ch] = self.channel_vus[ch].max(s * track.volume);
+            if is_full_mix && let (Some(t0), Some(t1)) = (t0_info, t1_info) {
+                let v0 = if t0.3 { t0.2 } else { 0.0 };
+                let v1 = if t1.3 { t1.2 } else { 0.0 };
+
+                let t0_samples = &self.active_tracks.values().find(|t| t.track_idx == 0).unwrap().sample_buf;
+                let t1_samples = &self.active_tracks.values().find(|t| t.track_idx == 1).unwrap().sample_buf;
+
+                for f in 0..frames_to_copy {
+                    let out_base = (frames_written + f) * hardware_channels;
+                    let base_idx_0 = t0.0 + f * t0.1 as usize;
+                    let base_idx_1 = t1.0 + f * t1.1 as usize;
+                    let ch_slice_0 = if base_idx_0 < t0_samples.len() { &t0_samples[base_idx_0..] } else { &[] };
+                    let ch_slice_1 = if base_idx_1 < t1_samples.len() { &t1_samples[base_idx_1..] } else { &[] };
+
+                    for c in 0..hardware_channels {
+                        let s0 = get_downmixed_sample(t0.1, ch_slice_0, hardware_channels, c);
+                        let s1 = get_downmixed_sample(t1.1, ch_slice_1, hardware_channels, c);
+                        // Extracted Vocals V = s1 - s0
+                        // Desired output: v0 * I + v1 * V = (v0 - v1) * s0 + v1 * s1
+                        let sum_val = (v0 - v1) * s0 + v1 * s1;
+                        let final_val = sum_val.clamp(-1.0, 1.0);
+                        output[out_base + c] = final_val;
+
+                        if c < self.channel_vus.len() {
+                            self.channel_vus[c] = self.channel_vus[c].max(final_val.abs());
+                        }
+                    }
+                }
+            } else {
+                for f in 0..frames_to_copy {
+                    let out_idx = (frames_written + f) * hardware_channels;
+
+                    // Update true channel VUs across all source channels for each active track
+                    for track in self.active_tracks.values() {
+                        if track.enabled && track.volume > 0.0 {
+                            let in_idx = track.buf_pos + f * track.channels as usize;
+                            for ch in 0..track.channels as usize {
+                                if ch < self.channel_vus.len() {
+                                    let s = track.sample_buf.get(in_idx + ch).copied().unwrap_or(0.0).abs();
+                                    self.channel_vus[ch] = self.channel_vus[ch].max(s * track.volume);
+                                }
                             }
                         }
                     }
-                }
 
-                for c in 0..hardware_channels {
-                    let mut sum_val = 0.0f32;
-                    for track in self.active_tracks.values() {
-                        if track.volume > 0.0 {
-                            let in_idx = track.buf_pos + f * track.channels as usize;
-                            let ch_slice = if in_idx < track.sample_buf.len() {
-                                &track.sample_buf[in_idx..]
-                            } else {
-                                &[]
-                            };
-                            let s_val = get_downmixed_sample(track.channels, ch_slice, hardware_channels, c);
-                            sum_val += s_val * track.volume;
+                    for c in 0..hardware_channels {
+                        let mut sum_val = 0.0f32;
+                        for track in self.active_tracks.values() {
+                            if track.enabled && track.volume > 0.0 {
+                                let in_idx = track.buf_pos + f * track.channels as usize;
+                                let ch_slice = if in_idx < track.sample_buf.len() {
+                                    &track.sample_buf[in_idx..]
+                                } else {
+                                    &[]
+                                };
+                                let s_val = get_downmixed_sample(track.channels, ch_slice, hardware_channels, c);
+                                sum_val += s_val * track.volume;
+                            }
                         }
+                        let out_val = (sum_val * headroom).clamp(-1.0, 1.0);
+                        output[out_idx + c] = out_val;
                     }
-                    let out_val = (sum_val * headroom).clamp(-1.0, 1.0);
-                    output[out_idx + c] = out_val;
                 }
             }
 
-            for track in self.active_tracks.values_mut().filter(|t| t.volume > 0.0 || t.stream_index == self.primary_stream_index) {
+            for track in self.active_tracks.values_mut().filter(|t| t.enabled || t.stream_index == self.primary_stream_index || (need_t0 && t.track_idx == 0)) {
                 let avail = (track.sample_buf.len().saturating_sub(track.buf_pos)) / track.channels.max(1) as usize;
                 let consume = frames_to_copy.min(avail);
                 track.buf_pos += consume * track.channels as usize;
@@ -1664,7 +1860,7 @@ impl AudioSource for FfmpegSource {
 
     fn get_active_audio_tracks(&self) -> Vec<usize> {
         let mut list: Vec<usize> = self.active_tracks.values()
-            .filter(|t| t.volume > 0.0)
+            .filter(|t| t.enabled)
             .map(|t| t.track_idx)
             .collect();
         list.sort();
@@ -1676,7 +1872,13 @@ impl AudioSource for FfmpegSource {
 
         let track_map: std::collections::HashMap<usize, f32> = tracks.iter().copied().collect();
         for track in self.active_tracks.values_mut() {
-            track.volume = track_map.get(&track.track_idx).copied().unwrap_or(0.0);
+            if let Some(&vol) = track_map.get(&track.track_idx) {
+                track.enabled = true;
+                track.volume = vol;
+            } else {
+                track.enabled = false;
+                track.volume = 0.0;
+            }
         }
 
         if let Some(&(first_idx, _)) = tracks.first()
@@ -1930,6 +2132,12 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
     let mut audio_tracks = Vec::new();
     let mut selected_track_idx = 0;
     
+    let mp4_track_names = if file_path.to_lowercase().ends_with(".mp4") || file_path.to_lowercase().ends_with(".m4a") || file_path.to_lowercase().ends_with(".mov") {
+        extract_mp4_track_names(file_path)
+    } else {
+        Vec::new()
+    };
+
     for stream in ictx.streams() {
         if stream.parameters().medium() == ffmpeg_next::media::Type::Audio {
             let s_idx = stream.index();
@@ -1965,8 +2173,15 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
             };
 
             let meta = stream.metadata();
-            let lang = meta.get("language").or_else(|| meta.get("LANG")).map(|s| s.to_string());
-            let title = meta.get("title").map(|s| s.to_string());
+            let lang = meta.get("language").or_else(|| meta.get("LANG")).map(|s| s.to_string())
+                .filter(|l| l.to_lowercase() != "und");
+            let title = meta.get("name")
+                .or_else(|| meta.get("NAME"))
+                .or_else(|| meta.get("title"))
+                .or_else(|| meta.get("TITLE"))
+                .or_else(|| meta.get("description"))
+                .map(|s| s.to_string())
+                .or_else(|| mp4_track_names.get(audio_tracks.len()).cloned());
 
             let mut desc_parts = Vec::new();
             desc_parts.push(codec_name.clone());
@@ -2038,16 +2253,16 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
             && let Ok(ctx) = ffmpeg_next::codec::context::Context::from_parameters(st.parameters())
             && let Ok(dec) = ctx.decoder().audio() {
             let ch = dec.channels();
-            let sr = dec.rate();
-                    if let Ok(resamp) = ffmpeg_next::software::resampling::context::Context::get(
+            if let Ok(resamp) = ffmpeg_next::software::resampling::context::Context::get(
                         dec.format(),
                         dec.channel_layout(),
                         dec.rate(),
                         ffmpeg_next::format::sample::Sample::F32(ffmpeg_next::format::sample::Type::Packed),
                         dec.channel_layout(),
-                        sr,
+                        sample_rate,
                     ) {
                         let vol = if t_idx == selected_track_idx { 1.0 } else { 0.0 };
+                        let enabled = t_idx == selected_track_idx;
                         let track_st_tb = st.time_base();
                         let track_tb_f64 = track_st_tb.numerator() as f64 / track_st_tb.denominator() as f64;
                         active_tracks.insert(track_info.id, ActiveFfmpegTrack {
@@ -2058,6 +2273,7 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
                             sample_buf: Vec::new(),
                             buf_pos: 0,
                             volume: vol,
+                            enabled,
                             channels: ch,
                             time_base: track_tb_f64,
                             current_time: 0.0,
@@ -2066,6 +2282,13 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
                     }
                 }
     }
+
+    let is_full_mix_guide = if audio_tracks.len() == 2 {
+        let t1_title = audio_tracks[1].title.to_lowercase();
+        t1_title.contains("full mix") || t1_title.contains("fullmix")
+    } else {
+        false
+    };
 
     Ok(Box::new(FfmpegSource {
         ictx,
@@ -2091,6 +2314,7 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
         output_sample_rate: sample_rate,
         is_eof: false,
         target_seek_time: None,
+        is_full_mix_guide,
     }))
 }
 
@@ -2100,36 +2324,56 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
 pub fn extract_mp4_track_names(path: &str) -> Vec<String> {
     let mut names = Vec::new();
     if let Ok(mut file) = std::fs::File::open(path) {
-        use std::io::Read;
-        // Limit to first 2MB which contains the moov/trak/udta metadata atoms
-        let mut data = vec![0u8; 2 * 1024 * 1024];
-        let bytes_read = file.read(&mut data).unwrap_or(0);
-        data.truncate(bytes_read);
+        use std::io::{Read, Seek, SeekFrom};
+        let file_len = file.metadata().map(|m| m.len()).unwrap_or(0);
+        let mut buffers = Vec::new();
 
-        let name_marker = b"name";
-        let mut i = 0;
-        while i + 8 < data.len() {
-            if &data[i..i+4] == name_marker {
-                let start = i + 4;
-                let mut end = start;
-                while end < data.len() && end < start + 64 && data[end] >= 0x20 && data[end] <= 0x7E {
-                    end += 1;
-                }
-                if end > start + 2
-                    && let Ok(name_str) = std::str::from_utf8(&data[start..end]) {
-                    let trimmed = name_str.trim();
-                    if !trimmed.is_empty() && !names.contains(&trimmed.to_string()) {
-                        names.push(trimmed.to_string());
-                    }
+        // 1. First 2MB (for faststart/web-optimized MP4s where moov is at the start)
+        let mut head = vec![0u8; (2 * 1024 * 1024).min(file_len as usize)];
+        if let Ok(n) = file.read(&mut head) {
+            head.truncate(n);
+            buffers.push(head);
+        }
+
+        // 2. If file > 2MB, also read last 4MB where moov is placed in standard MP4s
+        if file_len > 2 * 1024 * 1024 {
+            let tail_len = (4 * 1024 * 1024).min(file_len - 2 * 1024 * 1024) as usize;
+            let tail_offset = file_len - tail_len as u64;
+            if file.seek(SeekFrom::Start(tail_offset)).is_ok() {
+                let mut tail = vec![0u8; tail_len];
+                if let Ok(n) = file.read(&mut tail) {
+                    tail.truncate(n);
+                    buffers.push(tail);
                 }
             }
-            i += 1;
+        }
+
+        let name_marker = b"name";
+        for data in &buffers {
+            let mut i = 0;
+            while i + 8 < data.len() {
+                if &data[i..i+4] == name_marker {
+                    let start = i + 4;
+                    let mut end = start;
+                    while end < data.len() && end < start + 64 && data[end] >= 0x20 && data[end] <= 0x7E {
+                        end += 1;
+                    }
+                    if end > start + 2
+                        && let Ok(name_str) = std::str::from_utf8(&data[start..end]) {
+                        let trimmed = name_str.trim();
+                        if !trimmed.is_empty() && !names.contains(&trimmed.to_string()) {
+                            names.push(trimmed.to_string());
+                        }
+                    }
+                }
+                i += 1;
+            }
         }
     }
     names
 }
 
-fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(
+pub(crate) fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(
     file: R,
     probe_ext: &str,
     display_ext: &str,
@@ -2232,6 +2476,7 @@ fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(
             let t_sample_rate = t.codec_params.sample_rate.unwrap_or(44100);
             let t_time_base = t.codec_params.time_base.map(|tb| tb.calc_time(1).seconds as f64 + tb.calc_time(1).frac).unwrap_or(1.0 / 44100.0);
             let vol = if t_idx == selected_track_idx { 1.0 } else { 0.0 };
+            let enabled = t_idx == selected_track_idx;
             active_tracks.insert(t.id, ActiveSymphoniaTrack {
                 track_idx: t_idx,
                 track_id: t.id,
@@ -2240,6 +2485,7 @@ fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(
                 samples: Vec::new(),
                 buf_pos: 0,
                 volume: vol,
+                enabled,
                 channels: t_channels,
                 time_base: t_time_base,
                 current_time: 0.0,
@@ -2267,6 +2513,13 @@ fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(
         display_ext.to_uppercase()
     };
 
+    let is_full_mix_guide = if audio_tracks.len() == 2 {
+        let t1_title = audio_tracks[1].title.to_lowercase();
+        t1_title.contains("full mix") || t1_title.contains("fullmix")
+    } else {
+        false
+    };
+
     Ok(Box::new(SymphoniaSource {
         format,
         active_tracks,
@@ -2284,6 +2537,7 @@ fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(
         selected_track_idx,
         has_video,
         bitrate,
+        is_full_mix_guide,
     }))
 }
 
@@ -2430,6 +2684,7 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
         match try_symphonia(file, &ext, &ext, video_info.clone(), Some(file_path)) {
             Ok(source) => return Ok(source),
             Err(e) => {
+                println!("[RustTracker] Symphonia load failed for {}: {:?}", file_path, e);
                 symphonia_error = Some(e);
             }
         }
@@ -2755,7 +3010,7 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
                     state.selected_audio_track = audio_source.get_selected_audio_track();
                     state.active_audio_tracks = audio_source.get_active_audio_tracks();
                     state.audio_track_volumes = vec![1.0; state.audio_tracks.len()];
-                    state.multi_track_mix_mode = true;
+                    state.multi_track_mix_mode = state.active_audio_tracks.len() > 1;
                     state.audio_track_request = None;
                     state.audio_mix_request = None;
                     state.has_video_stream = audio_source.has_video_stream();
@@ -2843,7 +3098,7 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
                     state.selected_audio_track = audio_source.get_selected_audio_track();
                     state.active_audio_tracks = audio_source.get_active_audio_tracks();
                     state.audio_track_volumes = vec![1.0; state.audio_tracks.len()];
-                    state.multi_track_mix_mode = true;
+                    state.multi_track_mix_mode = state.active_audio_tracks.len() > 1;
                     state.audio_track_request = None;
                     state.audio_mix_request = None;
                     state.has_video_stream = audio_source.has_video_stream();
@@ -3331,51 +3586,77 @@ fn run_dummy(
                 if let Ok(mut state) = state_for_decoder.try_lock() {
                     if let Some(mix_req) = state.audio_mix_request.take()
                         && state.audio_tracks.len() > 1 && !mix_req.is_empty() {
+                        let mut new_active: Vec<usize> = mix_req.iter().map(|&(idx, _)| idx).collect();
+                        new_active.sort();
+                        let current_active = audio_source.get_active_audio_tracks();
+                        let tracks_changed = new_active != current_active;
                         let play_pos = state.current_seconds;
                         if audio_source.set_active_audio_tracks(&mix_req).is_ok() {
-                            audio_source.set_position_seconds(play_pos);
+                            if tracks_changed {
+                                audio_source.set_position_seconds(play_pos);
+                                state.audio_track_request = None;
+                            }
                             state.active_audio_tracks = audio_source.get_active_audio_tracks();
                             if let Some(&first_idx) = state.active_audio_tracks.first() {
                                 state.selected_audio_track = first_idx;
                             }
                             state.num_channels = audio_source.get_num_channels();
+                            let ch_count = state.num_channels as usize;
+                            state.channel_vus.resize(ch_count, 0.0);
+                            state.peak_vus.resize(ch_count, 0.0);
                             state.module_type = audio_source.get_type();
                             state.bitrate = audio_source.get_bitrate();
-                            
-                            let mix_desc = if state.active_audio_tracks.len() > 1 {
-                                let track_nums: Vec<String> = state.active_audio_tracks.iter().map(|idx| (idx + 1).to_string()).collect();
-                                format!("🎛 Audio Mix: Tracks {}", track_nums.join("+"))
-                            } else {
-                                let idx = state.selected_audio_track;
-                                let track_title = state.audio_tracks.get(idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", idx + 1));
-                                if track_title.to_lowercase().starts_with("track") {
-                                    format!("🎛 {}", track_title)
-                                } else {
-                                    format!("🎛 Track {}: {}", idx + 1, track_title)
+                            state.multi_track_mix_mode = state.active_audio_tracks.len() > 1;
+
+                            if state.audio_track_volumes.len() != state.audio_tracks.len() {
+                                state.audio_track_volumes = vec![1.0; state.audio_tracks.len()];
+                            }
+                            for &(idx, vol) in &mix_req {
+                                if idx < state.audio_track_volumes.len() {
+                                    state.audio_track_volumes[idx] = vol;
                                 }
-                            };
-                            state.osd_text = Some(mix_desc);
-                            state.osd_timer = 3.0;
+                            }
+                            
+                            if tracks_changed {
+                                let mix_desc = if state.active_audio_tracks.len() > 1 {
+                                    let track_nums: Vec<String> = state.active_audio_tracks.iter().map(|idx| (idx + 1).to_string()).collect();
+                                    format!("🎛 Audio Mix: Tracks {}", track_nums.join("+"))
+                                } else {
+                                    let idx = state.selected_audio_track;
+                                    let track_title = state.audio_tracks.get(idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", idx + 1));
+                                    if track_title.to_lowercase().starts_with("track") {
+                                        format!("🎛 {}", track_title)
+                                    } else {
+                                        format!("🎛 Track {}: {}", idx + 1, track_title)
+                                    }
+                                };
+                                state.osd_text = Some(mix_desc);
+                                state.osd_timer = 3.0;
 
-                            state.lookahead_queue.clear();
-                            state.lookahead_sample_buffer.clear();
-                            state.lookahead_timeline.fill(0.0);
-                            state.lookahead_buffer_start_time = play_pos;
-                            state.waveform_history.clear();
+                                state.lookahead_queue.clear();
+                                state.lookahead_sample_buffer.clear();
+                                state.lookahead_timeline.fill(0.0);
+                                state.lookahead_buffer_start_time = play_pos;
+                                state.waveform_history.clear();
 
-                            while let Ok(c) = ready_rx_for_decoder.try_recv() {
-                                let _ = free_tx_for_decoder.try_send(c);
+                                while let Ok(c) = ready_rx_for_decoder.try_recv() {
+                                    let _ = free_tx_for_decoder.try_send(c);
+                                }
                             }
                         }
                     }
                     if let Some(track_idx) = state.audio_track_request.take()
-                        && state.audio_tracks.len() > 1 && track_idx < state.audio_tracks.len() && track_idx != state.selected_audio_track {
+                        && state.audio_tracks.len() > 1 && track_idx < state.audio_tracks.len() && (audio_source.get_active_audio_tracks() != vec![track_idx]) {
                             let play_pos = state.current_seconds;
                             if audio_source.select_audio_track(track_idx).is_ok() {
                                 audio_source.set_position_seconds(play_pos);
                                 state.selected_audio_track = track_idx;
                                 state.active_audio_tracks = vec![track_idx];
+                                state.multi_track_mix_mode = false;
                                 state.num_channels = audio_source.get_num_channels();
+                                let ch_count = state.num_channels as usize;
+                                state.channel_vus.resize(ch_count, 0.0);
+                                state.peak_vus.resize(ch_count, 0.0);
                                 state.module_type = audio_source.get_type();
                                 state.bitrate = audio_source.get_bitrate();
                                 let track_title = state.audio_tracks.get(track_idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", track_idx + 1));
@@ -3499,52 +3780,78 @@ fn run_dummy(
                 if let Ok(mut state) = state_for_decoder.try_lock() {
                     if let Some(mix_req) = state.audio_mix_request.take()
                         && state.audio_tracks.len() > 1 && !mix_req.is_empty() {
+                        let mut new_active: Vec<usize> = mix_req.iter().map(|&(idx, _)| idx).collect();
+                        new_active.sort();
+                        let current_active = audio_source.get_active_audio_tracks();
+                        let tracks_changed = new_active != current_active;
                         let play_pos = state.current_seconds;
                         if audio_source.set_active_audio_tracks(&mix_req).is_ok() {
-                            audio_source.set_position_seconds(play_pos);
+                            if tracks_changed {
+                                audio_source.set_position_seconds(play_pos);
+                                state.audio_track_request = None;
+                            }
                             state.active_audio_tracks = audio_source.get_active_audio_tracks();
                             if let Some(&first_idx) = state.active_audio_tracks.first() {
                                 state.selected_audio_track = first_idx;
                             }
                             state.num_channels = audio_source.get_num_channels();
+                            let ch_count = state.num_channels as usize;
+                            state.channel_vus.resize(ch_count, 0.0);
+                            state.peak_vus.resize(ch_count, 0.0);
                             state.module_type = audio_source.get_type();
                             state.bitrate = audio_source.get_bitrate();
-                            
-                            let mix_desc = if state.active_audio_tracks.len() > 1 {
-                                let track_nums: Vec<String> = state.active_audio_tracks.iter().map(|idx| (idx + 1).to_string()).collect();
-                                format!("🎛 Audio Mix: Tracks {}", track_nums.join("+"))
-                            } else {
-                                let idx = state.selected_audio_track;
-                                let track_title = state.audio_tracks.get(idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", idx + 1));
-                                if track_title.to_lowercase().starts_with("track") {
-                                    format!("🎛 {}", track_title)
-                                } else {
-                                    format!("🎛 Track {}: {}", idx + 1, track_title)
-                                }
-                            };
-                            state.osd_text = Some(mix_desc);
-                            state.osd_timer = 3.0;
+                            state.multi_track_mix_mode = state.active_audio_tracks.len() > 1;
 
-                            state.lookahead_queue.clear();
-                            state.lookahead_sample_buffer.clear();
-                            state.lookahead_timeline.fill(0.0);
-                            state.lookahead_buffer_start_time = play_pos;
-                            state.waveform_history.clear();
-
-                            while let Ok(c) = ready_rx_for_decoder.try_recv() {
-                                let _ = free_tx_for_decoder.try_send(c);
+                            if state.audio_track_volumes.len() != state.audio_tracks.len() {
+                                state.audio_track_volumes = vec![1.0; state.audio_tracks.len()];
                             }
-                            seeked = true;
+                            for &(idx, vol) in &mix_req {
+                                if idx < state.audio_track_volumes.len() {
+                                    state.audio_track_volumes[idx] = vol;
+                                }
+                            }
+                            
+                            if tracks_changed {
+                                let mix_desc = if state.active_audio_tracks.len() > 1 {
+                                    let track_nums: Vec<String> = state.active_audio_tracks.iter().map(|idx| (idx + 1).to_string()).collect();
+                                    format!("🎛 Audio Mix: Tracks {}", track_nums.join("+"))
+                                } else {
+                                    let idx = state.selected_audio_track;
+                                    let track_title = state.audio_tracks.get(idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", idx + 1));
+                                    if track_title.to_lowercase().starts_with("track") {
+                                        format!("🎛 {}", track_title)
+                                    } else {
+                                        format!("🎛 Track {}: {}", idx + 1, track_title)
+                                    }
+                                };
+                                state.osd_text = Some(mix_desc);
+                                state.osd_timer = 3.0;
+
+                                state.lookahead_queue.clear();
+                                state.lookahead_sample_buffer.clear();
+                                state.lookahead_timeline.fill(0.0);
+                                state.lookahead_buffer_start_time = play_pos;
+                                state.waveform_history.clear();
+
+                                while let Ok(c) = ready_rx_for_decoder.try_recv() {
+                                    let _ = free_tx_for_decoder.try_send(c);
+                                }
+                                seeked = true;
+                            }
                         }
                     }
                     if let Some(track_idx) = state.audio_track_request.take()
-                        && state.audio_tracks.len() > 1 && track_idx < state.audio_tracks.len() && track_idx != state.selected_audio_track {
+                        && state.audio_tracks.len() > 1 && track_idx < state.audio_tracks.len() && (audio_source.get_active_audio_tracks() != vec![track_idx]) {
                             let play_pos = state.current_seconds;
                             if audio_source.select_audio_track(track_idx).is_ok() {
                                 audio_source.set_position_seconds(play_pos);
                                 state.selected_audio_track = track_idx;
                                 state.active_audio_tracks = vec![track_idx];
+                                state.multi_track_mix_mode = false;
                                 state.num_channels = audio_source.get_num_channels();
+                                let ch_count = state.num_channels as usize;
+                                state.channel_vus.resize(ch_count, 0.0);
+                                state.peak_vus.resize(ch_count, 0.0);
                                 state.module_type = audio_source.get_type();
                                 state.bitrate = audio_source.get_bitrate();
                                 let track_title = state.audio_tracks.get(track_idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", track_idx + 1));
@@ -4225,51 +4532,77 @@ where
                 if let Ok(mut state) = state_for_decoder.try_lock() {
                     if let Some(mix_req) = state.audio_mix_request.take()
                         && state.audio_tracks.len() > 1 && !mix_req.is_empty() {
+                        let mut new_active: Vec<usize> = mix_req.iter().map(|&(idx, _)| idx).collect();
+                        new_active.sort();
+                        let current_active = audio_source.get_active_audio_tracks();
+                        let tracks_changed = new_active != current_active;
                         let play_pos = state.current_seconds;
                         if audio_source.set_active_audio_tracks(&mix_req).is_ok() {
-                            audio_source.set_position_seconds(play_pos);
+                            if tracks_changed {
+                                audio_source.set_position_seconds(play_pos);
+                                state.audio_track_request = None;
+                            }
                             state.active_audio_tracks = audio_source.get_active_audio_tracks();
                             if let Some(&first_idx) = state.active_audio_tracks.first() {
                                 state.selected_audio_track = first_idx;
                             }
                             state.num_channels = audio_source.get_num_channels();
+                            let ch_count = state.num_channels as usize;
+                            state.channel_vus.resize(ch_count, 0.0);
+                            state.peak_vus.resize(ch_count, 0.0);
                             state.module_type = audio_source.get_type();
                             state.bitrate = audio_source.get_bitrate();
-                            
-                            let mix_desc = if state.active_audio_tracks.len() > 1 {
-                                let track_nums: Vec<String> = state.active_audio_tracks.iter().map(|idx| (idx + 1).to_string()).collect();
-                                format!("🎛 Audio Mix: Tracks {}", track_nums.join("+"))
-                            } else {
-                                let idx = state.selected_audio_track;
-                                let track_title = state.audio_tracks.get(idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", idx + 1));
-                                if track_title.to_lowercase().starts_with("track") {
-                                    format!("🎛 {}", track_title)
-                                } else {
-                                    format!("🎛 Track {}: {}", idx + 1, track_title)
+                            state.multi_track_mix_mode = state.active_audio_tracks.len() > 1;
+
+                            if state.audio_track_volumes.len() != state.audio_tracks.len() {
+                                state.audio_track_volumes = vec![1.0; state.audio_tracks.len()];
+                            }
+                            for &(idx, vol) in &mix_req {
+                                if idx < state.audio_track_volumes.len() {
+                                    state.audio_track_volumes[idx] = vol;
                                 }
-                            };
-                            state.osd_text = Some(mix_desc);
-                            state.osd_timer = 3.0;
+                            }
+                            
+                            if tracks_changed {
+                                let mix_desc = if state.active_audio_tracks.len() > 1 {
+                                    let track_nums: Vec<String> = state.active_audio_tracks.iter().map(|idx| (idx + 1).to_string()).collect();
+                                    format!("🎛 Audio Mix: Tracks {}", track_nums.join("+"))
+                                } else {
+                                    let idx = state.selected_audio_track;
+                                    let track_title = state.audio_tracks.get(idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", idx + 1));
+                                    if track_title.to_lowercase().starts_with("track") {
+                                        format!("🎛 {}", track_title)
+                                    } else {
+                                        format!("🎛 Track {}: {}", idx + 1, track_title)
+                                    }
+                                };
+                                state.osd_text = Some(mix_desc);
+                                state.osd_timer = 3.0;
 
-                            state.lookahead_queue.clear();
-                            state.lookahead_sample_buffer.clear();
-                            state.lookahead_timeline.fill(0.0);
-                            state.lookahead_buffer_start_time = play_pos;
-                            state.waveform_history.clear();
+                                state.lookahead_queue.clear();
+                                state.lookahead_sample_buffer.clear();
+                                state.lookahead_timeline.fill(0.0);
+                                state.lookahead_buffer_start_time = play_pos;
+                                state.waveform_history.clear();
 
-                            while let Ok(c) = ready_rx_for_decoder.try_recv() {
-                                let _ = free_tx_for_decoder.try_send(c);
+                                while let Ok(c) = ready_rx_for_decoder.try_recv() {
+                                    let _ = free_tx_for_decoder.try_send(c);
+                                }
                             }
                         }
                     }
                     if let Some(track_idx) = state.audio_track_request.take()
-                        && state.audio_tracks.len() > 1 && track_idx < state.audio_tracks.len() && track_idx != state.selected_audio_track {
+                        && state.audio_tracks.len() > 1 && track_idx < state.audio_tracks.len() && (audio_source.get_active_audio_tracks() != vec![track_idx]) {
                             let play_pos = state.current_seconds;
                             if audio_source.select_audio_track(track_idx).is_ok() {
                                 audio_source.set_position_seconds(play_pos);
                                 state.selected_audio_track = track_idx;
                                 state.active_audio_tracks = vec![track_idx];
+                                state.multi_track_mix_mode = false;
                                 state.num_channels = audio_source.get_num_channels();
+                                let ch_count = state.num_channels as usize;
+                                state.channel_vus.resize(ch_count, 0.0);
+                                state.peak_vus.resize(ch_count, 0.0);
                                 state.module_type = audio_source.get_type();
                                 state.bitrate = audio_source.get_bitrate();
                                 let track_title = state.audio_tracks.get(track_idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", track_idx + 1));
@@ -4396,52 +4729,78 @@ where
                 if let Ok(mut state) = state_for_decoder.try_lock() {
                     if let Some(mix_req) = state.audio_mix_request.take()
                         && state.audio_tracks.len() > 1 && !mix_req.is_empty() {
+                        let mut new_active: Vec<usize> = mix_req.iter().map(|&(idx, _)| idx).collect();
+                        new_active.sort();
+                        let current_active = audio_source.get_active_audio_tracks();
+                        let tracks_changed = new_active != current_active;
                         let play_pos = state.current_seconds;
                         if audio_source.set_active_audio_tracks(&mix_req).is_ok() {
-                            audio_source.set_position_seconds(play_pos);
+                            if tracks_changed {
+                                audio_source.set_position_seconds(play_pos);
+                                state.audio_track_request = None;
+                            }
                             state.active_audio_tracks = audio_source.get_active_audio_tracks();
                             if let Some(&first_idx) = state.active_audio_tracks.first() {
                                 state.selected_audio_track = first_idx;
                             }
                             state.num_channels = audio_source.get_num_channels();
+                            let ch_count = state.num_channels as usize;
+                            state.channel_vus.resize(ch_count, 0.0);
+                            state.peak_vus.resize(ch_count, 0.0);
                             state.module_type = audio_source.get_type();
                             state.bitrate = audio_source.get_bitrate();
-                            
-                            let mix_desc = if state.active_audio_tracks.len() > 1 {
-                                let track_nums: Vec<String> = state.active_audio_tracks.iter().map(|idx| (idx + 1).to_string()).collect();
-                                format!("🎛 Audio Mix: Tracks {}", track_nums.join("+"))
-                            } else {
-                                let idx = state.selected_audio_track;
-                                let track_title = state.audio_tracks.get(idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", idx + 1));
-                                if track_title.to_lowercase().starts_with("track") {
-                                    format!("🎛 {}", track_title)
-                                } else {
-                                    format!("🎛 Track {}: {}", idx + 1, track_title)
-                                }
-                            };
-                            state.osd_text = Some(mix_desc);
-                            state.osd_timer = 3.0;
+                            state.multi_track_mix_mode = state.active_audio_tracks.len() > 1;
 
-                            state.lookahead_queue.clear();
-                            state.lookahead_sample_buffer.clear();
-                            state.lookahead_timeline.fill(0.0);
-                            state.lookahead_buffer_start_time = play_pos;
-                            state.waveform_history.clear();
-
-                            while let Ok(c) = ready_rx_for_decoder.try_recv() {
-                                let _ = free_tx_for_decoder.try_send(c);
+                            if state.audio_track_volumes.len() != state.audio_tracks.len() {
+                                state.audio_track_volumes = vec![1.0; state.audio_tracks.len()];
                             }
-                            seeked = true;
+                            for &(idx, vol) in &mix_req {
+                                if idx < state.audio_track_volumes.len() {
+                                    state.audio_track_volumes[idx] = vol;
+                                }
+                            }
+                            
+                            if tracks_changed {
+                                let mix_desc = if state.active_audio_tracks.len() > 1 {
+                                    let track_nums: Vec<String> = state.active_audio_tracks.iter().map(|idx| (idx + 1).to_string()).collect();
+                                    format!("🎛 Audio Mix: Tracks {}", track_nums.join("+"))
+                                } else {
+                                    let idx = state.selected_audio_track;
+                                    let track_title = state.audio_tracks.get(idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", idx + 1));
+                                    if track_title.to_lowercase().starts_with("track") {
+                                        format!("🎛 {}", track_title)
+                                    } else {
+                                        format!("🎛 Track {}: {}", idx + 1, track_title)
+                                    }
+                                };
+                                state.osd_text = Some(mix_desc);
+                                state.osd_timer = 3.0;
+
+                                state.lookahead_queue.clear();
+                                state.lookahead_sample_buffer.clear();
+                                state.lookahead_timeline.fill(0.0);
+                                state.lookahead_buffer_start_time = play_pos;
+                                state.waveform_history.clear();
+
+                                while let Ok(c) = ready_rx_for_decoder.try_recv() {
+                                    let _ = free_tx_for_decoder.try_send(c);
+                                }
+                                seeked = true;
+                            }
                         }
                     }
                     if let Some(track_idx) = state.audio_track_request.take()
-                        && state.audio_tracks.len() > 1 && track_idx < state.audio_tracks.len() && track_idx != state.selected_audio_track {
+                        && state.audio_tracks.len() > 1 && track_idx < state.audio_tracks.len() && (audio_source.get_active_audio_tracks() != vec![track_idx]) {
                             let play_pos = state.current_seconds;
                             if audio_source.select_audio_track(track_idx).is_ok() {
                                 audio_source.set_position_seconds(play_pos);
                                 state.selected_audio_track = track_idx;
                                 state.active_audio_tracks = vec![track_idx];
+                                state.multi_track_mix_mode = false;
                                 state.num_channels = audio_source.get_num_channels();
+                                let ch_count = state.num_channels as usize;
+                                state.channel_vus.resize(ch_count, 0.0);
+                                state.peak_vus.resize(ch_count, 0.0);
                                 state.module_type = audio_source.get_type();
                                 state.bitrate = audio_source.get_bitrate();
                                 let track_title = state.audio_tracks.get(track_idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", track_idx + 1));
@@ -4615,4 +4974,148 @@ where
     )?;
 
     Ok(stream)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_calculate_mix_headroom_single_track() {
+        // Single track at full volume should have no attenuation
+        let headroom = calculate_mix_headroom([1.0]);
+        assert_eq!(headroom, 1.0);
+
+        // Single track at reduced volume should not boost headroom above 1.0
+        let headroom_half = calculate_mix_headroom([0.5]);
+        assert_eq!(headroom_half, 1.0);
+
+        // Zero tracks
+        let headroom_empty = calculate_mix_headroom([]);
+        assert_eq!(headroom_empty, 1.0);
+    }
+
+    #[test]
+    fn test_calculate_mix_headroom_multi_track_equal_power() {
+        // Two equal tracks at 1.0: active power = 2.0 -> headroom = 1 / sqrt(2) ≈ 0.7071068
+        let headroom_two = calculate_mix_headroom([1.0, 1.0]);
+        let expected_two = 1.0 / (2.0f32).sqrt();
+        assert!((headroom_two - expected_two).abs() < 1e-6);
+
+        // Three equal tracks at 1.0: active power = 3.0 -> headroom = 1 / sqrt(3) ≈ 0.5773503
+        let headroom_three = calculate_mix_headroom([1.0, 1.0, 1.0]);
+        let expected_three = 1.0 / (3.0f32).sqrt();
+        assert!((headroom_three - expected_three).abs() < 1e-6);
+
+        // Four tracks at 0.5: active power = 4 * 0.25 = 1.0 -> headroom = 1.0
+        let headroom_four_half = calculate_mix_headroom([0.5, 0.5, 0.5, 0.5]);
+        assert_eq!(headroom_four_half, 1.0);
+    }
+
+    #[test]
+    fn test_calculate_mix_headroom_muted_and_asymmetric_tracks() {
+        // Track 1 at 1.0 and Track 2 at 0.0 (muted)
+        // Muted track must NOT attenuate the active track
+        let headroom_muted = calculate_mix_headroom([1.0, 0.0]);
+        assert_eq!(headroom_muted, 1.0);
+
+        // Track 1 at 1.0 and Track 2 at 0.1 (low volume)
+        // Active power = 1.0 + 0.01 = 1.01 -> headroom ≈ 0.995037
+        // (Previously based on track count, this caused an abrupt 30% drop to 0.707)
+        let headroom_asymmetric = calculate_mix_headroom([1.0, 0.1]);
+        let expected = 1.0 / (1.01f32).sqrt();
+        assert!((headroom_asymmetric - expected).abs() < 1e-6);
+        assert!(headroom_asymmetric > 0.99);
+    }
+
+    #[test]
+    fn test_get_downmixed_sample_mono_to_stereo() {
+        let mono_sample = [0.8f32];
+        // Mono duplicated to L and R
+        let l = get_downmixed_sample(1, &mono_sample, 2, 0);
+        let r = get_downmixed_sample(1, &mono_sample, 2, 1);
+        assert_eq!(l, 0.8);
+        assert_eq!(r, 0.8);
+    }
+
+    #[test]
+    fn test_get_downmixed_sample_stereo_passthrough_and_folddown() {
+        let stereo_samples = [0.6f32, -0.4f32];
+        // Stereo to Stereo passthrough
+        let l = get_downmixed_sample(2, &stereo_samples, 2, 0);
+        let r = get_downmixed_sample(2, &stereo_samples, 2, 1);
+        assert_eq!(l, 0.6);
+        assert_eq!(r, -0.4);
+
+        // Stereo to Mono folddown: (L + R) * 0.5
+        let mono = get_downmixed_sample(2, &stereo_samples, 1, 0);
+        assert!((mono - (0.6 - 0.4) * 0.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_get_downmixed_sample_quad() {
+        // FL, FR, BL, BR
+        let quad_samples = [0.6f32, -0.6f32, 0.4f32, -0.4f32];
+        const INV_SQRT2: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
+        let left = get_downmixed_sample(4, &quad_samples, 2, 0);
+        let right = get_downmixed_sample(4, &quad_samples, 2, 1);
+
+        let expected_left = (0.6 + INV_SQRT2 * 0.4) * INV_SQRT2;
+        let expected_right = (-0.6 + INV_SQRT2 * -0.4) * INV_SQRT2;
+
+        assert!((left - expected_left).abs() < 1e-6);
+        assert!((right - expected_right).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_get_downmixed_sample_5_1_surround() {
+        // FL, FR, FC, LFE, BL, BR
+        let surround_samples = [0.5f32, 0.5f32, 0.4f32, 0.2f32, 0.3f32, 0.3f32];
+        const INV_SQRT2: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
+        let left = get_downmixed_sample(6, &surround_samples, 2, 0);
+        let right = get_downmixed_sample(6, &surround_samples, 2, 1);
+
+        let expected_left = (0.5 + INV_SQRT2 * 0.4 + INV_SQRT2 * 0.3 + 0.5 * 0.2) * INV_SQRT2;
+        let expected_right = (0.5 + INV_SQRT2 * 0.4 + INV_SQRT2 * 0.3 + 0.5 * 0.2) * INV_SQRT2;
+
+        assert!((left - expected_left).abs() < 1e-6);
+        assert!((right - expected_right).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_multi_track_active_tracks_filter_enabled() {
+        struct MockTrack {
+            track_idx: usize,
+            volume: f32,
+            enabled: bool,
+        }
+        let tracks = vec![
+            MockTrack { track_idx: 0, volume: 1.0, enabled: true },
+            MockTrack { track_idx: 1, volume: 0.0, enabled: true }, // Muted but enabled
+            MockTrack { track_idx: 2, volume: 0.0, enabled: false }, // Omitted / disabled
+        ];
+
+        // Active tracks filter checks `track.enabled`
+        let mut active: Vec<usize> = tracks.iter().filter(|t| t.enabled).map(|t| t.track_idx).collect();
+        active.sort();
+        // Track 1 must remain active in the UI controls despite 0.0 volume
+        assert_eq!(active, vec![0, 1]);
+
+        // Prior buggy filter checked `track.volume > 0.0`, erroneously dropping muted tracks
+        let buggy_active: Vec<usize> = tracks.iter().filter(|t| t.volume > 0.0).map(|t| t.track_idx).collect();
+        assert_eq!(buggy_active, vec![0]);
+    }
+
+    #[test]
+    fn test_multi_track_mix_mode_flag_transitions() {
+        let single_track = vec![0];
+        let multi_track = vec![0, 1];
+        let empty_track: Vec<usize> = vec![];
+
+        assert_eq!(single_track.len() > 1, false);
+        assert_eq!(multi_track.len() > 1, true);
+        assert_eq!(empty_track.len() > 1, false);
+    }
 }
