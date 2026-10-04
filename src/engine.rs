@@ -2499,7 +2499,7 @@ pub(crate) fn generate_storm_rain_volume_mesh() -> (Vec<Vertex>, Vec<u32>) {
 
     // Pure 3D Instanced Falling Raindrops across viewing frustum (mat = 3.0)
     for i in 0..2500 {
-        let seed = (i as f32) * 1.618_034;
+        let seed = (i as f32) * std::f32::consts::GOLDEN_RATIO;
         let rx = (((seed * 17.3).fract()) - 0.5) * 44.0;
         let ry = ((seed * 29.1).fract()) * 30.0;
         let rz = 2.0 + ((seed * 43.7).fract()) * 110.0;
