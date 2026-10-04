@@ -162,8 +162,8 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
             let dx = abs(hit_sb.x - softbox_pos.x);
             let dz = abs(hit_sb.z - softbox_pos.z);
             if (dx < softbox_w * 0.5 && dz < softbox_h * 0.7) {
-                let edge_fade = smoothstep(softbox_w * 0.5, softbox_w * 0.35, dx) *
-                                smoothstep(softbox_h * 0.7, softbox_h * 0.35, dz);
+                let edge_fade = smoothstep_r(softbox_w * 0.5, softbox_w * 0.35, dx) *
+                                smoothstep_r(softbox_h * 0.7, softbox_h * 0.35, dz);
                 spec_softbox = edge_fade;
             }
         }
@@ -175,8 +175,8 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
             let hit_letter = P + R * t_letter;
             let half_w = max(2.5, get_lyric_param(7u));
             if (abs(hit_letter.x) < half_w + 0.3 && hit_letter.y > -0.05 && hit_letter.y < 1.45) {
-                let fade_x = smoothstep(half_w + 0.3, half_w * 0.85, abs(hit_letter.x));
-                let fade_y = smoothstep(-0.05, 0.1, hit_letter.y) * smoothstep(1.45, 0.9, hit_letter.y);
+                let fade_x = smoothstep_r(half_w + 0.3, half_w * 0.85, abs(hit_letter.x));
+                let fade_y = smoothstep(-0.05, 0.1, hit_letter.y) * smoothstep_r(1.45, 0.9, hit_letter.y);
                 // Luminous crystal reflection distorted by water surface ripples
                 let crystal_tint = vec3<f32>(0.35, 0.75, 1.0) * (1.0 + bass * 1.5);
                 let core_glint = pow(max(0.0, dot(R, vec3<f32>(0.0, 0.8, -0.6))), 16.0);

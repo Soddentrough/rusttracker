@@ -12,7 +12,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let slat_phase = fract(p.x / slat_w);
     let wood_dark = vec3<f32>(0.035, 0.015, 0.008);
     let wood_walnut = vec3<f32>(0.09, 0.045, 0.022);
-    let slat = smoothstep(0.08, 0.20, slat_phase) * smoothstep(0.92, 0.80, slat_phase);
+    let slat = smoothstep(0.08, 0.20, slat_phase) * smoothstep_r(0.92, 0.80, slat_phase);
     var bg = mix(wood_dark, wood_walnut, slat);
 
     // Studio soft key light vignette

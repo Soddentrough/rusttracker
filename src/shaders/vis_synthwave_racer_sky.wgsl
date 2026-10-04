@@ -45,7 +45,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         if (star_rnd > 0.935) {
             let star_offset = (vec2<f32>(hash1(star_rnd * 13.1), hash1(star_rnd * 37.7)) - 0.5) * 0.6;
             let d = length(star_local - star_offset);
-            let star_point = smoothstep(0.18, 0.0, d);
+            let star_point = smoothstep_r(0.18, 0.0, d);
             let star_twinkle = sin(audio.smooth_time * 3.5 + star_rnd * 40.0) * 0.4 + 0.6;
             sky_col += vec3<f32>(0.92, 0.96, 1.0) * star_point * star_twinkle * (0.6 + treble_pulse * 0.6);
         }
@@ -68,7 +68,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
         if (!is_slit) {
             let sun_c = mix(vec3<f32>(1.0, 0.90, 0.20), vec3<f32>(1.0, 0.04, 0.48), clamp(rel_y * 1.25, 0.0, 1.0));
-            let sun_edge = smoothstep(sun_radius, sun_radius - 0.015, sun_dist);
+            let sun_edge = smoothstep_r(sun_radius, sun_radius - 0.015, sun_dist);
             sky_col = mix(sky_col, sun_c * (2.4 + bass_pulse * 0.7), sun_edge);
         }
     }
@@ -84,7 +84,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if (p.y < mtn_far_h) {
         let mtn_body = vec3<f32>(0.038, 0.008, 0.065);
         let rim_dist = abs(p.y - mtn_far_h);
-        let rim_glow = smoothstep(0.012, 0.0, rim_dist) * vec3<f32>(0.99, 0.05, 0.58) * (1.8 + mid_pulse * 0.8);
+        let rim_glow = smoothstep_r(0.012, 0.0, rim_dist) * vec3<f32>(0.99, 0.05, 0.58) * (1.8 + mid_pulse * 0.8);
         
         // Holographic neon altitude contour lines across far mountains
         let contour = smoothstep(0.88, 0.98, sin((p.y - horizon_y) * 120.0));
@@ -100,7 +100,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     if (p.y < mtn_near_h) {
         let mtn_body = vec3<f32>(0.020, 0.004, 0.038);
         let rim_dist = abs(p.y - mtn_near_h);
-        let rim_glow = smoothstep(0.009, 0.0, rim_dist) * vec3<f32>(0.0, 0.94, 1.0) * (1.6 + treble_pulse * 0.8);
+        let rim_glow = smoothstep_r(0.009, 0.0, rim_dist) * vec3<f32>(0.0, 0.94, 1.0) * (1.6 + treble_pulse * 0.8);
         
         let contour = smoothstep(0.86, 0.98, sin((p.y - horizon_y) * 150.0));
         let grid_glow = vec3<f32>(0.0, 0.90, 1.0) * contour * 0.30 * (0.8 + mid_pulse * 0.6);

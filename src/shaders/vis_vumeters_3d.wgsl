@@ -114,16 +114,16 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
 
         // Printed Logarithmic VU Arc Scale (Black track, red zone > 0dB)
         let arc_dist = abs(dial_r - 2.05);
-        let is_arc = smoothstep(0.028, 0.0, arc_dist) * step(abs(dial_ang), 0.65);
+        let is_arc = smoothstep_r(0.028, 0.0, arc_dist) * step(abs(dial_ang), 0.65);
         let is_red_zone = dial_ang > 0.12;
         let arc_col = select(vec3<f32>(0.06, 0.06, 0.06), vec3<f32>(0.92, 0.06, 0.06), is_red_zone);
 
         // Printed Tick Marks along Arc
         let tick_phase = fract((dial_ang + 0.65) * 12.0);
-        let is_tick = smoothstep(0.12, 0.0, tick_phase) * smoothstep(0.10, 0.0, abs(dial_r - 2.05)) * step(abs(dial_ang), 0.65);
+        let is_tick = smoothstep_r(0.12, 0.0, tick_phase) * smoothstep_r(0.10, 0.0, abs(dial_r - 2.05)) * step(abs(dial_ang), 0.65);
 
         // Dial VU branding text logo
-        let logo_box = smoothstep(0.45, 0.0, abs(rel_x)) * smoothstep(0.12, 0.0, abs(in.world_pos.y - 0.20));
+        let logo_box = smoothstep_r(0.45, 0.0, abs(rel_x)) * smoothstep_r(0.12, 0.0, abs(in.world_pos.y - 0.20));
         let logo_col = vec3<f32>(0.08, 0.08, 0.08) * logo_box * 0.6;
 
         var dial = parchment * tungsten_col * lamp_glow;

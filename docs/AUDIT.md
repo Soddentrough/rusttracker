@@ -117,6 +117,7 @@ RustTracker is a Vulkan/wgpu multichannel audio visualizer and tracker player. I
 | Priority | Items | Status |
 | :--- | :--- | :--- |
 | Quick wins | Wayland-then-X11 fallback & graceful window errors. Default to VSync/refresh cap with `--uncapped` flag. Fix clippy warnings & format codebase. Add fmt, clippy, WGSL validate, and test to CI. | **Done (Milestone 1)** |
+| Visualization Audit | Fix hardcoded 1.7777 aspect fallbacks. Migrate all reversed smoothstep calls to `smoothstep_r`. Verify framerate-independent simulation (`dt`). Wrap unbounded time & camera coords. Document audit status matrix. | **Done (Milestone 2)** |
 | Repo hygiene | Repo cleanup (debris out, `.git` pruning or LFS). Remove `allow(dead_code)` and delete dead shaders/buffers. | In Progress |
-| Medium | Framerate-independent simulation (`dt`). Explicit wgpu limits & features (`SHADER_F16`, `SUBGROUP`). Wrap time values. Replace hardcoded aspect ratios. Centralize constants & config. | Planned |
-| Larger | Split `engine.rs` and `audio.rs`. Move to `ApplicationHandler`. Headless golden-image tests and parser fuzzing. Hardware video decode and render-scale tier. Mesh3D migration per visualizer. | Planned |
+| Medium | Explicit wgpu limits & features (`SHADER_F16`, `SUBGROUP`). Centralize constants & config. Render-scale tier. | Planned |
+| Larger | Split `engine.rs` and `audio.rs`. Move to `ApplicationHandler`. Headless golden-image tests and parser fuzzing. Hardware video decode. Mesh3D migration per visualizer. | Planned |

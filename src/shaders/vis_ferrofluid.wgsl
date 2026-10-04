@@ -320,8 +320,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         var spec_sb = 0.0;
         if (t_sb > 0.0 && ref_dir.y > 0.0) {
             let hit_sb = final_p + ref_dir * t_sb;
-            let edge_x = smoothstep(2.5, 0.5, abs(hit_sb.x));
-            let edge_z = smoothstep(5.0, 1.4, abs(hit_sb.z));
+            let edge_x = smoothstep_r(2.5, 0.5, abs(hit_sb.x));
+            let edge_z = smoothstep_r(5.0, 1.4, abs(hit_sb.z));
             spec_sb = edge_x * edge_z;
         }
         let sb_radiance = vec3<f32>(3.8, 4.0, 4.3) * (1.0 + bass * 0.35);
@@ -395,7 +395,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                     var floor_spec = 0.0;
                     if (t_sb > 0.0 && ref_floor.y > 0.0) {
                         let hit_sb = p_floor + ref_floor * t_sb;
-                        floor_spec = smoothstep(2.6, 0.4, abs(hit_sb.x)) * smoothstep(5.0, 1.2, abs(hit_sb.z)) * 0.22;
+                        floor_spec = smoothstep_r(2.6, 0.4, abs(hit_sb.x)) * smoothstep_r(5.0, 1.2, abs(hit_sb.z)) * 0.22;
                     }
                     stage_albedo += vec3<f32>(0.08, 0.085, 0.09) * floor_spec;
 

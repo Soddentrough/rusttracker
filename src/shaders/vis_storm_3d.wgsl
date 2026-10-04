@@ -69,7 +69,7 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     let rain_col = base_rain * (0.85 + lightning_light * 0.6) * (1.1 + treble_pulse * 0.7);
 
     // Distance depth fade
-    let depth_fade = smoothstep(120.0, 10.0, in.world_pos.z);
+    let depth_fade = smoothstep_r(120.0, 10.0, in.world_pos.z);
     let final_color = rain_col * depth_fade;
 
     let tonemapped = aces_tonemap(final_color);

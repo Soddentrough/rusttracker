@@ -59,7 +59,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let bolt_seed = floor(audio.smooth_time * 10.0);
         let bolt_x = sin(p.y * 16.0 + audio.smooth_time * 60.0) * 0.15 + (hash1(bolt_seed) - 0.5) * 0.9;
         let dist_bolt = abs(p.x - bolt_x);
-        let bolt_core = smoothstep(0.015, 0.0, dist_bolt);
+        let bolt_core = smoothstep_r(0.015, 0.0, dist_bolt);
         let bolt_glow = 1.0 / (1.0 + dist_bolt * 30.0);
 
         let lightning_col = vec3<f32>(0.88, 0.94, 1.0) * (bolt_core * 6.0 + bolt_glow * 3.0) * flash_intensity;

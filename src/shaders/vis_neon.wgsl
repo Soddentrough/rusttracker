@@ -206,11 +206,7 @@ fn setup_scene() {
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let uv = in.uv * 2.0 - 1.0;
 
-    var aspect = 1.7777;
-    let dy = abs(dpdy(in.uv.y));
-    let dx = abs(dpdx(in.uv.x));
-    if (dx > 0.0001 && dy > 0.0001) { aspect = dy / dx; }
-
+    let aspect = max(audio.aspect_ratio, 0.01);
     let p = vec2<f32>(uv.x * aspect, -uv.y);
 
     let ro = vec3<f32>(0.0, 0.0, -4.0);

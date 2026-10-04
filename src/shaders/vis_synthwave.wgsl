@@ -460,7 +460,7 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
 fn vs_lamp(in: VertexInput, @builtin(instance_index) inst_idx: u32) -> VertexOutput3D {
     var out: VertexOutput3D;
     
-    let cam_z = audio.history_cam_z; // history-locked: 0.5 world units per history row
+    let cam_z = audio.history_cam_z % 6000.0; // history-locked: 0.5 world units per history row
     
     // Determine segment index and side from inst_idx
     // We have 8 segments (from current_seg to current_seg + 7)

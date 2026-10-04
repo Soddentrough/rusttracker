@@ -310,3 +310,35 @@ P3 (aesthetics/UX):
     desaturate ferrofluid channel glow; add tonemap to biolum/synthwave.
 16. LED-height coloring + peak caps for spectrum; glyph AA; firesim
     label toggle; document VU stereo-pair design.
+
+=====================================================================
+7. AUDIT & RESOLUTION STATUS (v0.9.27, 2026-10-04)
+=====================================================================
+
+Current Registry & Shader Counts:
+- 19 visualizers registered in state.rs::VISUALIZERS (26 shader mappings).
+- 43 WGSL shaders in src/shaders/ (all 43 pass Naga validation).
+
+Critical Findings (Section 2):
+- [C1] Ferrofluidsim particle stride: RESOLVED (repacked to two vec4s = 32B, matches host).
+- [C2] Video viewport dimensions: RESOLVED (uses actual surface dimensions / config.width in engine.rs).
+- [C3] Video row alignment: RESOLVED (256-byte stride repack in engine.rs:5760).
+- [C4] Framerate-dependent simulation: RESOLVED (play_time derived from real elapsed time dt * 2.88; compute passes scale via frame_dt/dt_scale).
+- [C5] Dead GPU FFT pipeline: RESOLVED (removed; gpu_spectrum upload gated on active consumer).
+
+Correctness & Spec Compliance Bugs (Section 3):
+- Lamppost spacing in racer: RESOLVED (26.0 spacing with 3120.0 seamless wrapping).
+- Oscilloscope double amber tint: RESOLVED.
+- 3D-oscilloscope divide-by-zero: RESOLVED.
+- HUD peak segment full-scale clamp: RESOLVED (min(..., num_segments - 1.0)).
+- Reversed-edge smoothstep spec UB: RESOLVED (all ~30 inverted-edge calls across 10 shaders & engine migrated to smoothstep_r).
+- Hardcoded 1.7777 aspect fallbacks: RESOLVED (migrated to audio.aspect_ratio in vis_neon, vis_ferrofluidsim, and engine CRT background).
+- Unbounded time / cam_z: RESOLVED (wrapped modulo 6000.0 for cam_z, 3120.0 for racer travel, 86400.0 for play_time).
+
+Performance Wins (Section 4):
+- Waveform history upload skipping: RESOLVED (gated by history_dirty).
+- GPU spectrum upload skipping: RESOLVED (gated by active visualizer and history_dirty).
+- VU meter ray-AABB early reject: RESOLVED (box_hit pre-test cuts 80 march steps on background).
+- Ferrofluid containment AABB & sky early-out: RESOLVED (bound_min/max pre-test & rd.y > 0 sky break).
+- Firesim black early-out: RESOLVED (skips erosion fbm when base_heat <= 0.003).
+- Unused visualizer pipelines: RESOLVED (only active visualizers are instantiated).

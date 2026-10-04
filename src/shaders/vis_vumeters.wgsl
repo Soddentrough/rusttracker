@@ -225,7 +225,7 @@ fn draw_vector_char(ch: u32, p: vec2<f32>, origin: vec2<f32>, scale: f32, local_
     let thickness = 0.12;
     let char_d = d * scale;
     let blur = local_pixel_size * 0.75;
-    return smoothstep(thickness * scale + blur, thickness * scale - blur, char_d);
+    return smoothstep_r(thickness * scale + blur, thickness * scale - blur, char_d);
 }
 
 fn draw_v_string_2(s: array<u32, 2>, p: vec2<f32>, origin: vec2<f32>, scale: f32, spacing: f32, local_pixel_size: f32) -> f32 {

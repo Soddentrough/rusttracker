@@ -3520,10 +3520,7 @@ impl VulkanEngine {
                 let border_dist = min(1.0 - abs(distorted_uv.x), 1.0 - abs(distorted_uv.y));
                 let bezel_mask = smoothstep(0.0, 0.03, border_dist);
 
-                var aspect = 1.7777;
-                let dy = abs(dpdy(in.uv.y));
-                let dx = abs(dpdx(in.uv.x));
-                if (dx > 0.0001 && dy > 0.0001) { aspect = dy / dx; }
+                let aspect = max(audio.aspect_ratio, 0.01);
                 let p = vec2<f32>(distorted_uv.x * aspect, -distorted_uv.y);
 
                 let ro = vec3<f32>(0.0, 0.0, 7.2);
@@ -3546,8 +3543,8 @@ impl VulkanEngine {
                     let grid_uv = fract(p_floor.xz / x_spacing - 0.5) - 0.5;
                     let dist_to_line = min(abs(grid_uv.x), abs(grid_uv.y));
                     let line_w = 0.02 * (1.0 + t_floor * 0.05);
-                    let grid_line = smoothstep(line_w, 0.0, dist_to_line);
-                    let fade = smoothstep(25.0, 4.0, t_floor);
+                    let grid_line = smoothstep_r(line_w, 0.0, dist_to_line);
+                    let fade = smoothstep_r(25.0, 4.0, t_floor);
                     grid_intensity = grid_intensity + grid_line * fade;
                 }
                 if (t_ceil > 0.0 && t_ceil < 25.0) {
@@ -3555,8 +3552,8 @@ impl VulkanEngine {
                     let grid_uv = fract(p_ceil.xz / x_spacing - 0.5) - 0.5;
                     let dist_to_line = min(abs(grid_uv.x), abs(grid_uv.y));
                     let line_w = 0.02 * (1.0 + t_ceil * 0.05);
-                    let grid_line = smoothstep(line_w, 0.0, dist_to_line);
-                    let fade = smoothstep(25.0, 4.0, t_ceil);
+                    let grid_line = smoothstep_r(line_w, 0.0, dist_to_line);
+                    let fade = smoothstep_r(25.0, 4.0, t_ceil);
                     grid_intensity = grid_intensity + grid_line * fade;
                 }
 
@@ -5164,7 +5161,7 @@ impl VulkanEngine {
         // per real second). Render-framerate independent. Uses the EMA-smoothed
         // dt to avoid CPU scheduling judder. Only advances while playing.
         if !state.is_paused && state.file_loaded && !state.track_ended {
-            self.play_time += self.smooth_dt * 2.88;
+            self.play_time = (self.play_time + self.smooth_dt * 2.88) % 86400.0;
         }
 
         // Progress bar fire dies off when playback stops / pauses / ends / reaches end of song
@@ -5184,8 +5181,9 @@ impl VulkanEngine {
 
         // World-Z camera position locked to history rows (0.5 units/row), used by
         // visualizers that scroll with the waveform/spectrum history ring buffer.
+        // Wrapped modulo 6000.0 to maintain single-precision float accuracy in long sessions.
         self.last_history_cam_z =
-            (self.last_history_push_count as f64 + step_fraction as f64) * 0.5;
+            ((self.last_history_push_count as f64 + step_fraction as f64) * 0.5) % 6000.0;
         let frame_dt = dt.clamp(0.0005, 0.1);
         let mut uniforms = AudioUniforms {
             spectrum: [0.0; 1024],

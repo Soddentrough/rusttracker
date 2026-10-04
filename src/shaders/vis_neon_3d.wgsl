@@ -82,8 +82,8 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
         let floor_dark = vec3<f32>(0.008, 0.009, 0.012);
 
         // Floor reflective tile grid lines
-        let grid_x = smoothstep(0.04, 0.0, abs(fract(in.world_pos.x * 1.5) - 0.5));
-        let grid_z = smoothstep(0.04, 0.0, abs(fract(in.world_pos.z * 1.5) - 0.5));
+        let grid_x = smoothstep_r(0.04, 0.0, abs(fract(in.world_pos.x * 1.5) - 0.5));
+        let grid_z = smoothstep_r(0.04, 0.0, abs(fract(in.world_pos.z * 1.5) - 0.5));
         let grid_tile = (grid_x + grid_z) * 0.20;
 
         // Dynamic reflected light from all 8 neon portal frames
