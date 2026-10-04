@@ -1,9 +1,9 @@
 use ratatui::{
+    Frame,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
-    Frame,
 };
 
 use crate::state::AppState;
@@ -29,12 +29,15 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
         .margin(1)
-        .constraints([
-            Constraint::Length(15), // Top: VUs, Heatmap, Meta
-            Constraint::Min(10),    // Middle: HUGE Spectrum Analyzer
-            Constraint::Length(1),  // Bottom: Timeline Gauge
-            Constraint::Length(1)   // Instructions
-        ].as_ref())
+        .constraints(
+            [
+                Constraint::Length(15), // Top: VUs, Heatmap, Meta
+                Constraint::Min(10),    // Middle: HUGE Spectrum Analyzer
+                Constraint::Length(1),  // Bottom: Timeline Gauge
+                Constraint::Length(1),  // Instructions
+            ]
+            .as_ref(),
+        )
         .split(f.area());
 
     let width = f.area().width;
@@ -64,12 +67,12 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         .split(main_chunks[0]);
 
     // 1. Layered Channel VUs with Peak Decay
-    let vu_height = top_chunks[0].height.saturating_sub(2) as usize; 
+    let vu_height = top_chunks[0].height.saturating_sub(2) as usize;
     let vu_width = top_chunks[0].width.saturating_sub(2) as usize;
     let chars_per_vu = (vu_width / state.channel_vus.len().max(1)).max(1);
 
     let mut vu_lines = Vec::new();
-    
+
     // Render VUs top to bottom, leaving 1 line at the bottom for labels
     for row in (0..vu_height.saturating_sub(1)).rev() {
         let mut spans = Vec::new();
@@ -116,7 +119,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     for i in 0..state.channel_vus.len() {
         let label = format!("{}", i + 1);
         let show = chars_per_vu >= 3 || (i % 2 == 0);
-        
+
         let padded_label = if !show {
             " ".repeat(chars_per_vu)
         } else {
@@ -124,15 +127,18 @@ pub fn draw(f: &mut Frame, state: &AppState) {
                 1 => String::from(if label.len() == 1 { &label[..1] } else { "+" }),
                 2 => format!("{:>2}", label),
                 3 => format!("{:^3}", label),
-                _ => format!("{:^width$}", label, width=chars_per_vu),
+                _ => format!("{:^width$}", label, width = chars_per_vu),
             }
         };
-        vu_label_spans.push(Span::styled(padded_label, Style::default().fg(Color::DarkGray)));
+        vu_label_spans.push(Span::styled(
+            padded_label,
+            Style::default().fg(Color::DarkGray),
+        ));
     }
     vu_lines.push(Line::from(vu_label_spans));
 
-    let vu_paragraph = Paragraph::new(vu_lines)
-        .block(Block::default().title("Channels").borders(Borders::ALL));
+    let vu_paragraph =
+        Paragraph::new(vu_lines).block(Block::default().title("Channels").borders(Borders::ALL));
     f.render_widget(vu_paragraph, top_chunks[0]);
 
     // 2. High-End Spectrogram Heatmap / Synchronized Lyrics
@@ -150,29 +156,41 @@ pub fn draw(f: &mut Frame, state: &AppState) {
             let mut lyric_lines = Vec::new();
             for r in 0..heatmap_height {
                 let offset = (r as i32) - (center_row as i32);
-                let target_idx = (base_idx as i32) + offset - if is_intro && offset > 0 { 1 } else { 0 };
+                let target_idx =
+                    (base_idx as i32) + offset - if is_intro && offset > 0 { 1 } else { 0 };
 
                 if is_intro && offset == 0 {
                     let intro_text = "♪ ♪ ♪  (Intro)";
                     let padding = heatmap_width.saturating_sub(intro_text.chars().count()) / 2;
                     let padded = format!("{}{}", " ".repeat(padding), intro_text);
-                    lyric_lines.push(Line::from(vec![
-                        Span::styled(padded, Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
-                    ]));
+                    lyric_lines.push(Line::from(vec![Span::styled(
+                        padded,
+                        Style::default()
+                            .fg(Color::Cyan)
+                            .add_modifier(Modifier::BOLD),
+                    )]));
                 } else if is_intro && offset < 0 {
                     lyric_lines.push(Line::raw(""));
                 } else if target_idx >= 0 && (target_idx as usize) < lyrics.lines.len() {
                     let line = &lyrics.lines[target_idx as usize];
-                    let text = if line.text.is_empty() { "♪ ♪ ♪" } else { &line.text };
-                    let truncated: String = text.chars().take(heatmap_width.saturating_sub(4)).collect();
+                    let text = if line.text.is_empty() {
+                        "♪ ♪ ♪"
+                    } else {
+                        &line.text
+                    };
+                    let truncated: String =
+                        text.chars().take(heatmap_width.saturating_sub(4)).collect();
                     let padding = heatmap_width.saturating_sub(truncated.chars().count() + 2) / 2;
-                    
+
                     if !is_intro && offset == 0 {
                         // Current active line
                         let formatted = format!("{}> {} <", " ".repeat(padding), truncated);
-                        lyric_lines.push(Line::from(vec![
-                            Span::styled(formatted, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
-                        ]));
+                        lyric_lines.push(Line::from(vec![Span::styled(
+                            formatted,
+                            Style::default()
+                                .fg(Color::Yellow)
+                                .add_modifier(Modifier::BOLD),
+                        )]));
                     } else {
                         let distance = offset.abs();
                         let fg_color = if distance == 1 {
@@ -183,9 +201,10 @@ pub fn draw(f: &mut Frame, state: &AppState) {
                             Color::Rgb(80, 80, 80)
                         };
                         let formatted = format!("{}{}", " ".repeat(padding + 2), truncated);
-                        lyric_lines.push(Line::from(vec![
-                            Span::styled(formatted, Style::default().fg(fg_color))
-                        ]));
+                        lyric_lines.push(Line::from(vec![Span::styled(
+                            formatted,
+                            Style::default().fg(fg_color),
+                        )]));
                     }
                 } else {
                     lyric_lines.push(Line::raw(""));
@@ -203,7 +222,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
             let history_len = state.spectrum_history.len();
             let total_history_lines = history_len / 2;
             let start_line = total_history_lines.saturating_sub(heatmap_height);
-            
+
             for cell_y in start_line..total_history_lines {
                 let mut spans = Vec::new();
                 let top_row_idx = cell_y * 2;
@@ -218,20 +237,22 @@ pub fn draw(f: &mut Frame, state: &AppState) {
                         let bg_col = val_to_color(bottom_row[x]);
 
                         spans.push(Span::styled(
-                            bin_str.clone(), 
-                            Style::default().fg(fg_col).bg(bg_col)
+                            bin_str.clone(),
+                            Style::default().fg(fg_col).bg(bg_col),
                         ));
                     }
                 }
                 heatmap_lines.push(Line::from(spans));
             }
 
-            let heatmap_paragraph = Paragraph::new(heatmap_lines)
-                .block(Block::default().title("Heatmap History").borders(Borders::ALL));
+            let heatmap_paragraph = Paragraph::new(heatmap_lines).block(
+                Block::default()
+                    .title("Heatmap History")
+                    .borders(Borders::ALL),
+            );
             f.render_widget(heatmap_paragraph, top_chunks[1]);
         }
     }
-
 
     // 3. Metadata
     let current_path_str = if state.playlist_index < state.playlist.len() {
@@ -239,8 +260,9 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     } else {
         state.song_title.clone()
     };
-    let is_network = current_path_str.starts_with("http://") || current_path_str.starts_with("https://");
-    
+    let is_network =
+        current_path_str.starts_with("http://") || current_path_str.starts_with("https://");
+
     let scroll_text = |text: &str, max_len: usize| -> String {
         let char_count = text.chars().count();
         if char_count > max_len {
@@ -248,7 +270,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
             let scroll_duration = max_scroll as f32 / 3.0; // 3 characters per second
             let total_period = 2.0 + scroll_duration + 2.0 + scroll_duration;
             let t = (state.current_seconds as f32) % total_period;
-            
+
             let offset = if t < 2.0 {
                 0
             } else if t < 2.0 + scroll_duration {
@@ -260,7 +282,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
                 let progress = (t - (2.0 + scroll_duration + 2.0)) / scroll_duration;
                 max_scroll.saturating_sub((progress * max_scroll as f32) as usize)
             };
-            
+
             let offset = offset.clamp(0, max_scroll);
             text.chars().skip(offset).take(max_len).collect()
         } else {
@@ -271,7 +293,11 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     let file_name = if is_network {
         state.song_title.clone()
     } else {
-        std::path::Path::new(&state.song_title).file_name().unwrap_or_default().to_string_lossy().to_string()
+        std::path::Path::new(&state.song_title)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string()
     };
     let file_dir = if is_network {
         current_path_str.clone()
@@ -302,13 +328,14 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     };
 
     let width = top_chunks[2].width.saturating_sub(2) as usize; // inside block width
-    
+
     let mut lines = Vec::new();
-    
+
     // 1. File Name / Title (bold, styled)
-    lines.push(Line::from(vec![
-        Span::styled(scroll_text(&file_name, width), Style::default().add_modifier(Modifier::BOLD))
-    ]));
+    lines.push(Line::from(vec![Span::styled(
+        scroll_text(&file_name, width),
+        Style::default().add_modifier(Modifier::BOLD),
+    )]));
 
     // 2. Artist (only if known)
     let trimmed_artist = state.artist.trim();
@@ -318,7 +345,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     {
         lines.push(Line::from(vec![
             Span::raw("Artist: "),
-            Span::raw(trimmed_artist)
+            Span::raw(trimmed_artist),
         ]));
     }
 
@@ -326,23 +353,21 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     let path_label = if is_network { "URL:    " } else { "Path:   " };
     lines.push(Line::from(vec![
         Span::raw(path_label),
-        Span::raw(scroll_text(&file_dir, width.saturating_sub(8)))
+        Span::raw(scroll_text(&file_dir, width.saturating_sub(8))),
     ]));
 
     // 4. Type
     lines.push(Line::from(vec![
         Span::raw("Type:   "),
-        Span::raw(&state.module_type)
+        Span::raw(&state.module_type),
     ]));
 
     // 4b. Visualization
-    let vis_name = crate::state::VISUALIZERS.get(state.current_visualizer_idx)
+    let vis_name = crate::state::VISUALIZERS
+        .get(state.current_visualizer_idx)
         .map(|v| v.name)
         .unwrap_or("Unknown");
-    lines.push(Line::from(vec![
-        Span::raw("Vis:    "),
-        Span::raw(vis_name)
-    ]));
+    lines.push(Line::from(vec![Span::raw("Vis:    "), Span::raw(vis_name)]));
 
     // 4c. Lyrics
     if let Some(lyrics) = &state.lyrics {
@@ -353,7 +378,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         };
         lines.push(Line::from(vec![
             Span::raw("Lyrics: "),
-            Span::styled(label, Style::default().fg(Color::Green))
+            Span::styled(label, Style::default().fg(Color::Green)),
         ]));
     }
 
@@ -361,7 +386,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     if state.bpm > 0 {
         lines.push(Line::from(vec![
             Span::raw("BPM:    "),
-            Span::raw(state.bpm.to_string())
+            Span::raw(state.bpm.to_string()),
         ]));
     }
 
@@ -369,69 +394,108 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     if state.speed > 0 {
         lines.push(Line::from(vec![
             Span::raw("Speed:  "),
-            Span::raw(state.speed.to_string())
+            Span::raw(state.speed.to_string()),
         ]));
     }
 
     // 7. Channels
     lines.push(Line::from(vec![
         Span::raw("Chans:  "),
-        Span::raw(state.num_channels.to_string())
+        Span::raw(state.num_channels.to_string()),
     ]));
 
     // 8. Sample Rate
     lines.push(Line::from(vec![
         Span::raw("Rate:   "),
-        Span::raw(format!("{} Hz", state.current_sample_rate as u32))
+        Span::raw(format!("{} Hz", state.current_sample_rate as u32)),
     ]));
 
     // 9. Bitrate
     lines.push(Line::from(vec![
         Span::raw("Bitr:   "),
-        Span::raw(state.bitrate.map(|b| format!("{} kbps", b)).unwrap_or_else(|| "Unknown".to_string()))
+        Span::raw(
+            state
+                .bitrate
+                .map(|b| format!("{} kbps", b))
+                .unwrap_or_else(|| "Unknown".to_string()),
+        ),
     ]));
 
     // 10. Length
     lines.push(Line::from(vec![
         Span::raw("Length: "),
-        Span::raw(if state.duration_seconds <= 0.0 { "LIVE".to_string() } else { format!("{:.1}s", state.duration_seconds) })
+        Span::raw(if state.duration_seconds <= 0.0 {
+            "LIVE".to_string()
+        } else {
+            format!("{:.1}s", state.duration_seconds)
+        }),
     ]));
 
     // 10b. Audio Track (if multi-track)
     if state.audio_tracks.len() > 1 {
         let track_str = if state.active_audio_tracks.len() > 1 {
-            let nums: Vec<String> = state.active_audio_tracks.iter().map(|i| (i + 1).to_string()).collect();
-            format!("Mix [{}] / {} tracks", nums.join("+"), state.audio_tracks.len())
+            let nums: Vec<String> = state
+                .active_audio_tracks
+                .iter()
+                .map(|i| (i + 1).to_string())
+                .collect();
+            format!(
+                "Mix [{}] / {} tracks",
+                nums.join("+"),
+                state.audio_tracks.len()
+            )
         } else {
-            format!("{}/{} [1-{} to switch]", state.selected_audio_track + 1, state.audio_tracks.len(), state.audio_tracks.len().min(9))
+            format!(
+                "{}/{} [1-{} to switch]",
+                state.selected_audio_track + 1,
+                state.audio_tracks.len(),
+                state.audio_tracks.len().min(9)
+            )
         };
         lines.push(Line::from(vec![
             Span::raw("Track:  "),
-            Span::styled(track_str, Style::default().fg(if state.active_audio_tracks.len() > 1 { Color::Green } else { Color::Yellow })),
+            Span::styled(
+                track_str,
+                Style::default().fg(if state.active_audio_tracks.len() > 1 {
+                    Color::Green
+                } else {
+                    Color::Yellow
+                }),
+            ),
         ]));
     }
 
     // 11. Next Song (at the bottom, scrollable)
     if state.playlist_index + 1 < state.playlist.len() {
         let next_path = std::path::Path::new(&state.playlist[state.playlist_index + 1]);
-        let next_song = next_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+        let next_song = next_path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
         lines.push(Line::from(vec![
             Span::styled("Next:   ", Style::default().fg(Color::DarkGray)),
-            Span::styled(scroll_text(&next_song, width.saturating_sub(8)), Style::default().fg(Color::DarkGray))
+            Span::styled(
+                scroll_text(&next_song, width.saturating_sub(8)),
+                Style::default().fg(Color::DarkGray),
+            ),
         ]));
     }
 
     let title_text = if state.playlist.len() > 1 {
-        format!("Track Info ({}/{})", state.playlist_index + 1, state.playlist.len())
+        format!(
+            "Track Info ({}/{})",
+            state.playlist_index + 1,
+            state.playlist.len()
+        )
     } else {
         "Track Info".to_string()
     };
 
-    let meta_paragraph = Paragraph::new(lines)
-        .block(Block::default().title(title_text).borders(Borders::ALL));
+    let meta_paragraph =
+        Paragraph::new(lines).block(Block::default().title(title_text).borders(Borders::ALL));
 
     f.render_widget(meta_paragraph, top_chunks[2]);
-
 
     // 4. HUGE Spectrum Analyzer
     let spec_height = main_chunks[1].height.saturating_sub(2) as usize;
@@ -459,7 +523,11 @@ pub fn draw(f: &mut Frame, state: &AppState) {
             let padded_symbol = match chars_per_spec {
                 1 => symbol.to_string(),
                 2 => format!("{} ", symbol),
-                _ => format!(" {}{}", symbol, " ".repeat(chars_per_spec.saturating_sub(2))),
+                _ => format!(
+                    " {}{}",
+                    symbol,
+                    " ".repeat(chars_per_spec.saturating_sub(2))
+                ),
             };
 
             let mut style = Style::default();
@@ -470,7 +538,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
                 let diff = (peak - val).max(0.001);
                 let dist = threshold - val;
                 let fade_ratio = (dist / diff).clamp(0.0, 1.0);
-                style = Style::default().fg(val_to_color(100.0 - (fade_ratio * 100.0))); 
+                style = Style::default().fg(val_to_color(100.0 - (fade_ratio * 100.0)));
             } else if val >= threshold {
                 style = Style::default().fg(val_to_color(val)); // Solid bright bar
             }
@@ -493,7 +561,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
             }
         }
     };
-    
+
     if state.spectrum_data.len() >= 128 {
         write_label(0, "0Hz");
         write_label(128 / 4, "2.5kHz");
@@ -501,14 +569,19 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         write_label(128 * 3 / 4, "7.5kHz");
         write_label(127, "10kHz");
     }
-    
+
     let label_str: String = label_line.into_iter().collect();
-    spec_lines.push(Line::from(vec![Span::styled(label_str, Style::default().fg(Color::DarkGray))]));
+    spec_lines.push(Line::from(vec![Span::styled(
+        label_str,
+        Style::default().fg(Color::DarkGray),
+    )]));
 
-    let spec_paragraph = Paragraph::new(spec_lines)
-        .block(Block::default().title("128-Band Spectrum Analyzer").borders(Borders::ALL));
+    let spec_paragraph = Paragraph::new(spec_lines).block(
+        Block::default()
+            .title("128-Band Spectrum Analyzer")
+            .borders(Borders::ALL),
+    );
     f.render_widget(spec_paragraph, main_chunks[1]);
-
 
     // 5. Timeline Gauge
     let progress = if state.duration_seconds > 0.0 {
@@ -520,44 +593,61 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     let gauge = ratatui::widgets::Gauge::default()
         .gauge_style(Style::default().fg(Color::Cyan).bg(Color::Rgb(30, 30, 30)))
         .percent((progress * 100.0) as u16)
-        .label(format!("{:.1}s / {:.1}s", state.current_seconds, state.duration_seconds));
-    
+        .label(format!(
+            "{:.1}s / {:.1}s",
+            state.current_seconds, state.duration_seconds
+        ));
+
     f.render_widget(gauge, main_chunks[2]);
 
     // 6. Instructions
-    let instructions = Paragraph::new("Press 'q' to quit | Space to pause | ⬅️  ➡️  to scrub timeline | 'd' for device picker")
-        .style(Style::default().add_modifier(Modifier::ITALIC));
+    let instructions = Paragraph::new(
+        "Press 'q' to quit | Space to pause | ⬅️  ➡️  to scrub timeline | 'd' for device picker",
+    )
+    .style(Style::default().add_modifier(Modifier::ITALIC));
     f.render_widget(instructions, main_chunks[3]);
 
     // 7. Device Picker Modal Overlay
     if state.show_tui_device_picker {
         use ratatui::widgets::{Clear, List, ListItem};
-        
+
         let area = f.area();
         let modal_width = 50.min(area.width.saturating_sub(4));
-        let modal_height = (state.available_audio_devices.len() as u16 + 2).min(area.height.saturating_sub(4));
-        
+        let modal_height =
+            (state.available_audio_devices.len() as u16 + 2).min(area.height.saturating_sub(4));
+
         let modal_area = ratatui::layout::Rect::new(
             (area.width - modal_width) / 2,
             (area.height - modal_height) / 2,
             modal_width,
             modal_height,
         );
-        
+
         f.render_widget(Clear, modal_area);
-        
-        let items: Vec<ListItem> = state.available_audio_devices.iter().enumerate().map(|(idx, dev)| {
-            let style = if idx == state.tui_device_picker_cursor {
-                Style::default().fg(Color::Black).bg(Color::Cyan).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::White)
-            };
-            ListItem::new(dev.clone()).style(style)
-        }).collect();
-        
-        let list = List::new(items)
-            .block(Block::default().title("Select Audio Output Device").borders(Borders::ALL));
-            
+
+        let items: Vec<ListItem> = state
+            .available_audio_devices
+            .iter()
+            .enumerate()
+            .map(|(idx, dev)| {
+                let style = if idx == state.tui_device_picker_cursor {
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(Color::White)
+                };
+                ListItem::new(dev.clone()).style(style)
+            })
+            .collect();
+
+        let list = List::new(items).block(
+            Block::default()
+                .title("Select Audio Output Device")
+                .borders(Borders::ALL),
+        );
+
         f.render_widget(list, modal_area);
     }
 }

@@ -25,7 +25,9 @@ impl ContourBuilder {
 
     fn finish(mut self) -> Vec<GlyphContour> {
         if !self.current_contour.is_empty() {
-            self.contours.push(GlyphContour { points: self.current_contour });
+            self.contours.push(GlyphContour {
+                points: self.current_contour,
+            });
         }
         self.contours
     }
@@ -34,7 +36,9 @@ impl ContourBuilder {
 impl ttf_parser::OutlineBuilder for ContourBuilder {
     fn move_to(&mut self, x: f32, y: f32) {
         if !self.current_contour.is_empty() {
-            self.contours.push(GlyphContour { points: std::mem::take(&mut self.current_contour) });
+            self.contours.push(GlyphContour {
+                points: std::mem::take(&mut self.current_contour),
+            });
         }
         self.start_point = [x, y];
         self.last_point = [x, y];
@@ -70,8 +74,14 @@ impl ttf_parser::OutlineBuilder for ContourBuilder {
         for i in 1..=steps {
             let t = i as f32 / steps as f32;
             let it = 1.0 - t;
-            let cx = it * it * it * p0[0] + 3.0 * it * it * t * p1[0] + 3.0 * it * t * t * p2[0] + t * t * t * p3[0];
-            let cy = it * it * it * p0[1] + 3.0 * it * it * t * p1[1] + 3.0 * it * t * t * p2[1] + t * t * t * p3[1];
+            let cx = it * it * it * p0[0]
+                + 3.0 * it * it * t * p1[0]
+                + 3.0 * it * t * t * p2[0]
+                + t * t * t * p3[0];
+            let cy = it * it * it * p0[1]
+                + 3.0 * it * it * t * p1[1]
+                + 3.0 * it * t * t * p2[1]
+                + t * t * t * p3[1];
             self.current_contour.push([cx, cy]);
         }
         self.last_point = [x, y];
@@ -86,14 +96,18 @@ impl ttf_parser::OutlineBuilder for ContourBuilder {
             }
         }
         if !self.current_contour.is_empty() {
-            self.contours.push(GlyphContour { points: std::mem::take(&mut self.current_contour) });
+            self.contours.push(GlyphContour {
+                points: std::mem::take(&mut self.current_contour),
+            });
         }
     }
 }
 
 fn signed_area(pts: &[[f32; 2]]) -> f32 {
     let n = pts.len();
-    if n < 3 { return 0.0; }
+    if n < 3 {
+        return 0.0;
+    }
     let mut area = 0.0;
     for i in 0..n {
         let j = (i + 1) % n;
@@ -121,9 +135,15 @@ fn point_in_polygon(p: [f32; 2], poly: &[[f32; 2]]) -> bool {
 
 fn point_strictly_in_triangle(p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> bool {
     // Check if p is coincident with any vertex
-    if (p[0] - a[0]).abs() < 1e-4 && (p[1] - a[1]).abs() < 1e-4 { return false; }
-    if (p[0] - b[0]).abs() < 1e-4 && (p[1] - b[1]).abs() < 1e-4 { return false; }
-    if (p[0] - c[0]).abs() < 1e-4 && (p[1] - c[1]).abs() < 1e-4 { return false; }
+    if (p[0] - a[0]).abs() < 1e-4 && (p[1] - a[1]).abs() < 1e-4 {
+        return false;
+    }
+    if (p[0] - b[0]).abs() < 1e-4 && (p[1] - b[1]).abs() < 1e-4 {
+        return false;
+    }
+    if (p[0] - c[0]).abs() < 1e-4 && (p[1] - c[1]).abs() < 1e-4 {
+        return false;
+    }
 
     let cross1 = (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]);
     let cross2 = (c[0] - b[0]) * (p[1] - b[1]) - (c[1] - b[1]) * (p[0] - b[0]);
@@ -134,7 +154,10 @@ fn point_strictly_in_triangle(p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]
 }
 
 // Mapbox-style EarCut Triangulator
-fn earcut_triangulate_polygon(outer: &[[f32; 2]], holes: &[Vec<[f32; 2]>]) -> (Vec<[f32; 2]>, Vec<[usize; 3]>) {
+fn earcut_triangulate_polygon(
+    outer: &[[f32; 2]],
+    holes: &[Vec<[f32; 2]>],
+) -> (Vec<[f32; 2]>, Vec<[usize; 3]>) {
     let mut ring: Vec<[f32; 2]> = outer.to_vec();
     if signed_area(&ring) < 0.0 {
         ring.reverse(); // Ensure CCW
@@ -153,7 +176,9 @@ fn earcut_triangulate_polygon(outer: &[[f32; 2]], holes: &[Vec<[f32; 2]>]) -> (V
     });
 
     for h in &sorted_holes {
-        if h.len() < 3 { continue; }
+        if h.len() < 3 {
+            continue;
+        }
         let mut best_h_idx = 0;
         let mut max_hx = f32::NEG_INFINITY;
         for (i, p) in h.iter().enumerate() {
@@ -287,7 +312,9 @@ fn triangulate_glyph_contours(contours: &[Vec<[f32; 2]>]) -> (Vec<[f32; 2]>, Vec
     let mut holes = Vec::new();
 
     for c in contours {
-        if c.len() < 3 { continue; }
+        if c.len() < 3 {
+            continue;
+        }
         let area = signed_area(c);
         if area < 0.0 {
             outers.push(c.clone());
@@ -328,7 +355,12 @@ struct Simple3DMesh {
     indices: Vec<u32>,
 }
 
-fn generate_3d_glyph_mesh(face: &ttf_parser::Face, ch: char, depth: f32, bevel: f32) -> Option<Simple3DMesh> {
+fn generate_3d_glyph_mesh(
+    face: &ttf_parser::Face,
+    ch: char,
+    depth: f32,
+    bevel: f32,
+) -> Option<Simple3DMesh> {
     let glyph_id = face.glyph_index(ch)?;
     let mut builder = ContourBuilder::new();
     let _bbox = face.outline_glyph(glyph_id, &mut builder)?;
@@ -339,7 +371,12 @@ fn generate_3d_glyph_mesh(face: &ttf_parser::Face, ch: char, depth: f32, bevel: 
     let scaled_contours: Vec<Vec<[f32; 2]>> = contours
         .iter()
         .filter(|c| c.points.len() >= 3)
-        .map(|c| c.points.iter().map(|p| [p[0] * scale, p[1] * scale]).collect())
+        .map(|c| {
+            c.points
+                .iter()
+                .map(|p| [p[0] * scale, p[1] * scale])
+                .collect()
+        })
         .collect();
 
     if scaled_contours.is_empty() {
@@ -389,7 +426,9 @@ fn generate_3d_glyph_mesh(face: &ttf_parser::Face, ch: char, depth: f32, bevel: 
             let dx = p1[0] - p0[0];
             let dy = p1[1] - p0[1];
             let len = (dx * dx + dy * dy).sqrt();
-            if len < 1e-6 { continue; }
+            if len < 1e-6 {
+                continue;
+            }
 
             let mut nx = dy / len;
             let mut ny = -dx / len;
@@ -402,36 +441,81 @@ fn generate_3d_glyph_mesh(face: &ttf_parser::Face, ch: char, depth: f32, bevel: 
 
             // Side quad
             let norm_side = [nx, ny, 0.0];
-            vertices.push([p0[0], p0[1], -hz + bevel]); normals.push(norm_side);
-            vertices.push([p1[0], p1[1], -hz + bevel]); normals.push(norm_side);
-            vertices.push([p1[0], p1[1], hz - bevel]);  normals.push(norm_side);
-            vertices.push([p0[0], p0[1], hz - bevel]);  normals.push(norm_side);
+            vertices.push([p0[0], p0[1], -hz + bevel]);
+            normals.push(norm_side);
+            vertices.push([p1[0], p1[1], -hz + bevel]);
+            normals.push(norm_side);
+            vertices.push([p1[0], p1[1], hz - bevel]);
+            normals.push(norm_side);
+            vertices.push([p0[0], p0[1], hz - bevel]);
+            normals.push(norm_side);
 
-            indices.extend_from_slice(&[start_v, start_v + 1, start_v + 2, start_v, start_v + 2, start_v + 3]);
+            indices.extend_from_slice(&[
+                start_v,
+                start_v + 1,
+                start_v + 2,
+                start_v,
+                start_v + 2,
+                start_v + 3,
+            ]);
 
             // Top Chamfer quad (+Z)
             let start_c1 = vertices.len() as u32;
-            let norm_c1 = [nx * std::f32::consts::FRAC_1_SQRT_2, ny * std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2];
-            vertices.push([p0[0], p0[1], hz - bevel]); normals.push(norm_c1);
-            vertices.push([p1[0], p1[1], hz - bevel]); normals.push(norm_c1);
-            vertices.push([p1[0] - nx * bevel, p1[1] - ny * bevel, hz]); normals.push(norm_c1);
-            vertices.push([p0[0] - nx * bevel, p0[1] - ny * bevel, hz]); normals.push(norm_c1);
+            let norm_c1 = [
+                nx * std::f32::consts::FRAC_1_SQRT_2,
+                ny * std::f32::consts::FRAC_1_SQRT_2,
+                std::f32::consts::FRAC_1_SQRT_2,
+            ];
+            vertices.push([p0[0], p0[1], hz - bevel]);
+            normals.push(norm_c1);
+            vertices.push([p1[0], p1[1], hz - bevel]);
+            normals.push(norm_c1);
+            vertices.push([p1[0] - nx * bevel, p1[1] - ny * bevel, hz]);
+            normals.push(norm_c1);
+            vertices.push([p0[0] - nx * bevel, p0[1] - ny * bevel, hz]);
+            normals.push(norm_c1);
 
-            indices.extend_from_slice(&[start_c1, start_c1 + 1, start_c1 + 2, start_c1, start_c1 + 2, start_c1 + 3]);
+            indices.extend_from_slice(&[
+                start_c1,
+                start_c1 + 1,
+                start_c1 + 2,
+                start_c1,
+                start_c1 + 2,
+                start_c1 + 3,
+            ]);
 
             // Bot Chamfer quad (-Z)
             let start_c2 = vertices.len() as u32;
-            let norm_c2 = [nx * std::f32::consts::FRAC_1_SQRT_2, ny * std::f32::consts::FRAC_1_SQRT_2, -std::f32::consts::FRAC_1_SQRT_2];
-            vertices.push([p0[0] - nx * bevel, p0[1] - ny * bevel, -hz]); normals.push(norm_c2);
-            vertices.push([p1[0] - nx * bevel, p1[0] - ny * bevel, -hz]); normals.push(norm_c2);
-            vertices.push([p1[0], p1[1], -hz + bevel]); normals.push(norm_c2);
-            vertices.push([p0[0], p0[1], -hz + bevel]); normals.push(norm_c2);
+            let norm_c2 = [
+                nx * std::f32::consts::FRAC_1_SQRT_2,
+                ny * std::f32::consts::FRAC_1_SQRT_2,
+                -std::f32::consts::FRAC_1_SQRT_2,
+            ];
+            vertices.push([p0[0] - nx * bevel, p0[1] - ny * bevel, -hz]);
+            normals.push(norm_c2);
+            vertices.push([p1[0] - nx * bevel, p1[0] - ny * bevel, -hz]);
+            normals.push(norm_c2);
+            vertices.push([p1[0], p1[1], -hz + bevel]);
+            normals.push(norm_c2);
+            vertices.push([p0[0], p0[1], -hz + bevel]);
+            normals.push(norm_c2);
 
-            indices.extend_from_slice(&[start_c2, start_c2 + 1, start_c2 + 2, start_c2, start_c2 + 2, start_c2 + 3]);
+            indices.extend_from_slice(&[
+                start_c2,
+                start_c2 + 1,
+                start_c2 + 2,
+                start_c2,
+                start_c2 + 2,
+                start_c2 + 3,
+            ]);
         }
     }
 
-    Some(Simple3DMesh { vertices, normals, indices })
+    Some(Simple3DMesh {
+        vertices,
+        normals,
+        indices,
+    })
 }
 
 fn render_font_preview(font_path: &str, output_path: &str) {
@@ -439,13 +523,7 @@ fn render_font_preview(font_path: &str, output_path: &str) {
     let face = ttf_parser::Face::parse(&font_bytes, 0).expect("Failed to parse font");
 
     let grid_chars = [
-        "ABCDEF",
-        "GHIJKL",
-        "MNOPQR",
-        "STUVWX",
-        "YZ0123",
-        "456789",
-        "!?'-.,",
+        "ABCDEF", "GHIJKL", "MNOPQR", "STUVWX", "YZ0123", "456789", "!?'-.,",
     ];
 
     let img_w = 1200;
@@ -493,7 +571,9 @@ fn render_font_preview(font_path: &str, output_path: &str) {
                     let p2 = proj(v2);
 
                     let light_dir = [0.0f32, 0.8, 0.6];
-                    let ndotl = (n0[0] * light_dir[0] + n0[1] * light_dir[1] + n0[2] * light_dir[2]).max(0.0);
+                    let ndotl =
+                        (n0[0] * light_dir[0] + n0[1] * light_dir[1] + n0[2] * light_dir[2])
+                            .max(0.0);
                     let intensity = 0.35 + 0.65 * ndotl;
 
                     let r = (210.0 * intensity + 45.0 * n0[2].max(0.0)).clamp(0.0, 255.0) as u8;
@@ -505,7 +585,11 @@ fn render_font_preview(font_path: &str, output_path: &str) {
                     let min_y = p0[1].min(p1[1]).min(p2[1]).max(0.0) as u32;
                     let max_y = p0[1].max(p1[1]).max(p2[1]).min(img_h as f32 - 1.0) as u32;
 
-                    let is_point_in_tri = |p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]| -> bool {
+                    let is_point_in_tri = |p: [f32; 2],
+                                           a: [f32; 2],
+                                           b: [f32; 2],
+                                           c: [f32; 2]|
+                     -> bool {
                         let cross1 = (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]);
                         let cross2 = (c[0] - b[0]) * (p[1] - b[1]) - (c[1] - b[1]) * (p[0] - b[0]);
                         let cross3 = (a[0] - c[0]) * (p[1] - c[1]) - (a[1] - c[1]) * (p[0] - c[0]);
@@ -554,7 +638,10 @@ fn render_phrase_preview(font_path: &str, output_path: &str, phrase: &str) {
     let mut total_advance = 0.0f32;
     for ch in phrase.chars() {
         if let Some(glyph_id) = face.glyph_index(ch) {
-            let adv = face.glyph_hor_advance(glyph_id).unwrap_or(face.units_per_em()) as f32 * base_scale;
+            let adv = face
+                .glyph_hor_advance(glyph_id)
+                .unwrap_or(face.units_per_em()) as f32
+                * base_scale;
             total_advance += adv;
         } else {
             total_advance += 0.5;
@@ -576,7 +663,11 @@ fn render_phrase_preview(font_path: &str, output_path: &str, phrase: &str) {
 
     for ch in phrase.chars() {
         if let Some(glyph_id) = face.glyph_index(ch) {
-            let adv = face.glyph_hor_advance(glyph_id).unwrap_or(face.units_per_em()) as f32 * base_scale * text_scale;
+            let adv = face
+                .glyph_hor_advance(glyph_id)
+                .unwrap_or(face.units_per_em()) as f32
+                * base_scale
+                * text_scale;
             let mut builder = ContourBuilder::new();
             if let Some(_bbox) = face.outline_glyph(glyph_id, &mut builder) {
                 let contours = builder.finish();
@@ -584,12 +675,15 @@ fn render_phrase_preview(font_path: &str, output_path: &str, phrase: &str) {
                     .iter()
                     .filter(|c| c.points.len() >= 3)
                     .map(|c| {
-                        c.points.iter().map(|p| {
-                            [
-                                curr_x + p[0] * base_scale * text_scale,
-                                p[1] * base_scale * text_scale,
-                            ]
-                        }).collect()
+                        c.points
+                            .iter()
+                            .map(|p| {
+                                [
+                                    curr_x + p[0] * base_scale * text_scale,
+                                    p[1] * base_scale * text_scale,
+                                ]
+                            })
+                            .collect()
                     })
                     .collect();
 
@@ -608,7 +702,11 @@ fn render_phrase_preview(font_path: &str, output_path: &str, phrase: &str) {
                         normals.push([0.0, 0.0, 1.0]);
                     }
                     for tri in &face_tris {
-                        indices.extend_from_slice(&[start_f + tri[0] as u32, start_f + tri[1] as u32, start_f + tri[2] as u32]);
+                        indices.extend_from_slice(&[
+                            start_f + tri[0] as u32,
+                            start_f + tri[1] as u32,
+                            start_f + tri[2] as u32,
+                        ]);
                     }
 
                     // Sidewalls & Bevels
@@ -624,7 +722,9 @@ fn render_phrase_preview(font_path: &str, output_path: &str, phrase: &str) {
                             let dx = p1[0] - p0[0];
                             let dy = p1[1] - p0[1];
                             let len = (dx * dx + dy * dy).sqrt();
-                            if len < 1e-6 { continue; }
+                            if len < 1e-6 {
+                                continue;
+                            }
 
                             let mut nx = dy / len;
                             let mut ny = -dx / len;
@@ -637,20 +737,46 @@ fn render_phrase_preview(font_path: &str, output_path: &str, phrase: &str) {
 
                             // Side quad
                             let norm_side = [nx, ny, 0.0];
-                            vertices.push([p0[0], p0[1], -hz + bevel]); normals.push(norm_side);
-                            vertices.push([p1[0], p1[1], -hz + bevel]); normals.push(norm_side);
-                            vertices.push([p1[0], p1[1], hz - bevel]);  normals.push(norm_side);
-                            vertices.push([p0[0], p0[1], hz - bevel]);  normals.push(norm_side);
-                            indices.extend_from_slice(&[start_v, start_v + 1, start_v + 2, start_v, start_v + 2, start_v + 3]);
+                            vertices.push([p0[0], p0[1], -hz + bevel]);
+                            normals.push(norm_side);
+                            vertices.push([p1[0], p1[1], -hz + bevel]);
+                            normals.push(norm_side);
+                            vertices.push([p1[0], p1[1], hz - bevel]);
+                            normals.push(norm_side);
+                            vertices.push([p0[0], p0[1], hz - bevel]);
+                            normals.push(norm_side);
+                            indices.extend_from_slice(&[
+                                start_v,
+                                start_v + 1,
+                                start_v + 2,
+                                start_v,
+                                start_v + 2,
+                                start_v + 3,
+                            ]);
 
                             // Top Chamfer quad (+Z)
                             let start_c1 = vertices.len() as u32;
-                            let norm_c1 = [nx * std::f32::consts::FRAC_1_SQRT_2, ny * std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2];
-                            vertices.push([p0[0], p0[1], hz - bevel]); normals.push(norm_c1);
-                            vertices.push([p1[0], p1[1], hz - bevel]); normals.push(norm_c1);
-                            vertices.push([p1[0] - nx * bevel, p1[1] - ny * bevel, hz]); normals.push(norm_c1);
-                            vertices.push([p0[0] - nx * bevel, p0[1] - ny * bevel, hz]); normals.push(norm_c1);
-                            indices.extend_from_slice(&[start_c1, start_c1 + 1, start_c1 + 2, start_c1, start_c1 + 2, start_c1 + 3]);
+                            let norm_c1 = [
+                                nx * std::f32::consts::FRAC_1_SQRT_2,
+                                ny * std::f32::consts::FRAC_1_SQRT_2,
+                                std::f32::consts::FRAC_1_SQRT_2,
+                            ];
+                            vertices.push([p0[0], p0[1], hz - bevel]);
+                            normals.push(norm_c1);
+                            vertices.push([p1[0], p1[1], hz - bevel]);
+                            normals.push(norm_c1);
+                            vertices.push([p1[0] - nx * bevel, p1[1] - ny * bevel, hz]);
+                            normals.push(norm_c1);
+                            vertices.push([p0[0] - nx * bevel, p0[1] - ny * bevel, hz]);
+                            normals.push(norm_c1);
+                            indices.extend_from_slice(&[
+                                start_c1,
+                                start_c1 + 1,
+                                start_c1 + 2,
+                                start_c1,
+                                start_c1 + 2,
+                                start_c1 + 3,
+                            ]);
                         }
                     }
 
@@ -666,7 +792,9 @@ fn render_phrase_preview(font_path: &str, output_path: &str, phrase: &str) {
                         let n0 = normals[i0];
 
                         let light_dir = [0.0f32, 0.8, 0.6];
-                        let ndotl = (n0[0] * light_dir[0] + n0[1] * light_dir[1] + n0[2] * light_dir[2]).max(0.0);
+                        let ndotl =
+                            (n0[0] * light_dir[0] + n0[1] * light_dir[1] + n0[2] * light_dir[2])
+                                .max(0.0);
                         let intensity = 0.35 + 0.65 * ndotl;
 
                         let r = (210.0 * intensity + 45.0 * n0[2].max(0.0)).clamp(0.0, 255.0) as u8;
@@ -678,19 +806,29 @@ fn render_phrase_preview(font_path: &str, output_path: &str, phrase: &str) {
                         let min_y = p0[1].min(p1[1]).min(p2[1]).max(0.0) as u32;
                         let max_y = p0[1].max(p1[1]).max(p2[1]).min(img_h as f32 - 1.0) as u32;
 
-                        let is_point_in_tri = |p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]| -> bool {
-                            let cross1 = (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]);
-                            let cross2 = (c[0] - b[0]) * (p[1] - b[1]) - (c[1] - b[1]) * (p[0] - b[0]);
-                            let cross3 = (a[0] - c[0]) * (p[1] - c[1]) - (a[1] - c[1]) * (p[0] - c[0]);
-                            let has_neg = (cross1 < -1e-6) || (cross2 < -1e-6) || (cross3 < -1e-6);
-                            let has_pos = (cross1 > 1e-6) || (cross2 > 1e-6) || (cross3 > 1e-6);
-                            !(has_neg && has_pos)
-                        };
+                        let is_point_in_tri =
+                            |p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]| -> bool {
+                                let cross1 =
+                                    (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]);
+                                let cross2 =
+                                    (c[0] - b[0]) * (p[1] - b[1]) - (c[1] - b[1]) * (p[0] - b[0]);
+                                let cross3 =
+                                    (a[0] - c[0]) * (p[1] - c[1]) - (a[1] - c[1]) * (p[0] - c[0]);
+                                let has_neg =
+                                    (cross1 < -1e-6) || (cross2 < -1e-6) || (cross3 < -1e-6);
+                                let has_pos = (cross1 > 1e-6) || (cross2 > 1e-6) || (cross3 > 1e-6);
+                                !(has_neg && has_pos)
+                            };
 
                         for py in min_y..=max_y {
                             for px in min_x..=max_x {
                                 let p = [px as f32 + 0.5, py as f32 + 0.5];
-                                if is_point_in_tri(p, [p0[0], p0[1]], [p1[0], p1[1]], [p2[0], p2[1]]) {
+                                if is_point_in_tri(
+                                    p,
+                                    [p0[0], p0[1]],
+                                    [p1[0], p1[1]],
+                                    [p2[0], p2[1]],
+                                ) {
                                     let idx = (py * img_w + px) as usize;
                                     if p0[2] < z_buf[idx] {
                                         z_buf[idx] = p0[2];
@@ -708,15 +846,26 @@ fn render_phrase_preview(font_path: &str, output_path: &str, phrase: &str) {
         }
     }
 
-    img.save(output_path).expect("Failed to save phrase preview");
+    img.save(output_path)
+        .expect("Failed to save phrase preview");
     println!("Saved phrase preview to {}", output_path);
 }
 
 fn main() {
-    render_font_preview("assets/Orbitron-Black.ttf", "/home/naoki/.gemini/antigravity/brain/81080094-7121-4c13-a627-684df1a03458/alphabet_orbitron.png");
+    render_font_preview(
+        "assets/Orbitron-Black.ttf",
+        "/home/naoki/.gemini/antigravity/brain/81080094-7121-4c13-a627-684df1a03458/alphabet_orbitron.png",
+    );
     let dejavu_path = "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf";
     if Path::new(dejavu_path).exists() {
-        render_font_preview(dejavu_path, "/home/naoki/.gemini/antigravity/brain/81080094-7121-4c13-a627-684df1a03458/alphabet_dejavu.png");
-        render_phrase_preview(dejavu_path, "/home/naoki/.gemini/antigravity/brain/81080094-7121-4c13-a627-684df1a03458/phrase_preview.png", "AND SO YOU'RE BACK");
+        render_font_preview(
+            dejavu_path,
+            "/home/naoki/.gemini/antigravity/brain/81080094-7121-4c13-a627-684df1a03458/alphabet_dejavu.png",
+        );
+        render_phrase_preview(
+            dejavu_path,
+            "/home/naoki/.gemini/antigravity/brain/81080094-7121-4c13-a627-684df1a03458/phrase_preview.png",
+            "AND SO YOU'RE BACK",
+        );
     }
 }

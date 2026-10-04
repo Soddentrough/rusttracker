@@ -2,11 +2,11 @@ use crossbeam_channel::Sender;
 
 #[cfg(unix)]
 mod unix_ipc {
+    use crossbeam_channel::Sender;
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::{UnixListener, UnixStream};
     use std::path::PathBuf;
     use std::time::Duration;
-    use crossbeam_channel::Sender;
 
     pub(crate) fn get_socket_path() -> PathBuf {
         if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
@@ -68,7 +68,10 @@ mod unix_ipc {
         let listener = match UnixListener::bind(&socket_path) {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("[ipc] Failed to bind UNIX domain socket {:?}: {}", socket_path, e);
+                eprintln!(
+                    "[ipc] Failed to bind UNIX domain socket {:?}: {}",
+                    socket_path, e
+                );
                 return;
             }
         };
@@ -83,7 +86,9 @@ mod unix_ipc {
                     };
                     let mut reader = BufReader::new(cloned);
                     let mut header = String::new();
-                    if reader.read_line(&mut header).is_err() || header.trim() != "RUSTTRACKER_IPC_V1" {
+                    if reader.read_line(&mut header).is_err()
+                        || header.trim() != "RUSTTRACKER_IPC_V1"
+                    {
                         continue;
                     }
 
@@ -114,17 +119,17 @@ mod unix_ipc {
 
 #[cfg(windows)]
 mod windows_ipc {
-    use std::io::{BufRead, BufReader, Write};
     use crossbeam_channel::Sender;
-    use windows::core::w;
+    use std::io::{BufRead, BufReader, Write};
     use windows::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows::Win32::Storage::FileSystem::{
         CreateFileW, FILE_GENERIC_READ, FILE_GENERIC_WRITE, OPEN_EXISTING, PIPE_ACCESS_DUPLEX,
     };
     use windows::Win32::System::Pipes::{
-        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe,
-        PIPE_READMODE_BYTE, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
+        ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE,
+        PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT,
     };
+    use windows::core::w;
 
     const PIPE_NAME: windows::core::PCWSTR = w!(r"\\.\pipe\RustTracker-SingleInstance");
 
@@ -212,7 +217,9 @@ mod windows_ipc {
                         let mut writer = file;
 
                         let mut header = String::new();
-                        if reader.read_line(&mut header).is_ok() && header.trim() == "RUSTTRACKER_IPC_V1" {
+                        if reader.read_line(&mut header).is_ok()
+                            && header.trim() == "RUSTTRACKER_IPC_V1"
+                        {
                             let mut count_str = String::new();
                             if reader.read_line(&mut count_str).is_ok() {
                                 let count: usize = count_str.trim().parse().unwrap_or(0);
@@ -288,11 +295,19 @@ mod tests {
         start_ipc_server(tx);
         std::thread::sleep(std::time::Duration::from_millis(100));
 
-        let files = vec!["/tmp/sample1.mp3".to_string(), "/tmp/sample2.flac".to_string()];
+        let files = vec![
+            "/tmp/sample1.mp3".to_string(),
+            "/tmp/sample2.flac".to_string(),
+        ];
         let forwarded = try_forward_to_existing_instance(&files);
-        assert!(forwarded, "try_forward_to_existing_instance should succeed when server is running");
+        assert!(
+            forwarded,
+            "try_forward_to_existing_instance should succeed when server is running"
+        );
 
-        let received = rx.recv_timeout(std::time::Duration::from_millis(1000)).expect("Should receive forwarded paths");
+        let received = rx
+            .recv_timeout(std::time::Duration::from_millis(1000))
+            .expect("Should receive forwarded paths");
         assert_eq!(received, files);
 
         // Clean up socket
@@ -302,6 +317,9 @@ mod tests {
         // Verify forwarding returns false when socket does not exist
         let files2 = vec!["/tmp/sample3.mp3".to_string()];
         let forwarded2 = try_forward_to_existing_instance(&files2);
-        assert!(!forwarded2, "try_forward_to_existing_instance should return false when no socket exists");
+        assert!(
+            !forwarded2,
+            "try_forward_to_existing_instance should return false when no socket exists"
+        );
     }
 }

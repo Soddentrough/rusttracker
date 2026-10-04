@@ -66,3 +66,4 @@ android/.cxx/
 android/.idea/
 *.apk
 *.aab
+dist/

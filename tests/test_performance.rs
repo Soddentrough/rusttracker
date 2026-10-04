@@ -1,16 +1,16 @@
-#[path = "../src/lyrics.rs"]
-pub mod lyrics;
-#[path = "../src/state.rs"]
-pub mod state;
 #[path = "../src/audio.rs"]
 pub mod audio;
 #[path = "../src/bitstream.rs"]
 pub mod bitstream;
 #[path = "../src/engine.rs"]
 pub mod engine;
+#[path = "../src/lyrics.rs"]
+pub mod lyrics;
+#[path = "../src/state.rs"]
+pub mod state;
 
-use wgpu::*;
 use std::time::Instant;
+use wgpu::*;
 
 fn resolve_shader_includes(source: &str) -> String {
     const SHADER_COMMON: &str = include_str!("../src/shaders/_common.wgsl");
@@ -33,12 +33,15 @@ async fn run_perf_test() {
         display: None,
         memory_budget_thresholds: MemoryBudgetThresholds::default(),
     });
-    
-    let adapter = instance.request_adapter(&RequestAdapterOptions {
-        power_preference: PowerPreference::HighPerformance,
-        compatible_surface: None,
-        force_fallback_adapter: false,
-    }).await.unwrap();
+
+    let adapter = instance
+        .request_adapter(&RequestAdapterOptions {
+            power_preference: PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        })
+        .await
+        .unwrap();
 
     println!("Selected Adapter: {:?}", adapter.get_info());
 
@@ -48,18 +51,21 @@ async fn run_perf_test() {
         required_features |= Features::TIMESTAMP_QUERY;
         println!("Timestamp queries are supported!");
     } else {
-        println!("WARNING: Timestamp queries NOT supported on this GPU/driver. Falling back to CPU-side measurements.");
+        println!(
+            "WARNING: Timestamp queries NOT supported on this GPU/driver. Falling back to CPU-side measurements."
+        );
     }
 
-    let (device, queue) = adapter.request_device(
-        &DeviceDescriptor {
+    let (device, queue) = adapter
+        .request_device(&DeviceDescriptor {
             label: None,
             required_features,
             required_limits: Limits::default(),
             memory_hints: MemoryHints::default(),
             ..Default::default()
-        },
-    ).await.unwrap();
+        })
+        .await
+        .unwrap();
 
     // Create 1920x1080 textures
     let width = 1920;
@@ -68,7 +74,11 @@ async fn run_perf_test() {
 
     let render_target = device.create_texture(&TextureDescriptor {
         label: Some("RenderTarget"),
-        size: Extent3d { width, height, depth_or_array_layers: 1 },
+        size: Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: TextureDimension::D2,
@@ -80,7 +90,11 @@ async fn run_perf_test() {
 
     let depth_texture = device.create_texture(&TextureDescriptor {
         label: Some("DepthTexture"),
-        size: Extent3d { width, height, depth_or_array_layers: 1 },
+        size: Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: TextureDimension::D2,
@@ -107,7 +121,11 @@ async fn run_perf_test() {
 
     let history_texture = device.create_texture(&TextureDescriptor {
         label: Some("Heatmap History Texture"),
-        size: Extent3d { width: 256, height: 1024, depth_or_array_layers: 1 },
+        size: Extent3d {
+            width: 256,
+            height: 1024,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: TextureDimension::D2,
@@ -119,7 +137,11 @@ async fn run_perf_test() {
 
     let fire_grid_texture = device.create_texture(&TextureDescriptor {
         label: Some("Fire Grid Texture"),
-        size: Extent3d { width: 1024, height: 576, depth_or_array_layers: 1 },
+        size: Extent3d {
+            width: 1024,
+            height: 576,
+            depth_or_array_layers: 1,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: TextureDimension::D2,
@@ -204,7 +226,7 @@ async fn run_perf_test() {
                     min_binding_size: None,
                 },
                 count: None,
-            }
+            },
         ],
         label: Some("audio_bind_group_layout"),
     });
@@ -212,12 +234,30 @@ async fn run_perf_test() {
     let uniform_bind_group = device.create_bind_group(&BindGroupDescriptor {
         layout: &bind_group_layout,
         entries: &[
-            BindGroupEntry { binding: 0, resource: uniform_buffer.as_entire_binding() },
-            BindGroupEntry { binding: 1, resource: waveform_storage_buffer.as_entire_binding() },
-            BindGroupEntry { binding: 2, resource: BindingResource::TextureView(&history_view) },
-            BindGroupEntry { binding: 3, resource: BindingResource::TextureView(&fire_grid_view) },
-            BindGroupEntry { binding: 4, resource: gpu_spectrum_buffer.as_entire_binding() },
-            BindGroupEntry { binding: 5, resource: ferrofluidsim_grid.as_entire_binding() }
+            BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 1,
+                resource: waveform_storage_buffer.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 2,
+                resource: BindingResource::TextureView(&history_view),
+            },
+            BindGroupEntry {
+                binding: 3,
+                resource: BindingResource::TextureView(&fire_grid_view),
+            },
+            BindGroupEntry {
+                binding: 4,
+                resource: gpu_spectrum_buffer.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 5,
+                resource: ferrofluidsim_grid.as_entire_binding(),
+            },
         ],
         label: Some("audio_bind_group"),
     });
@@ -225,7 +265,11 @@ async fn run_perf_test() {
     // Create smoke dummy bindings for the rendering layout
     let smoke_texture = device.create_texture(&TextureDescriptor {
         label: Some("Neon Smoke Texture"),
-        size: Extent3d { width: 64, height: 64, depth_or_array_layers: 64 },
+        size: Extent3d {
+            width: 64,
+            height: 64,
+            depth_or_array_layers: 64,
+        },
         mip_level_count: 1,
         sample_count: 1,
         dimension: TextureDimension::D3,
@@ -272,8 +316,14 @@ async fn run_perf_test() {
         label: Some("Smoke Render Bind Group"),
         layout: &smoke_render_layout,
         entries: &[
-            BindGroupEntry { binding: 0, resource: BindingResource::TextureView(&smoke_texture_view) },
-            BindGroupEntry { binding: 1, resource: BindingResource::Sampler(&smoke_sampler) },
+            BindGroupEntry {
+                binding: 0,
+                resource: BindingResource::TextureView(&smoke_texture_view),
+            },
+            BindGroupEntry {
+                binding: 1,
+                resource: BindingResource::Sampler(&smoke_sampler),
+            },
         ],
     });
 
@@ -314,10 +364,10 @@ async fn run_perf_test() {
         }],
     });
 
-    let biolum_render_bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-        label: Some("Biolum Render Layout"),
-        entries: &[
-            BindGroupLayoutEntry {
+    let biolum_render_bind_group_layout =
+        device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("Biolum Render Layout"),
+            entries: &[BindGroupLayoutEntry {
                 binding: 0,
                 visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
                 ty: BindingType::Buffer {
@@ -326,9 +376,8 @@ async fn run_perf_test() {
                     min_binding_size: None,
                 },
                 count: None,
-            },
-        ],
-    });
+            }],
+        });
 
     let biolum_particles_buffer = device.create_buffer(&BufferDescriptor {
         label: Some("Bioluminescent Particles"),
@@ -341,17 +390,19 @@ async fn run_perf_test() {
     let biolum_render_bind_group = device.create_bind_group(&BindGroupDescriptor {
         label: Some("Biolum Render Bind Group"),
         layout: &biolum_render_bind_group_layout,
-        entries: &[
-            BindGroupEntry {
-                binding: 0,
-                resource: biolum_particles_buffer.as_entire_binding(),
-            },
-        ],
+        entries: &[BindGroupEntry {
+            binding: 0,
+            resource: biolum_particles_buffer.as_entire_binding(),
+        }],
     });
 
     let render_pipeline_layout_3d = device.create_pipeline_layout(&PipelineLayoutDescriptor {
         label: Some("3D Render Pipeline Layout"),
-        bind_group_layouts: &[Some(&bind_group_layout), Some(&smoke_render_layout), Some(&camera_bind_group_layout)],
+        bind_group_layouts: &[
+            Some(&bind_group_layout),
+            Some(&smoke_render_layout),
+            Some(&camera_bind_group_layout),
+        ],
         immediate_size: 0,
     });
 
@@ -432,10 +483,26 @@ async fn run_perf_test() {
 
     // UnitQuad buffers for instanced particle visualizer (ID 20)
     let quad_verts = vec![
-        crate::engine::Vertex { position: [-0.5, -0.5, 0.0], normal: [0.0, 0.0, 1.0], tex_coords: [0.0, 0.0] },
-        crate::engine::Vertex { position: [ 0.5, -0.5, 0.0], normal: [0.0, 0.0, 1.0], tex_coords: [1.0, 0.0] },
-        crate::engine::Vertex { position: [ 0.5,  0.5, 0.0], normal: [0.0, 0.0, 1.0], tex_coords: [1.0, 1.0] },
-        crate::engine::Vertex { position: [-0.5,  0.5, 0.0], normal: [0.0, 0.0, 1.0], tex_coords: [0.0, 1.0] },
+        crate::engine::Vertex {
+            position: [-0.5, -0.5, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            tex_coords: [0.0, 0.0],
+        },
+        crate::engine::Vertex {
+            position: [0.5, -0.5, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            tex_coords: [1.0, 0.0],
+        },
+        crate::engine::Vertex {
+            position: [0.5, 0.5, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            tex_coords: [1.0, 1.0],
+        },
+        crate::engine::Vertex {
+            position: [-0.5, 0.5, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            tex_coords: [0.0, 1.0],
+        },
     ];
     let quad_inds: Vec<u32> = vec![0, 1, 2, 0, 2, 3];
     let quad_vertex_buffer = device.create_buffer(&BufferDescriptor {
@@ -493,7 +560,11 @@ async fn run_perf_test() {
         view_matrix: glam::Mat4::IDENTITY.to_cols_array_2d(),
         proj_matrix: glam::Mat4::IDENTITY.to_cols_array_2d(),
     };
-    queue.write_buffer(&camera_uniform_buffer, 0, bytemuck::cast_slice(&[camera_uniforms]));
+    queue.write_buffer(
+        &camera_uniform_buffer,
+        0,
+        bytemuck::cast_slice(&[camera_uniforms]),
+    );
     queue.write_buffer(&uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
     // Query set setup
@@ -576,7 +647,10 @@ async fn run_perf_test() {
             source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&full_source)),
         });
 
-        let is_3d = matches!(vis_def.pipeline_type, crate::state::PipelineType::Mesh3D { .. });
+        let is_3d = matches!(
+            vis_def.pipeline_type,
+            crate::state::PipelineType::Mesh3D { .. }
+        );
 
         let layout = if vis_def.id == 20 {
             &biolum_render_pipeline_layout
@@ -589,11 +663,7 @@ async fn run_perf_test() {
         let vs_entry = if is_3d { "vs_main_3d" } else { "vs_main" };
 
         let vertex_desc = crate::engine::Vertex::desc();
-        let buffers = if is_3d {
-            vec![vertex_desc]
-        } else {
-            vec![]
-        };
+        let buffers = if is_3d { vec![vertex_desc] } else { vec![] };
 
         let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
             label: Some(vis_def.name),
@@ -739,12 +809,15 @@ async fn run_perf_test() {
             }
             queue.submit(Some(encoder.finish()));
         }
-        let _ = device.poll(PollType::Wait { submission_index: None, timeout: None });
+        let _ = device.poll(PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
 
         // Benchmark runs
         let num_iterations = 60;
         let mut total_time_ms = 0.0;
-        
+
         for frame in 0..num_iterations {
             uniforms.mode = vis_def.id;
             uniforms.time = 5.0 + (frame as f32) * 0.016;
@@ -754,7 +827,7 @@ async fn run_perf_test() {
             queue.write_buffer(&uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
             let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
-            
+
             let tw = query_set.as_ref().map(|qs| RenderPassTimestampWrites {
                 query_set: qs,
                 beginning_of_pass_write_index: Some(0),
@@ -816,13 +889,18 @@ async fn run_perf_test() {
                 }
             }
 
-            if let (Some(qs), Some(res_buf), Some(read_buf)) = (&query_set, &query_resolve_buffer, &query_read_buffer) {
+            if let (Some(qs), Some(res_buf), Some(read_buf)) =
+                (&query_set, &query_resolve_buffer, &query_read_buffer)
+            {
                 encoder.resolve_query_set(qs, 0..2, res_buf, 0);
                 encoder.copy_buffer_to_buffer(res_buf, 0, read_buf, 0, 16);
             }
 
             queue.submit(Some(encoder.finish()));
-            let _ = device.poll(PollType::Wait { submission_index: None, timeout: None });
+            let _ = device.poll(PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            });
 
             if let Some(read_buf) = &query_read_buffer {
                 let slice = read_buf.slice(..);
@@ -830,7 +908,10 @@ async fn run_perf_test() {
                 slice.map_async(MapMode::Read, move |res| {
                     tx.send(res).unwrap();
                 });
-                let _ = device.poll(PollType::Wait { submission_index: None, timeout: None });
+                let _ = device.poll(PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                });
                 rx.recv().unwrap().unwrap();
 
                 let data = slice.get_mapped_range();
@@ -850,8 +931,15 @@ async fn run_perf_test() {
         }
 
         let avg_time_ms = total_time_ms / (num_iterations as f32);
-        let status = if avg_time_ms <= 0.7 { "PASS" } else { "FAIL (SLUGGISH)" };
-        println!("| {} | {} | {:.3} ms | 0.700 ms | {} |", vis_def.id, vis_def.name, avg_time_ms, status);
+        let status = if avg_time_ms <= 0.7 {
+            "PASS"
+        } else {
+            "FAIL (SLUGGISH)"
+        };
+        println!(
+            "| {} | {} | {:.3} ms | 0.700 ms | {} |",
+            vis_def.id, vis_def.name, avg_time_ms, status
+        );
     }
     println!("-------------------------------------");
 }
@@ -866,19 +954,25 @@ fn test_heatmap_compute_pipeline_creation() {
             display: None,
             memory_budget_thresholds: MemoryBudgetThresholds::default(),
         });
-        let adapter = instance.request_adapter(&RequestAdapterOptions {
-            power_preference: PowerPreference::HighPerformance,
-            compatible_surface: None,
-            force_fallback_adapter: false,
-        }).await.unwrap();
+        let adapter = instance
+            .request_adapter(&RequestAdapterOptions {
+                power_preference: PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            })
+            .await
+            .unwrap();
         let mut required_features = Features::empty();
         if adapter.features().contains(Features::PIPELINE_CACHE) {
             required_features |= Features::PIPELINE_CACHE;
         }
-        let (device, queue) = adapter.request_device(&DeviceDescriptor {
-            required_features,
-            ..Default::default()
-        }).await.unwrap();
+        let (device, queue) = adapter
+            .request_device(&DeviceDescriptor {
+                required_features,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
         let error_caught = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let error_caught_clone = error_caught.clone();
         device.on_uncaptured_error(std::sync::Arc::new(move |e: Error| {
@@ -889,9 +983,36 @@ fn test_heatmap_compute_pipeline_creation() {
         let heatmap_compute_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("heatmap_compute_layout"),
             entries: &[
-                BindGroupLayoutEntry { binding: 0, visibility: ShaderStages::COMPUTE, ty: BindingType::Buffer { ty: BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
-                BindGroupLayoutEntry { binding: 1, visibility: ShaderStages::COMPUTE, ty: BindingType::StorageTexture { access: StorageTextureAccess::WriteOnly, format: TextureFormat::R32Float, view_dimension: TextureViewDimension::D2 }, count: None },
-                BindGroupLayoutEntry { binding: 4, visibility: ShaderStages::COMPUTE, ty: BindingType::Buffer { ty: BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::StorageTexture {
+                        access: StorageTextureAccess::WriteOnly,
+                        format: TextureFormat::R32Float,
+                        view_dimension: TextureViewDimension::D2,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let common = include_str!("../src/shaders/_common.wgsl");
@@ -901,11 +1022,12 @@ fn test_heatmap_compute_pipeline_creation() {
             label: Some("Heatmap Compute Shader"),
             source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&heatmap_source)),
         });
-        let heatmap_compute_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-            label: Some("heatmap_compute_layout"),
-            bind_group_layouts: &[Some(&heatmap_compute_layout)],
-            immediate_size: 0,
-        });
+        let heatmap_compute_pipeline_layout =
+            device.create_pipeline_layout(&PipelineLayoutDescriptor {
+                label: Some("heatmap_compute_layout"),
+                bind_group_layouts: &[Some(&heatmap_compute_layout)],
+                immediate_size: 0,
+            });
 
         // Test with pipeline cache enabled if supported
         let pipeline_cache = if device.features().contains(Features::PIPELINE_CACHE) {
@@ -934,8 +1056,26 @@ fn test_heatmap_compute_pipeline_creation() {
         let biolum_compute_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
             label: Some("Biolum Compute Layout"),
             entries: &[
-                BindGroupLayoutEntry { binding: 0, visibility: ShaderStages::COMPUTE, ty: BindingType::Buffer { ty: BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
-                BindGroupLayoutEntry { binding: 1, visibility: ShaderStages::COMPUTE, ty: BindingType::Buffer { ty: BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None },
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
         let biolum_raw = include_str!("../src/shaders/biolum_compute.wgsl");
@@ -944,11 +1084,12 @@ fn test_heatmap_compute_pipeline_creation() {
             label: Some("Biolum Compute Shader"),
             source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&biolum_source)),
         });
-        let biolum_compute_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-            label: Some("Biolum Compute Pipeline Layout"),
-            bind_group_layouts: &[Some(&biolum_compute_layout)],
-            immediate_size: 0,
-        });
+        let biolum_compute_pipeline_layout =
+            device.create_pipeline_layout(&PipelineLayoutDescriptor {
+                label: Some("Biolum Compute Pipeline Layout"),
+                bind_group_layouts: &[Some(&biolum_compute_layout)],
+                immediate_size: 0,
+            });
         let biolum_compute_pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
             label: Some("Biolum Compute Pipeline"),
             layout: Some(&biolum_compute_pipeline_layout),
@@ -958,7 +1099,9 @@ fn test_heatmap_compute_pipeline_creation() {
             cache: pipeline_cache_ref,
         });
 
-        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor { label: Some("Render Encoder") });
+        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("Render Encoder"),
+        });
         {
             let mut compute_pass = encoder.begin_compute_pass(&ComputePassDescriptor {
                 label: Some("Heatmap Compute Pass"),
@@ -968,9 +1111,15 @@ fn test_heatmap_compute_pipeline_creation() {
             compute_pass.set_pipeline(&biolum_compute_pipeline);
         }
         queue.submit(Some(encoder.finish()));
-        let _ = device.poll(PollType::Wait { submission_index: None, timeout: None });
+        let _ = device.poll(PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
 
-        assert!(!error_caught.load(std::sync::atomic::Ordering::SeqCst), "Validation error was triggered!");
+        assert!(
+            !error_caught.load(std::sync::atomic::Ordering::SeqCst),
+            "Validation error was triggered!"
+        );
     });
 }
 
@@ -1003,16 +1152,43 @@ fn test_render_retro_fire_snapshot() {
     }
 
     const DOOM_PAL: [(u8, u8, u8); 37] = [
-        (0x07, 0x07, 0x07), (0x1f, 0x07, 0x07), (0x2f, 0x0f, 0x07), (0x47, 0x0f, 0x07),
-        (0x57, 0x17, 0x07), (0x67, 0x1f, 0x07), (0x77, 0x1f, 0x07), (0x8f, 0x27, 0x07),
-        (0x9f, 0x2f, 0x07), (0xaf, 0x3f, 0x07), (0xbf, 0x47, 0x07), (0xc7, 0x47, 0x07),
-        (0xdf, 0x4f, 0x07), (0xdf, 0x57, 0x07), (0xdf, 0x57, 0x07), (0xd7, 0x5f, 0x07),
-        (0xd7, 0x5f, 0x07), (0xd7, 0x67, 0x0f), (0xcf, 0x6f, 0x0f), (0xcf, 0x77, 0x0f),
-        (0xcf, 0x7f, 0x0f), (0xcf, 0x87, 0x17), (0xc7, 0x87, 0x17), (0xc7, 0x8f, 0x17),
-        (0xc7, 0x97, 0x1f), (0xbf, 0x9f, 0x1f), (0xbf, 0x9f, 0x1f), (0xbf, 0xa7, 0x27),
-        (0xbf, 0xa7, 0x27), (0xbf, 0xaf, 0x2f), (0xb7, 0xaf, 0x2f), (0xb7, 0xb7, 0x2f),
-        (0xb7, 0xb7, 0x37), (0xcf, 0xcf, 0x6f), (0xdf, 0xdf, 0x9f), (0xef, 0xef, 0xc7),
-        (0xff, 0xff, 0xff)
+        (0x07, 0x07, 0x07),
+        (0x1f, 0x07, 0x07),
+        (0x2f, 0x0f, 0x07),
+        (0x47, 0x0f, 0x07),
+        (0x57, 0x17, 0x07),
+        (0x67, 0x1f, 0x07),
+        (0x77, 0x1f, 0x07),
+        (0x8f, 0x27, 0x07),
+        (0x9f, 0x2f, 0x07),
+        (0xaf, 0x3f, 0x07),
+        (0xbf, 0x47, 0x07),
+        (0xc7, 0x47, 0x07),
+        (0xdf, 0x4f, 0x07),
+        (0xdf, 0x57, 0x07),
+        (0xdf, 0x57, 0x07),
+        (0xd7, 0x5f, 0x07),
+        (0xd7, 0x5f, 0x07),
+        (0xd7, 0x67, 0x0f),
+        (0xcf, 0x6f, 0x0f),
+        (0xcf, 0x77, 0x0f),
+        (0xcf, 0x7f, 0x0f),
+        (0xcf, 0x87, 0x17),
+        (0xc7, 0x87, 0x17),
+        (0xc7, 0x8f, 0x17),
+        (0xc7, 0x97, 0x1f),
+        (0xbf, 0x9f, 0x1f),
+        (0xbf, 0x9f, 0x1f),
+        (0xbf, 0xa7, 0x27),
+        (0xbf, 0xa7, 0x27),
+        (0xbf, 0xaf, 0x2f),
+        (0xb7, 0xaf, 0x2f),
+        (0xb7, 0xb7, 0x2f),
+        (0xb7, 0xb7, 0x37),
+        (0xcf, 0xcf, 0x6f),
+        (0xdf, 0xdf, 0x9f),
+        (0xef, 0xef, 0xc7),
+        (0xff, 0xff, 0xff),
     ];
 
     let scale = 3;
@@ -1033,5 +1209,3 @@ fn test_render_retro_fire_snapshot() {
     let out_path = std::env::temp_dir().join("actual_retro_fire_reactive.png");
     let _ = img.save(out_path);
 }
-
-

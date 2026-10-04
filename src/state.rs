@@ -22,14 +22,26 @@ impl MobileHudTab {
         match self {
             Self::Channels => Self::Heatmap,
             Self::Heatmap => Self::Info,
-            Self::Info => if has_video { Self::Video } else { Self::Channels },
+            Self::Info => {
+                if has_video {
+                    Self::Video
+                } else {
+                    Self::Channels
+                }
+            }
             Self::Video => Self::Channels,
         }
     }
-    
+
     pub fn prev(&self, has_video: bool) -> Self {
         match self {
-            Self::Channels => if has_video { Self::Video } else { Self::Info },
+            Self::Channels => {
+                if has_video {
+                    Self::Video
+                } else {
+                    Self::Info
+                }
+            }
             Self::Heatmap => Self::Channels,
             Self::Info => Self::Heatmap,
             Self::Video => Self::Info,
@@ -51,16 +63,16 @@ pub struct PerformanceStats {
     pub clipping_events: u32,
     pub bitstream_active: bool,
     pub bitstream_format: String,
-    
+
     // Fine-grained frame phase timings (microseconds)
-    pub phase_lock_update_us: f32,   // Main loop: lock + smoothing + engine.update()
-    pub phase_snapshot_us: f32,      // Main loop: render_snapshot() creation
-    pub phase_surface_us: f32,       // render(): get_current_texture()
-    pub phase_egui_layout_us: f32,   // render(): egui ctx.run() UI layout
-    pub phase_encode_us: f32,        // render(): GPU command encoding (compute + render passes)
+    pub phase_lock_update_us: f32, // Main loop: lock + smoothing + engine.update()
+    pub phase_snapshot_us: f32,    // Main loop: render_snapshot() creation
+    pub phase_surface_us: f32,     // render(): get_current_texture()
+    pub phase_egui_layout_us: f32, // render(): egui ctx.run() UI layout
+    pub phase_encode_us: f32,      // render(): GPU command encoding (compute + render passes)
     #[allow(dead_code)]
-    pub phase_submit_us: f32,        // render(): queue.submit() + present
-    pub phase_post_us: f32,          // Main loop: post-render state writeback
+    pub phase_submit_us: f32, // render(): queue.submit() + present
+    pub phase_post_us: f32,        // Main loop: post-render state writeback
 }
 
 #[derive(Clone)]
@@ -75,7 +87,7 @@ pub struct VideoFrame {
     pub y_stride: usize,
     pub u_stride: usize,
     pub v_stride: usize,
-    
+
     // HDR Metadata
     pub bit_depth: u8,
     pub color_space: u32,
@@ -114,10 +126,7 @@ pub enum Geometry {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PipelineType {
     FullscreenQuad,
-    Mesh3D {
-        geometry: Geometry,
-        instances: u32,
-    },
+    Mesh3D { geometry: Geometry, instances: u32 },
 }
 
 #[derive(Clone, Debug)]
@@ -135,25 +144,242 @@ pub struct VisualizerDef {
 }
 
 pub const VISUALIZERS: &[VisualizerDef] = &[
-    VisualizerDef { id: 0, name: "Frequency Spectrum", filename: "vis_spectrum.wgsl", description: "Standard 2D FFT spectrum analyzer", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
-    VisualizerDef { id: 25, name: "Studio LED Spectrum", filename: "vis_spectrum_led.wgsl", description: "Segmented studio LED frequency spectrum with peak hold", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
-    VisualizerDef { id: 24, name: "Retro Tape Head", filename: "vis_tape_head.wgsl", description: "Optical playhead with cathode spark impact & streaming waveform", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
-    VisualizerDef { id: 1, name: "CRT Oscilloscope", filename: "vis_oscilloscope.wgsl", description: "2D glowing CRT wave trace", pipeline_type: PipelineType::FullscreenQuad, requires_history: true, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
-    VisualizerDef { id: 3, name: "3D Oscilloscope", filename: "vis_3doscilloscope_raster.wgsl", description: "Rasterized 3D waterfall grid of waveform history", pipeline_type: PipelineType::Mesh3D { geometry: Geometry::Grid { width: 256, depth: 143 }, instances: 1 }, requires_history: true, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
-    VisualizerDef { id: 4, name: "3D Freq Oscilloscope", filename: "vis_3doscilloscope_freq.wgsl", description: "3D topographical frequency view", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: false, requires_resynth: true, requires_ferrofluidsim: false },
-    VisualizerDef { id: 5, name: "Retro Fire", filename: "vis_flame.wgsl", description: "Classic DOOM 2D fire simulation with CRT post-processing", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: true, requires_resynth: false, requires_ferrofluidsim: false },
-    VisualizerDef { id: 6, name: "Fire Simulation", filename: "vis_firesim.wgsl", description: "Multi-channel procedural fire simulation (experimental)", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: true, requires_resynth: false, requires_ferrofluidsim: false },
-    VisualizerDef { id: 7, name: "Solar Flare", filename: "vis_solar.wgsl", description: "Audio-reactive raymarched sun", pipeline_type: PipelineType::FullscreenQuad, requires_history: true, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
-    VisualizerDef { id: 8, name: "Spatial Vectors", filename: "vis_spatial.wgsl", description: "Multi-channel spatial audio map", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
-    VisualizerDef { id: 9, name: "Chrome Ferrofluid", filename: "vis_ferrofluid.wgsl", description: "Raymarched liquid metal simulation", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
-    VisualizerDef { id: 10, name: "Ferrofluid Particle Sim", filename: "vis_ferrofluidsim.wgsl", description: "Compute physics droplet simulation", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: true },
-    VisualizerDef { id: 13, name: "Synthwave Terrain", filename: "vis_synthwave.wgsl", description: "Retro 80s wireframe landscape", pipeline_type: PipelineType::Mesh3D { geometry: Geometry::Grid { width: 200, depth: 200 }, instances: 1 }, requires_history: true, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
-    VisualizerDef { id: 14, name: "Synthwave 3D Racer", filename: "vis_synthwave_racer_3d.wgsl", description: "Multi-pass 3D low-poly sports car, highway & infinite horizon sky", pipeline_type: PipelineType::Mesh3D { geometry: Geometry::SynthwaveRacerScene, instances: 1 }, requires_history: true, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
-    VisualizerDef { id: 16, name: "Midnight Storm", filename: "vis_rain.wgsl", description: "Cinematic atmospheric dark sky, falling rain & branching lightning", pipeline_type: PipelineType::FullscreenQuad, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
-    VisualizerDef { id: 19, name: "Retro VU Meters", filename: "vis_vumeters_3d.wgsl", description: "3D vintage Hi-Fi master rack with physical analog needles & warm glow", pipeline_type: PipelineType::Mesh3D { geometry: Geometry::VuMeterRack, instances: 1 }, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
-    VisualizerDef { id: 20, name: "Bioluminescent Waves", filename: "vis_bioluminescence.wgsl", description: "GPU compute-driven bioluminescent particle waves", pipeline_type: PipelineType::Mesh3D { geometry: Geometry::UnitQuad, instances: 65536 }, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
-    VisualizerDef { id: 22, name: "Neon Spatial Room", filename: "vis_neon_room.wgsl", description: "3D interactive spatial listening room with multi-channel speakers", pipeline_type: PipelineType::Mesh3D { geometry: Geometry::NeonRoom, instances: 1 }, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
-    VisualizerDef { id: 23, name: "3D Glass Water Lyrics", filename: "vis_lyrics.wgsl", description: "Chunky 3D glass letters in dark reflective water with kinetic slam & splashes", pipeline_type: PipelineType::Mesh3D { geometry: Geometry::GlassLyricsScene, instances: 1 }, requires_history: false, requires_fire: false, requires_resynth: false, requires_ferrofluidsim: false },
+    VisualizerDef {
+        id: 0,
+        name: "Frequency Spectrum",
+        filename: "vis_spectrum.wgsl",
+        description: "Standard 2D FFT spectrum analyzer",
+        pipeline_type: PipelineType::FullscreenQuad,
+        requires_history: false,
+        requires_fire: false,
+        requires_resynth: false,
+        requires_ferrofluidsim: false,
+    },
+    VisualizerDef {
+        id: 25,
+        name: "Studio LED Spectrum",
+        filename: "vis_spectrum_led.wgsl",
+        description: "Segmented studio LED frequency spectrum with peak hold",
+        pipeline_type: PipelineType::FullscreenQuad,
+        requires_history: false,
+        requires_fire: false,
+        requires_resynth: false,
+        requires_ferrofluidsim: false,
+    },
+    VisualizerDef {
+        id: 24,
+        name: "Retro Tape Head",
+        filename: "vis_tape_head.wgsl",
+        description: "Optical playhead with cathode spark impact & streaming waveform",
+        pipeline_type: PipelineType::FullscreenQuad,
+        requires_history: false,
+        requires_fire: false,
+        requires_resynth: false,
+        requires_ferrofluidsim: false,
+    },
+    VisualizerDef {
+        id: 1,
+        name: "CRT Oscilloscope",
+        filename: "vis_oscilloscope.wgsl",
+        description: "2D glowing CRT wave trace",
+        pipeline_type: PipelineType::FullscreenQuad,
+        requires_history: true,
+        requires_fire: false,
+        requires_resynth: false,
+        requires_ferrofluidsim: false,
+    },
+    VisualizerDef {
+        id: 3,
+        name: "3D Oscilloscope",
+        filename: "vis_3doscilloscope_raster.wgsl",
+        description: "Rasterized 3D waterfall grid of waveform history",
+        pipeline_type: PipelineType::Mesh3D {
+            geometry: Geometry::Grid {
+                width: 256,
+                depth: 143,
+            },
+            instances: 1,
+        },
+        requires_history: true,
+        requires_fire: false,
+        requires_resynth: false,
+        requires_ferrofluidsim: false,
+    },
+    VisualizerDef {
+        id: 4,
+        name: "3D Freq Oscilloscope",
+        filename: "vis_3doscilloscope_freq.wgsl",
+        description: "3D topographical frequency view",
+        pipeline_type: PipelineType::FullscreenQuad,
+        requires_history: false,
+        requires_fire: false,
+        requires_resynth: true,
+        requires_ferrofluidsim: false,
+    },
+    VisualizerDef {
+        id: 5,
+        name: "Retro Fire",
+        filename: "vis_flame.wgsl",
+        description: "Classic DOOM 2D fire simulation with CRT post-processing",
+        pipeline_type: PipelineType::FullscreenQuad,
+        requires_history: false,
+        requires_fire: true,
+        requires_resynth: false,
+        requires_ferrofluidsim: false,
+    },
+    VisualizerDef {
+        id: 6,
+        name: "Fire Simulation",
+        filename: "vis_firesim.wgsl",
+        description: "Multi-channel procedural fire simulation (experimental)",
+        pipeline_type: PipelineType::FullscreenQuad,
+        requires_history: false,
+        requires_fire: true,
+        requires_resynth: false,
+        requires_ferrofluidsim: false,
+    },
+    VisualizerDef {
+        id: 7,
+        name: "Solar Flare",
+        filename: "vis_solar.wgsl",
+        description: "Audio-reactive raymarched sun",
+        pipeline_type: PipelineType::FullscreenQuad,
+        requires_history: true,
+        requires_fire: false,
+        requires_resynth: false,
+        requires_ferrofluidsim: false,
+    },
+    VisualizerDef {
+        id: 8,
+        name: "Spatial Vectors",
+        filename: "vis_spatial.wgsl",
+        description: "Multi-channel spatial audio map",
+        pipeline_type: PipelineType::FullscreenQuad,
+        requires_history: false,
+        requires_fire: false,
+        requires_resynth: false,
+        requires_ferrofluidsim: false,
+    },
+    VisualizerDef {
+        id: 9,
+        name: "Chrome Ferrofluid",
+        filename: "vis_ferrofluid.wgsl",
+        description: "Raymarched liquid metal simulation",
+        pipeline_type: PipelineType::FullscreenQuad,
+        requires_history: false,
+        requires_fire: false,
+        requires_resynth: false,
+        requires_ferrofluidsim: false,
+    },
+    VisualizerDef {
+        id: 10,
+        name: "Ferrofluid Particle Sim",
+        filename: "vis_ferrofluidsim.wgsl",
+        description: "Compute physics droplet simulation",
+        pipeline_type: PipelineType::FullscreenQuad,
+        requires_history: false,
+        requires_fire: false,
+        requires_resynth: false,
+        requires_ferrofluidsim: true,
+    },
+    VisualizerDef {
+        id: 13,
+        name: "Synthwave Terrain",
+        filename: "vis_synthwave.wgsl",
+        description: "Retro 80s wireframe landscape",
+        pipeline_type: PipelineType::Mesh3D {
+            geometry: Geometry::Grid {
+                width: 200,
+                depth: 200,
+            },
+            instances: 1,
+        },
+        requires_history: true,
+        requires_fire: false,
+        requires_resynth: false,
+        requires_ferrofluidsim: false,
+    },
+    VisualizerDef {
+        id: 14,
+        name: "Synthwave 3D Racer",
+        filename: "vis_synthwave_racer_3d.wgsl",
+        description: "Multi-pass 3D low-poly sports car, highway & infinite horizon sky",
+        pipeline_type: PipelineType::Mesh3D {
+            geometry: Geometry::SynthwaveRacerScene,
+            instances: 1,
+        },
+        requires_history: true,
+        requires_fire: false,
+        requires_resynth: false,
+        requires_ferrofluidsim: false,
+    },
+    VisualizerDef {
+        id: 16,
+        name: "Midnight Storm",
+        filename: "vis_rain.wgsl",
+        description: "Cinematic atmospheric dark sky, falling rain & branching lightning",
+        pipeline_type: PipelineType::FullscreenQuad,
+        requires_history: false,
+        requires_fire: false,
+        requires_resynth: false,
+        requires_ferrofluidsim: false,
+    },
+    VisualizerDef {
+        id: 19,
+        name: "Retro VU Meters",
+        filename: "vis_vumeters_3d.wgsl",
+        description: "3D vintage Hi-Fi master rack with physical analog needles & warm glow",
+        pipeline_type: PipelineType::Mesh3D {
+            geometry: Geometry::VuMeterRack,
+            instances: 1,
+        },
+        requires_history: false,
+        requires_fire: false,
+        requires_resynth: false,
+        requires_ferrofluidsim: false,
+    },
+    VisualizerDef {
+        id: 20,
+        name: "Bioluminescent Waves",
+        filename: "vis_bioluminescence.wgsl",
+        description: "GPU compute-driven bioluminescent particle waves",
+        pipeline_type: PipelineType::Mesh3D {
+            geometry: Geometry::UnitQuad,
+            instances: 65536,
+        },
+        requires_history: false,
+        requires_fire: false,
+        requires_resynth: false,
+        requires_ferrofluidsim: false,
+    },
+    VisualizerDef {
+        id: 22,
+        name: "Neon Spatial Room",
+        filename: "vis_neon_room.wgsl",
+        description: "3D interactive spatial listening room with multi-channel speakers",
+        pipeline_type: PipelineType::Mesh3D {
+            geometry: Geometry::NeonRoom,
+            instances: 1,
+        },
+        requires_history: false,
+        requires_fire: false,
+        requires_resynth: false,
+        requires_ferrofluidsim: false,
+    },
+    VisualizerDef {
+        id: 23,
+        name: "3D Glass Water Lyrics",
+        filename: "vis_lyrics.wgsl",
+        description: "Chunky 3D glass letters in dark reflective water with kinetic slam & splashes",
+        pipeline_type: PipelineType::Mesh3D {
+            geometry: Geometry::GlassLyricsScene,
+            instances: 1,
+        },
+        requires_history: false,
+        requires_fire: false,
+        requires_resynth: false,
+        requires_ferrofluidsim: false,
+    },
 ];
 
 #[derive(Clone, Debug, PartialEq)]
@@ -293,7 +519,7 @@ impl AppState {
         for _ in 0..120 {
             history.push_back(vec![0.0; 1024]);
         }
-        
+
         let mut wave_history = VecDeque::new();
         for _ in 0..60 {
             wave_history.push_back(vec![0.0; 1024]);
@@ -304,7 +530,7 @@ impl AppState {
             .unwrap_or(false);
 
         let mut vis_enabled = vec![true; VISUALIZERS.len()];
-        
+
         // Solar Flare (ID 7): disabled on all systems due to computational cost and visual quality
         if let Some(idx) = VISUALIZERS.iter().position(|v| v.id == 7) {
             vis_enabled[idx] = false;
@@ -322,9 +548,9 @@ impl AppState {
             // Disable heavy pixel-loop raymarched oscilloscopes and problematic/redundant shaders on mobile
             let mobile_disabled_ids = [
                 1,  // CRT Oscilloscope (23.8ms on mobile)
-                2,  // 3D CRT Oscilloscope (38.2ms on mobile -> replaced by 3D Oscilloscope Raster at 178 FPS)
-                4,  // 3D Freq Oscilloscope (23.3ms on mobile)
-                9,  // Chrome Ferrofluid (raymarched liquid metal is too heavy for mobile GPUs and drains battery)
+                2, // 3D CRT Oscilloscope (38.2ms on mobile -> replaced by 3D Oscilloscope Raster at 178 FPS)
+                4, // 3D Freq Oscilloscope (23.3ms on mobile)
+                9, // Chrome Ferrofluid (raymarched liquid metal is too heavy for mobile GPUs and drains battery)
                 10, // Ferrofluid Particle Sim
                 11, // Neon Corridor
                 12, // Lissajous Laser
@@ -353,12 +579,13 @@ impl AppState {
                 }
             }
         }
-        
+
         let mut url_history = Vec::new();
         if let Ok(data) = std::fs::read_to_string(get_history_file_path()) {
             for line in data.lines() {
                 if let Some((url, title)) = line.split_once('|')
-                    && !url_history.iter().any(|(u, _)| u == url) {
+                    && !url_history.iter().any(|(u, _)| u == url)
+                {
                     url_history.push((url.to_string(), title.to_string()));
                 }
             }
@@ -446,7 +673,11 @@ impl AppState {
             force_stereo_downmix: is_steam_deck,
             append_to_playlist: false,
             panel_split_ratio: 0.5,
-            gamepad_type: if is_steam_deck { GamepadType::SteamDeck } else { GamepadType::Xbox },
+            gamepad_type: if is_steam_deck {
+                GamepadType::SteamDeck
+            } else {
+                GamepadType::Xbox
+            },
             has_gamepad: is_steam_deck,
             show_vis_picker: false,
             vis_picker_cursor: 0,
@@ -468,7 +699,7 @@ impl AppState {
             mobile_hud_tab: MobileHudTab::default(),
         }
     }
-    
+
     /// Create a lightweight clone for the render pass, skipping heavy audio data fields
     /// that are only consumed by engine.update() (which runs under the mutex lock).
     /// This saves ~1.3 MB of deep copies per frame vs a full .clone().
@@ -502,15 +733,15 @@ impl AppState {
             raw_spectrum_data: Vec::new(),
             spectrum_data: self.spectrum_data.clone(),
             spectrum_peaks: self.spectrum_peaks.clone(),
-            spectrum_history: VecDeque::new(),     // Skipped in snapshot (only used for HUD background heatmap)
-            waveform_history: VecDeque::new(),     // Skipped in snapshot
+            spectrum_history: VecDeque::new(), // Skipped in snapshot (only used for HUD background heatmap)
+            waveform_history: VecDeque::new(), // Skipped in snapshot
             waveform_history_push_count: 0,
             raw_waveform: Vec::new(),
             raw_audio_channels: Vec::new(),
             gpu_spectrum_data: Vec::new(),
-            fire_heat: Vec::new(),                 // Only used in engine.update() (under lock)
-            lookahead_timeline: Vec::new(),        // Only used in engine.update() (under lock)
-            lookahead_queue: VecDeque::new(),       // Only used under lock
+            fire_heat: Vec::new(), // Only used in engine.update() (under lock)
+            lookahead_timeline: Vec::new(), // Only used in engine.update() (under lock)
+            lookahead_queue: VecDeque::new(), // Only used under lock
             lookahead_sample_buffer: Vec::new(),
             lookahead_buffer_start_time: 0.0,
             show_hud: self.show_hud,

@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+
+permissions:
+  contents: read
+
+jobs:
+  check-format-clippy-test:
+    name: Code Quality & Test Suite
+    runs-on: ubuntu-latest
+    container:
+      image: fedora:latest
+
+    steps:
+      - name: Install Git
+        run: |
+          dnf update -y
+          dnf install -y git
+
+      - uses: actions/checkout@v5
+
+      - name: Install System Dependencies
+        run: |
+          dnf install -y https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm
+          dnf install -y gcc gcc-c++ binutils pkgconfig alsa-lib-devel wayland-devel libX11-devel libxkbcommon-devel systemd-devel ffmpeg-devel libopenmpt-devel clang clang-devel
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable --component rustfmt,clippy
+          source "$HOME/.cargo/env"
+          rustc --version
+          cargo --version
+
+      - name: Check Formatting
+        run: |
+          source "$HOME/.cargo/env"
+          cargo fmt --check
+
+      - name: Clippy Lint Check
+        run: |
+          source "$HOME/.cargo/env"
+          cargo clippy --all-targets -- -D warnings
+
+      - name: Validate WGSL Shaders
+        run: |
+          source "$HOME/.cargo/env"
+          cargo run --bin validate_wgsl
+
+      - name: Run Unit & Integration Tests
+        run: |
+          source "$HOME/.cargo/env"
+          cargo test --lib
+          cargo test --test test_audio_rs
+          cargo test --test test_multitrack
+          cargo test --test test_symphonia

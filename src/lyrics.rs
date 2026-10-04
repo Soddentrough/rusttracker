@@ -40,12 +40,12 @@ impl Lyrics {
             while remaining.starts_with('[') {
                 if let Some(close_bracket) = remaining.find(']') {
                     let tag_content = &remaining[1..close_bracket].trim();
-                    
+
                     // Check if it's a metadata tag (e.g., [ti:Song Title], [ar:Artist], [offset:500])
                     if let Some((key, val)) = tag_content.split_once(':') {
                         let key = key.trim().to_lowercase();
                         let val = val.trim();
-                        
+
                         match key.as_str() {
                             "ti" => title = Some(val.to_string()),
                             "ar" => artist = Some(val.to_string()),
@@ -94,7 +94,11 @@ impl Lyrics {
         }
 
         // Sort lines chronologically
-        lines.sort_by(|a, b| a.time_seconds.partial_cmp(&b.time_seconds).unwrap_or(std::cmp::Ordering::Equal));
+        lines.sort_by(|a, b| {
+            a.time_seconds
+                .partial_cmp(&b.time_seconds)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
 
         Some(Lyrics {
             file_name: None,
@@ -116,12 +120,15 @@ impl Lyrics {
         }
 
         match self.lines.binary_search_by(|line| {
-            line.time_seconds.partial_cmp(&current_time).unwrap_or(std::cmp::Ordering::Equal)
+            line.time_seconds
+                .partial_cmp(&current_time)
+                .unwrap_or(std::cmp::Ordering::Equal)
         }) {
             Ok(exact) => {
                 // If there are multiple identical timestamps, return the last one
                 let mut idx = exact;
-                while idx + 1 < self.lines.len() && self.lines[idx + 1].time_seconds <= current_time {
+                while idx + 1 < self.lines.len() && self.lines[idx + 1].time_seconds <= current_time
+                {
                     idx += 1;
                 }
                 Some(idx)
@@ -161,7 +168,10 @@ fn parse_time_tag(tag: &str) -> Option<f64> {
 
             if p3_str.contains('.') || p3_str.contains(',') {
                 // Definitely [hh:mm:ss.frac]
-                let (sec_str, frac_str) = p3_str.split_once('.').or_else(|| p3_str.split_once(',')).unwrap();
+                let (sec_str, frac_str) = p3_str
+                    .split_once('.')
+                    .or_else(|| p3_str.split_once(','))
+                    .unwrap();
                 let seconds: f64 = sec_str.parse().ok()?;
                 let frac: f64 = format!("0.{}", frac_str).parse().unwrap_or(0.0);
                 Some(p1 * 3600.0 + p2 * 60.0 + seconds + frac)
@@ -238,8 +248,11 @@ pub fn normalize_path_str(raw: &str) -> String {
     let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == b'%' && i + 2 < bytes.len()
-            && let Ok(val) = u8::from_str_radix(std::str::from_utf8(&bytes[i+1..i+3]).unwrap_or(""), 16) {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let Ok(val) =
+                u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
+        {
             decoded.push(val as char);
             i += 3;
             continue;
@@ -253,7 +266,16 @@ pub fn normalize_path_str(raw: &str) -> String {
 fn clean_song_stem(stem: &str) -> String {
     let mut s = stem.to_lowercase();
     s = s.replace(['_', '-', '.'], " ");
-    for tag in &["(instrumental)", "(vocals)", "(karaoke)", "(official)", "[flac]", "[mp3]", "(audio)", "(lyrics)"] {
+    for tag in &[
+        "(instrumental)",
+        "(vocals)",
+        "(karaoke)",
+        "(official)",
+        "[flac]",
+        "[mp3]",
+        "(audio)",
+        "(lyrics)",
+    ] {
         s = s.replace(tag, "");
     }
     s.retain(|c| c.is_alphanumeric() || c.is_whitespace());
@@ -304,7 +326,7 @@ pub fn find_sidecar_lrc_path(audio_path: &str) -> Option<PathBuf> {
     if let (Some(parent), Some(stem)) = (path.parent(), path.file_stem()) {
         let stem_raw = stem.to_string_lossy();
         let stem_clean = clean_song_stem(&stem_raw);
-        
+
         let search_dirs = [
             parent.to_path_buf(),
             parent.join("lyrics"),
@@ -316,17 +338,23 @@ pub fn find_sidecar_lrc_path(audio_path: &str) -> Option<PathBuf> {
                 for entry in entries.flatten() {
                     let entry_path = entry.path();
                     if entry_path.is_file()
-                        && entry_path.extension().is_some_and(|ext| ext.eq_ignore_ascii_case("lrc"))
-                        && let Some(entry_stem) = entry_path.file_stem() {
+                        && entry_path
+                            .extension()
+                            .is_some_and(|ext| ext.eq_ignore_ascii_case("lrc"))
+                        && let Some(entry_stem) = entry_path.file_stem()
+                    {
                         let entry_stem_raw = entry_stem.to_string_lossy();
-                                    let entry_stem_clean = clean_song_stem(&entry_stem_raw);
-                                    if entry_stem_raw.eq_ignore_ascii_case(&stem_raw)
-                                        || (!stem_clean.is_empty() && entry_stem_clean == stem_clean)
-                                        || (!stem_clean.is_empty() && !entry_stem_clean.is_empty() && (stem_clean.starts_with(&entry_stem_clean) || entry_stem_clean.starts_with(&stem_clean)))
-                                    {
-                                        return Some(entry_path);
-                                    }
-                                }
+                        let entry_stem_clean = clean_song_stem(&entry_stem_raw);
+                        if entry_stem_raw.eq_ignore_ascii_case(&stem_raw)
+                            || (!stem_clean.is_empty() && entry_stem_clean == stem_clean)
+                            || (!stem_clean.is_empty()
+                                && !entry_stem_clean.is_empty()
+                                && (stem_clean.starts_with(&entry_stem_clean)
+                                    || entry_stem_clean.starts_with(&stem_clean)))
+                        {
+                            return Some(entry_path);
+                        }
+                    }
                 }
             }
         }
@@ -340,7 +368,9 @@ pub fn load_lyrics_for_file(audio_path: &str) -> Option<Lyrics> {
     let lrc_path = find_sidecar_lrc_path(audio_path)?;
     let content = fs::read_to_string(&lrc_path).ok()?;
     let mut lyrics = Lyrics::parse(&content)?;
-    lyrics.file_name = lrc_path.file_name().map(|f| f.to_string_lossy().into_owned());
+    lyrics.file_name = lrc_path
+        .file_name()
+        .map(|f| f.to_string_lossy().into_owned());
     Some(lyrics)
 }
 
@@ -367,7 +397,10 @@ mod tests {
         assert_eq!(lyrics.lines.len(), 5);
 
         assert!((lyrics.lines[0].time_seconds - 21.06).abs() < 1e-4);
-        assert_eq!(lyrics.lines[0].text, "I wanna take you somewhere so you know I care");
+        assert_eq!(
+            lyrics.lines[0].text,
+            "I wanna take you somewhere so you know I care"
+        );
 
         assert!((lyrics.lines[3].time_seconds - 94.83).abs() < 1e-4);
         assert_eq!(lyrics.lines[3].text, "");
@@ -434,7 +467,8 @@ mod tests {
 
     #[test]
     fn test_karaoke_directory_sidecar_loading() {
-        let temp_dir = std::env::temp_dir().join(format!("rusttracker_test_{}", std::process::id()));
+        let temp_dir =
+            std::env::temp_dir().join(format!("rusttracker_test_{}", std::process::id()));
         let _ = fs::create_dir_all(&temp_dir);
         let flac_path = temp_dir.join("Test Artist - Test Song (Karaoke).flac");
         let lrc_path = temp_dir.join("Test Artist - Test Song.lrc");
@@ -442,7 +476,10 @@ mod tests {
         let _ = fs::write(&lrc_path, "[00:10.00] Test line\n[00:20.00] Second line\n");
 
         let lyrics = load_lyrics_for_file(&flac_path.to_string_lossy());
-        assert!(lyrics.is_some(), "Failed to load sidecar lyrics for temp file");
+        assert!(
+            lyrics.is_some(),
+            "Failed to load sidecar lyrics for temp file"
+        );
         let lyrics = lyrics.unwrap();
         assert_eq!(lyrics.lines.len(), 2);
         assert_eq!(lyrics.lines[0].text, "Test line");

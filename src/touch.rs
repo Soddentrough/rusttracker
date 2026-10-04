@@ -117,7 +117,10 @@ impl TouchGestureController {
                 if self.max_touch_count >= 2 {
                     if remaining == 0 {
                         let count = self.max_touch_count;
-                        let dt = self.multi_finger_start_time.map(|t| t.elapsed().as_secs_f32()).unwrap_or(1.0);
+                        let dt = self
+                            .multi_finger_start_time
+                            .map(|t| t.elapsed().as_secs_f32())
+                            .unwrap_or(1.0);
                         self.max_touch_count = 0;
                         self.multi_finger_start_time = None;
                         self.touch_start_pos = None;
@@ -137,7 +140,9 @@ impl TouchGestureController {
                 }
 
                 self.max_touch_count = remaining;
-                let (Some((start_x, start_y)), Some(start_time)) = (self.touch_start_pos, self.touch_start_time) else {
+                let (Some((start_x, start_y)), Some(start_time)) =
+                    (self.touch_start_pos, self.touch_start_time)
+                else {
                     return None;
                 };
 
@@ -203,9 +208,13 @@ impl TouchGestureController {
                 // Check for tap gestures (moved < 25px in < 250ms)
                 if dist < 25.0 && dt < 0.25 {
                     let now = Instant::now();
-                    if let (Some(last_time), Some((lx, ly))) = (self.last_tap_time, self.last_tap_pos) {
+                    if let (Some(last_time), Some((lx, ly))) =
+                        (self.last_tap_time, self.last_tap_pos)
+                    {
                         let tap_dist = ((x - lx).powi(2) + (y - ly).powi(2)).sqrt();
-                        if now.duration_since(last_time) < Duration::from_millis(250) && tap_dist < 35.0 {
+                        if now.duration_since(last_time) < Duration::from_millis(250)
+                            && tap_dist < 35.0
+                        {
                             self.last_tap_time = None;
                             self.last_tap_pos = None;
                             self.pending_single_tap = None;
@@ -235,7 +244,8 @@ impl TouchGestureController {
     /// Check if a pending single tap has expired
     pub fn update_pending_tap(&mut self) -> Option<TouchGesture> {
         if let Some(((x, y), tap_time)) = self.pending_single_tap
-            && tap_time.elapsed() >= Duration::from_millis(250) {
+            && tap_time.elapsed() >= Duration::from_millis(250)
+        {
             self.pending_single_tap = None;
             return Some(TouchGesture::SingleTap { x, y });
         }
@@ -263,10 +273,34 @@ mod tests {
         let mut controller = TouchGestureController::new();
 
         // 2-finger tap
-        controller.handle_touch(&make_touch(TouchPhase::Started, 0, 300.0, 500.0), 1080.0, 2400.0, true, 1200.0);
-        controller.handle_touch(&make_touch(TouchPhase::Started, 1, 600.0, 500.0), 1080.0, 2400.0, true, 1200.0);
-        controller.handle_touch(&make_touch(TouchPhase::Ended, 0, 300.0, 500.0), 1080.0, 2400.0, true, 1200.0);
-        let g1 = controller.handle_touch(&make_touch(TouchPhase::Ended, 1, 600.0, 500.0), 1080.0, 2400.0, true, 1200.0);
+        controller.handle_touch(
+            &make_touch(TouchPhase::Started, 0, 300.0, 500.0),
+            1080.0,
+            2400.0,
+            true,
+            1200.0,
+        );
+        controller.handle_touch(
+            &make_touch(TouchPhase::Started, 1, 600.0, 500.0),
+            1080.0,
+            2400.0,
+            true,
+            1200.0,
+        );
+        controller.handle_touch(
+            &make_touch(TouchPhase::Ended, 0, 300.0, 500.0),
+            1080.0,
+            2400.0,
+            true,
+            1200.0,
+        );
+        let g1 = controller.handle_touch(
+            &make_touch(TouchPhase::Ended, 1, 600.0, 500.0),
+            1080.0,
+            2400.0,
+            true,
+            1200.0,
+        );
         assert_eq!(g1, Some(TouchGesture::TwoFingerTap));
     }
 
@@ -275,12 +309,48 @@ mod tests {
         let mut controller = TouchGestureController::new();
 
         // 3-finger tap
-        controller.handle_touch(&make_touch(TouchPhase::Started, 0, 200.0, 500.0), 1080.0, 2400.0, true, 1200.0);
-        controller.handle_touch(&make_touch(TouchPhase::Started, 1, 500.0, 500.0), 1080.0, 2400.0, true, 1200.0);
-        controller.handle_touch(&make_touch(TouchPhase::Started, 2, 800.0, 500.0), 1080.0, 2400.0, true, 1200.0);
-        controller.handle_touch(&make_touch(TouchPhase::Ended, 0, 200.0, 500.0), 1080.0, 2400.0, true, 1200.0);
-        controller.handle_touch(&make_touch(TouchPhase::Ended, 1, 500.0, 500.0), 1080.0, 2400.0, true, 1200.0);
-        let g = controller.handle_touch(&make_touch(TouchPhase::Ended, 2, 800.0, 500.0), 1080.0, 2400.0, true, 1200.0);
+        controller.handle_touch(
+            &make_touch(TouchPhase::Started, 0, 200.0, 500.0),
+            1080.0,
+            2400.0,
+            true,
+            1200.0,
+        );
+        controller.handle_touch(
+            &make_touch(TouchPhase::Started, 1, 500.0, 500.0),
+            1080.0,
+            2400.0,
+            true,
+            1200.0,
+        );
+        controller.handle_touch(
+            &make_touch(TouchPhase::Started, 2, 800.0, 500.0),
+            1080.0,
+            2400.0,
+            true,
+            1200.0,
+        );
+        controller.handle_touch(
+            &make_touch(TouchPhase::Ended, 0, 200.0, 500.0),
+            1080.0,
+            2400.0,
+            true,
+            1200.0,
+        );
+        controller.handle_touch(
+            &make_touch(TouchPhase::Ended, 1, 500.0, 500.0),
+            1080.0,
+            2400.0,
+            true,
+            1200.0,
+        );
+        let g = controller.handle_touch(
+            &make_touch(TouchPhase::Ended, 2, 800.0, 500.0),
+            1080.0,
+            2400.0,
+            true,
+            1200.0,
+        );
         assert_eq!(g, Some(TouchGesture::ThreeFingerTap));
     }
 
@@ -289,13 +359,37 @@ mod tests {
         let mut controller = TouchGestureController::new();
 
         // Swipe up in top pane (start y=500, end y=300 < split_y=1200)
-        controller.handle_touch(&make_touch(TouchPhase::Started, 0, 500.0, 500.0), 1080.0, 2400.0, true, 1200.0);
-        let g = controller.handle_touch(&make_touch(TouchPhase::Ended, 0, 500.0, 300.0), 1080.0, 2400.0, true, 1200.0);
+        controller.handle_touch(
+            &make_touch(TouchPhase::Started, 0, 500.0, 500.0),
+            1080.0,
+            2400.0,
+            true,
+            1200.0,
+        );
+        let g = controller.handle_touch(
+            &make_touch(TouchPhase::Ended, 0, 500.0, 300.0),
+            1080.0,
+            2400.0,
+            true,
+            1200.0,
+        );
         assert_eq!(g, Some(TouchGesture::TopPaneSwipeUp));
 
         // Swipe down in top pane (start y=300, end y=500 < split_y=1200)
-        controller.handle_touch(&make_touch(TouchPhase::Started, 0, 500.0, 300.0), 1080.0, 2400.0, true, 1200.0);
-        let g_down = controller.handle_touch(&make_touch(TouchPhase::Ended, 0, 500.0, 500.0), 1080.0, 2400.0, true, 1200.0);
+        controller.handle_touch(
+            &make_touch(TouchPhase::Started, 0, 500.0, 300.0),
+            1080.0,
+            2400.0,
+            true,
+            1200.0,
+        );
+        let g_down = controller.handle_touch(
+            &make_touch(TouchPhase::Ended, 0, 500.0, 500.0),
+            1080.0,
+            2400.0,
+            true,
+            1200.0,
+        );
         assert_eq!(g_down, Some(TouchGesture::TopPaneSwipeDown));
     }
 }

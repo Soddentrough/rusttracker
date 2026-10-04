@@ -1,7 +1,7 @@
+use crate::state::AppState;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use winit::window::Window;
-use crate::state::AppState;
 
 fn gamepad_icon(g_type: crate::state::GamepadType, action: &str) -> String {
     match action {
@@ -40,7 +40,8 @@ fn gamepad_icon(g_type: crate::state::GamepadType, action: &str) -> String {
         "D-Pad L/R" => "\u{e9af} \u{e9ad}",
         "D-Pad U/D" => "\u{e9ac} \u{e9ae}",
         _ => action,
-    }.to_string()
+    }
+    .to_string()
 }
 
 #[derive(Clone, PartialEq)]
@@ -114,8 +115,6 @@ pub struct AudioUniforms {
     pub _pad2: f32,
     pub _pad3: f32,
 }
-
-
 
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
@@ -228,11 +227,11 @@ pub struct VulkanEngine {
     query_set: Option<wgpu::QuerySet>,
     query_resolve_buffer: Option<wgpu::Buffer>,
     query_read_buffer: Option<wgpu::Buffer>,
-    
+
     pub meters_uv_rect: [f32; 4],
     pub heatmap_uv_rect: [f32; 4],
     pub fire_uv_rect: [f32; 4],
-    
+
     // GPU compute fire simulation
     #[allow(dead_code)] // preserved for standalone GPU fire compute / testing
     fire_compute_pipeline: wgpu::ComputePipeline,
@@ -245,19 +244,19 @@ pub struct VulkanEngine {
     fire_bind_group_a: wgpu::BindGroup, // reads A, writes B
     fire_bind_group_b: wgpu::BindGroup, // reads B, writes A
     fire_ping: bool,
-    
+
     // Authentic DOOM Fire simulation state (visualizer ID 5: Retro Fire)
     retro_fire_cells: Box<[u8; 320 * 180]>,
     retro_fire_upload: Vec<f32>,
     retro_fire_rng: u32,
-    
+
     pub heatmap_row: u32,
     heatmap_compute_pipeline: wgpu::ComputePipeline,
     heatmap_bind_group: wgpu::BindGroup,
     ferrofluidsim_compute_pipeline: wgpu::ComputePipeline,
     ferrofluidsim_clear_pipeline: wgpu::ComputePipeline,
     ferrofluidsim_bind_group: wgpu::BindGroup,
-    
+
     // GPU compute bioluminescent waves simulation
     #[allow(dead_code)]
     biolum_particles_buffer: wgpu::Buffer,
@@ -275,18 +274,18 @@ pub struct VulkanEngine {
     resynth_compute_pipeline: wgpu::ComputePipeline,
     resynth_bind_group: wgpu::BindGroup,
     _gpu_spectrum_buffer: wgpu::Buffer,
-    
+
     // Neon Smoke Cache
     smoke_compute_pipeline: wgpu::ComputePipeline,
     smoke_compute_bind_group: wgpu::BindGroup,
     smoke_render_bind_group: wgpu::BindGroup,
     smoke_params_buffer: wgpu::Buffer,
-    
+
     depth_texture_view: wgpu::TextureView,
-    
+
     // Pre-allocated buffers to avoid per-frame heap allocations
     waveform_history_flat: Vec<f32>,
-    
+
     // Video
     video_bind_group_layout: wgpu::BindGroupLayout,
     video_pipeline: wgpu::RenderPipeline,
@@ -298,7 +297,7 @@ pub struct VulkanEngine {
     vumeters_bg_pipeline: wgpu::RenderPipeline,
     neon_bg_pipeline: wgpu::RenderPipeline,
     storm_sky_pipeline: wgpu::RenderPipeline,
-    
+
     // 3D Engine Extensions
     camera_uniform_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
@@ -330,31 +329,35 @@ pub struct VulkanEngine {
 pub(crate) fn generate_lamp_mesh() -> (Vec<Vertex>, Vec<u32>) {
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
-    
+
     // Helper to add a box
     let mut add_box = |center: [f32; 3], size: [f32; 3], color_flag: f32| {
         let half_x = size[0] / 2.0;
         let half_y = size[1] / 2.0;
         let half_z = size[2] / 2.0;
-        
+
         let local_verts = [
             // front
-            [-half_x, -half_y,  half_z], [ half_x, -half_y,  half_z],
-            [ half_x,  half_y,  half_z], [-half_x,  half_y,  half_z],
+            [-half_x, -half_y, half_z],
+            [half_x, -half_y, half_z],
+            [half_x, half_y, half_z],
+            [-half_x, half_y, half_z],
             // back
-            [-half_x, -half_y, -half_z], [-half_x,  half_y, -half_z],
-            [ half_x,  half_y, -half_z], [ half_x, -half_y, -half_z],
+            [-half_x, -half_y, -half_z],
+            [-half_x, half_y, -half_z],
+            [half_x, half_y, -half_z],
+            [half_x, -half_y, -half_z],
         ];
-        
+
         let normals = [
-            [0.0, 0.0, 1.0],   // front
-            [0.0, 0.0, -1.0],  // back
-            [-1.0, 0.0, 0.0],  // left
-            [1.0, 0.0, 0.0],   // right
-            [0.0, 1.0, 0.0],   // top
-            [0.0, -1.0, 0.0],  // bottom
+            [0.0, 0.0, 1.0],  // front
+            [0.0, 0.0, -1.0], // back
+            [-1.0, 0.0, 0.0], // left
+            [1.0, 0.0, 0.0],  // right
+            [0.0, 1.0, 0.0],  // top
+            [0.0, -1.0, 0.0], // bottom
         ];
-        
+
         let face_indices = [
             [0, 1, 2, 0, 2, 3], // front
             [4, 5, 6, 4, 6, 7], // back
@@ -363,12 +366,12 @@ pub(crate) fn generate_lamp_mesh() -> (Vec<Vertex>, Vec<u32>) {
             [3, 2, 6, 3, 6, 5], // top
             [4, 7, 1, 4, 1, 0], // bottom
         ];
-        
+
         // Add vertices and indices for each face to have clean normals
         for (face_idx, &_indices_map) in face_indices.iter().enumerate() {
             let start_v = vertices.len() as u32;
             let normal = normals[face_idx];
-            
+
             let unique_vert_indices = match face_idx {
                 0 => [0, 1, 2, 3], // front
                 1 => [4, 5, 6, 7], // back
@@ -378,7 +381,7 @@ pub(crate) fn generate_lamp_mesh() -> (Vec<Vertex>, Vec<u32>) {
                 5 => [4, 7, 1, 0], // bottom
                 _ => unreachable!(),
             };
-            
+
             for &vi in &unique_vert_indices {
                 let p = local_verts[vi];
                 vertices.push(Vertex {
@@ -387,7 +390,7 @@ pub(crate) fn generate_lamp_mesh() -> (Vec<Vertex>, Vec<u32>) {
                     tex_coords: [color_flag, (p[1] + center[1]) / 11.0],
                 });
             }
-            
+
             indices.push(start_v);
             indices.push(start_v + 1);
             indices.push(start_v + 2);
@@ -396,34 +399,68 @@ pub(crate) fn generate_lamp_mesh() -> (Vec<Vertex>, Vec<u32>) {
             indices.push(start_v + 3);
         }
     };
-    
+
     // 1. Pole: Vertical box
     add_box([0.0, 5.5, 0.0], [0.24, 11.0, 0.24], 0.0);
-    
+
     // 2. Overhang arm: Horizontal box
     // Extends by 2.0 units in +X direction (towards road)
     add_box([1.0, 11.0, 0.0], [2.0, 0.2, 0.2], 0.0);
-    
+
     // 3. Lamp Fitting/Head: Box at the end of overhang
     add_box([2.0, 10.8, 0.0], [0.8, 0.3, 0.5], 2.0); // Flag 2.0 for fixture
-    
+
     // 4. Lamp Bulb/Emissive source: Smaller glowing box underneath the fitting
     add_box([2.0, 10.6, 0.0], [0.4, 0.1, 0.3], 1.0); // Flag 1.0 for emissive bulb
-    
+
     (vertices, indices)
 }
 
 #[allow(clippy::too_many_arguments)]
-fn room_add_quad(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>, p0: [f32; 3], p1: [f32; 3], p2: [f32; 3], p3: [f32; 3], normal: [f32; 3], ch: f32, mat: f32) {
+fn room_add_quad(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    p0: [f32; 3],
+    p1: [f32; 3],
+    p2: [f32; 3],
+    p3: [f32; 3],
+    normal: [f32; 3],
+    ch: f32,
+    mat: f32,
+) {
     let start = vertices.len() as u32;
-    vertices.push(Vertex { position: p0, normal, tex_coords: [ch, mat] });
-    vertices.push(Vertex { position: p1, normal, tex_coords: [ch, mat] });
-    vertices.push(Vertex { position: p2, normal, tex_coords: [ch, mat] });
-    vertices.push(Vertex { position: p3, normal, tex_coords: [ch, mat] });
+    vertices.push(Vertex {
+        position: p0,
+        normal,
+        tex_coords: [ch, mat],
+    });
+    vertices.push(Vertex {
+        position: p1,
+        normal,
+        tex_coords: [ch, mat],
+    });
+    vertices.push(Vertex {
+        position: p2,
+        normal,
+        tex_coords: [ch, mat],
+    });
+    vertices.push(Vertex {
+        position: p3,
+        normal,
+        tex_coords: [ch, mat],
+    });
     indices.extend_from_slice(&[start, start + 1, start + 2, start, start + 2, start + 3]);
 }
 
-fn room_add_box(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>, center: [f32; 3], size: [f32; 3], rot_y: f32, ch: f32, mat: f32) {
+fn room_add_box(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    center: [f32; 3],
+    size: [f32; 3],
+    rot_y: f32,
+    ch: f32,
+    mat: f32,
+) {
     let hx = size[0] / 2.0;
     let hy = size[1] / 2.0;
     let hz = size[2] / 2.0;
@@ -443,44 +480,89 @@ fn room_add_box(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>, center: [f32
 
     // Front face (+z)
     room_add_quad(
-        vertices, indices,
-        rotate_pt([-hx, -hy, hz]), rotate_pt([hx, -hy, hz]), rotate_pt([hx, hy, hz]), rotate_pt([-hx, hy, hz]),
-        rotate_norm([0.0, 0.0, 1.0]), ch, mat
+        vertices,
+        indices,
+        rotate_pt([-hx, -hy, hz]),
+        rotate_pt([hx, -hy, hz]),
+        rotate_pt([hx, hy, hz]),
+        rotate_pt([-hx, hy, hz]),
+        rotate_norm([0.0, 0.0, 1.0]),
+        ch,
+        mat,
     );
     // Back face (-z)
     room_add_quad(
-        vertices, indices,
-        rotate_pt([hx, -hy, -hz]), rotate_pt([-hx, -hy, -hz]), rotate_pt([-hx, hy, -hz]), rotate_pt([hx, hy, -hz]),
-        rotate_norm([0.0, 0.0, -1.0]), ch, mat
+        vertices,
+        indices,
+        rotate_pt([hx, -hy, -hz]),
+        rotate_pt([-hx, -hy, -hz]),
+        rotate_pt([-hx, hy, -hz]),
+        rotate_pt([hx, hy, -hz]),
+        rotate_norm([0.0, 0.0, -1.0]),
+        ch,
+        mat,
     );
     // Left face (-x)
     room_add_quad(
-        vertices, indices,
-        rotate_pt([-hx, -hy, -hz]), rotate_pt([-hx, -hy, hz]), rotate_pt([-hx, hy, hz]), rotate_pt([-hx, hy, -hz]),
-        rotate_norm([-1.0, 0.0, 0.0]), ch, mat
+        vertices,
+        indices,
+        rotate_pt([-hx, -hy, -hz]),
+        rotate_pt([-hx, -hy, hz]),
+        rotate_pt([-hx, hy, hz]),
+        rotate_pt([-hx, hy, -hz]),
+        rotate_norm([-1.0, 0.0, 0.0]),
+        ch,
+        mat,
     );
     // Right face (+x)
     room_add_quad(
-        vertices, indices,
-        rotate_pt([hx, -hy, hz]), rotate_pt([hx, -hy, -hz]), rotate_pt([hx, hy, -hz]), rotate_pt([hx, hy, hz]),
-        rotate_norm([1.0, 0.0, 0.0]), ch, mat
+        vertices,
+        indices,
+        rotate_pt([hx, -hy, hz]),
+        rotate_pt([hx, -hy, -hz]),
+        rotate_pt([hx, hy, -hz]),
+        rotate_pt([hx, hy, hz]),
+        rotate_norm([1.0, 0.0, 0.0]),
+        ch,
+        mat,
     );
     // Top face (+y)
     room_add_quad(
-        vertices, indices,
-        rotate_pt([-hx, hy, hz]), rotate_pt([hx, hy, hz]), rotate_pt([hx, hy, -hz]), rotate_pt([-hx, hy, -hz]),
-        rotate_norm([0.0, 1.0, 0.0]), ch, mat
+        vertices,
+        indices,
+        rotate_pt([-hx, hy, hz]),
+        rotate_pt([hx, hy, hz]),
+        rotate_pt([hx, hy, -hz]),
+        rotate_pt([-hx, hy, -hz]),
+        rotate_norm([0.0, 1.0, 0.0]),
+        ch,
+        mat,
     );
     // Bottom face (-y)
     room_add_quad(
-        vertices, indices,
-        rotate_pt([-hx, -hy, -hz]), rotate_pt([hx, -hy, -hz]), rotate_pt([hx, -hy, hz]), rotate_pt([-hx, -hy, hz]),
-        rotate_norm([0.0, -1.0, 0.0]), ch, mat
+        vertices,
+        indices,
+        rotate_pt([-hx, -hy, -hz]),
+        rotate_pt([hx, -hy, -hz]),
+        rotate_pt([hx, -hy, hz]),
+        rotate_pt([-hx, -hy, hz]),
+        rotate_norm([0.0, -1.0, 0.0]),
+        ch,
+        mat,
     );
 }
 
 #[allow(clippy::too_many_arguments)]
-fn room_add_cone(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>, center: [f32; 3], radius: f32, depth: f32, rot_y: f32, ch: f32, mat: f32) {
+fn room_add_cone(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    center: [f32; 3],
+    radius: f32,
+    depth: f32,
+    rot_y: f32,
+    ch: f32,
+    mat: f32,
+) {
     let segs = 14;
     let cos_r = rot_y.cos();
     let sin_r = rot_y.sin();
@@ -504,9 +586,21 @@ fn room_add_cone(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>, center: [f3
 
         let n = rotate_norm([0.0, 0.0, 1.0]);
         let start = vertices.len() as u32;
-        vertices.push(Vertex { position: apex, normal: n, tex_coords: [ch, mat] });
-        vertices.push(Vertex { position: p0, normal: n, tex_coords: [ch, mat] });
-        vertices.push(Vertex { position: p1, normal: n, tex_coords: [ch, mat] });
+        vertices.push(Vertex {
+            position: apex,
+            normal: n,
+            tex_coords: [ch, mat],
+        });
+        vertices.push(Vertex {
+            position: p0,
+            normal: n,
+            tex_coords: [ch, mat],
+        });
+        vertices.push(Vertex {
+            position: p1,
+            normal: n,
+            tex_coords: [ch, mat],
+        });
         indices.extend_from_slice(&[start, start + 1, start + 2]);
 
         // Emissive halo ring
@@ -517,10 +611,25 @@ fn room_add_cone(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>, center: [f3
     }
 }
 
-fn room_add_speaker_tower(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>, pos: [f32; 3], rot_y: f32, ch: f32, is_tower: bool) {
+fn room_add_speaker_tower(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    pos: [f32; 3],
+    rot_y: f32,
+    ch: f32,
+    is_tower: bool,
+) {
     if is_tower {
         // Pedestal base & Cabinet
-        room_add_box(vertices, indices, [pos[0], pos[1] - 0.7, pos[2]], [0.95, 0.12, 1.05], rot_y, ch, 1.0);
+        room_add_box(
+            vertices,
+            indices,
+            [pos[0], pos[1] - 0.7, pos[2]],
+            [0.95, 0.12, 1.05],
+            rot_y,
+            ch,
+            1.0,
+        );
         room_add_box(vertices, indices, pos, [0.80, 2.2, 0.90], rot_y, ch, 1.0);
 
         // Baffle front face is at offset +0.45 in local Z
@@ -533,20 +642,79 @@ fn room_add_speaker_tower(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>, po
         };
 
         // Lower Bass Woofer (mat = 2.0)
-        room_add_cone(vertices, indices, local_to_world(0.0, -0.45, 0.46), 0.28, 0.12, rot_y, ch, 2.0);
+        room_add_cone(
+            vertices,
+            indices,
+            local_to_world(0.0, -0.45, 0.46),
+            0.28,
+            0.12,
+            rot_y,
+            ch,
+            2.0,
+        );
         // Midrange Cone (mat = 3.0)
-        room_add_cone(vertices, indices, local_to_world(0.0, 0.25, 0.46), 0.19, 0.08, rot_y, ch, 3.0);
+        room_add_cone(
+            vertices,
+            indices,
+            local_to_world(0.0, 0.25, 0.46),
+            0.19,
+            0.08,
+            rot_y,
+            ch,
+            3.0,
+        );
         // Tweeter Dome (mat = 4.0)
-        room_add_cone(vertices, indices, local_to_world(0.0, 0.72, 0.46), 0.09, 0.03, rot_y, ch, 4.0);
+        room_add_cone(
+            vertices,
+            indices,
+            local_to_world(0.0, 0.72, 0.46),
+            0.09,
+            0.03,
+            rot_y,
+            ch,
+            4.0,
+        );
 
         // Decorative vertical neon accent strip on cabinet sides
-        room_add_box(vertices, indices, local_to_world(-0.41, 0.0, 0.0), [0.03, 2.0, 0.03], rot_y, ch, 5.0);
-        room_add_box(vertices, indices, local_to_world(0.41, 0.0, 0.0), [0.03, 2.0, 0.03], rot_y, ch, 5.0);
+        room_add_box(
+            vertices,
+            indices,
+            local_to_world(-0.41, 0.0, 0.0),
+            [0.03, 2.0, 0.03],
+            rot_y,
+            ch,
+            5.0,
+        );
+        room_add_box(
+            vertices,
+            indices,
+            local_to_world(0.41, 0.0, 0.0),
+            [0.03, 2.0, 0.03],
+            rot_y,
+            ch,
+            5.0,
+        );
     } else {
         // Stand-mounted surround monitor
         // Stand pole
-        room_add_box(vertices, indices, [pos[0], pos[1] - 0.9, pos[2]], [0.08, 1.6, 0.08], rot_y, ch, 1.0);
-        room_add_box(vertices, indices, [pos[0], pos[1] - 1.7, pos[2]], [0.7, 0.06, 0.7], rot_y, ch, 1.0);
+        room_add_box(
+            vertices,
+            indices,
+            [pos[0], pos[1] - 0.9, pos[2]],
+            [0.08, 1.6, 0.08],
+            rot_y,
+            ch,
+            1.0,
+        );
+        room_add_box(
+            vertices,
+            indices,
+            [pos[0], pos[1] - 1.7, pos[2]],
+            [0.7, 0.06, 0.7],
+            rot_y,
+            ch,
+            1.0,
+        );
         // Monitor box
         room_add_box(vertices, indices, pos, [0.65, 1.1, 0.65], rot_y, ch, 1.0);
 
@@ -558,11 +726,37 @@ fn room_add_speaker_tower(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>, po
             [rx + pos[0], ly + pos[1], rz + pos[2]]
         };
         // Woofer
-        room_add_cone(vertices, indices, local_to_world(0.0, -0.15, 0.33), 0.22, 0.09, rot_y, ch, 2.0);
+        room_add_cone(
+            vertices,
+            indices,
+            local_to_world(0.0, -0.15, 0.33),
+            0.22,
+            0.09,
+            rot_y,
+            ch,
+            2.0,
+        );
         // Tweeter
-        room_add_cone(vertices, indices, local_to_world(0.0, 0.32, 0.33), 0.08, 0.03, rot_y, ch, 4.0);
+        room_add_cone(
+            vertices,
+            indices,
+            local_to_world(0.0, 0.32, 0.33),
+            0.08,
+            0.03,
+            rot_y,
+            ch,
+            4.0,
+        );
         // Neon perimeter halo
-        room_add_box(vertices, indices, local_to_world(0.0, -0.56, 0.0), [0.66, 0.03, 0.66], rot_y, ch, 5.0);
+        room_add_box(
+            vertices,
+            indices,
+            local_to_world(0.0, -0.56, 0.0),
+            [0.66, 0.03, 0.66],
+            rot_y,
+            ch,
+            5.0,
+        );
     }
 }
 
@@ -572,139 +766,512 @@ pub(crate) fn generate_neon_room_mesh() -> (Vec<Vertex>, Vec<u32>) {
 
     // 1. FLOOR & STAGE (mat = 0.0)
     room_add_quad(
-        &mut vertices, &mut indices,
-        [-11.0, -1.6, 9.0], [11.0, -1.6, 9.0], [11.0, -1.6, -9.0], [-11.0, -1.6, -9.0],
-        [0.0, 1.0, 0.0], 0.0, 0.0
+        &mut vertices,
+        &mut indices,
+        [-11.0, -1.6, 9.0],
+        [11.0, -1.6, 9.0],
+        [11.0, -1.6, -9.0],
+        [-11.0, -1.6, -9.0],
+        [0.0, 1.0, 0.0],
+        0.0,
+        0.0,
     );
 
     // Front stage platform riser
-    room_add_box(&mut vertices, &mut indices, [0.0, -1.48, 6.2], [10.5, 0.24, 4.8], 0.0, 0.0, 1.0);
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, -1.48, 6.2],
+        [10.5, 0.24, 4.8],
+        0.0,
+        0.0,
+        1.0,
+    );
     // Neon edge along stage riser
-    room_add_box(&mut vertices, &mut indices, [0.0, -1.35, 3.8], [10.6, 0.04, 0.04], 0.0, 3.0, 5.0);
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, -1.35, 3.8],
+        [10.6, 0.04, 0.04],
+        0.0,
+        3.0,
+        5.0,
+    );
 
     // 2. WALLS & CEILING (mat = 0.5)
     // Back acoustic wall (+Z)
     room_add_quad(
-        &mut vertices, &mut indices,
-        [-11.0, -1.6, 9.0], [-11.0, 5.0, 9.0], [11.0, 5.0, 9.0], [11.0, -1.6, 9.0],
-        [0.0, 0.0, -1.0], 0.0, 0.5
+        &mut vertices,
+        &mut indices,
+        [-11.0, -1.6, 9.0],
+        [-11.0, 5.0, 9.0],
+        [11.0, 5.0, 9.0],
+        [11.0, -1.6, 9.0],
+        [0.0, 0.0, -1.0],
+        0.0,
+        0.5,
     );
     // Rear studio wall (-Z)
     room_add_quad(
-        &mut vertices, &mut indices,
-        [11.0, -1.6, -9.0], [11.0, 5.0, -9.0], [-11.0, 5.0, -9.0], [-11.0, -1.6, -9.0],
-        [0.0, 0.0, 1.0], 0.0, 0.5
+        &mut vertices,
+        &mut indices,
+        [11.0, -1.6, -9.0],
+        [11.0, 5.0, -9.0],
+        [-11.0, 5.0, -9.0],
+        [-11.0, -1.6, -9.0],
+        [0.0, 0.0, 1.0],
+        0.0,
+        0.5,
     );
     // Left wall (-X)
     room_add_quad(
-        &mut vertices, &mut indices,
-        [-11.0, -1.6, -9.0], [-11.0, 5.0, -9.0], [-11.0, 5.0, 9.0], [-11.0, -1.6, 9.0],
-        [1.0, 0.0, 0.0], 0.0, 0.5
+        &mut vertices,
+        &mut indices,
+        [-11.0, -1.6, -9.0],
+        [-11.0, 5.0, -9.0],
+        [-11.0, 5.0, 9.0],
+        [-11.0, -1.6, 9.0],
+        [1.0, 0.0, 0.0],
+        0.0,
+        0.5,
     );
     // Right wall (+X)
     room_add_quad(
-        &mut vertices, &mut indices,
-        [11.0, -1.6, 9.0], [11.0, 5.0, 9.0], [11.0, 5.0, -9.0], [11.0, -1.6, -9.0],
-        [-1.0, 0.0, 0.0], 0.0, 0.5
+        &mut vertices,
+        &mut indices,
+        [11.0, -1.6, 9.0],
+        [11.0, 5.0, 9.0],
+        [11.0, 5.0, -9.0],
+        [11.0, -1.6, -9.0],
+        [-1.0, 0.0, 0.0],
+        0.0,
+        0.5,
     );
     // Ceiling (+Y)
     room_add_quad(
-        &mut vertices, &mut indices,
-        [-11.0, 5.0, -9.0], [11.0, 5.0, -9.0], [11.0, 5.0, 9.0], [-11.0, 5.0, 9.0],
-        [0.0, -1.0, 0.0], 0.0, 0.5
+        &mut vertices,
+        &mut indices,
+        [-11.0, 5.0, -9.0],
+        [11.0, 5.0, -9.0],
+        [11.0, 5.0, 9.0],
+        [-11.0, 5.0, 9.0],
+        [0.0, -1.0, 0.0],
+        0.0,
+        0.5,
     );
 
     // 3. ACOUSTIC DIFFUSER SLATS (mat = 6.0) on back wall
     for i in 0..14 {
         let x = -6.5 + (i as f32) * 1.0;
         let depth_offset = ((i * 7 + 3) % 5) as f32 * 0.06;
-        room_add_box(&mut vertices, &mut indices, [x, 1.6, 8.8 - depth_offset], [0.55, 4.2, 0.15 + depth_offset], 0.0, 0.0, 6.0);
+        room_add_box(
+            &mut vertices,
+            &mut indices,
+            [x, 1.6, 8.8 - depth_offset],
+            [0.55, 4.2, 0.15 + depth_offset],
+            0.0,
+            0.0,
+            6.0,
+        );
     }
 
     // Rear studio control room observation window & diffusers
     // Soundproof glass observation pane (mat = 7.0)
     room_add_quad(
-        &mut vertices, &mut indices,
-        [-4.5, 0.4, -8.85], [-4.5, 3.4, -8.85], [4.5, 3.4, -8.85], [4.5, 0.4, -8.85],
-        [0.0, 0.0, 1.0], 6.0, 7.0
+        &mut vertices,
+        &mut indices,
+        [-4.5, 0.4, -8.85],
+        [-4.5, 3.4, -8.85],
+        [4.5, 3.4, -8.85],
+        [4.5, 0.4, -8.85],
+        [0.0, 0.0, 1.0],
+        6.0,
+        7.0,
     );
     // Window neon illuminated perimeter frame
-    room_add_box(&mut vertices, &mut indices, [0.0, 3.45, -8.82], [9.2, 0.08, 0.08], 0.0, 6.0, 5.0);
-    room_add_box(&mut vertices, &mut indices, [0.0, 0.35, -8.82], [9.2, 0.08, 0.08], 0.0, 7.0, 5.0);
-    room_add_box(&mut vertices, &mut indices, [-4.55, 1.9, -8.82], [0.08, 3.1, 0.08], 0.0, 6.0, 5.0);
-    room_add_box(&mut vertices, &mut indices, [4.55, 1.9, -8.82], [0.08, 3.1, 0.08], 0.0, 7.0, 5.0);
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, 3.45, -8.82],
+        [9.2, 0.08, 0.08],
+        0.0,
+        6.0,
+        5.0,
+    );
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, 0.35, -8.82],
+        [9.2, 0.08, 0.08],
+        0.0,
+        7.0,
+        5.0,
+    );
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [-4.55, 1.9, -8.82],
+        [0.08, 3.1, 0.08],
+        0.0,
+        6.0,
+        5.0,
+    );
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [4.55, 1.9, -8.82],
+        [0.08, 3.1, 0.08],
+        0.0,
+        7.0,
+        5.0,
+    );
 
     // Rear flank acoustic diffuser panels
     for i in 0..4 {
         let x_left = -8.8 + (i as f32) * 0.9;
         let x_right = 6.1 + (i as f32) * 0.9;
         let depth_offset = ((i * 5 + 2) % 4) as f32 * 0.05;
-        room_add_box(&mut vertices, &mut indices, [x_left, 1.6, -8.8 + depth_offset], [0.5, 3.6, 0.12 + depth_offset], 0.0, 6.0, 6.0);
-        room_add_box(&mut vertices, &mut indices, [x_right, 1.6, -8.8 + depth_offset], [0.5, 3.6, 0.12 + depth_offset], 0.0, 7.0, 6.0);
+        room_add_box(
+            &mut vertices,
+            &mut indices,
+            [x_left, 1.6, -8.8 + depth_offset],
+            [0.5, 3.6, 0.12 + depth_offset],
+            0.0,
+            6.0,
+            6.0,
+        );
+        room_add_box(
+            &mut vertices,
+            &mut indices,
+            [x_right, 1.6, -8.8 + depth_offset],
+            [0.5, 3.6, 0.12 + depth_offset],
+            0.0,
+            7.0,
+            6.0,
+        );
     }
 
     // Side acoustic panels with illuminated neon perimeter backlights
     for i in 0..4 {
         let z = -4.5 + (i as f32) * 3.0;
         // Left side panel + halo
-        room_add_box(&mut vertices, &mut indices, [-10.8, 1.2, z], [0.18, 2.4, 1.8], 0.0, 4.0, 6.0);
-        room_add_box(&mut vertices, &mut indices, [-10.85, 1.2, z], [0.06, 2.5, 1.9], 0.0, 4.0, 5.0);
+        room_add_box(
+            &mut vertices,
+            &mut indices,
+            [-10.8, 1.2, z],
+            [0.18, 2.4, 1.8],
+            0.0,
+            4.0,
+            6.0,
+        );
+        room_add_box(
+            &mut vertices,
+            &mut indices,
+            [-10.85, 1.2, z],
+            [0.06, 2.5, 1.9],
+            0.0,
+            4.0,
+            5.0,
+        );
 
         // Right side panel + halo
-        room_add_box(&mut vertices, &mut indices, [10.8, 1.2, z], [0.18, 2.4, 1.8], 0.0, 5.0, 6.0);
-        room_add_box(&mut vertices, &mut indices, [10.85, 1.2, z], [0.06, 2.5, 1.9], 0.0, 5.0, 5.0);
+        room_add_box(
+            &mut vertices,
+            &mut indices,
+            [10.8, 1.2, z],
+            [0.18, 2.4, 1.8],
+            0.0,
+            5.0,
+            6.0,
+        );
+        room_add_box(
+            &mut vertices,
+            &mut indices,
+            [10.85, 1.2, z],
+            [0.06, 2.5, 1.9],
+            0.0,
+            5.0,
+            5.0,
+        );
     }
 
     // Overhead neon rail trusses
-    room_add_box(&mut vertices, &mut indices, [0.0, 4.8, 4.0], [21.0, 0.08, 0.08], 0.0, 0.0, 5.0);
-    room_add_box(&mut vertices, &mut indices, [0.0, 4.8, -3.0], [21.0, 0.08, 0.08], 0.0, 6.0, 5.0);
-    room_add_box(&mut vertices, &mut indices, [-8.0, 4.8, 0.0], [0.08, 0.08, 16.0], 0.0, 4.0, 5.0);
-    room_add_box(&mut vertices, &mut indices, [8.0, 4.8, 0.0], [0.08, 0.08, 16.0], 0.0, 5.0, 5.0);
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, 4.8, 4.0],
+        [21.0, 0.08, 0.08],
+        0.0,
+        0.0,
+        5.0,
+    );
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, 4.8, -3.0],
+        [21.0, 0.08, 0.08],
+        0.0,
+        6.0,
+        5.0,
+    );
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [-8.0, 4.8, 0.0],
+        [0.08, 0.08, 16.0],
+        0.0,
+        4.0,
+        5.0,
+    );
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [8.0, 4.8, 0.0],
+        [0.08, 0.08, 16.0],
+        0.0,
+        5.0,
+        5.0,
+    );
 
     // 4. SPATIAL SPEAKERS (7.1.4 Surround Placement)
     // Channel 0: Front Left (Tower)
-    room_add_speaker_tower(&mut vertices, &mut indices, [-3.8, -0.25, 5.5], -0.42, 0.0, true);
+    room_add_speaker_tower(
+        &mut vertices,
+        &mut indices,
+        [-3.8, -0.25, 5.5],
+        -0.42,
+        0.0,
+        true,
+    );
     // Channel 1: Front Right (Tower)
-    room_add_speaker_tower(&mut vertices, &mut indices, [3.8, -0.25, 5.5], 0.42, 1.0, true);
+    room_add_speaker_tower(
+        &mut vertices,
+        &mut indices,
+        [3.8, -0.25, 5.5],
+        0.42,
+        1.0,
+        true,
+    );
 
     // Channel 2: Center Channel (Horizontal Cabinet on Riser)
-    room_add_box(&mut vertices, &mut indices, [0.0, -0.85, 6.8], [1.7, 0.55, 0.65], 0.0, 2.0, 1.0);
-    room_add_cone(&mut vertices, &mut indices, [-0.52, -0.85, 7.13], 0.18, 0.07, 0.0, 2.0, 3.0);
-    room_add_cone(&mut vertices, &mut indices, [0.52, -0.85, 7.13], 0.18, 0.07, 0.0, 2.0, 3.0);
-    room_add_cone(&mut vertices, &mut indices, [0.0, -0.85, 7.13], 0.09, 0.03, 0.0, 2.0, 4.0);
-    room_add_box(&mut vertices, &mut indices, [0.0, -1.14, 6.8], [1.75, 0.03, 0.68], 0.0, 2.0, 5.0);
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, -0.85, 6.8],
+        [1.7, 0.55, 0.65],
+        0.0,
+        2.0,
+        1.0,
+    );
+    room_add_cone(
+        &mut vertices,
+        &mut indices,
+        [-0.52, -0.85, 7.13],
+        0.18,
+        0.07,
+        0.0,
+        2.0,
+        3.0,
+    );
+    room_add_cone(
+        &mut vertices,
+        &mut indices,
+        [0.52, -0.85, 7.13],
+        0.18,
+        0.07,
+        0.0,
+        2.0,
+        3.0,
+    );
+    room_add_cone(
+        &mut vertices,
+        &mut indices,
+        [0.0, -0.85, 7.13],
+        0.09,
+        0.03,
+        0.0,
+        2.0,
+        4.0,
+    );
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, -1.14, 6.8],
+        [1.75, 0.03, 0.68],
+        0.0,
+        2.0,
+        5.0,
+    );
 
     // Channel 3: Massive LFE Dual Subwoofer
-    room_add_box(&mut vertices, &mut indices, [0.0, -1.05, 5.2], [2.4, 0.85, 1.1], 0.0, 3.0, 1.0);
-    room_add_cone(&mut vertices, &mut indices, [-0.62, -1.05, 5.76], 0.36, 0.16, 0.0, 3.0, 2.0);
-    room_add_cone(&mut vertices, &mut indices, [0.62, -1.05, 5.76], 0.36, 0.16, 0.0, 3.0, 2.0);
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, -1.05, 5.2],
+        [2.4, 0.85, 1.1],
+        0.0,
+        3.0,
+        1.0,
+    );
+    room_add_cone(
+        &mut vertices,
+        &mut indices,
+        [-0.62, -1.05, 5.76],
+        0.36,
+        0.16,
+        0.0,
+        3.0,
+        2.0,
+    );
+    room_add_cone(
+        &mut vertices,
+        &mut indices,
+        [0.62, -1.05, 5.76],
+        0.36,
+        0.16,
+        0.0,
+        3.0,
+        2.0,
+    );
     // Subwoofer bass reflex port & neon trim
-    room_add_box(&mut vertices, &mut indices, [0.0, -0.75, 5.76], [0.35, 0.08, 0.05], 0.0, 3.0, 5.0);
-    room_add_box(&mut vertices, &mut indices, [0.0, -1.48, 5.2], [2.45, 0.04, 1.15], 0.0, 3.0, 5.0);
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, -0.75, 5.76],
+        [0.35, 0.08, 0.05],
+        0.0,
+        3.0,
+        5.0,
+    );
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, -1.48, 5.2],
+        [2.45, 0.04, 1.15],
+        0.0,
+        3.0,
+        5.0,
+    );
 
     // Channel 4: Surround Left (Stand Monitor)
-    room_add_speaker_tower(&mut vertices, &mut indices, [-6.2, 0.5, 0.5], -1.42, 4.0, false);
+    room_add_speaker_tower(
+        &mut vertices,
+        &mut indices,
+        [-6.2, 0.5, 0.5],
+        -1.42,
+        4.0,
+        false,
+    );
     // Channel 5: Surround Right (Stand Monitor)
-    room_add_speaker_tower(&mut vertices, &mut indices, [6.2, 0.5, 0.5], 1.42, 5.0, false);
+    room_add_speaker_tower(
+        &mut vertices,
+        &mut indices,
+        [6.2, 0.5, 0.5],
+        1.42,
+        5.0,
+        false,
+    );
 
     // Channel 6: Rear Left (Rear Surround Tower)
-    room_add_speaker_tower(&mut vertices, &mut indices, [-4.2, 0.1, -4.8], -2.65, 6.0, true);
+    room_add_speaker_tower(
+        &mut vertices,
+        &mut indices,
+        [-4.2, 0.1, -4.8],
+        -2.65,
+        6.0,
+        true,
+    );
     // Channel 7: Rear Right (Rear Surround Tower)
-    room_add_speaker_tower(&mut vertices, &mut indices, [4.2, 0.1, -4.8], 2.65, 7.0, true);
+    room_add_speaker_tower(
+        &mut vertices,
+        &mut indices,
+        [4.2, 0.1, -4.8],
+        2.65,
+        7.0,
+        true,
+    );
 
     // Channels 8..11: Overhead Ceiling Atmos Height Speakers
     // Top Front Left (8)
-    room_add_box(&mut vertices, &mut indices, [-3.2, 4.3, 3.5], [0.65, 0.45, 0.65], 0.0, 8.0, 1.0);
-    room_add_cone(&mut vertices, &mut indices, [-3.2, 4.05, 3.5], 0.20, 0.08, 0.0, 8.0, 2.0);
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [-3.2, 4.3, 3.5],
+        [0.65, 0.45, 0.65],
+        0.0,
+        8.0,
+        1.0,
+    );
+    room_add_cone(
+        &mut vertices,
+        &mut indices,
+        [-3.2, 4.05, 3.5],
+        0.20,
+        0.08,
+        0.0,
+        8.0,
+        2.0,
+    );
     // Top Front Right (9)
-    room_add_box(&mut vertices, &mut indices, [3.2, 4.3, 3.5], [0.65, 0.45, 0.65], 0.0, 9.0, 1.0);
-    room_add_cone(&mut vertices, &mut indices, [3.2, 4.05, 3.5], 0.20, 0.08, 0.0, 9.0, 2.0);
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [3.2, 4.3, 3.5],
+        [0.65, 0.45, 0.65],
+        0.0,
+        9.0,
+        1.0,
+    );
+    room_add_cone(
+        &mut vertices,
+        &mut indices,
+        [3.2, 4.05, 3.5],
+        0.20,
+        0.08,
+        0.0,
+        9.0,
+        2.0,
+    );
     // Top Rear Left (10)
-    room_add_box(&mut vertices, &mut indices, [-3.2, 4.3, -2.5], [0.65, 0.45, 0.65], 0.0, 10.0, 1.0);
-    room_add_cone(&mut vertices, &mut indices, [-3.2, 4.05, -2.5], 0.20, 0.08, 0.0, 10.0, 2.0);
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [-3.2, 4.3, -2.5],
+        [0.65, 0.45, 0.65],
+        0.0,
+        10.0,
+        1.0,
+    );
+    room_add_cone(
+        &mut vertices,
+        &mut indices,
+        [-3.2, 4.05, -2.5],
+        0.20,
+        0.08,
+        0.0,
+        10.0,
+        2.0,
+    );
     // Top Rear Right (11)
-    room_add_box(&mut vertices, &mut indices, [3.2, 4.3, -2.5], [0.65, 0.45, 0.65], 0.0, 11.0, 1.0);
-    room_add_cone(&mut vertices, &mut indices, [3.2, 4.05, -2.5], 0.20, 0.08, 0.0, 11.0, 2.0);
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [3.2, 4.3, -2.5],
+        [0.65, 0.45, 0.65],
+        0.0,
+        11.0,
+        1.0,
+    );
+    room_add_cone(
+        &mut vertices,
+        &mut indices,
+        [3.2, 4.05, -2.5],
+        0.20,
+        0.08,
+        0.0,
+        11.0,
+        2.0,
+    );
 
     (vertices, indices)
 }
@@ -722,10 +1289,26 @@ fn glass_add_quad(
     mat: f32,
 ) {
     let start = vertices.len() as u32;
-    vertices.push(Vertex { position: p0, normal, tex_coords: [ch, mat] });
-    vertices.push(Vertex { position: p1, normal, tex_coords: [ch, mat] });
-    vertices.push(Vertex { position: p2, normal, tex_coords: [ch, mat] });
-    vertices.push(Vertex { position: p3, normal, tex_coords: [ch, mat] });
+    vertices.push(Vertex {
+        position: p0,
+        normal,
+        tex_coords: [ch, mat],
+    });
+    vertices.push(Vertex {
+        position: p1,
+        normal,
+        tex_coords: [ch, mat],
+    });
+    vertices.push(Vertex {
+        position: p2,
+        normal,
+        tex_coords: [ch, mat],
+    });
+    vertices.push(Vertex {
+        position: p3,
+        normal,
+        tex_coords: [ch, mat],
+    });
     indices.extend_from_slice(&[start, start + 1, start + 2, start, start + 2, start + 3]);
 }
 
@@ -754,7 +1337,9 @@ impl GlassContourBuilder {
 
     fn finish(mut self) -> Vec<GlassGlyphContour> {
         if !self.current_contour.is_empty() {
-            self.contours.push(GlassGlyphContour { points: self.current_contour });
+            self.contours.push(GlassGlyphContour {
+                points: self.current_contour,
+            });
         }
         self.contours
     }
@@ -763,7 +1348,9 @@ impl GlassContourBuilder {
 impl ttf_parser::OutlineBuilder for GlassContourBuilder {
     fn move_to(&mut self, x: f32, y: f32) {
         if !self.current_contour.is_empty() {
-            self.contours.push(GlassGlyphContour { points: std::mem::take(&mut self.current_contour) });
+            self.contours.push(GlassGlyphContour {
+                points: std::mem::take(&mut self.current_contour),
+            });
         }
         self.start_point = [x, y];
         self.last_point = [x, y];
@@ -799,8 +1386,14 @@ impl ttf_parser::OutlineBuilder for GlassContourBuilder {
         for i in 1..=steps {
             let t = i as f32 / steps as f32;
             let it = 1.0 - t;
-            let cx = it * it * it * p0[0] + 3.0 * it * it * t * p1[0] + 3.0 * it * t * t * p2[0] + t * t * t * p3[0];
-            let cy = it * it * it * p0[1] + 3.0 * it * it * t * p1[1] + 3.0 * it * t * t * p2[1] + t * t * t * p3[1];
+            let cx = it * it * it * p0[0]
+                + 3.0 * it * it * t * p1[0]
+                + 3.0 * it * t * t * p2[0]
+                + t * t * t * p3[0];
+            let cy = it * it * it * p0[1]
+                + 3.0 * it * it * t * p1[1]
+                + 3.0 * it * t * t * p2[1]
+                + t * t * t * p3[1];
             self.current_contour.push([cx, cy]);
         }
         self.last_point = [x, y];
@@ -815,14 +1408,18 @@ impl ttf_parser::OutlineBuilder for GlassContourBuilder {
             }
         }
         if !self.current_contour.is_empty() {
-            self.contours.push(GlassGlyphContour { points: std::mem::take(&mut self.current_contour) });
+            self.contours.push(GlassGlyphContour {
+                points: std::mem::take(&mut self.current_contour),
+            });
         }
     }
 }
 
 fn glass_contour_signed_area(pts: &[[f32; 2]]) -> f32 {
     let n = pts.len();
-    if n < 3 { return 0.0; }
+    if n < 3 {
+        return 0.0;
+    }
     let mut area = 0.0;
     for i in 0..n {
         let j = (i + 1) % n;
@@ -849,9 +1446,15 @@ fn point_in_polygon(p: [f32; 2], poly: &[[f32; 2]]) -> bool {
 }
 
 fn point_strictly_in_triangle(p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> bool {
-    if (p[0] - a[0]).abs() < 1e-4 && (p[1] - a[1]).abs() < 1e-4 { return false; }
-    if (p[0] - b[0]).abs() < 1e-4 && (p[1] - b[1]).abs() < 1e-4 { return false; }
-    if (p[0] - c[0]).abs() < 1e-4 && (p[1] - c[1]).abs() < 1e-4 { return false; }
+    if (p[0] - a[0]).abs() < 1e-4 && (p[1] - a[1]).abs() < 1e-4 {
+        return false;
+    }
+    if (p[0] - b[0]).abs() < 1e-4 && (p[1] - b[1]).abs() < 1e-4 {
+        return false;
+    }
+    if (p[0] - c[0]).abs() < 1e-4 && (p[1] - c[1]).abs() < 1e-4 {
+        return false;
+    }
 
     let cross1 = (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]);
     let cross2 = (c[0] - b[0]) * (p[1] - b[1]) - (c[1] - b[1]) * (p[0] - b[0]);
@@ -860,7 +1463,10 @@ fn point_strictly_in_triangle(p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]
     cross1 > 1e-6 && cross2 > 1e-6 && cross3 > 1e-6
 }
 
-fn earcut_triangulate_polygon(outer: &[[f32; 2]], holes: &[Vec<[f32; 2]>]) -> (Vec<[f32; 2]>, Vec<[usize; 3]>) {
+fn earcut_triangulate_polygon(
+    outer: &[[f32; 2]],
+    holes: &[Vec<[f32; 2]>],
+) -> (Vec<[f32; 2]>, Vec<[usize; 3]>) {
     let mut ring: Vec<[f32; 2]> = outer.to_vec();
     if glass_contour_signed_area(&ring) < 0.0 {
         ring.reverse(); // Ensure CCW
@@ -875,11 +1481,15 @@ fn earcut_triangulate_polygon(outer: &[[f32; 2]], holes: &[Vec<[f32; 2]>]) -> (V
     sorted_holes.sort_by(|a, b| {
         let max_a = a.iter().map(|p| p[0]).fold(f32::NEG_INFINITY, f32::max);
         let max_b = b.iter().map(|p| p[0]).fold(f32::NEG_INFINITY, f32::max);
-        max_b.partial_cmp(&max_a).unwrap_or(std::cmp::Ordering::Equal)
+        max_b
+            .partial_cmp(&max_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
     });
 
     for h in &sorted_holes {
-        if h.len() < 3 { continue; }
+        if h.len() < 3 {
+            continue;
+        }
         let mut best_h_idx = 0;
         let mut max_hx = f32::NEG_INFINITY;
         for (i, p) in h.iter().enumerate() {
@@ -1012,7 +1622,9 @@ fn glass_triangulate_contours(contours: &[Vec<[f32; 2]>]) -> (Vec<[f32; 2]>, Vec
     let mut holes = Vec::new();
 
     for c in contours {
-        if c.len() < 3 { continue; }
+        if c.len() < 3 {
+            continue;
+        }
         let area = glass_contour_signed_area(c);
         if area < 0.0 {
             outers.push(c.clone());
@@ -1052,7 +1664,11 @@ pub(crate) fn generate_glass_lyrics_mesh(text: &str) -> (Vec<Vertex>, Vec<u32>) 
     let mut indices = Vec::with_capacity(65536);
 
     let trimmed = text.trim();
-    let display_str = if trimmed.is_empty() { "RUSTTRACKER" } else { trimmed };
+    let display_str = if trimmed.is_empty() {
+        "RUSTTRACKER"
+    } else {
+        trimmed
+    };
 
     // Try system DejaVu Sans Bold first, fallback to embedded Orbitron Black
     let sys_font_path = "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf";
@@ -1067,7 +1683,10 @@ pub(crate) fn generate_glass_lyrics_mesh(text: &str) -> (Vec<Vertex>, Vec<u32>) 
         let mut total_advance = 0.0f32;
         for ch in display_str.chars() {
             if let Some(glyph_id) = face.glyph_index(ch) {
-                let adv = face.glyph_hor_advance(glyph_id).unwrap_or(face.units_per_em()) as f32 * base_scale;
+                let adv = face
+                    .glyph_hor_advance(glyph_id)
+                    .unwrap_or(face.units_per_em()) as f32
+                    * base_scale;
                 total_advance += adv;
             } else {
                 total_advance += 0.5;
@@ -1086,7 +1705,11 @@ pub(crate) fn generate_glass_lyrics_mesh(text: &str) -> (Vec<Vertex>, Vec<u32>) 
 
         for (ch_idx, ch) in display_str.chars().enumerate() {
             if let Some(glyph_id) = face.glyph_index(ch) {
-                let adv = face.glyph_hor_advance(glyph_id).unwrap_or(face.units_per_em()) as f32 * base_scale * text_scale;
+                let adv = face
+                    .glyph_hor_advance(glyph_id)
+                    .unwrap_or(face.units_per_em()) as f32
+                    * base_scale
+                    * text_scale;
 
                 let mut builder = GlassContourBuilder::new();
                 if let Some(_bbox) = face.outline_glyph(glyph_id, &mut builder) {
@@ -1096,17 +1719,21 @@ pub(crate) fn generate_glass_lyrics_mesh(text: &str) -> (Vec<Vertex>, Vec<u32>) 
                         .iter()
                         .filter(|c| c.points.len() >= 3)
                         .map(|c| {
-                            c.points.iter().map(|p| {
-                                [
-                                    curr_x + p[0] * base_scale * text_scale,
-                                    baseline_y + p[1] * base_scale * text_scale,
-                                ]
-                            }).collect()
+                            c.points
+                                .iter()
+                                .map(|p| {
+                                    [
+                                        curr_x + p[0] * base_scale * text_scale,
+                                        baseline_y + p[1] * base_scale * text_scale,
+                                    ]
+                                })
+                                .collect()
                         })
                         .collect();
 
                     if !scaled_contours.is_empty() {
-                        let (face_verts_2d, face_tris) = glass_triangulate_contours(&scaled_contours);
+                        let (face_verts_2d, face_tris) =
+                            glass_triangulate_contours(&scaled_contours);
 
                         // 1. Front and Back Faces
                         let start_front = vertices.len() as u32;
@@ -1150,7 +1777,9 @@ pub(crate) fn generate_glass_lyrics_mesh(text: &str) -> (Vec<Vertex>, Vec<u32>) 
                                 let dx = p1[0] - p0[0];
                                 let dy = p1[1] - p0[1];
                                 let len = (dx * dx + dy * dy).sqrt();
-                                if len < 1e-6 { continue; }
+                                if len < 1e-6 {
+                                    continue;
+                                }
 
                                 let mut nx = dy / len;
                                 let mut ny = -dx / len;
@@ -1163,29 +1792,106 @@ pub(crate) fn generate_glass_lyrics_mesh(text: &str) -> (Vec<Vertex>, Vec<u32>) 
 
                                 // Side quad
                                 let norm_side = [nx, ny, 0.0];
-                                vertices.push(Vertex { position: [p0[0], p0[1], -hz + bevel], normal: norm_side, tex_coords: [ch_idx as f32, 1.0] });
-                                vertices.push(Vertex { position: [p1[0], p1[1], -hz + bevel], normal: norm_side, tex_coords: [ch_idx as f32, 1.0] });
-                                vertices.push(Vertex { position: [p1[0], p1[1], hz - bevel],  normal: norm_side, tex_coords: [ch_idx as f32, 1.0] });
-                                vertices.push(Vertex { position: [p0[0], p0[1], hz - bevel],  normal: norm_side, tex_coords: [ch_idx as f32, 1.0] });
-                                indices.extend_from_slice(&[start_v, start_v + 1, start_v + 2, start_v, start_v + 2, start_v + 3]);
+                                vertices.push(Vertex {
+                                    position: [p0[0], p0[1], -hz + bevel],
+                                    normal: norm_side,
+                                    tex_coords: [ch_idx as f32, 1.0],
+                                });
+                                vertices.push(Vertex {
+                                    position: [p1[0], p1[1], -hz + bevel],
+                                    normal: norm_side,
+                                    tex_coords: [ch_idx as f32, 1.0],
+                                });
+                                vertices.push(Vertex {
+                                    position: [p1[0], p1[1], hz - bevel],
+                                    normal: norm_side,
+                                    tex_coords: [ch_idx as f32, 1.0],
+                                });
+                                vertices.push(Vertex {
+                                    position: [p0[0], p0[1], hz - bevel],
+                                    normal: norm_side,
+                                    tex_coords: [ch_idx as f32, 1.0],
+                                });
+                                indices.extend_from_slice(&[
+                                    start_v,
+                                    start_v + 1,
+                                    start_v + 2,
+                                    start_v,
+                                    start_v + 2,
+                                    start_v + 3,
+                                ]);
 
                                 // Top Chamfer quad (+Z)
                                 let start_c1 = vertices.len() as u32;
-                                let norm_c1 = [nx * std::f32::consts::FRAC_1_SQRT_2, ny * std::f32::consts::FRAC_1_SQRT_2, std::f32::consts::FRAC_1_SQRT_2];
-                                vertices.push(Vertex { position: [p0[0], p0[1], hz - bevel], normal: norm_c1, tex_coords: [ch_idx as f32, 1.0] });
-                                vertices.push(Vertex { position: [p1[0], p1[1], hz - bevel], normal: norm_c1, tex_coords: [ch_idx as f32, 1.0] });
-                                vertices.push(Vertex { position: [p1[0] - nx * bevel, p1[1] - ny * bevel, hz], normal: norm_c1, tex_coords: [ch_idx as f32, 1.0] });
-                                vertices.push(Vertex { position: [p0[0] - nx * bevel, p0[1] - ny * bevel, hz], normal: norm_c1, tex_coords: [ch_idx as f32, 1.0] });
-                                indices.extend_from_slice(&[start_c1, start_c1 + 1, start_c1 + 2, start_c1, start_c1 + 2, start_c1 + 3]);
+                                let norm_c1 = [
+                                    nx * std::f32::consts::FRAC_1_SQRT_2,
+                                    ny * std::f32::consts::FRAC_1_SQRT_2,
+                                    std::f32::consts::FRAC_1_SQRT_2,
+                                ];
+                                vertices.push(Vertex {
+                                    position: [p0[0], p0[1], hz - bevel],
+                                    normal: norm_c1,
+                                    tex_coords: [ch_idx as f32, 1.0],
+                                });
+                                vertices.push(Vertex {
+                                    position: [p1[0], p1[1], hz - bevel],
+                                    normal: norm_c1,
+                                    tex_coords: [ch_idx as f32, 1.0],
+                                });
+                                vertices.push(Vertex {
+                                    position: [p1[0] - nx * bevel, p1[1] - ny * bevel, hz],
+                                    normal: norm_c1,
+                                    tex_coords: [ch_idx as f32, 1.0],
+                                });
+                                vertices.push(Vertex {
+                                    position: [p0[0] - nx * bevel, p0[1] - ny * bevel, hz],
+                                    normal: norm_c1,
+                                    tex_coords: [ch_idx as f32, 1.0],
+                                });
+                                indices.extend_from_slice(&[
+                                    start_c1,
+                                    start_c1 + 1,
+                                    start_c1 + 2,
+                                    start_c1,
+                                    start_c1 + 2,
+                                    start_c1 + 3,
+                                ]);
 
                                 // Bot Chamfer quad (-Z)
                                 let start_c2 = vertices.len() as u32;
-                                let norm_c2 = [nx * std::f32::consts::FRAC_1_SQRT_2, ny * std::f32::consts::FRAC_1_SQRT_2, -std::f32::consts::FRAC_1_SQRT_2];
-                                vertices.push(Vertex { position: [p0[0] - nx * bevel, p0[1] - ny * bevel, -hz], normal: norm_c2, tex_coords: [ch_idx as f32, 1.0] });
-                                vertices.push(Vertex { position: [p1[0] - nx * bevel, p1[1] - ny * bevel, -hz], normal: norm_c2, tex_coords: [ch_idx as f32, 1.0] });
-                                vertices.push(Vertex { position: [p1[0], p1[1], -hz + bevel], normal: norm_c2, tex_coords: [ch_idx as f32, 1.0] });
-                                vertices.push(Vertex { position: [p0[0], p0[1], -hz + bevel], normal: norm_c2, tex_coords: [ch_idx as f32, 1.0] });
-                                indices.extend_from_slice(&[start_c2, start_c2 + 1, start_c2 + 2, start_c2, start_c2 + 2, start_c2 + 3]);
+                                let norm_c2 = [
+                                    nx * std::f32::consts::FRAC_1_SQRT_2,
+                                    ny * std::f32::consts::FRAC_1_SQRT_2,
+                                    -std::f32::consts::FRAC_1_SQRT_2,
+                                ];
+                                vertices.push(Vertex {
+                                    position: [p0[0] - nx * bevel, p0[1] - ny * bevel, -hz],
+                                    normal: norm_c2,
+                                    tex_coords: [ch_idx as f32, 1.0],
+                                });
+                                vertices.push(Vertex {
+                                    position: [p1[0] - nx * bevel, p1[1] - ny * bevel, -hz],
+                                    normal: norm_c2,
+                                    tex_coords: [ch_idx as f32, 1.0],
+                                });
+                                vertices.push(Vertex {
+                                    position: [p1[0], p1[1], -hz + bevel],
+                                    normal: norm_c2,
+                                    tex_coords: [ch_idx as f32, 1.0],
+                                });
+                                vertices.push(Vertex {
+                                    position: [p0[0], p0[1], -hz + bevel],
+                                    normal: norm_c2,
+                                    tex_coords: [ch_idx as f32, 1.0],
+                                });
+                                indices.extend_from_slice(&[
+                                    start_c2,
+                                    start_c2 + 1,
+                                    start_c2 + 2,
+                                    start_c2,
+                                    start_c2 + 2,
+                                    start_c2 + 3,
+                                ]);
                             }
                         }
                     }
@@ -1234,15 +1940,35 @@ pub(crate) fn generate_glass_lyrics_mesh(text: &str) -> (Vec<Vertex>, Vec<u32>) 
     let cos_t = tilt.cos();
     let sin_t = tilt.sin();
 
-    let p0 = [sb_center[0] - sb_w * 0.5, sb_center[1] + sb_h * 0.5 * cos_t, sb_center[2] + sb_h * 0.5 * sin_t];
-    let p1 = [sb_center[0] + sb_w * 0.5, sb_center[1] + sb_h * 0.5 * cos_t, sb_center[2] + sb_h * 0.5 * sin_t];
-    let p2 = [sb_center[0] + sb_w * 0.5, sb_center[1] - sb_h * 0.5 * cos_t, sb_center[2] - sb_h * 0.5 * sin_t];
-    let p3 = [sb_center[0] - sb_w * 0.5, sb_center[1] - sb_h * 0.5 * cos_t, sb_center[2] - sb_h * 0.5 * sin_t];
+    let p0 = [
+        sb_center[0] - sb_w * 0.5,
+        sb_center[1] + sb_h * 0.5 * cos_t,
+        sb_center[2] + sb_h * 0.5 * sin_t,
+    ];
+    let p1 = [
+        sb_center[0] + sb_w * 0.5,
+        sb_center[1] + sb_h * 0.5 * cos_t,
+        sb_center[2] + sb_h * 0.5 * sin_t,
+    ];
+    let p2 = [
+        sb_center[0] + sb_w * 0.5,
+        sb_center[1] - sb_h * 0.5 * cos_t,
+        sb_center[2] - sb_h * 0.5 * sin_t,
+    ];
+    let p3 = [
+        sb_center[0] - sb_w * 0.5,
+        sb_center[1] - sb_h * 0.5 * cos_t,
+        sb_center[2] - sb_h * 0.5 * sin_t,
+    ];
     let sb_norm = [0.0, -sin_t, cos_t];
 
     glass_add_quad(
-        &mut vertices, &mut indices,
-        p0, p1, p2, p3,
+        &mut vertices,
+        &mut indices,
+        p0,
+        p1,
+        p2,
+        p3,
         sb_norm,
         0.0,
         3.0, // Mat 3.0 = Emissive Softbox
@@ -1252,16 +1978,49 @@ pub(crate) fn generate_glass_lyrics_mesh(text: &str) -> (Vec<Vertex>, Vec<u32>) 
 }
 
 #[allow(clippy::too_many_arguments)]
-fn cyber_add_quad(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>, p0: [f32; 3], p1: [f32; 3], p2: [f32; 3], p3: [f32; 3], normal: [f32; 3], mat: f32, uv_y: f32) {
+fn cyber_add_quad(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    p0: [f32; 3],
+    p1: [f32; 3],
+    p2: [f32; 3],
+    p3: [f32; 3],
+    normal: [f32; 3],
+    mat: f32,
+    uv_y: f32,
+) {
     let start = vertices.len() as u32;
-    vertices.push(Vertex { position: p0, normal, tex_coords: [mat, uv_y] });
-    vertices.push(Vertex { position: p1, normal, tex_coords: [mat, uv_y] });
-    vertices.push(Vertex { position: p2, normal, tex_coords: [mat, uv_y] });
-    vertices.push(Vertex { position: p3, normal, tex_coords: [mat, uv_y] });
+    vertices.push(Vertex {
+        position: p0,
+        normal,
+        tex_coords: [mat, uv_y],
+    });
+    vertices.push(Vertex {
+        position: p1,
+        normal,
+        tex_coords: [mat, uv_y],
+    });
+    vertices.push(Vertex {
+        position: p2,
+        normal,
+        tex_coords: [mat, uv_y],
+    });
+    vertices.push(Vertex {
+        position: p3,
+        normal,
+        tex_coords: [mat, uv_y],
+    });
     indices.extend_from_slice(&[start, start + 1, start + 2, start, start + 2, start + 3]);
 }
 
-fn cyber_add_box(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>, center: [f32; 3], size: [f32; 3], rot_y: f32, mat: f32) {
+fn cyber_add_box(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    center: [f32; 3],
+    size: [f32; 3],
+    rot_y: f32,
+    mat: f32,
+) {
     let hx = size[0] / 2.0;
     let hy = size[1] / 2.0;
     let hz = size[2] / 2.0;
@@ -1279,12 +2038,72 @@ fn cyber_add_box(vertices: &mut Vec<Vertex>, indices: &mut Vec<u32>, center: [f3
         [rx, n[1], rz]
     };
 
-    cyber_add_quad(vertices, indices, rotate_pt([-hx, -hy, hz]), rotate_pt([hx, -hy, hz]), rotate_pt([hx, hy, hz]), rotate_pt([-hx, hy, hz]), rotate_norm([0.0, 0.0, 1.0]), mat, center[1] + hy);
-    cyber_add_quad(vertices, indices, rotate_pt([hx, -hy, -hz]), rotate_pt([-hx, -hy, -hz]), rotate_pt([-hx, hy, -hz]), rotate_pt([hx, hy, -hz]), rotate_norm([0.0, 0.0, -1.0]), mat, center[1] + hy);
-    cyber_add_quad(vertices, indices, rotate_pt([-hx, -hy, -hz]), rotate_pt([-hx, -hy, hz]), rotate_pt([-hx, hy, hz]), rotate_pt([-hx, hy, -hz]), rotate_norm([-1.0, 0.0, 0.0]), mat, center[1] + hy);
-    cyber_add_quad(vertices, indices, rotate_pt([hx, -hy, hz]), rotate_pt([hx, -hy, -hz]), rotate_pt([hx, hy, -hz]), rotate_pt([hx, hy, hz]), rotate_norm([1.0, 0.0, 0.0]), mat, center[1] + hy);
-    cyber_add_quad(vertices, indices, rotate_pt([-hx, hy, hz]), rotate_pt([hx, hy, hz]), rotate_pt([hx, hy, -hz]), rotate_pt([-hx, hy, -hz]), rotate_norm([0.0, 1.0, 0.0]), mat, center[1] + hy);
-    cyber_add_quad(vertices, indices, rotate_pt([-hx, -hy, -hz]), rotate_pt([hx, -hy, -hz]), rotate_pt([hx, -hy, hz]), rotate_pt([-hx, -hy, hz]), rotate_norm([0.0, -1.0, 0.0]), mat, center[1] - hy);
+    cyber_add_quad(
+        vertices,
+        indices,
+        rotate_pt([-hx, -hy, hz]),
+        rotate_pt([hx, -hy, hz]),
+        rotate_pt([hx, hy, hz]),
+        rotate_pt([-hx, hy, hz]),
+        rotate_norm([0.0, 0.0, 1.0]),
+        mat,
+        center[1] + hy,
+    );
+    cyber_add_quad(
+        vertices,
+        indices,
+        rotate_pt([hx, -hy, -hz]),
+        rotate_pt([-hx, -hy, -hz]),
+        rotate_pt([-hx, hy, -hz]),
+        rotate_pt([hx, hy, -hz]),
+        rotate_norm([0.0, 0.0, -1.0]),
+        mat,
+        center[1] + hy,
+    );
+    cyber_add_quad(
+        vertices,
+        indices,
+        rotate_pt([-hx, -hy, -hz]),
+        rotate_pt([-hx, -hy, hz]),
+        rotate_pt([-hx, hy, hz]),
+        rotate_pt([-hx, hy, -hz]),
+        rotate_norm([-1.0, 0.0, 0.0]),
+        mat,
+        center[1] + hy,
+    );
+    cyber_add_quad(
+        vertices,
+        indices,
+        rotate_pt([hx, -hy, hz]),
+        rotate_pt([hx, -hy, -hz]),
+        rotate_pt([hx, hy, -hz]),
+        rotate_pt([hx, hy, hz]),
+        rotate_norm([1.0, 0.0, 0.0]),
+        mat,
+        center[1] + hy,
+    );
+    cyber_add_quad(
+        vertices,
+        indices,
+        rotate_pt([-hx, hy, hz]),
+        rotate_pt([hx, hy, hz]),
+        rotate_pt([hx, hy, -hz]),
+        rotate_pt([-hx, hy, -hz]),
+        rotate_norm([0.0, 1.0, 0.0]),
+        mat,
+        center[1] + hy,
+    );
+    cyber_add_quad(
+        vertices,
+        indices,
+        rotate_pt([-hx, -hy, -hz]),
+        rotate_pt([hx, -hy, -hz]),
+        rotate_pt([hx, -hy, hz]),
+        rotate_pt([-hx, -hy, hz]),
+        rotate_norm([0.0, -1.0, 0.0]),
+        mat,
+        center[1] - hy,
+    );
 }
 
 struct ObjFaceTri {
@@ -1313,13 +2132,23 @@ fn parse_obj_template(obj_src: &str, default_mat: f32) -> ParsedObjTemplate {
         if let Some(rest) = trimmed.strip_prefix("v ") {
             let parts: Vec<&str> = rest.split_whitespace().collect();
             if parts.len() >= 3
-                && let (Ok(x), Ok(y), Ok(z)) = (parts[0].parse::<f32>(), parts[1].parse::<f32>(), parts[2].parse::<f32>()) {
+                && let (Ok(x), Ok(y), Ok(z)) = (
+                    parts[0].parse::<f32>(),
+                    parts[1].parse::<f32>(),
+                    parts[2].parse::<f32>(),
+                )
+            {
                 raw_positions.push([x, y, z]);
             }
         } else if let Some(rest) = trimmed.strip_prefix("vn ") {
             let parts: Vec<&str> = rest.split_whitespace().collect();
             if parts.len() >= 3
-                && let (Ok(x), Ok(y), Ok(z)) = (parts[0].parse::<f32>(), parts[1].parse::<f32>(), parts[2].parse::<f32>()) {
+                && let (Ok(x), Ok(y), Ok(z)) = (
+                    parts[0].parse::<f32>(),
+                    parts[1].parse::<f32>(),
+                    parts[2].parse::<f32>(),
+                )
+            {
                 raw_normals.push([x, y, z]);
             }
         } else if let Some(rest) = trimmed.strip_prefix("g ") {
@@ -1378,7 +2207,8 @@ fn parse_obj_template(obj_src: &str, default_mat: f32) -> ParsedObjTemplate {
                     Some((v_idx, vn_idx))
                 };
 
-                let face_verts: Vec<(usize, usize)> = parts.iter().filter_map(|p| parse_vert(p)).collect();
+                let face_verts: Vec<(usize, usize)> =
+                    parts.iter().filter_map(|p| parse_vert(p)).collect();
                 if face_verts.len() >= 3 {
                     for i in 1..face_verts.len() - 1 {
                         tris.push(ObjFaceTri {
@@ -1414,7 +2244,11 @@ fn instantiate_obj_template(
         let sz = p[2] * scale[2];
         let rx = sx * cos_r + sz * sin_r;
         let rz = -sx * sin_r + sz * cos_r;
-        [rx + translation[0], sy + translation[1], rz + translation[2]]
+        [
+            rx + translation[0],
+            sy + translation[1],
+            rz + translation[2],
+        ]
     };
     let transform_norm = |n: [f32; 3]| -> [f32; 3] {
         let rx = n[0] * cos_r + n[2] * sin_r;
@@ -1425,8 +2259,16 @@ fn instantiate_obj_template(
     for tri in &template.tris {
         let start_idx = vertices.len() as u32;
         for &(v_i, vn_i) in &tri.verts {
-            let pos = if v_i < template.positions.len() { template.positions[v_i] } else { [0.0, 0.0, 0.0] };
-            let norm = if vn_i < template.normals.len() { template.normals[vn_i] } else { [0.0, 1.0, 0.0] };
+            let pos = if v_i < template.positions.len() {
+                template.positions[v_i]
+            } else {
+                [0.0, 0.0, 0.0]
+            };
+            let norm = if vn_i < template.normals.len() {
+                template.normals[vn_i]
+            } else {
+                [0.0, 1.0, 0.0]
+            };
             let world_p = transform_pos(pos);
             let world_n = transform_norm(norm);
             vertices.push(Vertex {
@@ -1459,16 +2301,26 @@ pub(crate) fn generate_synthwave_racer_mesh() -> (Vec<Vertex>, Vec<u32>) {
     // 1. Continuous Desert / Terrain Ground Planes (mat = 0.5)
     let ground_w = 200.0;
     cyber_add_quad(
-        &mut vertices, &mut indices,
-        [-ground_w, -0.05, -10.0], [-9.0, -0.05, -10.0],
-        [-9.0, -0.05, 360.0], [-ground_w, -0.05, 360.0],
-        [0.0, 1.0, 0.0], 0.5, 0.0
+        &mut vertices,
+        &mut indices,
+        [-ground_w, -0.05, -10.0],
+        [-9.0, -0.05, -10.0],
+        [-9.0, -0.05, 360.0],
+        [-ground_w, -0.05, 360.0],
+        [0.0, 1.0, 0.0],
+        0.5,
+        0.0,
     );
     cyber_add_quad(
-        &mut vertices, &mut indices,
-        [9.0, -0.05, -10.0], [ground_w, -0.05, -10.0],
-        [ground_w, -0.05, 360.0], [9.0, -0.05, 360.0],
-        [0.0, 1.0, 0.0], 0.5, 0.0
+        &mut vertices,
+        &mut indices,
+        [9.0, -0.05, -10.0],
+        [ground_w, -0.05, -10.0],
+        [ground_w, -0.05, 360.0],
+        [9.0, -0.05, 360.0],
+        [0.0, 1.0, 0.0],
+        0.5,
+        0.0,
     );
 
     // 2. 3D Highway Roadbed, Curbs & Concrete K-Rails
@@ -1481,53 +2333,99 @@ pub(crate) fn generate_synthwave_racer_mesh() -> (Vec<Vertex>, Vec<u32>) {
 
         // Asphalt (mat = 0.0)
         cyber_add_quad(
-            &mut vertices, &mut indices,
-            [-road_half_w, 0.0, z0], [road_half_w, 0.0, z0],
-            [road_half_w, 0.0, z1], [-road_half_w, 0.0, z1],
-            [0.0, 1.0, 0.0], 0.0, z0
+            &mut vertices,
+            &mut indices,
+            [-road_half_w, 0.0, z0],
+            [road_half_w, 0.0, z0],
+            [road_half_w, 0.0, z1],
+            [-road_half_w, 0.0, z1],
+            [0.0, 1.0, 0.0],
+            0.0,
+            z0,
         );
 
         // Curbs (mat = 1.0)
         cyber_add_quad(
-            &mut vertices, &mut indices,
-            [-road_half_w - 0.8, 0.15, z0], [-road_half_w, 0.0, z0],
-            [-road_half_w, 0.0, z1], [-road_half_w - 0.8, 0.15, z1],
-            [0.2, 0.98, 0.0], 1.0, z0
+            &mut vertices,
+            &mut indices,
+            [-road_half_w - 0.8, 0.15, z0],
+            [-road_half_w, 0.0, z0],
+            [-road_half_w, 0.0, z1],
+            [-road_half_w - 0.8, 0.15, z1],
+            [0.2, 0.98, 0.0],
+            1.0,
+            z0,
         );
         cyber_add_quad(
-            &mut vertices, &mut indices,
-            [road_half_w, 0.0, z0], [road_half_w + 0.8, 0.15, z0],
-            [road_half_w + 0.8, 0.15, z1], [road_half_w, 0.0, z1],
-            [-0.2, 0.98, 0.0], 1.0, z0
+            &mut vertices,
+            &mut indices,
+            [road_half_w, 0.0, z0],
+            [road_half_w + 0.8, 0.15, z0],
+            [road_half_w + 0.8, 0.15, z1],
+            [road_half_w, 0.0, z1],
+            [-0.2, 0.98, 0.0],
+            1.0,
+            z0,
         );
 
         // Concrete K-Rail Barriers (mat = 2.0)
-        cyber_add_box(&mut vertices, &mut indices, [-road_half_w - 1.2, 0.45, (z0 + z1) / 2.0], [0.35, 0.75, seg_len], 0.0, 2.0);
-        cyber_add_box(&mut vertices, &mut indices, [road_half_w + 1.2, 0.45, (z0 + z1) / 2.0], [0.35, 0.75, seg_len], 0.0, 2.0);
+        cyber_add_box(
+            &mut vertices,
+            &mut indices,
+            [-road_half_w - 1.2, 0.45, (z0 + z1) / 2.0],
+            [0.35, 0.75, seg_len],
+            0.0,
+            2.0,
+        );
+        cyber_add_box(
+            &mut vertices,
+            &mut indices,
+            [road_half_w + 1.2, 0.45, (z0 + z1) / 2.0],
+            [0.35, 0.75, seg_len],
+            0.0,
+            2.0,
+        );
     }
 
     // 3. Embedded 3D Low-Poly Supercar Model (.OBJ)
     load_obj_mesh(
-        &mut vertices, &mut indices,
+        &mut vertices,
+        &mut indices,
         include_str!("assets/models/supercar_f40.obj"),
         [0.0, 0.40, 5.2],
         [1.0, 1.0, 1.0],
         0.0,
-        3.0
+        3.0,
     );
 
     // 3b. Solid Supercar Underbody Floor Pan & Interior Cabin Firewall (mat = 8.0 carbon)
-    cyber_add_box(&mut vertices, &mut indices, [0.0, 0.35, 5.2], [1.70, 0.04, 3.8], 0.0, 8.0);
-    cyber_add_box(&mut vertices, &mut indices, [0.0, 0.44, 4.8], [1.30, 0.16, 1.8], 0.0, 8.0);
+    cyber_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, 0.35, 5.2],
+        [1.70, 0.04, 3.8],
+        0.0,
+        8.0,
+    );
+    cyber_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, 0.44, 4.8],
+        [1.30, 0.16, 1.8],
+        0.0,
+        8.0,
+    );
 
     // 4. Roadside Streetlamps & Palm Trees (.OBJ Meshes)
     let palm_template = parse_obj_template(include_str!("assets/models/palm_tree.obj"), 10.0);
-    let streetlamp_template = parse_obj_template(include_str!("assets/models/streetlamp.obj"), 11.0);
+    let streetlamp_template =
+        parse_obj_template(include_str!("assets/models/streetlamp.obj"), 11.0);
     for i in 0..12 {
         let pz = 18.0 + (i as f32) * 26.0;
         // Left Palm Tree
         instantiate_obj_template(
-            &mut vertices, &mut indices,
+            &mut vertices,
+            &mut indices,
             &palm_template,
             [-road_half_w - 3.8, 0.0, pz],
             [1.0, 1.0, 1.0],
@@ -1535,7 +2433,8 @@ pub(crate) fn generate_synthwave_racer_mesh() -> (Vec<Vertex>, Vec<u32>) {
         );
         // Right Cobra-Head Streetlamp
         instantiate_obj_template(
-            &mut vertices, &mut indices,
+            &mut vertices,
+            &mut indices,
             &streetlamp_template,
             [road_half_w + 2.4, 0.0, pz + 13.0],
             [1.0, 1.0, 1.0],
@@ -1544,14 +2443,16 @@ pub(crate) fn generate_synthwave_racer_mesh() -> (Vec<Vertex>, Vec<u32>) {
     }
 
     // 5. Distant Horizon Skyscrapers (.OBJ Meshes)
-    let skyscraper_template = parse_obj_template(include_str!("assets/models/skyscraper.obj"), 12.0);
+    let skyscraper_template =
+        parse_obj_template(include_str!("assets/models/skyscraper.obj"), 12.0);
     for i in 0..16 {
         let ang = (i as f32) * 0.38 - 3.0;
         let tx = ang * 46.0;
         let tz = 260.0 + ((i * 7) % 5) as f32 * 14.0;
         let s = 0.75 + ((i * 3) % 4) as f32 * 0.15;
         instantiate_obj_template(
-            &mut vertices, &mut indices,
+            &mut vertices,
+            &mut indices,
             &skyscraper_template,
             [tx, -2.0, tz],
             [s, s, s],
@@ -1566,12 +2467,13 @@ pub(crate) fn generate_vumeter_rack_mesh() -> (Vec<Vertex>, Vec<u32>) {
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
     load_obj_mesh(
-        &mut vertices, &mut indices,
+        &mut vertices,
+        &mut indices,
         include_str!("assets/models/vumeter_rack.obj"),
         [0.0, 0.0, 0.0],
         [1.0, 1.0, 1.0],
         0.0,
-        1.0
+        1.0,
     );
     (vertices, indices)
 }
@@ -1580,12 +2482,13 @@ pub(crate) fn generate_neon_corridor_mesh() -> (Vec<Vertex>, Vec<u32>) {
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
     load_obj_mesh(
-        &mut vertices, &mut indices,
+        &mut vertices,
+        &mut indices,
         include_str!("assets/models/neon_corridor_frames.obj"),
         [0.0, 0.0, 0.0],
         [1.0, 1.0, 1.0],
         0.0,
-        0.0
+        0.0,
     );
     (vertices, indices)
 }
@@ -1593,7 +2496,7 @@ pub(crate) fn generate_neon_corridor_mesh() -> (Vec<Vertex>, Vec<u32>) {
 pub(crate) fn generate_storm_rain_volume_mesh() -> (Vec<Vertex>, Vec<u32>) {
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
-    
+
     // Pure 3D Instanced Falling Raindrops across viewing frustum (mat = 3.0)
     for i in 0..2500 {
         let seed = (i as f32) * 1.618_034;
@@ -1602,17 +2505,20 @@ pub(crate) fn generate_storm_rain_volume_mesh() -> (Vec<Vertex>, Vec<u32>) {
         let rz = 2.0 + ((seed * 43.7).fract()) * 110.0;
         let drop_len = 0.55;
         cyber_add_quad(
-            &mut vertices, &mut indices,
-            [rx - 0.015, ry, rz], [rx + 0.015, ry, rz],
-            [rx + 0.015, ry + drop_len, rz], [rx - 0.015, ry + drop_len, rz],
-            [0.0, 0.0, 1.0], 3.0, ry
+            &mut vertices,
+            &mut indices,
+            [rx - 0.015, ry, rz],
+            [rx + 0.015, ry, rz],
+            [rx + 0.015, ry + drop_len, rz],
+            [rx - 0.015, ry + drop_len, rz],
+            [0.0, 0.0, 1.0],
+            3.0,
+            ry,
         );
     }
 
     (vertices, indices)
 }
-
-
 
 impl VulkanEngine {
     pub async fn new(window: Arc<Window>) -> Self {
@@ -1629,13 +2535,14 @@ impl VulkanEngine {
 
         let surface = instance.create_surface(window.clone()).unwrap();
 
-        let adapter = instance.request_adapter(
-            &wgpu::RequestAdapterOptions {
+        let adapter = instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
-            },
-        ).await.unwrap();
+            })
+            .await
+            .unwrap();
 
         let mut required_features = wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
         let supports_timestamps = if cfg!(target_os = "android") {
@@ -1649,7 +2556,10 @@ impl VulkanEngine {
         if supports_timestamps {
             required_features |= wgpu::Features::TIMESTAMP_QUERY;
         }
-        if adapter.features().contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM) {
+        if adapter
+            .features()
+            .contains(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM)
+        {
             required_features |= wgpu::Features::TEXTURE_FORMAT_16BIT_NORM;
         }
         let pipeline_cache_enabled = std::env::var("RUSTTRACKER_PIPELINE_CACHE")
@@ -1659,15 +2569,16 @@ impl VulkanEngine {
             required_features |= wgpu::Features::PIPELINE_CACHE;
         }
 
-        let (device, queue) = adapter.request_device(
-            &wgpu::DeviceDescriptor {
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
                 label: None,
                 required_features,
                 required_limits: wgpu::Limits::default(),
                 memory_hints: wgpu::MemoryHints::default(),
                 ..Default::default()
-            },
-        ).await.unwrap();
+            })
+            .await
+            .unwrap();
 
         device.on_uncaptured_error(std::sync::Arc::new(|e: wgpu::Error| {
             eprintln!("WGPU VALIDATION ERROR: {:?}", e);
@@ -1698,7 +2609,9 @@ impl VulkanEngine {
         //
         // Pipeline caching is enabled by default to eliminate shader recompilation hitches,
         // with opt-out via RUSTTRACKER_PIPELINE_CACHE=0.
-        let pipeline_cache = if pipeline_cache_enabled && device.features().contains(wgpu::Features::PIPELINE_CACHE) {
+        let pipeline_cache = if pipeline_cache_enabled
+            && device.features().contains(wgpu::Features::PIPELINE_CACHE)
+        {
             Some(unsafe {
                 device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
                     label: Some("RustTracker Pipeline Cache"),
@@ -1713,7 +2626,9 @@ impl VulkanEngine {
         let pipeline_cache_ref = pipeline_cache.as_ref();
 
         let surface_caps = surface.get_capabilities(&adapter);
-        let surface_format = surface_caps.formats.iter()
+        let surface_format = surface_caps
+            .formats
+            .iter()
             .copied()
             .find(|f| f.is_srgb())
             .unwrap_or(surface_caps.formats[0]);
@@ -1722,14 +2637,32 @@ impl VulkanEngine {
         let present_mode = if let Ok(mode_str) = std::env::var("RUSTTRACKER_PRESENT_MODE") {
             match mode_str.to_lowercase().as_str() {
                 "novsync" | "immediate" => wgpu::PresentMode::AutoNoVsync,
-                "mailbox" if surface_caps.present_modes.contains(&wgpu::PresentMode::Mailbox) => wgpu::PresentMode::Mailbox,
-                "fiforelaxed" | "adaptive" if surface_caps.present_modes.contains(&wgpu::PresentMode::FifoRelaxed) => wgpu::PresentMode::FifoRelaxed,
+                "mailbox"
+                    if surface_caps
+                        .present_modes
+                        .contains(&wgpu::PresentMode::Mailbox) =>
+                {
+                    wgpu::PresentMode::Mailbox
+                }
+                "fiforelaxed" | "adaptive"
+                    if surface_caps
+                        .present_modes
+                        .contains(&wgpu::PresentMode::FifoRelaxed) =>
+                {
+                    wgpu::PresentMode::FifoRelaxed
+                }
                 "fifo" => wgpu::PresentMode::Fifo,
                 _ => wgpu::PresentMode::AutoVsync,
             }
-        } else if surface_caps.present_modes.contains(&wgpu::PresentMode::AutoVsync) {
+        } else if surface_caps
+            .present_modes
+            .contains(&wgpu::PresentMode::AutoVsync)
+        {
             wgpu::PresentMode::AutoVsync
-        } else if surface_caps.present_modes.contains(&wgpu::PresentMode::FifoRelaxed) {
+        } else if surface_caps
+            .present_modes
+            .contains(&wgpu::PresentMode::FifoRelaxed)
+        {
             wgpu::PresentMode::FifoRelaxed
         } else {
             wgpu::PresentMode::Fifo
@@ -1747,8 +2680,6 @@ impl VulkanEngine {
         };
         surface.configure(&device, &config);
 
-
-
         let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Audio Uniform Buffer"),
             size: std::mem::size_of::<AudioUniforms>() as u64,
@@ -1759,7 +2690,9 @@ impl VulkanEngine {
         let gpu_spectrum_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("GPU FFT Spectrum Buffer"),
             size: 32 * 1024 * 8, // 32 channels, 1024 bins, vec2<f32>
-            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
         let waveform_storage_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -1771,7 +2704,11 @@ impl VulkanEngine {
 
         let history_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Heatmap History Texture"),
-            size: wgpu::Extent3d { width: 256, height: 1024, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: 256,
+                height: 1024,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -1783,7 +2720,11 @@ impl VulkanEngine {
 
         let fire_grid_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Fire Grid Texture"),
-            size: wgpu::Extent3d { width: 1024, height: 576, depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: 1024,
+                height: 576,
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -1867,7 +2808,7 @@ impl VulkanEngine {
                         min_binding_size: None,
                     },
                     count: None,
-                }
+                },
             ],
             label: Some("audio_bind_group_layout"),
         });
@@ -1898,63 +2839,71 @@ impl VulkanEngine {
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: ferrofluidsim_grid.as_entire_binding(),
-                }
+                },
             ],
             label: Some("audio_bind_group"),
         });
 
-        let smoke_render_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Smoke Render Layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
+        let smoke_render_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Smoke Render Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D3,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
+        let camera_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Camera Bind Group Layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D3,
-                        multisampled: false,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
                     },
                     count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-            ],
-        });
+                }],
+            });
 
-        let camera_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Camera Bind Group Layout"),
-            entries: &[wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Buffer {
-                    ty: wgpu::BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            }],
-        });
+        let render_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Render Pipeline Layout"),
+                bind_group_layouts: &[Some(&bind_group_layout), Some(&smoke_render_layout)],
+                immediate_size: 0,
+            });
 
-        let render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Render Pipeline Layout"),
-            bind_group_layouts: &[Some(&bind_group_layout), Some(&smoke_render_layout)],
-            immediate_size: 0,
-        });
+        let render_pipeline_layout_3d =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("3D Render Pipeline Layout"),
+                bind_group_layouts: &[
+                    Some(&bind_group_layout),
+                    Some(&smoke_render_layout),
+                    Some(&camera_bind_group_layout),
+                ],
+                immediate_size: 0,
+            });
 
-        let render_pipeline_layout_3d = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("3D Render Pipeline Layout"),
-            bind_group_layouts: &[Some(&bind_group_layout), Some(&smoke_render_layout), Some(&camera_bind_group_layout)],
-            immediate_size: 0,
-        });
-
-        let biolum_render_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Biolum Render Layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
+        let biolum_render_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Biolum Render Layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
                     binding: 0,
                     visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
@@ -1963,20 +2912,20 @@ impl VulkanEngine {
                         min_binding_size: None,
                     },
                     count: None,
-                },
-            ],
-        });
+                }],
+            });
 
-        let biolum_render_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Biolum Render Pipeline Layout"),
-            bind_group_layouts: &[
-                Some(&bind_group_layout),
-                Some(&smoke_render_layout),
-                Some(&camera_bind_group_layout),
-                Some(&biolum_render_bind_group_layout),
-            ],
-            immediate_size: 0,
-        });
+        let biolum_render_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Biolum Render Pipeline Layout"),
+                bind_group_layouts: &[
+                    Some(&bind_group_layout),
+                    Some(&smoke_render_layout),
+                    Some(&camera_bind_group_layout),
+                    Some(&biolum_render_bind_group_layout),
+                ],
+                immediate_size: 0,
+            });
 
         // Shared shader headers — included at compile time, resolved via simple string replacement.
         // This is the single source of truth for AudioUniforms layout and glyph font.
@@ -2021,16 +2970,19 @@ impl VulkanEngine {
             }
         };
 
-        let shader_sources: Vec<String> = crate::state::VISUALIZERS.iter().map(|v| resolve_shader_includes(get_shader_source(v.id))).collect();
+        let shader_sources: Vec<String> = crate::state::VISUALIZERS
+            .iter()
+            .map(|v| resolve_shader_includes(get_shader_source(v.id)))
+            .collect();
 
         let mut render_pipelines = Vec::new();
-        
+
         let scope_fallback = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let fallback_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Fallback Shader"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&shader_sources[0])),
         });
-        
+
         let fallback_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Fallback Render Pipeline"),
             layout: Some(&render_pipeline_layout),
@@ -2059,13 +3011,13 @@ impl VulkanEngine {
                 unclipped_depth: false,
                 conservative: false,
             },
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: Some(true),
-                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
             multisample: wgpu::MultisampleState {
                 count: 1,
                 mask: !0,
@@ -2075,18 +3027,18 @@ impl VulkanEngine {
             cache: pipeline_cache_ref,
         });
         let _ = scope_fallback.pop().await;
-        
+
         let mut lamp_pipeline = fallback_pipeline.clone();
 
         for (i, source) in shader_sources.iter().enumerate() {
             let vis_def = &crate::state::VISUALIZERS[i];
             let scope_main = device.push_error_scope(wgpu::ErrorFilter::Validation);
-            
+
             let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some(&format!("Shader {}", i)),
                 source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(source.as_str())),
             });
-            
+
             let (layout, vertex_buffers, primitive, vs_entry) = if vis_def.id == 20 {
                 (
                     &biolum_render_pipeline_layout,
@@ -2100,7 +3052,7 @@ impl VulkanEngine {
                         unclipped_depth: false,
                         conservative: false,
                     },
-                    "vs_main_3d"
+                    "vs_main_3d",
                 )
             } else {
                 match vis_def.pipeline_type {
@@ -2116,7 +3068,7 @@ impl VulkanEngine {
                             unclipped_depth: false,
                             conservative: false,
                         },
-                        "vs_main"
+                        "vs_main",
                     ),
                     crate::state::PipelineType::Mesh3D { .. } => (
                         &render_pipeline_layout_3d,
@@ -2130,11 +3082,11 @@ impl VulkanEngine {
                             unclipped_depth: false,
                             conservative: false,
                         },
-                        "vs_main_3d"
+                        "vs_main_3d",
                     ),
                 }
             };
-            
+
             let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some(&format!("Render Pipeline {}", i)),
                 layout: Some(layout),
@@ -2170,10 +3122,13 @@ impl VulkanEngine {
                 multiview_mask: None,
                 cache: pipeline_cache_ref,
             });
-            
+
             let error_future = scope_main.pop();
-            let _ = device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None });
-            
+            let _ = device.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            });
+
             if let Some(error) = error_future.await {
                 eprintln!("WGSL compilation error in visualizer {}: {:?}", i, error);
                 render_pipelines.push(fallback_pipeline.clone());
@@ -2229,65 +3184,73 @@ impl VulkanEngine {
         }
 
         // --- Video Pipeline ---
-        let video_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Video Bind Group Layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry { // Y
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
+        let video_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Video Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        // Y
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry { // U
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
+                    wgpu::BindGroupLayoutEntry {
+                        // U
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry { // V
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                        view_dimension: wgpu::TextureViewDimension::D2,
-                        multisampled: false,
+                    wgpu::BindGroupLayoutEntry {
+                        // V
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry { // Sampler
-                    binding: 3,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry { // Params
-                    binding: 4,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    wgpu::BindGroupLayoutEntry {
+                        // Sampler
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
                     },
-                    count: None,
-                },
-            ],
-        });
+                    wgpu::BindGroupLayoutEntry {
+                        // Params
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
 
-        let video_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Video Pipeline Layout"),
-            bind_group_layouts: &[Some(&video_bind_group_layout)],
-            immediate_size: 0,
-        });
+        let video_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Video Pipeline Layout"),
+                bind_group_layouts: &[Some(&video_bind_group_layout)],
+                immediate_size: 0,
+            });
 
-        let video_shader = device.create_shader_module(wgpu::include_wgsl!("shaders/vis_video.wgsl"));
+        let video_shader =
+            device.create_shader_module(wgpu::include_wgsl!("shaders/vis_video.wgsl"));
         let video_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Video Render Pipeline"),
             layout: Some(&video_pipeline_layout),
@@ -2379,7 +3342,8 @@ impl VulkanEngine {
 
         let solid_black_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Solid Black Shader"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(r#"
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(
+                r#"
                 struct VertexOutput {
                     @builtin(position) clip_position: vec4<f32>,
                 }
@@ -2395,7 +3359,8 @@ impl VulkanEngine {
                 fn fs_main() -> @location(0) vec4<f32> {
                     return vec4<f32>(0.0, 0.0, 0.0, 1.0);
                 }
-            "#)),
+            "#,
+            )),
         });
 
         let clear_black_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -2446,7 +3411,8 @@ impl VulkanEngine {
 
         let solid_biolum_bg_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Solid Biolum BG Shader"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(r#"
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(
+                r#"
                 struct VertexOutput {
                     @builtin(position) clip_position: vec4<f32>,
                     @location(0) ndc: vec2<f32>,
@@ -2456,11 +3422,11 @@ impl VulkanEngine {
                     var out: VertexOutput;
                     let x = f32((in_vertex_index << 1u) & 2u) * 2.0 - 1.0;
                     let y = f32(in_vertex_index & 2u) * 2.0 - 1.0;
-                    
+
                     let ndc = vec2<f32>(x, y);
                     let r2 = dot(ndc, ndc);
                     let distorted_ndc = ndc * (1.0 + r2 * 0.055);
-                    
+
                     out.clip_position = vec4<f32>(distorted_ndc, 1.0, 1.0);
                     out.ndc = distorted_ndc;
                     return out;
@@ -2472,10 +3438,11 @@ impl VulkanEngine {
                     }
                     let border_dist = min(1.0 - abs(in.ndc.x), 1.0 - abs(in.ndc.y));
                     let bezel_mask = smoothstep(0.0, 0.03, border_dist);
-                    
+
                     return vec4<f32>(vec3<f32>(0.001, 0.003, 0.008) * bezel_mask, 1.0);
                 }
-            "#)),
+            "#,
+            )),
         });
 
         let biolum_bg_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -2518,7 +3485,8 @@ impl VulkanEngine {
             cache: pipeline_cache_ref,
         });
 
-        let crt_background_shader_src = resolve_shader_includes(r#"
+        let crt_background_shader_src = resolve_shader_includes(
+            r#"
             // INCLUDE: common
 
             @group(0) @binding(0) var<uniform> audio: AudioUniforms;
@@ -2544,34 +3512,34 @@ impl VulkanEngine {
                 let crt_uv = in.uv * 2.0 - 1.0;
                 let r2 = dot(crt_uv, crt_uv);
                 let distorted_uv = crt_uv * (1.0 + r2 * 0.055);
-                
+
                 if (abs(distorted_uv.x) > 1.0 || abs(distorted_uv.y) > 1.0) {
                     return vec4<f32>(0.0, 0.0, 0.0, 1.0);
                 }
-                
+
                 let border_dist = min(1.0 - abs(distorted_uv.x), 1.0 - abs(distorted_uv.y));
                 let bezel_mask = smoothstep(0.0, 0.03, border_dist);
-                
+
                 var aspect = 1.7777;
                 let dy = abs(dpdy(in.uv.y));
                 let dx = abs(dpdx(in.uv.x));
                 if (dx > 0.0001 && dy > 0.0001) { aspect = dy / dx; }
                 let p = vec2<f32>(distorted_uv.x * aspect, -distorted_uv.y);
-                
+
                 let ro = vec3<f32>(0.0, 0.0, 7.2);
                 let rd = normalize(vec3<f32>(-p.x, p.y, -1.5));
-                
+
                 let bass = clamp(audio.spectrum[0].x + audio.spectrum[1].x + audio.spectrum[2].x, 0.0, 1.0);
                 let base_green = vec3<f32>(0.02, 1.0, 0.38);
                 let neon_green = mix(base_green, vec3<f32>(1.0, 1.0, 1.0), clamp(bass * 0.45, 0.0, 1.0));
-                
+
                 var t_floor = -1.0;
                 if (rd.y < -0.001) { t_floor = -3.2 / rd.y; }
                 var t_ceil = -1.0;
                 if (rd.y > 0.001) { t_ceil = 3.2 / rd.y; }
-                
+
                 let x_spacing = 1.35;
-                
+
                 var grid_intensity = 0.0;
                 if (t_floor > 0.0 && t_floor < 25.0) {
                     let p_floor = ro + rd * t_floor;
@@ -2591,124 +3559,129 @@ impl VulkanEngine {
                     let fade = smoothstep(25.0, 4.0, t_ceil);
                     grid_intensity = grid_intensity + grid_line * fade;
                 }
-                
+
                 var final_color = neon_green * grid_intensity * 0.35;
-                
+
                 let center_dist = length(distorted_uv);
                 let bg_glow = vec3<f32>(0.005, 0.038, 0.016) * (1.0 - center_dist * 0.55);
                 final_color = final_color + bg_glow;
-                
+
                 final_color = final_color * bezel_mask;
-                
+
                 let scanline = 0.86 + 0.14 * cos(in.clip_position.y * 3.14159);
                 final_color = final_color * scanline;
-                
+
                 let flicker = 0.98 + 0.02 * sin(audio.time * 115.0);
                 final_color = final_color * flicker;
-                
+
                 let noise_val = hash21(in.clip_position.xy + fract(audio.smooth_time) * 149.0);
                 let static_noise = noise_val * 0.022 * bezel_mask;
                 final_color = final_color + vec3<f32>(static_noise);
-                
+
                 var final_col = (final_color * (2.51 * final_color + 0.03)) / (final_color * (2.43 * final_color + 0.59) + 0.14);
                 final_col = max(final_col, vec3<f32>(0.0));
-                
+
                 return vec4<f32>(final_col, 1.0);
             }
-        "#);
+        "#,
+        );
 
         let crt_background_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("CRT Background Shader"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(crt_background_shader_src)),
         });
 
-        let crt_background_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("CRT Background Pipeline"),
-            layout: Some(&render_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &crt_background_shader,
-                entry_point: Some("vs_background"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &crt_background_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Always),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: pipeline_cache_ref,
-        });
+        let crt_background_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("CRT Background Pipeline"),
+                layout: Some(&render_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &crt_background_shader,
+                    entry_point: Some("vs_background"),
+                    buffers: &[],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &crt_background_shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(wgpu::CompareFunction::Always),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: pipeline_cache_ref,
+            });
 
-        let synthwave_sky_shader_src = resolve_shader_includes(include_str!("shaders/vis_synthwave_racer_sky.wgsl"));
+        let synthwave_sky_shader_src =
+            resolve_shader_includes(include_str!("shaders/vis_synthwave_racer_sky.wgsl"));
         let synthwave_sky_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Synthwave Sky Shader"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(synthwave_sky_shader_src)),
         });
 
-        let synthwave_sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Synthwave Sky Pipeline"),
-            layout: Some(&render_pipeline_layout),
-            vertex: wgpu::VertexState {
-                module: &synthwave_sky_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &synthwave_sky_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Always),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: pipeline_cache_ref,
-        });
+        let synthwave_sky_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Synthwave Sky Pipeline"),
+                layout: Some(&render_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &synthwave_sky_shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &synthwave_sky_shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::Always),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: pipeline_cache_ref,
+            });
 
-        let vumeters_bg_shader_src = resolve_shader_includes(include_str!("shaders/vis_vumeters_bg.wgsl"));
+        let vumeters_bg_shader_src =
+            resolve_shader_includes(include_str!("shaders/vis_vumeters_bg.wgsl"));
         let vumeters_bg_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("VU Meters Background Shader"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(vumeters_bg_shader_src)),
@@ -2800,7 +3773,8 @@ impl VulkanEngine {
             cache: pipeline_cache_ref,
         });
 
-        let storm_sky_shader_src = resolve_shader_includes(include_str!("shaders/vis_storm_sky.wgsl"));
+        let storm_sky_shader_src =
+            resolve_shader_includes(include_str!("shaders/vis_storm_sky.wgsl"));
         let storm_sky_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Storm Sky Shader"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(storm_sky_shader_src)),
@@ -2851,7 +3825,11 @@ impl VulkanEngine {
         // ------------------------------------------------------------------
         let smoke_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Neon Smoke Texture"),
-            size: wgpu::Extent3d { width: 64, height: 64, depth_or_array_layers: 64 },
+            size: wgpu::Extent3d {
+                width: 64,
+                height: 64,
+                depth_or_array_layers: 64,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D3,
@@ -2859,9 +3837,9 @@ impl VulkanEngine {
             usage: wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::TEXTURE_BINDING,
             view_formats: &[],
         });
-        
+
         let smoke_texture_view = smoke_texture.create_view(&wgpu::TextureViewDescriptor::default());
-        
+
         let smoke_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Neon Smoke Sampler"),
             address_mode_u: wgpu::AddressMode::ClampToEdge,
@@ -2872,7 +3850,7 @@ impl VulkanEngine {
             mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
-        
+
         let smoke_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Smoke Params Buffer"),
             size: 16,
@@ -2880,38 +3858,45 @@ impl VulkanEngine {
             mapped_at_creation: false,
         });
 
-        let smoke_compute_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Smoke Compute Layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::StorageTexture {
-                        access: wgpu::StorageTextureAccess::WriteOnly,
-                        format: wgpu::TextureFormat::Rgba16Float,
-                        view_dimension: wgpu::TextureViewDimension::D3,
+        let smoke_compute_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Smoke Compute Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format: wgpu::TextureFormat::Rgba16Float,
+                            view_dimension: wgpu::TextureViewDimension::D3,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-            ],
-        });
+                ],
+            });
 
         let smoke_compute_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Smoke Compute Bind Group"),
             layout: &smoke_compute_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&smoke_texture_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: smoke_params_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&smoke_texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: smoke_params_buffer.as_entire_binding(),
+                },
             ],
         });
 
@@ -2921,34 +3906,48 @@ impl VulkanEngine {
             label: Some("Smoke Render Bind Group"),
             layout: &smoke_render_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&smoke_texture_view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&smoke_sampler) },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&smoke_texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&smoke_sampler),
+                },
             ],
         });
 
         let smoke_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Neon Smoke Compute Shader"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!("shaders/vis_neon_smoke_cs.wgsl"))),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(include_str!(
+                "shaders/vis_neon_smoke_cs.wgsl"
+            ))),
         });
 
-        let smoke_compute_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Smoke Compute Pipeline Layout"),
-            bind_group_layouts: &[Some(&smoke_compute_layout)],
-            immediate_size: 0,
-        });
+        let smoke_compute_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Smoke Compute Pipeline Layout"),
+                bind_group_layouts: &[Some(&smoke_compute_layout)],
+                immediate_size: 0,
+            });
 
-        let smoke_compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Smoke Compute Pipeline"),
-            layout: Some(&smoke_compute_pipeline_layout),
-            module: &smoke_shader,
-            entry_point: Some("cs_main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: pipeline_cache_ref,
-        });
+        let smoke_compute_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Smoke Compute Pipeline"),
+                layout: Some(&smoke_compute_pipeline_layout),
+                module: &smoke_shader,
+                entry_point: Some("cs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: pipeline_cache_ref,
+            });
 
         let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("Depth Texture"),
-            size: wgpu::Extent3d { width: config.width.max(1), height: config.height.max(1), depth_or_array_layers: 1 },
+            size: wgpu::Extent3d {
+                width: config.width.max(1),
+                height: config.height.max(1),
+                depth_or_array_layers: 1,
+            },
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
@@ -2958,10 +3957,14 @@ impl VulkanEngine {
         });
         let depth_texture_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let egui_renderer = egui_wgpu::Renderer::new(&device, config.format, egui_wgpu::RendererOptions {
-            depth_stencil_format: None,
-            ..Default::default()
-        });
+        let egui_renderer = egui_wgpu::Renderer::new(
+            &device,
+            config.format,
+            egui_wgpu::RendererOptions {
+                depth_stencil_format: None,
+                ..Default::default()
+            },
+        );
 
         // --- Fire Compute Pipeline ---
         let fire_grid_size = 1024 * 576 * 4; // 1024 × 576 × f32
@@ -2990,21 +3993,58 @@ impl VulkanEngine {
             mapped_at_creation: false,
         });
 
-
-        let heatmap_compute_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("heatmap_compute_layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
-                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::StorageTexture { access: wgpu::StorageTextureAccess::WriteOnly, format: wgpu::TextureFormat::R32Float, view_dimension: wgpu::TextureViewDimension::D2 }, count: None },
-                wgpu::BindGroupLayoutEntry { binding: 4, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
-            ],
-        });
+        let heatmap_compute_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("heatmap_compute_layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format: wgpu::TextureFormat::R32Float,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
         let heatmap_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("heatmap_bind_group"), layout: &heatmap_compute_layout,
+            label: Some("heatmap_bind_group"),
+            layout: &heatmap_compute_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: uniform_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&history_view) },
-                wgpu::BindGroupEntry { binding: 4, resource: gpu_spectrum_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&history_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: gpu_spectrum_buffer.as_entire_binding(),
+                },
             ],
         });
         let heatmap_source = resolve_shader_includes(include_str!("shaders/heatmap_compute.wgsl"));
@@ -3012,106 +4052,248 @@ impl VulkanEngine {
             label: Some("Heatmap Compute Shader"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&heatmap_source)),
         });
-        let heatmap_compute_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("heatmap_compute_layout"), bind_group_layouts: &[Some(&heatmap_compute_layout)], immediate_size: 0,
-        });
-        let heatmap_compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Heatmap Compute Pipeline"), layout: Some(&heatmap_compute_pipeline_layout), module: &heatmap_compute_shader, entry_point: Some("main"), compilation_options: wgpu::PipelineCompilationOptions::default(), cache: pipeline_cache_ref,
-        });
-        let fire_compute_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("fire_compute_layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
-                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None },
-                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None },
-                wgpu::BindGroupLayoutEntry { binding: 3, visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
-                wgpu::BindGroupLayoutEntry { binding: 4, visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: true }, has_dynamic_offset: false, min_binding_size: None }, count: None },
-            ],
-        });
+        let heatmap_compute_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("heatmap_compute_layout"),
+                bind_group_layouts: &[Some(&heatmap_compute_layout)],
+                immediate_size: 0,
+            });
+        let heatmap_compute_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Heatmap Compute Pipeline"),
+                layout: Some(&heatmap_compute_pipeline_layout),
+                module: &heatmap_compute_shader,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: pipeline_cache_ref,
+            });
+        let fire_compute_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("fire_compute_layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
 
         let fire_bind_group_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("fire_bg_a"), layout: &fire_compute_layout,
+            label: Some("fire_bg_a"),
+            layout: &fire_compute_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: fire_buffer_a.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: fire_buffer_b.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: fire_coal_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: fire_params_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: gpu_spectrum_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: fire_buffer_a.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: fire_buffer_b.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: fire_coal_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: fire_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: gpu_spectrum_buffer.as_entire_binding(),
+                },
             ],
         });
         let fire_bind_group_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("fire_bg_b"), layout: &fire_compute_layout,
+            label: Some("fire_bg_b"),
+            layout: &fire_compute_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: fire_buffer_b.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: fire_buffer_a.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: fire_coal_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 3, resource: fire_params_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 4, resource: gpu_spectrum_buffer.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: fire_buffer_b.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: fire_buffer_a.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: fire_coal_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: fire_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: gpu_spectrum_buffer.as_entire_binding(),
+                },
             ],
         });
 
-        let fire_compute_shader = device.create_shader_module(wgpu::include_wgsl!("shaders/fire_compute.wgsl"));
-        let firesim_compute_shader = device.create_shader_module(wgpu::include_wgsl!("shaders/firesim_compute.wgsl"));
-        let fire_compute_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("fire_compute_layout"),
-            bind_group_layouts: &[Some(&fire_compute_layout)],
-            immediate_size: 0,
-        });
-        let fire_compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Fire Compute Pipeline"),
-            layout: Some(&fire_compute_pipeline_layout),
-            module: &fire_compute_shader,
-            entry_point: Some("main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: pipeline_cache_ref,
-        });
-        let firesim_compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("FireSim Compute Pipeline"),
-            layout: Some(&fire_compute_pipeline_layout),
-            module: &firesim_compute_shader,
-            entry_point: Some("main"),
-            compilation_options: wgpu::PipelineCompilationOptions::default(),
-            cache: pipeline_cache_ref,
-        });
+        let fire_compute_shader =
+            device.create_shader_module(wgpu::include_wgsl!("shaders/fire_compute.wgsl"));
+        let firesim_compute_shader =
+            device.create_shader_module(wgpu::include_wgsl!("shaders/firesim_compute.wgsl"));
+        let fire_compute_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("fire_compute_layout"),
+                bind_group_layouts: &[Some(&fire_compute_layout)],
+                immediate_size: 0,
+            });
+        let fire_compute_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Fire Compute Pipeline"),
+                layout: Some(&fire_compute_pipeline_layout),
+                module: &fire_compute_shader,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: pipeline_cache_ref,
+            });
+        let firesim_compute_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FireSim Compute Pipeline"),
+                layout: Some(&fire_compute_pipeline_layout),
+                module: &firesim_compute_shader,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: pipeline_cache_ref,
+            });
 
-        let ferrofluidsim_compute_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("ferrofluidsim_compute_layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: false, min_binding_size: None }, count: None },
-                wgpu::BindGroupLayoutEntry { binding: 1, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None },
-                wgpu::BindGroupLayoutEntry { binding: 2, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None },
-            ],
-        });
+        let ferrofluidsim_compute_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("ferrofluidsim_compute_layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
 
         let ferrofluidsim_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("ferrofluidsim_bg"), layout: &ferrofluidsim_compute_layout,
+            label: Some("ferrofluidsim_bg"),
+            layout: &ferrofluidsim_compute_layout,
             entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: uniform_buffer.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 1, resource: ferrofluidsim_particles.as_entire_binding() },
-                wgpu::BindGroupEntry { binding: 2, resource: ferrofluidsim_grid.as_entire_binding() },
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: ferrofluidsim_particles.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: ferrofluidsim_grid.as_entire_binding(),
+                },
             ],
         });
 
-        let ferrofluidsim_source = resolve_shader_includes(include_str!("shaders/ferrofluidsim_compute.wgsl"));
-        let ferrofluidsim_compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Ferrofluid Sim Compute Shader"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&ferrofluidsim_source)),
-        });
-        let ferrofluidsim_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("ferrofluidsim_layout"), bind_group_layouts: &[Some(&ferrofluidsim_compute_layout)], immediate_size: 0,
-        });
-        
-        let ferrofluidsim_compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Ferrofluid Compute"), layout: Some(&ferrofluidsim_pipeline_layout), module: &ferrofluidsim_compute_shader, entry_point: Some("main"), compilation_options: Default::default(), cache: pipeline_cache_ref,
-        });
-        let ferrofluidsim_clear_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Ferrofluid Clear"), layout: Some(&ferrofluidsim_pipeline_layout), module: &ferrofluidsim_compute_shader, entry_point: Some("clear"), compilation_options: Default::default(), cache: pipeline_cache_ref,
-        });
+        let ferrofluidsim_source =
+            resolve_shader_includes(include_str!("shaders/ferrofluidsim_compute.wgsl"));
+        let ferrofluidsim_compute_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Ferrofluid Sim Compute Shader"),
+                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&ferrofluidsim_source)),
+            });
+        let ferrofluidsim_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("ferrofluidsim_layout"),
+                bind_group_layouts: &[Some(&ferrofluidsim_compute_layout)],
+                immediate_size: 0,
+            });
+
+        let ferrofluidsim_compute_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Ferrofluid Compute"),
+                layout: Some(&ferrofluidsim_pipeline_layout),
+                module: &ferrofluidsim_compute_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+        let ferrofluidsim_clear_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Ferrofluid Clear"),
+                layout: Some(&ferrofluidsim_pipeline_layout),
+                module: &ferrofluidsim_compute_shader,
+                entry_point: Some("clear"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
 
         // --- Bioluminescent Waves Compute & Render Setup ---
         let biolum_particles_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -3122,31 +4304,32 @@ impl VulkanEngine {
         });
         queue.write_buffer(&biolum_particles_buffer, 0, &vec![0u8; 65536 * 32]);
 
-        let biolum_compute_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("Biolum Compute Layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+        let biolum_compute_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Biolum Compute Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 1,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                },
-            ],
-        });
+                ],
+            });
 
         let biolum_compute_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Biolum Compute Bind Group"),
@@ -3163,36 +4346,37 @@ impl VulkanEngine {
             ],
         });
 
-        let biolum_compute_source = resolve_shader_includes(include_str!("shaders/biolum_compute.wgsl"));
+        let biolum_compute_source =
+            resolve_shader_includes(include_str!("shaders/biolum_compute.wgsl"));
         let biolum_compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Biolum Compute Shader"),
             source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&biolum_compute_source)),
         });
 
-        let biolum_compute_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("Biolum Compute Pipeline Layout"),
-            bind_group_layouts: &[Some(&biolum_compute_layout)],
-            immediate_size: 0,
-        });
+        let biolum_compute_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Biolum Compute Pipeline Layout"),
+                bind_group_layouts: &[Some(&biolum_compute_layout)],
+                immediate_size: 0,
+            });
 
-        let biolum_compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Biolum Compute Pipeline"),
-            layout: Some(&biolum_compute_pipeline_layout),
-            module: &biolum_compute_shader,
-            entry_point: Some("main"),
-            compilation_options: Default::default(),
-            cache: pipeline_cache_ref,
-        });
+        let biolum_compute_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Biolum Compute Pipeline"),
+                layout: Some(&biolum_compute_pipeline_layout),
+                module: &biolum_compute_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
 
         let biolum_render_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("Biolum Render Bind Group"),
             layout: &biolum_render_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: biolum_particles_buffer.as_entire_binding(),
-                },
-            ],
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: biolum_particles_buffer.as_entire_binding(),
+            }],
         });
         // --- End Bioluminescent Waves Setup ---
 
@@ -3224,25 +4408,45 @@ impl VulkanEngine {
         }
 
         // --- Resynth compute (consumes the CPU-filled GPU spectrum buffer) ---
-        let resynth_bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("resynth_bind_group_layout"),
-            entries: &[
-                wgpu::BindGroupLayoutEntry { binding: 0, visibility: wgpu::ShaderStages::COMPUTE, ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Storage { read_only: false }, has_dynamic_offset: false, min_binding_size: None }, count: None },
-            ],
-        });
+        let resynth_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("resynth_bind_group_layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::COMPUTE,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
         let resynth_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("resynth_bind_group"), layout: &resynth_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: gpu_spectrum_buffer.as_entire_binding() },
-            ],
+            label: Some("resynth_bind_group"),
+            layout: &resynth_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: gpu_spectrum_buffer.as_entire_binding(),
+            }],
         });
-        let resynth_compute_shader = device.create_shader_module(wgpu::include_wgsl!("shaders/resynth_compute.wgsl"));
-        let resynth_compute_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("resynth_compute_layout"), bind_group_layouts: &[Some(&resynth_bind_group_layout)], immediate_size: 0,
-        });
-        let resynth_compute_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("Resynth Compute Pipeline"), layout: Some(&resynth_compute_pipeline_layout), module: &resynth_compute_shader, entry_point: Some("main"), compilation_options: wgpu::PipelineCompilationOptions::default(), cache: pipeline_cache_ref,
-        });
+        let resynth_compute_shader =
+            device.create_shader_module(wgpu::include_wgsl!("shaders/resynth_compute.wgsl"));
+        let resynth_compute_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("resynth_compute_layout"),
+                bind_group_layouts: &[Some(&resynth_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let resynth_compute_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Resynth Compute Pipeline"),
+                layout: Some(&resynth_compute_pipeline_layout),
+                module: &resynth_compute_shader,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: pipeline_cache_ref,
+            });
         // --- 3D Engine Extensions Init ---
         let mut mesh_registry = std::collections::HashMap::new();
         let mut unique_geometries = std::collections::HashSet::new();
@@ -3251,7 +4455,7 @@ impl VulkanEngine {
                 unique_geometries.insert(geometry.clone());
             }
         }
-        
+
         for geom in unique_geometries {
             let (vertices, indices) = match &geom {
                 crate::state::Geometry::Grid { width, depth } => {
@@ -3266,7 +4470,10 @@ impl VulkanEngine {
                             vertices.push(Vertex {
                                 position: [px, 0.0, pz],
                                 normal: [0.0, 1.0, 0.0],
-                                tex_coords: [x as f32 / grid_width as f32, z as f32 / grid_depth as f32],
+                                tex_coords: [
+                                    x as f32 / grid_width as f32,
+                                    z as f32 / grid_depth as f32,
+                                ],
                             });
                         }
                     }
@@ -3287,24 +4494,67 @@ impl VulkanEngine {
                     let mut vertices = Vec::new();
                     let mut indices = Vec::new();
                     let start_idx = 0;
-                    vertices.push(Vertex { position: [-0.5, -0.5, 0.0], normal: [0.0, 0.0, 1.0], tex_coords: [0.0, 0.0] });
-                    vertices.push(Vertex { position: [ 0.5, -0.5, 0.0], normal: [0.0, 0.0, 1.0], tex_coords: [1.0, 0.0] });
-                    vertices.push(Vertex { position: [ 0.5,  0.5, 0.0], normal: [0.0, 0.0, 1.0], tex_coords: [1.0, 1.0] });
-                    vertices.push(Vertex { position: [-0.5,  0.5, 0.0], normal: [0.0, 0.0, 1.0], tex_coords: [0.0, 1.0] });
-                    indices.extend_from_slice(&[start_idx, start_idx + 1, start_idx + 2, start_idx, start_idx + 2, start_idx + 3]);
+                    vertices.push(Vertex {
+                        position: [-0.5, -0.5, 0.0],
+                        normal: [0.0, 0.0, 1.0],
+                        tex_coords: [0.0, 0.0],
+                    });
+                    vertices.push(Vertex {
+                        position: [0.5, -0.5, 0.0],
+                        normal: [0.0, 0.0, 1.0],
+                        tex_coords: [1.0, 0.0],
+                    });
+                    vertices.push(Vertex {
+                        position: [0.5, 0.5, 0.0],
+                        normal: [0.0, 0.0, 1.0],
+                        tex_coords: [1.0, 1.0],
+                    });
+                    vertices.push(Vertex {
+                        position: [-0.5, 0.5, 0.0],
+                        normal: [0.0, 0.0, 1.0],
+                        tex_coords: [0.0, 1.0],
+                    });
+                    indices.extend_from_slice(&[
+                        start_idx,
+                        start_idx + 1,
+                        start_idx + 2,
+                        start_idx,
+                        start_idx + 2,
+                        start_idx + 3,
+                    ]);
                     (vertices, indices)
                 }
                 crate::state::Geometry::UnitBox => {
                     let mut vertices = Vec::new();
                     let mut indices = Vec::new();
-                    
-                    let mut add_face = |p0: [f32; 3], p1: [f32; 3], p2: [f32; 3], p3: [f32; 3], normal: [f32; 3]| {
+
+                    let mut add_face = |p0: [f32; 3],
+                                        p1: [f32; 3],
+                                        p2: [f32; 3],
+                                        p3: [f32; 3],
+                                        normal: [f32; 3]| {
                         let start_idx = vertices.len() as u32;
-                        vertices.push(Vertex { position: p0, normal, tex_coords: [0.0, 0.0] });
-                        vertices.push(Vertex { position: p1, normal, tex_coords: [1.0, 0.0] });
-                        vertices.push(Vertex { position: p2, normal, tex_coords: [1.0, 1.0] });
-                        vertices.push(Vertex { position: p3, normal, tex_coords: [0.0, 1.0] });
-                        
+                        vertices.push(Vertex {
+                            position: p0,
+                            normal,
+                            tex_coords: [0.0, 0.0],
+                        });
+                        vertices.push(Vertex {
+                            position: p1,
+                            normal,
+                            tex_coords: [1.0, 0.0],
+                        });
+                        vertices.push(Vertex {
+                            position: p2,
+                            normal,
+                            tex_coords: [1.0, 1.0],
+                        });
+                        vertices.push(Vertex {
+                            position: p3,
+                            normal,
+                            tex_coords: [0.0, 1.0],
+                        });
+
                         indices.push(start_idx);
                         indices.push(start_idx + 1);
                         indices.push(start_idx + 2);
@@ -3312,56 +4562,56 @@ impl VulkanEngine {
                         indices.push(start_idx + 2);
                         indices.push(start_idx + 3);
                     };
-                    
+
                     // Front face (z = +0.5)
                     add_face(
-                        [-0.5, -0.5,  0.5],
-                        [ 0.5, -0.5,  0.5],
-                        [ 0.5,  0.5,  0.5],
-                        [-0.5,  0.5,  0.5],
+                        [-0.5, -0.5, 0.5],
+                        [0.5, -0.5, 0.5],
+                        [0.5, 0.5, 0.5],
+                        [-0.5, 0.5, 0.5],
                         [0.0, 0.0, 1.0],
                     );
                     // Back face (z = -0.5)
                     add_face(
-                        [ 0.5, -0.5, -0.5],
+                        [0.5, -0.5, -0.5],
                         [-0.5, -0.5, -0.5],
-                        [-0.5,  0.5, -0.5],
-                        [ 0.5,  0.5, -0.5],
+                        [-0.5, 0.5, -0.5],
+                        [0.5, 0.5, -0.5],
                         [0.0, 0.0, -1.0],
                     );
                     // Left face (x = -0.5)
                     add_face(
                         [-0.5, -0.5, -0.5],
-                        [-0.5, -0.5,  0.5],
-                        [-0.5,  0.5,  0.5],
-                        [-0.5,  0.5, -0.5],
+                        [-0.5, -0.5, 0.5],
+                        [-0.5, 0.5, 0.5],
+                        [-0.5, 0.5, -0.5],
                         [-1.0, 0.0, 0.0],
                     );
                     // Right face (x = +0.5)
                     add_face(
-                        [ 0.5, -0.5,  0.5],
-                        [ 0.5, -0.5, -0.5],
-                        [ 0.5,  0.5, -0.5],
-                        [ 0.5,  0.5,  0.5],
+                        [0.5, -0.5, 0.5],
+                        [0.5, -0.5, -0.5],
+                        [0.5, 0.5, -0.5],
+                        [0.5, 0.5, 0.5],
                         [1.0, 0.0, 0.0],
                     );
                     // Top face (y = +0.5)
                     add_face(
-                        [-0.5,  0.5,  0.5],
-                        [ 0.5,  0.5,  0.5],
-                        [ 0.5,  0.5, -0.5],
-                        [-0.5,  0.5, -0.5],
+                        [-0.5, 0.5, 0.5],
+                        [0.5, 0.5, 0.5],
+                        [0.5, 0.5, -0.5],
+                        [-0.5, 0.5, -0.5],
                         [0.0, 1.0, 0.0],
                     );
                     // Bottom face (y = -0.5)
                     add_face(
                         [-0.5, -0.5, -0.5],
-                        [ 0.5, -0.5, -0.5],
-                        [ 0.5, -0.5,  0.5],
-                        [-0.5, -0.5,  0.5],
+                        [0.5, -0.5, -0.5],
+                        [0.5, -0.5, 0.5],
+                        [-0.5, -0.5, 0.5],
                         [0.0, -1.0, 0.0],
                     );
-                    
+
                     (vertices, indices)
                 }
                 crate::state::Geometry::NeonRoom => generate_neon_room_mesh(),
@@ -3369,9 +4619,11 @@ impl VulkanEngine {
                 crate::state::Geometry::VuMeterRack => generate_vumeter_rack_mesh(),
                 crate::state::Geometry::NeonCorridorFrames => generate_neon_corridor_mesh(),
                 crate::state::Geometry::StormRainVolume => generate_storm_rain_volume_mesh(),
-                crate::state::Geometry::GlassLyricsScene => generate_glass_lyrics_mesh("RUSTTRACKER"),
+                crate::state::Geometry::GlassLyricsScene => {
+                    generate_glass_lyrics_mesh("RUSTTRACKER")
+                }
             };
-            
+
             let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
                 label: Some(&format!("Mesh Vertex Buffer {:?}", geom)),
                 size: (vertices.len() * std::mem::size_of::<Vertex>()) as u64,
@@ -3388,12 +4640,15 @@ impl VulkanEngine {
             });
             queue.write_buffer(&index_buffer, 0, bytemuck::cast_slice(&indices));
             let index_count = indices.len() as u32;
-            
-            mesh_registry.insert(geom, MeshBuffers {
-                vertex_buffer,
-                index_buffer,
-                index_count,
-            });
+
+            mesh_registry.insert(
+                geom,
+                MeshBuffers {
+                    vertex_buffer,
+                    index_buffer,
+                    index_count,
+                },
+            );
         }
 
         let camera_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
@@ -3434,7 +4689,8 @@ impl VulkanEngine {
         // can skip recompiling all visualizer/compute pipelines.
         if pipeline_cache_enabled
             && let (Some(path), Some(cache)) = (&pipeline_cache_path, &pipeline_cache)
-            && let Some(data) = cache.get_data() {
+            && let Some(data) = cache.get_data()
+        {
             let tmp = path.with_extension("tmp");
             if std::fs::write(&tmp, &data).is_ok() {
                 let _ = std::fs::rename(&tmp, path);
@@ -3497,14 +4753,14 @@ impl VulkanEngine {
             resynth_compute_pipeline,
             resynth_bind_group,
             _gpu_spectrum_buffer: gpu_spectrum_buffer,
-            
+
             smoke_compute_pipeline,
             smoke_compute_bind_group,
             smoke_render_bind_group,
             smoke_params_buffer,
-            
+
             depth_texture_view,
-            
+
             waveform_history_flat: vec![0.0; 2048 * 144],
             video_bind_group_layout,
             video_pipeline,
@@ -3516,7 +4772,7 @@ impl VulkanEngine {
             vumeters_bg_pipeline,
             neon_bg_pipeline,
             storm_sky_pipeline,
-            
+
             camera_uniform_buffer,
             camera_bind_group,
             mesh_registry,
@@ -3552,10 +4808,14 @@ impl VulkanEngine {
             if let Some(surface) = &self.surface {
                 surface.configure(&self.device, &self.config);
             }
-            
+
             let depth_texture = self.device.create_texture(&wgpu::TextureDescriptor {
                 label: Some("Depth Texture"),
-                size: wgpu::Extent3d { width: self.config.width.max(1), height: self.config.height.max(1), depth_or_array_layers: 1 },
+                size: wgpu::Extent3d {
+                    width: self.config.width.max(1),
+                    height: self.config.height.max(1),
+                    depth_or_array_layers: 1,
+                },
                 mip_level_count: 1,
                 sample_count: 1,
                 dimension: wgpu::TextureDimension::D2,
@@ -3563,7 +4823,8 @@ impl VulkanEngine {
                 usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
                 view_formats: &[],
             });
-            self.depth_texture_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+            self.depth_texture_view =
+                depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
         }
     }
 
@@ -3576,7 +4837,10 @@ impl VulkanEngine {
     #[allow(dead_code)]
     pub fn resume_surface(&mut self, window: Arc<Window>) {
         let size = window.inner_size();
-        eprintln!("[RustTracker Engine] Resuming surface with size: {:?}", size);
+        eprintln!(
+            "[RustTracker Engine] Resuming surface with size: {:?}",
+            size
+        );
         match self.instance.create_surface(window) {
             Ok(surface) => {
                 self.surface = Some(surface);
@@ -3584,11 +4848,13 @@ impl VulkanEngine {
                 eprintln!("[RustTracker Engine] Surface successfully resumed and configured!");
             }
             Err(e) => {
-                eprintln!("[RustTracker Engine] Failed to create resumed surface: {:?}", e);
+                eprintln!(
+                    "[RustTracker Engine] Failed to create resumed surface: {:?}",
+                    e
+                );
             }
         }
     }
-
 
     pub fn clear_video_state(&mut self) {
         self.video_state = None;
@@ -3618,7 +4884,10 @@ impl VulkanEngine {
         } else {
             // 1. Audio Analysis: Bass transient detection and column energy mapping
             let bass_raw = if state.spectrum_data.len() >= 16 {
-                state.spectrum_data[1..16].iter().copied().fold(0.0f32, f32::max)
+                state.spectrum_data[1..16]
+                    .iter()
+                    .copied()
+                    .fold(0.0f32, f32::max)
             } else {
                 0.0
             };
@@ -3630,16 +4899,22 @@ impl VulkanEngine {
             if let Some(num_tracks) = state.tracker_channels.filter(|&n| n > 0) {
                 let n_ch = (num_tracks as usize).min(64);
                 let left_master = state.channel_vus.first().copied().unwrap_or(0.0);
-                let right_master = state.channel_vus.get(1 + n_ch).copied().unwrap_or(left_master);
+                let right_master = state
+                    .channel_vus
+                    .get(1 + n_ch)
+                    .copied()
+                    .unwrap_or(left_master);
 
                 for (x, energy) in col_energies.iter_mut().enumerate().take(W) {
                     let track_idx = ((x * n_ch) / W).min(n_ch.saturating_sub(1));
                     let track_vu = state.channel_vus.get(1 + track_idx).copied().unwrap_or(0.0);
 
                     // Symmetrical center-out spectrum distribution (bass in center, highs on outer edges)
-                    let center_dist = (x as f32 - (W - 1) as f32 / 2.0).abs() / ((W - 1) as f32 / 2.0);
+                    let center_dist =
+                        (x as f32 - (W - 1) as f32 / 2.0).abs() / ((W - 1) as f32 / 2.0);
                     let spec_idx = if spec_len > 1 {
-                        (((center_dist.powf(1.4) * 450.0) as usize) + 1).clamp(1, spec_len.saturating_sub(1))
+                        (((center_dist.powf(1.4) * 450.0) as usize) + 1)
+                            .clamp(1, spec_len.saturating_sub(1))
                     } else {
                         0
                     };
@@ -3648,7 +4923,8 @@ impl VulkanEngine {
                     let frac = x as f32 / (W - 1) as f32;
                     let master_pan = left_master * (1.0 - frac) + right_master * frac;
 
-                    *energy = (track_vu * 0.60 + master_pan * 0.20 + spec_val * 0.20).clamp(0.0, 1.5);
+                    *energy =
+                        (track_vu * 0.60 + master_pan * 0.20 + spec_val * 0.20).clamp(0.0, 1.5);
                 }
             } else {
                 // Non-tracker audio (Stereo MP3, FLAC, AAC, WAV, Radio Stream, Multi-channel 5.1/7.1):
@@ -3671,8 +4947,16 @@ impl VulkanEngine {
                             let idx0 = (pos.floor() as usize).min(order_len - 1);
                             let idx1 = (pos.ceil() as usize).min(order_len - 1);
                             let blend = pos - idx0 as f32;
-                            let vu0 = state.channel_vus.get(display_order[idx0]).copied().unwrap_or(0.0);
-                            let vu1 = state.channel_vus.get(display_order[idx1]).copied().unwrap_or(vu0);
+                            let vu0 = state
+                                .channel_vus
+                                .get(display_order[idx0])
+                                .copied()
+                                .unwrap_or(0.0);
+                            let vu1 = state
+                                .channel_vus
+                                .get(display_order[idx1])
+                                .copied()
+                                .unwrap_or(vu0);
                             vu0 * (1.0 - blend) + vu1 * blend
                         } else {
                             state.channel_vus.first().copied().unwrap_or(0.0)
@@ -3682,9 +4966,11 @@ impl VulkanEngine {
                     };
 
                     // Symmetrical center-out spectrum distribution (bass in center, highs mirroring outward)
-                    let center_dist = (x as f32 - (W - 1) as f32 / 2.0).abs() / ((W - 1) as f32 / 2.0);
+                    let center_dist =
+                        (x as f32 - (W - 1) as f32 / 2.0).abs() / ((W - 1) as f32 / 2.0);
                     let bin = if spec_len > 1 {
-                        (((center_dist.powf(1.4) * 450.0) as usize) + 1).clamp(1, spec_len.saturating_sub(1))
+                        (((center_dist.powf(1.4) * 450.0) as usize) + 1)
+                            .clamp(1, spec_len.saturating_sub(1))
                     } else {
                         0
                     };
@@ -3728,7 +5014,11 @@ impl VulkanEngine {
                     *rng ^= *rng << 13;
                     *rng ^= *rng >> 17;
                     *rng ^= *rng << 5;
-                    let dy = if col_e > 0.70 && !(*rng).is_multiple_of(4) { 2 } else { 1 };
+                    let dy = if col_e > 0.70 && !(*rng).is_multiple_of(4) {
+                        2
+                    } else {
+                        1
+                    };
 
                     for y in dy..H {
                         let from = y * W + x;
@@ -3746,7 +5036,11 @@ impl VulkanEngine {
                             let to = target_y * W + target_x;
 
                             // Altitude cooling: taper smoke above 60% screen height so flame tips dance naturally
-                            let alt_decay = if y < 70 && ((*rng >> 8) % 100 < 35) { 1 } else { 0 };
+                            let alt_decay = if y < 70 && ((*rng >> 8) % 100 < 35) {
+                                1
+                            } else {
+                                0
+                            };
                             let decay = if ((*rng >> 4) % 1000) < thresh { 1 } else { 0 };
                             let total_decay = decay.max(alt_decay);
                             cells[to] = pixel.saturating_sub(total_decay);
@@ -3800,7 +5094,11 @@ impl VulkanEngine {
                 bytes_per_row: Some(1024 * 4),
                 rows_per_image: Some(576),
             },
-            wgpu::Extent3d { width: 1024, height: 576, depth_or_array_layers: 1 },
+            wgpu::Extent3d {
+                width: 1024,
+                height: 576,
+                depth_or_array_layers: 1,
+            },
         );
     }
 
@@ -3811,7 +5109,7 @@ impl VulkanEngine {
 
     pub fn update(&mut self, state: &AppState, dt: f32) {
         self.frame_count = self.frame_count.wrapping_add(1);
-        
+
         // Exponential moving average to smooth CPU scheduling time jitter
         let alpha = 0.03f64;
         self.smooth_dt = self.smooth_dt * (1.0 - alpha) + (dt as f64).clamp(0.001, 0.1) * alpha;
@@ -3825,17 +5123,20 @@ impl VulkanEngine {
 
         let mut steps = 0;
         if state.waveform_history_push_count != self.last_history_push_count {
-            let diff = state.waveform_history_push_count.saturating_sub(self.last_history_push_count);
+            let diff = state
+                .waveform_history_push_count
+                .saturating_sub(self.last_history_push_count);
             steps = diff as u32;
             self.heatmap_row = (self.heatmap_row + steps) % 1024;
-            
+
             // Measure the actual elapsed time between buffer pushes to stay in perfect
             // phase with the audio callback cadence (e.g. PipeWire/ALSA vs WASAPI)
             if self.time_since_last_push > 0.002 && self.time_since_last_push < 0.25 {
                 let interval_per_step = self.time_since_last_push / (steps as f64).max(1.0);
-                self.measured_push_interval = self.measured_push_interval * 0.8 + interval_per_step * 0.2;
+                self.measured_push_interval =
+                    self.measured_push_interval * 0.8 + interval_per_step * 0.2;
             }
-            
+
             self.time_since_last_push = 0.0;
             self.last_history_push_count = state.waveform_history_push_count;
         } else if !state.is_paused && state.file_loaded && !state.track_ended {
@@ -3846,13 +5147,14 @@ impl VulkanEngine {
         }
 
         // Target interval between pushes: use measured cadence with fallback to target_fps
-        let push_interval = if self.measured_push_interval > 0.002 && self.measured_push_interval < 0.25 {
-            self.measured_push_interval
-        } else if state.target_fps > 0 {
-            1.0 / state.target_fps as f64
-        } else {
-            1.0 / 60.0
-        };
+        let push_interval =
+            if self.measured_push_interval > 0.002 && self.measured_push_interval < 0.25 {
+                self.measured_push_interval
+            } else if state.target_fps > 0 {
+                1.0 / state.target_fps as f64
+            } else {
+                1.0 / 60.0
+            };
 
         // Smoothly interpolate within the current frame push window
         let step_fraction = (self.time_since_last_push / push_interval).clamp(0.0, 1.0) as f32;
@@ -3866,20 +5168,24 @@ impl VulkanEngine {
         }
 
         // Progress bar fire dies off when playback stops / pauses / ends / reaches end of song
-        let is_at_end = state.duration_seconds > 0.0 && state.current_seconds >= state.duration_seconds - 0.05;
+        let is_at_end =
+            state.duration_seconds > 0.0 && state.current_seconds >= state.duration_seconds - 0.05;
         let is_playing = !state.is_paused && state.file_loaded && !state.track_ended && !is_at_end;
         let target_intensity = if is_playing { 1.0f32 } else { 0.0f32 };
         let fire_rate = if is_playing { 5.0f32 } else { 3.5f32 };
         let dt_clamped = dt.clamp(0.001, 0.1);
         if self.fire_intensity < target_intensity {
-            self.fire_intensity = (self.fire_intensity + fire_rate * dt_clamped).min(target_intensity);
+            self.fire_intensity =
+                (self.fire_intensity + fire_rate * dt_clamped).min(target_intensity);
         } else if self.fire_intensity > target_intensity {
-            self.fire_intensity = (self.fire_intensity - fire_rate * dt_clamped).max(target_intensity);
+            self.fire_intensity =
+                (self.fire_intensity - fire_rate * dt_clamped).max(target_intensity);
         }
 
         // World-Z camera position locked to history rows (0.5 units/row), used by
         // visualizers that scroll with the waveform/spectrum history ring buffer.
-        self.last_history_cam_z = (self.last_history_push_count as f64 + step_fraction as f64) * 0.5;
+        self.last_history_cam_z =
+            (self.last_history_push_count as f64 + step_fraction as f64) * 0.5;
         let frame_dt = dt.clamp(0.0005, 0.1);
         let mut uniforms = AudioUniforms {
             spectrum: [0.0; 1024],
@@ -3896,7 +5202,11 @@ impl VulkanEngine {
             smooth_time: self.play_time as f32,
             heatmap_row: self.heatmap_row,
             fft_channels: state.raw_audio_channels.len() as u32,
-            num_spatial_channels: state.channel_vus.len().saturating_sub(state.tracker_channels.unwrap_or(0) as usize) as u32,
+            num_spatial_channels: state
+                .channel_vus
+                .len()
+                .saturating_sub(state.tracker_channels.unwrap_or(0) as usize)
+                as u32,
             ui_meters_rect: self.meters_uv_rect,
             ui_heatmap_rect: self.heatmap_uv_rect,
             ui_fire_rect: self.fire_uv_rect,
@@ -3938,7 +5248,8 @@ impl VulkanEngine {
                 // Sway gently if no file is loaded
                 let t = self.smooth_time as f32;
                 let offset = if i == 0 { 0.0 } else { 1.5 };
-                (0.12 * (t * 2.0 + offset).sin() + 0.15 * (t * 3.7 - offset).cos() + 0.2).clamp(0.0, 1.0)
+                (0.12 * (t * 2.0 + offset).sin() + 0.15 * (t * 3.7 - offset).cos() + 0.2)
+                    .clamp(0.0, 1.0)
             } else {
                 0.0
             };
@@ -3962,7 +5273,7 @@ impl VulkanEngine {
         }
 
         let ch_len = state.channel_vus.len().min(32);
-        
+
         // 1. Populate UI Display Channels (may be visually remapped)
         let mut display_order: Vec<usize> = (0..ch_len).collect();
         if state.tracker_channels.is_none() {
@@ -3986,7 +5297,7 @@ impl VulkanEngine {
                 uniforms.channel_peaks[disp_idx] = state.peak_vus[src_idx];
             }
         }
-        
+
         // 2. Populate Raw Spatial Channels (strict spatial mapping without UI reordering)
         if state.tracker_channels.is_some() {
             // For tracker files, channel_vus is [L_Peak, Track1..N, R_Peak]
@@ -4000,7 +5311,7 @@ impl VulkanEngine {
                 uniforms.spatial_channels[i] = state.channel_vus[i];
             }
         }
-        
+
         if state.visualizer_mode == 19 {
             let actual_ch = state.channel_vus.len().max(2);
             uniforms.num_channels = actual_ch as u32;
@@ -4017,7 +5328,10 @@ impl VulkanEngine {
 
         if state.visualizer_mode == 23 {
             let display_secs = state.scrub_target_seconds.unwrap_or(state.current_seconds);
-            let active_idx = state.lyrics.as_ref().and_then(|l| l.find_current_line_idx(display_secs));
+            let active_idx = state
+                .lyrics
+                .as_ref()
+                .and_then(|l| l.find_current_line_idx(display_secs));
 
             // Smooth 500+ FPS frame-interpolated slam timer
             if active_idx != self.last_lyric_line_idx {
@@ -4027,29 +5341,43 @@ impl VulkanEngine {
                 self.lyric_slam_timer += frame_dt;
             }
 
-            let (char_bytes, line_progress, is_instrumental, line_duration) = if let Some(lyrics) = &state.lyrics {
-                if !lyrics.lines.is_empty() {
-                    if let Some(idx) = active_idx {
-                        let cur_time = lyrics.lines[idx].time_seconds;
-                        let next_time = if idx + 1 < lyrics.lines.len() {
-                            lyrics.lines[idx + 1].time_seconds
+            let (char_bytes, line_progress, is_instrumental, line_duration) =
+                if let Some(lyrics) = &state.lyrics {
+                    if !lyrics.lines.is_empty() {
+                        if let Some(idx) = active_idx {
+                            let cur_time = lyrics.lines[idx].time_seconds;
+                            let next_time = if idx + 1 < lyrics.lines.len() {
+                                lyrics.lines[idx + 1].time_seconds
+                            } else {
+                                cur_time + 4.0
+                            };
+                            let dur = (next_time - cur_time).max(0.1) as f32;
+                            let elapsed = (display_secs - cur_time).max(0.0) as f32;
+                            let prog = (elapsed / dur).clamp(0.0, 1.0);
+                            let text = lyrics.lines[idx].text.trim().to_uppercase();
+                            let bytes = text.into_bytes();
+
+                            let gap = (next_time - display_secs) as f32;
+                            let is_inst =
+                                if (next_time - cur_time) > 4.5 && elapsed > 2.5 && gap > 1.5 {
+                                    1.0
+                                } else {
+                                    0.0
+                                };
+                            (bytes, prog, is_inst, dur)
                         } else {
-                            cur_time + 4.0
-                        };
-                        let dur = (next_time - cur_time).max(0.1) as f32;
-                        let elapsed = (display_secs - cur_time).max(0.0) as f32;
-                        let prog = (elapsed / dur).clamp(0.0, 1.0);
-                        let text = lyrics.lines[idx].text.trim().to_uppercase();
-                        let bytes = text.into_bytes();
-                        
-                        let gap = (next_time - display_secs) as f32;
-                        let is_inst = if (next_time - cur_time) > 4.5 && elapsed > 2.5 && gap > 1.5 { 1.0 } else { 0.0 };
-                        (bytes, prog, is_inst, dur)
+                            // Intro
+                            let first_time = lyrics.lines[0].time_seconds;
+                            let prog = (display_secs / first_time.max(0.1)).clamp(0.0, 1.0) as f32;
+                            ("RUSTTRACKER".to_string().into_bytes(), prog, 1.0, 4.0)
+                        }
                     } else {
-                        // Intro
-                        let first_time = lyrics.lines[0].time_seconds;
-                        let prog = (display_secs / first_time.max(0.1)).clamp(0.0, 1.0) as f32;
-                        ("RUSTTRACKER".to_string().into_bytes(), prog, 1.0, 4.0)
+                        let title = if !state.song_title.is_empty() {
+                            state.song_title.trim().to_uppercase()
+                        } else {
+                            "RUSTTRACKER".to_string()
+                        };
+                        (title.into_bytes(), 0.0, 1.0, 4.0)
                     }
                 } else {
                     let title = if !state.song_title.is_empty() {
@@ -4058,19 +5386,14 @@ impl VulkanEngine {
                         "RUSTTRACKER".to_string()
                     };
                     (title.into_bytes(), 0.0, 1.0, 4.0)
-                }
-            } else {
-                let title = if !state.song_title.is_empty() {
-                    state.song_title.trim().to_uppercase()
-                } else {
-                    "RUSTTRACKER".to_string()
                 };
-                (title.into_bytes(), 0.0, 1.0, 4.0)
-            };
 
             let slam_t = self.lyric_slam_timer;
             let bass = if state.spectrum_data.len() > 4 {
-                state.spectrum_data[1..5].iter().copied().fold(0.0f32, f32::max)
+                state.spectrum_data[1..5]
+                    .iter()
+                    .copied()
+                    .fold(0.0f32, f32::max)
             } else {
                 0.0
             };
@@ -4086,7 +5409,8 @@ impl VulkanEngine {
                 let impact_spring = -0.32 * (-3.6 * dt_impact).exp() * (9.5 * dt_impact).cos();
                 // Gentle continuous idle buoyancy on the water surface after impact settles
                 let settle = 1.0 - (-2.0 * dt_impact).exp();
-                let idle_bob = ((slam_t * 1.6).sin() * 0.022 + (slam_t * 0.85).cos() * 0.014) * settle;
+                let idle_bob =
+                    ((slam_t * 1.6).sin() * 0.022 + (slam_t * 0.85).cos() * 0.014) * settle;
                 let bass_swell = bass * 0.03 * settle;
                 impact_spring + idle_bob + bass_swell
             };
@@ -4116,7 +5440,8 @@ impl VulkanEngine {
                     usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });
-                self.queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+                self.queue
+                    .write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&vertices));
 
                 let index_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
                     label: Some("Mesh Index Buffer GlassLyricsScene"),
@@ -4124,7 +5449,8 @@ impl VulkanEngine {
                     usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
                     mapped_at_creation: false,
                 });
-                self.queue.write_buffer(&index_buffer, 0, bytemuck::cast_slice(&indices));
+                self.queue
+                    .write_buffer(&index_buffer, 0, bytemuck::cast_slice(&indices));
                 let index_count = indices.len() as u32;
 
                 self.mesh_registry.insert(
@@ -4144,7 +5470,8 @@ impl VulkanEngine {
         uniforms.waveform_history_size = state.waveform_history.len().min(144) as u32;
         uniforms.step_fraction = step_fraction;
 
-        self.queue.write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+        self.queue
+            .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
         // Only upload waveform history when the active visualizer requires it,
         // and only when new rows were pushed or the width changed (saves a
@@ -4154,7 +5481,11 @@ impl VulkanEngine {
             || vis_width != self.last_uploaded_vis_width;
         if vis_def.id == 24 {
             if !state.lookahead_timeline.is_empty() {
-                self.queue.write_buffer(&self.waveform_storage_buffer, 0, bytemuck::cast_slice(&state.lookahead_timeline));
+                self.queue.write_buffer(
+                    &self.waveform_storage_buffer,
+                    0,
+                    bytemuck::cast_slice(&state.lookahead_timeline),
+                );
             }
         } else if vis_def.requires_history && history_dirty {
             self.last_uploaded_push_count = state.waveform_history_push_count;
@@ -4163,28 +5494,40 @@ impl VulkanEngine {
             let hist_len = state.waveform_history.len();
             let start = hist_len.saturating_sub(144);
             let visual_width_usize = vis_width as usize;
-            
-            for (slot, wave) in state.waveform_history.iter().skip(start).enumerate().take(144) {
+
+            for (slot, wave) in state
+                .waveform_history
+                .iter()
+                .skip(start)
+                .enumerate()
+                .take(144)
+            {
                 let wave_len = wave.len().min(visual_width_usize);
                 if wave_len > 0 {
                     let offset = slot * 2048; // Max width is 2048
-                    self.waveform_history_flat[offset..offset + wave_len].copy_from_slice(&wave[..wave_len]);
-                    
+                    self.waveform_history_flat[offset..offset + wave_len]
+                        .copy_from_slice(&wave[..wave_len]);
+
                     // Simple pre-smoothing inline
                     if wave_len > 2 {
                         let mut prev = self.waveform_history_flat[offset];
                         for j in 1..wave_len - 1 {
                             let curr = self.waveform_history_flat[offset + j];
                             let next = self.waveform_history_flat[offset + j + 1];
-                            self.waveform_history_flat[offset + j] = (prev + curr * 2.0 + next) / 4.0;
+                            self.waveform_history_flat[offset + j] =
+                                (prev + curr * 2.0 + next) / 4.0;
                             prev = curr;
                         }
                     }
                 }
             }
-            self.queue.write_buffer(&self.waveform_storage_buffer, 0, bytemuck::cast_slice(&self.waveform_history_flat));
+            self.queue.write_buffer(
+                &self.waveform_storage_buffer,
+                0,
+                bytemuck::cast_slice(&self.waveform_history_flat),
+            );
         }
-        
+
         if vis_def.requires_fire {
             if vis_def.id == 5 {
                 let start_sim = std::time::Instant::now();
@@ -4195,16 +5538,27 @@ impl VulkanEngine {
                 let mut bass_sum = 0.0;
                 let mut mids_sum = 0.0;
                 let mut highs_sum = 0.0;
-                for i in 0..64 { bass_sum += uniforms.fire_heat[i]; }
+                for i in 0..64 {
+                    bass_sum += uniforms.fire_heat[i];
+                }
                 let bass = (bass_sum / 64.0 / 100.0).min(1.0);
-                for i in 64..512 { mids_sum += uniforms.fire_heat[i]; }
+                for i in 64..512 {
+                    mids_sum += uniforms.fire_heat[i];
+                }
                 let mids = (mids_sum / 448.0 / 100.0).min(1.0);
-                for i in 512..1024 { highs_sum += uniforms.fire_heat[i]; }
+                for i in 512..1024 {
+                    highs_sum += uniforms.fire_heat[i];
+                }
                 let highs = (highs_sum / 512.0 / 100.0).min(1.0);
-                
+
                 let n_ch = state.channel_vus.len().clamp(1, 32);
-                let lfe_idx = if (n_ch == 6 || n_ch == 8 || n_ch == 16) && state.tracker_channels.is_none() { 3 } else { 999 };
-                
+                let lfe_idx =
+                    if (n_ch == 6 || n_ch == 8 || n_ch == 16) && state.tracker_channels.is_none() {
+                        3
+                    } else {
+                        999
+                    };
+
                 let mut fire_params = FireParams {
                     bass,
                     mids,
@@ -4221,193 +5575,326 @@ impl VulkanEngine {
                     display_order: [0; 16],
                     channels: [[0.0; 4]; 8],
                 };
-                
+
                 for i in 0..16 {
                     fire_params.display_order[i] = uniforms.display_order[i];
                 }
                 for i in 0..n_ch {
                     fire_params.channels[i / 4][i % 4] = uniforms.channels[i];
                 }
-                
-                self.queue.write_buffer(&self.fire_params_buffer, 0, bytemuck::cast_slice(&[fire_params]));
+
+                self.queue.write_buffer(
+                    &self.fire_params_buffer,
+                    0,
+                    bytemuck::cast_slice(&[fire_params]),
+                );
             }
         }
-        
+
         // GPU spectrum is consumed only by the firesim compute (id 6) and the
         // resynth compute (requires_resynth, id 8) — skip the 256KB upload otherwise,
         // and only upload when new audio FFT data arrived (history_dirty)
-        if state.gpu_fft && (vis_def.id == 6 || vis_def.requires_resynth)
-            && !state.gpu_spectrum_data.is_empty() && history_dirty {
-            self.queue.write_buffer(&self._gpu_spectrum_buffer, 0, bytemuck::cast_slice(&state.gpu_spectrum_data));
+        if state.gpu_fft
+            && (vis_def.id == 6 || vis_def.requires_resynth)
+            && !state.gpu_spectrum_data.is_empty()
+            && history_dirty
+        {
+            self.queue.write_buffer(
+                &self._gpu_spectrum_buffer,
+                0,
+                bytemuck::cast_slice(&state.gpu_spectrum_data),
+            );
         }
-        
+
         if let Some(rx) = &state.video_frame_rx {
             let mut latest_frame = None;
             while let Ok(frame) = rx.try_recv() {
                 if let Some(old_frame) = latest_frame.take()
-                    && let Some(tx) = &state.free_video_frame_tx {
+                    && let Some(tx) = &state.free_video_frame_tx
+                {
                     let _ = tx.try_send(old_frame);
                 }
                 latest_frame = Some(frame);
             }
-            
+
             if let Some(frame) = latest_frame {
                 if frame.width >= 2 && frame.height >= 2 {
-                    let needs_init = !self.video_state.as_ref().is_some_and(|vs| vs.width == frame.width && vs.height == frame.height && vs.bit_depth == frame.bit_depth as u32);
-                if needs_init {
-                    let tex_format = if frame.bit_depth > 8 { wgpu::TextureFormat::R16Unorm } else { wgpu::TextureFormat::R8Unorm };
-                    let y_texture = self.device.create_texture(&wgpu::TextureDescriptor {
-                        label: Some("Video Y Texture"),
-                        size: wgpu::Extent3d { width: frame.width, height: frame.height, depth_or_array_layers: 1 },
-                        mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
-                        format: tex_format,
-                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                        view_formats: &[],
+                    let needs_init = !self.video_state.as_ref().is_some_and(|vs| {
+                        vs.width == frame.width
+                            && vs.height == frame.height
+                            && vs.bit_depth == frame.bit_depth as u32
                     });
-                    let u_texture = self.device.create_texture(&wgpu::TextureDescriptor {
-                        label: Some("Video U Texture"),
-                        size: wgpu::Extent3d { width: frame.width / 2, height: frame.height / 2, depth_or_array_layers: 1 },
-                        mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
-                        format: tex_format,
-                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                        view_formats: &[],
-                    });
-                    let v_texture = self.device.create_texture(&wgpu::TextureDescriptor {
-                        label: Some("Video V Texture"),
-                        size: wgpu::Extent3d { width: frame.width / 2, height: frame.height / 2, depth_or_array_layers: 1 },
-                        mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
-                        format: tex_format,
-                        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                        view_formats: &[],
-                    });
-                    
-                    let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
-                        label: Some("Video Sampler"),
-                        address_mode_u: wgpu::AddressMode::ClampToEdge,
-                        address_mode_v: wgpu::AddressMode::ClampToEdge,
-                        address_mode_w: wgpu::AddressMode::ClampToEdge,
-                        mag_filter: wgpu::FilterMode::Linear,
-                        min_filter: wgpu::FilterMode::Linear,
-                        mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-                        ..Default::default()
-                    });
-                    
-                    let params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-                        label: Some("Video Params Buffer"),
-                        size: std::mem::size_of::<VideoParams>() as u64,
-                        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                        mapped_at_creation: false,
-                    });
-                    
-                    let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("Video Bind Group"),
-                        layout: &self.video_bind_group_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&y_texture.create_view(&wgpu::TextureViewDescriptor::default())) },
-                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&u_texture.create_view(&wgpu::TextureViewDescriptor::default())) },
-                            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::TextureView(&v_texture.create_view(&wgpu::TextureViewDescriptor::default())) },
-                            wgpu::BindGroupEntry { binding: 3, resource: wgpu::BindingResource::Sampler(&sampler) },
-                            wgpu::BindGroupEntry { binding: 4, resource: params_buffer.as_entire_binding() },
-                        ],
-                    });
-                    
-                    self.video_state = Some(VideoState { 
-                        y_texture, u_texture, v_texture, bind_group, params_buffer, 
-                        width: frame.width, height: frame.height,
-                        rotation: frame.rotation,
-                        color_space: frame.color_space,
-                        color_range: frame.color_range,
-                        bit_depth: frame.bit_depth as u32,
-                        color_trc: frame.color_trc,
-                    });
-                } else if let Some(vs) = &mut self.video_state {
-                    vs.rotation = frame.rotation;
-                    vs.color_space = frame.color_space;
-                    vs.color_range = frame.color_range;
-                    vs.bit_depth = frame.bit_depth as u32;
-                    vs.color_trc = frame.color_trc;
-                }
-                
-                if let Some(vs) = &self.video_state {
-                    // wgpu requires bytes_per_row to be a multiple of 256; repack
-                    // into a staging buffer with padded rows when the decoder
-                    // stride doesn't comply or buffer size is under-allocated.
-                    let pack_plane = |plane: &[u8], stride: usize, width_bytes: usize, rows: usize| -> (Vec<u8>, usize, bool) {
-                        let aligned = (width_bytes + 255) & !255;
-                        if stride == aligned && plane.len() >= aligned * rows {
-                            return (Vec::new(), stride, false);
-                        }
-                        let mut packed = vec![0u8; aligned * rows];
-                        let plane_len = plane.len();
-                        for r in 0..rows {
-                            let src_start = r * stride;
-                            let src_end = src_start + width_bytes;
-                            let dst_start = r * aligned;
-                            let dst_end = dst_start + width_bytes;
-                            if src_end <= plane_len && dst_end <= packed.len() {
-                                packed[dst_start..dst_end].copy_from_slice(&plane[src_start..src_end]);
-                            } else if src_start < plane_len && dst_end <= packed.len() {
-                                let available = plane_len - src_start;
-                                packed[dst_start..dst_start + available].copy_from_slice(&plane[src_start..plane_len]);
-                            }
-                        }
-                        (packed, aligned, true)
-                    };
-                    let bytes_per_px = if frame.bit_depth > 8 { 2 } else { 1 };
-                    let y_w = frame.width as usize * bytes_per_px;
-                    let c_w = (frame.width / 2) as usize * bytes_per_px;
-                    let (y_packed, y_stride, y_repack) = pack_plane(&frame.y_plane, frame.y_stride, y_w, frame.height as usize);
-                    let (u_packed, u_stride, u_repack) = pack_plane(&frame.u_plane, frame.u_stride, c_w, (frame.height / 2) as usize);
-                    let (v_packed, v_stride, v_repack) = pack_plane(&frame.v_plane, frame.v_stride, c_w, (frame.height / 2) as usize);
-                    let y_data: &[u8] = if y_repack { &y_packed } else { &frame.y_plane };
-                    let u_data: &[u8] = if u_repack { &u_packed } else { &frame.u_plane };
-                    let v_data: &[u8] = if v_repack { &v_packed } else { &frame.v_plane };
-                    let y_stride = y_stride as u32;
-                    let u_stride = u_stride as u32;
-                    let v_stride = v_stride as u32;
-                    self.queue.write_texture(
-                        wgpu::TexelCopyTextureInfo { texture: &vs.y_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                        y_data,
-                        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(y_stride), rows_per_image: Some(frame.height) },
-                        wgpu::Extent3d { width: frame.width, height: frame.height, depth_or_array_layers: 1 }
-                    );
-                    self.queue.write_texture(
-                        wgpu::TexelCopyTextureInfo { texture: &vs.u_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                        u_data,
-                        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(u_stride), rows_per_image: Some(frame.height / 2) },
-                        wgpu::Extent3d { width: frame.width / 2, height: frame.height / 2, depth_or_array_layers: 1 }
-                    );
-                    self.queue.write_texture(
-                        wgpu::TexelCopyTextureInfo { texture: &vs.v_texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                        v_data,
-                        wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(v_stride), rows_per_image: Some(frame.height / 2) },
-                        wgpu::Extent3d { width: frame.width / 2, height: frame.height / 2, depth_or_array_layers: 1 }
-                    );
+                    if needs_init {
+                        let tex_format = if frame.bit_depth > 8 {
+                            wgpu::TextureFormat::R16Unorm
+                        } else {
+                            wgpu::TextureFormat::R8Unorm
+                        };
+                        let y_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                            label: Some("Video Y Texture"),
+                            size: wgpu::Extent3d {
+                                width: frame.width,
+                                height: frame.height,
+                                depth_or_array_layers: 1,
+                            },
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: tex_format,
+                            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                                | wgpu::TextureUsages::COPY_DST,
+                            view_formats: &[],
+                        });
+                        let u_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                            label: Some("Video U Texture"),
+                            size: wgpu::Extent3d {
+                                width: frame.width / 2,
+                                height: frame.height / 2,
+                                depth_or_array_layers: 1,
+                            },
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: tex_format,
+                            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                                | wgpu::TextureUsages::COPY_DST,
+                            view_formats: &[],
+                        });
+                        let v_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                            label: Some("Video V Texture"),
+                            size: wgpu::Extent3d {
+                                width: frame.width / 2,
+                                height: frame.height / 2,
+                                depth_or_array_layers: 1,
+                            },
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: tex_format,
+                            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                                | wgpu::TextureUsages::COPY_DST,
+                            view_formats: &[],
+                        });
 
-                    let params = VideoParams {
-                        color_space: frame.color_space,
-                        color_range: frame.color_range,
-                        bit_depth: frame.bit_depth as u32,
-                        color_trc: frame.color_trc,
-                        viewport_width: self.config.width as f32,
-                        viewport_height: self.config.height as f32,
-                        video_width: frame.width as f32,
-                        video_height: frame.height as f32,
-                        rotation: frame.rotation,
-                        _pad1: 0.0,
-                        _pad2: 0.0,
-                        _pad3: 0.0,
-                    };
-                    self.queue.write_buffer(&vs.params_buffer, 0, bytemuck::cast_slice(&[params]));
+                        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+                            label: Some("Video Sampler"),
+                            address_mode_u: wgpu::AddressMode::ClampToEdge,
+                            address_mode_v: wgpu::AddressMode::ClampToEdge,
+                            address_mode_w: wgpu::AddressMode::ClampToEdge,
+                            mag_filter: wgpu::FilterMode::Linear,
+                            min_filter: wgpu::FilterMode::Linear,
+                            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+                            ..Default::default()
+                        });
+
+                        let params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("Video Params Buffer"),
+                            size: std::mem::size_of::<VideoParams>() as u64,
+                            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        });
+
+                        let bind_group =
+                            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: Some("Video Bind Group"),
+                                layout: &self.video_bind_group_layout,
+                                entries: &[
+                                    wgpu::BindGroupEntry {
+                                        binding: 0,
+                                        resource: wgpu::BindingResource::TextureView(
+                                            &y_texture.create_view(
+                                                &wgpu::TextureViewDescriptor::default(),
+                                            ),
+                                        ),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 1,
+                                        resource: wgpu::BindingResource::TextureView(
+                                            &u_texture.create_view(
+                                                &wgpu::TextureViewDescriptor::default(),
+                                            ),
+                                        ),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 2,
+                                        resource: wgpu::BindingResource::TextureView(
+                                            &v_texture.create_view(
+                                                &wgpu::TextureViewDescriptor::default(),
+                                            ),
+                                        ),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 3,
+                                        resource: wgpu::BindingResource::Sampler(&sampler),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 4,
+                                        resource: params_buffer.as_entire_binding(),
+                                    },
+                                ],
+                            });
+
+                        self.video_state = Some(VideoState {
+                            y_texture,
+                            u_texture,
+                            v_texture,
+                            bind_group,
+                            params_buffer,
+                            width: frame.width,
+                            height: frame.height,
+                            rotation: frame.rotation,
+                            color_space: frame.color_space,
+                            color_range: frame.color_range,
+                            bit_depth: frame.bit_depth as u32,
+                            color_trc: frame.color_trc,
+                        });
+                    } else if let Some(vs) = &mut self.video_state {
+                        vs.rotation = frame.rotation;
+                        vs.color_space = frame.color_space;
+                        vs.color_range = frame.color_range;
+                        vs.bit_depth = frame.bit_depth as u32;
+                        vs.color_trc = frame.color_trc;
+                    }
+
+                    if let Some(vs) = &self.video_state {
+                        // wgpu requires bytes_per_row to be a multiple of 256; repack
+                        // into a staging buffer with padded rows when the decoder
+                        // stride doesn't comply or buffer size is under-allocated.
+                        let pack_plane = |plane: &[u8],
+                                          stride: usize,
+                                          width_bytes: usize,
+                                          rows: usize|
+                         -> (Vec<u8>, usize, bool) {
+                            let aligned = (width_bytes + 255) & !255;
+                            if stride == aligned && plane.len() >= aligned * rows {
+                                return (Vec::new(), stride, false);
+                            }
+                            let mut packed = vec![0u8; aligned * rows];
+                            let plane_len = plane.len();
+                            for r in 0..rows {
+                                let src_start = r * stride;
+                                let src_end = src_start + width_bytes;
+                                let dst_start = r * aligned;
+                                let dst_end = dst_start + width_bytes;
+                                if src_end <= plane_len && dst_end <= packed.len() {
+                                    packed[dst_start..dst_end]
+                                        .copy_from_slice(&plane[src_start..src_end]);
+                                } else if src_start < plane_len && dst_end <= packed.len() {
+                                    let available = plane_len - src_start;
+                                    packed[dst_start..dst_start + available]
+                                        .copy_from_slice(&plane[src_start..plane_len]);
+                                }
+                            }
+                            (packed, aligned, true)
+                        };
+                        let bytes_per_px = if frame.bit_depth > 8 { 2 } else { 1 };
+                        let y_w = frame.width as usize * bytes_per_px;
+                        let c_w = (frame.width / 2) as usize * bytes_per_px;
+                        let (y_packed, y_stride, y_repack) =
+                            pack_plane(&frame.y_plane, frame.y_stride, y_w, frame.height as usize);
+                        let (u_packed, u_stride, u_repack) = pack_plane(
+                            &frame.u_plane,
+                            frame.u_stride,
+                            c_w,
+                            (frame.height / 2) as usize,
+                        );
+                        let (v_packed, v_stride, v_repack) = pack_plane(
+                            &frame.v_plane,
+                            frame.v_stride,
+                            c_w,
+                            (frame.height / 2) as usize,
+                        );
+                        let y_data: &[u8] = if y_repack { &y_packed } else { &frame.y_plane };
+                        let u_data: &[u8] = if u_repack { &u_packed } else { &frame.u_plane };
+                        let v_data: &[u8] = if v_repack { &v_packed } else { &frame.v_plane };
+                        let y_stride = y_stride as u32;
+                        let u_stride = u_stride as u32;
+                        let v_stride = v_stride as u32;
+                        self.queue.write_texture(
+                            wgpu::TexelCopyTextureInfo {
+                                texture: &vs.y_texture,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d::ZERO,
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            y_data,
+                            wgpu::TexelCopyBufferLayout {
+                                offset: 0,
+                                bytes_per_row: Some(y_stride),
+                                rows_per_image: Some(frame.height),
+                            },
+                            wgpu::Extent3d {
+                                width: frame.width,
+                                height: frame.height,
+                                depth_or_array_layers: 1,
+                            },
+                        );
+                        self.queue.write_texture(
+                            wgpu::TexelCopyTextureInfo {
+                                texture: &vs.u_texture,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d::ZERO,
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            u_data,
+                            wgpu::TexelCopyBufferLayout {
+                                offset: 0,
+                                bytes_per_row: Some(u_stride),
+                                rows_per_image: Some(frame.height / 2),
+                            },
+                            wgpu::Extent3d {
+                                width: frame.width / 2,
+                                height: frame.height / 2,
+                                depth_or_array_layers: 1,
+                            },
+                        );
+                        self.queue.write_texture(
+                            wgpu::TexelCopyTextureInfo {
+                                texture: &vs.v_texture,
+                                mip_level: 0,
+                                origin: wgpu::Origin3d::ZERO,
+                                aspect: wgpu::TextureAspect::All,
+                            },
+                            v_data,
+                            wgpu::TexelCopyBufferLayout {
+                                offset: 0,
+                                bytes_per_row: Some(v_stride),
+                                rows_per_image: Some(frame.height / 2),
+                            },
+                            wgpu::Extent3d {
+                                width: frame.width / 2,
+                                height: frame.height / 2,
+                                depth_or_array_layers: 1,
+                            },
+                        );
+
+                        let params = VideoParams {
+                            color_space: frame.color_space,
+                            color_range: frame.color_range,
+                            bit_depth: frame.bit_depth as u32,
+                            color_trc: frame.color_trc,
+                            viewport_width: self.config.width as f32,
+                            viewport_height: self.config.height as f32,
+                            video_width: frame.width as f32,
+                            video_height: frame.height as f32,
+                            rotation: frame.rotation,
+                            _pad1: 0.0,
+                            _pad2: 0.0,
+                            _pad3: 0.0,
+                        };
+                        self.queue.write_buffer(
+                            &vs.params_buffer,
+                            0,
+                            bytemuck::cast_slice(&[params]),
+                        );
+                    }
                 }
-                }
-                
+
                 if let Some(tx) = &state.free_video_frame_tx {
                     let _ = tx.try_send(frame);
                 }
             }
         }
-        
     }
 
     #[allow(clippy::type_complexity)]
@@ -4418,8 +5905,22 @@ impl VulkanEngine {
         egui_state: &mut egui_winit::State,
         state: &AppState,
         file_dialog: &mut egui_file_dialog::FileDialog,
-        gamepad_events: Vec<egui::Event>
-    ) -> Result<(EngineAction, f32, f32, Option<f32>, Option<f32>, Option<f32>, f32, f32, f32, f32), wgpu::SurfaceStatus> {
+        gamepad_events: Vec<egui::Event>,
+    ) -> Result<
+        (
+            EngineAction,
+            f32,
+            f32,
+            Option<f32>,
+            Option<f32>,
+            Option<f32>,
+            f32,
+            f32,
+            f32,
+            f32,
+        ),
+        wgpu::SurfaceStatus,
+    > {
         let physical_size = window.inner_size();
         if physical_size.width > 0 && physical_size.height > 0 && physical_size != self.size {
             self.resize(physical_size);
@@ -4428,56 +5929,60 @@ impl VulkanEngine {
         let surface = self.surface.as_ref().ok_or(wgpu::SurfaceStatus::Lost)?;
         let output = surface.get_current_texture();
         let surface_texture = match output {
-            wgpu::CurrentSurfaceTexture::Success(tex) | wgpu::CurrentSurfaceTexture::Suboptimal(tex) => tex,
+            wgpu::CurrentSurfaceTexture::Success(tex)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(tex) => tex,
             wgpu::CurrentSurfaceTexture::Lost => return Err(wgpu::SurfaceStatus::Lost),
             wgpu::CurrentSurfaceTexture::Outdated => return Err(wgpu::SurfaceStatus::Outdated),
             wgpu::CurrentSurfaceTexture::Timeout => return Err(wgpu::SurfaceStatus::Timeout),
             _ => return Err(wgpu::SurfaceStatus::Lost),
         };
-        let view = surface_texture.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let view = surface_texture
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
         let phase_surface_us = surface_start.elapsed().as_micros() as f32;
 
         let mut fft_shader_time_us = self.cached_fft_us;
         let mut fire_shader_time_us = self.cached_fire_us;
         let mut vis_shader_time_us = self.cached_vis_us;
-        
+
         // NON-BLOCKING timestamp readback: poll without waiting, check if mapping completed
         if self.timestamp_mapping_active {
             // Non-blocking poll to process any completed GPU work
             let _ = self.device.poll(wgpu::PollType::Poll);
-            
+
             if self.timestamp_map_complete.load(Ordering::Acquire)
-                && let Some(read_buffer) = &self.query_read_buffer {
-                    let slice = read_buffer.slice(..);
-                    let data = slice.get_mapped_range();
-                    
-                    let fft_start: u64 = u64::from_le_bytes(data[0..8].try_into().unwrap());
-                    let fft_end: u64 = u64::from_le_bytes(data[8..16].try_into().unwrap());
-                    if fft_end > fft_start {
-                        let elapsed_ns = (fft_end - fft_start) as f32 * self.timestamp_period;
-                        fft_shader_time_us = Some(elapsed_ns / 1_000.0);
-                        self.cached_fft_us = fft_shader_time_us;
-                    }
+                && let Some(read_buffer) = &self.query_read_buffer
+            {
+                let slice = read_buffer.slice(..);
+                let data = slice.get_mapped_range();
 
-                    let fire_start: u64 = u64::from_le_bytes(data[16..24].try_into().unwrap());
-                    let fire_end: u64 = u64::from_le_bytes(data[24..32].try_into().unwrap());
-                    if fire_end > fire_start {
-                        let elapsed_ns = (fire_end - fire_start) as f32 * self.timestamp_period;
-                        fire_shader_time_us = Some(elapsed_ns / 1_000.0);
-                        self.cached_fire_us = fire_shader_time_us;
-                    }
+                let fft_start: u64 = u64::from_le_bytes(data[0..8].try_into().unwrap());
+                let fft_end: u64 = u64::from_le_bytes(data[8..16].try_into().unwrap());
+                if fft_end > fft_start {
+                    let elapsed_ns = (fft_end - fft_start) as f32 * self.timestamp_period;
+                    fft_shader_time_us = Some(elapsed_ns / 1_000.0);
+                    self.cached_fft_us = fft_shader_time_us;
+                }
 
-                    let vis_start: u64 = u64::from_le_bytes(data[32..40].try_into().unwrap());
-                    let vis_end: u64 = u64::from_le_bytes(data[40..48].try_into().unwrap());
-                    if vis_end > vis_start {
-                        let elapsed_ns = (vis_end - vis_start) as f32 * self.timestamp_period;
-                        vis_shader_time_us = Some(elapsed_ns / 1_000.0);
-                        self.cached_vis_us = vis_shader_time_us;
-                    }
+                let fire_start: u64 = u64::from_le_bytes(data[16..24].try_into().unwrap());
+                let fire_end: u64 = u64::from_le_bytes(data[24..32].try_into().unwrap());
+                if fire_end > fire_start {
+                    let elapsed_ns = (fire_end - fire_start) as f32 * self.timestamp_period;
+                    fire_shader_time_us = Some(elapsed_ns / 1_000.0);
+                    self.cached_fire_us = fire_shader_time_us;
+                }
 
-                    drop(data);
-                    read_buffer.unmap();
-                    self.timestamp_mapping_active = false;
+                let vis_start: u64 = u64::from_le_bytes(data[32..40].try_into().unwrap());
+                let vis_end: u64 = u64::from_le_bytes(data[40..48].try_into().unwrap());
+                if vis_end > vis_start {
+                    let elapsed_ns = (vis_end - vis_start) as f32 * self.timestamp_period;
+                    vis_shader_time_us = Some(elapsed_ns / 1_000.0);
+                    self.cached_vis_us = vis_shader_time_us;
+                }
+
+                drop(data);
+                read_buffer.unmap();
+                self.timestamp_mapping_active = false;
             }
             // If mapping not yet complete, we use cached values from last successful read
         }
@@ -4486,21 +5991,24 @@ impl VulkanEngine {
         let ui_start = std::time::Instant::now();
         let mut raw_input = egui_state.take_egui_input(window);
         raw_input.events.extend(gamepad_events);
-        let mut central_rect = egui::Rect::from_min_max(Default::default(), egui::pos2(self.config.width as f32, self.config.height as f32));
+        let mut central_rect = egui::Rect::from_min_max(
+            Default::default(),
+            egui::pos2(self.config.width as f32, self.config.height as f32),
+        );
         let mut engine_action = EngineAction::None;
-        
+
         let mut out_meters_rect = None;
         let mut out_fire_rect = None;
         let mut out_heatmap_rect = None;
         let mut out_track_info_rect = None;
         let mut out_top_panel_rect = None;
         let mut out_video_rect = None;
-        
+
         let vis_name = crate::state::VISUALIZERS
             .get(state.current_visualizer_idx)
             .map(|v| v.name)
             .unwrap_or("Unknown");
-        
+
         let mut video_info_str = None;
         if let Some(vs) = &self.video_state {
             let cs = match vs.color_space {
@@ -4512,10 +6020,17 @@ impl VulkanEngine {
                 2 => "Full Range",
                 _ => "Limited Range",
             };
-            let (disp_w, disp_h) = if vs.rotation == 90 || vs.rotation == 270 { (vs.height, vs.width) } else { (vs.width, vs.height) };
-            video_info_str = Some(format!("{}x{} | {} {}-bit {}", disp_w, disp_h, cs, vs.bit_depth, cr));
+            let (disp_w, disp_h) = if vs.rotation == 90 || vs.rotation == 270 {
+                (vs.height, vs.width)
+            } else {
+                (vs.width, vs.height)
+            };
+            video_info_str = Some(format!(
+                "{}x{} | {} {}-bit {}",
+                disp_w, disp_h, cs, vs.bit_depth, cr
+            ));
         }
-        
+
         let full_output = egui_ctx.run_ui(raw_input, |ctx| {
             if state.is_url_dialog_open {
                 egui::Window::new("Open Network Stream")
@@ -4551,7 +6066,7 @@ impl VulkanEngine {
                                 }
                             });
                         });
-                        
+
                         if !state.url_history.is_empty() {
                             ui.separator();
                             ui.label(egui::RichText::new("Recent Streams:").strong());
@@ -4592,7 +6107,7 @@ impl VulkanEngine {
                                 .color(egui::Color32::YELLOW)
                         );
                         ui.separator();
-                        
+
                         if state.stats.bitstream_active {
                             ui.label(
                                 egui::RichText::new("Bitstream Passthrough: ACTIVE")
@@ -4689,16 +6204,16 @@ impl VulkanEngine {
                         let total_phases: f32 = phases.iter().map(|(_, v)| v).sum();
                         for (name, val) in &phases {
                             let mut color = if *val > 2000.0 { egui::Color32::RED }
-                                       else if *val > 1000.0 { egui::Color32::YELLOW } 
+                                       else if *val > 1000.0 { egui::Color32::YELLOW }
                                        else { egui::Color32::from_rgb(160, 160, 160) };
-                            
+
                             let display_name = if *name == "  Surface Acq" {
                                 color = egui::Color32::from_rgb(160, 160, 160);
                                 "  Surface Acq (VSync Wait)"
                             } else {
                                 *name
                             };
-                            
+
                             ui.label(
                                 egui::RichText::new(format!("{}: {:.2} ms", display_name, val / 1000.0))
                                     .color(color)
@@ -4939,7 +6454,7 @@ impl VulkanEngine {
                 ui.separator();
                 ui.checkbox(&mut append, "Add to Playlist instead of replacing");
             });
-            
+
             if append != state.append_to_playlist {
                 engine_action = EngineAction::SetAppendToPlaylist(append);
             }
@@ -4954,13 +6469,13 @@ impl VulkanEngine {
             if !state.file_loaded {
                 central_rect = ctx.content_rect();
                 let time = self.smooth_time as f32;
-                
+
                 // --- Background Retro Grid (Demoscene Vibe) ---
                 let bg_painter = ctx.layer_painter(egui::LayerId::background());
                 let rect = ctx.content_rect();
                 let horizon_y = rect.top() + rect.height() * 0.55;
                 let center_x = rect.center().x;
-                
+
                 // 1. Sky gradient
                 let sky_steps = 40;
                 let sky_height = horizon_y - rect.top();
@@ -5000,18 +6515,18 @@ impl VulkanEngine {
                     x ^= x << 5;
                     (x % 1000) as f32 / 1000.0
                 };
-                
+
                 for i in 0..50 {
                     let rx = pseudo_rand(i * 31);
                     let ry = pseudo_rand(i * 31 + 1);
                     let rr = pseudo_rand(i * 31 + 2);
                     let rt = pseudo_rand(i * 31 + 3);
-                    
+
                     let x = rect.left() + rx * rect.width();
                     let y = rect.top() + ry * sky_height * 0.7; // Stars in upper 70%
                     let radius = rr * 1.5 + 0.5;
                     let twinkle = ((time * (1.0 + rt * 2.0) + rx * 100.0).sin() * 0.5 + 0.5) * 200.0 + 55.0;
-                    
+
                     bg_painter.circle_filled(
                         egui::pos2(x, y),
                         radius,
@@ -5022,29 +6537,29 @@ impl VulkanEngine {
                 // 3. Retro Sliced Sun
                 let sun_radius = rect.width().min(rect.height()) * 0.25;
                 let sun_center = egui::pos2(center_x, horizon_y - sun_radius * 0.3);
-                
+
                 let sun_steps = 40;
                 for i in 0..sun_steps {
                     let t = i as f32 / sun_steps as f32;
                     let next_t = (i + 1) as f32 / sun_steps as f32;
-                    
+
                     if t > 0.45 {
                         let slice_t = (t - 0.45) / 0.55;
                         let slice_val = (slice_t * 15.0).fract();
-                        let gap_threshold = 0.2 + slice_t * 0.6; 
+                        let gap_threshold = 0.2 + slice_t * 0.6;
                         if slice_val < gap_threshold {
                             continue;
                         }
                     }
-                    
+
                     let y_min = sun_center.y - sun_radius + t * sun_radius * 2.0;
                     let y_max = sun_center.y - sun_radius + next_t * sun_radius * 2.0;
-                    
+
                     let r = 255;
                     let g = (204.0 * (1.0 - t) + 80.0 * t) as u8;
                     let b = (0.0 * (1.0 - t) + 100.0 * t) as u8;
                     let color = egui::Color32::from_rgb(r, g, b);
-                    
+
                     bg_painter.with_clip_rect(egui::Rect::from_min_max(
                         egui::pos2(rect.left(), y_min),
                         egui::pos2(rect.right(), y_max),
@@ -5060,22 +6575,22 @@ impl VulkanEngine {
                     let h1 = pseudo_rand(i * 17);
                     let h2 = pseudo_rand(i * 17 + 1);
                     let h3 = pseudo_rand(i * 17 + 2);
-                    
+
                     let cx = rect.left() + h1 * rect.width();
                     let cy = horizon_y;
                     let width = rect.width() * (0.1 + h2 * 0.25);
                     let height = rect.height() * (0.05 + h3 * 0.25);
-                    
+
                     let p1 = egui::pos2(cx - width, cy);
                     let p2 = egui::pos2(cx + width, cy);
                     let p3 = egui::pos2(cx, cy - height);
-                    
+
                     bg_painter.add(egui::Shape::convex_polygon(
                         vec![p1, p2, p3],
                         egui::Color32::from_rgb(27, 27, 58),
                         egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(91, 50, 212)),
                     ));
-                    
+
                     // Center ridge
                     let ridge_offset = (pseudo_rand(i * 17 + 3) - 0.5) * 0.4;
                     bg_painter.line_segment(
@@ -5095,19 +6610,19 @@ impl VulkanEngine {
                 );
 
                 let grid_color = egui::Color32::from_rgb(212, 34, 161);
-                
+
                 // Vertical radiating lines
                 let num_v_lines = 40;
                 for i in 0..=num_v_lines {
                     let t = i as f32 / num_v_lines as f32;
                     let bottom_x = rect.left() + (t - 0.5) * rect.width() * 8.0;
-                    
+
                     bg_painter.line_segment(
                         [egui::pos2(center_x, horizon_y), egui::pos2(bottom_x, rect.bottom())],
                         egui::Stroke::new(1.0_f32, grid_color)
                     );
                 }
-                
+
                 // Horizontal scrolling perspective lines
                 let num_h_lines = 30;
                 for i in 0..num_h_lines {
@@ -5115,19 +6630,19 @@ impl VulkanEngine {
                     if offset <= 0.0 { continue; }
                     let y = horizon_y + (rect.bottom() - horizon_y) * offset.powf(3.0);
                     let thickness = 1.0 + offset * 2.0;
-                    
+
                     bg_painter.line_segment(
                         [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
                         egui::Stroke::new(thickness, grid_color)
                     );
                 }
                 // --- End Retro Grid ---
-                
+
                 let is_mobile = cfg!(target_os = "android");
-                let is_game_mode = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_lowercase() == "gamescope" || 
+                let is_game_mode = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_lowercase() == "gamescope" ||
                                    std::env::var("XDG_SESSION_DESKTOP").unwrap_or_default().to_lowercase() == "gamescope" ||
                                    std::env::var("STEAM_DECK").is_ok();
-                                   
+
                 let show_kb = !is_game_mode && !is_mobile;
                 let show_gp = state.has_gamepad && !is_mobile;
                 let show_touch = is_mobile;
@@ -5139,7 +6654,7 @@ impl VulkanEngine {
                             let height = if is_mobile { 120.0 } else if show_kb && show_gp { 170.0 } else { 140.0 };
                             ui.add_space(height);
                         });
-                        
+
                     egui::Area::new(egui::Id::new("splash_shortcuts_area"))
                         .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, if is_mobile { -12.0 } else { -40.0 }))
                         .show(ctx, |ui| {
@@ -5185,12 +6700,12 @@ impl VulkanEngine {
                                     } else {
                                         ui.horizontal_centered(|ui| {
                                             let pairs_per_row = if show_kb && show_gp { 2 } else { 3 };
-                                            
+
                                             if show_kb {
                                                 ui.vertical(|ui| {
                                                     ui.label(egui::RichText::new("🖮 Keyboard Shortcuts").color(egui::Color32::LIGHT_GRAY).strong().size(18.0));
                                                     ui.add_space(10.0);
-                                                    
+
                                                     egui::Grid::new("kb_shortcuts")
                                                         .num_columns(pairs_per_row * 2)
                                                         .spacing([25.0, 12.0])
@@ -5224,7 +6739,7 @@ impl VulkanEngine {
                                                         });
                                                 });
                                             }
-                                            
+
                                             if show_kb && show_gp {
                                                 ui.add_space(20.0);
                                                 let (rect, _) = ui.allocate_exact_size(egui::vec2(1.0, 180.0), egui::Sense::hover());
@@ -5234,7 +6749,7 @@ impl VulkanEngine {
                                                 );
                                                 ui.add_space(20.0);
                                             }
-                                            
+
                                             if show_gp {
                                                 ui.vertical(|ui| {
                                                     ui.horizontal(|ui| {
@@ -5278,11 +6793,11 @@ impl VulkanEngine {
                 let frame = egui::Frame::NONE
                     .fill(egui::Color32::from_rgba_unmultiplied(10, 10, 15, 180)) // Translucent to show grid
                     .inner_margin(if is_mobile { 16.0 } else { 40.0 });
-                    
+
                 egui::CentralPanel::default().frame(frame).show_inside(ctx, |ui| {
                     let real_avail_height = ui.available_height();
                     let real_avail_width = ui.available_width();
-                    
+
                     egui::ScrollArea::vertical().show(ui, |ui| {
                         ui.vertical_centered(|ui| {
                             let top_space = if is_mobile {
@@ -5307,9 +6822,9 @@ impl VulkanEngine {
                             let (title_rect, _) = ui.allocate_exact_size(egui::vec2(title_width, title_height), egui::Sense::hover());
                             let painter = ui.painter();
                             let text = "RustTracker";
-                            
+
                             let font_id = egui::FontId::new(font_size, egui::FontFamily::Name("Orbitron".into()));
-                            
+
                             // 1. Silver Outer Bevel (3px offset)
                             let silver_color = egui::Color32::from_rgb(200, 220, 255);
                             for dx in [-3.0, 0.0, 3.0] {
@@ -5324,7 +6839,7 @@ impl VulkanEngine {
                                     );
                                 }
                             }
-                            
+
                             // 2. Black Inner Outline (1px offset)
                             for dx in [-1.0, 0.0, 1.0] {
                                 for dy in [-1.0, 0.0, 1.0] {
@@ -5338,29 +6853,29 @@ impl VulkanEngine {
                                     );
                                 }
                             }
-                            
+
                             // 3. Sliced Chrome Scrolling Palette Interior
                             let steps = 40; // More steps for cooler copper bar effect
                             let top_y = title_rect.center().y - gradient_extent;
                             let bottom_y = title_rect.center().y + gradient_extent;
                             let height = bottom_y - top_y;
-                            
+
                             for i in 0..steps {
                                 let t = i as f32 / steps as f32;
                                 let next_t = (i + 1) as f32 / steps as f32;
                                 let min_y = top_y + t * height;
                                 let max_y = top_y + next_t * height;
-                                
+
                                 let clip_rect = egui::Rect::from_min_max(
                                     egui::pos2(title_rect.left(), min_y),
                                     egui::pos2(title_rect.right(), max_y),
                                 );
-                                
+
                                 // Palette cycling calculation
                                 let scroll_speed = 0.1;
                                 let mut color_t = (t + time * scroll_speed).fract();
                                 if color_t < 0.0 { color_t += 1.0; }
-                                
+
                                 let color = if color_t < 0.48 {
                                     // Sky: Cyan to Dark Blue
                                     let sky_t = color_t / 0.48;
@@ -5389,7 +6904,7 @@ impl VulkanEngine {
                                 );
                             }
                             ui.add_space(20.0);
-                            
+
                             let is_file_hovered = !ui.input(|i| i.raw.hovered_files.is_empty()) || state.hovered_file.is_some();
                             if is_file_hovered {
                                 let badge_text = if let Some(hf) = &state.hovered_file {
@@ -5476,23 +6991,23 @@ impl VulkanEngine {
                                             });
                                         }
                                     });
-                                
+
                                 ui.add_space(20.0);
-                            
+
                             let mut force_stereo = state.force_stereo_downmix;
                             if ui.checkbox(&mut force_stereo, "Force Stereo Downmix (Fixes crackling on some devices)").changed() {
                                 engine_action = EngineAction::SetForceStereo(force_stereo);
                             }
-                            
+
                             #[cfg(any(target_os = "windows", target_os = "linux"))]
                             {
                                 let mut passthrough = state.passthrough_enabled;
-                                 
+
                                 #[cfg(target_os = "windows")]
                                 let label = "Enable Bitstream Passthrough (WASAPI Exclusive)";
                                 #[cfg(target_os = "linux")]
                                 let label = "Enable Bitstream Passthrough (PipeWire)";
-                                
+
                                 if ui.checkbox(&mut passthrough, label).changed() {
                                     engine_action = EngineAction::SetPassthrough(passthrough);
                                 }
@@ -5542,7 +7057,7 @@ impl VulkanEngine {
                                 // Custom Fire/Charred Progress Bar
                                 let (rect, response) = col.allocate_exact_size(egui::vec2(col.available_width(), 16.0), egui::Sense::click_and_drag());
                                 *out_fire_rect = Some(rect);
-                                
+
                                 if response.drag_stopped() || response.clicked() {
                                     if let Some(mouse_pos) = response.interact_pointer_pos() {
                                         let rel_x = (mouse_pos.x - rect.left()).clamp(0.0, rect.width());
@@ -5558,7 +7073,7 @@ impl VulkanEngine {
                                 } else if !response.is_pointer_button_down_on() && state.scrub_target_seconds.is_some() {
                                     *engine_action = EngineAction::ScrubEnd;
                                 }
-                                
+
                                 let painter = col.painter();
                                 let format_time = |secs: f64| -> String {
                                     let m = (secs / 60.0).floor() as u32;
@@ -5566,14 +7081,14 @@ impl VulkanEngine {
                                     let f = (secs.fract() * 10.0).floor() as u32;
                                     format!("{:02}:{:02}.{}", m, s, f)
                                 };
-                                
+
                                 let display_secs = state.scrub_target_seconds.unwrap_or(state.current_seconds);
                                 let time_text = if state.duration_seconds <= 0.0 {
                                     format!("{} / LIVE", format_time(display_secs))
                                 } else {
                                     format!("{} / {}", format_time(display_secs), format_time(state.duration_seconds))
                                 };
-                                
+
                                 painter.text(
                                     rect.center(),
                                     egui::Align2::CENTER_CENTER,
@@ -5594,11 +7109,11 @@ impl VulkanEngine {
                                     col.available_height() - 25.0
                                 };
                                 let (channel_rect, _) = col.allocate_exact_size(
-                                    egui::vec2(col.available_width(), meters_height), 
+                                    egui::vec2(col.available_width(), meters_height),
                                     egui::Sense::hover()
                                 );
                                 *out_meters_rect = Some(channel_rect);
-                                
+
                                 let painter = col.painter();
                                 let num_channels = state.channel_vus.len();
                                 if num_channels > 0 {
@@ -5607,7 +7122,7 @@ impl VulkanEngine {
                                         let x = channel_rect.left() + i as f32 * w + w * 0.2;
                                         let bw = w * 0.6;
                                         let y_bottom = channel_rect.bottom() - 15.0;
-                                        
+
                                         // Label
                                         if num_channels <= 16 {
                                             let label = if state.tracker_channels.is_some() {
@@ -5639,7 +7154,7 @@ impl VulkanEngine {
                                         }
                                     }
                                 }
-                                
+
                                 if !is_portrait {
                                     col.add_space(5.0);
                                     render_progress_bar(col, out_fire_rect, engine_action);
@@ -5660,18 +7175,18 @@ impl VulkanEngine {
                                 }
                                 let hm_rect = col.available_rect_before_wrap();
                                 *out_heatmap_rect = Some(hm_rect);
-                                
+
                                 col.painter().rect_filled(hm_rect, 0.0, egui::Color32::TRANSPARENT);
-                                
+
                                 let painter = col.painter().with_clip_rect(hm_rect);
                                 let chunks = 64;
                                 let cell_w = hm_rect.width() / chunks as f32;
-                                
+
                                 for c in 0..=chunks {
                                     let x = hm_rect.left() + c as f32 * cell_w;
                                     painter.line_segment([egui::pos2(x, hm_rect.top()), egui::pos2(x, hm_rect.bottom())], (1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 5)));
                                 }
-                                
+
                                 if let Some(lyrics) = &state.lyrics {
                                     // Layer 1: Backdrop Scrim - Dim heatmap slightly for crisp lyrics readability
                                     painter.rect_filled(
@@ -5792,18 +7307,18 @@ impl VulkanEngine {
                                     let center_y = hm_rect.top() + hm_rect.height() / 2.0;
                                     let row_height = 16.0;
                                     let num_rows_to_draw = (hm_rect.height() / row_height) as i32;
-                                    
+
                                     let font_id = egui::FontId::monospace(12.0);
                                     let char_width = 7.0; // Approx monospace char width at 12pt
                                     let max_chars = ((hm_rect.width() - 20.0) / char_width).max(10.0) as usize;
                                     let max_text_chars = max_chars.saturating_sub(4);
-                                    
+
                                     let mut formatted = String::with_capacity(max_text_chars + 16);
-                                    
+
                                     for offset in -(num_rows_to_draw / 2)..=(num_rows_to_draw / 2) {
                                         let mut resolved_order = current_order;
                                         let mut resolved_row = current_row + offset;
-                                        
+
                                         if offset < 0 {
                                             // Read exact playback sequence from history
                                             let history_idx = (-offset - 1) as usize;
@@ -5834,16 +7349,16 @@ impl VulkanEngine {
                                                 }
                                             }
                                         }
-                                        
+
                                         if resolved_order >= 0 && (resolved_order as usize) < state.tracker_patterns_by_order.len() {
                                             let pattern = &state.tracker_patterns_by_order[resolved_order as usize];
                                             if resolved_row >= 0 && (resolved_row as usize) < pattern.len() {
                                                 let row_str = &pattern[resolved_row as usize];
-                                                
+
                                                 let distance = offset.abs() as f32 / (num_rows_to_draw as f32 / 2.0);
                                                 let alpha = (1.0 - distance * 0.75).clamp(0.0, 1.0);
                                                 let y = center_y + (offset as f32) * row_height;
-                                                
+
                                                 // Format tracker row text
                                                 formatted.clear();
                                                 let text_slice = if row_str.chars().count() > max_text_chars {
@@ -5858,10 +7373,10 @@ impl VulkanEngine {
                                                 } else {
                                                     row_str.as_str()
                                                 };
-                                                
+
                                                 use std::fmt::Write;
                                                 let _ = write!(formatted, "{:02} | {}", resolved_row, text_slice);
-                                                
+
                                                 let pos = egui::pos2(hm_rect.left() + 10.0, y);
                                                 if offset == 0 {
                                                     // Prominent highlight background on the active playback row
@@ -5883,17 +7398,17 @@ impl VulkanEngine {
                                                 } else {
                                                     // Valid unmultiplied alpha color
                                                     let color = egui::Color32::from_rgba_unmultiplied(150, 150, 150, (alpha * 100.0) as u8);
-                                                    
+
                                                     let galley = painter.layout_no_wrap(
                                                         formatted.clone(),
                                                         font_id.clone(),
                                                         egui::Color32::WHITE,
                                                     );
-                                                    
+
                                                     let rect = egui::Rect::from_center_size(pos, galley.size());
                                                     painter.galley(rect.min, galley, color);
                                                 }
-                                                
+
                                                 // Pattern boundary indicator
                                                 if resolved_row == 0 {
                                                     painter.line_segment(
@@ -5938,26 +7453,26 @@ impl VulkanEngine {
                                         });
                                     });
                                     col.separator();
-                                
+
                                     let render_smooth_marquee = |ui: &mut egui::Ui, text: &str, size: f32, is_title: bool| {
                                         let available_width = ui.available_width();
                                         let font_id = egui::FontId::proportional(size);
                                         let color = ui.style().visuals.override_text_color.unwrap_or(egui::Color32::from_gray(235));
                                         let text_color = if is_title { egui::Color32::WHITE } else { color };
-                                        
+
                                         let galley = ui.painter().layout_no_wrap(text.to_string(), font_id, text_color);
                                         let text_width = galley.rect.width();
                                         let height = galley.rect.height();
-                                        
+
                                         let (rect, _response) = ui.allocate_exact_size(egui::vec2(available_width, height), egui::Sense::hover());
                                         let painter = ui.painter().with_clip_rect(rect);
-                                        
+
                                         if text_width > available_width {
                                             let max_scroll = text_width - available_width;
                                             let scroll_duration = max_scroll / 35.0;
                                             let total_period = 2.0 + scroll_duration + 2.0 + scroll_duration;
                                             let t = (state.current_seconds as f32) % total_period;
-                                            
+
                                             let offset = if t < 2.0 {
                                                 0.0
                                             } else if t < 2.0 + scroll_duration {
@@ -5969,7 +7484,7 @@ impl VulkanEngine {
                                                 let progress = (t - (2.0 + scroll_duration + 2.0)) / scroll_duration;
                                                 max_scroll - (progress * max_scroll)
                                             };
-                                            
+
                                             painter.galley(rect.min + egui::vec2(-offset, 0.0), galley, text_color);
                                         } else {
                                             painter.galley(rect.min, galley, text_color);
@@ -6032,7 +7547,7 @@ impl VulkanEngine {
                                                     ui.label(egui::RichText::new("Title:").color(egui::Color32::from_rgb(160, 180, 200)).strong());
                                                     render_smooth_marquee(ui, &display_title, 14.0, true);
                                                     ui.end_row();
-                                                    
+
                                                     // 2. Artist (only display if known)
                                                     let trimmed_artist = state.artist.trim();
                                                     if !trimmed_artist.is_empty()
@@ -6043,7 +7558,7 @@ impl VulkanEngine {
                                                         render_smooth_marquee(ui, trimmed_artist, 14.0, false);
                                                         ui.end_row();
                                                     }
-                                                    
+
                                                     // 3. File Name
                                                     ui.label(egui::RichText::new("File:").color(egui::Color32::from_rgb(160, 180, 200)));
                                                     render_smooth_marquee(ui, &file_name, 14.0, false);
@@ -6054,13 +7569,13 @@ impl VulkanEngine {
                                                     ui.label(egui::RichText::new(folder_label).color(egui::Color32::from_rgb(160, 180, 200)));
                                                     render_smooth_marquee(ui, &file_dir, 14.0, false);
                                                     ui.end_row();
-                                                    
+
                                                     // 5 & 6. Format, Bitrate & Channels
                                                     let effective_bitrate = state.bitrate.or_else(|| {
                                                         if state.duration_seconds > 0.0 && !is_network {
                                                             std::fs::metadata(&current_path_str)
                                                                 .ok()
-                                                                .map(|m| ((m.len() as f64 * 8.0) / (state.duration_seconds as f64 * 1000.0)).round() as u32)
+                                                                .map(|m| ((m.len() as f64 * 8.0) / (state.duration_seconds * 1000.0)).round() as u32)
                                                         } else {
                                                             None
                                                         }
@@ -6119,7 +7634,7 @@ impl VulkanEngine {
                                                         ui.label(egui::RichText::new("Format:").color(egui::Color32::from_rgb(160, 180, 200)));
                                                         ui.label(format_str);
                                                         ui.end_row();
-                                                        
+
                                                         ui.label(egui::RichText::new("Channels:").color(egui::Color32::from_rgb(160, 180, 200)));
                                                         ui.label(ch_info);
                                                         ui.end_row();
@@ -6450,12 +7965,12 @@ impl VulkanEngine {
                                                  }
                                                 ui.add_space(4.0);
                                             }
-                                            
+
                                             ui.horizontal(|ui| {
                                                 ui.label(egui::RichText::new("Device:").color(egui::Color32::from_rgb(160, 180, 200)));
                                                 let mut current_device = state.selected_audio_device.clone().unwrap_or_else(|| "Default Device".to_string());
                                                 let prev_device = current_device.clone();
-                                                
+
                                                 egui::ComboBox::from_id_salt("audio_device_combo")
                                                     .selected_text(&current_device)
                                                     .width(ui.available_width().max(80.0))
@@ -6464,23 +7979,23 @@ impl VulkanEngine {
                                                             ui.selectable_value(&mut current_device, dev.clone(), dev);
                                                         }
                                                     });
-                                                
+
                                                 if current_device != prev_device {
                                                     *engine_action = EngineAction::SetAudioDevice(current_device);
                                                 }
                                             });
-                                            
+
                                             // 8. Next Song (placed at the bottom, smooth marquee if long)
                                             if state.playlist_index + 1 < state.playlist.len() {
                                                 let next_path = std::path::Path::new(&state.playlist[state.playlist_index + 1]);
                                                 let next_song = next_path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                                                ui.horizontal(|ui| { 
-                                                    ui.label("Next Song:"); 
-                                                    render_smooth_marquee(ui, &next_song, 14.0, false); 
+                                                ui.horizontal(|ui| {
+                                                    ui.label("Next Song:");
+                                                    render_smooth_marquee(ui, &next_song, 14.0, false);
                                                 });
                                             }
                                         });
-                                    
+
                                     *out_track_info_rect = Some(col.max_rect());
                                 }
                             };
@@ -6536,9 +8051,9 @@ impl VulkanEngine {
         if state.show_hud && state.video_mode != 3 {
             let total_height = ctx.content_rect().height();
             let total_width = ctx.content_rect().width();
-            
+
             let drag_y = out_top_panel_rect.map(|r| r.bottom()).unwrap_or(total_height * state.panel_split_ratio);
-            
+
             egui::Area::new("split_drag_area".into())
                 .fixed_pos(egui::pos2(0.0, drag_y - 6.0))
                 .order(egui::Order::Foreground)
@@ -6566,7 +8081,7 @@ impl VulkanEngine {
             egui::CentralPanel::default().frame(frame).show_inside(ctx, |ui| {
                 let rect = ui.available_rect_before_wrap();
                 central_rect = rect;
-                
+
                 // Draw OSD text from keyboard/gamepad/touch actions
                 if let Some(osd) = &state.osd_text
                     && state.osd_timer > 0.0 {
@@ -6574,13 +8089,13 @@ impl VulkanEngine {
                         let alpha = (state.osd_timer.min(0.5) * 2.0 * 255.0) as u8;
                         let screen = ui.ctx().viewport_rect();
                         let is_portrait = screen.width() < screen.height();
-                        
+
                         let max_width = if is_portrait {
                             (screen.width() - 40.0).max(100.0)
                         } else {
                             (screen.width() * 0.85).max(200.0)
                         };
-                        
+
                         let font_size = if is_portrait {
                             if osd.len() > 32 {
                                 17.0
@@ -6596,7 +8111,7 @@ impl VulkanEngine {
                                 32.0
                             }
                         };
-                        
+
                         let text_color = egui::Color32::from_rgba_premultiplied(255, 255, 255, alpha);
                         let galley = painter.layout(
                             osd.clone(),
@@ -6604,7 +8119,7 @@ impl VulkanEngine {
                             text_color,
                             max_width,
                         );
-                        
+
                         let top_y = if is_portrait {
                             screen.top() + 65.0
                         } else {
@@ -6614,7 +8129,7 @@ impl VulkanEngine {
                             screen.center().x - galley.rect.width() * 0.5,
                             top_y,
                         );
-                        
+
                         let bg_rect = galley.rect.translate(galley_pos.to_vec2()).expand2(egui::vec2(14.0, 8.0));
                         let bg_alpha = (alpha as f32 * 0.65) as u8;
                         painter.rect_filled(
@@ -6622,23 +8137,23 @@ impl VulkanEngine {
                             8.0,
                             egui::Color32::from_rgba_unmultiplied(10, 10, 15, bg_alpha),
                         );
-                        
+
                         painter.galley(galley_pos, galley, text_color);
                     }
-                
+
                 if state.visualizer_mode == 0 && state.show_hud && state.video_mode != 3 {
                     let painter = ui.painter();
                     let is_portrait = ui.ctx().viewport_rect().width() < ui.ctx().viewport_rect().height();
                     let bottom_margin = if is_portrait { 36.0 } else { 20.0 };
                     let y = rect.bottom() - bottom_margin;
-                    
+
                     let max_freq = state.max_frequency;
                     let min_freq = 20.0_f32;
                     let x_at = |f: f32| -> f32 { (f / min_freq).ln() / (max_freq / min_freq).ln() };
-                    
+
                     let side_margin = if is_portrait { 28.0 } else { 16.0 };
                     let usable_width = (rect.width() - 2.0 * side_margin).max(10.0);
-                    
+
                     let labels = [
                         (0.0_f32, format!("{}Hz", min_freq as u32), egui::Align2::LEFT_BOTTOM),
                         (x_at(100.0), "100Hz".to_string(), egui::Align2::CENTER_BOTTOM),
@@ -6646,7 +8161,7 @@ impl VulkanEngine {
                         (x_at(5000.0), "5kHz".to_string(), egui::Align2::CENTER_BOTTOM),
                         (1.0_f32, format!("{:.0}kHz", max_freq / 1000.0), egui::Align2::RIGHT_BOTTOM),
                     ];
-                    
+
                     for (x_pct, text, align) in labels.iter() {
                         let x = rect.left() + side_margin + usable_width * x_pct;
                         painter.text(
@@ -6739,33 +8254,50 @@ impl VulkanEngine {
         let scale = egui_ctx.pixels_per_point();
         let w = self.config.width as f32;
         let h = self.config.height as f32;
-        
+
         if let Some(r) = out_meters_rect {
-            self.meters_uv_rect = [(r.min.x * scale) / w, (r.min.y * scale) / h, (r.max.x * scale) / w, (r.max.y * scale) / h];
+            self.meters_uv_rect = [
+                (r.min.x * scale) / w,
+                (r.min.y * scale) / h,
+                (r.max.x * scale) / w,
+                (r.max.y * scale) / h,
+            ];
         } else {
             self.meters_uv_rect = [0.0; 4];
         }
-        
+
         if let Some(r) = out_fire_rect {
-            self.fire_uv_rect = [(r.min.x * scale) / w, (r.min.y * scale) / h, (r.max.x * scale) / w, (r.max.y * scale) / h];
+            self.fire_uv_rect = [
+                (r.min.x * scale) / w,
+                (r.min.y * scale) / h,
+                (r.max.x * scale) / w,
+                (r.max.y * scale) / h,
+            ];
         } else {
             self.fire_uv_rect = [0.0; 4];
         }
-        
+
         if let Some(r) = out_heatmap_rect {
-            self.heatmap_uv_rect = [(r.min.x * scale) / w, (r.min.y * scale) / h, (r.max.x * scale) / w, (r.max.y * scale) / h];
+            self.heatmap_uv_rect = [
+                (r.min.x * scale) / w,
+                (r.min.y * scale) / h,
+                (r.max.x * scale) / w,
+                (r.max.y * scale) / h,
+            ];
         } else {
             self.heatmap_uv_rect = [0.0; 4];
         }
 
         egui_state.handle_platform_output(window, full_output.platform_output);
-        let clipped_primitives = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+        let clipped_primitives =
+            egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
 
         let ui_elapsed = ui_start.elapsed().as_micros() as f32;
         let phase_egui_layout_us = ui_elapsed; // Egui layout now accurately measures only UI logic and tessellation
 
         for (id, image_delta) in &full_output.textures_delta.set {
-            self.egui_renderer.update_texture(&self.device, &self.queue, *id, image_delta);
+            self.egui_renderer
+                .update_texture(&self.device, &self.queue, *id, image_delta);
         }
 
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
@@ -6774,9 +8306,11 @@ impl VulkanEngine {
         };
         let render_start = std::time::Instant::now();
 
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Render Encoder"),
-        });
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Render Encoder"),
+            });
 
         self.egui_renderer.update_buffers(
             &self.device,
@@ -6785,7 +8319,6 @@ impl VulkanEngine {
             &clipped_primitives,
             &screen_descriptor,
         );
-
 
         // GPU heatmap compute
         {
@@ -6797,7 +8330,7 @@ impl VulkanEngine {
             compute_pass.set_bind_group(0, Some(&self.heatmap_bind_group), &[]);
             compute_pass.dispatch_workgroups(1, 1, 1); // 256x1x1 threads
         }
-        
+
         // GPU FFT compute - bypassed on GPU since we now compute Cooley-Tukey FFT on CPU
         // Write dummy timestamps to satisfy Vulkan query resolving
         if let Some(qs) = &self.query_set {
@@ -6829,21 +8362,32 @@ impl VulkanEngine {
         if vis_def.requires_fire {
             if vis_def.id == 6 {
                 {
-                    let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                        label: Some("Fire Compute"),
-                        timestamp_writes: self.query_set.as_ref().map(|qs| wgpu::ComputePassTimestampWrites {
-                            query_set: qs,
-                            beginning_of_pass_write_index: Some(2),
-                            end_of_pass_write_index: Some(3),
-                        }),
-                    });
+                    let mut compute_pass =
+                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("Fire Compute"),
+                            timestamp_writes: self.query_set.as_ref().map(|qs| {
+                                wgpu::ComputePassTimestampWrites {
+                                    query_set: qs,
+                                    beginning_of_pass_write_index: Some(2),
+                                    end_of_pass_write_index: Some(3),
+                                }
+                            }),
+                        });
                     compute_pass.set_pipeline(&self.firesim_compute_pipeline);
-                    let bg = if self.fire_ping { &self.fire_bind_group_a } else { &self.fire_bind_group_b };
+                    let bg = if self.fire_ping {
+                        &self.fire_bind_group_a
+                    } else {
+                        &self.fire_bind_group_b
+                    };
                     compute_pass.set_bind_group(0, Some(bg), &[]);
                     compute_pass.dispatch_workgroups(64, 36, 1); // 1024/16=64, 576/16=36
                 }
                 // Copy output buffer to fire_grid_texture
-                let output_buffer = if self.fire_ping { &self.fire_buffer_b } else { &self.fire_buffer_a };
+                let output_buffer = if self.fire_ping {
+                    &self.fire_buffer_b
+                } else {
+                    &self.fire_buffer_a
+                };
                 encoder.copy_buffer_to_texture(
                     wgpu::TexelCopyBufferInfo {
                         buffer: output_buffer,
@@ -6859,7 +8403,11 @@ impl VulkanEngine {
                         origin: wgpu::Origin3d::ZERO,
                         aspect: wgpu::TextureAspect::All,
                     },
-                    wgpu::Extent3d { width: 1024, height: 576, depth_or_array_layers: 1 },
+                    wgpu::Extent3d {
+                        width: 1024,
+                        height: 576,
+                        depth_or_array_layers: 1,
+                    },
                 );
                 self.fire_ping = !self.fire_ping;
             } else {
@@ -6890,18 +8438,27 @@ impl VulkanEngine {
             }
         }
 
-        if vis_def.id == 11 { // Neon Corridor
+        if vis_def.id == 11 {
+            // Neon Corridor
             // Update params
             let mut act = 0.0;
             let count = state.channel_vus.len().min(8);
             for i in 0..count {
                 act += state.channel_vus[i];
             }
-            if count > 0 { act /= count as f32; }
-            self.queue.write_buffer(&self.smoke_params_buffer, 0, bytemuck::cast_slice(&[
-                state.current_seconds as f32,
-                act, 0.0, 0.0 // padding
-            ]));
+            if count > 0 {
+                act /= count as f32;
+            }
+            self.queue.write_buffer(
+                &self.smoke_params_buffer,
+                0,
+                bytemuck::cast_slice(&[
+                    state.current_seconds as f32,
+                    act,
+                    0.0,
+                    0.0, // padding
+                ]),
+            );
 
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Neon Smoke Compute Pass"),
@@ -6920,7 +8477,7 @@ impl VulkanEngine {
             compute_pass.set_pipeline(&self.ferrofluidsim_clear_pipeline);
             compute_pass.set_bind_group(0, Some(&self.ferrofluidsim_bind_group), &[]);
             compute_pass.dispatch_workgroups(1024, 1, 1);
-            
+
             compute_pass.set_pipeline(&self.ferrofluidsim_compute_pipeline);
             compute_pass.dispatch_workgroups(391, 1, 1);
         }
@@ -6943,7 +8500,12 @@ impl VulkanEngine {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color { r: 0.1, g: 0.1, b: 0.1, a: 1.0 }),
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.1,
+                            g: 0.1,
+                            b: 0.1,
+                            a: 1.0,
+                        }),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -6955,30 +8517,38 @@ impl VulkanEngine {
                     }),
                     stencil_ops: None,
                 }),
-                timestamp_writes: self.query_set.as_ref().map(|qs| wgpu::RenderPassTimestampWrites {
-                    query_set: qs,
-                    beginning_of_pass_write_index: Some(4),
-                    end_of_pass_write_index: Some(5),
+                timestamp_writes: self.query_set.as_ref().map(|qs| {
+                    wgpu::RenderPassTimestampWrites {
+                        query_set: qs,
+                        beginning_of_pass_write_index: Some(4),
+                        end_of_pass_write_index: Some(5),
+                    }
                 }),
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
 
             let scale_factor = egui_ctx.pixels_per_point();
-            let vp_x = ((central_rect.min.x * scale_factor).clamp(0.0, self.config.width as f32)).round();
-            let vp_y = ((central_rect.min.y * scale_factor).clamp(0.0, self.config.height as f32)).round();
+            let vp_x =
+                ((central_rect.min.x * scale_factor).clamp(0.0, self.config.width as f32)).round();
+            let vp_y =
+                ((central_rect.min.y * scale_factor).clamp(0.0, self.config.height as f32)).round();
             let max_w = (self.config.width as f32 - vp_x).max(1.0);
             let vp_w = ((central_rect.width() * scale_factor).clamp(1.0, max_w)).round();
             let max_h = (self.config.height as f32 - vp_y).max(1.0);
             let vp_h = ((central_rect.height() * scale_factor).clamp(1.0, max_h)).round();
-            
+
             // --- 3D Engine Camera Math ---
             let aspect = vp_w / vp_h.max(1.0);
-            
+
             // Update aspect_ratio uniform dynamically based on current viewport
             const ASPECT_RATIO_OFFSET: wgpu::BufferAddress =
                 std::mem::offset_of!(AudioUniforms, aspect_ratio) as wgpu::BufferAddress;
-            self.queue.write_buffer(&self.uniform_buffer, ASPECT_RATIO_OFFSET, bytemuck::cast_slice(&[aspect as f32]));
+            self.queue.write_buffer(
+                &self.uniform_buffer,
+                ASPECT_RATIO_OFFSET,
+                bytemuck::cast_slice(&[aspect as f32]),
+            );
 
             // Adapt FOV when aspect ratio is square or portrait (< 1.0) so 3D scenes fit without horizontal clipping
             let base_fov = if state.visualizer_mode == 22 {
@@ -6989,7 +8559,11 @@ impl VulkanEngine {
             let fov_y = if state.visualizer_mode == 19 || state.visualizer_mode == 23 {
                 base_fov
             } else if aspect < 1.0 {
-                (base_fov / aspect.clamp(0.65, 1.0)).min(if state.visualizer_mode == 22 { 85.0_f32.to_radians() } else { 75.0_f32.to_radians() })
+                (base_fov / aspect.clamp(0.65, 1.0)).min(if state.visualizer_mode == 22 {
+                    85.0_f32.to_radians()
+                } else {
+                    75.0_f32.to_radians()
+                })
             } else {
                 base_fov
             };
@@ -7065,12 +8639,18 @@ impl VulkanEngine {
                 view_matrix: view.to_cols_array_2d(),
                 proj_matrix: proj.to_cols_array_2d(),
             };
-            self.queue.write_buffer(&self.camera_uniform_buffer, 0, bytemuck::cast_slice(&[camera_uniforms]));
-            
+            self.queue.write_buffer(
+                &self.camera_uniform_buffer,
+                0,
+                bytemuck::cast_slice(&[camera_uniforms]),
+            );
+
             render_pass.set_viewport(vp_x, vp_y, vp_w, vp_h, 0.0, 1.0);
             render_pass.set_scissor_rect(vp_x as u32, vp_y as u32, vp_w as u32, vp_h as u32);
 
-            let mode_idx = state.current_visualizer_idx.min(self.render_pipelines.len() - 1);
+            let mode_idx = state
+                .current_visualizer_idx
+                .min(self.render_pipelines.len() - 1);
             let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
 
             if vis_def.id == 12 || vis_def.id == 3 || vis_def.id == 23 {
@@ -7105,46 +8685,55 @@ impl VulkanEngine {
                 render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
                 render_pass.draw(0..3, 0..1);
             }
-            
+
             render_pass.set_pipeline(&self.render_pipelines[mode_idx]);
             render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
             render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
-            
+
             match &vis_def.pipeline_type {
                 crate::state::PipelineType::FullscreenQuad => {
                     render_pass.draw(0..3, 0..1);
-                },
-                crate::state::PipelineType::Mesh3D { geometry, instances } => {
+                }
+                crate::state::PipelineType::Mesh3D {
+                    geometry,
+                    instances,
+                } => {
                     render_pass.set_bind_group(2, &self.camera_bind_group, &[]);
                     if vis_def.id == 20 {
                         render_pass.set_bind_group(3, &self.biolum_render_bind_group, &[]);
                     }
                     if let Some(mesh) = self.mesh_registry.get(geometry) {
                         render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                        render_pass.set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                        render_pass.set_index_buffer(
+                            mesh.index_buffer.slice(..),
+                            wgpu::IndexFormat::Uint32,
+                        );
                         render_pass.draw_indexed(0..mesh.index_count, 0, 0..*instances);
                     }
-                    
+
                     if vis_def.id == 13 {
                         render_pass.set_pipeline(&self.lamp_pipeline);
                         render_pass.set_vertex_buffer(0, self.lamp_vertex_buffer.slice(..));
-                        render_pass.set_index_buffer(self.lamp_index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                        render_pass.set_index_buffer(
+                            self.lamp_index_buffer.slice(..),
+                            wgpu::IndexFormat::Uint32,
+                        );
                         render_pass.draw_indexed(0..self.lamp_index_count, 0, 0..16);
                     }
                 }
             }
-            
+
             let is_portrait = self.config.width < self.config.height;
-            let is_video_active = self.video_state.is_some() && (
-                state.video_mode > 0 || (is_portrait && state.mobile_hud_tab == crate::state::MobileHudTab::Video)
-            );
-            
+            let is_video_active = self.video_state.is_some()
+                && (state.video_mode > 0
+                    || (is_portrait && state.mobile_hud_tab == crate::state::MobileHudTab::Video));
+
             if is_video_active {
                 let mut v_vp_x = 0.0;
                 let mut v_vp_y = 0.0;
                 let mut v_vp_w = self.config.width as f32;
                 let mut v_vp_h = self.config.height as f32;
-                
+
                 let target_rect = if state.video_mode == 3 {
                     None // mode 3: full screen
                 } else if is_portrait && state.mobile_hud_tab == crate::state::MobileHudTab::Video {
@@ -7156,19 +8745,26 @@ impl VulkanEngine {
                 } else {
                     None // mode 3: full screen
                 };
-                
+
                 if let Some(r) = target_rect {
-                    v_vp_x = ((r.min.x * scale_factor).clamp(0.0, self.config.width as f32)).round();
-                    v_vp_y = ((r.min.y * scale_factor).clamp(0.0, self.config.height as f32)).round();
+                    v_vp_x =
+                        ((r.min.x * scale_factor).clamp(0.0, self.config.width as f32)).round();
+                    v_vp_y =
+                        ((r.min.y * scale_factor).clamp(0.0, self.config.height as f32)).round();
                     let max_w = (self.config.width as f32 - v_vp_x).max(1.0);
                     v_vp_w = ((r.width() * scale_factor).clamp(1.0, max_w)).round();
                     let max_h = (self.config.height as f32 - v_vp_y).max(1.0);
                     v_vp_h = ((r.height() * scale_factor).clamp(1.0, max_h)).round();
                 }
-                
+
                 render_pass.set_viewport(v_vp_x, v_vp_y, v_vp_w, v_vp_h, 0.0, 1.0);
-                render_pass.set_scissor_rect(v_vp_x as u32, v_vp_y as u32, v_vp_w as u32, v_vp_h as u32);
-                
+                render_pass.set_scissor_rect(
+                    v_vp_x as u32,
+                    v_vp_y as u32,
+                    v_vp_w as u32,
+                    v_vp_h as u32,
+                );
+
                 if let Some(vs) = &self.video_state {
                     let params = VideoParams {
                         color_space: vs.color_space,
@@ -7184,39 +8780,49 @@ impl VulkanEngine {
                         _pad2: 0.0,
                         _pad3: 0.0,
                     };
-                    self.queue.write_buffer(&vs.params_buffer, 0, bytemuck::cast_slice(&[params]));
+                    self.queue
+                        .write_buffer(&vs.params_buffer, 0, bytemuck::cast_slice(&[params]));
                     render_pass.set_pipeline(&self.video_pipeline);
                     render_pass.set_bind_group(0, &vs.bind_group, &[]);
                     render_pass.draw(0..3, 0..1);
                 }
             }
-            
+
             if state.show_hud && state.video_mode != 3 {
-                render_pass.set_viewport(0.0, 0.0, self.config.width as f32, self.config.height as f32, 0.0, 1.0);
+                render_pass.set_viewport(
+                    0.0,
+                    0.0,
+                    self.config.width as f32,
+                    self.config.height as f32,
+                    0.0,
+                    1.0,
+                );
                 render_pass.set_pipeline(&self.hud_pipeline);
                 render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
                 render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
-                
+
                 let mut drawn = false;
                 let mut draw_rect = |r: Option<egui::Rect>| {
                     if let Some(rect) = r {
-                        let x = ((rect.min.x * scale_factor).clamp(0.0, self.config.width as f32)).round() as u32;
-                        let y = ((rect.min.y * scale_factor).clamp(0.0, self.config.height as f32)).round() as u32;
-                        
+                        let x = ((rect.min.x * scale_factor).clamp(0.0, self.config.width as f32))
+                            .round() as u32;
+                        let y = ((rect.min.y * scale_factor).clamp(0.0, self.config.height as f32))
+                            .round() as u32;
+
                         let w = if x < self.config.width {
                             let max_w = self.config.width - x;
                             ((rect.width() * scale_factor).round() as u32).clamp(1, max_w)
                         } else {
                             0
                         };
-                        
+
                         let h = if y < self.config.height {
                             let max_h = self.config.height - y;
                             ((rect.height() * scale_factor).round() as u32).clamp(1, max_h)
                         } else {
                             0
                         };
-                        
+
                         if w > 0 && h > 0 {
                             render_pass.set_scissor_rect(x, y, w, h);
                             render_pass.draw(0..3, 0..1);
@@ -7237,23 +8843,26 @@ impl VulkanEngine {
         }
 
         {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Egui Render Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-                multiview_mask: None,
-            }).forget_lifetime();
-            self.egui_renderer.render(&mut render_pass, &clipped_primitives, &screen_descriptor);
+            let mut render_pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Egui Render Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                })
+                .forget_lifetime();
+            self.egui_renderer
+                .render(&mut render_pass, &clipped_primitives, &screen_descriptor);
         }
 
         // Resolve timestamp queries into the resolve buffer, then copy to the read buffer.
@@ -7261,7 +8870,12 @@ impl VulkanEngine {
         // that has an active or pending map operation.
         let should_start_mapping = !self.timestamp_mapping_active && self.query_set.is_some();
         if should_start_mapping
-            && let (Some(qs), Some(res_buf), Some(read_buf)) = (&self.query_set, &self.query_resolve_buffer, &self.query_read_buffer) {
+            && let (Some(qs), Some(res_buf), Some(read_buf)) = (
+                &self.query_set,
+                &self.query_resolve_buffer,
+                &self.query_read_buffer,
+            )
+        {
             encoder.resolve_query_set(qs, 0..6, res_buf, 0);
             encoder.copy_buffer_to_buffer(res_buf, 0, read_buf, 0, 48);
         }
@@ -7271,9 +8885,18 @@ impl VulkanEngine {
         } else {
             180
         };
-        let capture_count = std::env::var("CAPTURE_FRAMES_COUNT").ok().and_then(|s| s.parse::<u32>().ok()).unwrap_or(1);
-        let capture_start = if capture_count > 1 { capture_frame.saturating_sub(capture_count.saturating_sub(1)) } else { capture_frame };
-        let do_capture = std::env::var("CAPTURE_FRAME").is_ok() && self.frame_count >= capture_start && self.frame_count <= capture_frame;
+        let capture_count = std::env::var("CAPTURE_FRAMES_COUNT")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .unwrap_or(1);
+        let capture_start = if capture_count > 1 {
+            capture_frame.saturating_sub(capture_count.saturating_sub(1))
+        } else {
+            capture_frame
+        };
+        let do_capture = std::env::var("CAPTURE_FRAME").is_ok()
+            && self.frame_count >= capture_start
+            && self.frame_count <= capture_frame;
 
         let mut readback_buffer = None;
         if do_capture {
@@ -7285,19 +8908,33 @@ impl VulkanEngine {
                 mapped_at_creation: false,
             });
             encoder.copy_texture_to_buffer(
-                wgpu::TexelCopyTextureInfo { texture: &surface_texture.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                wgpu::TexelCopyBufferInfo { buffer: &rb, layout: wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(bpr), rows_per_image: Some(self.config.height) } },
-                wgpu::Extent3d { width: self.config.width, height: self.config.height, depth_or_array_layers: 1 }
+                wgpu::TexelCopyTextureInfo {
+                    texture: &surface_texture.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &rb,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(bpr),
+                        rows_per_image: Some(self.config.height),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: self.config.width,
+                    height: self.config.height,
+                    depth_or_array_layers: 1,
+                },
             );
             readback_buffer = Some(rb);
         }
 
         self.queue.submit(std::iter::once(encoder.finish()));
-        
 
         // Start async timestamp mapping AFTER submit (non-blocking)
-        if should_start_mapping
-            && let Some(read_buf) = &self.query_read_buffer {
+        if should_start_mapping && let Some(read_buf) = &self.query_read_buffer {
             let flag = self.timestamp_map_complete.clone();
             flag.store(false, Ordering::Release);
             let slice = read_buf.slice(..);
@@ -7308,12 +8945,17 @@ impl VulkanEngine {
             });
             self.timestamp_mapping_active = true;
         }
-        
+
         if let Some(rb) = readback_buffer {
             let slice = rb.slice(..);
             let (tx, rx) = std::sync::mpsc::channel();
             slice.map_async(wgpu::MapMode::Read, move |v| tx.send(v).unwrap());
-            self.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }).unwrap();
+            self.device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                })
+                .unwrap();
             if rx.recv().unwrap().is_ok() {
                 let data = slice.get_mapped_range();
                 let bpr = (self.config.width * 4 + 255) & !255;
@@ -7328,10 +8970,16 @@ impl VulkanEngine {
                         img.put_pixel(x, y, image::Rgba([r, g, b, 255])); // Ignore A to force fully opaque screenshot
                     }
                 }
-                let base_capture_path = std::env::var("CAPTURE_PATH").unwrap_or_else(|_| "screenshot.png".to_string());
+                let base_capture_path =
+                    std::env::var("CAPTURE_PATH").unwrap_or_else(|_| "screenshot.png".to_string());
                 let capture_path = if capture_count > 1 {
                     if let Some(pos) = base_capture_path.rfind('.') {
-                        format!("{}_{:03}{}", &base_capture_path[..pos], self.frame_count, &base_capture_path[pos..])
+                        format!(
+                            "{}_{:03}{}",
+                            &base_capture_path[..pos],
+                            self.frame_count,
+                            &base_capture_path[pos..]
+                        )
                     } else {
                         format!("{}_{:03}.png", base_capture_path, self.frame_count)
                     }
@@ -7345,18 +8993,28 @@ impl VulkanEngine {
                 std::process::exit(0);
             }
         }
-        
+
         surface_texture.present();
 
         for id in &full_output.textures_delta.free {
             self.egui_renderer.free_texture(id);
         }
-        
+
         let submit_elapsed = render_start.elapsed().as_micros() as f32;
         let phase_encode_us = submit_elapsed; // entire encode+submit block
 
-        Ok((engine_action, ui_elapsed, submit_elapsed, fire_shader_time_us, fft_shader_time_us, vis_shader_time_us,
-             phase_surface_us, phase_egui_layout_us, phase_encode_us, 0.0))
+        Ok((
+            engine_action,
+            ui_elapsed,
+            submit_elapsed,
+            fire_shader_time_us,
+            fft_shader_time_us,
+            vis_shader_time_us,
+            phase_surface_us,
+            phase_egui_layout_us,
+            phase_encode_us,
+            0.0,
+        ))
     }
 }
 
@@ -7367,7 +9025,11 @@ mod tests {
     #[test]
     fn test_uniform_size_alignment() {
         let rust_size = std::mem::size_of::<AudioUniforms>();
-        assert_eq!(rust_size, 8832, "Rust AudioUniforms size is not 8832 bytes (actual: {})", rust_size);
+        assert_eq!(
+            rust_size, 8832,
+            "Rust AudioUniforms size is not 8832 bytes (actual: {})",
+            rust_size
+        );
 
         // Parse _common.wgsl to compute WGSL structure size
         let common_source = std::fs::read_to_string("src/shaders/_common.wgsl")
@@ -7420,8 +9082,16 @@ mod tests {
 
         // Align struct size to maximum alignment (16)
         let wgsl_size = offset.div_ceil(16) * 16;
-        assert_eq!(wgsl_size, 8832, "WGSL AudioUniforms size is not 8832 bytes (actual: {})", wgsl_size);
-        assert_eq!(rust_size, wgsl_size, "Size mismatch: Rust AudioUniforms is {}, WGSL is {}", rust_size, wgsl_size);
+        assert_eq!(
+            wgsl_size, 8832,
+            "WGSL AudioUniforms size is not 8832 bytes (actual: {})",
+            wgsl_size
+        );
+        assert_eq!(
+            rust_size, wgsl_size,
+            "Size mismatch: Rust AudioUniforms is {}, WGSL is {}",
+            rust_size, wgsl_size
+        );
     }
 
     #[test]
@@ -7455,8 +9125,8 @@ mod tests {
         let mut raw_accelerations = Vec::new();
         let mut smooth_accelerations = Vec::new();
         for i in 1..99 {
-            let acc_raw = raw_deltas[i] - raw_deltas[i-1];
-            let acc_smooth = smooth_deltas[i] - smooth_deltas[i-1];
+            let acc_raw = raw_deltas[i] - raw_deltas[i - 1];
+            let acc_smooth = smooth_deltas[i] - smooth_deltas[i - 1];
             raw_accelerations.push(acc_raw.abs());
             smooth_accelerations.push(acc_smooth.abs());
         }
@@ -7465,7 +9135,10 @@ mod tests {
         let max_smooth_acc = smooth_accelerations.iter().cloned().fold(0.0, f64::max);
 
         println!("Max raw frame-to-frame velocity jump: {:.6}s", max_raw_acc);
-        println!("Max smoothed frame-to-frame velocity jump: {:.6}s", max_smooth_acc);
+        println!(
+            "Max smoothed frame-to-frame velocity jump: {:.6}s",
+            max_smooth_acc
+        );
 
         // Smooth timelines must have at least 15x lower frame-to-frame velocity jumps
         assert!(
@@ -7497,8 +9170,10 @@ mod tests {
 
         // Use Case 2: Drop on main view outside Track Info (e.g. cursor at (400, 150))
         let cursor_outside = [400.0f32, 150.0];
-        let is_over_ti = cursor_outside[0] >= track_info_rect[0] && cursor_outside[0] <= track_info_rect[2]
-            && cursor_outside[1] >= track_info_rect[1] && cursor_outside[1] <= track_info_rect[3];
+        let is_over_ti = cursor_outside[0] >= track_info_rect[0]
+            && cursor_outside[0] <= track_info_rect[2]
+            && cursor_outside[1] >= track_info_rect[1]
+            && cursor_outside[1] <= track_info_rect[3];
         assert!(!is_over_ti);
 
         let new_file = "song2.mp3".to_string();
@@ -7512,8 +9187,10 @@ mod tests {
 
         // Use Case 3: Drop on Track Info pane (e.g. cursor at (950, 100))
         let cursor_inside = [950.0f32, 100.0];
-        let is_over_ti_inside = cursor_inside[0] >= track_info_rect[0] && cursor_inside[0] <= track_info_rect[2]
-            && cursor_inside[1] >= track_info_rect[1] && cursor_inside[1] <= track_info_rect[3];
+        let is_over_ti_inside = cursor_inside[0] >= track_info_rect[0]
+            && cursor_inside[0] <= track_info_rect[2]
+            && cursor_inside[1] >= track_info_rect[1]
+            && cursor_inside[1] <= track_info_rect[3];
         assert!(is_over_ti_inside);
 
         let append_file = "song3.wav".to_string();
@@ -7524,7 +9201,10 @@ mod tests {
         }
         assert_eq!(state.playlist.len(), 2);
         assert_eq!(state.playlist[1], "song3.wav");
-        assert_eq!(state.osd_text, Some("Added to Playlist: song3.wav".to_string()));
+        assert_eq!(
+            state.osd_text,
+            Some("Added to Playlist: song3.wav".to_string())
+        );
     }
 
     #[test]
@@ -7547,11 +9227,20 @@ mod tests {
     #[test]
     fn test_synthwave_lyrics_visualizer_registration() {
         let vis = crate::state::VISUALIZERS.iter().find(|v| v.id == 23);
-        assert!(vis.is_some(), "Visualizer ID 23 (3D Glass Water Lyrics) must be registered in VISUALIZERS");
+        assert!(
+            vis.is_some(),
+            "Visualizer ID 23 (3D Glass Water Lyrics) must be registered in VISUALIZERS"
+        );
         let def = vis.unwrap();
         assert_eq!(def.name, "3D Glass Water Lyrics");
         assert_eq!(def.filename, "vis_lyrics.wgsl");
-        assert_eq!(def.pipeline_type, crate::state::PipelineType::Mesh3D { geometry: crate::state::Geometry::GlassLyricsScene, instances: 1 });
+        assert_eq!(
+            def.pipeline_type,
+            crate::state::PipelineType::Mesh3D {
+                geometry: crate::state::Geometry::GlassLyricsScene,
+                instances: 1
+            }
+        );
 
         // Verify that the shader source is present and includes compile cleanly
         let raw_source = include_str!("shaders/vis_lyrics.wgsl");
@@ -7572,13 +9261,26 @@ mod tests {
 
         // Verify VU meter rack OBJ model loads cleanly and has non-empty geometry
         let (vu_verts, vu_indices) = generate_vumeter_rack_mesh();
-        assert!(!vu_verts.is_empty(), "VU meter rack vertices must not be empty");
-        assert!(!vu_indices.is_empty(), "VU meter rack indices must not be empty");
+        assert!(
+            !vu_verts.is_empty(),
+            "VU meter rack vertices must not be empty"
+        );
+        assert!(
+            !vu_indices.is_empty(),
+            "VU meter rack indices must not be empty"
+        );
 
         // Verify Glass Lyrics mesh generator handles long strings with appropriate scaling
-        let (lyrics_verts, lyrics_indices) = generate_glass_lyrics_mesh("THIS IS A VERY LONG TEST LYRIC LINE FOR MOBILE VIEWPORT");
-        assert!(!lyrics_verts.is_empty(), "Glass lyrics vertices must not be empty for long line");
-        assert!(!lyrics_indices.is_empty(), "Glass lyrics indices must not be empty for long line");
+        let (lyrics_verts, lyrics_indices) =
+            generate_glass_lyrics_mesh("THIS IS A VERY LONG TEST LYRIC LINE FOR MOBILE VIEWPORT");
+        assert!(
+            !lyrics_verts.is_empty(),
+            "Glass lyrics vertices must not be empty for long line"
+        );
+        assert!(
+            !lyrics_indices.is_empty(),
+            "Glass lyrics indices must not be empty for long line"
+        );
 
         const SHADER_COMMON: &str = include_str!("shaders/_common.wgsl");
         const SHADER_GLYPH_FONT: &str = include_str!("shaders/_glyph_font.wgsl");
@@ -7594,17 +9296,27 @@ mod tests {
 
         let vu_resolved = resolve_shader_includes(include_str!("shaders/vis_vumeters_3d.wgsl"));
         if let Err(e) = wgpu::naga::front::wgsl::parse_str(&vu_resolved) {
-            panic!("vis_vumeters_3d WGSL error:\n{}", e.emit_to_string(&vu_resolved));
+            panic!(
+                "vis_vumeters_3d WGSL error:\n{}",
+                e.emit_to_string(&vu_resolved)
+            );
         }
 
         let lyrics_resolved = resolve_shader_includes(include_str!("shaders/vis_lyrics.wgsl"));
         if let Err(e) = wgpu::naga::front::wgsl::parse_str(&lyrics_resolved) {
-            panic!("vis_lyrics WGSL error:\n{}", e.emit_to_string(&lyrics_resolved));
+            panic!(
+                "vis_lyrics WGSL error:\n{}",
+                e.emit_to_string(&lyrics_resolved)
+            );
         }
 
-        let scope_resolved = resolve_shader_includes(include_str!("shaders/vis_3doscilloscope_raster.wgsl"));
+        let scope_resolved =
+            resolve_shader_includes(include_str!("shaders/vis_3doscilloscope_raster.wgsl"));
         if let Err(e) = wgpu::naga::front::wgsl::parse_str(&scope_resolved) {
-            panic!("vis_3doscilloscope_raster WGSL error:\n{}", e.emit_to_string(&scope_resolved));
+            panic!(
+                "vis_3doscilloscope_raster WGSL error:\n{}",
+                e.emit_to_string(&scope_resolved)
+            );
         }
     }
 
@@ -7618,19 +9330,35 @@ mod tests {
             // 2 tracks: 2 buttons per row, 2 rows
             let row_w = ((width - spacing) / 2.0).max(60.0);
             let row_total = row_w * 2.0 + spacing;
-            assert!(row_total <= width + 0.01, "Row width {} must fit in available width {}", row_total, width);
+            assert!(
+                row_total <= width + 0.01,
+                "Row width {} must fit in available width {}",
+                row_total,
+                width
+            );
 
             // 4 tracks: Row 1 has 2 buttons, Row 2 has 2 buttons, Row 3 has 2 buttons
             let chunk_w = ((width - spacing) / 2.0).max(45.0);
             let chunk_total = chunk_w * 2.0 + spacing;
-            assert!(chunk_total <= width + 0.01, "Chunk width {} must fit in available width {}", chunk_total, width);
+            assert!(
+                chunk_total <= width + 0.01,
+                "Chunk width {} must fit in available width {}",
+                chunk_total,
+                width
+            );
         }
     }
 
     #[test]
     fn test_mobile_audio_info_formatting() {
         // Verify mobile portrait single-line audio format string e.g. "Audio: AAC/MP4, X-channels, Y bitrate"
-        let format_audio_line = |module_type: &str, codec: Option<&str>, bitrate: Option<u32>, num_channels: usize, tracker_channels: Option<usize>, hardware_channels: usize| -> (String, String) {
+        let format_audio_line = |module_type: &str,
+                                 codec: Option<&str>,
+                                 bitrate: Option<u32>,
+                                 num_channels: usize,
+                                 tracker_channels: Option<usize>,
+                                 hardware_channels: usize|
+         -> (String, String) {
             let format_name = if let Some(c) = codec {
                 if !c.is_empty() && !module_type.eq_ignore_ascii_case(c) {
                     format!("{}/{}", c, module_type)
@@ -7676,9 +9404,17 @@ mod tests {
         assert_eq!(val, "ProTracker MOD, 4 hw / 4 tracker");
 
         // Case 5: Composite module_type already containing codec (avoid AAC/AAC/MP4)
-        let format_audio_line_dedup = |module_type: &str, codec: Option<&str>, bitrate: Option<u32>, num_channels: usize| -> String {
+        let format_audio_line_dedup = |module_type: &str,
+                                       codec: Option<&str>,
+                                       bitrate: Option<u32>,
+                                       num_channels: usize|
+         -> String {
             let format_name = if let Some(c) = codec {
-                if !c.is_empty() && !module_type.to_ascii_uppercase().contains(&c.to_ascii_uppercase()) {
+                if !c.is_empty()
+                    && !module_type
+                        .to_ascii_uppercase()
+                        .contains(&c.to_ascii_uppercase())
+                {
                     format!("{}/{}", c, module_type)
                 } else {
                     module_type.to_string()
@@ -7699,7 +9435,10 @@ mod tests {
         let format_audio_with_ext = |format_name: &str, ext: Option<&str>| -> String {
             if let Some(e) = ext {
                 let ext_upper = e.to_ascii_uppercase();
-                if (ext_upper == "MP4" || ext_upper == "M4A" || ext_upper == "MOV" || ext_upper == "MKV")
+                if (ext_upper == "MP4"
+                    || ext_upper == "M4A"
+                    || ext_upper == "MOV"
+                    || ext_upper == "MKV")
                     && !format_name.to_ascii_uppercase().contains(&ext_upper)
                 {
                     format!("{}/{}", format_name, ext_upper)
@@ -7765,27 +9504,46 @@ mod tests {
         }
 
         // Verify Retro Fire (ID 5)
-        let retro_fire = crate::state::VISUALIZERS.iter().find(|v| v.id == 5)
+        let retro_fire = crate::state::VISUALIZERS
+            .iter()
+            .find(|v| v.id == 5)
             .expect("Visualizer ID 5 (Retro Fire) must be registered in VISUALIZERS");
         assert_eq!(retro_fire.name, "Retro Fire");
         assert_eq!(retro_fire.filename, "vis_flame.wgsl");
         assert!(retro_fire.requires_fire, "Retro Fire requires fire compute");
 
         // Verify Fire Simulation (ID 6)
-        let firesim = crate::state::VISUALIZERS.iter().find(|v| v.id == 6)
+        let firesim = crate::state::VISUALIZERS
+            .iter()
+            .find(|v| v.id == 6)
             .expect("Visualizer ID 6 (Fire Simulation) must be registered in VISUALIZERS");
         assert_eq!(firesim.name, "Fire Simulation");
         assert_eq!(firesim.filename, "vis_firesim.wgsl");
 
         // Verify ID 26 (DOOM Fire) is removed
-        assert!(crate::state::VISUALIZERS.iter().all(|v| v.id != 26), "ID 26 should no longer exist");
+        assert!(
+            crate::state::VISUALIZERS.iter().all(|v| v.id != 26),
+            "ID 26 should no longer exist"
+        );
 
         // Verify default enablement states in AppState
         let state = crate::state::AppState::new("Test App".to_string());
-        let retro_fire_idx = crate::state::VISUALIZERS.iter().position(|v| v.id == 5).unwrap();
-        let firesim_idx = crate::state::VISUALIZERS.iter().position(|v| v.id == 6).unwrap();
-        assert!(state.vis_enabled[retro_fire_idx], "Retro Fire should be enabled by default");
-        assert!(!state.vis_enabled[firesim_idx], "Fire Simulation should be disabled by default");
+        let retro_fire_idx = crate::state::VISUALIZERS
+            .iter()
+            .position(|v| v.id == 5)
+            .unwrap();
+        let firesim_idx = crate::state::VISUALIZERS
+            .iter()
+            .position(|v| v.id == 6)
+            .unwrap();
+        assert!(
+            state.vis_enabled[retro_fire_idx],
+            "Retro Fire should be enabled by default"
+        );
+        assert!(
+            !state.vis_enabled[firesim_idx],
+            "Fire Simulation should be disabled by default"
+        );
 
         // Verify vis_flame.wgsl contains DOOM palette and CRT post-processing
         let flame_source = include_str!("shaders/vis_flame.wgsl");
@@ -7814,7 +9572,10 @@ mod tests {
                 fire_intensity = (fire_intensity - fire_rate * dt).max(target_intensity);
             }
         }
-        assert!((fire_intensity - 1.0).abs() < 1e-4, "Fire should be fully ignited (1.0) while playing");
+        assert!(
+            (fire_intensity - 1.0).abs() < 1e-4,
+            "Fire should be fully ignited (1.0) while playing"
+        );
 
         // 2. Pause playback -> fire intensity should decay down to 0.0
         state.is_paused = true;
@@ -7828,15 +9589,20 @@ mod tests {
                 fire_intensity = (fire_intensity - fire_rate * dt).max(target_intensity);
             }
         }
-        assert_eq!(fire_intensity, 0.0, "Fire intensity should die off completely (0.0) when paused");
+        assert_eq!(
+            fire_intensity, 0.0,
+            "Fire intensity should die off completely (0.0) when paused"
+        );
 
         // 3. Track ended -> fire intensity should die off
         state.is_paused = false;
         state.track_ended = true;
         fire_intensity = 0.8;
         for _ in 0..60 {
-            let is_at_end = state.duration_seconds > 0.0 && state.current_seconds >= state.duration_seconds - 0.05;
-            let is_playing = !state.is_paused && state.file_loaded && !state.track_ended && !is_at_end;
+            let is_at_end = state.duration_seconds > 0.0
+                && state.current_seconds >= state.duration_seconds - 0.05;
+            let is_playing =
+                !state.is_paused && state.file_loaded && !state.track_ended && !is_at_end;
             let target_intensity = if is_playing { 1.0f32 } else { 0.0f32 };
             let fire_rate = if is_playing { 5.0f32 } else { 3.5f32 };
             if fire_intensity < target_intensity {
@@ -7845,7 +9611,10 @@ mod tests {
                 fire_intensity = (fire_intensity - fire_rate * dt).max(target_intensity);
             }
         }
-        assert_eq!(fire_intensity, 0.0, "Fire intensity should die off completely (0.0) when track ended");
+        assert_eq!(
+            fire_intensity, 0.0,
+            "Fire intensity should die off completely (0.0) when track ended"
+        );
 
         // 4. End of song reached (current_seconds >= duration_seconds) -> fire intensity should die off
         state.track_ended = false;
@@ -7853,8 +9622,10 @@ mod tests {
         state.current_seconds = 180.0;
         fire_intensity = 0.9;
         for _ in 0..60 {
-            let is_at_end = state.duration_seconds > 0.0 && state.current_seconds >= state.duration_seconds - 0.05;
-            let is_playing = !state.is_paused && state.file_loaded && !state.track_ended && !is_at_end;
+            let is_at_end = state.duration_seconds > 0.0
+                && state.current_seconds >= state.duration_seconds - 0.05;
+            let is_playing =
+                !state.is_paused && state.file_loaded && !state.track_ended && !is_at_end;
             let target_intensity = if is_playing { 1.0f32 } else { 0.0f32 };
             let fire_rate = if is_playing { 5.0f32 } else { 3.5f32 };
             if fire_intensity < target_intensity {
@@ -7863,7 +9634,10 @@ mod tests {
                 fire_intensity = (fire_intensity - fire_rate * dt).max(target_intensity);
             }
         }
-        assert_eq!(fire_intensity, 0.0, "Fire intensity should die off completely (0.0) when end of song is reached");
+        assert_eq!(
+            fire_intensity, 0.0,
+            "Fire intensity should die off completely (0.0) when end of song is reached"
+        );
     }
 
     #[test]
@@ -7988,8 +9762,12 @@ mod tests {
         for _ in 0..60 {
             VulkanEngine::update_retro_fire_grid(&mut cells, &mut rng, 1.0, &state);
         }
-        let left_heavy_l: u32 = (0..H).flat_map(|y| (0..160).map(move |x| cells[y * W + x] as u32)).sum();
-        let left_heavy_r: u32 = (0..H).flat_map(|y| (160..320).map(move |x| cells[y * W + x] as u32)).sum();
+        let left_heavy_l: u32 = (0..H)
+            .flat_map(|y| (0..160).map(move |x| cells[y * W + x] as u32))
+            .sum();
+        let left_heavy_r: u32 = (0..H)
+            .flat_map(|y| (160..320).map(move |x| cells[y * W + x] as u32))
+            .sum();
         assert!(
             left_heavy_l > left_heavy_r,
             "Left-panned audio should have more heat on left half (L: {}, R: {})",
@@ -8037,9 +9815,9 @@ mod tests {
 
     #[test]
     fn test_windows_installer_icon_registration() {
-        let iss_content = std::fs::read_to_string("installer.iss")
-            .expect("installer.iss must exist");
-        
+        let iss_content =
+            std::fs::read_to_string("installer.iss").expect("installer.iss must exist");
+
         // Ensure no unquoted or raw .ico,0 references exist (Windows ExtractIconEx fails with .ico,0)
         assert!(
             !iss_content.contains("{app}\\icon.ico,0"),
@@ -8084,8 +9862,14 @@ mod tests {
         state.stats.audio_buffer_fill_pct = 0.0;
         state.track_ended = false;
 
-        assert!(!state.stats.bitstream_active, "bitstream_active must be false after dropping stream");
-        assert_eq!(state.stats.audio_buffer_fill_pct, 0.0, "audio_buffer_fill_pct must be 0 after dropping stream");
+        assert!(
+            !state.stats.bitstream_active,
+            "bitstream_active must be false after dropping stream"
+        );
+        assert_eq!(
+            state.stats.audio_buffer_fill_pct, 0.0,
+            "audio_buffer_fill_pct must be 0 after dropping stream"
+        );
     }
 
     #[test]
@@ -8096,15 +9880,36 @@ mod tests {
         let channels = vec![samples.clone(), samples];
         let current_seconds = 12.5;
 
-        crate::audio::push_planar_lookahead_slices(&mut state, &channels, sample_rate, current_seconds);
+        crate::audio::push_planar_lookahead_slices(
+            &mut state,
+            &channels,
+            sample_rate,
+            current_seconds,
+        );
 
-        assert!(!state.lookahead_queue.is_empty(), "Queue must contain slices");
+        assert!(
+            !state.lookahead_queue.is_empty(),
+            "Queue must contain slices"
+        );
         let (first_t, _) = state.lookahead_queue.front().unwrap();
         let (last_t, _) = state.lookahead_queue.back().unwrap();
 
-        assert!(*first_t >= current_seconds, "First slice timestamp ({}) must start at or after current_seconds ({})", first_t, current_seconds);
-        assert!(*last_t > *first_t, "Last slice timestamp ({}) must be ahead of first slice timestamp ({})", last_t, first_t);
-        assert!((*last_t - current_seconds) >= 0.9, "Lookahead span should extend ~1s into the future");
+        assert!(
+            *first_t >= current_seconds,
+            "First slice timestamp ({}) must start at or after current_seconds ({})",
+            first_t,
+            current_seconds
+        );
+        assert!(
+            *last_t > *first_t,
+            "Last slice timestamp ({}) must be ahead of first slice timestamp ({})",
+            last_t,
+            first_t
+        );
+        assert!(
+            (*last_t - current_seconds) >= 0.9,
+            "Lookahead span should extend ~1s into the future"
+        );
     }
 
     #[test]
@@ -8116,7 +9921,10 @@ mod tests {
         for i in 0..700 {
             let t = 5.0 + (i as f64 * 0.01);
             let s = (i as f32 * 0.05).sin() * 0.4;
-            state.lookahead_queue.push_back((t, [-s.abs(), s.abs(), -s.abs(), s.abs(), 0.35, 0.35, 0.5, 0.5]));
+            state.lookahead_queue.push_back((
+                t,
+                [-s.abs(), s.abs(), -s.abs(), s.abs(), 0.35, 0.35, 0.5, 0.5],
+            ));
         }
 
         let cur_t = 6.0;
@@ -8130,16 +9938,19 @@ mod tests {
 
             if target_t < t_first {
                 let fade = (1.0 - ((t_first - target_t) / 0.5)).max(0.0) as f32;
-                for c in 0..8 {
-                    state.lookahead_timeline[off + c] = d_first[c] * fade;
+                for (c, val) in d_first.iter().enumerate() {
+                    state.lookahead_timeline[off + c] = *val * fade;
                 }
             } else if target_t > t_last {
                 let fade = (1.0 - ((target_t - t_last) / 0.5)).max(0.0) as f32;
-                for c in 0..8 {
-                    state.lookahead_timeline[off + c] = d_last[c] * fade;
+                for (c, val) in d_last.iter().enumerate() {
+                    state.lookahead_timeline[off + c] = *val * fade;
                 }
             } else {
-                let idx = match state.lookahead_queue.binary_search_by(|(t, _)| t.partial_cmp(&target_t).unwrap_or(std::cmp::Ordering::Equal)) {
+                let idx = match state.lookahead_queue.binary_search_by(|(t, _)| {
+                    t.partial_cmp(&target_t)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                }) {
                     Ok(i) => i,
                     Err(i) => i,
                 };
@@ -8171,7 +9982,13 @@ mod tests {
             let max0 = state.lookahead_timeline[off0 + 1];
             let max1 = state.lookahead_timeline[off1 + 1];
             let diff = (max1 - max0).abs();
-            assert!(diff < 0.05, "Adjacent slices {} and {} must be continuous (diff: {})", k, k + 1, diff);
+            assert!(
+                diff < 0.05,
+                "Adjacent slices {} and {} must be continuous (diff: {})",
+                k,
+                k + 1,
+                diff
+            );
         }
 
         // Part 2: Fallback synthesis when queue is empty
@@ -8180,8 +9997,18 @@ mod tests {
         state.raw_channel_vus = vec![0.7, 0.7];
 
         let wave_len = state.raw_waveform.len();
-        let vu_l = state.raw_channel_vus.first().copied().unwrap_or(0.2).clamp(0.05, 1.0);
-        let vu_r = state.raw_channel_vus.get(1).copied().unwrap_or(vu_l).clamp(0.05, 1.0);
+        let vu_l = state
+            .raw_channel_vus
+            .first()
+            .copied()
+            .unwrap_or(0.2)
+            .clamp(0.05, 1.0);
+        let vu_r = state
+            .raw_channel_vus
+            .get(1)
+            .copied()
+            .unwrap_or(vu_l)
+            .clamp(0.05, 1.0);
         for k in 0..600 {
             let off = k * 8;
             let wave_idx = (k * 13) % wave_len;
@@ -8192,7 +10019,7 @@ mod tests {
             let min_r = sample.min(sample_next).min(0.0) * vu_r;
             let max_r = sample.max(sample_next).max(0.0) * vu_r;
             let rms = (sample.abs() * 0.7 + 0.3 * (vu_l + vu_r) * 0.5).min(1.0);
-            state.lookahead_timeline[off + 0] = min_s;
+            state.lookahead_timeline[off] = min_s;
             state.lookahead_timeline[off + 1] = max_s;
             state.lookahead_timeline[off + 2] = min_r;
             state.lookahead_timeline[off + 3] = max_r;
@@ -8213,10 +10040,13 @@ mod tests {
 
     #[test]
     fn test_open_file_button_theme_colors() {
-        let engine_code = std::fs::read_to_string("src/engine.rs")
-            .expect("src/engine.rs must exist");
-        let prod_code = engine_code.split("#[cfg(test)]").next().unwrap_or(&engine_code);
-        
+        let engine_code =
+            std::fs::read_to_string("src/engine.rs").expect("src/engine.rs must exist");
+        let prod_code = engine_code
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or(&engine_code);
+
         // Assert no old cyan/blue button colors in empty state or header button
         assert!(
             !prod_code.contains("Color32::from_rgb(0, 150, 220)"),

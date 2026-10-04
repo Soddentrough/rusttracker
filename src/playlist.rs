@@ -40,7 +40,11 @@ fn collect_directory_files(dir: &Path, results: &mut Vec<String>) {
         let path = entry.path();
         if path.is_dir() {
             collect_directory_files(&path, results);
-        } else if path.extension().and_then(|s| s.to_str()).is_some_and(is_supported_media_extension) {
+        } else if path
+            .extension()
+            .and_then(|s| s.to_str())
+            .is_some_and(is_supported_media_extension)
+        {
             results.push(path.to_string_lossy().into_owned());
         }
     }
@@ -51,14 +55,20 @@ fn collect_directory_files(dir: &Path, results: &mut Vec<String>) {
 pub fn parse_playlist_file(playlist_path: &Path) -> Result<Vec<String>, std::io::Error> {
     let content = std::fs::read_to_string(playlist_path)?;
     let parent_dir = playlist_path.parent().unwrap_or_else(|| Path::new("."));
-    let ext = playlist_path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
+    let ext = playlist_path
+        .extension()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_lowercase();
 
     let mut paths = Vec::new();
 
     if ext == "pls" {
         for line in content.lines() {
             let trimmed = line.trim();
-            if let Some((_, path_part)) = trimmed.strip_prefix("File").and_then(|s| s.split_once('=')) {
+            if let Some((_, path_part)) =
+                trimmed.strip_prefix("File").and_then(|s| s.split_once('='))
+            {
                 let path_str = path_part.trim();
                 if !path_str.is_empty() {
                     paths.push(resolve_path(path_str, parent_dir));

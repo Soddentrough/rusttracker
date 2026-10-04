@@ -1,18 +1,24 @@
 #[cfg(target_os = "android")]
 pub mod decoder {
-    use std::ffi::{c_char, c_void, CStr};
+    use crate::state::{AppState, VideoFrame};
+    use crossbeam_channel::{bounded, unbounded};
+    use std::ffi::{CStr, c_char, c_void};
     use std::ptr;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex};
-    use crossbeam_channel::{bounded, unbounded};
-    use crate::state::{AppState, VideoFrame};
 
     #[repr(C)]
-    struct AMediaExtractor { _private: [u8; 0] }
+    struct AMediaExtractor {
+        _private: [u8; 0],
+    }
     #[repr(C)]
-    struct AMediaCodec { _private: [u8; 0] }
+    struct AMediaCodec {
+        _private: [u8; 0],
+    }
     #[repr(C)]
-    struct AMediaFormat { _private: [u8; 0] }
+    struct AMediaFormat {
+        _private: [u8; 0],
+    }
 
     #[repr(C)]
     struct AMediaCodecBufferInfo {
@@ -31,34 +37,87 @@ pub mod decoder {
     unsafe extern "C" {
         fn AMediaExtractor_new() -> *mut AMediaExtractor;
         fn AMediaExtractor_delete(extractor: *mut AMediaExtractor) -> i32;
-        fn AMediaExtractor_setDataSourceFd(extractor: *mut AMediaExtractor, fd: i32, offset: i64, length: i64) -> i32;
+        fn AMediaExtractor_setDataSourceFd(
+            extractor: *mut AMediaExtractor,
+            fd: i32,
+            offset: i64,
+            length: i64,
+        ) -> i32;
         fn AMediaExtractor_getTrackCount(extractor: *mut AMediaExtractor) -> usize;
-        fn AMediaExtractor_getTrackFormat(extractor: *mut AMediaExtractor, idx: usize) -> *mut AMediaFormat;
+        fn AMediaExtractor_getTrackFormat(
+            extractor: *mut AMediaExtractor,
+            idx: usize,
+        ) -> *mut AMediaFormat;
         fn AMediaExtractor_selectTrack(extractor: *mut AMediaExtractor, idx: usize) -> i32;
-        fn AMediaExtractor_seekTo(extractor: *mut AMediaExtractor, seekPosUs: i64, mode: i32) -> i32;
+        fn AMediaExtractor_seekTo(
+            extractor: *mut AMediaExtractor,
+            seekPosUs: i64,
+            mode: i32,
+        ) -> i32;
         fn AMediaExtractor_advance(extractor: *mut AMediaExtractor) -> bool;
-        fn AMediaExtractor_readSampleData(extractor: *mut AMediaExtractor, buffer: *mut u8, capacity: usize) -> isize;
+        fn AMediaExtractor_readSampleData(
+            extractor: *mut AMediaExtractor,
+            buffer: *mut u8,
+            capacity: usize,
+        ) -> isize;
         fn AMediaExtractor_getSampleTime(extractor: *mut AMediaExtractor) -> i64;
         fn AMediaExtractor_getSampleFlags(extractor: *mut AMediaExtractor) -> u32;
 
         fn AMediaFormat_delete(format: *mut AMediaFormat) -> i32;
-        fn AMediaFormat_getString(format: *mut AMediaFormat, name: *const c_char, out: *mut *const c_char) -> bool;
-        fn AMediaFormat_getInt32(format: *mut AMediaFormat, name: *const c_char, out: *mut i32) -> bool;
+        fn AMediaFormat_getString(
+            format: *mut AMediaFormat,
+            name: *const c_char,
+            out: *mut *const c_char,
+        ) -> bool;
+        fn AMediaFormat_getInt32(
+            format: *mut AMediaFormat,
+            name: *const c_char,
+            out: *mut i32,
+        ) -> bool;
         fn AMediaFormat_setInt32(format: *mut AMediaFormat, name: *const c_char, value: i32);
 
         fn AMediaCodec_createDecoderByType(mime_type: *const c_char) -> *mut AMediaCodec;
-        fn AMediaCodec_configure(codec: *mut AMediaCodec, format: *const AMediaFormat, surface: *mut c_void, crypto: *mut c_void, flags: u32) -> i32;
+        fn AMediaCodec_configure(
+            codec: *mut AMediaCodec,
+            format: *const AMediaFormat,
+            surface: *mut c_void,
+            crypto: *mut c_void,
+            flags: u32,
+        ) -> i32;
         fn AMediaCodec_start(codec: *mut AMediaCodec) -> i32;
         fn AMediaCodec_stop(codec: *mut AMediaCodec) -> i32;
         fn AMediaCodec_delete(codec: *mut AMediaCodec) -> i32;
         fn AMediaCodec_flush(codec: *mut AMediaCodec) -> i32;
         fn AMediaCodec_dequeueInputBuffer(codec: *mut AMediaCodec, timeoutUs: i64) -> isize;
-        fn AMediaCodec_getInputBuffer(codec: *mut AMediaCodec, idx: usize, out_size: *mut usize) -> *mut u8;
-        fn AMediaCodec_queueInputBuffer(codec: *mut AMediaCodec, idx: usize, offset: usize, size: usize, pts: u64, flags: u32) -> i32;
-        fn AMediaCodec_dequeueOutputBuffer(codec: *mut AMediaCodec, info: *mut AMediaCodecBufferInfo, timeoutUs: i64) -> isize;
-        fn AMediaCodec_getOutputBuffer(codec: *mut AMediaCodec, idx: usize, out_size: *mut usize) -> *mut u8;
+        fn AMediaCodec_getInputBuffer(
+            codec: *mut AMediaCodec,
+            idx: usize,
+            out_size: *mut usize,
+        ) -> *mut u8;
+        fn AMediaCodec_queueInputBuffer(
+            codec: *mut AMediaCodec,
+            idx: usize,
+            offset: usize,
+            size: usize,
+            pts: u64,
+            flags: u32,
+        ) -> i32;
+        fn AMediaCodec_dequeueOutputBuffer(
+            codec: *mut AMediaCodec,
+            info: *mut AMediaCodecBufferInfo,
+            timeoutUs: i64,
+        ) -> isize;
+        fn AMediaCodec_getOutputBuffer(
+            codec: *mut AMediaCodec,
+            idx: usize,
+            out_size: *mut usize,
+        ) -> *mut u8;
         fn AMediaCodec_getOutputFormat(codec: *mut AMediaCodec) -> *mut AMediaFormat;
-        fn AMediaCodec_releaseOutputBuffer(codec: *mut AMediaCodec, idx: usize, render: bool) -> i32;
+        fn AMediaCodec_releaseOutputBuffer(
+            codec: *mut AMediaCodec,
+            idx: usize,
+            render: bool,
+        ) -> i32;
     }
 
     pub fn start_android_video_thread(
@@ -240,7 +299,7 @@ pub mod decoder {
 
                         if out_idx >= 0 {
                             let pts_sec = (info.presentation_time_us.max(0) as f64) / 1_000_000.0;
-                            
+
                             // Audio-video sync: check current audio timestamp
                             let current_audio_pts = state_for_video.lock().map(|s| s.current_seconds).unwrap_or(pts_sec);
                             if pts_sec > current_audio_pts + 0.08 {
@@ -354,7 +413,7 @@ pub mod decoder {
                                         _ => 0,
                                     };
                                 }
-                                
+
                                 vid_w = new_w;
                                 vid_h = new_h;
                                 out_stride = if new_stride > 0 { new_stride as usize } else { new_w as usize };

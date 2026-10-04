@@ -17,17 +17,23 @@ use symphonia::core::io::MediaSourceStream;
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
 
+use midly::{MetaMessage, MidiMessage, Smf, TrackEventKind};
 use rustysynth::{MidiFile, MidiFileSequencer, SoundFont, Synthesizer, SynthesizerSettings};
-use midly::{Smf, TrackEventKind, MetaMessage, MidiMessage};
 
 use crate::state::AppState;
-use crossbeam_channel::{bounded, unbounded, Sender, Receiver};
+use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 
 #[allow(dead_code)]
 pub enum PlaybackHandle {
     Cpal(cpal::Stream, Arc<std::sync::atomic::AtomicBool>),
-    Bitstream(Option<std::thread::JoinHandle<()>>, Arc<std::sync::atomic::AtomicBool>),
-    Dummy(Option<std::thread::JoinHandle<()>>, Arc<std::sync::atomic::AtomicBool>),
+    Bitstream(
+        Option<std::thread::JoinHandle<()>>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ),
+    Dummy(
+        Option<std::thread::JoinHandle<()>>,
+        Arc<std::sync::atomic::AtomicBool>,
+    ),
 }
 
 impl Drop for PlaybackHandle {
@@ -73,7 +79,10 @@ fn is_relevant_audio_device(name: &str) -> bool {
     }
     // Filter out virtual multi-channel surround setups on Linux (e.g. surround40/51/71 ALSA aliases)
     #[cfg(target_os = "linux")]
-    if name_lower.starts_with("surround4") || name_lower.starts_with("surround5") || name_lower.starts_with("surround7") {
+    if name_lower.starts_with("surround4")
+        || name_lower.starts_with("surround5")
+        || name_lower.starts_with("surround7")
+    {
         return false;
     }
     // Filter out internal mixer and snooping plugins
@@ -103,7 +112,7 @@ pub fn get_available_audio_devices(mic: bool) -> Vec<String> {
     } else {
         host.output_devices()
     };
-    
+
     let mut names = Vec::new();
     if let Ok(devices) = devices {
         for d in devices {
@@ -147,13 +156,22 @@ pub fn spawn_dsp_thread(
 
         // Pre-compute Hann window coefficients
         let hann_window: Vec<f32> = (0..window_size)
-            .map(|i| 0.5 * (1.0 - (2.0 * std::f32::consts::PI * i as f32 / (window_size - 1) as f32).cos()))
+            .map(|i| {
+                0.5 * (1.0
+                    - (2.0 * std::f32::consts::PI * i as f32 / (window_size - 1) as f32).cos())
+            })
             .collect();
 
         // Pre-plan FFT (rustfft caches the twiddle factors)
         let mut planner = FftPlanner::<f32>::new();
         let fft = planner.plan_fft_forward(window_size);
-        let mut complex_buf = vec![Complex { re: 0.0f32, im: 0.0f32 }; window_size];
+        let mut complex_buf = vec![
+            Complex {
+                re: 0.0f32,
+                im: 0.0f32
+            };
+            window_size
+        ];
         let mut magnitudes = vec![0.0f32; window_size / 2];
 
         // Precompute log-spaced bin interpolation mapping for GPU spectrum
@@ -189,7 +207,10 @@ pub fn spawn_dsp_thread(
             // 1. Apply Hann window and prepare complex input for mono channel
             for i in 0..window_size {
                 let sample = *msg.audio_data.get(i).unwrap_or(&0.0);
-                complex_buf[i] = Complex { re: sample * hann_window[i], im: 0.0 };
+                complex_buf[i] = Complex {
+                    re: sample * hann_window[i],
+                    im: 0.0,
+                };
             }
 
             // Run FFT
@@ -237,7 +258,10 @@ pub fn spawn_dsp_thread(
                 let channel_data = &msg.channel_audio_data[c];
                 for i in 0..window_size {
                     let sample = *channel_data.get(i).unwrap_or(&0.0);
-                    complex_buf[i] = Complex { re: sample * hann_window[i], im: 0.0 };
+                    complex_buf[i] = Complex {
+                        re: sample * hann_window[i],
+                        im: 0.0,
+                    };
                 }
                 fft.process(&mut complex_buf);
 
@@ -246,10 +270,10 @@ pub fn spawn_dsp_thread(
                     let c1 = complex_buf[mapping.i1];
                     let re = c0.re * (1.0 - mapping.frac) + c1.re * mapping.frac;
                     let im = c0.im * (1.0 - mapping.frac) + c1.im * mapping.frac;
-                    
+
                     let norm_re = re / n_sqrt;
                     let norm_im = im / n_sqrt;
-                    
+
                     let out_idx = c * 1024 * 2 + i * 2;
                     gpu_spectrum[out_idx] = norm_re;
                     gpu_spectrum[out_idx + 1] = norm_im;
@@ -262,41 +286,50 @@ pub fn spawn_dsp_thread(
             if let Ok(mut state) = shared_state.lock() {
                 // Decay/smooth the execution stats for readability
                 state.stats.fft_us = state.stats.fft_us * 0.9 + fft_elapsed * 0.1;
-                
+
                 if state.stats.bitstream_active
-                    && let Some(cap) = rx.capacity() {
+                    && let Some(cap) = rx.capacity()
+                {
                     state.stats.audio_buffer_fill_pct = (rx.len() as f32 / cap as f32) * 100.0;
                 }
-                
+
                 state.raw_channel_vus.clear();
                 for vu in msg.channel_vus {
                     state.raw_channel_vus.push(vu);
                 }
-                
+
                 state.raw_spectrum_data.copy_from_slice(&binned_data);
                 state.gpu_spectrum_data = gpu_spectrum.clone();
                 state.raw_audio_channels = msg.channel_audio_data;
-                
+
                 // --- Waveform extraction (Zero-Crossing Edge Trigger) ---
                 let visual_width = state.visual_width.clamp(128, 4096) as usize;
                 let target_fps = state.target_fps.clamp(30, 500);
-                let waveform_push_interval = std::time::Duration::from_secs_f64(1.0 / target_fps as f64);
-                
+                let waveform_push_interval =
+                    std::time::Duration::from_secs_f64(1.0 / target_fps as f64);
+
                 // Maintain a constant ~23ms time window regardless of sample rate
                 let target_window_samples = (sample_rate as f32 * 0.023).round() as usize;
                 let stride = (target_window_samples as f32 / visual_width as f32).max(1.0);
                 let actual_window_samples = (visual_width as f32 * stride).ceil() as usize;
-                
+
                 // Restrict search to the last ~33ms to ensure a fresh trigger at >= 30 FPS,
                 // avoiding the visual "freeze" caused by searching the entire history buffer.
                 let search_window = (sample_rate as f32 / 30.0) as usize;
-                let search_start = msg.audio_data.len().saturating_sub(actual_window_samples + search_window);
+                let search_start = msg
+                    .audio_data
+                    .len()
+                    .saturating_sub(actual_window_samples + search_window);
                 // Ensure i+1 stays in bounds during zero-crossing search
-                let search_limit = msg.audio_data.len().saturating_sub(actual_window_samples).min(msg.audio_data.len().saturating_sub(1));
-                
+                let search_limit = msg
+                    .audio_data
+                    .len()
+                    .saturating_sub(actual_window_samples)
+                    .min(msg.audio_data.len().saturating_sub(1));
+
                 let mut start_idx = search_start;
                 let mut best_slope = 0.0;
-                
+
                 if msg.audio_data.len() >= 2 {
                     for i in search_start..search_limit {
                         if msg.audio_data[i] <= 0.0 && msg.audio_data[i + 1] > 0.0 {
@@ -308,18 +341,19 @@ pub fn spawn_dsp_thread(
                         }
                     }
                 }
-                
+
                 if state.raw_waveform.len() != visual_width {
                     state.raw_waveform.resize(visual_width, 0.0);
                 }
-                
+
                 if !msg.audio_data.is_empty() {
-                for i in 0..visual_width {
-                    let sample_idx = start_idx + (i as f32 * stride) as usize;
-                    state.raw_waveform[i] = msg.audio_data[sample_idx.min(msg.audio_data.len() - 1)];
+                    for i in 0..visual_width {
+                        let sample_idx = start_idx + (i as f32 * stride) as usize;
+                        state.raw_waveform[i] =
+                            msg.audio_data[sample_idx.min(msg.audio_data.len() - 1)];
+                    }
                 }
-                }
-                
+
                 let now = Instant::now();
                 if now.duration_since(last_waveform_push) >= waveform_push_interval {
                     while state.waveform_history.len() >= 144 {
@@ -330,9 +364,13 @@ pub fn spawn_dsp_thread(
                     state.waveform_history_push_count += 1;
                     last_waveform_push = now;
                 }
-                
-                if msg.bpm != 0 { state.bpm = msg.bpm; }
-                if msg.speed != 0 { state.speed = msg.speed; }
+
+                if msg.bpm != 0 {
+                    state.bpm = msg.bpm;
+                }
+                if msg.speed != 0 {
+                    state.speed = msg.speed;
+                }
                 if state.duration_seconds > 0.0 {
                     state.current_seconds = msg.current_seconds.min(state.duration_seconds);
                 } else {
@@ -364,18 +402,21 @@ pub fn spawn_dsp_thread(
                         if target_t < t_first {
                             // Prior to available history buffer: smooth fade out to first slice
                             let fade = (1.0 - ((t_first - target_t) / 0.5)).max(0.0) as f32;
-                            for c in 0..8 {
-                                state.lookahead_timeline[off + c] = d_first[c] * fade;
+                            for (c, val) in d_first.iter().enumerate() {
+                                state.lookahead_timeline[off + c] = *val * fade;
                             }
                         } else if target_t > t_last {
                             // Beyond decoded lookahead horizon (e.g. at end of track or initial buffering):
                             // Smooth fade out to silence - NEVER wrap or repeat to avoid banding/seam artifacts!
                             let fade = (1.0 - ((target_t - t_last) / 0.5)).max(0.0) as f32;
-                            for c in 0..8 {
-                                state.lookahead_timeline[off + c] = d_last[c] * fade;
+                            for (c, val) in d_last.iter().enumerate() {
+                                state.lookahead_timeline[off + c] = *val * fade;
                             }
                         } else {
-                            let idx = match state.lookahead_queue.binary_search_by(|(t, _)| t.partial_cmp(&target_t).unwrap_or(std::cmp::Ordering::Equal)) {
+                            let idx = match state.lookahead_queue.binary_search_by(|(t, _)| {
+                                t.partial_cmp(&target_t)
+                                    .unwrap_or(std::cmp::Ordering::Equal)
+                            }) {
                                 Ok(i) => i,
                                 Err(i) => i,
                             };
@@ -391,7 +432,8 @@ pub fn spawn_dsp_thread(
                                 if dt > 0.0001 && dt < 1.0 && target_t >= t0 && target_t <= t1 {
                                     let frac = ((target_t - t0) / dt).clamp(0.0, 1.0) as f32;
                                     for c in 0..8 {
-                                        state.lookahead_timeline[off + c] = d0[c] * (1.0 - frac) + d1[c] * frac;
+                                        state.lookahead_timeline[off + c] =
+                                            d0[c] * (1.0 - frac) + d1[c] * frac;
                                     }
                                 } else {
                                     state.lookahead_timeline[off..off + 8].copy_from_slice(&d0);
@@ -403,19 +445,30 @@ pub fn spawn_dsp_thread(
                     // Fallback synthesis when lookahead_queue is empty (e.g. initial playback or live mic)
                     // Synthesize continuous timeline envelope from raw waveform and channel VUs so tape head is never dead
                     let wave_len = state.raw_waveform.len();
-                    let vu_l = state.raw_channel_vus.first().copied().unwrap_or(0.2).clamp(0.05, 1.0);
-                    let vu_r = state.raw_channel_vus.get(1).copied().unwrap_or(vu_l).clamp(0.05, 1.0);
+                    let vu_l = state
+                        .raw_channel_vus
+                        .first()
+                        .copied()
+                        .unwrap_or(0.2)
+                        .clamp(0.05, 1.0);
+                    let vu_r = state
+                        .raw_channel_vus
+                        .get(1)
+                        .copied()
+                        .unwrap_or(vu_l)
+                        .clamp(0.05, 1.0);
                     for k in 0..600 {
                         let off = k * 8;
                         let wave_idx = (k * 13) % wave_len;
                         let sample = state.raw_waveform[wave_idx].clamp(-1.0, 1.0);
-                        let sample_next = state.raw_waveform[(wave_idx + 1) % wave_len].clamp(-1.0, 1.0);
+                        let sample_next =
+                            state.raw_waveform[(wave_idx + 1) % wave_len].clamp(-1.0, 1.0);
                         let min_s = sample.min(sample_next).min(0.0) * vu_l;
                         let max_s = sample.max(sample_next).max(0.0) * vu_l;
                         let min_r = sample.min(sample_next).min(0.0) * vu_r;
                         let max_r = sample.max(sample_next).max(0.0) * vu_r;
                         let rms = (sample.abs() * 0.7 + 0.3 * (vu_l + vu_r) * 0.5).min(1.0);
-                        state.lookahead_timeline[off + 0] = min_s;
+                        state.lookahead_timeline[off] = min_s;
                         state.lookahead_timeline[off + 1] = max_s;
                         state.lookahead_timeline[off + 2] = min_r;
                         state.lookahead_timeline[off + 3] = max_r;
@@ -425,11 +478,13 @@ pub fn spawn_dsp_thread(
                         state.lookahead_timeline[off + 7] = vu_r;
                     }
                 }
-                
-                if state.current_tracker_order != msg.current_order || state.current_tracker_row != msg.current_row {
+
+                if state.current_tracker_order != msg.current_order
+                    || state.current_tracker_row != msg.current_row
+                {
                     let cur_order = state.current_tracker_order;
                     let cur_row = state.current_tracker_row;
-                    
+
                     if cur_order == msg.current_order && msg.current_row > cur_row {
                         for r in cur_row..msg.current_row {
                             state.tracker_row_history.push_front((cur_order, r));
@@ -437,21 +492,24 @@ pub fn spawn_dsp_thread(
                     } else {
                         state.tracker_row_history.push_front((cur_order, cur_row));
                     }
-                    
+
                     state.tracker_row_history.truncate(128);
-                    
+
                     state.current_tracker_order = msg.current_order;
                     state.current_tracker_row = msg.current_row;
                 }
-                
-
             }
         }
     });
 }
 
 pub trait AudioSource: Send {
-    fn read_frames(&mut self, hardware_channels: usize, sample_rate: u32, output: &mut [f32]) -> usize;
+    fn read_frames(
+        &mut self,
+        hardware_channels: usize,
+        sample_rate: u32,
+        output: &mut [f32],
+    ) -> usize;
     fn get_duration_seconds(&mut self) -> f64;
     fn get_position_seconds(&mut self) -> f64;
     fn set_position_seconds(&mut self, pos: f64);
@@ -467,19 +525,41 @@ pub trait AudioSource: Send {
     fn get_num_patterns(&mut self) -> i32;
     fn get_current_order(&mut self) -> i32;
     fn get_current_row(&mut self) -> i32;
-    fn get_tracker_channels(&mut self) -> Option<i32> { None }
-    fn pre_format_tracker_data(&mut self) -> Vec<Vec<String>> { Vec::new() }
-    fn get_current_row_string(&mut self) -> String { String::new() }
-    fn get_video_info(&mut self) -> Option<String> { None }
+    fn get_tracker_channels(&mut self) -> Option<i32> {
+        None
+    }
+    fn pre_format_tracker_data(&mut self) -> Vec<Vec<String>> {
+        Vec::new()
+    }
+    fn get_current_row_string(&mut self) -> String {
+        String::new()
+    }
+    fn get_video_info(&mut self) -> Option<String> {
+        None
+    }
     #[cfg(not(target_os = "android"))]
     fn attach_video_queue(&mut self, _tx: crossbeam_channel::Sender<(u64, ffmpeg_next::Packet)>) {}
     #[cfg(not(target_os = "android"))]
-    fn take_video_parameters(&mut self) -> Option<(ffmpeg_next::codec::Parameters, ffmpeg_next::Rational, u32)> { None }
-    fn get_bitrate(&mut self) -> Option<u32> { None }
-    fn get_audio_tracks(&self) -> Vec<crate::state::AudioTrackInfo> { Vec::new() }
-    fn get_selected_audio_track(&self) -> usize { 0 }
-    fn select_audio_track(&mut self, _track_idx: usize) -> Result<()> { Ok(()) }
-    fn get_active_audio_tracks(&self) -> Vec<usize> { vec![self.get_selected_audio_track()] }
+    fn take_video_parameters(
+        &mut self,
+    ) -> Option<(ffmpeg_next::codec::Parameters, ffmpeg_next::Rational, u32)> {
+        None
+    }
+    fn get_bitrate(&mut self) -> Option<u32> {
+        None
+    }
+    fn get_audio_tracks(&self) -> Vec<crate::state::AudioTrackInfo> {
+        Vec::new()
+    }
+    fn get_selected_audio_track(&self) -> usize {
+        0
+    }
+    fn select_audio_track(&mut self, _track_idx: usize) -> Result<()> {
+        Ok(())
+    }
+    fn get_active_audio_tracks(&self) -> Vec<usize> {
+        vec![self.get_selected_audio_track()]
+    }
     fn set_active_audio_tracks(&mut self, tracks: &[(usize, f32)]) -> Result<()> {
         if let Some(&(idx, _)) = tracks.first() {
             self.select_audio_track(idx)
@@ -487,7 +567,9 @@ pub trait AudioSource: Send {
             Ok(())
         }
     }
-    fn has_video_stream(&self) -> bool { false }
+    fn has_video_stream(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------
@@ -507,7 +589,12 @@ struct OpenMptSource {
 
 #[cfg(not(target_os = "android"))]
 impl AudioSource for OpenMptSource {
-    fn read_frames(&mut self, hardware_channels: usize, sample_rate: u32, output: &mut [f32]) -> usize {
+    fn read_frames(
+        &mut self,
+        hardware_channels: usize,
+        sample_rate: u32,
+        output: &mut [f32],
+    ) -> usize {
         let frames_to_render = output.len() / hardware_channels;
 
         // The openmpt crate uses Vec::capacity() (not len()) to decide how many
@@ -520,13 +607,13 @@ impl AudioSource for OpenMptSource {
         let frames_read = self.module.0.read_float_stereo(
             sample_rate as i32,
             &mut self.left_buf,
-            &mut self.right_buf
+            &mut self.right_buf,
         );
 
         for i in 0..frames_read {
             let l = self.left_buf[i];
             let r = self.right_buf[i];
-            
+
             output[i * hardware_channels] = l;
             if hardware_channels > 1 {
                 output[i * hardware_channels + 1] = r;
@@ -539,37 +626,71 @@ impl AudioSource for OpenMptSource {
         frames_read
     }
 
-    fn get_duration_seconds(&mut self) -> f64 { self.module.0.get_duration_seconds() }
-    fn get_position_seconds(&mut self) -> f64 { self.module.0.get_position_seconds() }
-    fn set_position_seconds(&mut self, pos: f64) { self.module.0.set_position_seconds(pos); }
-    fn get_num_channels(&mut self) -> i32 { 2 }
-    fn get_current_channel_vu_mono(&mut self, channel: i32) -> f32 { self.module.0.get_current_channel_vu_mono(channel) }
-    
+    fn get_duration_seconds(&mut self) -> f64 {
+        self.module.0.get_duration_seconds()
+    }
+    fn get_position_seconds(&mut self) -> f64 {
+        self.module.0.get_position_seconds()
+    }
+    fn set_position_seconds(&mut self, pos: f64) {
+        self.module.0.set_position_seconds(pos);
+    }
+    fn get_num_channels(&mut self) -> i32 {
+        2
+    }
+    fn get_current_channel_vu_mono(&mut self, channel: i32) -> f32 {
+        self.module.0.get_current_channel_vu_mono(channel)
+    }
+
     fn get_artist(&mut self) -> String {
         use openmpt::module::metadata::MetadataKey;
-        self.module.0.get_metadata(MetadataKey::ModuleArtist).unwrap_or("Unknown".to_string())
+        self.module
+            .0
+            .get_metadata(MetadataKey::ModuleArtist)
+            .unwrap_or("Unknown".to_string())
     }
-    
+
     fn get_type(&mut self) -> String {
         use openmpt::module::metadata::MetadataKey;
-        self.module.0.get_metadata(MetadataKey::TypeExt).unwrap_or("Tracker".to_string())
+        self.module
+            .0
+            .get_metadata(MetadataKey::TypeExt)
+            .unwrap_or("Tracker".to_string())
     }
-    
-    fn get_tempo(&mut self) -> i32 { self.module.0.get_current_tempo() }
-    fn get_speed(&mut self) -> i32 { self.module.0.get_current_speed() }
-    fn get_intrinsic_sample_rate(&mut self) -> Option<u32> { None }
-    fn get_num_samples(&mut self) -> i32 { self.module.0.get_num_samples() }
-    fn get_num_instruments(&mut self) -> i32 { self.module.0.get_num_instruments() }
-    fn get_num_patterns(&mut self) -> i32 { self.module.0.get_num_patterns() }
-    fn get_current_order(&mut self) -> i32 { self.module.0.get_current_order() }
-    fn get_current_row(&mut self) -> i32 { self.module.0.get_current_row() }
-    fn get_tracker_channels(&mut self) -> Option<i32> { Some(self.module.0.get_num_channels()) }
+
+    fn get_tempo(&mut self) -> i32 {
+        self.module.0.get_current_tempo()
+    }
+    fn get_speed(&mut self) -> i32 {
+        self.module.0.get_current_speed()
+    }
+    fn get_intrinsic_sample_rate(&mut self) -> Option<u32> {
+        None
+    }
+    fn get_num_samples(&mut self) -> i32 {
+        self.module.0.get_num_samples()
+    }
+    fn get_num_instruments(&mut self) -> i32 {
+        self.module.0.get_num_instruments()
+    }
+    fn get_num_patterns(&mut self) -> i32 {
+        self.module.0.get_num_patterns()
+    }
+    fn get_current_order(&mut self) -> i32 {
+        self.module.0.get_current_order()
+    }
+    fn get_current_row(&mut self) -> i32 {
+        self.module.0.get_current_row()
+    }
+    fn get_tracker_channels(&mut self) -> Option<i32> {
+        Some(self.module.0.get_num_channels())
+    }
 
     fn pre_format_tracker_data(&mut self) -> Vec<Vec<String>> {
         let mut patterns_by_order = Vec::new();
         let num_orders = self.module.0.get_num_orders();
         let num_channels = self.module.0.get_num_channels();
-        
+
         for o in 0..num_orders {
             let mut row_strings = Vec::new();
             if let Some(mut pattern) = self.module.0.get_pattern_by_order(o) {
@@ -579,7 +700,9 @@ impl AudioSource for OpenMptSource {
                         let mut row_str = String::new();
                         for c in 0..num_channels {
                             if let Some(mut cell) = row.get_cell_by_channel(c) {
-                                if c != 0 { row_str.push_str(" | "); }
+                                if c != 0 {
+                                    row_str.push_str(" | ");
+                                }
                                 row_str.push_str(&cell.get_formatted(0, false));
                             }
                         }
@@ -589,7 +712,7 @@ impl AudioSource for OpenMptSource {
             }
             patterns_by_order.push(row_strings);
         }
-        
+
         patterns_by_order
     }
 
@@ -598,12 +721,15 @@ impl AudioSource for OpenMptSource {
         let num_channels = self.module.0.get_num_channels();
         let cur_order = self.module.0.get_current_order();
         let cur_row = self.module.0.get_current_row();
-        
+
         if let Some(mut pattern) = self.module.0.get_pattern_by_order(cur_order)
-            && let Some(mut row) = pattern.get_row_by_number(cur_row) {
+            && let Some(mut row) = pattern.get_row_by_number(cur_row)
+        {
             for c in 0..num_channels {
                 if let Some(mut cell) = row.get_cell_by_channel(c) {
-                    if c != 0 { row_str.push_str(" | "); }
+                    if c != 0 {
+                        row_str.push_str(" | ");
+                    }
                     row_str.push_str(&cell.get_formatted(0, false));
                 }
             }
@@ -663,27 +789,30 @@ impl MidiSource {
             artist_suffix = " (No SoundFont)";
             None
         };
-        
+
         let mut midi_file = File::open(file_path)?;
-        let midi = Arc::new(MidiFile::new(&mut midi_file).map_err(|e| anyhow::anyhow!("Midi parse error: {:?}", e))?);
-        
+        let midi = Arc::new(
+            MidiFile::new(&mut midi_file)
+                .map_err(|e| anyhow::anyhow!("Midi parse error: {:?}", e))?,
+        );
+
         let duration = midi.get_length();
         if let Some(seq) = &mut sequencer {
             seq.play(&midi, false);
         }
-        
+
         let data = std::fs::read(file_path)?;
         let smf = Smf::parse(&data).map_err(|e| anyhow::anyhow!("Midly parse error: {:?}", e))?;
-        
+
         let mut artist = String::new();
         let mut title = String::new();
-        
+
         let mut absolute_events = Vec::new();
         let ticks_per_beat = match smf.header.timing {
             midly::Timing::Metrical(ticks) => ticks.as_int() as f64,
             _ => 480.0,
         };
-        
+
         for track in &smf.tracks {
             let mut current_tick = 0;
             for event in track {
@@ -699,28 +828,38 @@ impl MidiSource {
                             artist = String::from_utf8_lossy(text).to_string();
                         }
                     }
-                    TrackEventKind::Midi { channel, message } => {
-                        match message {
-                            MidiMessage::NoteOn { key, vel } => {
-                                absolute_events.push((current_tick, channel.as_int(), key.as_int(), vel.as_int(), vel.as_int() > 0));
-                            }
-                            MidiMessage::NoteOff { key, vel } => {
-                                absolute_events.push((current_tick, channel.as_int(), key.as_int(), vel.as_int(), false));
-                            }
-                            _ => {}
+                    TrackEventKind::Midi { channel, message } => match message {
+                        MidiMessage::NoteOn { key, vel } => {
+                            absolute_events.push((
+                                current_tick,
+                                channel.as_int(),
+                                key.as_int(),
+                                vel.as_int(),
+                                vel.as_int() > 0,
+                            ));
                         }
-                    }
+                        MidiMessage::NoteOff { key, vel } => {
+                            absolute_events.push((
+                                current_tick,
+                                channel.as_int(),
+                                key.as_int(),
+                                vel.as_int(),
+                                false,
+                            ));
+                        }
+                        _ => {}
+                    },
                     _ => {}
                 }
             }
         }
-        
+
         absolute_events.sort_by_key(|e| e.0);
-        
+
         let tempo = 500000.0;
         let mut current_tick = 0;
         let mut current_time = 0.0;
-        
+
         let mut parsed_events = Vec::new();
         for (tick, channel, _key, vel, is_on) in absolute_events {
             let delta_ticks = tick - current_tick;
@@ -728,7 +867,7 @@ impl MidiSource {
             let seconds = beats * (tempo / 1000000.0);
             current_time += seconds;
             current_tick = tick;
-            
+
             parsed_events.push(MidiEvent {
                 time_sec: current_time,
                 channel: channel as i32,
@@ -736,7 +875,7 @@ impl MidiSource {
                 is_note_on: is_on,
             });
         }
-        
+
         let mut pattern_rows: Vec<Vec<String>> = Vec::new();
         for track in &smf.tracks {
             let mut tick = 0;
@@ -744,12 +883,15 @@ impl MidiSource {
                 tick += event.delta.as_int();
                 if let TrackEventKind::Midi { channel, message } = &event.kind
                     && let MidiMessage::NoteOn { key, vel } = message
-                    && *vel > 0 {
+                    && *vel > 0
+                {
                     let row_idx = (tick as f64 / (ticks_per_beat / 4.0)) as usize;
                     while pattern_rows.len() <= row_idx {
                         pattern_rows.push(vec!["... .. ..".to_string(); 16]);
                     }
-                    let notes = ["C-", "C#", "D-", "D#", "E-", "F-", "F#", "G-", "G#", "A-", "A#", "B-"];
+                    let notes = [
+                        "C-", "C#", "D-", "D#", "E-", "F-", "F#", "G-", "G#", "A-", "A#", "B-",
+                    ];
                     let octave = key.as_int() / 12;
                     let note = key.as_int() % 12;
                     let note_name = format!("{}{}", notes[note as usize], octave);
@@ -758,20 +900,20 @@ impl MidiSource {
                 }
             }
         }
-        
+
         let mut final_rows = Vec::new();
         for row in pattern_rows {
             final_rows.push(row.join(" | "));
         }
         let tracker_data = vec![final_rows];
-        
+
         if artist.is_empty() {
             artist = "Unknown MIDI".to_string();
         }
         if !artist_suffix.is_empty() {
             artist.push_str(artist_suffix);
         }
-        
+
         Ok(Self {
             sequencer,
             pos_silent: 0.0,
@@ -791,15 +933,23 @@ impl MidiSource {
 }
 
 impl AudioSource for MidiSource {
-    fn read_frames(&mut self, hardware_channels: usize, _sample_rate: u32, output: &mut [f32]) -> usize {
+    fn read_frames(
+        &mut self,
+        hardware_channels: usize,
+        _sample_rate: u32,
+        output: &mut [f32],
+    ) -> usize {
         let frames_to_render = output.len() / hardware_channels;
-        
+
         let pos = if let Some(ref mut seq) = self.sequencer {
             if self.left_buf.len() < frames_to_render {
                 self.left_buf.resize(frames_to_render, 0.0);
                 self.right_buf.resize(frames_to_render, 0.0);
             }
-            seq.render(&mut self.left_buf[..frames_to_render], &mut self.right_buf[..frames_to_render]);
+            seq.render(
+                &mut self.left_buf[..frames_to_render],
+                &mut self.right_buf[..frames_to_render],
+            );
             for i in 0..frames_to_render {
                 let l = self.left_buf[i];
                 let r = self.right_buf[i];
@@ -814,14 +964,15 @@ impl AudioSource for MidiSource {
             seq.get_position()
         } else {
             output.fill(0.0);
-            self.pos_silent = (self.pos_silent + frames_to_render as f64 / _sample_rate as f64).min(self.duration);
+            self.pos_silent = (self.pos_silent + frames_to_render as f64 / _sample_rate as f64)
+                .min(self.duration);
             self.pos_silent
         };
-        
+
         for c in 0..16 {
             self.channel_vus[c] = (self.channel_vus[c] - 0.02).max(0.0);
         }
-        
+
         while self.event_idx < self.events.len() && self.events[self.event_idx].time_sec <= pos {
             let ev = &self.events[self.event_idx];
             if ev.is_note_on {
@@ -832,21 +983,19 @@ impl AudioSource for MidiSource {
             }
             self.event_idx += 1;
         }
-        
+
         let is_end = if let Some(ref seq) = self.sequencer {
             seq.end_of_sequence()
         } else {
             pos >= self.duration
         };
-        
-        if is_end {
-            0
-        } else {
-            frames_to_render
-        }
+
+        if is_end { 0 } else { frames_to_render }
     }
-    
-    fn get_duration_seconds(&mut self) -> f64 { self.duration }
+
+    fn get_duration_seconds(&mut self) -> f64 {
+        self.duration
+    }
     fn get_position_seconds(&mut self) -> f64 {
         if let Some(ref seq) = self.sequencer {
             seq.get_position()
@@ -854,13 +1003,13 @@ impl AudioSource for MidiSource {
             self.pos_silent
         }
     }
-    
+
     fn set_position_seconds(&mut self, pos: f64) {
         if let Some(ref mut seq) = self.sequencer {
             if pos < seq.get_position() {
                 seq.play(&self.midi_file, false);
             }
-            
+
             let mut trash_left = vec![0.0; 8192];
             let mut trash_right = vec![0.0; 8192];
             while seq.get_position() < pos && !seq.end_of_sequence() {
@@ -869,15 +1018,19 @@ impl AudioSource for MidiSource {
         } else {
             self.pos_silent = pos.clamp(0.0, self.duration);
         }
-        
+
         self.event_idx = 0;
         while self.event_idx < self.events.len() && self.events[self.event_idx].time_sec < pos {
             self.event_idx += 1;
         }
-        for c in 0..16 { self.channel_vus[c] = 0.0; }
+        for c in 0..16 {
+            self.channel_vus[c] = 0.0;
+        }
     }
-    
-    fn get_num_channels(&mut self) -> i32 { 2 }
+
+    fn get_num_channels(&mut self) -> i32 {
+        2
+    }
     fn get_current_channel_vu_mono(&mut self, channel: i32) -> f32 {
         if (0..16).contains(&channel) {
             self.channel_vus[channel as usize]
@@ -885,7 +1038,7 @@ impl AudioSource for MidiSource {
             0.0
         }
     }
-    
+
     fn get_artist(&mut self) -> String {
         if !self.title.is_empty() {
             format!("{} - {}", self.artist, self.title)
@@ -893,26 +1046,44 @@ impl AudioSource for MidiSource {
             self.artist.clone()
         }
     }
-    
-    fn get_type(&mut self) -> String { "MIDI".to_string() }
-    fn get_tempo(&mut self) -> i32 { self.tempo }
-    fn get_speed(&mut self) -> i32 { 0 }
-    fn get_intrinsic_sample_rate(&mut self) -> Option<u32> { Some(48000) }
-    fn get_num_samples(&mut self) -> i32 { 0 }
-    fn get_num_instruments(&mut self) -> i32 { 128 }
-    fn get_num_patterns(&mut self) -> i32 { 1 }
-    
-    fn get_current_order(&mut self) -> i32 { 0 }
+
+    fn get_type(&mut self) -> String {
+        "MIDI".to_string()
+    }
+    fn get_tempo(&mut self) -> i32 {
+        self.tempo
+    }
+    fn get_speed(&mut self) -> i32 {
+        0
+    }
+    fn get_intrinsic_sample_rate(&mut self) -> Option<u32> {
+        Some(48000)
+    }
+    fn get_num_samples(&mut self) -> i32 {
+        0
+    }
+    fn get_num_instruments(&mut self) -> i32 {
+        128
+    }
+    fn get_num_patterns(&mut self) -> i32 {
+        1
+    }
+
+    fn get_current_order(&mut self) -> i32 {
+        0
+    }
     fn get_current_row(&mut self) -> i32 {
         (self.get_position_seconds() * (self.tempo as f64 / 60.0) * 4.0) as i32
     }
-    
-    fn get_tracker_channels(&mut self) -> Option<i32> { Some(16) }
-    
+
+    fn get_tracker_channels(&mut self) -> Option<i32> {
+        Some(16)
+    }
+
     fn pre_format_tracker_data(&mut self) -> Vec<Vec<String>> {
         self.tracker_data.clone()
     }
-    
+
     fn get_current_row_string(&mut self) -> String {
         let row = self.get_current_row() as usize;
         if !self.tracker_data.is_empty() && row < self.tracker_data[0].len() {
@@ -955,7 +1126,12 @@ where
 }
 
 #[inline(always)]
-pub(crate) fn get_downmixed_sample(track_channels: u16, base_slice: &[f32], hardware_channels: usize, out_channel: usize) -> f32 {
+pub(crate) fn get_downmixed_sample(
+    track_channels: u16,
+    base_slice: &[f32],
+    hardware_channels: usize,
+    out_channel: usize,
+) -> f32 {
     if base_slice.is_empty() {
         return 0.0;
     }
@@ -1068,7 +1244,12 @@ struct SymphoniaSource {
 }
 
 impl AudioSource for SymphoniaSource {
-    fn read_frames(&mut self, hardware_channels: usize, _sample_rate: u32, output: &mut [f32]) -> usize {
+    fn read_frames(
+        &mut self,
+        hardware_channels: usize,
+        _sample_rate: u32,
+        output: &mut [f32],
+    ) -> usize {
         let mut frames_written = 0;
         let frames_needed = output.len() / hardware_channels;
         self.channel_vus.fill(0.0);
@@ -1098,9 +1279,14 @@ impl AudioSource for SymphoniaSource {
                     }
                     if e0 > 0.001 && e1 > 0.001 && ediff < 0.35 * e1 {
                         self.is_full_mix_guide = true;
-                        eprintln!("[RustTracker Audio] Detected Full Mix vocal guide stem - enabling phase cancellation");
+                        eprintln!(
+                            "[RustTracker Audio] Detected Full Mix vocal guide stem - enabling phase cancellation"
+                        );
                         #[cfg(target_os = "android")]
-                        crate::android::log_android(3, "[RustTracker Audio] Detected Full Mix vocal guide stem - enabling phase cancellation");
+                        crate::android::log_android(
+                            3,
+                            "[RustTracker Audio] Detected Full Mix vocal guide stem - enabling phase cancellation",
+                        );
                     }
                 }
             }
@@ -1110,8 +1296,11 @@ impl AudioSource for SymphoniaSource {
 
         while frames_written < frames_needed {
             let mut need_more = false;
-            for track in self.active_tracks.values().filter(|t| t.enabled || t.track_id == self.primary_track_id || (need_t0 && t.track_idx == 0)) {
-                let avail = (track.samples.len().saturating_sub(track.buf_pos)) / track.channels.max(1) as usize;
+            for track in self.active_tracks.values().filter(|t| {
+                t.enabled || t.track_id == self.primary_track_id || (need_t0 && t.track_idx == 0)
+            }) {
+                let avail = (track.samples.len().saturating_sub(track.buf_pos))
+                    / track.channels.max(1) as usize;
                 if avail < (frames_needed - frames_written) {
                     need_more = true;
                     break;
@@ -1120,10 +1309,17 @@ impl AudioSource for SymphoniaSource {
 
             if need_more {
                 for _ in 0..512 {
-                    let all_satisfied = self.active_tracks.values()
-                        .filter(|t| t.enabled || t.track_id == self.primary_track_id || (need_t0 && t.track_idx == 0))
+                    let all_satisfied = self
+                        .active_tracks
+                        .values()
+                        .filter(|t| {
+                            t.enabled
+                                || t.track_id == self.primary_track_id
+                                || (need_t0 && t.track_idx == 0)
+                        })
                         .all(|t| {
-                            let avail = (t.samples.len().saturating_sub(t.buf_pos)) / t.channels.max(1) as usize;
+                            let avail = (t.samples.len().saturating_sub(t.buf_pos))
+                                / t.channels.max(1) as usize;
                             avail >= (frames_needed - frames_written)
                         });
                     if all_satisfied {
@@ -1134,13 +1330,19 @@ impl AudioSource for SymphoniaSource {
                         Ok(packet) => {
                             let pkt_track_id = packet.track_id();
                             if let Some(track) = self.active_tracks.get_mut(&pkt_track_id)
-                                && (track.enabled || track.track_id == self.primary_track_id || (need_t0 && track.track_idx == 0))
-                                && let Ok(decoded) = track.decoder.decode(&packet) {
+                                && (track.enabled
+                                    || track.track_id == self.primary_track_id
+                                    || (need_t0 && track.track_idx == 0))
+                                && let Ok(decoded) = track.decoder.decode(&packet)
+                            {
                                 if track.sample_buf.capacity() < decoded.capacity() {
-                                    track.sample_buf = SampleBuffer::<f32>::new(decoded.capacity() as u64, *decoded.spec());
+                                    track.sample_buf = SampleBuffer::<f32>::new(
+                                        decoded.capacity() as u64,
+                                        *decoded.spec(),
+                                    );
                                 }
                                 track.sample_buf.copy_interleaved_ref(decoded);
-                                
+
                                 if track.buf_pos > 4096 {
                                     track.samples.drain(0..track.buf_pos);
                                     track.buf_pos = 0;
@@ -1154,15 +1356,21 @@ impl AudioSource for SymphoniaSource {
             }
 
             let mut min_available = usize::MAX;
-            for track in self.active_tracks.values().filter(|t| t.enabled || t.track_id == self.primary_track_id || (need_t0 && t.track_idx == 0)) {
-                let avail = (track.samples.len().saturating_sub(track.buf_pos)) / track.channels.max(1) as usize;
+            for track in self.active_tracks.values().filter(|t| {
+                t.enabled || t.track_id == self.primary_track_id || (need_t0 && t.track_idx == 0)
+            }) {
+                let avail = (track.samples.len().saturating_sub(track.buf_pos))
+                    / track.channels.max(1) as usize;
                 min_available = min_available.min(avail);
             }
 
             if min_available == 0 || min_available == usize::MAX {
                 if let Some(primary) = self.active_tracks.get(&self.primary_track_id) {
-                    let avail = (primary.samples.len().saturating_sub(primary.buf_pos)) / primary.channels.max(1) as usize;
-                    if avail == 0 { break; }
+                    let avail = (primary.samples.len().saturating_sub(primary.buf_pos))
+                        / primary.channels.max(1) as usize;
+                    if avail == 0 {
+                        break;
+                    }
                     min_available = avail;
                 } else {
                     break;
@@ -1170,9 +1378,16 @@ impl AudioSource for SymphoniaSource {
             }
 
             let frames_to_copy = min_available.min(frames_needed - frames_written);
-            if frames_to_copy == 0 { break; }
+            if frames_to_copy == 0 {
+                break;
+            }
 
-            let headroom = calculate_mix_headroom(self.active_tracks.values().filter(|t| t.enabled).map(|t| t.volume));
+            let headroom = calculate_mix_headroom(
+                self.active_tracks
+                    .values()
+                    .filter(|t| t.enabled)
+                    .map(|t| t.volume),
+            );
 
             let is_full_mix = self.is_full_mix_guide && is_2track;
             let (t0_info, t1_info) = if is_full_mix {
@@ -1194,15 +1409,33 @@ impl AudioSource for SymphoniaSource {
                 let v0 = if t0.3 { t0.2 } else { 0.0 };
                 let v1 = if t1.3 { t1.2 } else { 0.0 };
 
-                let t0_samples = &self.active_tracks.values().find(|t| t.track_idx == 0).unwrap().samples;
-                let t1_samples = &self.active_tracks.values().find(|t| t.track_idx == 1).unwrap().samples;
+                let t0_samples = &self
+                    .active_tracks
+                    .values()
+                    .find(|t| t.track_idx == 0)
+                    .unwrap()
+                    .samples;
+                let t1_samples = &self
+                    .active_tracks
+                    .values()
+                    .find(|t| t.track_idx == 1)
+                    .unwrap()
+                    .samples;
 
                 for f in 0..frames_to_copy {
                     let out_base = (frames_written + f) * hardware_channels;
                     let base_idx_0 = t0.0 + f * t0.1 as usize;
                     let base_idx_1 = t1.0 + f * t1.1 as usize;
-                    let ch_slice_0 = if base_idx_0 < t0_samples.len() { &t0_samples[base_idx_0..] } else { &[] };
-                    let ch_slice_1 = if base_idx_1 < t1_samples.len() { &t1_samples[base_idx_1..] } else { &[] };
+                    let ch_slice_0 = if base_idx_0 < t0_samples.len() {
+                        &t0_samples[base_idx_0..]
+                    } else {
+                        &[]
+                    };
+                    let ch_slice_1 = if base_idx_1 < t1_samples.len() {
+                        &t1_samples[base_idx_1..]
+                    } else {
+                        &[]
+                    };
 
                     for c in 0..hardware_channels {
                         let s0 = get_downmixed_sample(t0.1, ch_slice_0, hardware_channels, c);
@@ -1228,8 +1461,14 @@ impl AudioSource for SymphoniaSource {
                             let base_idx = track.buf_pos + f * track.channels as usize;
                             for ch in 0..track.channels as usize {
                                 if ch < self.channel_vus.len() {
-                                    let s = track.samples.get(base_idx + ch).copied().unwrap_or(0.0).abs();
-                                    self.channel_vus[ch] = self.channel_vus[ch].max(s * track.volume);
+                                    let s = track
+                                        .samples
+                                        .get(base_idx + ch)
+                                        .copied()
+                                        .unwrap_or(0.0)
+                                        .abs();
+                                    self.channel_vus[ch] =
+                                        self.channel_vus[ch].max(s * track.volume);
                                 }
                             }
                         }
@@ -1245,7 +1484,12 @@ impl AudioSource for SymphoniaSource {
                                 } else {
                                     &[]
                                 };
-                                let s_val = get_downmixed_sample(track.channels, ch_slice, hardware_channels, c);
+                                let s_val = get_downmixed_sample(
+                                    track.channels,
+                                    ch_slice,
+                                    hardware_channels,
+                                    c,
+                                );
                                 sum_val += s_val * track.volume;
                             }
                         }
@@ -1255,11 +1499,15 @@ impl AudioSource for SymphoniaSource {
                 }
             }
 
-            for track in self.active_tracks.values_mut().filter(|t| t.enabled || t.track_id == self.primary_track_id || (need_t0 && t.track_idx == 0)) {
-                let avail = (track.samples.len().saturating_sub(track.buf_pos)) / track.channels.max(1) as usize;
+            for track in self.active_tracks.values_mut().filter(|t| {
+                t.enabled || t.track_id == self.primary_track_id || (need_t0 && t.track_idx == 0)
+            }) {
+                let avail = (track.samples.len().saturating_sub(track.buf_pos))
+                    / track.channels.max(1) as usize;
                 let consume = frames_to_copy.min(avail);
                 track.buf_pos += consume * track.channels as usize;
-                track.current_time += consume as f64 / self.intrinsic_sample_rate.unwrap_or(44100) as f64;
+                track.current_time +=
+                    consume as f64 / self.intrinsic_sample_rate.unwrap_or(44100) as f64;
             }
             if let Some(primary) = self.active_tracks.get(&self.primary_track_id) {
                 self.current_time = primary.current_time;
@@ -1270,9 +1518,13 @@ impl AudioSource for SymphoniaSource {
         frames_written
     }
 
-    fn get_duration_seconds(&mut self) -> f64 { self.duration }
-    fn get_position_seconds(&mut self) -> f64 { self.current_time }
-    
+    fn get_duration_seconds(&mut self) -> f64 {
+        self.duration
+    }
+    fn get_position_seconds(&mut self) -> f64 {
+        self.current_time
+    }
+
     fn set_position_seconds(&mut self, pos: f64) {
         let ts = (pos / self.time_base) as u64;
         let seek_res = self.format.seek(
@@ -1280,9 +1532,9 @@ impl AudioSource for SymphoniaSource {
             symphonia::core::formats::SeekTo::TimeStamp {
                 ts,
                 track_id: self.primary_track_id,
-            }
+            },
         );
-        
+
         if seek_res.is_ok() {
             for track in self.active_tracks.values_mut() {
                 track.decoder.reset();
@@ -1297,7 +1549,7 @@ impl AudioSource for SymphoniaSource {
                 symphonia::core::formats::SeekTo::TimeStamp {
                     ts: 0,
                     track_id: self.primary_track_id,
-                }
+                },
             );
             if seek_res_start.is_ok() {
                 for track in self.active_tracks.values_mut() {
@@ -1310,34 +1562,79 @@ impl AudioSource for SymphoniaSource {
             }
         }
     }
-    
-    fn get_num_channels(&mut self) -> i32 { self.channels as i32 }
-    fn get_current_channel_vu_mono(&mut self, channel: i32) -> f32 { self.channel_vus.get(channel as usize).cloned().unwrap_or(0.0) }
-    fn get_type(&mut self) -> String { self.ext_type.clone() }
-    fn get_tempo(&mut self) -> i32 { 0 }
-    fn get_speed(&mut self) -> i32 { 0 }
-    fn get_intrinsic_sample_rate(&mut self) -> Option<u32> { self.intrinsic_sample_rate }
-    fn get_num_samples(&mut self) -> i32 { 0 }
-    fn get_num_instruments(&mut self) -> i32 { 0 }
-    fn get_num_patterns(&mut self) -> i32 { 0 }
-    fn get_current_order(&mut self) -> i32 { 0 }
-    fn get_current_row(&mut self) -> i32 { 0 }
-    fn get_tracker_channels(&mut self) -> Option<i32> { None }
-    fn pre_format_tracker_data(&mut self) -> Vec<Vec<String>> { Vec::new() }
-    fn get_current_row_string(&mut self) -> String { String::new() }
-    fn get_artist(&mut self) -> String { self.artist.clone() }
-    fn get_video_info(&mut self) -> Option<String> { self.video_info.clone() }
 
-    fn get_audio_tracks(&self) -> Vec<crate::state::AudioTrackInfo> { self.audio_tracks.clone() }
-    fn get_selected_audio_track(&self) -> usize { self.selected_track_idx }
-    
+    fn get_num_channels(&mut self) -> i32 {
+        self.channels as i32
+    }
+    fn get_current_channel_vu_mono(&mut self, channel: i32) -> f32 {
+        self.channel_vus
+            .get(channel as usize)
+            .cloned()
+            .unwrap_or(0.0)
+    }
+    fn get_type(&mut self) -> String {
+        self.ext_type.clone()
+    }
+    fn get_tempo(&mut self) -> i32 {
+        0
+    }
+    fn get_speed(&mut self) -> i32 {
+        0
+    }
+    fn get_intrinsic_sample_rate(&mut self) -> Option<u32> {
+        self.intrinsic_sample_rate
+    }
+    fn get_num_samples(&mut self) -> i32 {
+        0
+    }
+    fn get_num_instruments(&mut self) -> i32 {
+        0
+    }
+    fn get_num_patterns(&mut self) -> i32 {
+        0
+    }
+    fn get_current_order(&mut self) -> i32 {
+        0
+    }
+    fn get_current_row(&mut self) -> i32 {
+        0
+    }
+    fn get_tracker_channels(&mut self) -> Option<i32> {
+        None
+    }
+    fn pre_format_tracker_data(&mut self) -> Vec<Vec<String>> {
+        Vec::new()
+    }
+    fn get_current_row_string(&mut self) -> String {
+        String::new()
+    }
+    fn get_artist(&mut self) -> String {
+        self.artist.clone()
+    }
+    fn get_video_info(&mut self) -> Option<String> {
+        self.video_info.clone()
+    }
+
+    fn get_audio_tracks(&self) -> Vec<crate::state::AudioTrackInfo> {
+        self.audio_tracks.clone()
+    }
+    fn get_selected_audio_track(&self) -> usize {
+        self.selected_track_idx
+    }
+
     fn get_active_audio_tracks(&self) -> Vec<usize> {
-        let mut list: Vec<usize> = self.active_tracks.values()
+        let mut list: Vec<usize> = self
+            .active_tracks
+            .values()
             .filter(|t| t.enabled)
             .map(|t| t.track_idx)
             .collect();
         list.sort();
-        if list.is_empty() { vec![self.selected_track_idx] } else { list }
+        if list.is_empty() {
+            vec![self.selected_track_idx]
+        } else {
+            list
+        }
     }
 
     fn set_active_audio_tracks(&mut self, tracks: &[(usize, f32)]) -> Result<()> {
@@ -1357,7 +1654,8 @@ impl AudioSource for SymphoniaSource {
         }
 
         if let Some(&(first_idx, _)) = tracks.first()
-            && first_idx < self.audio_tracks.len() {
+            && first_idx < self.audio_tracks.len()
+        {
             self.selected_track_idx = first_idx;
             self.primary_track_id = self.audio_tracks[first_idx].id as u32;
             let container = self.ext_type.split('/').nth(1).map(|s| s.to_string());
@@ -1414,7 +1712,7 @@ struct FfmpegSource {
     ictx: ffmpeg_next::format::context::Input,
     active_tracks: std::collections::HashMap<usize, ActiveFfmpegTrack>,
     primary_stream_index: usize,
-    
+
     channels: u16,
     time_base: f64,
     current_time: f64,
@@ -1449,7 +1747,10 @@ impl FfmpegSource {
 
         // 1. Drain any packets currently in the active decoders
         for track in self.active_tracks.values_mut() {
-            if !track.enabled && track.stream_index != self.primary_stream_index && (!need_t0 || track.track_idx != 0) {
+            if !track.enabled
+                && track.stream_index != self.primary_stream_index
+                && (!need_t0 || track.track_idx != 0)
+            {
                 continue;
             }
             let mut decoded = ffmpeg_next::frame::Audio::empty();
@@ -1458,7 +1759,8 @@ impl FfmpegSource {
                 if track.resampler.run(&decoded, &mut resampled).is_ok() {
                     let data = resampled.plane::<f32>(0);
                     let actual_len = resampled.samples() * resampled.channels() as usize;
-                    let actual_data = unsafe { std::slice::from_raw_parts(data.as_ptr(), actual_len) };
+                    let actual_data =
+                        unsafe { std::slice::from_raw_parts(data.as_ptr(), actual_len) };
                     if track.buf_pos > 4096 {
                         track.sample_buf.drain(0..track.buf_pos);
                         track.buf_pos = 0;
@@ -1470,10 +1772,16 @@ impl FfmpegSource {
                             track.current_time += frame_dur;
                         } else if track.current_time < target_pos {
                             let skip_sec = target_pos - track.current_time;
-                            let skip_frames = (skip_sec * self.output_sample_rate as f64).round() as usize;
-                            let skip_samples = (skip_frames * track.channels as usize).min(actual_len);
-                            track.sample_buf.extend_from_slice(&actual_data[skip_samples..]);
-                            track.current_time = target_pos + (actual_frames - skip_frames) as f64 / self.output_sample_rate as f64;
+                            let skip_frames =
+                                (skip_sec * self.output_sample_rate as f64).round() as usize;
+                            let skip_samples =
+                                (skip_frames * track.channels as usize).min(actual_len);
+                            track
+                                .sample_buf
+                                .extend_from_slice(&actual_data[skip_samples..]);
+                            track.current_time = target_pos
+                                + (actual_frames - skip_frames) as f64
+                                    / self.output_sample_rate as f64;
                             progress = true;
                         } else {
                             track.sample_buf.extend_from_slice(actual_data);
@@ -1491,10 +1799,14 @@ impl FfmpegSource {
         // 2. Read packets from container if any active track still needs data
         let mut need_packets = false;
         for track in self.active_tracks.values() {
-            if !track.enabled && track.stream_index != self.primary_stream_index && (!need_t0 || track.track_idx != 0) {
+            if !track.enabled
+                && track.stream_index != self.primary_stream_index
+                && (!need_t0 || track.track_idx != 0)
+            {
                 continue;
             }
-            let avail = (track.sample_buf.len().saturating_sub(track.buf_pos)) / track.channels.max(1) as usize;
+            let avail = (track.sample_buf.len().saturating_sub(track.buf_pos))
+                / track.channels.max(1) as usize;
             if avail < 1024 {
                 need_packets = true;
                 break;
@@ -1503,10 +1815,17 @@ impl FfmpegSource {
 
         if need_packets && !self.is_eof {
             for _ in 0..512 {
-                let all_satisfied = self.active_tracks.values()
-                    .filter(|t| t.enabled || t.stream_index == self.primary_stream_index || (need_t0 && t.track_idx == 0))
+                let all_satisfied = self
+                    .active_tracks
+                    .values()
+                    .filter(|t| {
+                        t.enabled
+                            || t.stream_index == self.primary_stream_index
+                            || (need_t0 && t.track_idx == 0)
+                    })
                     .all(|t| {
-                        let avail = (t.sample_buf.len().saturating_sub(t.buf_pos)) / t.channels.max(1) as usize;
+                        let avail = (t.sample_buf.len().saturating_sub(t.buf_pos))
+                            / t.channels.max(1) as usize;
                         avail >= 1024
                     });
                 if all_satisfied {
@@ -1520,9 +1839,13 @@ impl FfmpegSource {
                             let _ = tx.try_send((self.video_epoch, packet.clone()));
                         }
                     } else if let Some(track) = self.active_tracks.get_mut(&s_idx)
-                        && (track.enabled || track.stream_index == self.primary_stream_index || (need_t0 && track.track_idx == 0)) {
+                        && (track.enabled
+                            || track.stream_index == self.primary_stream_index
+                            || (need_t0 && track.track_idx == 0))
+                    {
                         if track.seek_in_progress
-                            && let Some(pkt_pts) = packet.pts() {
+                            && let Some(pkt_pts) = packet.pts()
+                        {
                             track.current_time = pkt_pts as f64 * track.time_base;
                             track.seek_in_progress = false;
                         }
@@ -1532,23 +1855,34 @@ impl FfmpegSource {
                             let mut resampled = ffmpeg_next::frame::Audio::empty();
                             if track.resampler.run(&decoded, &mut resampled).is_ok() {
                                 let data = resampled.plane::<f32>(0);
-                                let actual_len = resampled.samples() * resampled.channels() as usize;
-                                let actual_data = unsafe { std::slice::from_raw_parts(data.as_ptr(), actual_len) };
+                                let actual_len =
+                                    resampled.samples() * resampled.channels() as usize;
+                                let actual_data = unsafe {
+                                    std::slice::from_raw_parts(data.as_ptr(), actual_len)
+                                };
                                 if track.buf_pos > 4096 {
                                     track.sample_buf.drain(0..track.buf_pos);
                                     track.buf_pos = 0;
                                 }
                                 if let Some(target_pos) = self.target_seek_time {
                                     let actual_frames = actual_len / track.channels.max(1) as usize;
-                                    let frame_dur = actual_frames as f64 / self.output_sample_rate as f64;
+                                    let frame_dur =
+                                        actual_frames as f64 / self.output_sample_rate as f64;
                                     if track.current_time + frame_dur <= target_pos {
                                         track.current_time += frame_dur;
                                     } else if track.current_time < target_pos {
                                         let skip_sec = target_pos - track.current_time;
-                                        let skip_frames = (skip_sec * self.output_sample_rate as f64).round() as usize;
-                                        let skip_samples = (skip_frames * track.channels as usize).min(actual_len);
-                                        track.sample_buf.extend_from_slice(&actual_data[skip_samples..]);
-                                        track.current_time = target_pos + (actual_frames - skip_frames) as f64 / self.output_sample_rate as f64;
+                                        let skip_frames =
+                                            (skip_sec * self.output_sample_rate as f64).round()
+                                                as usize;
+                                        let skip_samples =
+                                            (skip_frames * track.channels as usize).min(actual_len);
+                                        track
+                                            .sample_buf
+                                            .extend_from_slice(&actual_data[skip_samples..]);
+                                        track.current_time = target_pos
+                                            + (actual_frames - skip_frames) as f64
+                                                / self.output_sample_rate as f64;
                                         progress = true;
                                     } else {
                                         track.sample_buf.extend_from_slice(actual_data);
@@ -1570,7 +1904,9 @@ impl FfmpegSource {
         }
 
         if let Some(target_pos) = self.target_seek_time {
-            let all_reached = self.active_tracks.values()
+            let all_reached = self
+                .active_tracks
+                .values()
                 .filter(|t| t.enabled || t.stream_index == self.primary_stream_index)
                 .all(|t| !t.seek_in_progress && t.current_time >= target_pos);
             if all_reached {
@@ -1584,7 +1920,12 @@ impl FfmpegSource {
 
 #[cfg(not(target_os = "android"))]
 impl AudioSource for FfmpegSource {
-    fn read_frames(&mut self, hardware_channels: usize, sample_rate: u32, output: &mut [f32]) -> usize {
+    fn read_frames(
+        &mut self,
+        hardware_channels: usize,
+        sample_rate: u32,
+        output: &mut [f32],
+    ) -> usize {
         if sample_rate > 0 && sample_rate != self.output_sample_rate {
             self.output_sample_rate = sample_rate;
             for track in self.active_tracks.values_mut() {
@@ -1592,7 +1933,9 @@ impl AudioSource for FfmpegSource {
                     track.decoder.format(),
                     track.decoder.channel_layout(),
                     track.decoder.rate(),
-                    ffmpeg_next::format::sample::Sample::F32(ffmpeg_next::format::sample::Type::Packed),
+                    ffmpeg_next::format::sample::Sample::F32(
+                        ffmpeg_next::format::sample::Type::Packed,
+                    ),
                     track.decoder.channel_layout(),
                     self.output_sample_rate,
                 ) {
@@ -1621,15 +1964,25 @@ impl AudioSource for FfmpegSource {
                     let mut e1 = 0.0f32;
                     let mut ediff = 0.0f32;
                     for i in 0..check_frames {
-                        let s0 = t0.sample_buf.get(t0.buf_pos + i * ch0).copied().unwrap_or(0.0);
-                        let s1 = t1.sample_buf.get(t1.buf_pos + i * ch1).copied().unwrap_or(0.0);
+                        let s0 = t0
+                            .sample_buf
+                            .get(t0.buf_pos + i * ch0)
+                            .copied()
+                            .unwrap_or(0.0);
+                        let s1 = t1
+                            .sample_buf
+                            .get(t1.buf_pos + i * ch1)
+                            .copied()
+                            .unwrap_or(0.0);
                         e0 += s0 * s0;
                         e1 += s1 * s1;
                         ediff += (s1 - s0) * (s1 - s0);
                     }
                     if e0 > 0.001 && e1 > 0.001 && ediff < 0.35 * e1 {
                         self.is_full_mix_guide = true;
-                        eprintln!("[RustTracker Audio] Detected Full Mix vocal guide stem in FFmpegSource - enabling phase cancellation");
+                        eprintln!(
+                            "[RustTracker Audio] Detected Full Mix vocal guide stem in FFmpegSource - enabling phase cancellation"
+                        );
                     }
                 }
             }
@@ -1639,15 +1992,21 @@ impl AudioSource for FfmpegSource {
 
         while frames_written < frames_needed {
             let mut min_available = usize::MAX;
-            for track in self.active_tracks.values().filter(|t| t.enabled || t.stream_index == self.primary_stream_index || (need_t0 && t.track_idx == 0)) {
-                let avail = (track.sample_buf.len().saturating_sub(track.buf_pos)) / track.channels.max(1) as usize;
+            for track in self.active_tracks.values().filter(|t| {
+                t.enabled
+                    || t.stream_index == self.primary_stream_index
+                    || (need_t0 && t.track_idx == 0)
+            }) {
+                let avail = (track.sample_buf.len().saturating_sub(track.buf_pos))
+                    / track.channels.max(1) as usize;
                 min_available = min_available.min(avail);
             }
 
             if min_available == 0 || min_available == usize::MAX {
                 if !self.fill_buffers() {
                     if let Some(primary) = self.active_tracks.get(&self.primary_stream_index) {
-                        let avail = (primary.sample_buf.len().saturating_sub(primary.buf_pos)) / primary.channels.max(1) as usize;
+                        let avail = (primary.sample_buf.len().saturating_sub(primary.buf_pos))
+                            / primary.channels.max(1) as usize;
                         if avail == 0 {
                             if self.is_eof {
                                 break;
@@ -1668,9 +2027,16 @@ impl AudioSource for FfmpegSource {
             }
 
             let frames_to_copy = min_available.min(frames_needed - frames_written);
-            if frames_to_copy == 0 { break; }
+            if frames_to_copy == 0 {
+                break;
+            }
 
-            let headroom = calculate_mix_headroom(self.active_tracks.values().filter(|t| t.enabled).map(|t| t.volume));
+            let headroom = calculate_mix_headroom(
+                self.active_tracks
+                    .values()
+                    .filter(|t| t.enabled)
+                    .map(|t| t.volume),
+            );
 
             let is_full_mix = self.is_full_mix_guide && is_2track;
             let (t0_info, t1_info) = if is_full_mix {
@@ -1692,15 +2058,33 @@ impl AudioSource for FfmpegSource {
                 let v0 = if t0.3 { t0.2 } else { 0.0 };
                 let v1 = if t1.3 { t1.2 } else { 0.0 };
 
-                let t0_samples = &self.active_tracks.values().find(|t| t.track_idx == 0).unwrap().sample_buf;
-                let t1_samples = &self.active_tracks.values().find(|t| t.track_idx == 1).unwrap().sample_buf;
+                let t0_samples = &self
+                    .active_tracks
+                    .values()
+                    .find(|t| t.track_idx == 0)
+                    .unwrap()
+                    .sample_buf;
+                let t1_samples = &self
+                    .active_tracks
+                    .values()
+                    .find(|t| t.track_idx == 1)
+                    .unwrap()
+                    .sample_buf;
 
                 for f in 0..frames_to_copy {
                     let out_base = (frames_written + f) * hardware_channels;
                     let base_idx_0 = t0.0 + f * t0.1 as usize;
                     let base_idx_1 = t1.0 + f * t1.1 as usize;
-                    let ch_slice_0 = if base_idx_0 < t0_samples.len() { &t0_samples[base_idx_0..] } else { &[] };
-                    let ch_slice_1 = if base_idx_1 < t1_samples.len() { &t1_samples[base_idx_1..] } else { &[] };
+                    let ch_slice_0 = if base_idx_0 < t0_samples.len() {
+                        &t0_samples[base_idx_0..]
+                    } else {
+                        &[]
+                    };
+                    let ch_slice_1 = if base_idx_1 < t1_samples.len() {
+                        &t1_samples[base_idx_1..]
+                    } else {
+                        &[]
+                    };
 
                     for c in 0..hardware_channels {
                         let s0 = get_downmixed_sample(t0.1, ch_slice_0, hardware_channels, c);
@@ -1726,8 +2110,14 @@ impl AudioSource for FfmpegSource {
                             let in_idx = track.buf_pos + f * track.channels as usize;
                             for ch in 0..track.channels as usize {
                                 if ch < self.channel_vus.len() {
-                                    let s = track.sample_buf.get(in_idx + ch).copied().unwrap_or(0.0).abs();
-                                    self.channel_vus[ch] = self.channel_vus[ch].max(s * track.volume);
+                                    let s = track
+                                        .sample_buf
+                                        .get(in_idx + ch)
+                                        .copied()
+                                        .unwrap_or(0.0)
+                                        .abs();
+                                    self.channel_vus[ch] =
+                                        self.channel_vus[ch].max(s * track.volume);
                                 }
                             }
                         }
@@ -1743,7 +2133,12 @@ impl AudioSource for FfmpegSource {
                                 } else {
                                     &[]
                                 };
-                                let s_val = get_downmixed_sample(track.channels, ch_slice, hardware_channels, c);
+                                let s_val = get_downmixed_sample(
+                                    track.channels,
+                                    ch_slice,
+                                    hardware_channels,
+                                    c,
+                                );
                                 sum_val += s_val * track.volume;
                             }
                         }
@@ -1753,8 +2148,13 @@ impl AudioSource for FfmpegSource {
                 }
             }
 
-            for track in self.active_tracks.values_mut().filter(|t| t.enabled || t.stream_index == self.primary_stream_index || (need_t0 && t.track_idx == 0)) {
-                let avail = (track.sample_buf.len().saturating_sub(track.buf_pos)) / track.channels.max(1) as usize;
+            for track in self.active_tracks.values_mut().filter(|t| {
+                t.enabled
+                    || t.stream_index == self.primary_stream_index
+                    || (need_t0 && t.track_idx == 0)
+            }) {
+                let avail = (track.sample_buf.len().saturating_sub(track.buf_pos))
+                    / track.channels.max(1) as usize;
                 let consume = frames_to_copy.min(avail);
                 track.buf_pos += consume * track.channels as usize;
                 track.current_time += consume as f64 / self.output_sample_rate as f64;
@@ -1768,18 +2168,26 @@ impl AudioSource for FfmpegSource {
         frames_written
     }
 
-    fn get_duration_seconds(&mut self) -> f64 { self.duration }
-    fn get_position_seconds(&mut self) -> f64 { self.current_time }
-    
+    fn get_duration_seconds(&mut self) -> f64 {
+        self.duration
+    }
+    fn get_position_seconds(&mut self) -> f64 {
+        self.current_time
+    }
+
     fn set_position_seconds(&mut self, pos: f64) {
         self.is_eof = false;
-        let (stream_idx, pts) = if let (Some(v_idx), Some(tb)) = (self.video_stream_index, self.video_time_base) {
-            let tb_f64 = tb.numerator() as f64 / tb.denominator() as f64;
-            (v_idx as i32, (pos / tb_f64) as i64)
-        } else {
-            (-1, (pos * ffmpeg_next::ffi::AV_TIME_BASE as f64).max(0.0) as i64)
-        };
-        
+        let (stream_idx, pts) =
+            if let (Some(v_idx), Some(tb)) = (self.video_stream_index, self.video_time_base) {
+                let tb_f64 = tb.numerator() as f64 / tb.denominator() as f64;
+                (v_idx as i32, (pos / tb_f64) as i64)
+            } else {
+                (
+                    -1,
+                    (pos * ffmpeg_next::ffi::AV_TIME_BASE as f64).max(0.0) as i64,
+                )
+            };
+
         let ret = unsafe {
             ffmpeg_next::ffi::av_seek_frame(
                 self.ictx.as_mut_ptr(),
@@ -1810,65 +2218,113 @@ impl AudioSource for FfmpegSource {
         self.current_time = pos;
         self.video_epoch += 1;
     }
-    
-    fn get_num_channels(&mut self) -> i32 { self.channels as i32 }
-    fn get_current_channel_vu_mono(&mut self, channel: i32) -> f32 { self.channel_vus.get(channel as usize).cloned().unwrap_or(0.0) }
+
+    fn get_num_channels(&mut self) -> i32 {
+        self.channels as i32
+    }
+    fn get_current_channel_vu_mono(&mut self, channel: i32) -> f32 {
+        self.channel_vus
+            .get(channel as usize)
+            .cloned()
+            .unwrap_or(0.0)
+    }
     fn get_artist(&mut self) -> String {
         self.artist.clone()
     }
-    fn get_type(&mut self) -> String { self.ext_type.clone() }
-    fn get_tempo(&mut self) -> i32 { 0 }
-    fn get_speed(&mut self) -> i32 { 0 }
-    fn get_intrinsic_sample_rate(&mut self) -> Option<u32> { Some(self.intrinsic_sample_rate) }
-    fn get_num_samples(&mut self) -> i32 { 0 }
-    fn get_num_instruments(&mut self) -> i32 { 0 }
-    fn get_num_patterns(&mut self) -> i32 { 0 }
-    fn get_current_order(&mut self) -> i32 { 0 }
-    fn get_current_row(&mut self) -> i32 { 0 }
-    fn get_tracker_channels(&mut self) -> Option<i32> { None }
-    fn pre_format_tracker_data(&mut self) -> Vec<Vec<String>> { Vec::new() }
-    fn get_current_row_string(&mut self) -> String { String::new() }
-    fn get_video_info(&mut self) -> Option<String> { self.video_info.clone() }
-    
+    fn get_type(&mut self) -> String {
+        self.ext_type.clone()
+    }
+    fn get_tempo(&mut self) -> i32 {
+        0
+    }
+    fn get_speed(&mut self) -> i32 {
+        0
+    }
+    fn get_intrinsic_sample_rate(&mut self) -> Option<u32> {
+        Some(self.intrinsic_sample_rate)
+    }
+    fn get_num_samples(&mut self) -> i32 {
+        0
+    }
+    fn get_num_instruments(&mut self) -> i32 {
+        0
+    }
+    fn get_num_patterns(&mut self) -> i32 {
+        0
+    }
+    fn get_current_order(&mut self) -> i32 {
+        0
+    }
+    fn get_current_row(&mut self) -> i32 {
+        0
+    }
+    fn get_tracker_channels(&mut self) -> Option<i32> {
+        None
+    }
+    fn pre_format_tracker_data(&mut self) -> Vec<Vec<String>> {
+        Vec::new()
+    }
+    fn get_current_row_string(&mut self) -> String {
+        String::new()
+    }
+    fn get_video_info(&mut self) -> Option<String> {
+        self.video_info.clone()
+    }
+
     fn get_bitrate(&mut self) -> Option<u32> {
         if let Some(icy_br) = self.ictx.metadata().get("icy-br")
-            && let Ok(br) = icy_br.parse::<u32>() {
+            && let Ok(br) = icy_br.parse::<u32>()
+        {
             return Some(br);
         }
-        
+
         let br = self.ictx.bit_rate();
         if br > 0 {
             return Some((br / 1000) as u32);
         }
-        
+
         None
     }
-    
+
     fn attach_video_queue(&mut self, tx: crossbeam_channel::Sender<(u64, ffmpeg_next::Packet)>) {
         self.video_tx = Some(tx);
     }
-    
-    fn take_video_parameters(&mut self) -> Option<(ffmpeg_next::codec::Parameters, ffmpeg_next::Rational, u32)> {
+
+    fn take_video_parameters(
+        &mut self,
+    ) -> Option<(ffmpeg_next::codec::Parameters, ffmpeg_next::Rational, u32)> {
         if let (Some(p), Some(tb)) = (self.video_params.take(), self.video_time_base.take()) {
             return Some((p, tb, self.video_rotation));
         }
         None
     }
 
-    fn get_audio_tracks(&self) -> Vec<crate::state::AudioTrackInfo> { self.audio_tracks.clone() }
-    fn get_selected_audio_track(&self) -> usize { self.selected_track_idx }
+    fn get_audio_tracks(&self) -> Vec<crate::state::AudioTrackInfo> {
+        self.audio_tracks.clone()
+    }
+    fn get_selected_audio_track(&self) -> usize {
+        self.selected_track_idx
+    }
 
     fn get_active_audio_tracks(&self) -> Vec<usize> {
-        let mut list: Vec<usize> = self.active_tracks.values()
+        let mut list: Vec<usize> = self
+            .active_tracks
+            .values()
             .filter(|t| t.enabled)
             .map(|t| t.track_idx)
             .collect();
         list.sort();
-        if list.is_empty() { vec![self.selected_track_idx] } else { list }
+        if list.is_empty() {
+            vec![self.selected_track_idx]
+        } else {
+            list
+        }
     }
 
     fn set_active_audio_tracks(&mut self, tracks: &[(usize, f32)]) -> Result<()> {
-        if tracks.is_empty() { return Ok(()); }
+        if tracks.is_empty() {
+            return Ok(());
+        }
 
         let track_map: std::collections::HashMap<usize, f32> = tracks.iter().copied().collect();
         for track in self.active_tracks.values_mut() {
@@ -1882,14 +2338,19 @@ impl AudioSource for FfmpegSource {
         }
 
         if let Some(&(first_idx, _)) = tracks.first()
-            && first_idx < self.audio_tracks.len() {
+            && first_idx < self.audio_tracks.len()
+        {
             self.selected_track_idx = first_idx;
             self.primary_stream_index = self.audio_tracks[first_idx].id;
             self.channels = self.audio_tracks[first_idx].channels;
-            self.time_base = self.ictx.stream(self.primary_stream_index).map(|s| {
-                let tb = s.time_base();
-                tb.numerator() as f64 / tb.denominator() as f64
-            }).unwrap_or(1.0 / 44100.0);
+            self.time_base = self
+                .ictx
+                .stream(self.primary_stream_index)
+                .map(|s| {
+                    let tb = s.time_base();
+                    tb.numerator() as f64 / tb.denominator() as f64
+                })
+                .unwrap_or(1.0 / 44100.0);
             let container = self.ext_type.split('/').nth(1).map(|s| s.to_string());
             if let Some(container) = container {
                 self.ext_type = format!("{}/{}", self.audio_tracks[first_idx].codec, container);
@@ -1936,7 +2397,12 @@ struct AndroidVideoOnlySource {
 
 #[cfg(target_os = "android")]
 impl AudioSource for AndroidVideoOnlySource {
-    fn read_frames(&mut self, hardware_channels: usize, sample_rate: u32, output: &mut [f32]) -> usize {
+    fn read_frames(
+        &mut self,
+        hardware_channels: usize,
+        sample_rate: u32,
+        output: &mut [f32],
+    ) -> usize {
         let frames_to_write = output.len() / hardware_channels;
         for v in output.iter_mut() {
             *v = 0.0;
@@ -1944,37 +2410,75 @@ impl AudioSource for AndroidVideoOnlySource {
         self.current_time += frames_to_write as f64 / sample_rate as f64;
         frames_to_write
     }
-    fn get_duration_seconds(&mut self) -> f64 { self.duration }
-    fn get_position_seconds(&mut self) -> f64 { self.current_time }
-    fn set_position_seconds(&mut self, pos: f64) { self.current_time = pos; }
-    fn get_num_channels(&mut self) -> i32 { 2 }
-    fn get_current_channel_vu_mono(&mut self, _channel: i32) -> f32 { 0.0 }
-    fn get_artist(&mut self) -> String { "Video Stream".to_string() }
-    fn get_type(&mut self) -> String { "Video".to_string() }
-    fn get_tempo(&mut self) -> i32 { 0 }
-    fn get_speed(&mut self) -> i32 { 0 }
-    fn get_intrinsic_sample_rate(&mut self) -> Option<u32> { Some(48000) }
-    fn get_num_samples(&mut self) -> i32 { 0 }
-    fn get_num_instruments(&mut self) -> i32 { 0 }
-    fn get_num_patterns(&mut self) -> i32 { 0 }
-    fn get_current_order(&mut self) -> i32 { 0 }
-    fn get_current_row(&mut self) -> i32 { 0 }
-    fn has_video_stream(&self) -> bool { true }
+    fn get_duration_seconds(&mut self) -> f64 {
+        self.duration
+    }
+    fn get_position_seconds(&mut self) -> f64 {
+        self.current_time
+    }
+    fn set_position_seconds(&mut self, pos: f64) {
+        self.current_time = pos;
+    }
+    fn get_num_channels(&mut self) -> i32 {
+        2
+    }
+    fn get_current_channel_vu_mono(&mut self, _channel: i32) -> f32 {
+        0.0
+    }
+    fn get_artist(&mut self) -> String {
+        "Video Stream".to_string()
+    }
+    fn get_type(&mut self) -> String {
+        "Video".to_string()
+    }
+    fn get_tempo(&mut self) -> i32 {
+        0
+    }
+    fn get_speed(&mut self) -> i32 {
+        0
+    }
+    fn get_intrinsic_sample_rate(&mut self) -> Option<u32> {
+        Some(48000)
+    }
+    fn get_num_samples(&mut self) -> i32 {
+        0
+    }
+    fn get_num_instruments(&mut self) -> i32 {
+        0
+    }
+    fn get_num_patterns(&mut self) -> i32 {
+        0
+    }
+    fn get_current_order(&mut self) -> i32 {
+        0
+    }
+    fn get_current_row(&mut self) -> i32 {
+        0
+    }
+    fn has_video_stream(&self) -> bool {
+        true
+    }
 }
 
 #[cfg(not(target_os = "android"))]
 impl AudioSource for VideoOnlySource {
-    fn read_frames(&mut self, hardware_channels: usize, sample_rate: u32, output: &mut [f32]) -> usize {
+    fn read_frames(
+        &mut self,
+        hardware_channels: usize,
+        sample_rate: u32,
+        output: &mut [f32],
+    ) -> usize {
         let frames_to_write = output.len() / hardware_channels;
         for v in output.iter_mut() {
             *v = 0.0;
         }
-        
+
         let mut packets_read = 0;
         while packets_read < 20 {
             if let Some((stream, packet)) = self.ictx.packets().next() {
                 if stream.index() == self.video_stream_index
-                    && let Some(tx) = &self.video_tx {
+                    && let Some(tx) = &self.video_tx
+                {
                     let _ = tx.try_send((self.video_epoch, packet.clone()));
                 }
                 packets_read += 1;
@@ -1982,14 +2486,18 @@ impl AudioSource for VideoOnlySource {
                 break;
             }
         }
-        
+
         self.current_time += frames_to_write as f64 / sample_rate as f64;
         frames_to_write
     }
-    
-    fn get_duration_seconds(&mut self) -> f64 { self.duration }
-    fn get_position_seconds(&mut self) -> f64 { self.current_time }
-    
+
+    fn get_duration_seconds(&mut self) -> f64 {
+        self.duration
+    }
+    fn get_position_seconds(&mut self) -> f64 {
+        self.current_time
+    }
+
     fn set_position_seconds(&mut self, pos: f64) {
         let (stream_idx, pts) = if let Some(tb) = self.video_time_base {
             let tb_f64 = tb.numerator() as f64 / tb.denominator() as f64;
@@ -1997,39 +2505,66 @@ impl AudioSource for VideoOnlySource {
         } else {
             (-1, (pos * ffmpeg_next::ffi::AV_TIME_BASE as f64) as i64)
         };
-        
+
         unsafe {
             ffmpeg_next::ffi::av_seek_frame(
                 self.ictx.as_mut_ptr(),
                 stream_idx,
                 pts,
-                ffmpeg_next::ffi::AVSEEK_FLAG_BACKWARD
+                ffmpeg_next::ffi::AVSEEK_FLAG_BACKWARD,
             );
         }
         self.current_time = pos;
         self.video_epoch += 1;
     }
-    
-    fn get_num_channels(&mut self) -> i32 { 2 }
-    fn get_current_channel_vu_mono(&mut self, _channel: i32) -> f32 { 0.0 }
-    fn get_artist(&mut self) -> String { "Video Only".to_string() }
-    fn get_type(&mut self) -> String { self.ext_type.clone() }
-    fn get_tempo(&mut self) -> i32 { 0 }
-    fn get_speed(&mut self) -> i32 { 0 }
-    fn get_intrinsic_sample_rate(&mut self) -> Option<u32> { Some(44100) }
-    fn get_num_samples(&mut self) -> i32 { 0 }
-    fn get_num_instruments(&mut self) -> i32 { 0 }
-    fn get_num_patterns(&mut self) -> i32 { 0 }
-    fn get_current_order(&mut self) -> i32 { 0 }
-    fn get_current_row(&mut self) -> i32 { 0 }
-    fn get_video_info(&mut self) -> Option<String> { self.video_info.clone() }
 
+    fn get_num_channels(&mut self) -> i32 {
+        2
+    }
+    fn get_current_channel_vu_mono(&mut self, _channel: i32) -> f32 {
+        0.0
+    }
+    fn get_artist(&mut self) -> String {
+        "Video Only".to_string()
+    }
+    fn get_type(&mut self) -> String {
+        self.ext_type.clone()
+    }
+    fn get_tempo(&mut self) -> i32 {
+        0
+    }
+    fn get_speed(&mut self) -> i32 {
+        0
+    }
+    fn get_intrinsic_sample_rate(&mut self) -> Option<u32> {
+        Some(44100)
+    }
+    fn get_num_samples(&mut self) -> i32 {
+        0
+    }
+    fn get_num_instruments(&mut self) -> i32 {
+        0
+    }
+    fn get_num_patterns(&mut self) -> i32 {
+        0
+    }
+    fn get_current_order(&mut self) -> i32 {
+        0
+    }
+    fn get_current_row(&mut self) -> i32 {
+        0
+    }
+    fn get_video_info(&mut self) -> Option<String> {
+        self.video_info.clone()
+    }
 
     fn attach_video_queue(&mut self, tx: crossbeam_channel::Sender<(u64, ffmpeg_next::Packet)>) {
         self.video_tx = Some(tx);
     }
-    
-    fn take_video_parameters(&mut self) -> Option<(ffmpeg_next::codec::Parameters, ffmpeg_next::Rational, u32)> {
+
+    fn take_video_parameters(
+        &mut self,
+    ) -> Option<(ffmpeg_next::codec::Parameters, ffmpeg_next::Rational, u32)> {
         if let (Some(p), Some(tb)) = (self.video_params.take(), self.video_time_base.take()) {
             Some((p, tb, self.video_rotation))
         } else {
@@ -2048,13 +2583,14 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
     let mut dict = ffmpeg_next::Dictionary::new();
     dict.set("probesize", "5000000");
     dict.set("analyzeduration", "5000000");
-    let ictx = ffmpeg_next::format::input_with_dictionary(&file_path, dict).context("Failed to open file via libavformat")?;
-    
+    let ictx = ffmpeg_next::format::input_with_dictionary(&file_path, dict)
+        .context("Failed to open file via libavformat")?;
+
     let mut duration = ictx.duration() as f64 / ffmpeg_next::ffi::AV_TIME_BASE as f64;
     if is_network || duration < 0.0 {
         duration = 0.0;
     }
-    
+
     if duration <= 0.0 {
         let mut max_stream_duration = 0.0;
         for stream in ictx.streams() {
@@ -2068,13 +2604,13 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
             duration = max_stream_duration;
         }
     }
-    
+
     let ext = std::path::Path::new(file_path)
         .extension()
         .and_then(|s| s.to_str())
         .unwrap_or("FFMPEG")
         .to_uppercase();
-        
+
     let mut video_info = None;
     let mut video_stream_index = None;
     let mut video_params = None;
@@ -2087,7 +2623,8 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
 
         // 1. Check metadata dictionary for "rotate" tag
         if let Some(rot_str) = v_stream.metadata().get("rotate")
-            && let Ok(rot_deg) = rot_str.parse::<i32>() {
+            && let Ok(rot_deg) = rot_str.parse::<i32>()
+        {
             let norm = ((rot_deg % 360) + 360) % 360;
             if norm == 90 || norm == 180 || norm == 270 {
                 video_rotation = norm as u32;
@@ -2113,14 +2650,25 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
             }
         }
 
-        if let Ok(v_ctx) = ffmpeg_next::codec::context::Context::from_parameters(v_stream.parameters()) {
+        if let Ok(v_ctx) =
+            ffmpeg_next::codec::context::Context::from_parameters(v_stream.parameters())
+        {
             if let Ok(v_dec) = v_ctx.decoder().video() {
                 let (disp_w, disp_h) = if video_rotation == 90 || video_rotation == 270 {
                     (v_dec.height(), v_dec.width())
                 } else {
                     (v_dec.width(), v_dec.height())
                 };
-                video_info = Some(format!("{} ({}x{})", v_dec.codec().map(|c| c.name().to_string()).unwrap_or("H264".to_string()).to_uppercase(), disp_w, disp_h));
+                video_info = Some(format!(
+                    "{} ({}x{})",
+                    v_dec
+                        .codec()
+                        .map(|c| c.name().to_string())
+                        .unwrap_or("H264".to_string())
+                        .to_uppercase(),
+                    disp_w,
+                    disp_h
+                ));
             } else {
                 video_info = Some("Unsupported Codec".to_string());
             }
@@ -2131,8 +2679,11 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
 
     let mut audio_tracks = Vec::new();
     let mut selected_track_idx = 0;
-    
-    let mp4_track_names = if file_path.to_lowercase().ends_with(".mp4") || file_path.to_lowercase().ends_with(".m4a") || file_path.to_lowercase().ends_with(".mov") {
+
+    let mp4_track_names = if file_path.to_lowercase().ends_with(".mp4")
+        || file_path.to_lowercase().ends_with(".m4a")
+        || file_path.to_lowercase().ends_with(".mov")
+    {
         extract_mp4_track_names(file_path)
     } else {
         Vec::new()
@@ -2153,12 +2704,17 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
                 ffmpeg_next::codec::Id::MP3 => "MP3".to_string(),
                 ffmpeg_next::codec::Id::VORBIS => "Vorbis".to_string(),
                 ffmpeg_next::codec::Id::OPUS => "Opus".to_string(),
-                ffmpeg_next::codec::Id::PCM_S16LE | ffmpeg_next::codec::Id::PCM_S24LE | ffmpeg_next::codec::Id::PCM_S32LE | ffmpeg_next::codec::Id::PCM_F32LE => "PCM".to_string(),
+                ffmpeg_next::codec::Id::PCM_S16LE
+                | ffmpeg_next::codec::Id::PCM_S24LE
+                | ffmpeg_next::codec::Id::PCM_S32LE
+                | ffmpeg_next::codec::Id::PCM_F32LE => "PCM".to_string(),
                 _ => format!("{:?}", codec_id).to_uppercase(),
             };
 
-            let (channels, rate) = if let Ok(ctx) = ffmpeg_next::codec::context::Context::from_parameters(p.clone())
-                && let Ok(dec) = ctx.decoder().audio() {
+            let (channels, rate) = if let Ok(ctx) =
+                ffmpeg_next::codec::context::Context::from_parameters(p.clone())
+                && let Ok(dec) = ctx.decoder().audio()
+            {
                 (dec.channels(), dec.rate())
             } else {
                 (2, 48000)
@@ -2173,9 +2729,13 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
             };
 
             let meta = stream.metadata();
-            let lang = meta.get("language").or_else(|| meta.get("LANG")).map(|s| s.to_string())
+            let lang = meta
+                .get("language")
+                .or_else(|| meta.get("LANG"))
+                .map(|s| s.to_string())
                 .filter(|l| l.to_lowercase() != "und");
-            let title = meta.get("name")
+            let title = meta
+                .get("name")
                 .or_else(|| meta.get("NAME"))
                 .or_else(|| meta.get("title"))
                 .or_else(|| meta.get("TITLE"))
@@ -2192,9 +2752,19 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
 
             let technical = desc_parts.join(" ");
             let display_title = match (lang.as_deref(), title.as_deref()) {
-                (Some(l), Some(t)) => format!("Track {}: {} [{} - {}]", audio_tracks.len() + 1, technical, l, t),
-                (Some(l), None) => format!("Track {}: {} [{}]", audio_tracks.len() + 1, technical, l),
-                (None, Some(t)) => format!("Track {}: {} [{}]", audio_tracks.len() + 1, technical, t),
+                (Some(l), Some(t)) => format!(
+                    "Track {}: {} [{} - {}]",
+                    audio_tracks.len() + 1,
+                    technical,
+                    l,
+                    t
+                ),
+                (Some(l), None) => {
+                    format!("Track {}: {} [{}]", audio_tracks.len() + 1, technical, l)
+                }
+                (None, Some(t)) => {
+                    format!("Track {}: {} [{}]", audio_tracks.len() + 1, technical, t)
+                }
                 (None, None) => format!("Track {}: {}", audio_tracks.len() + 1, technical),
             };
 
@@ -2225,7 +2795,9 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
                 ext_type: ext,
             }));
         } else {
-            return Err(anyhow::anyhow!("No audio stream found and no video stream found"));
+            return Err(anyhow::anyhow!(
+                "No audio stream found and no video stream found"
+            ));
         }
     }
 
@@ -2239,48 +2811,69 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
         audio_tracks[0].id
     };
 
-    let stream = ictx.stream(stream_index).context("Audio stream not found")?;
-    let channels = audio_tracks.get(selected_track_idx).map(|t| t.channels).unwrap_or(2);
-    let sample_rate = audio_tracks.get(selected_track_idx).map(|t| t.sample_rate).unwrap_or(48000);
+    let stream = ictx
+        .stream(stream_index)
+        .context("Audio stream not found")?;
+    let channels = audio_tracks
+        .get(selected_track_idx)
+        .map(|t| t.channels)
+        .unwrap_or(2);
+    let sample_rate = audio_tracks
+        .get(selected_track_idx)
+        .map(|t| t.sample_rate)
+        .unwrap_or(48000);
     let time_base = stream.time_base();
     let tb = time_base.numerator() as f64 / time_base.denominator() as f64;
 
-    let initial_artist = ictx.metadata().get("artist").map(|s| s.to_string()).unwrap_or_else(|| "Unknown".to_string());
+    let initial_artist = ictx
+        .metadata()
+        .get("artist")
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| "Unknown".to_string());
 
     let mut active_tracks = std::collections::HashMap::new();
     for (t_idx, track_info) in audio_tracks.iter().enumerate() {
         if let Some(st) = ictx.stream(track_info.id)
             && let Ok(ctx) = ffmpeg_next::codec::context::Context::from_parameters(st.parameters())
-            && let Ok(dec) = ctx.decoder().audio() {
+            && let Ok(dec) = ctx.decoder().audio()
+        {
             let ch = dec.channels();
             if let Ok(resamp) = ffmpeg_next::software::resampling::context::Context::get(
-                        dec.format(),
-                        dec.channel_layout(),
-                        dec.rate(),
-                        ffmpeg_next::format::sample::Sample::F32(ffmpeg_next::format::sample::Type::Packed),
-                        dec.channel_layout(),
-                        sample_rate,
-                    ) {
-                        let vol = if t_idx == selected_track_idx { 1.0 } else { 0.0 };
-                        let enabled = t_idx == selected_track_idx;
-                        let track_st_tb = st.time_base();
-                        let track_tb_f64 = track_st_tb.numerator() as f64 / track_st_tb.denominator() as f64;
-                        active_tracks.insert(track_info.id, ActiveFfmpegTrack {
-                            track_idx: t_idx,
-                            stream_index: track_info.id,
-                            decoder: dec,
-                            resampler: resamp,
-                            sample_buf: Vec::new(),
-                            buf_pos: 0,
-                            volume: vol,
-                            enabled,
-                            channels: ch,
-                            time_base: track_tb_f64,
-                            current_time: 0.0,
-                            seek_in_progress: false,
-                        });
-                    }
-                }
+                dec.format(),
+                dec.channel_layout(),
+                dec.rate(),
+                ffmpeg_next::format::sample::Sample::F32(ffmpeg_next::format::sample::Type::Packed),
+                dec.channel_layout(),
+                sample_rate,
+            ) {
+                let vol = if t_idx == selected_track_idx {
+                    1.0
+                } else {
+                    0.0
+                };
+                let enabled = t_idx == selected_track_idx;
+                let track_st_tb = st.time_base();
+                let track_tb_f64 =
+                    track_st_tb.numerator() as f64 / track_st_tb.denominator() as f64;
+                active_tracks.insert(
+                    track_info.id,
+                    ActiveFfmpegTrack {
+                        track_idx: t_idx,
+                        stream_index: track_info.id,
+                        decoder: dec,
+                        resampler: resamp,
+                        sample_buf: Vec::new(),
+                        buf_pos: 0,
+                        volume: vol,
+                        enabled,
+                        channels: ch,
+                        time_base: track_tb_f64,
+                        current_time: 0.0,
+                        seek_in_progress: false,
+                    },
+                );
+            }
+        }
     }
 
     let is_full_mix_guide = if audio_tracks.len() == 2 {
@@ -2299,7 +2892,10 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
         current_time: 0.0,
         duration,
         artist: initial_artist,
-        ext_type: audio_tracks.get(selected_track_idx).map(|t| t.codec.clone()).unwrap_or(ext),
+        ext_type: audio_tracks
+            .get(selected_track_idx)
+            .map(|t| t.codec.clone())
+            .unwrap_or(ext),
         intrinsic_sample_rate: sample_rate,
         video_info,
         channel_vus: vec![0.0; channels as usize],
@@ -2317,7 +2913,6 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
         is_full_mix_guide,
     }))
 }
-
 
 /// Helper to extract human-readable track names (e.g. "Instrumental (Karaoke)", "Vocals (Guide)")
 /// from ISO-BMFF / MP4 containers when present in `udta.name` or `name` atoms.
@@ -2352,14 +2947,19 @@ pub fn extract_mp4_track_names(path: &str) -> Vec<String> {
         for data in &buffers {
             let mut i = 0;
             while i + 8 < data.len() {
-                if &data[i..i+4] == name_marker {
+                if &data[i..i + 4] == name_marker {
                     let start = i + 4;
                     let mut end = start;
-                    while end < data.len() && end < start + 64 && data[end] >= 0x20 && data[end] <= 0x7E {
+                    while end < data.len()
+                        && end < start + 64
+                        && data[end] >= 0x20
+                        && data[end] <= 0x7E
+                    {
                         end += 1;
                     }
                     if end > start + 2
-                        && let Ok(name_str) = std::str::from_utf8(&data[start..end]) {
+                        && let Ok(name_str) = std::str::from_utf8(&data[start..end])
+                    {
                         let trimmed = name_str.trim();
                         if !trimmed.is_empty() && !names.contains(&trimmed.to_string()) {
                             names.push(trimmed.to_string());
@@ -2385,13 +2985,21 @@ pub(crate) fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(
     hint.with_extension(probe_ext);
 
     let probed = symphonia::default::get_probe()
-        .format(&hint, mss, &FormatOptions::default(), &MetadataOptions::default())
+        .format(
+            &hint,
+            mss,
+            &FormatOptions::default(),
+            &MetadataOptions::default(),
+        )
         .context("Unsupported audio format")?;
 
     let format = probed.format;
-    
+
     let mp4_track_names = if let Some(p) = file_path {
-        if p.to_lowercase().ends_with(".mp4") || p.to_lowercase().ends_with(".m4a") || p.to_lowercase().ends_with(".mov") {
+        if p.to_lowercase().ends_with(".mp4")
+            || p.to_lowercase().ends_with(".m4a")
+            || p.to_lowercase().ends_with(".mov")
+        {
             extract_mp4_track_names(p)
         } else {
             Vec::new()
@@ -2400,9 +3008,15 @@ pub(crate) fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(
         Vec::new()
     };
 
-    let has_video = format.tracks().iter().any(|t| {
-        t.codec_params.codec == symphonia::core::codecs::CODEC_TYPE_NULL
-    }) || probe_ext == "mp4" || probe_ext == "mkv" || probe_ext == "webm" || probe_ext == "mov" || probe_ext == "avi";
+    let has_video = format
+        .tracks()
+        .iter()
+        .any(|t| t.codec_params.codec == symphonia::core::codecs::CODEC_TYPE_NULL)
+        || probe_ext == "mp4"
+        || probe_ext == "mkv"
+        || probe_ext == "webm"
+        || probe_ext == "mov"
+        || probe_ext == "avi";
 
     let mut audio_tracks = Vec::new();
     let mut selected_track = None;
@@ -2410,8 +3024,11 @@ pub(crate) fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(
     let mut audio_track_count = 0;
 
     for track in format.tracks().iter() {
-        if track.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL && 
-           symphonia::default::get_codecs().make(&track.codec_params, &DecoderOptions::default()).is_ok() {
+        if track.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL
+            && symphonia::default::get_codecs()
+                .make(&track.codec_params, &DecoderOptions::default())
+                .is_ok()
+        {
             let codec_name = match track.codec_params.codec {
                 symphonia::core::codecs::CODEC_TYPE_AAC => "AAC".to_string(),
                 symphonia::core::codecs::CODEC_TYPE_MP3 => "MP3".to_string(),
@@ -2421,7 +3038,10 @@ pub(crate) fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(
                 symphonia::core::codecs::CODEC_TYPE_ALAC => "ALAC".to_string(),
                 _ => format!("{:?}", track.codec_params.codec),
             };
-            let sym_channels = track.codec_params.channels.unwrap_or(symphonia::core::audio::Channels::FRONT_LEFT | symphonia::core::audio::Channels::FRONT_RIGHT);
+            let sym_channels = track.codec_params.channels.unwrap_or(
+                symphonia::core::audio::Channels::FRONT_LEFT
+                    | symphonia::core::audio::Channels::FRONT_RIGHT,
+            );
             let channels = sym_channels.count() as u16;
             let rate = track.codec_params.sample_rate.unwrap_or(44100);
             let ch_desc = match channels {
@@ -2436,11 +3056,30 @@ pub(crate) fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(
             audio_track_count += 1;
 
             let title = if let Some(ref name) = track_name_opt {
-                format!("Track {}: {} [{} {}]", audio_tracks.len() + 1, name, codec_name, ch_desc)
+                format!(
+                    "Track {}: {} [{} {}]",
+                    audio_tracks.len() + 1,
+                    name,
+                    codec_name,
+                    ch_desc
+                )
             } else if let Some(ref lang) = track.language {
-                format!("Track {}: {} [{}] {} {}Hz", audio_tracks.len() + 1, codec_name, lang, ch_desc, rate)
+                format!(
+                    "Track {}: {} [{}] {} {}Hz",
+                    audio_tracks.len() + 1,
+                    codec_name,
+                    lang,
+                    ch_desc,
+                    rate
+                )
             } else {
-                format!("Track {}: {} {} {}Hz", audio_tracks.len() + 1, codec_name, ch_desc, rate)
+                format!(
+                    "Track {}: {} {} {}Hz",
+                    audio_tracks.len() + 1,
+                    codec_name,
+                    ch_desc,
+                    rate
+                )
             };
 
             if selected_track.is_none() {
@@ -2461,35 +3100,68 @@ pub(crate) fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(
 
     let track = selected_track.context("No supported audio track found")?;
     let track_id = track.id;
-    let sym_channels = track.codec_params.channels.unwrap_or(symphonia::core::audio::Channels::FRONT_LEFT | symphonia::core::audio::Channels::FRONT_RIGHT);
+    let sym_channels = track.codec_params.channels.unwrap_or(
+        symphonia::core::audio::Channels::FRONT_LEFT
+            | symphonia::core::audio::Channels::FRONT_RIGHT,
+    );
     let channels = sym_channels.count() as u16;
     let intrinsic_sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
-    let time_base = track.codec_params.time_base.map(|t| t.calc_time(1).seconds as f64 + t.calc_time(1).frac).unwrap_or(1.0 / 44100.0);
-    let duration = track.codec_params.n_frames.map(|n| n as f64 * time_base).unwrap_or(0.0);
+    let time_base = track
+        .codec_params
+        .time_base
+        .map(|t| t.calc_time(1).seconds as f64 + t.calc_time(1).frac)
+        .unwrap_or(1.0 / 44100.0);
+    let duration = track
+        .codec_params
+        .n_frames
+        .map(|n| n as f64 * time_base)
+        .unwrap_or(0.0);
 
     let mut active_tracks = std::collections::HashMap::new();
     for (t_idx, track_info) in audio_tracks.iter().enumerate() {
-        if let Some(t) = format.tracks().iter().find(|t| t.id == track_info.id as u32)
-            && let Ok(dec) = symphonia::default::get_codecs().make(&t.codec_params, &DecoderOptions::default()) {
-            let t_sym_channels = t.codec_params.channels.unwrap_or(symphonia::core::audio::Channels::FRONT_LEFT | symphonia::core::audio::Channels::FRONT_RIGHT);
+        if let Some(t) = format
+            .tracks()
+            .iter()
+            .find(|t| t.id == track_info.id as u32)
+            && let Ok(dec) =
+                symphonia::default::get_codecs().make(&t.codec_params, &DecoderOptions::default())
+        {
+            let t_sym_channels = t.codec_params.channels.unwrap_or(
+                symphonia::core::audio::Channels::FRONT_LEFT
+                    | symphonia::core::audio::Channels::FRONT_RIGHT,
+            );
             let t_channels = t_sym_channels.count() as u16;
             let t_sample_rate = t.codec_params.sample_rate.unwrap_or(44100);
-            let t_time_base = t.codec_params.time_base.map(|tb| tb.calc_time(1).seconds as f64 + tb.calc_time(1).frac).unwrap_or(1.0 / 44100.0);
-            let vol = if t_idx == selected_track_idx { 1.0 } else { 0.0 };
+            let t_time_base = t
+                .codec_params
+                .time_base
+                .map(|tb| tb.calc_time(1).seconds as f64 + tb.calc_time(1).frac)
+                .unwrap_or(1.0 / 44100.0);
+            let vol = if t_idx == selected_track_idx {
+                1.0
+            } else {
+                0.0
+            };
             let enabled = t_idx == selected_track_idx;
-            active_tracks.insert(t.id, ActiveSymphoniaTrack {
-                track_idx: t_idx,
-                track_id: t.id,
-                decoder: dec,
-                sample_buf: SampleBuffer::<f32>::new(0, symphonia::core::audio::SignalSpec::new(t_sample_rate, t_sym_channels)),
-                samples: Vec::new(),
-                buf_pos: 0,
-                volume: vol,
-                enabled,
-                channels: t_channels,
-                time_base: t_time_base,
-                current_time: 0.0,
-            });
+            active_tracks.insert(
+                t.id,
+                ActiveSymphoniaTrack {
+                    track_idx: t_idx,
+                    track_id: t.id,
+                    decoder: dec,
+                    sample_buf: SampleBuffer::<f32>::new(
+                        0,
+                        symphonia::core::audio::SignalSpec::new(t_sample_rate, t_sym_channels),
+                    ),
+                    samples: Vec::new(),
+                    buf_pos: 0,
+                    volume: vol,
+                    enabled,
+                    channels: t_channels,
+                    time_base: t_time_base,
+                    current_time: 0.0,
+                },
+            );
         }
     }
 
@@ -2504,8 +3176,14 @@ pub(crate) fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(
         None
     };
 
-    let ext_type = if display_ext.eq_ignore_ascii_case("mp4") || display_ext.eq_ignore_ascii_case("m4a") || display_ext.eq_ignore_ascii_case("mov") {
-        let first_codec = audio_tracks.first().map(|t| t.codec.as_str()).unwrap_or("AAC");
+    let ext_type = if display_ext.eq_ignore_ascii_case("mp4")
+        || display_ext.eq_ignore_ascii_case("m4a")
+        || display_ext.eq_ignore_ascii_case("mov")
+    {
+        let first_codec = audio_tracks
+            .first()
+            .map(|t| t.codec.as_str())
+            .unwrap_or("AAC");
         format!("{}/{}", first_codec, display_ext.to_uppercase())
     } else if display_ext.is_empty() {
         "UNKNOWN".to_string()
@@ -2549,11 +3227,21 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
     if file_path.starts_with("http") {
         let mut actual_path = file_path.to_string();
         if let Ok(mut resp) = ureq::get(&actual_path).call() {
-            let content_type = resp.headers().get("content-type").and_then(|v| v.to_str().ok()).unwrap_or("").to_lowercase();
+            let content_type = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_lowercase();
             if content_type.contains("audio/x-scpls") || actual_path.ends_with(".pls") {
                 let mut body = String::new();
                 use std::io::Read;
-                if resp.body_mut().as_reader().read_to_string(&mut body).is_ok() {
+                if resp
+                    .body_mut()
+                    .as_reader()
+                    .read_to_string(&mut body)
+                    .is_ok()
+                {
                     for line in body.lines() {
                         if line.starts_with("File1=") {
                             actual_path = line.trim_start_matches("File1=").to_string();
@@ -2561,20 +3249,28 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
                         }
                     }
                 }
-            } else if content_type.contains("mpegurl") || actual_path.ends_with(".m3u") || actual_path.ends_with(".m3u8") {
-                 let mut body = String::new();
-                 use std::io::Read;
-                 if resp.body_mut().as_reader().read_to_string(&mut body).is_ok() {
-                     for line in body.lines() {
-                         if !line.starts_with('#') && line.trim().starts_with("http") {
-                             actual_path = line.trim().to_string();
-                             break;
-                         }
-                     }
-                 }
+            } else if content_type.contains("mpegurl")
+                || actual_path.ends_with(".m3u")
+                || actual_path.ends_with(".m3u8")
+            {
+                let mut body = String::new();
+                use std::io::Read;
+                if resp
+                    .body_mut()
+                    .as_reader()
+                    .read_to_string(&mut body)
+                    .is_ok()
+                {
+                    for line in body.lines() {
+                        if !line.starts_with('#') && line.trim().starts_with("http") {
+                            actual_path = line.trim().to_string();
+                            break;
+                        }
+                    }
+                }
             }
         }
-        
+
         let ffmpeg_result = try_ffmpeg(&actual_path, true);
         if let Ok(source) = ffmpeg_result {
             return Ok(source);
@@ -2587,7 +3283,7 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_lowercase();
-        
+
     let video_info = None; // Symphonia doesn't do video
 
     // 1. Prioritize FFmpeg for video containers (MKV, MP4, WEBM, MOV, AVI) on desktop to ensure video streams are processed.
@@ -2603,15 +3299,27 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
 
     // 2. Try OpenMPT Tracker module FIRST for tracker module files on desktop
     #[cfg(not(target_os = "android"))]
-    if (ext == "mod" || ext == "s3m" || ext == "xm" || ext == "it" || ext == "mptm"
-        || ext == "stm" || ext == "med" || ext == "okt" || ext == "669" || ext == "mtm"
-        || ext == "far" || ext == "ult" || ext == "amf" || ext == "dsm")
-        && let Ok(mut file) = File::open(file_path) {
+    if (ext == "mod"
+        || ext == "s3m"
+        || ext == "xm"
+        || ext == "it"
+        || ext == "mptm"
+        || ext == "stm"
+        || ext == "med"
+        || ext == "okt"
+        || ext == "669"
+        || ext == "mtm"
+        || ext == "far"
+        || ext == "ult"
+        || ext == "amf"
+        || ext == "dsm")
+        && let Ok(mut file) = File::open(file_path)
+    {
         let mut data = Vec::new();
         if file.read_to_end(&mut data).is_ok() {
             let mut module_cursor = Cursor::new(data);
             if let Ok(module) = Module::create(&mut module_cursor, Logger::None, &[]) {
-                return Ok(Box::new(OpenMptSource { 
+                return Ok(Box::new(OpenMptSource {
                     module: SafeModule(module),
                     left_buf: Vec::with_capacity(8192),
                     right_buf: Vec::with_capacity(8192),
@@ -2630,24 +3338,25 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
             } else {
                 let mut found = false;
                 if let Ok(exe_path) = std::env::current_exe()
-                    && let Some(exe_dir) = exe_path.parent() {
+                    && let Some(exe_dir) = exe_path.parent()
+                {
                     let test_paths = vec![
-                            exe_dir.join("assets/soundfont.sf2"),
-                            exe_dir.join("soundfont.sf2"),
-                            exe_dir.join("../share/rusttracker/assets/soundfont.sf2"),
-                            exe_dir.join("../share/rusttracker/soundfont.sf2"),
-                            exe_dir.join("../Resources/soundfont.sf2"),
-                            exe_dir.join("../Resources/assets/soundfont.sf2"),
-                        ];
-                        for tp in test_paths {
-                            if tp.exists() {
-                                sf_path = tp.to_string_lossy().into_owned();
-                                found = true;
-                                break;
-                            }
+                        exe_dir.join("assets/soundfont.sf2"),
+                        exe_dir.join("soundfont.sf2"),
+                        exe_dir.join("../share/rusttracker/assets/soundfont.sf2"),
+                        exe_dir.join("../share/rusttracker/soundfont.sf2"),
+                        exe_dir.join("../Resources/soundfont.sf2"),
+                        exe_dir.join("../Resources/assets/soundfont.sf2"),
+                    ];
+                    for tp in test_paths {
+                        if tp.exists() {
+                            sf_path = tp.to_string_lossy().into_owned();
+                            found = true;
+                            break;
                         }
                     }
-                
+                }
+
                 // Fallback to system-wide paths on Linux/Android/BSD if not found yet
                 if !found {
                     let system_paths = vec![
@@ -2674,7 +3383,10 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
         if let Ok(source) = MidiSource::new(file_path, &sf_path, 48000) {
             return Ok(Box::new(source));
         } else {
-            return Err(anyhow::anyhow!("Failed to parse MIDI or missing SoundFont ({}). Please place a SoundFont in assets/soundfont.sf2 or bundled resources", sf_path));
+            return Err(anyhow::anyhow!(
+                "Failed to parse MIDI or missing SoundFont ({}). Please place a SoundFont in assets/soundfont.sf2 or bundled resources",
+                sf_path
+            ));
         }
     }
 
@@ -2684,7 +3396,10 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
         match try_symphonia(file, &ext, &ext, video_info.clone(), Some(file_path)) {
             Ok(source) => return Ok(source),
             Err(e) => {
-                println!("[RustTracker] Symphonia load failed for {}: {:?}", file_path, e);
+                println!(
+                    "[RustTracker] Symphonia load failed for {}: {:?}",
+                    file_path, e
+                );
                 symphonia_error = Some(e);
             }
         }
@@ -2698,7 +3413,10 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
             return Ok(source);
         } else if let Err(ref err) = ffmpeg_result {
             if let Some(se) = symphonia_error {
-                eprintln!("[RustTracker] Symphonia load failed for {}: {:?}", file_path, se);
+                eprintln!(
+                    "[RustTracker] Symphonia load failed for {}: {:?}",
+                    file_path, se
+                );
             }
             eprintln!("FFmpeg fallback load failed for {}: {:?}", file_path, err);
         }
@@ -2710,33 +3428,68 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
     // 6. Fallback for Video-Only containers on Android (e.g. camera videos or silent MP4 clips)
     #[cfg(target_os = "android")]
     {
-        if ext == "mp4" || ext == "mkv" || ext == "mov" || ext == "webm" || ext == "3gp" || ext == "m4v" || ext == "avi" || ext == "ts" {
+        if ext == "mp4"
+            || ext == "mkv"
+            || ext == "mov"
+            || ext == "webm"
+            || ext == "3gp"
+            || ext == "m4v"
+            || ext == "avi"
+            || ext == "ts"
+        {
             return Ok(Box::new(AndroidVideoOnlySource {
                 current_time: 0.0,
                 duration: 0.0,
             }));
         }
         if let Some(se) = symphonia_error {
-            crate::android::log_android(5, &format!("[RustTracker] Symphonia load failed for {}: {:?}", file_path, se));
-            return Err(anyhow::anyhow!("Unsupported or unreadable audio format ({:?}): {}", se, file_path));
+            crate::android::log_android(
+                5,
+                &format!(
+                    "[RustTracker] Symphonia load failed for {}: {:?}",
+                    file_path, se
+                ),
+            );
+            return Err(anyhow::anyhow!(
+                "Unsupported or unreadable audio format ({:?}): {}",
+                se,
+                file_path
+            ));
         }
-        Err(anyhow::anyhow!("Unsupported or unreadable audio format: {}", file_path))
+        Err(anyhow::anyhow!(
+            "Unsupported or unreadable audio format: {}",
+            file_path
+        ))
     }
 }
 
-pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<AppState>>) -> Result<PlaybackHandle> {
+pub fn start_audio_thread(
+    file_path: &str,
+    mic: bool,
+    shared_state: Arc<Mutex<AppState>>,
+) -> Result<PlaybackHandle> {
     #[cfg(not(target_os = "android"))]
     if !mic {
         let passthrough = shared_state.lock().unwrap().passthrough_enabled;
         if passthrough {
             let (tx, rx) = bounded::<DspMessage>(32);
             let stop_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
-            if let Ok((handle, decoder_rate, channels, codec_name, has_video, artist, duration)) = crate::bitstream::start_bitstream_thread(file_path, shared_state.clone(), tx.clone(), stop_token.clone()) {
+            if let Ok((handle, decoder_rate, channels, codec_name, has_video, artist, duration)) =
+                crate::bitstream::start_bitstream_thread(
+                    file_path,
+                    shared_state.clone(),
+                    tx.clone(),
+                    stop_token.clone(),
+                )
+            {
                 let max_frequency = shared_state.lock().unwrap().max_frequency;
                 let sample_rate = decoder_rate;
                 let window_size = calculate_power_of_two_window_size(sample_rate);
-                
-                let is_lpcm = codec_name == "flac" || codec_name == "pcm" || codec_name == "alac" || codec_name == "multichannel_pcm";
+
+                let is_lpcm = codec_name == "flac"
+                    || codec_name == "pcm"
+                    || codec_name == "alac"
+                    || codec_name == "multichannel_pcm";
                 let display_name = match codec_name.as_str() {
                     "truehd" => "TrueHD / Dolby Atmos",
                     "eac3" => "E-AC3 / Dolby Digital Plus",
@@ -2746,12 +3499,25 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
                     "pcm" => "Multi-Channel LPCM",
                     "alac" => "ALAC Multi-Channel LPCM",
                     _ => &codec_name,
-                }.to_string();
-                
-                let video_suffix = if has_video { " (Video available: 'v' to view)" } else { "" };
-                
-                let default_artist = if is_lpcm { "WASAPI Exclusive LPCM" } else { "Bitstream Active" };
-                let meta_artist = if !artist.is_empty() { artist } else { default_artist.to_string() };
+                }
+                .to_string();
+
+                let video_suffix = if has_video {
+                    " (Video available: 'v' to view)"
+                } else {
+                    ""
+                };
+
+                let default_artist = if is_lpcm {
+                    "WASAPI Exclusive LPCM"
+                } else {
+                    "Bitstream Active"
+                };
+                let meta_artist = if !artist.is_empty() {
+                    artist
+                } else {
+                    default_artist.to_string()
+                };
                 let meta_duration = duration;
 
                 {
@@ -2765,7 +3531,11 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
                     state.raw_waveform.fill(0.0);
                     state.track_ended = false;
                     state.artist = meta_artist;
-                    state.module_type = if is_lpcm { "Multi-Channel LPCM".to_string() } else { "Hardware Passthrough".to_string() };
+                    state.module_type = if is_lpcm {
+                        "Multi-Channel LPCM".to_string()
+                    } else {
+                        "Hardware Passthrough".to_string()
+                    };
                     state.stats.bitstream_active = true;
                     state.current_sample_rate = sample_rate as f32;
                     state.duration_seconds = meta_duration;
@@ -2776,8 +3546,14 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
                     state.peak_vus = vec![0.0; ch as usize];
                     state.video_info = Some(format!("{}{}", display_name, video_suffix));
                 }
-                
-                spawn_dsp_thread(rx, shared_state.clone(), sample_rate, max_frequency, window_size);
+
+                spawn_dsp_thread(
+                    rx,
+                    shared_state.clone(),
+                    sample_rate,
+                    max_frequency,
+                    window_size,
+                );
                 return Ok(PlaybackHandle::Bitstream(Some(handle), stop_token));
             }
         }
@@ -2790,11 +3566,21 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
     }
 
     let host = cpal::default_host();
-    let mut audio_source_opt = if mic { None } else { Some(load_audio_source(file_path)?) };
-    let rate = audio_source_opt.as_mut().and_then(|a| a.get_intrinsic_sample_rate()).unwrap_or(48000);
+    let mut audio_source_opt = if mic {
+        None
+    } else {
+        Some(load_audio_source(file_path)?)
+    };
+    let rate = audio_source_opt
+        .as_mut()
+        .and_then(|a| a.get_intrinsic_sample_rate())
+        .unwrap_or(48000);
     let target_rate: cpal::SampleRate = rate;
     let force_stereo = shared_state.lock().unwrap().force_stereo_downmix;
-    let mut target_channels = audio_source_opt.as_mut().map(|a| a.get_num_channels() as u16).unwrap_or(2);
+    let mut target_channels = audio_source_opt
+        .as_mut()
+        .map(|a| a.get_num_channels() as u16)
+        .unwrap_or(2);
     if force_stereo {
         target_channels = 2;
     }
@@ -2806,7 +3592,8 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
         };
         let mut dev = None;
         if let Some(ref name) = selected_device_name
-            && let Ok(devices) = host.input_devices() {
+            && let Ok(devices) = host.input_devices()
+        {
             for d in devices {
                 if let Ok(desc) = d.description() {
                     let d_name = desc.name();
@@ -2820,11 +3607,14 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
         let device = if let Some(d) = dev {
             d
         } else {
-            host.default_input_device().context("No input device available")?
+            host.default_input_device()
+                .context("No input device available")?
         };
 
         let supported_config = {
-            let supported_configs_range = device.supported_input_configs().context("error while querying input configs")?;
+            let supported_configs_range = device
+                .supported_input_configs()
+                .context("error while querying input configs")?;
             supported_configs_range
                 .into_iter()
                 .find(|c| {
@@ -2856,15 +3646,30 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
 
         let max_frequency = { shared_state.lock().unwrap().max_frequency };
         let window_size = calculate_power_of_two_window_size(config.sample_rate);
-        spawn_dsp_thread(rx, shared_state.clone(), config.sample_rate, max_frequency, window_size);
+        spawn_dsp_thread(
+            rx,
+            shared_state.clone(),
+            config.sample_rate,
+            max_frequency,
+            window_size,
+        );
 
         let stream = match supported_config.sample_format() {
-            cpal::SampleFormat::F32 => run_mic::<f32>(&device, &config, shared_state, tx, config.sample_rate),
-            cpal::SampleFormat::I16 => run_mic::<i16>(&device, &config, shared_state, tx, config.sample_rate),
-            cpal::SampleFormat::U16 => run_mic::<u16>(&device, &config, shared_state, tx, config.sample_rate),
+            cpal::SampleFormat::F32 => {
+                run_mic::<f32>(&device, &config, shared_state, tx, config.sample_rate)
+            }
+            cpal::SampleFormat::I16 => {
+                run_mic::<i16>(&device, &config, shared_state, tx, config.sample_rate)
+            }
+            cpal::SampleFormat::U16 => {
+                run_mic::<u16>(&device, &config, shared_state, tx, config.sample_rate)
+            }
             _ => return Err(anyhow::anyhow!("Unsupported sample format")),
         }?;
-        return Ok(PlaybackHandle::Cpal(stream, Arc::new(std::sync::atomic::AtomicBool::new(false))));
+        return Ok(PlaybackHandle::Cpal(
+            stream,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        ));
     }
 
     let shared_state_closure = shared_state.clone();
@@ -2873,34 +3678,38 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
             let state = shared_state_closure.lock().unwrap();
             state.selected_audio_device.clone()
         };
-        
+
         let devices_to_try = if let Some(ref name) = selected_device_name {
             let mut candidates = Vec::new();
             let mut is_default = false;
-            
+
             // ALSA WORKAROUND: If the user selected the default device by name, ensure we use the REAL default host handle.
-            // Matching by name in the output_devices() iterator on Linux can inadvertently pick a raw hardware endpoint 
+            // Matching by name in the output_devices() iterator on Linux can inadvertently pick a raw hardware endpoint
             // that bypasses PulseAudio/PipeWire and fails with ALSA `unable to open slave` lock errors.
             if let Some(default_dev) = host.default_output_device()
                 && let Ok(desc) = default_dev.description()
-                && desc.name() == *name {
+                && desc.name() == *name
+            {
                 candidates.push(default_dev);
                 is_default = true;
             }
-            
-            if !is_default
-                && let Ok(devices) = host.output_devices() {
+
+            if !is_default && let Ok(devices) = host.output_devices() {
                 for d in devices {
                     if let Ok(desc) = d.description()
-                        && desc.name() == *name {
+                        && desc.name() == *name
+                    {
                         candidates.push(d);
                         break;
                     }
                 }
             }
-            
+
             if candidates.is_empty() {
-                return Err(anyhow::anyhow!("Selected audio device '{}' not found", name));
+                return Err(anyhow::anyhow!(
+                    "Selected audio device '{}' not found",
+                    name
+                ));
             }
             candidates
         } else {
@@ -2912,7 +3721,8 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
                 for d in devices {
                     if let Some(default_dev) = host.default_output_device()
                         && let (Ok(desc1), Ok(desc2)) = (d.description(), default_dev.description())
-                        && desc1.name() == desc2.name() {
+                        && desc1.name() == desc2.name()
+                    {
                         continue;
                     }
                     candidates.push(d);
@@ -2927,37 +3737,51 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
 
         let mut last_err = anyhow::anyhow!("No candidate audio device succeeded");
         for device in devices_to_try {
-            let device_name = device.description().map(|desc| desc.name().to_string()).unwrap_or_else(|_| "Unknown Device".to_string());
-            
+            let device_name = device
+                .description()
+                .map(|desc| desc.name().to_string())
+                .unwrap_or_else(|_| "Unknown Device".to_string());
+
             // Re-load the audio source for this attempt to ensure it is fresh
-            let mut attempt_audio_source_opt = if mic { None } else { Some(load_audio_source(file_path)?) };
-            
+            let mut attempt_audio_source_opt = if mic {
+                None
+            } else {
+                Some(load_audio_source(file_path)?)
+            };
+
             let result = (|| -> Result<(cpal::Stream, Arc<std::sync::atomic::AtomicBool>)> {
                 let supported_config = {
-                    let supported_configs_range = device.supported_output_configs().context("error while querying output configs")?;
+                    let supported_configs_range = device
+                        .supported_output_configs()
+                        .context("error while querying output configs")?;
                     let mut configs: Vec<_> = supported_configs_range
                         .filter(|c| {
-                            c.sample_format() == cpal::SampleFormat::F32 || c.sample_format() == cpal::SampleFormat::I16
+                            c.sample_format() == cpal::SampleFormat::F32
+                                || c.sample_format() == cpal::SampleFormat::I16
                         })
                         .collect();
-                        
+
                     configs.sort_by_key(|c| {
                         let ch_match = c.channels() == target_channels;
                         let stereo = c.channels() >= 2;
-                        let rate_match = c.min_sample_rate() <= target_rate && c.max_sample_rate() >= target_rate;
-                        
+                        let rate_match = c.min_sample_rate() <= target_rate
+                            && c.max_sample_rate() >= target_rate;
+
                         (
                             std::cmp::Reverse(ch_match),
                             std::cmp::Reverse(stereo),
                             std::cmp::Reverse(rate_match),
-                            std::cmp::Reverse(c.channels())
+                            std::cmp::Reverse(c.channels()),
                         )
                     });
-                    
-                    configs.into_iter()
+
+                    configs
+                        .into_iter()
                         .next()
                         .map(|c| {
-                            let rate = if c.min_sample_rate() <= target_rate && c.max_sample_rate() >= target_rate {
+                            let rate = if c.min_sample_rate() <= target_rate
+                                && c.max_sample_rate() >= target_rate
+                            {
                                 target_rate
                             } else {
                                 c.max_sample_rate()
@@ -2970,9 +3794,11 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
 
                 let config: cpal::StreamConfig = supported_config.clone().into();
                 let (tx, rx) = bounded::<DspMessage>(32);
-                
-                let audio_source = attempt_audio_source_opt.as_mut().ok_or_else(|| anyhow::anyhow!("No audio source available"))?;
-                
+
+                let audio_source = attempt_audio_source_opt
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("No audio source available"))?;
+
                 {
                     let mut state = shared_state_closure.lock().unwrap();
                     state.current_seconds = 0.0;
@@ -2998,7 +3824,8 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
                     state.bpm = audio_source.get_tempo();
                     state.speed = audio_source.get_speed();
                     state.video_info = audio_source.get_video_info();
-                    state.max_frequency = audio_source.get_intrinsic_sample_rate()
+                    state.max_frequency = audio_source
+                        .get_intrinsic_sample_rate()
                         .map(|r| r as f32 / 2.0)
                         .unwrap_or(10000.0);
                     state.current_sample_rate = config.sample_rate as f32;
@@ -3020,13 +3847,49 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
 
                 let max_frequency = { shared_state_closure.lock().unwrap().max_frequency };
                 let window_size = calculate_power_of_two_window_size(config.sample_rate);
-                
-                spawn_dsp_thread(rx, shared_state_closure.clone(), config.sample_rate, max_frequency, window_size);
+
+                spawn_dsp_thread(
+                    rx,
+                    shared_state_closure.clone(),
+                    config.sample_rate,
+                    max_frequency,
+                    window_size,
+                );
 
                 let (stream, stop_token) = match supported_config.sample_format() {
-                    cpal::SampleFormat::F32 => run::<f32>(&device, &config, &mut attempt_audio_source_opt, shared_state_closure.clone(), tx, config.sample_rate, max_frequency, window_size, file_path),
-                    cpal::SampleFormat::I16 => run::<i16>(&device, &config, &mut attempt_audio_source_opt, shared_state_closure.clone(), tx, config.sample_rate, max_frequency, window_size, file_path),
-                    cpal::SampleFormat::U16 => run::<u16>(&device, &config, &mut attempt_audio_source_opt, shared_state_closure.clone(), tx, config.sample_rate, max_frequency, window_size, file_path),
+                    cpal::SampleFormat::F32 => run::<f32>(
+                        &device,
+                        &config,
+                        &mut attempt_audio_source_opt,
+                        shared_state_closure.clone(),
+                        tx,
+                        config.sample_rate,
+                        max_frequency,
+                        window_size,
+                        file_path,
+                    ),
+                    cpal::SampleFormat::I16 => run::<i16>(
+                        &device,
+                        &config,
+                        &mut attempt_audio_source_opt,
+                        shared_state_closure.clone(),
+                        tx,
+                        config.sample_rate,
+                        max_frequency,
+                        window_size,
+                        file_path,
+                    ),
+                    cpal::SampleFormat::U16 => run::<u16>(
+                        &device,
+                        &config,
+                        &mut attempt_audio_source_opt,
+                        shared_state_closure.clone(),
+                        tx,
+                        config.sample_rate,
+                        max_frequency,
+                        window_size,
+                        file_path,
+                    ),
                     _ => return Err(anyhow::anyhow!("Unsupported sample format")),
                 }?;
 
@@ -3039,7 +3902,10 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
                     return Ok((stream, stop_token));
                 }
                 Err(err) => {
-                    eprintln!("Warning: Failed to create/play audio stream on device '{}': {:?}", device_name, err);
+                    eprintln!(
+                        "Warning: Failed to create/play audio stream on device '{}': {:?}",
+                        device_name, err
+                    );
                     last_err = err;
                 }
             }
@@ -3054,13 +3920,16 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
             if mic {
                 return Err(err);
             }
-            eprintln!("Warning: CPAL audio stream creation failed: {:?}. Falling back to silent dummy device.", err);
-            
+            eprintln!(
+                "Warning: CPAL audio stream creation failed: {:?}. Falling back to silent dummy device.",
+                err
+            );
+
             if let Some(mut audio_source) = audio_source_opt.take() {
                 let sample_rate = target_rate;
                 let window_size = calculate_power_of_two_window_size(sample_rate);
                 let (tx, rx) = bounded::<DspMessage>(32);
-                
+
                 {
                     let mut state = shared_state.lock().unwrap();
                     state.current_seconds = 0.0;
@@ -3086,7 +3955,8 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
                     state.bpm = audio_source.get_tempo();
                     state.speed = audio_source.get_speed();
                     state.video_info = audio_source.get_video_info();
-                    state.max_frequency = audio_source.get_intrinsic_sample_rate()
+                    state.max_frequency = audio_source
+                        .get_intrinsic_sample_rate()
                         .map(|r| r as f32 / 2.0)
                         .unwrap_or(10000.0);
                     state.current_sample_rate = sample_rate as f32;
@@ -3107,16 +3977,31 @@ pub fn start_audio_thread(file_path: &str, mic: bool, shared_state: Arc<Mutex<Ap
                 }
 
                 let max_frequency = { shared_state.lock().unwrap().max_frequency };
-                spawn_dsp_thread(rx, shared_state.clone(), sample_rate, max_frequency, window_size);
-                
-                run_dummy(audio_source, shared_state, tx, sample_rate, window_size, file_path)
+                spawn_dsp_thread(
+                    rx,
+                    shared_state.clone(),
+                    sample_rate,
+                    max_frequency,
+                    window_size,
+                );
+
+                run_dummy(
+                    audio_source,
+                    shared_state,
+                    tx,
+                    sample_rate,
+                    window_size,
+                    file_path,
+                )
             } else {
-                Err(anyhow::anyhow!("CPAL audio stream creation failed: {:?}, and no audio source was available for fallback.", err))
+                Err(anyhow::anyhow!(
+                    "CPAL audio stream creation failed: {:?}, and no audio source was available for fallback.",
+                    err
+                ))
             }
         }
     }
 }
-
 
 fn push_chunk_lookahead_slices(
     state: &mut AppState,
@@ -3130,22 +4015,27 @@ fn push_chunk_lookahead_slices(
     }
     let slice_frames = ((sample_rate as f64 * 0.01).round() as usize).max(16);
     let valid_samples = frames_read * hardware_channels;
-    
-    let existing_end_time = state.lookahead_buffer_start_time + (state.lookahead_sample_buffer.len() / hardware_channels) as f64 / sample_rate as f64;
-    if state.lookahead_sample_buffer.is_empty() || (chunk.current_seconds - existing_end_time).abs() > 0.05 {
+
+    let existing_end_time = state.lookahead_buffer_start_time
+        + (state.lookahead_sample_buffer.len() / hardware_channels) as f64 / sample_rate as f64;
+    if state.lookahead_sample_buffer.is_empty()
+        || (chunk.current_seconds - existing_end_time).abs() > 0.05
+    {
         state.lookahead_sample_buffer.clear();
         state.lookahead_buffer_start_time = chunk.current_seconds;
     }
-    state.lookahead_sample_buffer.extend_from_slice(&chunk.samples[..valid_samples]);
-    
+    state
+        .lookahead_sample_buffer
+        .extend_from_slice(&chunk.samples[..valid_samples]);
+
     let buffer_frames = state.lookahead_sample_buffer.len() / hardware_channels;
     let full_slices = buffer_frames / slice_frames;
-    
+
     for s in 0..full_slices {
         let start_f = s * slice_frames;
         let end_f = start_f + slice_frames;
         let slice_time = state.lookahead_buffer_start_time + (start_f as f64 / sample_rate as f64);
-        
+
         let mut min_l = 0.0f32;
         let mut max_l = 0.0f32;
         let mut min_r = 0.0f32;
@@ -3154,19 +4044,23 @@ fn push_chunk_lookahead_slices(
         let mut sq_r = 0.0f32;
         let mut bass_acc = 0.0f32;
         let mut treb_acc = 0.0f32;
-        
+
         let cnt = slice_frames as f32;
         for i in start_f..end_f {
             let l = state.lookahead_sample_buffer[i * hardware_channels];
-            let r = if hardware_channels > 1 { state.lookahead_sample_buffer[i * hardware_channels + 1] } else { l };
-            
+            let r = if hardware_channels > 1 {
+                state.lookahead_sample_buffer[i * hardware_channels + 1]
+            } else {
+                l
+            };
+
             min_l = min_l.min(l);
             max_l = max_l.max(l);
             min_r = min_r.min(r);
             max_r = max_r.max(r);
             sq_l += l * l;
             sq_r += r * r;
-            
+
             let mono = (l + r) * 0.5;
             let diff = if i > start_f {
                 let prev_l = state.lookahead_sample_buffer[(i - 1) * hardware_channels];
@@ -3174,16 +4068,16 @@ fn push_chunk_lookahead_slices(
             } else {
                 0.0
             };
-            
+
             bass_acc += mono.abs();
             treb_acc += diff * 2.0;
         }
-        
+
         let rms_l = (sq_l / cnt).sqrt().min(1.0);
         let rms_r = (sq_r / cnt).sqrt().min(1.0);
         let bass = (bass_acc / cnt * 2.0).min(1.0);
         let treble = (treb_acc / cnt * 2.0).min(1.0);
-        
+
         while let Some((t, _)) = state.lookahead_queue.back() {
             if *t >= slice_time - 0.0001 {
                 state.lookahead_queue.pop_back();
@@ -3192,24 +4086,28 @@ fn push_chunk_lookahead_slices(
             }
         }
 
-        state.lookahead_queue.push_back((slice_time, [
-            min_l.clamp(-1.0, 1.0),
-            max_l.clamp(-1.0, 1.0),
-            min_r.clamp(-1.0, 1.0),
-            max_r.clamp(-1.0, 1.0),
-            rms_l,
-            rms_r,
-            bass,
-            treble,
-        ]));
+        state.lookahead_queue.push_back((
+            slice_time,
+            [
+                min_l.clamp(-1.0, 1.0),
+                max_l.clamp(-1.0, 1.0),
+                min_r.clamp(-1.0, 1.0),
+                max_r.clamp(-1.0, 1.0),
+                rms_l,
+                rms_r,
+                bass,
+                treble,
+            ],
+        ));
     }
-    
+
     let consumed_samples = full_slices * slice_frames * hardware_channels;
     if consumed_samples > 0 {
         state.lookahead_sample_buffer.drain(0..consumed_samples);
-        state.lookahead_buffer_start_time += (full_slices * slice_frames) as f64 / sample_rate as f64;
+        state.lookahead_buffer_start_time +=
+            (full_slices * slice_frames) as f64 / sample_rate as f64;
     }
-    
+
     while state.lookahead_queue.len() > 1800 {
         state.lookahead_queue.pop_front();
     }
@@ -3228,8 +4126,16 @@ pub fn push_planar_lookahead_slices(
     if left.is_empty() {
         return;
     }
-    let right = if channels.len() > 1 { &channels[1] } else { left };
-    let center = if channels.len() > 2 { Some(&channels[2]) } else { None };
+    let right = if channels.len() > 1 {
+        &channels[1]
+    } else {
+        left
+    };
+    let center = if channels.len() > 2 {
+        Some(&channels[2])
+    } else {
+        None
+    };
 
     let slice_frames = ((sample_rate as f64 * 0.01).round() as usize).max(16);
     let total_samples = left.len();
@@ -3296,16 +4202,19 @@ pub fn push_planar_lookahead_slices(
             }
         }
 
-        state.lookahead_queue.push_back((slice_time, [
-            min_l.clamp(-1.0, 1.0),
-            max_l.clamp(-1.0, 1.0),
-            min_r.clamp(-1.0, 1.0),
-            max_r.clamp(-1.0, 1.0),
-            rms_l,
-            rms_r,
-            bass,
-            treble,
-        ]));
+        state.lookahead_queue.push_back((
+            slice_time,
+            [
+                min_l.clamp(-1.0, 1.0),
+                max_l.clamp(-1.0, 1.0),
+                min_r.clamp(-1.0, 1.0),
+                max_r.clamp(-1.0, 1.0),
+                rms_l,
+                rms_r,
+                bass,
+                treble,
+            ],
+        ));
     }
 
     while state.lookahead_queue.len() > 1800 {
@@ -3325,8 +4234,8 @@ fn run_dummy(
     let stop_token_clone = stop_token.clone();
     let hardware_channels = 2;
     let chunk_frames = 1024;
-    let pool_size = ((sample_rate as usize * 8) / chunk_frames).clamp(384, 1024); 
-    
+    let pool_size = ((sample_rate as usize * 8) / chunk_frames).clamp(384, 1024);
+
     let (ready_tx, ready_rx) = bounded::<AudioChunk>(pool_size);
     let (free_tx, free_rx) = unbounded::<AudioChunk>();
     #[cfg(not(target_os = "android"))]
@@ -3335,7 +4244,7 @@ fn run_dummy(
     let (_video_packet_tx, video_packet_rx) = bounded::<(u64, ())>(1);
     #[cfg(not(target_os = "android"))]
     audio_source.attach_video_queue(video_packet_tx);
-    
+
     #[cfg(target_os = "android")]
     if audio_source.has_video_stream() {
         crate::android_video::decoder::start_android_video_thread(
@@ -3344,12 +4253,12 @@ fn run_dummy(
             stop_token.clone(),
         );
     }
-    
+
     #[cfg(not(target_os = "android"))]
     if let Some((params, time_base, rotation)) = audio_source.take_video_parameters() {
         let (video_frame_tx, video_frame_rx) = bounded::<crate::state::VideoFrame>(16);
         let (free_video_frame_tx, free_video_frame_rx) = unbounded::<crate::state::VideoFrame>();
-        
+
         for _ in 0..16 {
             let _ = free_video_frame_tx.try_send(crate::state::VideoFrame {
                 pts: 0.0,
@@ -3368,190 +4277,228 @@ fn run_dummy(
                 color_trc: 0,
             });
         }
-        
+
         if let Ok(mut state) = shared_state.lock() {
             state.video_frame_rx = Some(video_frame_rx);
             state.free_video_frame_tx = Some(free_video_frame_tx.clone());
         }
-        
+
         let state_for_video = shared_state.clone();
         let video_packet_rx_for_video = video_packet_rx.clone();
         let stop_token_video = stop_token.clone();
         std::thread::spawn(move || {
             if let Ok(context) = ffmpeg_next::codec::context::Context::from_parameters(params)
-                && let Ok(mut decoder) = context.decoder().video() {
-                    let tb = time_base.numerator() as f64 / time_base.denominator() as f64;
-                    let mut local_epoch = 0;
-                    let mut fallback_pts_seconds = 0.0;
-                    let mut is_first_frame_after_seek = false;
-                    
-                    while !stop_token_video.load(std::sync::atomic::Ordering::Relaxed) {
-                        match video_packet_rx_for_video.recv_timeout(std::time::Duration::from_millis(50)) {
-                            Ok((packet_epoch, packet)) => {
-                                {
-                                    let state = state_for_video.lock().unwrap();
-                                    if state.seek_epoch > local_epoch {
-                                        decoder.flush();
-                                        local_epoch = state.seek_epoch;
-                                        is_first_frame_after_seek = true;
+                && let Ok(mut decoder) = context.decoder().video()
+            {
+                let tb = time_base.numerator() as f64 / time_base.denominator() as f64;
+                let mut local_epoch = 0;
+                let mut fallback_pts_seconds = 0.0;
+                let mut is_first_frame_after_seek = false;
+
+                while !stop_token_video.load(std::sync::atomic::Ordering::Relaxed) {
+                    match video_packet_rx_for_video
+                        .recv_timeout(std::time::Duration::from_millis(50))
+                    {
+                        Ok((packet_epoch, packet)) => {
+                            {
+                                let state = state_for_video.lock().unwrap();
+                                if state.seek_epoch > local_epoch {
+                                    decoder.flush();
+                                    local_epoch = state.seek_epoch;
+                                    is_first_frame_after_seek = true;
+                                }
+                            }
+
+                            if packet_epoch < local_epoch {
+                                continue;
+                            }
+
+                            if decoder.send_packet(&packet).is_ok() {
+                                let mut decoded = ffmpeg_next::frame::Video::empty();
+                                while decoder.receive_frame(&mut decoded).is_ok() {
+                                    if stop_token_video.load(std::sync::atomic::Ordering::Relaxed) {
+                                        return;
                                     }
-                                }
-                                
-                                if packet_epoch < local_epoch {
-                                    continue;
-                                }
-                                
-                                if decoder.send_packet(&packet).is_ok() {
-                                    let mut decoded = ffmpeg_next::frame::Video::empty();
-                                    while decoder.receive_frame(&mut decoded).is_ok() {
-                                        if stop_token_video.load(std::sync::atomic::Ordering::Relaxed) {
-                                            return;
-                                        }
-                                        let mut pts = decoded.timestamp().map(|t| t as f64 * tb)
-                                            .or_else(|| decoded.pts().map(|p| p as f64 * tb))
-                                            .unwrap_or(-1.0);
-                                            
-                                        if pts < 0.0 {
-                                            pts = fallback_pts_seconds;
-                                            fallback_pts_seconds += 1.0 / 30.0;
-                                        } else {
-                                            fallback_pts_seconds = pts + (1.0 / 30.0);
-                                        }
-                                        
-                                        let mut skip_push = false;
-                                        if is_first_frame_after_seek {
-                                            is_first_frame_after_seek = false;
-                                        } else {
-                                            let sync_start = std::time::Instant::now();
-                                            loop {
-                                                if stop_token_video.load(std::sync::atomic::Ordering::Relaxed) {
-                                                    return;
-                                                }
-                                                let (cached_seconds, current_epoch, is_paused, track_ended) = {
-                                                    let state = state_for_video.lock().unwrap();
-                                                    (state.current_seconds, state.seek_epoch, state.is_paused, state.track_ended)
-                                                };
-                                                
-                                                if track_ended || current_epoch > local_epoch {
-                                                    skip_push = true;
-                                                    break;
-                                                }
-                                                
-                                                if pts < cached_seconds - 0.05 {
-                                                    skip_push = true;
-                                                    break;
-                                                }
-                                                
-                                                if pts <= cached_seconds + 0.05 {
-                                                    break;
-                                                }
-                                                
-                                                if sync_start.elapsed() > std::time::Duration::from_millis(500) {
-                                                    skip_push = true;
-                                                    break;
-                                                }
-                                                
-                                                let sleep_dur = if is_paused { 50 } else { 5 };
-                                                std::thread::sleep(std::time::Duration::from_millis(sleep_dur));
-                                            }
-                                        }
-                                        
-                                        if skip_push {
-                                            continue;
-                                        }
-                                        
-                                        let mut frame_opt = None;
+                                    let mut pts = decoded
+                                        .timestamp()
+                                        .map(|t| t as f64 * tb)
+                                        .or_else(|| decoded.pts().map(|p| p as f64 * tb))
+                                        .unwrap_or(-1.0);
+
+                                    if pts < 0.0 {
+                                        pts = fallback_pts_seconds;
+                                        fallback_pts_seconds += 1.0 / 30.0;
+                                    } else {
+                                        fallback_pts_seconds = pts + (1.0 / 30.0);
+                                    }
+
+                                    let mut skip_push = false;
+                                    if is_first_frame_after_seek {
+                                        is_first_frame_after_seek = false;
+                                    } else {
+                                        let sync_start = std::time::Instant::now();
                                         loop {
-                                            if stop_token_video.load(std::sync::atomic::Ordering::Relaxed) {
+                                            if stop_token_video
+                                                .load(std::sync::atomic::Ordering::Relaxed)
+                                            {
                                                 return;
                                             }
-                                            let (current_epoch, is_paused, track_ended) = {
+                                            let (
+                                                cached_seconds,
+                                                current_epoch,
+                                                is_paused,
+                                                track_ended,
+                                            ) = {
                                                 let state = state_for_video.lock().unwrap();
-                                                (state.seek_epoch, state.is_paused, state.track_ended)
+                                                (
+                                                    state.current_seconds,
+                                                    state.seek_epoch,
+                                                    state.is_paused,
+                                                    state.track_ended,
+                                                )
                                             };
+
                                             if track_ended || current_epoch > local_epoch {
                                                 skip_push = true;
                                                 break;
                                             }
-                                            match free_video_frame_rx.recv_timeout(std::time::Duration::from_millis(10)) {
-                                                Ok(f) => {
-                                                    frame_opt = Some(f);
-                                                    break;
-                                                }
-                                                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                                                    let sleep_dur = if is_paused { 50 } else { 5 };
-                                                    std::thread::sleep(std::time::Duration::from_millis(sleep_dur));
-                                                }
-                                                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                                                    return;
-                                                }
+
+                                            if pts < cached_seconds - 0.05 {
+                                                skip_push = true;
+                                                break;
+                                            }
+
+                                            if pts <= cached_seconds + 0.05 {
+                                                break;
+                                            }
+
+                                            if sync_start.elapsed()
+                                                > std::time::Duration::from_millis(500)
+                                            {
+                                                skip_push = true;
+                                                break;
+                                            }
+
+                                            let sleep_dur = if is_paused { 50 } else { 5 };
+                                            std::thread::sleep(std::time::Duration::from_millis(
+                                                sleep_dur,
+                                            ));
+                                        }
+                                    }
+
+                                    if skip_push {
+                                        continue;
+                                    }
+
+                                    let mut frame_opt = None;
+                                    loop {
+                                        if stop_token_video
+                                            .load(std::sync::atomic::Ordering::Relaxed)
+                                        {
+                                            return;
+                                        }
+                                        let (current_epoch, is_paused, track_ended) = {
+                                            let state = state_for_video.lock().unwrap();
+                                            (state.seek_epoch, state.is_paused, state.track_ended)
+                                        };
+                                        if track_ended || current_epoch > local_epoch {
+                                            skip_push = true;
+                                            break;
+                                        }
+                                        match free_video_frame_rx
+                                            .recv_timeout(std::time::Duration::from_millis(10))
+                                        {
+                                            Ok(f) => {
+                                                frame_opt = Some(f);
+                                                break;
+                                            }
+                                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                                                let sleep_dur = if is_paused { 50 } else { 5 };
+                                                std::thread::sleep(
+                                                    std::time::Duration::from_millis(sleep_dur),
+                                                );
+                                            }
+                                            Err(
+                                                crossbeam_channel::RecvTimeoutError::Disconnected,
+                                            ) => {
+                                                return;
                                             }
                                         }
-                                        
-                                        if skip_push {
-                                            continue;
+                                    }
+
+                                    if skip_push {
+                                        continue;
+                                    }
+
+                                    if let Some(mut frame) = frame_opt {
+                                        frame.pts = pts;
+                                        frame.width = decoded.width();
+                                        frame.height = decoded.height();
+                                        frame.rotation = rotation;
+
+                                        let format_name = format!("{:?}", decoded.format());
+                                        frame.bit_depth = if format_name.contains("10LE") {
+                                            10
+                                        } else if format_name.contains("12LE") {
+                                            12
+                                        } else {
+                                            8
+                                        };
+                                        frame.color_space = decoded.color_space() as u32;
+                                        frame.color_range = decoded.color_range() as u32;
+                                        frame.color_trc =
+                                            decoded.color_transfer_characteristic() as u32;
+
+                                        frame.y_stride = decoded.stride(0);
+                                        frame.u_stride = decoded.stride(1);
+                                        frame.v_stride = decoded.stride(2);
+
+                                        let height = decoded.height() as usize;
+                                        let y_len = frame.y_stride * height;
+                                        let u_len = frame.u_stride * (height / 2);
+                                        let v_len = frame.v_stride * (height / 2);
+
+                                        frame.y_plane.clear();
+                                        let y_plane = decoded.data(0);
+                                        let y_copy_len = y_len.min(y_plane.len());
+                                        frame.y_plane.extend_from_slice(&y_plane[..y_copy_len]);
+                                        if y_copy_len < y_len {
+                                            frame.y_plane.resize(y_len, 0);
                                         }
-                                        
-                                        if let Some(mut frame) = frame_opt {
-                                            frame.pts = pts;
-                                            frame.width = decoded.width();
-                                            frame.height = decoded.height();
-                                            frame.rotation = rotation;
-                                            
-                                            let format_name = format!("{:?}", decoded.format());
-                                            frame.bit_depth = if format_name.contains("10LE") { 10 } else if format_name.contains("12LE") { 12 } else { 8 };
-                                            frame.color_space = decoded.color_space() as u32;
-                                            frame.color_range = decoded.color_range() as u32;
-                                            frame.color_trc = decoded.color_transfer_characteristic() as u32;
-                                            
-                                            frame.y_stride = decoded.stride(0);
-                                            frame.u_stride = decoded.stride(1);
-                                            frame.v_stride = decoded.stride(2);
-                                            
-                                            let height = decoded.height() as usize;
-                                            let y_len = frame.y_stride * height;
-                                            let u_len = frame.u_stride * (height / 2);
-                                            let v_len = frame.v_stride * (height / 2);
-                                            
-                                            frame.y_plane.clear();
-                                            let y_plane = decoded.data(0);
-                                            let y_copy_len = y_len.min(y_plane.len());
-                                            frame.y_plane.extend_from_slice(&y_plane[..y_copy_len]);
-                                            if y_copy_len < y_len {
-                                                frame.y_plane.resize(y_len, 0);
-                                            }
-                                            
-                                            frame.u_plane.clear();
-                                            let u_plane = decoded.data(1);
-                                            let u_copy_len = u_len.min(u_plane.len());
-                                            frame.u_plane.extend_from_slice(&u_plane[..u_copy_len]);
-                                            if u_copy_len < u_len {
-                                                frame.u_plane.resize(u_len, 0);
-                                            }
-                                            
-                                            frame.v_plane.clear();
-                                            let v_plane = decoded.data(2);
-                                            let v_copy_len = v_len.min(v_plane.len());
-                                            frame.v_plane.extend_from_slice(&v_plane[..v_copy_len]);
-                                            if v_copy_len < v_len {
-                                                frame.v_plane.resize(v_len, 0);
-                                            }
-                                            
-                                            if let Err(crossbeam_channel::TrySendError::Full(f)) = video_frame_tx.try_send(frame) {
-                                                let _ = free_video_frame_tx.try_send(f);
-                                            }
+
+                                        frame.u_plane.clear();
+                                        let u_plane = decoded.data(1);
+                                        let u_copy_len = u_len.min(u_plane.len());
+                                        frame.u_plane.extend_from_slice(&u_plane[..u_copy_len]);
+                                        if u_copy_len < u_len {
+                                            frame.u_plane.resize(u_len, 0);
+                                        }
+
+                                        frame.v_plane.clear();
+                                        let v_plane = decoded.data(2);
+                                        let v_copy_len = v_len.min(v_plane.len());
+                                        frame.v_plane.extend_from_slice(&v_plane[..v_copy_len]);
+                                        if v_copy_len < v_len {
+                                            frame.v_plane.resize(v_len, 0);
+                                        }
+
+                                        if let Err(crossbeam_channel::TrySendError::Full(f)) =
+                                            video_frame_tx.try_send(frame)
+                                        {
+                                            let _ = free_video_frame_tx.try_send(f);
                                         }
                                     }
                                 }
                             }
-                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-                            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                         }
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                     }
                 }
+            }
         });
     }
-    
+
     for _ in 0..pool_size {
         let _ = free_tx.try_send(AudioChunk {
             samples: vec![0.0; chunk_frames * hardware_channels],
@@ -3570,13 +4517,13 @@ fn run_dummy(
             track_ended: false,
         });
     }
-    
+
     let state_for_decoder = shared_state.clone();
     let ready_rx_for_decoder = ready_rx.clone();
     let free_tx_for_decoder = free_tx.clone();
     let video_rx_for_decoder = video_packet_rx.clone();
     let stop_token_decoder = stop_token.clone();
-    
+
     std::thread::spawn(move || {
         while !stop_token_decoder.load(std::sync::atomic::Ordering::Relaxed) {
             let mut chunk = loop {
@@ -3585,8 +4532,11 @@ fn run_dummy(
                 }
                 if let Ok(mut state) = state_for_decoder.try_lock() {
                     if let Some(mix_req) = state.audio_mix_request.take()
-                        && state.audio_tracks.len() > 1 && !mix_req.is_empty() {
-                        let mut new_active: Vec<usize> = mix_req.iter().map(|&(idx, _)| idx).collect();
+                        && state.audio_tracks.len() > 1
+                        && !mix_req.is_empty()
+                    {
+                        let mut new_active: Vec<usize> =
+                            mix_req.iter().map(|&(idx, _)| idx).collect();
                         new_active.sort();
                         let current_active = audio_source.get_active_audio_tracks();
                         let tracks_changed = new_active != current_active;
@@ -3616,14 +4566,22 @@ fn run_dummy(
                                     state.audio_track_volumes[idx] = vol;
                                 }
                             }
-                            
+
                             if tracks_changed {
                                 let mix_desc = if state.active_audio_tracks.len() > 1 {
-                                    let track_nums: Vec<String> = state.active_audio_tracks.iter().map(|idx| (idx + 1).to_string()).collect();
+                                    let track_nums: Vec<String> = state
+                                        .active_audio_tracks
+                                        .iter()
+                                        .map(|idx| (idx + 1).to_string())
+                                        .collect();
                                     format!("🎛 Audio Mix: Tracks {}", track_nums.join("+"))
                                 } else {
                                     let idx = state.selected_audio_track;
-                                    let track_title = state.audio_tracks.get(idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", idx + 1));
+                                    let track_title = state
+                                        .audio_tracks
+                                        .get(idx)
+                                        .map(|t| t.title.clone())
+                                        .unwrap_or_else(|| format!("Track {}", idx + 1));
                                     if track_title.to_lowercase().starts_with("track") {
                                         format!("🎛 {}", track_title)
                                     } else {
@@ -3646,39 +4604,46 @@ fn run_dummy(
                         }
                     }
                     if let Some(track_idx) = state.audio_track_request.take()
-                        && state.audio_tracks.len() > 1 && track_idx < state.audio_tracks.len() && (audio_source.get_active_audio_tracks() != vec![track_idx]) {
-                            let play_pos = state.current_seconds;
-                            if audio_source.select_audio_track(track_idx).is_ok() {
-                                audio_source.set_position_seconds(play_pos);
-                                state.selected_audio_track = track_idx;
-                                state.active_audio_tracks = vec![track_idx];
-                                state.multi_track_mix_mode = false;
-                                state.num_channels = audio_source.get_num_channels();
-                                let ch_count = state.num_channels as usize;
-                                state.channel_vus.resize(ch_count, 0.0);
-                                state.peak_vus.resize(ch_count, 0.0);
-                                state.module_type = audio_source.get_type();
-                                state.bitrate = audio_source.get_bitrate();
-                                let track_title = state.audio_tracks.get(track_idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", track_idx + 1));
-                                let display_title = if track_title.to_lowercase().starts_with("track") {
-                                    format!("🎛 {}", track_title)
-                                } else {
-                                    format!("🎛 Track {}: {}", track_idx + 1, track_title)
-                                };
-                                state.osd_text = Some(display_title);
-                                state.osd_timer = 3.0;
+                        && state.audio_tracks.len() > 1
+                        && track_idx < state.audio_tracks.len()
+                        && (audio_source.get_active_audio_tracks() != vec![track_idx])
+                    {
+                        let play_pos = state.current_seconds;
+                        if audio_source.select_audio_track(track_idx).is_ok() {
+                            audio_source.set_position_seconds(play_pos);
+                            state.selected_audio_track = track_idx;
+                            state.active_audio_tracks = vec![track_idx];
+                            state.multi_track_mix_mode = false;
+                            state.num_channels = audio_source.get_num_channels();
+                            let ch_count = state.num_channels as usize;
+                            state.channel_vus.resize(ch_count, 0.0);
+                            state.peak_vus.resize(ch_count, 0.0);
+                            state.module_type = audio_source.get_type();
+                            state.bitrate = audio_source.get_bitrate();
+                            let track_title = state
+                                .audio_tracks
+                                .get(track_idx)
+                                .map(|t| t.title.clone())
+                                .unwrap_or_else(|| format!("Track {}", track_idx + 1));
+                            let display_title = if track_title.to_lowercase().starts_with("track") {
+                                format!("🎛 {}", track_title)
+                            } else {
+                                format!("🎛 Track {}: {}", track_idx + 1, track_title)
+                            };
+                            state.osd_text = Some(display_title);
+                            state.osd_timer = 3.0;
 
-                                state.lookahead_queue.clear();
-                                state.lookahead_sample_buffer.clear();
-                                state.lookahead_timeline.fill(0.0);
-                                state.lookahead_buffer_start_time = play_pos;
-                                state.waveform_history.clear();
+                            state.lookahead_queue.clear();
+                            state.lookahead_sample_buffer.clear();
+                            state.lookahead_timeline.fill(0.0);
+                            state.lookahead_buffer_start_time = play_pos;
+                            state.waveform_history.clear();
 
-                                while let Ok(c) = ready_rx_for_decoder.try_recv() {
-                                    let _ = free_tx_for_decoder.try_send(c);
-                                }
+                            while let Ok(c) = ready_rx_for_decoder.try_recv() {
+                                let _ = free_tx_for_decoder.try_send(c);
                             }
                         }
+                    }
                     if let Some(pos) = state.seek_request.take() {
                         audio_source.set_position_seconds(pos);
                         state.current_seconds = pos;
@@ -3698,12 +4663,16 @@ fn run_dummy(
                     Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
                 }
             };
-            
+
             let chunk_start_seconds = audio_source.get_position_seconds();
             let decode_start = Instant::now();
-            let frames_read = audio_source.read_frames(hardware_channels, sample_rate, &mut chunk.samples[..chunk_frames * hardware_channels]);
+            let frames_read = audio_source.read_frames(
+                hardware_channels,
+                sample_rate,
+                &mut chunk.samples[..chunk_frames * hardware_channels],
+            );
             let decode_elapsed = decode_start.elapsed().as_micros() as f32;
-            
+
             chunk.valid_frames = frames_read;
             chunk.current_order = audio_source.get_current_order();
             chunk.current_row = audio_source.get_current_row();
@@ -3711,30 +4680,36 @@ fn run_dummy(
             chunk.speed = audio_source.get_speed();
             chunk.current_seconds = chunk_start_seconds;
             chunk.current_row_string.clear();
-            chunk.current_row_string.push_str(&audio_source.get_current_row_string());
+            chunk
+                .current_row_string
+                .push_str(&audio_source.get_current_row_string());
             chunk.tracker_channels = audio_source.get_tracker_channels();
             chunk.spatial_channels = audio_source.get_num_channels();
             chunk.track_ended = frames_read == 0;
-            
+
             let mut left_peak = 0.0_f32;
             let mut right_peak = 0.0_f32;
             let mut clips = 0;
             for i in 0..frames_read {
                 let l_val = chunk.samples[i * hardware_channels];
                 left_peak = left_peak.max(l_val.abs());
-                if l_val.abs() > 1.0001 { clips += 1; }
-                
+                if l_val.abs() > 1.0001 {
+                    clips += 1;
+                }
+
                 if hardware_channels > 1 {
                     let r_val = chunk.samples[i * hardware_channels + 1];
                     right_peak = right_peak.max(r_val.abs());
-                    if r_val.abs() > 1.0001 { clips += 1; }
+                    if r_val.abs() > 1.0001 {
+                        clips += 1;
+                    }
                 } else {
                     right_peak = left_peak;
                 }
             }
             chunk.left_peak = left_peak;
             chunk.right_peak = right_peak;
-            
+
             let mut channel_vus = Vec::new();
             if let Some(num_mod_channels) = chunk.tracker_channels {
                 channel_vus.push(left_peak);
@@ -3749,7 +4724,7 @@ fn run_dummy(
             }
             chunk.channel_vus.clear();
             chunk.channel_vus.extend_from_slice(&channel_vus);
-            
+
             let current_artist = audio_source.get_artist();
             if let Ok(mut state) = state_for_decoder.try_lock() {
                 if current_artist != "Unknown" && !current_artist.is_empty() {
@@ -3768,7 +4743,13 @@ fn run_dummy(
                 let video_pct = (video_rx_for_decoder.len() as f32 / 4096.0) * 100.0;
                 state.stats.video_buffer_fill_pct = video_pct;
                 state.stats.clipping_events += clips;
-                push_chunk_lookahead_slices(&mut state, &chunk, frames_read, hardware_channels, sample_rate);
+                push_chunk_lookahead_slices(
+                    &mut state,
+                    &chunk,
+                    frames_read,
+                    hardware_channels,
+                    sample_rate,
+                );
             }
 
             let mut chunk_to_send = chunk;
@@ -3779,8 +4760,11 @@ fn run_dummy(
                 let mut seeked = false;
                 if let Ok(mut state) = state_for_decoder.try_lock() {
                     if let Some(mix_req) = state.audio_mix_request.take()
-                        && state.audio_tracks.len() > 1 && !mix_req.is_empty() {
-                        let mut new_active: Vec<usize> = mix_req.iter().map(|&(idx, _)| idx).collect();
+                        && state.audio_tracks.len() > 1
+                        && !mix_req.is_empty()
+                    {
+                        let mut new_active: Vec<usize> =
+                            mix_req.iter().map(|&(idx, _)| idx).collect();
                         new_active.sort();
                         let current_active = audio_source.get_active_audio_tracks();
                         let tracks_changed = new_active != current_active;
@@ -3810,14 +4794,22 @@ fn run_dummy(
                                     state.audio_track_volumes[idx] = vol;
                                 }
                             }
-                            
+
                             if tracks_changed {
                                 let mix_desc = if state.active_audio_tracks.len() > 1 {
-                                    let track_nums: Vec<String> = state.active_audio_tracks.iter().map(|idx| (idx + 1).to_string()).collect();
+                                    let track_nums: Vec<String> = state
+                                        .active_audio_tracks
+                                        .iter()
+                                        .map(|idx| (idx + 1).to_string())
+                                        .collect();
                                     format!("🎛 Audio Mix: Tracks {}", track_nums.join("+"))
                                 } else {
                                     let idx = state.selected_audio_track;
-                                    let track_title = state.audio_tracks.get(idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", idx + 1));
+                                    let track_title = state
+                                        .audio_tracks
+                                        .get(idx)
+                                        .map(|t| t.title.clone())
+                                        .unwrap_or_else(|| format!("Track {}", idx + 1));
                                     if track_title.to_lowercase().starts_with("track") {
                                         format!("🎛 {}", track_title)
                                     } else {
@@ -3841,40 +4833,47 @@ fn run_dummy(
                         }
                     }
                     if let Some(track_idx) = state.audio_track_request.take()
-                        && state.audio_tracks.len() > 1 && track_idx < state.audio_tracks.len() && (audio_source.get_active_audio_tracks() != vec![track_idx]) {
-                            let play_pos = state.current_seconds;
-                            if audio_source.select_audio_track(track_idx).is_ok() {
-                                audio_source.set_position_seconds(play_pos);
-                                state.selected_audio_track = track_idx;
-                                state.active_audio_tracks = vec![track_idx];
-                                state.multi_track_mix_mode = false;
-                                state.num_channels = audio_source.get_num_channels();
-                                let ch_count = state.num_channels as usize;
-                                state.channel_vus.resize(ch_count, 0.0);
-                                state.peak_vus.resize(ch_count, 0.0);
-                                state.module_type = audio_source.get_type();
-                                state.bitrate = audio_source.get_bitrate();
-                                let track_title = state.audio_tracks.get(track_idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", track_idx + 1));
-                                let display_title = if track_title.to_lowercase().starts_with("track") {
-                                    format!("🎛 {}", track_title)
-                                } else {
-                                    format!("🎛 Track {}: {}", track_idx + 1, track_title)
-                                };
-                                state.osd_text = Some(display_title);
-                                state.osd_timer = 3.0;
+                        && state.audio_tracks.len() > 1
+                        && track_idx < state.audio_tracks.len()
+                        && (audio_source.get_active_audio_tracks() != vec![track_idx])
+                    {
+                        let play_pos = state.current_seconds;
+                        if audio_source.select_audio_track(track_idx).is_ok() {
+                            audio_source.set_position_seconds(play_pos);
+                            state.selected_audio_track = track_idx;
+                            state.active_audio_tracks = vec![track_idx];
+                            state.multi_track_mix_mode = false;
+                            state.num_channels = audio_source.get_num_channels();
+                            let ch_count = state.num_channels as usize;
+                            state.channel_vus.resize(ch_count, 0.0);
+                            state.peak_vus.resize(ch_count, 0.0);
+                            state.module_type = audio_source.get_type();
+                            state.bitrate = audio_source.get_bitrate();
+                            let track_title = state
+                                .audio_tracks
+                                .get(track_idx)
+                                .map(|t| t.title.clone())
+                                .unwrap_or_else(|| format!("Track {}", track_idx + 1));
+                            let display_title = if track_title.to_lowercase().starts_with("track") {
+                                format!("🎛 {}", track_title)
+                            } else {
+                                format!("🎛 Track {}: {}", track_idx + 1, track_title)
+                            };
+                            state.osd_text = Some(display_title);
+                            state.osd_timer = 3.0;
 
-                                state.lookahead_queue.clear();
-                                state.lookahead_sample_buffer.clear();
-                                state.lookahead_timeline.fill(0.0);
-                                state.lookahead_buffer_start_time = play_pos;
-                                state.waveform_history.clear();
+                            state.lookahead_queue.clear();
+                            state.lookahead_sample_buffer.clear();
+                            state.lookahead_timeline.fill(0.0);
+                            state.lookahead_buffer_start_time = play_pos;
+                            state.waveform_history.clear();
 
-                                while let Ok(c) = ready_rx_for_decoder.try_recv() {
-                                    let _ = free_tx_for_decoder.try_send(c);
-                                }
-                                seeked = true;
+                            while let Ok(c) = ready_rx_for_decoder.try_recv() {
+                                let _ = free_tx_for_decoder.try_send(c);
                             }
+                            seeked = true;
                         }
+                    }
                     if let Some(pos) = state.seek_request.take() {
                         audio_source.set_position_seconds(pos);
                         state.current_seconds = pos;
@@ -3906,7 +4905,7 @@ fn run_dummy(
                     }
                 }
             }
-            
+
             if frames_read == 0 {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
@@ -3917,7 +4916,8 @@ fn run_dummy(
 
     let thread_handle = std::thread::spawn(move || {
         let mut fft_buffer: Vec<f32> = vec![0.0; window_size];
-        let mut channel_fft_buffers: Vec<Vec<f32>> = vec![vec![0.0; window_size]; hardware_channels];
+        let mut channel_fft_buffers: Vec<Vec<f32>> =
+            vec![vec![0.0; window_size]; hardware_channels];
         let mut windowed_buffer: Vec<f32> = vec![0.0; window_size];
         let mut windowed_channels: Vec<Vec<f32>> = vec![vec![0.0; window_size]; hardware_channels];
         let mut spare_channels: Vec<Vec<f32>> = vec![vec![0.0; window_size]; hardware_channels];
@@ -3942,7 +4942,8 @@ fn run_dummy(
             match ready_rx.recv_timeout(std::time::Duration::from_millis(50)) {
                 Ok(chunk) => {
                     if chunk.track_ended
-                        && let Ok(mut state) = shared_state_dummy.try_lock() {
+                        && let Ok(mut state) = shared_state_dummy.try_lock()
+                    {
                         state.track_ended = true;
                     }
 
@@ -3950,7 +4951,11 @@ fn run_dummy(
                     let to_copy = chunk.valid_frames;
                     for i in 0..to_copy {
                         let mut mono = 0.0;
-                        for (c, buf) in channel_fft_buffers.iter_mut().enumerate().take(hardware_channels) {
+                        for (c, buf) in channel_fft_buffers
+                            .iter_mut()
+                            .enumerate()
+                            .take(hardware_channels)
+                        {
                             let sample = chunk.samples[i * hardware_channels + c].clamp(-1.0, 1.0);
                             mono += sample;
                             buf[fft_index] = sample;
@@ -3979,7 +4984,10 @@ fn run_dummy(
                         speed: chunk.speed,
                         current_seconds: chunk.current_seconds,
                         current_row_string: chunk.current_row_string.clone(),
-                        channel_audio_data: std::mem::replace(&mut spare_channels, vec![vec![0.0; window_size]; hardware_channels]),
+                        channel_audio_data: std::mem::replace(
+                            &mut spare_channels,
+                            vec![vec![0.0; window_size]; hardware_channels],
+                        ),
                     };
 
                     let _ = tx.try_send(msg);
@@ -4005,7 +5013,6 @@ fn run_dummy(
 
     Ok(PlaybackHandle::Dummy(Some(thread_handle), stop_token))
 }
-
 
 struct AudioChunk {
     samples: Vec<f32>,
@@ -4041,28 +5048,28 @@ where
 {
     let stop_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let hardware_channels = config.channels as usize;
-    
+
     let chunk_frames = 1024;
-    let pool_size = ((sample_rate as usize * 8) / chunk_frames).clamp(384, 1024); 
-    
+    let pool_size = ((sample_rate as usize * 8) / chunk_frames).clamp(384, 1024);
+
     let (ready_tx, ready_rx) = bounded::<AudioChunk>(pool_size);
     let (free_tx, free_rx) = unbounded::<AudioChunk>();
-    
+
     #[cfg(not(target_os = "android"))]
     let (video_packet_tx, video_packet_rx) = bounded::<(u64, ffmpeg_next::Packet)>(4096);
     #[cfg(target_os = "android")]
     let (_video_packet_tx, video_packet_rx) = bounded::<(u64, ())>(1);
-    
+
     let mut current_chunk: Option<AudioChunk> = None;
     let mut chunk_frame_pos = 0;
-    
+
     let mut fft_buffer: Vec<f32> = vec![0.0; window_size];
     let mut channel_fft_buffers: Vec<Vec<f32>> = vec![vec![0.0; window_size]; hardware_channels];
     let mut windowed_buffer: Vec<f32> = vec![0.0; window_size];
     let mut windowed_channels: Vec<Vec<f32>> = vec![vec![0.0; window_size]; hardware_channels];
     let mut spare_channels: Vec<Vec<f32>> = vec![vec![0.0; window_size]; hardware_channels];
     let mut fft_index = 0;
-    
+
     let mut last_channel_vus = Vec::new();
     let mut last_current_order = 0;
     let mut last_current_row = 0;
@@ -4084,7 +5091,7 @@ where
             if let Ok(state) = shared_state_cb.try_lock() {
                 was_paused = state.is_paused;
             }
-            
+
             if was_paused {
                 for sample in data.iter_mut() {
                     *sample = T::from_sample(0.0);
@@ -4098,7 +5105,7 @@ where
 
             let frames_to_render = data.len() / hardware_channels;
             let mut frames_written = 0;
-            
+
             while frames_written < frames_to_render {
                 if current_chunk.is_none() {
                     match ready_rx_cb.try_recv() {
@@ -4112,17 +5119,20 @@ where
                             last_current_seconds = chunk.current_seconds;
                             last_current_row_string.clear();
                             last_current_row_string.push_str(&chunk.current_row_string);
-                            
+
                             if chunk.track_ended
-                                && let Ok(mut state) = shared_state_cb.try_lock() {
+                                && let Ok(mut state) = shared_state_cb.try_lock()
+                            {
                                 state.track_ended = true;
                             }
-                            
+
                             current_chunk = Some(chunk);
                             chunk_frame_pos = 0;
                         }
                         Err(_) => {
-                            for frame in data[frames_written * hardware_channels..].chunks_mut(hardware_channels) {
+                            for frame in data[frames_written * hardware_channels..]
+                                .chunks_mut(hardware_channels)
+                            {
                                 for sample in frame.iter_mut() {
                                     *sample = T::from_sample(0.0);
                                 }
@@ -4131,36 +5141,37 @@ where
                         }
                     }
                 }
-                
+
                 if let Some(chunk) = current_chunk.as_mut() {
                     let frames_available = chunk.valid_frames.saturating_sub(chunk_frame_pos);
                     let frames_needed = frames_to_render - frames_written;
-                    
+
                     if frames_available == 0 {
                         let c = current_chunk.take().unwrap();
                         let _ = free_tx_cb.try_send(c);
                         continue;
                     }
-                    
+
                     let to_copy = std::cmp::min(frames_available, frames_needed);
-                    
+
                     for i in 0..to_copy {
                         let src_frame_idx = chunk_frame_pos + i;
                         let dst_frame_idx = frames_written + i;
-                        
+
                         let mut mono = 0.0;
                         for c in 0..hardware_channels {
-                            let sample = chunk.samples[src_frame_idx * hardware_channels + c].clamp(-1.0, 1.0);
+                            let sample = chunk.samples[src_frame_idx * hardware_channels + c]
+                                .clamp(-1.0, 1.0);
                             data[dst_frame_idx * hardware_channels + c] = T::from_sample(sample);
                             mono += sample;
                             channel_fft_buffers[c][fft_index] = sample;
                         }
                         mono /= hardware_channels as f32;
-                        
+
                         fft_buffer[fft_index] = mono;
                         fft_index = (fft_index + 1) % window_size;
                     }
-                    
+
                     chunk_frame_pos += to_copy;
                     frames_written += to_copy;
                 }
@@ -4174,11 +5185,11 @@ where
                     windowed_channels[c][i] = channel_fft_buffers[c][idx];
                 }
             }
-            
+
             // Swap filled buffers with spare set — zero allocations in the hot path
             std::mem::swap(&mut windowed_channels, &mut spare_channels);
             // spare_channels now has the filled data, windowed_channels has the empties
-            
+
             let play_time = last_current_seconds + (chunk_frame_pos as f64 / sample_rate as f64);
             let msg = DspMessage {
                 audio_data: windowed_buffer.clone(),
@@ -4189,9 +5200,12 @@ where
                 speed: last_speed,
                 current_seconds: play_time,
                 current_row_string: last_current_row_string.clone(),
-                channel_audio_data: std::mem::replace(&mut spare_channels, vec![vec![0.0; window_size]; hardware_channels]),
+                channel_audio_data: std::mem::replace(
+                    &mut spare_channels,
+                    vec![vec![0.0; window_size]; hardware_channels],
+                ),
             };
-            
+
             let _ = tx_cb.try_send(msg);
         },
         move |err| {
@@ -4225,7 +5239,7 @@ where
     let mut audio_source = audio_source_opt.take().unwrap();
     #[cfg(not(target_os = "android"))]
     audio_source.attach_video_queue(video_packet_tx);
-    
+
     #[cfg(target_os = "android")]
     if audio_source.has_video_stream() {
         crate::android_video::decoder::start_android_video_thread(
@@ -4234,12 +5248,12 @@ where
             stop_token.clone(),
         );
     }
-    
+
     #[cfg(not(target_os = "android"))]
     if let Some((params, time_base, rotation)) = audio_source.take_video_parameters() {
         let (video_frame_tx, video_frame_rx) = bounded::<crate::state::VideoFrame>(16);
         let (free_video_frame_tx, free_video_frame_rx) = unbounded::<crate::state::VideoFrame>();
-        
+
         for _ in 0..16 {
             let _ = free_video_frame_tx.try_send(crate::state::VideoFrame {
                 pts: 0.0,
@@ -4258,190 +5272,228 @@ where
                 color_trc: 0,
             });
         }
-        
+
         if let Ok(mut state) = shared_state.lock() {
             state.video_frame_rx = Some(video_frame_rx);
             state.free_video_frame_tx = Some(free_video_frame_tx.clone());
         }
-        
+
         let state_for_video = shared_state.clone();
         let video_packet_rx_for_video = video_packet_rx.clone();
         let stop_token_video = stop_token.clone();
         std::thread::spawn(move || {
             if let Ok(context) = ffmpeg_next::codec::context::Context::from_parameters(params)
-                && let Ok(mut decoder) = context.decoder().video() {
-                    let tb = time_base.numerator() as f64 / time_base.denominator() as f64;
-                    let mut local_epoch = 0;
-                    let mut fallback_pts_seconds = 0.0;
-                    let mut is_first_frame_after_seek = false;
-                    
-                    while !stop_token_video.load(std::sync::atomic::Ordering::Relaxed) {
-                        match video_packet_rx_for_video.recv_timeout(std::time::Duration::from_millis(50)) {
-                            Ok((packet_epoch, packet)) => {
-                                {
-                                    let state = state_for_video.lock().unwrap();
-                                    if state.seek_epoch > local_epoch {
-                                        decoder.flush();
-                                        local_epoch = state.seek_epoch;
-                                        is_first_frame_after_seek = true;
+                && let Ok(mut decoder) = context.decoder().video()
+            {
+                let tb = time_base.numerator() as f64 / time_base.denominator() as f64;
+                let mut local_epoch = 0;
+                let mut fallback_pts_seconds = 0.0;
+                let mut is_first_frame_after_seek = false;
+
+                while !stop_token_video.load(std::sync::atomic::Ordering::Relaxed) {
+                    match video_packet_rx_for_video
+                        .recv_timeout(std::time::Duration::from_millis(50))
+                    {
+                        Ok((packet_epoch, packet)) => {
+                            {
+                                let state = state_for_video.lock().unwrap();
+                                if state.seek_epoch > local_epoch {
+                                    decoder.flush();
+                                    local_epoch = state.seek_epoch;
+                                    is_first_frame_after_seek = true;
+                                }
+                            }
+
+                            if packet_epoch < local_epoch {
+                                continue;
+                            }
+
+                            if decoder.send_packet(&packet).is_ok() {
+                                let mut decoded = ffmpeg_next::frame::Video::empty();
+                                while decoder.receive_frame(&mut decoded).is_ok() {
+                                    if stop_token_video.load(std::sync::atomic::Ordering::Relaxed) {
+                                        return;
                                     }
-                                }
-                                
-                                if packet_epoch < local_epoch {
-                                    continue;
-                                }
-                                
-                                if decoder.send_packet(&packet).is_ok() {
-                                    let mut decoded = ffmpeg_next::frame::Video::empty();
-                                    while decoder.receive_frame(&mut decoded).is_ok() {
-                                        if stop_token_video.load(std::sync::atomic::Ordering::Relaxed) {
-                                            return;
-                                        }
-                                        let mut pts = decoded.timestamp().map(|t| t as f64 * tb)
-                                            .or_else(|| decoded.pts().map(|p| p as f64 * tb))
-                                            .unwrap_or(-1.0);
-                                            
-                                        if pts < 0.0 {
-                                            pts = fallback_pts_seconds;
-                                            fallback_pts_seconds += 1.0 / 30.0;
-                                        } else {
-                                            fallback_pts_seconds = pts + (1.0 / 30.0);
-                                        }
-                                        
-                                        let mut skip_push = false;
-                                        if is_first_frame_after_seek {
-                                            is_first_frame_after_seek = false;
-                                        } else {
-                                            let sync_start = std::time::Instant::now();
-                                            loop {
-                                                if stop_token_video.load(std::sync::atomic::Ordering::Relaxed) {
-                                                    return;
-                                                }
-                                                let (cached_seconds, current_epoch, is_paused, track_ended) = {
-                                                    let state = state_for_video.lock().unwrap();
-                                                    (state.current_seconds, state.seek_epoch, state.is_paused, state.track_ended)
-                                                };
-                                                
-                                                if track_ended || current_epoch > local_epoch {
-                                                    skip_push = true;
-                                                    break;
-                                                }
-                                                
-                                                if pts < cached_seconds - 0.05 {
-                                                    skip_push = true;
-                                                    break;
-                                                }
-                                                
-                                                if pts <= cached_seconds + 0.05 {
-                                                    break;
-                                                }
-                                                
-                                                if sync_start.elapsed() > std::time::Duration::from_millis(500) {
-                                                    skip_push = true;
-                                                    break;
-                                                }
-                                                
-                                                let sleep_dur = if is_paused { 50 } else { 5 };
-                                                std::thread::sleep(std::time::Duration::from_millis(sleep_dur));
-                                            }
-                                        }
-                                        
-                                        if skip_push {
-                                            continue;
-                                        }
-                                        
-                                        let mut frame_opt = None;
+                                    let mut pts = decoded
+                                        .timestamp()
+                                        .map(|t| t as f64 * tb)
+                                        .or_else(|| decoded.pts().map(|p| p as f64 * tb))
+                                        .unwrap_or(-1.0);
+
+                                    if pts < 0.0 {
+                                        pts = fallback_pts_seconds;
+                                        fallback_pts_seconds += 1.0 / 30.0;
+                                    } else {
+                                        fallback_pts_seconds = pts + (1.0 / 30.0);
+                                    }
+
+                                    let mut skip_push = false;
+                                    if is_first_frame_after_seek {
+                                        is_first_frame_after_seek = false;
+                                    } else {
+                                        let sync_start = std::time::Instant::now();
                                         loop {
-                                            if stop_token_video.load(std::sync::atomic::Ordering::Relaxed) {
+                                            if stop_token_video
+                                                .load(std::sync::atomic::Ordering::Relaxed)
+                                            {
                                                 return;
                                             }
-                                            let (current_epoch, is_paused, track_ended) = {
+                                            let (
+                                                cached_seconds,
+                                                current_epoch,
+                                                is_paused,
+                                                track_ended,
+                                            ) = {
                                                 let state = state_for_video.lock().unwrap();
-                                                (state.seek_epoch, state.is_paused, state.track_ended)
+                                                (
+                                                    state.current_seconds,
+                                                    state.seek_epoch,
+                                                    state.is_paused,
+                                                    state.track_ended,
+                                                )
                                             };
+
                                             if track_ended || current_epoch > local_epoch {
                                                 skip_push = true;
                                                 break;
                                             }
-                                            match free_video_frame_rx.recv_timeout(std::time::Duration::from_millis(10)) {
-                                                Ok(f) => {
-                                                    frame_opt = Some(f);
-                                                    break;
-                                                }
-                                                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                                                    let sleep_dur = if is_paused { 50 } else { 5 };
-                                                    std::thread::sleep(std::time::Duration::from_millis(sleep_dur));
-                                                }
-                                                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                                                    return;
-                                                }
+
+                                            if pts < cached_seconds - 0.05 {
+                                                skip_push = true;
+                                                break;
+                                            }
+
+                                            if pts <= cached_seconds + 0.05 {
+                                                break;
+                                            }
+
+                                            if sync_start.elapsed()
+                                                > std::time::Duration::from_millis(500)
+                                            {
+                                                skip_push = true;
+                                                break;
+                                            }
+
+                                            let sleep_dur = if is_paused { 50 } else { 5 };
+                                            std::thread::sleep(std::time::Duration::from_millis(
+                                                sleep_dur,
+                                            ));
+                                        }
+                                    }
+
+                                    if skip_push {
+                                        continue;
+                                    }
+
+                                    let mut frame_opt = None;
+                                    loop {
+                                        if stop_token_video
+                                            .load(std::sync::atomic::Ordering::Relaxed)
+                                        {
+                                            return;
+                                        }
+                                        let (current_epoch, is_paused, track_ended) = {
+                                            let state = state_for_video.lock().unwrap();
+                                            (state.seek_epoch, state.is_paused, state.track_ended)
+                                        };
+                                        if track_ended || current_epoch > local_epoch {
+                                            skip_push = true;
+                                            break;
+                                        }
+                                        match free_video_frame_rx
+                                            .recv_timeout(std::time::Duration::from_millis(10))
+                                        {
+                                            Ok(f) => {
+                                                frame_opt = Some(f);
+                                                break;
+                                            }
+                                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                                                let sleep_dur = if is_paused { 50 } else { 5 };
+                                                std::thread::sleep(
+                                                    std::time::Duration::from_millis(sleep_dur),
+                                                );
+                                            }
+                                            Err(
+                                                crossbeam_channel::RecvTimeoutError::Disconnected,
+                                            ) => {
+                                                return;
                                             }
                                         }
-                                        
-                                        if skip_push {
-                                            continue;
+                                    }
+
+                                    if skip_push {
+                                        continue;
+                                    }
+
+                                    if let Some(mut frame) = frame_opt {
+                                        frame.pts = pts;
+                                        frame.width = decoded.width();
+                                        frame.height = decoded.height();
+                                        frame.rotation = rotation;
+
+                                        let format_name = format!("{:?}", decoded.format());
+                                        frame.bit_depth = if format_name.contains("10LE") {
+                                            10
+                                        } else if format_name.contains("12LE") {
+                                            12
+                                        } else {
+                                            8
+                                        };
+                                        frame.color_space = decoded.color_space() as u32;
+                                        frame.color_range = decoded.color_range() as u32;
+                                        frame.color_trc =
+                                            decoded.color_transfer_characteristic() as u32;
+
+                                        frame.y_stride = decoded.stride(0);
+                                        frame.u_stride = decoded.stride(1);
+                                        frame.v_stride = decoded.stride(2);
+
+                                        let height = decoded.height() as usize;
+                                        let y_len = frame.y_stride * height;
+                                        let u_len = frame.u_stride * (height / 2);
+                                        let v_len = frame.v_stride * (height / 2);
+
+                                        frame.y_plane.clear();
+                                        let y_plane = decoded.data(0);
+                                        let y_copy_len = y_len.min(y_plane.len());
+                                        frame.y_plane.extend_from_slice(&y_plane[..y_copy_len]);
+                                        if y_copy_len < y_len {
+                                            frame.y_plane.resize(y_len, 0);
                                         }
-                                        
-                                        if let Some(mut frame) = frame_opt {
-                                            frame.pts = pts;
-                                            frame.width = decoded.width();
-                                            frame.height = decoded.height();
-                                            frame.rotation = rotation;
-                                            
-                                            let format_name = format!("{:?}", decoded.format());
-                                            frame.bit_depth = if format_name.contains("10LE") { 10 } else if format_name.contains("12LE") { 12 } else { 8 };
-                                            frame.color_space = decoded.color_space() as u32;
-                                            frame.color_range = decoded.color_range() as u32;
-                                            frame.color_trc = decoded.color_transfer_characteristic() as u32;
-                                            
-                                            frame.y_stride = decoded.stride(0);
-                                            frame.u_stride = decoded.stride(1);
-                                            frame.v_stride = decoded.stride(2);
-                                            
-                                            let height = decoded.height() as usize;
-                                            let y_len = frame.y_stride * height;
-                                            let u_len = frame.u_stride * (height / 2);
-                                            let v_len = frame.v_stride * (height / 2);
-                                            
-                                            frame.y_plane.clear();
-                                            let y_plane = decoded.data(0);
-                                            let y_copy_len = y_len.min(y_plane.len());
-                                            frame.y_plane.extend_from_slice(&y_plane[..y_copy_len]);
-                                            if y_copy_len < y_len {
-                                                frame.y_plane.resize(y_len, 0);
-                                            }
-                                            
-                                            frame.u_plane.clear();
-                                            let u_plane = decoded.data(1);
-                                            let u_copy_len = u_len.min(u_plane.len());
-                                            frame.u_plane.extend_from_slice(&u_plane[..u_copy_len]);
-                                            if u_copy_len < u_len {
-                                                frame.u_plane.resize(u_len, 0);
-                                            }
-                                            
-                                            frame.v_plane.clear();
-                                            let v_plane = decoded.data(2);
-                                            let v_copy_len = v_len.min(v_plane.len());
-                                            frame.v_plane.extend_from_slice(&v_plane[..v_copy_len]);
-                                            if v_copy_len < v_len {
-                                                frame.v_plane.resize(v_len, 0);
-                                            }
-                                            
-                                            if let Err(crossbeam_channel::TrySendError::Full(f)) = video_frame_tx.try_send(frame) {
-                                                let _ = free_video_frame_tx.try_send(f);
-                                            }
+
+                                        frame.u_plane.clear();
+                                        let u_plane = decoded.data(1);
+                                        let u_copy_len = u_len.min(u_plane.len());
+                                        frame.u_plane.extend_from_slice(&u_plane[..u_copy_len]);
+                                        if u_copy_len < u_len {
+                                            frame.u_plane.resize(u_len, 0);
+                                        }
+
+                                        frame.v_plane.clear();
+                                        let v_plane = decoded.data(2);
+                                        let v_copy_len = v_len.min(v_plane.len());
+                                        frame.v_plane.extend_from_slice(&v_plane[..v_copy_len]);
+                                        if v_copy_len < v_len {
+                                            frame.v_plane.resize(v_len, 0);
+                                        }
+
+                                        if let Err(crossbeam_channel::TrySendError::Full(f)) =
+                                            video_frame_tx.try_send(frame)
+                                        {
+                                            let _ = free_video_frame_tx.try_send(f);
                                         }
                                     }
                                 }
                             }
-                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-                            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                         }
+                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
                     }
                 }
+            }
         });
     }
-    
+
     for _ in 0..pool_size {
         let _ = free_tx.try_send(AudioChunk {
             samples: vec![0.0; chunk_frames * hardware_channels],
@@ -4465,7 +5517,11 @@ where
     for _ in 0..4 {
         if let Ok(mut chunk) = free_rx.try_recv() {
             let chunk_start_seconds = audio_source.get_position_seconds();
-            let frames_read = audio_source.read_frames(hardware_channels, sample_rate, &mut chunk.samples[..chunk_frames * hardware_channels]);
+            let frames_read = audio_source.read_frames(
+                hardware_channels,
+                sample_rate,
+                &mut chunk.samples[..chunk_frames * hardware_channels],
+            );
             if frames_read > 0 {
                 chunk.valid_frames = frames_read;
                 chunk.current_order = audio_source.get_current_order();
@@ -4474,7 +5530,9 @@ where
                 chunk.speed = audio_source.get_speed();
                 chunk.current_seconds = chunk_start_seconds;
                 chunk.current_row_string.clear();
-                chunk.current_row_string.push_str(&audio_source.get_current_row_string());
+                chunk
+                    .current_row_string
+                    .push_str(&audio_source.get_current_row_string());
                 chunk.tracker_channels = audio_source.get_tracker_channels();
                 chunk.spatial_channels = audio_source.get_num_channels();
                 chunk.track_ended = false;
@@ -4516,13 +5574,13 @@ where
             }
         }
     }
-    
+
     let state_for_decoder = shared_state.clone();
     let ready_rx_for_decoder = ready_rx.clone();
     let free_tx_for_decoder = free_tx.clone();
     let video_rx_for_decoder = video_packet_rx.clone();
     let stop_token_decoder = stop_token.clone();
-    
+
     std::thread::spawn(move || {
         while !stop_token_decoder.load(std::sync::atomic::Ordering::Relaxed) {
             let mut chunk = loop {
@@ -4531,8 +5589,11 @@ where
                 }
                 if let Ok(mut state) = state_for_decoder.try_lock() {
                     if let Some(mix_req) = state.audio_mix_request.take()
-                        && state.audio_tracks.len() > 1 && !mix_req.is_empty() {
-                        let mut new_active: Vec<usize> = mix_req.iter().map(|&(idx, _)| idx).collect();
+                        && state.audio_tracks.len() > 1
+                        && !mix_req.is_empty()
+                    {
+                        let mut new_active: Vec<usize> =
+                            mix_req.iter().map(|&(idx, _)| idx).collect();
                         new_active.sort();
                         let current_active = audio_source.get_active_audio_tracks();
                         let tracks_changed = new_active != current_active;
@@ -4562,14 +5623,22 @@ where
                                     state.audio_track_volumes[idx] = vol;
                                 }
                             }
-                            
+
                             if tracks_changed {
                                 let mix_desc = if state.active_audio_tracks.len() > 1 {
-                                    let track_nums: Vec<String> = state.active_audio_tracks.iter().map(|idx| (idx + 1).to_string()).collect();
+                                    let track_nums: Vec<String> = state
+                                        .active_audio_tracks
+                                        .iter()
+                                        .map(|idx| (idx + 1).to_string())
+                                        .collect();
                                     format!("🎛 Audio Mix: Tracks {}", track_nums.join("+"))
                                 } else {
                                     let idx = state.selected_audio_track;
-                                    let track_title = state.audio_tracks.get(idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", idx + 1));
+                                    let track_title = state
+                                        .audio_tracks
+                                        .get(idx)
+                                        .map(|t| t.title.clone())
+                                        .unwrap_or_else(|| format!("Track {}", idx + 1));
                                     if track_title.to_lowercase().starts_with("track") {
                                         format!("🎛 {}", track_title)
                                     } else {
@@ -4592,39 +5661,46 @@ where
                         }
                     }
                     if let Some(track_idx) = state.audio_track_request.take()
-                        && state.audio_tracks.len() > 1 && track_idx < state.audio_tracks.len() && (audio_source.get_active_audio_tracks() != vec![track_idx]) {
-                            let play_pos = state.current_seconds;
-                            if audio_source.select_audio_track(track_idx).is_ok() {
-                                audio_source.set_position_seconds(play_pos);
-                                state.selected_audio_track = track_idx;
-                                state.active_audio_tracks = vec![track_idx];
-                                state.multi_track_mix_mode = false;
-                                state.num_channels = audio_source.get_num_channels();
-                                let ch_count = state.num_channels as usize;
-                                state.channel_vus.resize(ch_count, 0.0);
-                                state.peak_vus.resize(ch_count, 0.0);
-                                state.module_type = audio_source.get_type();
-                                state.bitrate = audio_source.get_bitrate();
-                                let track_title = state.audio_tracks.get(track_idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", track_idx + 1));
-                                let display_title = if track_title.to_lowercase().starts_with("track") {
-                                    format!("🎛 {}", track_title)
-                                } else {
-                                    format!("🎛 Track {}: {}", track_idx + 1, track_title)
-                                };
-                                state.osd_text = Some(display_title);
-                                state.osd_timer = 3.0;
+                        && state.audio_tracks.len() > 1
+                        && track_idx < state.audio_tracks.len()
+                        && (audio_source.get_active_audio_tracks() != vec![track_idx])
+                    {
+                        let play_pos = state.current_seconds;
+                        if audio_source.select_audio_track(track_idx).is_ok() {
+                            audio_source.set_position_seconds(play_pos);
+                            state.selected_audio_track = track_idx;
+                            state.active_audio_tracks = vec![track_idx];
+                            state.multi_track_mix_mode = false;
+                            state.num_channels = audio_source.get_num_channels();
+                            let ch_count = state.num_channels as usize;
+                            state.channel_vus.resize(ch_count, 0.0);
+                            state.peak_vus.resize(ch_count, 0.0);
+                            state.module_type = audio_source.get_type();
+                            state.bitrate = audio_source.get_bitrate();
+                            let track_title = state
+                                .audio_tracks
+                                .get(track_idx)
+                                .map(|t| t.title.clone())
+                                .unwrap_or_else(|| format!("Track {}", track_idx + 1));
+                            let display_title = if track_title.to_lowercase().starts_with("track") {
+                                format!("🎛 {}", track_title)
+                            } else {
+                                format!("🎛 Track {}: {}", track_idx + 1, track_title)
+                            };
+                            state.osd_text = Some(display_title);
+                            state.osd_timer = 3.0;
 
-                                state.lookahead_queue.clear();
-                                state.lookahead_sample_buffer.clear();
-                                state.lookahead_timeline.fill(0.0);
-                                state.lookahead_buffer_start_time = play_pos;
-                                state.waveform_history.clear();
+                            state.lookahead_queue.clear();
+                            state.lookahead_sample_buffer.clear();
+                            state.lookahead_timeline.fill(0.0);
+                            state.lookahead_buffer_start_time = play_pos;
+                            state.waveform_history.clear();
 
-                                while let Ok(c) = ready_rx_for_decoder.try_recv() {
-                                    let _ = free_tx_for_decoder.try_send(c);
-                                }
+                            while let Ok(c) = ready_rx_for_decoder.try_recv() {
+                                let _ = free_tx_for_decoder.try_send(c);
                             }
                         }
+                    }
                     if let Some(pos) = state.seek_request.take() {
                         audio_source.set_position_seconds(pos);
                         state.current_seconds = pos;
@@ -4647,12 +5723,16 @@ where
                     Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
                 }
             };
-            
+
             let chunk_start_seconds = audio_source.get_position_seconds();
             let decode_start = Instant::now();
-            let frames_read = audio_source.read_frames(hardware_channels, sample_rate, &mut chunk.samples[..chunk_frames * hardware_channels]);
+            let frames_read = audio_source.read_frames(
+                hardware_channels,
+                sample_rate,
+                &mut chunk.samples[..chunk_frames * hardware_channels],
+            );
             let decode_elapsed = decode_start.elapsed().as_micros() as f32;
-            
+
             chunk.valid_frames = frames_read;
             chunk.current_order = audio_source.get_current_order();
             chunk.current_row = audio_source.get_current_row();
@@ -4660,30 +5740,36 @@ where
             chunk.speed = audio_source.get_speed();
             chunk.current_seconds = chunk_start_seconds;
             chunk.current_row_string.clear();
-            chunk.current_row_string.push_str(&audio_source.get_current_row_string());
+            chunk
+                .current_row_string
+                .push_str(&audio_source.get_current_row_string());
             chunk.tracker_channels = audio_source.get_tracker_channels();
             chunk.spatial_channels = audio_source.get_num_channels();
             chunk.track_ended = frames_read == 0;
-            
+
             let mut left_peak = 0.0_f32;
             let mut right_peak = 0.0_f32;
             let mut clips = 0;
             for i in 0..frames_read {
                 let l_val = chunk.samples[i * hardware_channels];
                 left_peak = left_peak.max(l_val.abs());
-                if l_val.abs() > 1.0001 { clips += 1; }
-                
+                if l_val.abs() > 1.0001 {
+                    clips += 1;
+                }
+
                 if hardware_channels > 1 {
                     let r_val = chunk.samples[i * hardware_channels + 1];
                     right_peak = right_peak.max(r_val.abs());
-                    if r_val.abs() > 1.0001 { clips += 1; }
+                    if r_val.abs() > 1.0001 {
+                        clips += 1;
+                    }
                 } else {
                     right_peak = left_peak;
                 }
             }
             chunk.left_peak = left_peak;
             chunk.right_peak = right_peak;
-            
+
             let mut channel_vus = Vec::new();
             if let Some(num_mod_channels) = chunk.tracker_channels {
                 channel_vus.push(left_peak);
@@ -4698,7 +5784,7 @@ where
             }
             chunk.channel_vus.clear();
             chunk.channel_vus.extend_from_slice(&channel_vus);
-            
+
             let current_artist = audio_source.get_artist();
             if let Ok(mut state) = state_for_decoder.try_lock() {
                 if current_artist != "Unknown" && !current_artist.is_empty() {
@@ -4717,7 +5803,13 @@ where
                 let video_pct = (video_rx_for_decoder.len() as f32 / 4096.0) * 100.0;
                 state.stats.video_buffer_fill_pct = video_pct;
                 state.stats.clipping_events += clips;
-                push_chunk_lookahead_slices(&mut state, &chunk, frames_read, hardware_channels, sample_rate);
+                push_chunk_lookahead_slices(
+                    &mut state,
+                    &chunk,
+                    frames_read,
+                    hardware_channels,
+                    sample_rate,
+                );
             }
 
             let mut chunk_to_send = chunk;
@@ -4728,8 +5820,11 @@ where
                 let mut seeked = false;
                 if let Ok(mut state) = state_for_decoder.try_lock() {
                     if let Some(mix_req) = state.audio_mix_request.take()
-                        && state.audio_tracks.len() > 1 && !mix_req.is_empty() {
-                        let mut new_active: Vec<usize> = mix_req.iter().map(|&(idx, _)| idx).collect();
+                        && state.audio_tracks.len() > 1
+                        && !mix_req.is_empty()
+                    {
+                        let mut new_active: Vec<usize> =
+                            mix_req.iter().map(|&(idx, _)| idx).collect();
                         new_active.sort();
                         let current_active = audio_source.get_active_audio_tracks();
                         let tracks_changed = new_active != current_active;
@@ -4759,14 +5854,22 @@ where
                                     state.audio_track_volumes[idx] = vol;
                                 }
                             }
-                            
+
                             if tracks_changed {
                                 let mix_desc = if state.active_audio_tracks.len() > 1 {
-                                    let track_nums: Vec<String> = state.active_audio_tracks.iter().map(|idx| (idx + 1).to_string()).collect();
+                                    let track_nums: Vec<String> = state
+                                        .active_audio_tracks
+                                        .iter()
+                                        .map(|idx| (idx + 1).to_string())
+                                        .collect();
                                     format!("🎛 Audio Mix: Tracks {}", track_nums.join("+"))
                                 } else {
                                     let idx = state.selected_audio_track;
-                                    let track_title = state.audio_tracks.get(idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", idx + 1));
+                                    let track_title = state
+                                        .audio_tracks
+                                        .get(idx)
+                                        .map(|t| t.title.clone())
+                                        .unwrap_or_else(|| format!("Track {}", idx + 1));
                                     if track_title.to_lowercase().starts_with("track") {
                                         format!("🎛 {}", track_title)
                                     } else {
@@ -4790,40 +5893,47 @@ where
                         }
                     }
                     if let Some(track_idx) = state.audio_track_request.take()
-                        && state.audio_tracks.len() > 1 && track_idx < state.audio_tracks.len() && (audio_source.get_active_audio_tracks() != vec![track_idx]) {
-                            let play_pos = state.current_seconds;
-                            if audio_source.select_audio_track(track_idx).is_ok() {
-                                audio_source.set_position_seconds(play_pos);
-                                state.selected_audio_track = track_idx;
-                                state.active_audio_tracks = vec![track_idx];
-                                state.multi_track_mix_mode = false;
-                                state.num_channels = audio_source.get_num_channels();
-                                let ch_count = state.num_channels as usize;
-                                state.channel_vus.resize(ch_count, 0.0);
-                                state.peak_vus.resize(ch_count, 0.0);
-                                state.module_type = audio_source.get_type();
-                                state.bitrate = audio_source.get_bitrate();
-                                let track_title = state.audio_tracks.get(track_idx).map(|t| t.title.clone()).unwrap_or_else(|| format!("Track {}", track_idx + 1));
-                                let display_title = if track_title.to_lowercase().starts_with("track") {
-                                    format!("🎛 {}", track_title)
-                                } else {
-                                    format!("🎛 Track {}: {}", track_idx + 1, track_title)
-                                };
-                                state.osd_text = Some(display_title);
-                                state.osd_timer = 3.0;
+                        && state.audio_tracks.len() > 1
+                        && track_idx < state.audio_tracks.len()
+                        && (audio_source.get_active_audio_tracks() != vec![track_idx])
+                    {
+                        let play_pos = state.current_seconds;
+                        if audio_source.select_audio_track(track_idx).is_ok() {
+                            audio_source.set_position_seconds(play_pos);
+                            state.selected_audio_track = track_idx;
+                            state.active_audio_tracks = vec![track_idx];
+                            state.multi_track_mix_mode = false;
+                            state.num_channels = audio_source.get_num_channels();
+                            let ch_count = state.num_channels as usize;
+                            state.channel_vus.resize(ch_count, 0.0);
+                            state.peak_vus.resize(ch_count, 0.0);
+                            state.module_type = audio_source.get_type();
+                            state.bitrate = audio_source.get_bitrate();
+                            let track_title = state
+                                .audio_tracks
+                                .get(track_idx)
+                                .map(|t| t.title.clone())
+                                .unwrap_or_else(|| format!("Track {}", track_idx + 1));
+                            let display_title = if track_title.to_lowercase().starts_with("track") {
+                                format!("🎛 {}", track_title)
+                            } else {
+                                format!("🎛 Track {}: {}", track_idx + 1, track_title)
+                            };
+                            state.osd_text = Some(display_title);
+                            state.osd_timer = 3.0;
 
-                                state.lookahead_queue.clear();
-                                state.lookahead_sample_buffer.clear();
-                                state.lookahead_timeline.fill(0.0);
-                                state.lookahead_buffer_start_time = play_pos;
-                                state.waveform_history.clear();
+                            state.lookahead_queue.clear();
+                            state.lookahead_sample_buffer.clear();
+                            state.lookahead_timeline.fill(0.0);
+                            state.lookahead_buffer_start_time = play_pos;
+                            state.waveform_history.clear();
 
-                                while let Ok(c) = ready_rx_for_decoder.try_recv() {
-                                    let _ = free_tx_for_decoder.try_send(c);
-                                }
-                                seeked = true;
+                            while let Ok(c) = ready_rx_for_decoder.try_recv() {
+                                let _ = free_tx_for_decoder.try_send(c);
                             }
+                            seeked = true;
                         }
+                    }
                     if let Some(pos) = state.seek_request.take() {
                         audio_source.set_position_seconds(pos);
                         state.current_seconds = pos;
@@ -4855,7 +5965,7 @@ where
                     }
                 }
             }
-            
+
             if frames_read == 0 {
                 std::thread::sleep(std::time::Duration::from_millis(10));
             }
@@ -4884,7 +5994,7 @@ where
     let mut windowed_channels: Vec<Vec<f32>> = vec![vec![0.0; window_size]; channels];
     let mut spare_channels: Vec<Vec<f32>> = vec![vec![0.0; window_size]; channels];
     let mut fft_index = 0;
-    
+
     let mut was_paused = false;
 
     let shared_state_err = shared_state.clone();
@@ -4894,7 +6004,7 @@ where
             if let Ok(state) = shared_state.try_lock() {
                 was_paused = state.is_paused;
             }
-            
+
             if was_paused {
                 if let Ok(mut state) = shared_state.try_lock() {
                     state.raw_channel_vus.fill(0.0);
@@ -4909,14 +6019,18 @@ where
             for frame in data.chunks(channels) {
                 let left = frame[0].into();
                 let right = if channels >= 2 { frame[1].into() } else { left };
-                
+
                 left_peak = left_peak.max(left.abs());
                 right_peak = right_peak.max(right.abs());
 
                 let mono = (left + right) / 2.0;
                 fft_buffer[fft_index] = mono;
                 for c in 0..channels {
-                    channel_fft_buffers[c][fft_index] = if c < frame.len() { frame[c].into() } else { 0.0 };
+                    channel_fft_buffers[c][fft_index] = if c < frame.len() {
+                        frame[c].into()
+                    } else {
+                        0.0
+                    };
                 }
                 fft_index = (fft_index + 1) % window_size;
             }
@@ -4928,13 +6042,17 @@ where
                     windowed_channels[c][i] = channel_fft_buffers[c][idx];
                 }
             }
-            
+
             // Swap filled buffers with spare set — zero allocations in the hot path
             std::mem::swap(&mut windowed_channels, &mut spare_channels);
 
             let mut channel_vus = Vec::new();
-            if channels >= 1 { channel_vus.push(left_peak); }
-            if channels >= 2 { channel_vus.push(right_peak); }
+            if channels >= 1 {
+                channel_vus.push(left_peak);
+            }
+            if channels >= 2 {
+                channel_vus.push(right_peak);
+            }
 
             let msg = DspMessage {
                 audio_data: windowed_buffer.clone(),
@@ -4945,27 +6063,28 @@ where
                 speed: 0,
                 current_seconds: 0.0,
                 current_row_string: String::new(),
-                channel_audio_data: std::mem::replace(&mut spare_channels, vec![vec![0.0; window_size]; channels]),
+                channel_audio_data: std::mem::replace(
+                    &mut spare_channels,
+                    vec![vec![0.0; window_size]; channels],
+                ),
             };
-            
+
             let _ = tx.try_send(msg);
         },
-        move |err| {
-            match &err {
-                cpal::StreamError::DeviceNotAvailable => {
-                    eprintln!("Audio input device disconnected: {}", err);
+        move |err| match &err {
+            cpal::StreamError::DeviceNotAvailable => {
+                eprintln!("Audio input device disconnected: {}", err);
+                if let Ok(mut state) = shared_state_err.try_lock() {
+                    state.audio_device_lost = true;
+                }
+            }
+            cpal::StreamError::BufferUnderrun => {}
+            _ => {
+                let s = err.to_string().to_lowercase();
+                if !s.contains("underrun") && !s.contains("overrun") {
+                    eprintln!("an error occurred on input stream: {}", err);
                     if let Ok(mut state) = shared_state_err.try_lock() {
                         state.audio_device_lost = true;
-                    }
-                }
-                cpal::StreamError::BufferUnderrun => {}
-                _ => {
-                    let s = err.to_string().to_lowercase();
-                    if !s.contains("underrun") && !s.contains("overrun") {
-                        eprintln!("an error occurred on input stream: {}", err);
-                        if let Ok(mut state) = shared_state_err.try_lock() {
-                            state.audio_device_lost = true;
-                        }
                     }
                 }
             }
@@ -5091,31 +6210,51 @@ mod tests {
             volume: f32,
             enabled: bool,
         }
-        let tracks = vec![
-            MockTrack { track_idx: 0, volume: 1.0, enabled: true },
-            MockTrack { track_idx: 1, volume: 0.0, enabled: true }, // Muted but enabled
-            MockTrack { track_idx: 2, volume: 0.0, enabled: false }, // Omitted / disabled
+        let tracks = [
+            MockTrack {
+                track_idx: 0,
+                volume: 1.0,
+                enabled: true,
+            },
+            MockTrack {
+                track_idx: 1,
+                volume: 0.0,
+                enabled: true,
+            }, // Muted but enabled
+            MockTrack {
+                track_idx: 2,
+                volume: 0.0,
+                enabled: false,
+            }, // Omitted / disabled
         ];
 
         // Active tracks filter checks `track.enabled`
-        let mut active: Vec<usize> = tracks.iter().filter(|t| t.enabled).map(|t| t.track_idx).collect();
+        let mut active: Vec<usize> = tracks
+            .iter()
+            .filter(|t| t.enabled)
+            .map(|t| t.track_idx)
+            .collect();
         active.sort();
         // Track 1 must remain active in the UI controls despite 0.0 volume
         assert_eq!(active, vec![0, 1]);
 
         // Prior buggy filter checked `track.volume > 0.0`, erroneously dropping muted tracks
-        let buggy_active: Vec<usize> = tracks.iter().filter(|t| t.volume > 0.0).map(|t| t.track_idx).collect();
+        let buggy_active: Vec<usize> = tracks
+            .iter()
+            .filter(|t| t.volume > 0.0)
+            .map(|t| t.track_idx)
+            .collect();
         assert_eq!(buggy_active, vec![0]);
     }
 
     #[test]
     fn test_multi_track_mix_mode_flag_transitions() {
-        let single_track = vec![0];
-        let multi_track = vec![0, 1];
-        let empty_track: Vec<usize> = vec![];
+        let single_track = [0];
+        let multi_track = [0, 1];
+        let empty_track: [usize; 0] = [];
 
-        assert_eq!(single_track.len() > 1, false);
-        assert_eq!(multi_track.len() > 1, true);
-        assert_eq!(empty_track.len() > 1, false);
+        assert!(!(single_track.len() > 1));
+        assert!(multi_track.len() > 1);
+        assert!(!(empty_track.len() > 1));
     }
 }
