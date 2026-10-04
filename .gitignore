@@ -52,7 +52,9 @@ scratch_bitstream_windows/
 /test_*
 test_*.png
 test_*.wav
+!test_sine.wav
 test_*.lrc
+!test_sine.lrc
 test_baselines/
 
 # Android Build Outputs
