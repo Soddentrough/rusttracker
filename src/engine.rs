@@ -269,6 +269,16 @@ pub struct VulkanEngine {
     flip_compute_bind_group: wgpu::BindGroup,
     flip_render_bind_group: wgpu::BindGroup,
 
+    // GPU FLIP Acoustic Water simulation
+    flip_water_clear_pipeline: wgpu::ComputePipeline,
+    flip_water_clear_render_pipeline: wgpu::ComputePipeline,
+    flip_water_p2g_pipeline: wgpu::ComputePipeline,
+    flip_water_forces_pipeline: wgpu::ComputePipeline,
+    flip_water_pressure_0_to_1_pipeline: wgpu::ComputePipeline,
+    flip_water_pressure_1_to_0_pipeline: wgpu::ComputePipeline,
+    flip_water_project_pipeline: wgpu::ComputePipeline,
+    flip_water_g2p_advect_pipeline: wgpu::ComputePipeline,
+
     // GPU compute bioluminescent waves simulation
     #[allow(dead_code)]
     biolum_particles_buffer: wgpu::Buffer,
@@ -1671,7 +1681,7 @@ fn glass_triangulate_contours(contours: &[Vec<[f32; 2]>]) -> (Vec<[f32; 2]>, Vec
     (all_verts, all_tris)
 }
 
-pub(crate) fn generate_glass_lyrics_mesh(text: &str) -> (Vec<Vertex>, Vec<u32>) {
+pub fn generate_glass_lyrics_mesh(text: &str) -> (Vec<Vertex>, Vec<u32>) {
     let mut vertices = Vec::with_capacity(16384);
     let mut indices = Vec::with_capacity(65536);
 
@@ -3004,6 +3014,7 @@ impl VulkanEngine {
                 24 => include_str!("shaders/vis_tape_head.wgsl"),
                 25 => include_str!("shaders/vis_spectrum_led.wgsl"),
                 27 => include_str!("shaders/vis_flip_ferrofluid.wgsl"),
+                28 => include_str!("shaders/vis_glass_water.wgsl"),
                 _ => include_str!("shaders/vis_spectrum.wgsl"),
             }
         };
@@ -3092,7 +3103,7 @@ impl VulkanEngine {
                     },
                     "vs_main_3d",
                 )
-            } else if vis_def.id == 27 {
+            } else if vis_def.id == 27 || vis_def.id == 28 {
                 (
                     &flip_render_pipeline_layout,
                     Vec::new(),
@@ -4625,6 +4636,95 @@ impl VulkanEngine {
             }],
         });
 
+        // --- Acoustic FLIP Water Compute Pipelines ---
+        let flip_water_compute_source =
+            resolve_shader_includes(include_str!("shaders/flip_water_compute.wgsl"));
+        let flip_water_compute_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("FLIP Water Compute Shader"),
+                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&flip_water_compute_source)),
+            });
+
+        let flip_water_clear_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FLIP Water Clear"),
+                layout: Some(&flip_compute_pipeline_layout),
+                module: &flip_water_compute_shader,
+                entry_point: Some("cs_clear"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+
+        let flip_water_clear_render_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FLIP Water Clear Render"),
+                layout: Some(&flip_compute_pipeline_layout),
+                module: &flip_water_compute_shader,
+                entry_point: Some("cs_clear_render"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+
+        let flip_water_p2g_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FLIP Water P2G"),
+                layout: Some(&flip_compute_pipeline_layout),
+                module: &flip_water_compute_shader,
+                entry_point: Some("cs_p2g"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+
+        let flip_water_forces_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FLIP Water Forces"),
+                layout: Some(&flip_compute_pipeline_layout),
+                module: &flip_water_compute_shader,
+                entry_point: Some("cs_grid_forces"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+
+        let flip_water_pressure_0_to_1_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FLIP Water Pressure 0->1"),
+                layout: Some(&flip_compute_pipeline_layout),
+                module: &flip_water_compute_shader,
+                entry_point: Some("cs_pressure_0_to_1"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+
+        let flip_water_pressure_1_to_0_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FLIP Water Pressure 1->0"),
+                layout: Some(&flip_compute_pipeline_layout),
+                module: &flip_water_compute_shader,
+                entry_point: Some("cs_pressure_1_to_0"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+
+        let flip_water_project_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FLIP Water Project"),
+                layout: Some(&flip_compute_pipeline_layout),
+                module: &flip_water_compute_shader,
+                entry_point: Some("cs_grid_project"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+
+        let flip_water_g2p_advect_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FLIP Water G2P Advect"),
+                layout: Some(&flip_compute_pipeline_layout),
+                module: &flip_water_compute_shader,
+                entry_point: Some("cs_g2p_advect_splat"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+
         // --- Bioluminescent Waves Compute & Render Setup ---
         let biolum_particles_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Bioluminescent Particles"),
@@ -5083,6 +5183,15 @@ impl VulkanEngine {
             flip_g2p_advect_pipeline,
             flip_compute_bind_group,
             flip_render_bind_group,
+
+            flip_water_clear_pipeline,
+            flip_water_clear_render_pipeline,
+            flip_water_p2g_pipeline,
+            flip_water_forces_pipeline,
+            flip_water_pressure_0_to_1_pipeline,
+            flip_water_pressure_1_to_0_pipeline,
+            flip_water_project_pipeline,
+            flip_water_g2p_advect_pipeline,
 
             biolum_particles_buffer,
             biolum_compute_pipeline,
@@ -8871,6 +8980,53 @@ impl VulkanEngine {
             compute_pass.dispatch_workgroups(256, 1, 1);
         }
 
+        if vis_def.requires_flip_water {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Acoustic FLIP Water Compute"),
+                timestamp_writes: None,
+            });
+            // 1. Clear grid accum and pressure buffers
+            compute_pass.set_pipeline(&self.flip_water_clear_pipeline);
+            compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+            compute_pass.dispatch_workgroups(512, 1, 1);
+
+            // 2. Clear render heightfield grid
+            compute_pass.set_pipeline(&self.flip_water_clear_render_pipeline);
+            compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+            compute_pass.dispatch_workgroups(1024, 1, 1);
+
+            // 3. P2G (Transfer particle momentum to grid)
+            compute_pass.set_pipeline(&self.flip_water_p2g_pipeline);
+            compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+            compute_pass.dispatch_workgroups(256, 1, 1);
+
+            // 4. Grid forces (normalize, gravity, acoustic sub-bass geyser forces, Faraday ripples, walls)
+            compute_pass.set_pipeline(&self.flip_water_forces_pipeline);
+            compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+            compute_pass.dispatch_workgroups(512, 1, 1);
+
+            // 5. Pressure solve (16 Jacobi iterations ping-ponging 0 -> 1 -> 0 -> 1)
+            for _ in 0..8 {
+                compute_pass.set_pipeline(&self.flip_water_pressure_0_to_1_pipeline);
+                compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                compute_pass.dispatch_workgroups(512, 1, 1);
+
+                compute_pass.set_pipeline(&self.flip_water_pressure_1_to_0_pipeline);
+                compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                compute_pass.dispatch_workgroups(512, 1, 1);
+            }
+
+            // 6. Velocity projection (subtract pressure gradient)
+            compute_pass.set_pipeline(&self.flip_water_project_pipeline);
+            compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+            compute_pass.dispatch_workgroups(512, 1, 1);
+
+            // 7. G2P & Advection & Splat to Render Grid
+            compute_pass.set_pipeline(&self.flip_water_g2p_advect_pipeline);
+            compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+            compute_pass.dispatch_workgroups(256, 1, 1);
+        }
+
         if vis_def.id == 20 {
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Bioluminescence Waves Sim Compute"),
@@ -9077,7 +9233,7 @@ impl VulkanEngine {
 
             render_pass.set_pipeline(&self.render_pipelines[mode_idx]);
             render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-            if vis_def.id == 27 {
+            if vis_def.id == 27 || vis_def.id == 28 {
                 render_pass.set_bind_group(1, &self.flip_render_bind_group, &[]);
             } else {
                 render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
