@@ -141,6 +141,7 @@ pub struct VisualizerDef {
     pub requires_fire: bool,
     pub requires_resynth: bool,
     pub requires_ferrofluidsim: bool,
+    pub requires_flip_ferrofluid: bool,
 }
 
 pub const VISUALIZERS: &[VisualizerDef] = &[
@@ -154,6 +155,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_fire: false,
         requires_resynth: false,
         requires_ferrofluidsim: false,
+        requires_flip_ferrofluid: false,
     },
     VisualizerDef {
         id: 25,
@@ -165,6 +167,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_fire: false,
         requires_resynth: false,
         requires_ferrofluidsim: false,
+        requires_flip_ferrofluid: false,
     },
     VisualizerDef {
         id: 24,
@@ -176,6 +179,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_fire: false,
         requires_resynth: false,
         requires_ferrofluidsim: false,
+        requires_flip_ferrofluid: false,
     },
     VisualizerDef {
         id: 1,
@@ -187,6 +191,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_fire: false,
         requires_resynth: false,
         requires_ferrofluidsim: false,
+        requires_flip_ferrofluid: false,
     },
     VisualizerDef {
         id: 3,
@@ -204,6 +209,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_fire: false,
         requires_resynth: false,
         requires_ferrofluidsim: false,
+        requires_flip_ferrofluid: false,
     },
     VisualizerDef {
         id: 4,
@@ -215,6 +221,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_fire: false,
         requires_resynth: true,
         requires_ferrofluidsim: false,
+        requires_flip_ferrofluid: false,
     },
     VisualizerDef {
         id: 5,
@@ -226,6 +233,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_fire: true,
         requires_resynth: false,
         requires_ferrofluidsim: false,
+        requires_flip_ferrofluid: false,
     },
     VisualizerDef {
         id: 6,
@@ -237,6 +245,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_fire: true,
         requires_resynth: false,
         requires_ferrofluidsim: false,
+        requires_flip_ferrofluid: false,
     },
     VisualizerDef {
         id: 7,
@@ -248,6 +257,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_fire: false,
         requires_resynth: false,
         requires_ferrofluidsim: false,
+        requires_flip_ferrofluid: false,
     },
     VisualizerDef {
         id: 8,
@@ -259,6 +269,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_fire: false,
         requires_resynth: false,
         requires_ferrofluidsim: false,
+        requires_flip_ferrofluid: false,
     },
     VisualizerDef {
         id: 9,
@@ -270,6 +281,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_fire: false,
         requires_resynth: false,
         requires_ferrofluidsim: false,
+        requires_flip_ferrofluid: false,
     },
     VisualizerDef {
         id: 10,
@@ -281,6 +293,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_fire: false,
         requires_resynth: false,
         requires_ferrofluidsim: true,
+        requires_flip_ferrofluid: false,
     },
     VisualizerDef {
         id: 13,
@@ -298,6 +311,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_fire: false,
         requires_resynth: false,
         requires_ferrofluidsim: false,
+        requires_flip_ferrofluid: false,
     },
     VisualizerDef {
         id: 14,
@@ -312,6 +326,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_fire: false,
         requires_resynth: false,
         requires_ferrofluidsim: false,
+        requires_flip_ferrofluid: false,
     },
     VisualizerDef {
         id: 16,
@@ -323,6 +338,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_fire: false,
         requires_resynth: false,
         requires_ferrofluidsim: false,
+        requires_flip_ferrofluid: false,
     },
     VisualizerDef {
         id: 19,
@@ -337,6 +353,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_fire: false,
         requires_resynth: false,
         requires_ferrofluidsim: false,
+        requires_flip_ferrofluid: false,
     },
     VisualizerDef {
         id: 20,
@@ -351,6 +368,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_fire: false,
         requires_resynth: false,
         requires_ferrofluidsim: false,
+        requires_flip_ferrofluid: false,
     },
     VisualizerDef {
         id: 22,
@@ -365,6 +383,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_fire: false,
         requires_resynth: false,
         requires_ferrofluidsim: false,
+        requires_flip_ferrofluid: false,
     },
     VisualizerDef {
         id: 23,
@@ -379,6 +398,19 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_fire: false,
         requires_resynth: false,
         requires_ferrofluidsim: false,
+        requires_flip_ferrofluid: false,
+    },
+    VisualizerDef {
+        id: 27,
+        name: "Quantum FLIP Ferrofluid",
+        filename: "vis_flip_ferrofluid.wgsl",
+        description: "Incompressible FLIP hydrodynamic simulation with Rosensweig magnetic spikes",
+        pipeline_type: PipelineType::FullscreenQuad,
+        requires_history: false,
+        requires_fire: false,
+        requires_resynth: false,
+        requires_ferrofluidsim: false,
+        requires_flip_ferrofluid: true,
     },
 ];
 

@@ -257,6 +257,18 @@ pub struct VulkanEngine {
     ferrofluidsim_clear_pipeline: wgpu::ComputePipeline,
     ferrofluidsim_bind_group: wgpu::BindGroup,
 
+    // GPU Quantum FLIP Ferrofluid simulation
+    flip_clear_pipeline: wgpu::ComputePipeline,
+    flip_clear_render_pipeline: wgpu::ComputePipeline,
+    flip_p2g_pipeline: wgpu::ComputePipeline,
+    flip_forces_pipeline: wgpu::ComputePipeline,
+    flip_pressure_0_to_1_pipeline: wgpu::ComputePipeline,
+    flip_pressure_1_to_0_pipeline: wgpu::ComputePipeline,
+    flip_project_pipeline: wgpu::ComputePipeline,
+    flip_g2p_advect_pipeline: wgpu::ComputePipeline,
+    flip_compute_bind_group: wgpu::BindGroup,
+    flip_render_bind_group: wgpu::BindGroup,
+
     // GPU compute bioluminescent waves simulation
     #[allow(dead_code)]
     biolum_particles_buffer: wgpu::Buffer,
@@ -2927,6 +2939,31 @@ impl VulkanEngine {
                 immediate_size: 0,
             });
 
+        let flip_render_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("FLIP Render Layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+
+        let flip_render_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("FLIP Render Pipeline Layout"),
+                bind_group_layouts: &[
+                    Some(&bind_group_layout),
+                    Some(&flip_render_bind_group_layout),
+                ],
+                immediate_size: 0,
+            });
+
         // Shared shader headers — included at compile time, resolved via simple string replacement.
         // This is the single source of truth for AudioUniforms layout and glyph font.
         const SHADER_COMMON: &str = include_str!("shaders/_common.wgsl");
@@ -2966,6 +3003,7 @@ impl VulkanEngine {
                 23 => include_str!("shaders/vis_lyrics.wgsl"),
                 24 => include_str!("shaders/vis_tape_head.wgsl"),
                 25 => include_str!("shaders/vis_spectrum_led.wgsl"),
+                27 => include_str!("shaders/vis_flip_ferrofluid.wgsl"),
                 _ => include_str!("shaders/vis_spectrum.wgsl"),
             }
         };
@@ -3053,6 +3091,21 @@ impl VulkanEngine {
                         conservative: false,
                     },
                     "vs_main_3d",
+                )
+            } else if vis_def.id == 27 {
+                (
+                    &flip_render_pipeline_layout,
+                    Vec::new(),
+                    wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        strip_index_format: None,
+                        front_face: wgpu::FrontFace::Ccw,
+                        cull_mode: None,
+                        polygon_mode: wgpu::PolygonMode::Fill,
+                        unclipped_depth: false,
+                        conservative: false,
+                    },
+                    "vs_main",
                 )
             } else {
                 match vis_def.pipeline_type {
@@ -4292,6 +4345,286 @@ impl VulkanEngine {
                 cache: pipeline_cache_ref,
             });
 
+        // --- Quantum FLIP Ferrofluid Compute & Render Setup ---
+        let flip_particles = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("FLIP Particles"),
+            size: (65536 * 32) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&flip_particles, 0, &vec![0u8; 65536 * 32]);
+
+        let flip_grid_accum = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("FLIP Grid Accum"),
+            size: (131072 * 16) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let flip_grid_vel_new = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("FLIP Grid Vel New"),
+            size: (131072 * 16) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let flip_grid_vel_old = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("FLIP Grid Vel Old"),
+            size: (131072 * 16) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let flip_pressure_0 = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("FLIP Pressure 0"),
+            size: (131072 * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let flip_pressure_1 = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("FLIP Pressure 1"),
+            size: (131072 * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let flip_render_grid = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("FLIP Render Grid"),
+            size: (512 * 512 * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let flip_compute_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("flip_compute_layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 7,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let flip_compute_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("flip_compute_bg"),
+            layout: &flip_compute_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: flip_particles.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: flip_grid_accum.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: flip_grid_vel_new.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: flip_grid_vel_old.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: flip_pressure_0.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: flip_pressure_1.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: flip_render_grid.as_entire_binding(),
+                },
+            ],
+        });
+
+        let flip_compute_source =
+            resolve_shader_includes(include_str!("shaders/flip_ferrofluid_compute.wgsl"));
+        let flip_compute_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("FLIP Ferrofluid Compute Shader"),
+                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&flip_compute_source)),
+            });
+        let flip_compute_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("flip_compute_layout"),
+                bind_group_layouts: &[Some(&flip_compute_layout)],
+                immediate_size: 0,
+            });
+
+        let flip_clear_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FLIP Clear"),
+                layout: Some(&flip_compute_pipeline_layout),
+                module: &flip_compute_shader,
+                entry_point: Some("cs_clear"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+
+        let flip_clear_render_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FLIP Clear Render"),
+                layout: Some(&flip_compute_pipeline_layout),
+                module: &flip_compute_shader,
+                entry_point: Some("cs_clear_render"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+
+        let flip_p2g_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FLIP P2G"),
+                layout: Some(&flip_compute_pipeline_layout),
+                module: &flip_compute_shader,
+                entry_point: Some("cs_p2g"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+
+        let flip_forces_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FLIP Forces"),
+                layout: Some(&flip_compute_pipeline_layout),
+                module: &flip_compute_shader,
+                entry_point: Some("cs_grid_forces"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+
+        let flip_pressure_0_to_1_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FLIP Pressure 0->1"),
+                layout: Some(&flip_compute_pipeline_layout),
+                module: &flip_compute_shader,
+                entry_point: Some("cs_pressure_0_to_1"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+
+        let flip_pressure_1_to_0_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FLIP Pressure 1->0"),
+                layout: Some(&flip_compute_pipeline_layout),
+                module: &flip_compute_shader,
+                entry_point: Some("cs_pressure_1_to_0"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+
+        let flip_project_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FLIP Project"),
+                layout: Some(&flip_compute_pipeline_layout),
+                module: &flip_compute_shader,
+                entry_point: Some("cs_grid_project"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+
+        let flip_g2p_advect_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FLIP G2P Advect"),
+                layout: Some(&flip_compute_pipeline_layout),
+                module: &flip_compute_shader,
+                entry_point: Some("cs_g2p_advect_splat"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+
+        let flip_render_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("FLIP Render BG"),
+            layout: &flip_render_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: flip_render_grid.as_entire_binding(),
+            }],
+        });
+
         // --- Bioluminescent Waves Compute & Render Setup ---
         let biolum_particles_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Bioluminescent Particles"),
@@ -4739,6 +5072,17 @@ impl VulkanEngine {
             ferrofluidsim_compute_pipeline,
             ferrofluidsim_clear_pipeline,
             ferrofluidsim_bind_group,
+
+            flip_clear_pipeline,
+            flip_clear_render_pipeline,
+            flip_p2g_pipeline,
+            flip_forces_pipeline,
+            flip_pressure_0_to_1_pipeline,
+            flip_pressure_1_to_0_pipeline,
+            flip_project_pipeline,
+            flip_g2p_advect_pipeline,
+            flip_compute_bind_group,
+            flip_render_bind_group,
 
             biolum_particles_buffer,
             biolum_compute_pipeline,
@@ -8480,6 +8824,53 @@ impl VulkanEngine {
             compute_pass.dispatch_workgroups(391, 1, 1);
         }
 
+        if vis_def.requires_flip_ferrofluid {
+            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: Some("Quantum FLIP Ferrofluid Compute"),
+                timestamp_writes: None,
+            });
+            // 1. Clear grid accum and pressure buffers
+            compute_pass.set_pipeline(&self.flip_clear_pipeline);
+            compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+            compute_pass.dispatch_workgroups(512, 1, 1);
+
+            // 2. Clear render heightfield grid
+            compute_pass.set_pipeline(&self.flip_clear_render_pipeline);
+            compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+            compute_pass.dispatch_workgroups(1024, 1, 1);
+
+            // 3. P2G (Transfer particle momentum to grid)
+            compute_pass.set_pipeline(&self.flip_p2g_pipeline);
+            compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+            compute_pass.dispatch_workgroups(256, 1, 1);
+
+            // 4. Grid forces (normalize, gravity, magnetic body forces, boundary walls)
+            compute_pass.set_pipeline(&self.flip_forces_pipeline);
+            compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+            compute_pass.dispatch_workgroups(512, 1, 1);
+
+            // 5. Pressure solve (16 Jacobi iterations ping-ponging 0 -> 1 -> 0 -> 1)
+            for _ in 0..8 {
+                compute_pass.set_pipeline(&self.flip_pressure_0_to_1_pipeline);
+                compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                compute_pass.dispatch_workgroups(512, 1, 1);
+
+                compute_pass.set_pipeline(&self.flip_pressure_1_to_0_pipeline);
+                compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                compute_pass.dispatch_workgroups(512, 1, 1);
+            }
+
+            // 6. Velocity projection (subtract pressure gradient)
+            compute_pass.set_pipeline(&self.flip_project_pipeline);
+            compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+            compute_pass.dispatch_workgroups(512, 1, 1);
+
+            // 7. G2P & Advection & Splat to Render Grid
+            compute_pass.set_pipeline(&self.flip_g2p_advect_pipeline);
+            compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+            compute_pass.dispatch_workgroups(256, 1, 1);
+        }
+
         if vis_def.id == 20 {
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                 label: Some("Bioluminescence Waves Sim Compute"),
@@ -8686,7 +9077,11 @@ impl VulkanEngine {
 
             render_pass.set_pipeline(&self.render_pipelines[mode_idx]);
             render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-            render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
+            if vis_def.id == 27 {
+                render_pass.set_bind_group(1, &self.flip_render_bind_group, &[]);
+            } else {
+                render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
+            }
 
             match &vis_def.pipeline_type {
                 crate::state::PipelineType::FullscreenQuad => {
