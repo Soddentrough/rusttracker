@@ -102,8 +102,8 @@ fn cs_p2g(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     var p = particles[p_idx];
 
-    // Seed initial particle pool in a circular dish if uninitialized
-    if (length(p.pos.xyz) < 0.001) {
+    // Seed initial particle pool in a circular dish if uninitialized or switched from water FLIP (pos.w != 27.0)
+    if (length(p.pos.xyz) < 0.001 || abs(p.pos.w - 27.0) > 0.1) {
         let fi = f32(p_idx);
         let r1 = fract(sin(fi * 12.9898 + 0.123) * 43758.5453);
         let r2 = fract(sin(fi * 78.233 + 0.456) * 43758.5453);
@@ -113,7 +113,7 @@ fn cs_p2g(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let radius = sqrt(r2) * 2.85;
         let y_pos = 0.08 + r3 * 0.22;
 
-        p.pos = vec4<f32>(cos(angle) * radius, y_pos, sin(angle) * radius, 1.0);
+        p.pos = vec4<f32>(cos(angle) * radius, y_pos, sin(angle) * radius, 27.0);
         p.vel = vec4<f32>(0.0);
         particles[p_idx] = p;
     }
@@ -196,9 +196,9 @@ fn cs_grid_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
         // 1. Gravity
         var force = vec3<f32>(0.0, -9.8, 0.0);
 
-        // 2. Audio-reactive Rosensweig Electromagnetism
+        // 2. Audio-reactive Rosensweig Electromagnetism (properly normalized from 0..100 spectrum scale)
         // Central Sub-bass Coil with apex pull
-        let sub_bass = clamp(audio.spectrum[0].x * 1.6 + audio.channels[0].x * 0.8, 0.0, 2.0);
+        let sub_bass = clamp(max(audio.spectrum[0].x, audio.spectrum[1].x) / 55.0 + audio.channels[0].x * 0.65, 0.0, 2.0);
         let center_apex = vec3<f32>(0.0, 0.45 + sub_bass * 0.85, 0.0);
         let center_dir = center_apex - world_p;
         let dist_sq_center = dot(center_dir, center_dir) * 0.4 + 0.22;
@@ -206,10 +206,10 @@ fn cs_grid_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
         force += normalize(center_dir) * center_mag_strength;
 
         // Azimuthal Spectrum Electromagnetic Ring (16 staggered poles in concentric hexagonal pattern)
-        // Continuous angular interpolation between adjacent poles
+        // Continuous angular interpolation aligned with pole centers at (idx + 0.5) / 16.0
         let azimuth = atan2(world_p.z, world_p.x);
         let norm_azimuth = (azimuth + 3.14159265) / 6.2831853; // [0, 1]
-        let frac_pole = norm_azimuth * 16.0;
+        let frac_pole = fract(norm_azimuth - (0.5 / 16.0) + 1.0) * 16.0;
         let pole_idx0 = u32(floor(frac_pole)) % 16u;
         let pole_idx1 = (pole_idx0 + 1u) % 16u;
         let t_pole = fract(frac_pole);
@@ -219,24 +219,24 @@ fn cs_grid_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let is_outer0 = (pole_idx0 % 2u) == 1u;
         let pole_r0 = select(1.65, 2.65, is_outer0);
         let spec_bin0 = pole_idx0 * 8u + 4u;
-        let spec0 = clamp(audio.spectrum[spec_bin0 / 4u][spec_bin0 % 4u], 0.0, 1.5);
+        let spec0 = clamp(audio.spectrum[spec_bin0 / 4u][spec_bin0 % 4u] / 62.0, 0.0, 1.5);
         let pole_h0 = select(0.5 + spec0 * 0.85, 0.4 + spec0 * 0.7, is_outer0);
         let pole_pos0 = vec3<f32>(cos(pole_angle0) * pole_r0, pole_h0, sin(pole_angle0) * pole_r0);
         let pole_dir0 = pole_pos0 - world_p;
         let dist_sq0 = dot(pole_dir0, pole_dir0) + 0.22;
-        let pole_force0 = (spec0 * 180.0 + 10.0) / dist_sq0;
+        let pole_force0 = (spec0 * 185.0 + 10.0) / dist_sq0;
 
         // Compute force from pole 1
         let pole_angle1 = (f32(pole_idx1) + 0.5) / 16.0 * 6.2831853 - 3.14159265;
         let is_outer1 = (pole_idx1 % 2u) == 1u;
         let pole_r1 = select(1.65, 2.65, is_outer1);
         let spec_bin1 = pole_idx1 * 8u + 4u;
-        let spec1 = clamp(audio.spectrum[spec_bin1 / 4u][spec_bin1 % 4u], 0.0, 1.5);
+        let spec1 = clamp(audio.spectrum[spec_bin1 / 4u][spec_bin1 % 4u] / 62.0, 0.0, 1.5);
         let pole_h1 = select(0.5 + spec1 * 0.85, 0.4 + spec1 * 0.7, is_outer1);
         let pole_pos1 = vec3<f32>(cos(pole_angle1) * pole_r1, pole_h1, sin(pole_angle1) * pole_r1);
         let pole_dir1 = pole_pos1 - world_p;
         let dist_sq1 = dot(pole_dir1, pole_dir1) + 0.22;
-        let pole_force1 = (spec1 * 180.0 + 10.0) / dist_sq1;
+        let pole_force1 = (spec1 * 185.0 + 10.0) / dist_sq1;
 
         let f0 = normalize(pole_dir0) * pole_force0;
         let f1 = normalize(pole_dir1) * pole_force1;
@@ -259,8 +259,10 @@ fn cs_grid_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
 }
 
 // ----------------------------------------------------------------------------
-// PASS 4A & 4B: Jacobi Incompressibility Pressure Solver (Ping-Pong)
+// PASS 4A & 4B: Damped Jacobi Over-Relaxation Pressure Solver (Ping-Pong)
 // ----------------------------------------------------------------------------
+const JACOBI_OMEGA: f32 = 1.28;
+
 fn compute_divergence(gx: i32, gy: i32, gz: i32) -> f32 {
     let inv_2dx = 0.5 * INV_CELL_SIZE.x;
     let inv_2dy = 0.5 * INV_CELL_SIZE.y;
@@ -323,7 +325,8 @@ fn cs_pressure_0_to_1(@builtin(global_invocation_id) global_id: vec3<u32>) {
     p_sum += cz * (sample_p_0(gx, gy, gz + 1, idx) + sample_p_0(gx, gy, gz - 1, idx));
 
     let p_rhs = (FLUID_DENSITY / dt) * div;
-    pressure_1[idx] = (p_sum - p_rhs) / c_diag;
+    let p_jacobi = (p_sum - p_rhs) / c_diag;
+    pressure_1[idx] = mix(pressure_0[idx], p_jacobi, JACOBI_OMEGA);
 }
 
 @compute @workgroup_size(256)
@@ -355,7 +358,8 @@ fn cs_pressure_1_to_0(@builtin(global_invocation_id) global_id: vec3<u32>) {
     p_sum += cz * (sample_p_1(gx, gy, gz + 1, idx) + sample_p_1(gx, gy, gz - 1, idx));
 
     let p_rhs = (FLUID_DENSITY / dt) * div;
-    pressure_0[idx] = (p_sum - p_rhs) / c_diag;
+    let p_jacobi = (p_sum - p_rhs) / c_diag;
+    pressure_0[idx] = mix(pressure_1[idx], p_jacobi, JACOBI_OMEGA);
 }
 
 // ----------------------------------------------------------------------------
@@ -446,7 +450,7 @@ fn cs_g2p_advect_splat(@builtin(global_invocation_id) global_id: vec3<u32>) {
     p.vel = vec4<f32>(mix(v_pic, v_flip, FLIP_RATIO), p.vel.w);
 
     // 2. Advect Particle Position
-    p.pos = vec4<f32>(p.pos.xyz + p.vel.xyz * dt, p.pos.w);
+    p.pos = vec4<f32>(p.pos.xyz + p.vel.xyz * dt, 27.0);
 
     // 3. Boundary Collisions (Parabolic Dish Container)
     let r_xz = length(p.pos.xz);
@@ -477,6 +481,12 @@ fn cs_g2p_advect_splat(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
 
     particles[p_idx] = p;
+
+    // Skip 5x5 atomicMax splat for deeply submerged bottom-layer particles that lie below
+    // the resting meniscus puddle (eliminates massive atomic contention on render_grid).
+    if (p.pos.y <= floor_y + 0.042) {
+        return;
+    }
 
     // 4. Splat Particle to 512x512 Render Heightfield
     // World [-3.6, 3.6] -> [0, 512]

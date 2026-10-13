@@ -3,7 +3,6 @@
 @group(0) @binding(0)
 var<uniform> audio: AudioUniforms;
 
-
 fn rotate2d(v: vec2<f32>, a: f32) -> vec2<f32> {
     let c = cos(a);
     let s = sin(a);
@@ -13,12 +12,23 @@ fn rotate2d(v: vec2<f32>, a: f32) -> vec2<f32> {
 fn hash_f(n: f32) -> f32 { return fract(sin(n) * 43758.5453123); }
 
 fn get_spatial_vu(i: u32) -> f32 {
-    let v = audio.spatial_channels[i / 4u];
-    let c = i % 4u;
-    if c == 0u { return clamp(v.x, 0.0, 1.0); }
-    else if c == 1u { return clamp(v.y, 0.0, 1.0); }
-    else if c == 2u { return clamp(v.z, 0.0, 1.0); }
-    else { return clamp(v.w, 0.0, 1.0); }
+    if audio.num_spatial_channels > 2u {
+        let v = audio.spatial_channels[i / 4u][i % 4u];
+        return clamp(v, 0.0, 1.0);
+    }
+    if audio.num_channels > 2u {
+        let idx = i % audio.num_channels;
+        return clamp(audio.channels[idx / 4u][idx % 4u], 0.0, 1.0);
+    }
+    let ch_l = audio.channels[0].x;
+    let ch_r = select(ch_l, audio.channels[0].y, audio.num_channels >= 2u);
+    let ph_l = audio.channel_phases[0].x;
+    let ph_r = audio.channel_phases[0].y;
+    let bass_e = clamp((audio.spectrum[0].x + audio.spectrum[1].x + audio.spectrum[2].x) / 210.0, 0.0, 1.0);
+    let lowmid_e = clamp((audio.spectrum[6].x + audio.spectrum[10].x) / 140.0, 0.0, 1.0);
+    let mid_e = clamp((audio.spectrum[20].x + audio.spectrum[32].x) / 130.0, 0.0, 1.0);
+    let high_e = clamp((audio.spectrum[64].x + audio.spectrum[96].x) / 120.0, 0.0, 1.0);
+    return stereo_upmix_12(i, ch_l, ch_r, ph_l, ph_r, bass_e, lowmid_e, mid_e, high_e);
 }
 
 fn project_3d(p3: vec3<f32>, ro: vec3<f32>, cu: vec3<f32>, cv: vec3<f32>, cw: vec3<f32>) -> vec3<f32> {
@@ -40,9 +50,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let dy = dpdy(in.uv.y);
     let aspect = dy / max(dx, 0.00001);
 
-    let render_channels = min(audio.num_spatial_channels, 12u);
+    // Enable all 12 speakers via stereo_upmix_12 when source is stereo/tracker, or true spatial count for 5.1/7.1
+    let render_channels = select(min(audio.num_spatial_channels, 12u), 12u, audio.num_spatial_channels <= 2u);
+    let time = audio.smooth_time;
 
-    // --- Pre-compute LFE VU and total volume for global effects ---
     var lfe_vu = 0.0;
     if render_channels > 3u {
         lfe_vu = get_spatial_vu(3u);
@@ -60,8 +71,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     let cam_dist = 2.4;
     let cam_height = 0.65;
-    let shake_x = sin(audio.time * 7.3) * lfe_vu * 0.012;
-    let shake_z = sin(audio.time * 5.1 + 1.3) * lfe_vu * 0.008;
+    let shake_x = sin(time * 7.3) * lfe_vu * 0.012;
+    let shake_z = sin(time * 5.1 + 1.3) * lfe_vu * 0.008;
     let ro = vec3<f32>(shake_x, -cam_dist, cam_height + shake_z);
     let cam_target = vec3<f32>(0.0, 0.3, 0.15);
 
@@ -71,9 +82,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     let rd = normalize(cw + p.x * cu - p.y * cv);
 
-    let room_angle = 0.0;
+    // Gentle panoramic orbital sway so 3D spatial vectors exhibit parallax depth
+    let room_angle = sin(time * 0.18) * 0.12;
 
-    // Deep dark background with subtle vertical gradient
     let sky_grad = smoothstep(-1.0, 1.0, uv.y) * 0.008;
     var color = vec3<f32>(0.012 + sky_grad, 0.012 + sky_grad * 0.5, 0.018 + sky_grad * 1.5);
 
@@ -85,70 +96,58 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let hit = ro + floor_t * rd;
         floor_xy = rotate2d(hit.xy, -room_angle);
 
-        // LFE grid warp: push grid coordinates radially outward with bass
         let dome_r = length(floor_xy);
         let warp_dir = floor_xy / max(dome_r, 0.01);
         let warp_strength = lfe_vu * 0.08 / max(dome_r, 0.2);
         let warped_xy = floor_xy + warp_dir * warp_strength;
 
-        // Rectangular tile grid with warped coordinates
         let cell_size = 0.4;
         let grid_x = smoothstep_r(0.015, 0.0, abs(fract(warped_xy.x / cell_size + 0.5) - 0.5) * cell_size);
         let grid_y = smoothstep_r(0.015, 0.0, abs(fract(warped_xy.y / cell_size + 0.5) - 0.5) * cell_size);
         let grid_lines = max(grid_x, grid_y) * 0.4;
 
-        // Extended perspective distance fade for wider view
-        let grid_mask = 1.0 - smoothstep(1.5, 5.5, floor_t);
-
+        let grid_mask = smoothstep_r(5.5, 1.5, floor_t);
         color = color + vec3<f32>(0.04, 0.07, 0.1) * grid_lines * grid_mask;
 
-        // --- LFE Pressure Dome: room-scale bass phenomenon ---
-        let dome_pulse = smoothstep(2.8 + lfe_vu * 1.5, 0.0, dome_r);
-        let dome_breathe = 1.0 + sin(audio.time * 6.0) * lfe_vu * 0.15;
+        // --- LFE Pressure Dome ---
+        let dome_pulse = smoothstep_r(2.8 + lfe_vu * 1.5, 0.0, dome_r);
+        let dome_breathe = 1.0 + sin(time * 6.0) * lfe_vu * 0.15;
         let lfe_color = vec3<f32>(1.0, 0.2, 0.4);
         color = color + lfe_color * dome_pulse * lfe_vu * lfe_vu * dome_breathe * 0.4;
 
-        // LFE expanding pressure rings
-        let ring_phase = audio.time * 3.0;
+        let ring_phase = time * 3.0;
         let ring1 = smoothstep_r(0.06, 0.0, abs(dome_r - fract(ring_phase) * 3.5)) * lfe_vu;
         let ring2 = smoothstep_r(0.06, 0.0, abs(dome_r - fract(ring_phase + 0.5) * 3.5)) * lfe_vu;
         color = color + lfe_color * (ring1 + ring2) * 0.2 * grid_mask;
 
-        // Ambient bass glow
-        let bass = clamp(audio.spectrum[1].x * 2.0 + audio.spectrum[2].x, 0.0, 1.0);
+        let bass = clamp((audio.spectrum[1].x * 2.0 + audio.spectrum[2].x) / 180.0, 0.0, 1.0);
         color = color + vec3<f32>(0.05, 0.02, 0.08) * bass * smoothstep_r(3.5, 0.0, dome_r);
     }
 
-    // Dolby Atmos 7.1.4 speaker layout (SMPTE channel order)
-    // Listener at origin. +Y = front wall, -Y = rear. Z = height above ear level.
-    // Positions tuned to stay within viewport (camera at Y=-2.4, fov=0.75).
-    //
-    // NOTE: In 5.1, Ls/Rs are the ONLY surround speakers — placed at ≈110-120°
-    // (behind the listener). In 7.1+, when Lrs/Rrs are added at the rear,
-    // Ls/Rs shift forward to ≈90° (the sides). We handle this dynamically below.
     var speaker_data = array<vec3<f32>, 12>(
-        vec3<f32>(-2.5, 2.0, 0.0),    // 0: L   — Front left              (≈30°)
-        vec3<f32>(2.5, 2.0, 0.0),     // 1: R   — Front right             (≈30°)
-        vec3<f32>(0.0, 2.5, 0.0),     // 2: C   — Center                  (0°)
-        vec3<f32>(0.0, 0.5, 0.0),     // 3: LFE — Subwoofer               (room pressure)
-        vec3<f32>(-2.2, -0.5, 0.0),   // 4: Ls  — Surround left (7.1: side ≈90°)
-        vec3<f32>(2.2, -0.5, 0.0),    // 5: Rs  — Surround right (7.1: side ≈90°)
-        vec3<f32>(-1.2, -1.2, 0.0),   // 6: Lrs — Surround back left      (≈140°)
-        vec3<f32>(1.2, -1.2, 0.0),    // 7: Rrs — Surround back right     (≈140°)
-        vec3<f32>(-2.2, 1.5, 0.7),    // 8: Ltf — Front left height       (above front)
-        vec3<f32>(2.2, 1.5, 0.7),     // 9: Rtf — Front right height      (above front)
-        vec3<f32>(-1.2, -1.2, 0.7),   // 10: Ltr — Back left height       (above Lrs)
-        vec3<f32>(1.2, -1.2, 0.7)     // 11: Rtr — Back right height      (above Rrs)
+        vec3<f32>(-2.5, 2.0, 0.0),    // 0: L
+        vec3<f32>(2.5, 2.0, 0.0),     // 1: R
+        vec3<f32>(0.0, 2.5, 0.0),     // 2: C
+        vec3<f32>(0.0, 0.5, 0.0),     // 3: LFE
+        vec3<f32>(-2.2, -0.5, 0.0),   // 4: Ls
+        vec3<f32>(2.2, -0.5, 0.0),    // 5: Rs
+        vec3<f32>(-1.2, -1.2, 0.0),   // 6: Lrs
+        vec3<f32>(1.2, -1.2, 0.0),    // 7: Rrs
+        vec3<f32>(-2.2, 1.5, 0.7),    // 8: Ltf
+        vec3<f32>(2.2, 1.5, 0.7),     // 9: Rtf
+        vec3<f32>(-1.2, -1.2, 0.7),   // 10: Ltr
+        vec3<f32>(1.2, -1.2, 0.7)     // 11: Rtr
     );
 
-    // In 5.1 (≤6 channels), Ls/Rs are the rear speakers (≈110-120°).
-    // Move them to the back position since there are no separate Lrs/Rrs.
     if render_channels <= 6u {
-        speaker_data[4] = vec3<f32>(-1.2, -1.2, 0.0);   // Ls → rear position
-        speaker_data[5] = vec3<f32>(1.2, -1.2, 0.0);    // Rs → rear position
+        speaker_data[4] = vec3<f32>(-1.2, -1.2, 0.0);
+        speaker_data[5] = vec3<f32>(1.2, -1.2, 0.0);
     }
 
-    // Always render all 12 speaker positions; inactive channels shown as dull grey
+    // Listener origin node in 3D space for Demoscene Vectorball / Acoustic Ray connections
+    let listener_3d = vec3<f32>(0.0, 0.0, 0.08);
+    let proj_listener = project_3d(listener_3d, ro, cu, cv, cw);
+
     for (var i = 0u; i < 12u; i = i + 1u) {
         let room_xy = vec2<f32>(speaker_data[i].x, speaker_data[i].y);
         var height = speaker_data[i].z;
@@ -157,12 +156,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let is_active = i < render_channels;
         let is_lfe = i == 3u;
 
-        // VU level — 0 for inactive channels, subdued for LFE dot
         var vu = 0.0;
         if is_active { vu = get_spatial_vu(i); }
-        if is_lfe { vu = vu * 0.3; } // LFE dot stays subtle; pressure dome handles impact
+        if is_lfe { vu = vu * 0.3; }
 
-        // Physical bounce (active only)
         height = height + (vu * 0.08);
 
         let p3_base = vec3<f32>(world_xy.x, world_xy.y, 0.0);
@@ -175,120 +172,103 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let proj_speaker_2d = proj_s.xy;
         let depth = proj_s.z;
 
-        // Color: active = channel color, inactive = dull grey
         var base_color = vec3<f32>(0.15, 0.15, 0.18);
         if is_active {
-            if i <= 2u { base_color = vec3<f32>(0.0, 0.8, 1.0); }         // Front — cyan
-            else if is_lfe { base_color = vec3<f32>(1.0, 0.2, 0.4); }     // LFE — pink
-            else if i <= 7u { base_color = vec3<f32>(0.0, 0.8, 1.0); }    // Surrounds — cyan
-            else { base_color = vec3<f32>(1.0, 0.7, 0.1); }               // Heights — gold
+            if i <= 2u { base_color = vec3<f32>(0.0, 0.85, 1.0); }
+            else if is_lfe { base_color = vec3<f32>(1.0, 0.2, 0.45); }
+            else if i <= 7u { base_color = vec3<f32>(0.15, 0.95, 0.78); }
+            else { base_color = vec3<f32>(1.0, 0.72, 0.12); }
         }
 
-        // Depth cue
         let depth_fade = smoothstep_r(6.0, 1.5, depth);
         let ch_color = base_color * (0.3 + 0.7 * depth_fade);
 
-        // Size = audio importance. Front L/C/R are the primary sound source and must
-        // dominate visually despite being furthest from camera. Factor must overcome
-        // perspective distance reduction (front scale ≈ 0.44 vs rear ≈ 1.5).
         var size_factor = 1.0;
-        if i <= 2u { size_factor = 5.0; }           // Front L/C/R — main PA stacks
-        else if is_lfe { size_factor = 0.8; }       // LFE — small dot (room pressure)
-        else if i <= 5u { size_factor = 2.0; }      // Side surrounds — medium
-        else if i <= 7u { size_factor = 1.0; }      // Rear surrounds — natural perspective
-        else { size_factor = 0.8; }                  // Heights — smallest
+        if i <= 2u { size_factor = 5.0; }
+        else if is_lfe { size_factor = 0.8; }
+        else if i <= 5u { size_factor = 2.0; }
+        else if i <= 7u { size_factor = 1.0; }
+        else { size_factor = 0.8; }
 
-        // Floor ripples (active non-LFE only)
+        let raw_scale = 2.0 / max(depth, 0.1);
+        let scale = clamp(raw_scale, 0.3, 1.5);
+
+        // Demoscene Vector Beams: connect active speakers to the central acoustic focus node
+        // and draw vertical elevation struts for height speakers
+        if is_active && !is_lfe && vu > 0.05 && proj_listener.z > 0.01 {
+            let beam_d = sd_line_segment(p, proj_speaker_2d, proj_listener.xy);
+            let beam_glow = smoothstep_r(0.0035 * scale, 0.0, beam_d) * vu * 0.28;
+            color += ch_color * beam_glow;
+        }
+
+        if height > 0.0 {
+            // Vertical vector strut from floor anchor to elevated speaker orb
+            let strut_d = sd_line_segment(p, proj_base_2d, proj_speaker_2d);
+            let strut_line = smoothstep_r(0.0025 * scale, 0.0, strut_d) * (0.25 + vu * 0.5);
+            let dist_base = length(p - proj_base_2d);
+            let anchor_s = size_factor * 0.5 + 0.5;
+            let base_core = smoothstep_r(0.03 * scale * anchor_s, 0.0, dist_base) * 0.4;
+            let base_ring = smoothstep_r(0.005 * scale, 0.0, abs(dist_base - 0.04 * scale * anchor_s)) * 0.4;
+            color = color + ch_color * (base_core + base_ring + strut_line);
+        }
+
         if rd.z < 0.0 && is_active && !is_lfe {
-            let time_offset = audio.time * 8.0;
+            let time_offset = time * 8.0;
             let dist_room = length(floor_xy - room_xy);
             let ripple = sin(dist_room * 20.0 - time_offset) * 0.5 + 0.5;
             let ripple_radius = 0.8 + (size_factor - 1.0) * 0.5;
             let ripple_mask = smoothstep_r(ripple_radius, 0.0, dist_room) * vu * 0.4;
-            let grid_fade = 1.0 - smoothstep(2.0, 7.0, length(floor_xy));
+            let grid_fade = smoothstep_r(7.0, 2.0, length(floor_xy));
             color = color + ch_color * ripple * ripple_mask * grid_fade;
         }
 
-        // Perspective scaling — clamped to prevent extreme size distortion
-        let raw_scale = 2.0 / max(depth, 0.1);
-        let scale = clamp(raw_scale, 0.3, 1.5);
-
-        // Floor anchor for elevated speakers
-        if height > 0.0 {
-            let dist_base = length(p - proj_base_2d);
-            let anchor_s = size_factor * 0.5 + 0.5;
-            let base_core = smoothstep(0.03 * scale * anchor_s, 0.0, dist_base) * 0.4;
-            let base_ring = smoothstep(0.005 * scale, 0.0, abs(dist_base - 0.04 * scale * anchor_s)) * 0.4;
-            color = color + ch_color * (base_core + base_ring);
-        }
-
-        // --- Speaker Orb ---
+        // --- Speaker Vectorball Orb ---
         let dist = length(p - proj_speaker_2d);
-        // Wrap time so the sin-based hash keeps f32 precision in long sessions
-        let noise_phase = hash_f(f32(i) * 17.3 + (audio.time % 341.0) * 3.0) * 0.004 * vu * size_factor;
+        let noise_phase = hash_f(f32(i) * 17.3 + (time % 341.0) * 3.0) * 0.004 * vu * size_factor;
         let organic_dist = dist + noise_phase;
 
         let dot_size = (0.03 + vu * 0.04) * scale * size_factor;
-
-        // Inactive: dim static orb. Active: full bright with effects.
         let active_mult = select(0.4, 1.0, is_active);
 
-        let core_hot = smoothstep(dot_size * 0.3, 0.0, dist) * 1.2 * active_mult;
-        let core = smoothstep(dot_size, dot_size * 0.5, dist);
+        let core_hot = smoothstep_r(dot_size * 0.3, 0.0, dist) * 1.2 * active_mult;
+        let core = smoothstep_r(dot_size, dot_size * 0.5, dist);
 
         let rim_inner = smoothstep(dot_size * 0.6, dot_size * 0.85, dist);
-        let rim_outer = smoothstep(dot_size * 1.1, dot_size * 0.85, dist);
+        let rim_outer = smoothstep_r(dot_size * 1.1, dot_size * 0.85, dist);
         let rim = rim_inner * rim_outer * max(vu, 0.15) * 1.5 * active_mult;
 
-        let glow = smoothstep(dot_size * 3.0, 0.0, organic_dist) * max(vu, 0.08) * 0.5;
+        let glow = smoothstep_r(dot_size * 3.0, 0.0, organic_dist) * max(vu, 0.08) * 0.5;
 
         let shock_radius = dot_size + (0.01 + vu * 0.05) * scale * size_factor;
-        let shockwave = smoothstep(0.006 * scale, 0.0, abs(dist - shock_radius)) * (vu * vu);
+        let shockwave = smoothstep_r(0.006 * scale, 0.0, abs(dist - shock_radius)) * (vu * vu);
 
-        // Composite
         color = color + vec3<f32>(1.0) * core_hot;
         color = color + ch_color * core * (0.8 + 1.2 * active_mult);
         color = color + ch_color * rim;
         color = color + ch_color * glow;
         if is_active { color = color + ch_color * shockwave; }
 
-        // --- Debug label below speaker ---
-        // Labels: L, R, C, LFE, Ls, Rs, Lrs, Rrs, Ltf, Rtf, Ltr, Rtr
-        // Encoded as arrays of glyph indices (10=L,11=R,12=C,13=S,14=F,15=E,16=T,19=space;
-        // NOTE: 17 is 'M' in _glyph_font.wgsl, not space — space is any index >= 19)
-        var lbl = array<u32, 3>(19u, 19u, 19u); // default: spaces
-        var lbl_len = 1u;
-        switch i {
-            case 0u  { lbl[0]=10u; }                                // L
-            case 1u  { lbl[0]=11u; }                                // R
-            case 2u  { lbl[0]=12u; }                                // C
-            case 3u  { lbl[0]=10u; lbl[1]=14u; lbl[2]=15u; lbl_len=3u; } // LFE
-            case 4u  { lbl[0]=10u; lbl[1]=13u; lbl_len=2u; }       // LS
-            case 5u  { lbl[0]=11u; lbl[1]=13u; lbl_len=2u; }       // RS
-            case 6u  { lbl[0]=10u; lbl[1]=11u; lbl[2]=13u; lbl_len=3u; } // LRS
-            case 7u  { lbl[0]=11u; lbl[1]=11u; lbl[2]=13u; lbl_len=3u; } // RRS
-            case 8u  { lbl[0]=10u; lbl[1]=16u; lbl[2]=14u; lbl_len=3u; } // LTF
-            case 9u  { lbl[0]=11u; lbl[1]=16u; lbl[2]=14u; lbl_len=3u; } // RTF
-            case 10u { lbl[0]=10u; lbl[1]=16u; lbl[2]=11u; lbl_len=3u; } // LTR
-            case 11u { lbl[0]=11u; lbl[1]=16u; lbl[2]=11u; lbl_len=3u; } // RTR
-            default  { }
-        }
-
+        // --- SMPTE Channel Label below speaker (gated by bounding box early-out) ---
         let px_size = 0.004 * scale;
-        let char_w = px_size * 4.0; // 3px + 1px gap
-        let total_w = char_w * f32(lbl_len) - px_size;
-        let label_origin = proj_speaker_2d + vec2<f32>(-total_w * 0.5, dot_size + px_size * 3.0);
+        let label_y = proj_speaker_2d.y + dot_size + px_size * 3.0;
+        if abs(p.x - proj_speaker_2d.x) < px_size * 7.0 && abs(p.y - (label_y + px_size * 2.5)) < px_size * 4.0 {
+            let smpte = get_smpte_channel_label(i);
+            let lbl = array<u32, 3>(smpte.x, smpte.y, smpte.z);
+            let lbl_len = smpte.w;
+            let char_w = px_size * 4.0;
+            let total_w = char_w * f32(lbl_len) - px_size;
+            let label_origin = vec2<f32>(proj_speaker_2d.x - total_w * 0.5, label_y);
 
-        var label_alpha = 0.0;
-        for (var c = 0u; c < lbl_len; c = c + 1u) {
-            let char_origin = label_origin + vec2<f32>(char_w * f32(c), 0.0);
-            label_alpha = max(label_alpha, draw_label_char(lbl[c], p, char_origin, px_size));
+            var label_alpha = 0.0;
+            for (var c = 0u; c < lbl_len; c = c + 1u) {
+                let char_origin = label_origin + vec2<f32>(char_w * f32(c), 0.0);
+                label_alpha = max(label_alpha, draw_label_char(lbl[c], p, char_origin, px_size));
+            }
+            let label_color = select(vec3<f32>(0.35, 0.35, 0.4), ch_color, is_active);
+            color = color + label_color * label_alpha * 0.85;
         }
-        let label_color = select(vec3<f32>(0.35, 0.35, 0.4), ch_color, is_active);
-        color = color + label_color * label_alpha * 0.8;
     }
 
-    // --- LFE room edge glow (simulates wall/ceiling vibration bleed) ---
     if render_channels > 3u {
         let lfe_color = vec3<f32>(1.0, 0.2, 0.4);
         let edge_x = smoothstep(0.6, 1.0, abs(uv.x));
@@ -297,22 +277,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         color = color + lfe_color * edge_glow * 0.15;
     }
 
-    // --- Atmospheric edge fog, blown away by volume ---
     let fog_color = vec3<f32>(0.025, 0.02, 0.035);
     let fog_clear = smoothstep(0.0, 0.8, total_volume);
     let radial_dist = length(uv);
     let fog_edge = smoothstep(0.4 + fog_clear * 0.6, 1.8, radial_dist);
-    let fog_turb = sin(uv.x * 3.0 + audio.time * 0.5) * cos(uv.y * 2.0 + audio.time * 0.3) * 0.08;
+    let fog_turb = sin(uv.x * 3.0 + time * 0.5) * cos(uv.y * 2.0 + time * 0.3) * 0.08;
     let fog_density = clamp(fog_edge + fog_turb, 0.0, 1.0) * (1.0 - fog_clear * 0.7);
     color = mix(color, fog_color, fog_density);
 
-    // Vignette
-    let vignette = 1.0 - smoothstep(0.5, 2.0, length(uv));
+    let vignette = smoothstep_r(2.0, 0.5, length(uv));
     color = color * vignette;
 
-    // ACES Narkowicz tonemapping (matches other visualizers)
-    var final_col = aces_tonemap(color);
-    final_col = max(final_col, vec3<f32>(0.0));
-
+    let final_col = aces_tonemap(color);
     return vec4<f32>(final_col, 1.0);
 }

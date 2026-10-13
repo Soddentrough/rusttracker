@@ -53,7 +53,6 @@ pub enum EngineAction {
     ScrubPreview(f32, f64),
     ScrubEnd,
     SetForceStereo(bool),
-    #[allow(dead_code)]
     SetPassthrough(bool),
     SetSplitRatio(f32),
     SetAppendToPlaylist(bool),
@@ -69,15 +68,9 @@ pub enum EngineAction {
     EditUrl(String),
     ClearFocusUrlInput,
     SetAudioDevice(String),
-    #[allow(dead_code)]
-    SetAudioTrack(usize),
     ToggleAudioTrackInMix(usize),
     SetAudioTrackVolume(usize, f32),
-    #[allow(dead_code)]
-    SetAudioMixMode(bool),
     SetAudioMixTracks(Vec<(usize, f32)>),
-    #[allow(dead_code)]
-    SetMobileHudTab(crate::state::MobileHudTab),
     ToggleVisPicker,
 }
 
@@ -202,7 +195,6 @@ struct MeshBuffers {
 }
 
 pub struct VulkanEngine {
-    #[allow(dead_code)]
     instance: wgpu::Instance,
     surface: Option<wgpu::Surface<'static>>,
     device: wgpu::Device,
@@ -213,8 +205,7 @@ pub struct VulkanEngine {
     hud_pipeline: wgpu::RenderPipeline,
     uniform_buffer: wgpu::Buffer,
     waveform_storage_buffer: wgpu::Buffer,
-    #[allow(dead_code)] // accessed via GPU bind groups, not directly from Rust
-    history_texture: wgpu::Texture,
+    _history_texture: wgpu::Texture,
     fire_grid_texture: wgpu::Texture,
     uniform_bind_group: wgpu::BindGroup,
     pub egui_renderer: egui_wgpu::Renderer,
@@ -233,13 +224,11 @@ pub struct VulkanEngine {
     pub fire_uv_rect: [f32; 4],
 
     // GPU compute fire simulation
-    #[allow(dead_code)] // preserved for standalone GPU fire compute / testing
-    fire_compute_pipeline: wgpu::ComputePipeline,
+    _fire_compute_pipeline: wgpu::ComputePipeline,
     firesim_compute_pipeline: wgpu::ComputePipeline,
     fire_buffer_a: wgpu::Buffer,
     fire_buffer_b: wgpu::Buffer,
-    #[allow(dead_code)] // accessed via GPU bind groups, not directly from Rust
-    fire_coal_buffer: wgpu::Buffer,
+    _fire_coal_buffer: wgpu::Buffer,
     fire_params_buffer: wgpu::Buffer,
     fire_bind_group_a: wgpu::BindGroup, // reads A, writes B
     fire_bind_group_b: wgpu::BindGroup, // reads B, writes A
@@ -249,6 +238,8 @@ pub struct VulkanEngine {
     retro_fire_cells: Box<[u8; 320 * 180]>,
     retro_fire_upload: Vec<f32>,
     retro_fire_rng: u32,
+    retro_fire_accum: f32,
+    retro_fire_cold_uploaded: bool,
 
     pub heatmap_row: u32,
     heatmap_compute_pipeline: wgpu::ComputePipeline,
@@ -278,18 +269,16 @@ pub struct VulkanEngine {
     flip_water_pressure_1_to_0_pipeline: wgpu::ComputePipeline,
     flip_water_project_pipeline: wgpu::ComputePipeline,
     flip_water_g2p_advect_pipeline: wgpu::ComputePipeline,
+    water_splash_pipeline: wgpu::RenderPipeline,
+    splash_quad_vertex_buffer: wgpu::Buffer,
+    splash_quad_index_buffer: wgpu::Buffer,
 
     // GPU compute bioluminescent waves simulation
-    #[allow(dead_code)]
-    biolum_particles_buffer: wgpu::Buffer,
+    _biolum_particles_buffer: wgpu::Buffer,
     biolum_compute_pipeline: wgpu::ComputePipeline,
     biolum_compute_bind_group: wgpu::BindGroup,
     biolum_render_bind_group: wgpu::BindGroup,
-    #[allow(dead_code)]
-    biolum_render_pipeline_layout: wgpu::PipelineLayout,
-
-    #[allow(dead_code)]
-    pub start_time: std::time::Instant,
+    _biolum_render_pipeline_layout: wgpu::PipelineLayout,
 
     // GPU FFT was removed (FFT is computed on the CPU); the dummy timestamp
     // pass in render() keeps the query-slot layout intact.
@@ -342,13 +331,14 @@ pub struct VulkanEngine {
     // Change detection for waveform history uploads (skip 1.2MB write when unchanged)
     last_uploaded_push_count: u64,
     last_uploaded_vis_width: u32,
+    last_uploaded_vis_id: u32,
     pub lyric_slam_timer: f32,
     pub last_lyric_line_idx: Option<usize>,
     pub current_lyric_mesh_text: String,
     pub fire_intensity: f32,
 }
 
-pub(crate) fn generate_lamp_mesh() -> (Vec<Vertex>, Vec<u32>) {
+pub fn generate_lamp_mesh() -> (Vec<Vertex>, Vec<u32>) {
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
 
@@ -611,7 +601,7 @@ fn room_add_cone(
         vertices.push(Vertex {
             position: apex,
             normal: n,
-            tex_coords: [ch, mat],
+            tex_coords: [ch, mat + 0.25],
         });
         vertices.push(Vertex {
             position: p0,
@@ -1692,10 +1682,13 @@ pub fn generate_glass_lyrics_mesh(text: &str) -> (Vec<Vertex>, Vec<u32>) {
         trimmed
     };
 
-    // Try system DejaVu Sans Bold first, fallback to embedded Orbitron Black
-    let sys_font_path = "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf";
-    let font_bytes = std::fs::read(sys_font_path).unwrap_or_else(|_| EMBEDDED_GLASS_FONT.to_vec());
-    let face = ttf_parser::Face::parse(&font_bytes, 0).ok();
+    // Cache system DejaVu Sans Bold once across process lifetime, fallback to embedded Orbitron Black
+    static CACHED_SYS_FONT: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    let sys_font = CACHED_SYS_FONT.get_or_init(|| {
+        std::fs::read("/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf").ok()
+    });
+    let font_slice: &[u8] = sys_font.as_deref().unwrap_or(EMBEDDED_GLASS_FONT);
+    let face = ttf_parser::Face::parse(font_slice, 0).ok();
 
     if let Some(face) = face {
         let em = face.units_per_em() as f32;
@@ -1925,14 +1918,14 @@ pub fn generate_glass_lyrics_mesh(text: &str) -> (Vec<Vertex>, Vec<u32>) {
         }
     }
 
-    // 2. Tessellated 3D Water Grid Plane: 64 x 64 vertices spanning [-16.0, 16.0] x [-10.0, 10.0]
-    let grid_res_x = 64;
-    let grid_res_z = 64;
+    // 2. Tessellated 3D Water Grid Plane: 128 x 128 vertices spanning [-16.0, 16.0] x [-10.0, 4.5]
+    let grid_res_x = 128;
+    let grid_res_z = 128;
     let start_water_vert = vertices.len() as u32;
 
     for iz in 0..grid_res_z {
         let fz = iz as f32 / (grid_res_z - 1) as f32;
-        let z = -10.0 + fz * 20.0;
+        let z = -10.0 + fz * 14.5;
         for ix in 0..grid_res_x {
             let fx = ix as f32 / (grid_res_x - 1) as f32;
             let x = -16.0 + fx * 32.0;
@@ -2500,48 +2493,6 @@ pub(crate) fn generate_vumeter_rack_mesh() -> (Vec<Vertex>, Vec<u32>) {
     (vertices, indices)
 }
 
-pub(crate) fn generate_neon_corridor_mesh() -> (Vec<Vertex>, Vec<u32>) {
-    let mut vertices = Vec::new();
-    let mut indices = Vec::new();
-    load_obj_mesh(
-        &mut vertices,
-        &mut indices,
-        include_str!("assets/models/neon_corridor_frames.obj"),
-        [0.0, 0.0, 0.0],
-        [1.0, 1.0, 1.0],
-        0.0,
-        0.0,
-    );
-    (vertices, indices)
-}
-
-pub(crate) fn generate_storm_rain_volume_mesh() -> (Vec<Vertex>, Vec<u32>) {
-    let mut vertices = Vec::new();
-    let mut indices = Vec::new();
-
-    // Pure 3D Instanced Falling Raindrops across viewing frustum (mat = 3.0)
-    for i in 0..2500 {
-        let seed = (i as f32) * std::f32::consts::GOLDEN_RATIO;
-        let rx = (((seed * 17.3).fract()) - 0.5) * 44.0;
-        let ry = ((seed * 29.1).fract()) * 30.0;
-        let rz = 2.0 + ((seed * 43.7).fract()) * 110.0;
-        let drop_len = 0.55;
-        cyber_add_quad(
-            &mut vertices,
-            &mut indices,
-            [rx - 0.015, ry, rz],
-            [rx + 0.015, ry, rz],
-            [rx + 0.015, ry + drop_len, rz],
-            [rx - 0.015, ry + drop_len, rz],
-            [0.0, 0.0, 1.0],
-            3.0,
-            ry,
-        );
-    }
-
-    (vertices, indices)
-}
-
 impl VulkanEngine {
     pub async fn new(window: Arc<Window>) -> Self {
         let size = window.inner_size();
@@ -2610,9 +2561,14 @@ impl VulkanEngine {
         // Keyed by the adapter so caches from different devices don't collide.
         let pipeline_cache_path: Option<std::path::PathBuf> = (|| {
             let key = wgpu::util::pipeline_cache_key(&adapter.get_info())?;
-            let dir = std::env::var("RUSTTRACKER_CACHE_DIR")
-                .map(std::path::PathBuf::from)
-                .ok()
+            let dir = crate::state::CACHE_DIR_OVERRIDE
+                .get()
+                .cloned()
+                .or_else(|| {
+                    std::env::var("RUSTTRACKER_CACHE_DIR")
+                        .map(std::path::PathBuf::from)
+                        .ok()
+                })
                 .or_else(|| {
                     directories::ProjectDirs::from("com", "RustTracker", "RustTracker")
                         .map(|p| p.cache_dir().to_path_buf())
@@ -2656,7 +2612,9 @@ impl VulkanEngine {
             .unwrap_or(surface_caps.formats[0]);
 
         // Enable dynamic display refresh & VRR (Adaptive Sync / FreeSync / G-Sync)
-        let present_mode = if let Ok(mode_str) = std::env::var("RUSTTRACKER_PRESENT_MODE") {
+        let present_mode = if crate::state::UNCAPPED_PRESENT_MODE.load(Ordering::Relaxed) {
+            wgpu::PresentMode::AutoNoVsync
+        } else if let Ok(mode_str) = std::env::var("RUSTTRACKER_PRESENT_MODE") {
             match mode_str.to_lowercase().as_str() {
                 "novsync" | "immediate" => wgpu::PresentMode::AutoNoVsync,
                 "mailbox"
@@ -2952,16 +2910,28 @@ impl VulkanEngine {
         let flip_render_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("FLIP Render Layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: true },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                }],
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
             });
 
         let flip_render_pipeline_layout =
@@ -2970,6 +2940,17 @@ impl VulkanEngine {
                 bind_group_layouts: &[
                     Some(&bind_group_layout),
                     Some(&flip_render_bind_group_layout),
+                ],
+                immediate_size: 0,
+            });
+
+        let lyrics_render_pipeline_layout_3d =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Lyrics 3D Render Pipeline Layout"),
+                bind_group_layouts: &[
+                    Some(&bind_group_layout),
+                    Some(&flip_render_bind_group_layout),
+                    Some(&camera_bind_group_layout),
                 ],
                 immediate_size: 0,
             });
@@ -3091,6 +3072,21 @@ impl VulkanEngine {
             let (layout, vertex_buffers, primitive, vs_entry) = if vis_def.id == 20 {
                 (
                     &biolum_render_pipeline_layout,
+                    vec![Vertex::desc()],
+                    wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        strip_index_format: None,
+                        front_face: wgpu::FrontFace::Ccw,
+                        cull_mode: None,
+                        polygon_mode: wgpu::PolygonMode::Fill,
+                        unclipped_depth: false,
+                        conservative: false,
+                    },
+                    "vs_main_3d",
+                )
+            } else if vis_def.id == 23 {
+                (
+                    &lyrics_render_pipeline_layout_3d,
                     vec![Vertex::desc()],
                     wgpu::PrimitiveState {
                         topology: wgpu::PrimitiveTopology::TriangleList,
@@ -4240,8 +4236,12 @@ impl VulkanEngine {
 
         let fire_compute_shader =
             device.create_shader_module(wgpu::include_wgsl!("shaders/fire_compute.wgsl"));
-        let firesim_compute_shader =
-            device.create_shader_module(wgpu::include_wgsl!("shaders/firesim_compute.wgsl"));
+        let firesim_compute_source =
+            resolve_shader_includes(include_str!("shaders/firesim_compute.wgsl"));
+        let firesim_compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("FireSim Compute Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&firesim_compute_source)),
+        });
         let fire_compute_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("fire_compute_layout"),
@@ -4535,11 +4535,10 @@ impl VulkanEngine {
 
         let flip_compute_source =
             resolve_shader_includes(include_str!("shaders/flip_ferrofluid_compute.wgsl"));
-        let flip_compute_shader =
-            device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("FLIP Ferrofluid Compute Shader"),
-                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&flip_compute_source)),
-            });
+        let flip_compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("FLIP Ferrofluid Compute Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&flip_compute_source)),
+        });
         let flip_compute_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("flip_compute_layout"),
@@ -4567,15 +4566,14 @@ impl VulkanEngine {
                 cache: pipeline_cache_ref,
             });
 
-        let flip_p2g_pipeline =
-            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("FLIP P2G"),
-                layout: Some(&flip_compute_pipeline_layout),
-                module: &flip_compute_shader,
-                entry_point: Some("cs_p2g"),
-                compilation_options: Default::default(),
-                cache: pipeline_cache_ref,
-            });
+        let flip_p2g_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("FLIP P2G"),
+            layout: Some(&flip_compute_pipeline_layout),
+            module: &flip_compute_shader,
+            entry_point: Some("cs_p2g"),
+            compilation_options: Default::default(),
+            cache: pipeline_cache_ref,
+        });
 
         let flip_forces_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -4630,20 +4628,27 @@ impl VulkanEngine {
         let flip_render_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("FLIP Render BG"),
             layout: &flip_render_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: flip_render_grid.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: flip_render_grid.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: flip_particles.as_entire_binding(),
+                },
+            ],
         });
 
         // --- Acoustic FLIP Water Compute Pipelines ---
         let flip_water_compute_source =
             resolve_shader_includes(include_str!("shaders/flip_water_compute.wgsl"));
-        let flip_water_compute_shader =
-            device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some("FLIP Water Compute Shader"),
-                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&flip_water_compute_source)),
-            });
+        let flip_water_compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("FLIP Water Compute Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(
+                &flip_water_compute_source,
+            )),
+        });
 
         let flip_water_clear_pipeline =
             device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -4722,6 +4727,103 @@ impl VulkanEngine {
                 module: &flip_water_compute_shader,
                 entry_point: Some("cs_g2p_advect_splat"),
                 compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+
+        // --- 3D Airborne Water Splash Droplet Pipeline ---
+        let splash_quad_verts = [
+            Vertex {
+                position: [-0.5, -0.5, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                tex_coords: [0.0, 0.0],
+            },
+            Vertex {
+                position: [0.5, -0.5, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                tex_coords: [1.0, 0.0],
+            },
+            Vertex {
+                position: [0.5, 0.5, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                tex_coords: [1.0, 1.0],
+            },
+            Vertex {
+                position: [-0.5, 0.5, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                tex_coords: [0.0, 1.0],
+            },
+        ];
+        let splash_quad_inds: [u32; 6] = [0, 1, 2, 0, 2, 3];
+
+        let splash_quad_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Splash Quad Vertex Buffer"),
+            size: (splash_quad_verts.len() * std::mem::size_of::<Vertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(
+            &splash_quad_vertex_buffer,
+            0,
+            bytemuck::cast_slice(&splash_quad_verts),
+        );
+
+        let splash_quad_index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Splash Quad Index Buffer"),
+            size: (splash_quad_inds.len() * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(
+            &splash_quad_index_buffer,
+            0,
+            bytemuck::cast_slice(&splash_quad_inds),
+        );
+
+        let water_splash_source =
+            resolve_shader_includes(include_str!("shaders/vis_water_splash.wgsl"));
+        let water_splash_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Water Splash Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&water_splash_source)),
+        });
+
+        let water_splash_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Water Splash Droplet Pipeline"),
+                layout: Some(&lyrics_render_pipeline_layout_3d),
+                vertex: wgpu::VertexState {
+                    module: &water_splash_shader,
+                    entry_point: Some("vs_splash"),
+                    buffers: &[Vertex::desc()],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &water_splash_shader,
+                    entry_point: Some("fs_splash"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
                 cache: pipeline_cache_ref,
             });
 
@@ -4837,31 +4939,53 @@ impl VulkanEngine {
             }));
         }
 
-        // --- Resynth compute (consumes the CPU-filled GPU spectrum buffer) ---
+        // --- Resynth compute (consumes the CPU-filled GPU spectrum buffer + AudioUniforms) ---
         let resynth_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("resynth_bind_group_layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::COMPUTE,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Storage { read_only: false },
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                }],
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
             });
         let resynth_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("resynth_bind_group"),
             layout: &resynth_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: gpu_spectrum_buffer.as_entire_binding(),
-            }],
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: gpu_spectrum_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+            ],
         });
-        let resynth_compute_shader =
-            device.create_shader_module(wgpu::include_wgsl!("shaders/resynth_compute.wgsl"));
+        let resynth_compute_source =
+            resolve_shader_includes(include_str!("shaders/resynth_compute.wgsl"));
+        let resynth_compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Resynth Compute Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&resynth_compute_source)),
+        });
         let resynth_compute_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("resynth_compute_layout"),
@@ -4954,101 +5078,9 @@ impl VulkanEngine {
                     ]);
                     (vertices, indices)
                 }
-                crate::state::Geometry::UnitBox => {
-                    let mut vertices = Vec::new();
-                    let mut indices = Vec::new();
-
-                    let mut add_face = |p0: [f32; 3],
-                                        p1: [f32; 3],
-                                        p2: [f32; 3],
-                                        p3: [f32; 3],
-                                        normal: [f32; 3]| {
-                        let start_idx = vertices.len() as u32;
-                        vertices.push(Vertex {
-                            position: p0,
-                            normal,
-                            tex_coords: [0.0, 0.0],
-                        });
-                        vertices.push(Vertex {
-                            position: p1,
-                            normal,
-                            tex_coords: [1.0, 0.0],
-                        });
-                        vertices.push(Vertex {
-                            position: p2,
-                            normal,
-                            tex_coords: [1.0, 1.0],
-                        });
-                        vertices.push(Vertex {
-                            position: p3,
-                            normal,
-                            tex_coords: [0.0, 1.0],
-                        });
-
-                        indices.push(start_idx);
-                        indices.push(start_idx + 1);
-                        indices.push(start_idx + 2);
-                        indices.push(start_idx);
-                        indices.push(start_idx + 2);
-                        indices.push(start_idx + 3);
-                    };
-
-                    // Front face (z = +0.5)
-                    add_face(
-                        [-0.5, -0.5, 0.5],
-                        [0.5, -0.5, 0.5],
-                        [0.5, 0.5, 0.5],
-                        [-0.5, 0.5, 0.5],
-                        [0.0, 0.0, 1.0],
-                    );
-                    // Back face (z = -0.5)
-                    add_face(
-                        [0.5, -0.5, -0.5],
-                        [-0.5, -0.5, -0.5],
-                        [-0.5, 0.5, -0.5],
-                        [0.5, 0.5, -0.5],
-                        [0.0, 0.0, -1.0],
-                    );
-                    // Left face (x = -0.5)
-                    add_face(
-                        [-0.5, -0.5, -0.5],
-                        [-0.5, -0.5, 0.5],
-                        [-0.5, 0.5, 0.5],
-                        [-0.5, 0.5, -0.5],
-                        [-1.0, 0.0, 0.0],
-                    );
-                    // Right face (x = +0.5)
-                    add_face(
-                        [0.5, -0.5, 0.5],
-                        [0.5, -0.5, -0.5],
-                        [0.5, 0.5, -0.5],
-                        [0.5, 0.5, 0.5],
-                        [1.0, 0.0, 0.0],
-                    );
-                    // Top face (y = +0.5)
-                    add_face(
-                        [-0.5, 0.5, 0.5],
-                        [0.5, 0.5, 0.5],
-                        [0.5, 0.5, -0.5],
-                        [-0.5, 0.5, -0.5],
-                        [0.0, 1.0, 0.0],
-                    );
-                    // Bottom face (y = -0.5)
-                    add_face(
-                        [-0.5, -0.5, -0.5],
-                        [0.5, -0.5, -0.5],
-                        [0.5, -0.5, 0.5],
-                        [-0.5, -0.5, 0.5],
-                        [0.0, -1.0, 0.0],
-                    );
-
-                    (vertices, indices)
-                }
                 crate::state::Geometry::NeonRoom => generate_neon_room_mesh(),
                 crate::state::Geometry::SynthwaveRacerScene => generate_synthwave_racer_mesh(),
                 crate::state::Geometry::VuMeterRack => generate_vumeter_rack_mesh(),
-                crate::state::Geometry::NeonCorridorFrames => generate_neon_corridor_mesh(),
-                crate::state::Geometry::StormRainVolume => generate_storm_rain_volume_mesh(),
                 crate::state::Geometry::GlassLyricsScene => {
                     generate_glass_lyrics_mesh("RUSTTRACKER")
                 }
@@ -5138,7 +5170,7 @@ impl VulkanEngine {
             hud_pipeline,
             uniform_buffer,
             waveform_storage_buffer,
-            history_texture,
+            _history_texture: history_texture,
             fire_grid_texture,
             uniform_bind_group,
             egui_renderer,
@@ -5154,11 +5186,11 @@ impl VulkanEngine {
             meters_uv_rect: [0.0; 4],
             heatmap_uv_rect: [0.0; 4],
             fire_uv_rect: [0.0; 4],
-            fire_compute_pipeline,
+            _fire_compute_pipeline: fire_compute_pipeline,
             firesim_compute_pipeline,
             fire_buffer_a,
             fire_buffer_b,
-            fire_coal_buffer,
+            _fire_coal_buffer: fire_coal_buffer,
             fire_params_buffer,
             fire_bind_group_a,
             fire_bind_group_b,
@@ -5166,6 +5198,8 @@ impl VulkanEngine {
             retro_fire_cells: Box::new([0u8; 320 * 180]),
             retro_fire_upload: vec![0.0f32; 1024 * 576],
             retro_fire_rng: 0x12345678,
+            retro_fire_accum: 0.0,
+            retro_fire_cold_uploaded: false,
             heatmap_row: 0,
             heatmap_compute_pipeline,
             heatmap_bind_group,
@@ -5192,14 +5226,16 @@ impl VulkanEngine {
             flip_water_pressure_1_to_0_pipeline,
             flip_water_project_pipeline,
             flip_water_g2p_advect_pipeline,
+            water_splash_pipeline,
+            splash_quad_vertex_buffer,
+            splash_quad_index_buffer,
 
-            biolum_particles_buffer,
+            _biolum_particles_buffer: biolum_particles_buffer,
             biolum_compute_pipeline,
             biolum_compute_bind_group,
             biolum_render_bind_group,
-            biolum_render_pipeline_layout,
+            _biolum_render_pipeline_layout: biolum_render_pipeline_layout,
 
-            start_time: std::time::Instant::now(),
             resynth_compute_pipeline,
             resynth_bind_group,
             _gpu_spectrum_buffer: gpu_spectrum_buffer,
@@ -5243,6 +5279,7 @@ impl VulkanEngine {
             channel_phases: [0.0; 32],
             last_uploaded_push_count: u64::MAX,
             last_uploaded_vis_width: 0,
+            last_uploaded_vis_id: u32::MAX,
             lyric_slam_timer: 0.0,
             last_lyric_line_idx: None,
             current_lyric_mesh_text: "RUSTTRACKER".to_string(),
@@ -5278,13 +5315,11 @@ impl VulkanEngine {
         }
     }
 
-    #[allow(dead_code)]
     pub fn suspend_surface(&mut self) {
         eprintln!("[RustTracker Engine] Suspending surface...");
         self.surface = None;
     }
 
-    #[allow(dead_code)]
     pub fn resume_surface(&mut self, window: Arc<Window>) {
         let size = window.inner_size();
         eprintln!(
@@ -5501,13 +5536,29 @@ impl VulkanEngine {
         }
     }
 
-    pub fn update_retro_fire(&mut self, state: &crate::state::AppState, _uniforms: &AudioUniforms) {
-        Self::update_retro_fire_grid(
-            &mut self.retro_fire_cells,
-            &mut self.retro_fire_rng,
-            self.fire_intensity,
-            state,
-        );
+    pub fn update_retro_fire(&mut self, state: &crate::state::AppState, uniforms: &AudioUniforms) {
+        let dt = uniforms.frame_dt.clamp(0.001, 0.05);
+        self.retro_fire_accum = (self.retro_fire_accum + dt * 60.0).min(3.0);
+        let steps = (self.retro_fire_accum.floor() as u32).max(1);
+        self.retro_fire_accum = (self.retro_fire_accum - steps as f32).max(0.0);
+
+        for _ in 0..steps {
+            Self::update_retro_fire_grid(
+                &mut self.retro_fire_cells,
+                &mut self.retro_fire_rng,
+                self.fire_intensity,
+                state,
+            );
+        }
+
+        if self.fire_intensity < 0.001 && self.retro_fire_cells.iter().all(|&c| c == 0) {
+            if self.retro_fire_cold_uploaded {
+                return;
+            }
+            self.retro_fire_cold_uploaded = true;
+        } else {
+            self.retro_fire_cold_uploaded = false;
+        }
 
         // Fast upload to 1024x576 fire_grid_texture using precomputed coordinate maps:
         const PAL_FLOAT: [f32; 37] = {
@@ -5552,7 +5603,6 @@ impl VulkanEngine {
         );
     }
 
-    #[allow(dead_code)]
     pub fn has_video_stream(&self) -> bool {
         self.video_state.is_some()
     }
@@ -5841,10 +5891,12 @@ impl VulkanEngine {
 
             let slam_t = self.lyric_slam_timer;
             let bass = if state.spectrum_data.len() > 4 {
-                state.spectrum_data[1..5]
+                (state.spectrum_data[1..5]
                     .iter()
                     .copied()
                     .fold(0.0f32, f32::max)
+                    / 65.0)
+                    .clamp(0.0, 1.5)
             } else {
                 0.0
             };
@@ -5929,9 +5981,13 @@ impl VulkanEngine {
         // 1.2MB buffer write + CPU flatten/smooth pass every frame while paused)
         let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
         let history_dirty = state.waveform_history_push_count != self.last_uploaded_push_count
-            || vis_width != self.last_uploaded_vis_width;
-        if vis_def.id == 24 {
+            || vis_width != self.last_uploaded_vis_width
+            || vis_def.id != self.last_uploaded_vis_id;
+        if vis_def.id == 24 && history_dirty {
             if !state.lookahead_timeline.is_empty() {
+                self.last_uploaded_push_count = state.waveform_history_push_count;
+                self.last_uploaded_vis_width = vis_width;
+                self.last_uploaded_vis_id = vis_def.id;
                 self.queue.write_buffer(
                     &self.waveform_storage_buffer,
                     0,
@@ -5941,6 +5997,7 @@ impl VulkanEngine {
         } else if vis_def.requires_history && history_dirty {
             self.last_uploaded_push_count = state.waveform_history_push_count;
             self.last_uploaded_vis_width = vis_width;
+            self.last_uploaded_vis_id = vis_def.id;
             // Upload up to 144 most recent frames
             let hist_len = state.waveform_history.len();
             let start = hist_len.saturating_sub(144);
@@ -6043,13 +6100,15 @@ impl VulkanEngine {
         }
 
         // GPU spectrum is consumed only by the firesim compute (id 6) and the
-        // resynth compute (requires_resynth, id 8) — skip the 256KB upload otherwise,
+        // resynth compute (requires_resynth, id 4) — skip the 256KB upload otherwise,
         // and only upload when new audio FFT data arrived (history_dirty)
-        if state.gpu_fft
-            && (vis_def.id == 6 || vis_def.requires_resynth)
+        if (vis_def.id == 6 || vis_def.requires_resynth)
             && !state.gpu_spectrum_data.is_empty()
             && history_dirty
         {
+            self.last_uploaded_push_count = state.waveform_history_push_count;
+            self.last_uploaded_vis_width = vis_width;
+            self.last_uploaded_vis_id = vis_def.id;
             self.queue.write_buffer(
                 &self._gpu_spectrum_buffer,
                 0,
@@ -6592,30 +6651,20 @@ impl VulkanEngine {
                             egui::RichText::new(format!("CPU UI: {:.2} ms | CPU Render: {:.2} ms", state.stats.ui_us / 1000.0, state.stats.render_us / 1000.0))
                                 .color(egui::Color32::WHITE)
                         );
-                        if state.gpu_fft {
-                            let fft_label = if state.stats.gpu_fft_us > 0.0 {
-                                format!("GPU FFT: {:.2} ms", state.stats.gpu_fft_us / 1000.0)
-                            } else {
-                                "GPU FFT: Active (Compute)".to_string()
-                            };
+                        ui.label(
+                            egui::RichText::new(format!("CPU FFT: {:.2} ms", state.stats.fft_us / 1000.0))
+                                .color(egui::Color32::WHITE)
+                        );
+                        if state.gpu_fft && state.stats.gpu_fft_us > 0.0 {
                             ui.label(
-                                egui::RichText::new(fft_label)
+                                egui::RichText::new(format!("GPU Compute: {:.2} ms", state.stats.gpu_fft_us / 1000.0))
                                     .color(egui::Color32::LIGHT_BLUE)
                             );
-                            ui.label(
-                                egui::RichText::new(format!("CPU Decode: {:.2} ms", state.stats.decode_us / 1000.0))
-                                    .color(egui::Color32::WHITE)
-                            );
-                        } else {
-                            ui.label(
-                                egui::RichText::new(format!("CPU FFT: {:.2} ms", state.stats.fft_us / 1000.0))
-                                    .color(egui::Color32::WHITE)
-                            );
-                            ui.label(
-                                egui::RichText::new(format!("CPU Decode: {:.2} ms", state.stats.decode_us / 1000.0))
-                                    .color(egui::Color32::WHITE)
-                            );
                         }
+                        ui.label(
+                            egui::RichText::new(format!("CPU Decode: {:.2} ms", state.stats.decode_us / 1000.0))
+                                .color(egui::Color32::WHITE)
+                        );
                         let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
                         let mut total_vis_us = state.stats.shader_us;
                         if vis_def.requires_fire {
@@ -8771,37 +8820,24 @@ impl VulkanEngine {
             &screen_descriptor,
         );
 
-        // GPU heatmap compute
+        // GPU heatmap & resynth compute (timed via query indices 0..1)
         {
             let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Heatmap Compute Pass"),
-                timestamp_writes: None,
+                label: Some("Heatmap & Resynth Compute Pass"),
+                timestamp_writes: self.query_set.as_ref().map(|qs| {
+                    wgpu::ComputePassTimestampWrites {
+                        query_set: qs,
+                        beginning_of_pass_write_index: Some(0),
+                        end_of_pass_write_index: Some(1),
+                    }
+                }),
             });
             compute_pass.set_pipeline(&self.heatmap_compute_pipeline);
             compute_pass.set_bind_group(0, Some(&self.heatmap_bind_group), &[]);
             compute_pass.dispatch_workgroups(1, 1, 1); // 256x1x1 threads
-        }
 
-        // GPU FFT compute - bypassed on GPU since we now compute Cooley-Tukey FFT on CPU
-        // Write dummy timestamps to satisfy Vulkan query resolving
-        if let Some(qs) = &self.query_set {
-            encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Dummy FFT Pass"),
-                timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
-                    query_set: qs,
-                    beginning_of_pass_write_index: Some(0),
-                    end_of_pass_write_index: Some(1),
-                }),
-            });
-        }
-
-        if state.gpu_fft {
             let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
             if vis_def.requires_resynth {
-                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Resynth Compute Pass"),
-                    timestamp_writes: None,
-                });
                 compute_pass.set_pipeline(&self.resynth_compute_pipeline);
                 compute_pass.set_bind_group(0, Some(&self.resynth_bind_group), &[]);
                 compute_pass.dispatch_workgroups(32, 2, 1); // 512/16=32, 32/16=2
@@ -9233,7 +9269,7 @@ impl VulkanEngine {
 
             render_pass.set_pipeline(&self.render_pipelines[mode_idx]);
             render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-            if vis_def.id == 27 || vis_def.id == 28 {
+            if vis_def.id == 27 || vis_def.id == 28 || vis_def.id == 23 {
                 render_pass.set_bind_group(1, &self.flip_render_bind_group, &[]);
             } else {
                 render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
@@ -9258,6 +9294,16 @@ impl VulkanEngine {
                             wgpu::IndexFormat::Uint32,
                         );
                         render_pass.draw_indexed(0..mesh.index_count, 0, 0..*instances);
+                    }
+
+                    if vis_def.id == 23 {
+                        render_pass.set_pipeline(&self.water_splash_pipeline);
+                        render_pass.set_vertex_buffer(0, self.splash_quad_vertex_buffer.slice(..));
+                        render_pass.set_index_buffer(
+                            self.splash_quad_index_buffer.slice(..),
+                            wgpu::IndexFormat::Uint32,
+                        );
+                        render_pass.draw_indexed(0..6, 0, 0..65536);
                     }
 
                     if vis_def.id == 13 {
@@ -9429,7 +9475,10 @@ impl VulkanEngine {
             encoder.copy_buffer_to_buffer(res_buf, 0, read_buf, 0, 48);
         }
 
-        let capture_frame = if let Ok(bf_str) = std::env::var("BENCH_FRAMES") {
+        let bench_override = crate::state::BENCH_FRAMES_OVERRIDE.load(Ordering::Relaxed);
+        let capture_frame = if bench_override > 0 {
+            bench_override.saturating_sub(1)
+        } else if let Ok(bf_str) = std::env::var("BENCH_FRAMES") {
             bf_str.parse::<u32>().unwrap_or(180).saturating_sub(1)
         } else {
             180
@@ -9538,7 +9587,10 @@ impl VulkanEngine {
                 img.save(&capture_path).unwrap();
                 println!("Screenshot saved to {}", capture_path);
             }
-            if std::env::var("BENCH_FRAMES").is_err() && self.frame_count == capture_frame {
+            if bench_override == 0
+                && std::env::var("BENCH_FRAMES").is_err()
+                && self.frame_count == capture_frame
+            {
                 std::process::exit(0);
             }
         }

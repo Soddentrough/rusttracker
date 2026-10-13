@@ -29,14 +29,7 @@ use winit::{
     keyboard::{KeyCode as WinitKeyCode, PhysicalKey},
 };
 
-pub mod audio;
-pub mod bitstream;
-mod engine;
-pub mod ipc;
-pub mod lyrics;
-pub mod playlist;
-mod state;
-mod ui;
+use rusttracker::{audio, engine, ipc, lyrics, playlist, state, ui};
 
 use crate::engine::{EngineAction, VulkanEngine};
 use crate::state::AppState;
@@ -103,19 +96,6 @@ impl Drop for Tui {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    #[cfg(target_os = "linux")]
-    {
-        // If the user explicitly requested X11 via RUSTTRACKER_X11, configure WINIT_UNIX_BACKEND.
-        // Otherwise, allow winit to natively connect to Wayland on Wayland compositors (e.g. GNOME/KDE)
-        // or X11 on standard X servers, preventing crashes when DISPLAY points to an unavailable server.
-        if std::env::var("RUSTTRACKER_X11").is_ok() && std::env::var("WINIT_UNIX_BACKEND").is_err()
-        {
-            unsafe {
-                std::env::set_var("WINIT_UNIX_BACKEND", "x11");
-            }
-        }
-    }
-
     env_logger::init();
     std::panic::set_hook(Box::new(|info| {
         let backtrace = std::backtrace::Backtrace::force_capture();
@@ -141,9 +121,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let mut args = Args::parse();
     if args.uncapped {
-        unsafe {
-            std::env::set_var("RUSTTRACKER_PRESENT_MODE", "immediate");
-        }
+        crate::state::UNCAPPED_PRESENT_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
     let should_list_vis =
         args.list_vis || matches!(args.vis.as_deref(), Some("") | Some("list") | Some("help"));
@@ -317,7 +295,63 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-#[allow(unused_variables, unused_assignments)]
+struct DesktopRuntime {
+    egui_state: egui_winit::State,
+    engine: VulkanEngine,
+    window: Arc<winit::window::Window>,
+}
+
+struct DesktopApp<InitFn, EventFn> {
+    runtime: Option<DesktopRuntime>,
+    init_error: Option<anyhow::Error>,
+    init_fn: Option<InitFn>,
+    event_fn: EventFn,
+}
+
+impl<InitFn, EventFn> winit::application::ApplicationHandler for DesktopApp<InitFn, EventFn>
+where
+    InitFn: FnOnce(&winit::event_loop::ActiveEventLoop) -> anyhow::Result<DesktopRuntime>,
+    EventFn: FnMut(&mut DesktopRuntime, Event<()>, &winit::event_loop::ActiveEventLoop),
+{
+    fn resumed(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        if self.runtime.is_none()
+            && let Some(init) = self.init_fn.take()
+        {
+            match init(event_loop) {
+                Ok(rt) => {
+                    event_loop.set_control_flow(ControlFlow::Poll);
+                    self.runtime = Some(rt);
+                }
+                Err(e) => {
+                    self.init_error = Some(e);
+                    event_loop.exit();
+                }
+            }
+        }
+    }
+
+    fn window_event(
+        &mut self,
+        event_loop: &winit::event_loop::ActiveEventLoop,
+        window_id: winit::window::WindowId,
+        event: WindowEvent,
+    ) {
+        if let Some(ref mut rt) = self.runtime {
+            (self.event_fn)(rt, Event::WindowEvent { window_id, event }, event_loop);
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &winit::event_loop::ActiveEventLoop) {
+        if let Some(ref mut rt) = self.runtime {
+            (self.event_fn)(rt, Event::AboutToWait, event_loop);
+        }
+    }
+
+    fn exiting(&mut self, _event_loop: &winit::event_loop::ActiveEventLoop) {
+        let _ = self.runtime.take();
+    }
+}
+
 async fn run_gui(
     args: Args,
     app_state: Arc<Mutex<AppState>>,
@@ -335,9 +369,7 @@ async fn run_gui(
         state.gpu_fft = true;
     }
     if let Some(bf) = bench {
-        unsafe {
-            std::env::set_var("BENCH_FRAMES", bf.to_string());
-        }
+        crate::state::BENCH_FRAMES_OVERRIDE.store(bf, std::sync::atomic::Ordering::Relaxed);
     }
 
     let mut event_loop_builder = EventLoop::builder();
@@ -356,9 +388,6 @@ async fn run_gui(
                     "[warn] Failed to initialize display backend ({:?}). Retrying default display backend...",
                     err
                 );
-                unsafe {
-                    std::env::remove_var("WINIT_UNIX_BACKEND");
-                }
                 EventLoop::builder().build().map_err(|e| {
                     anyhow::anyhow!("Failed to initialize GUI display/window event loop: {:?}. Make sure a graphical display (Wayland or X11) is available, or use a virtual display (e.g. xvfb-run).", e)
                 })?
@@ -409,7 +438,6 @@ async fn run_gui(
         winit::dpi::LogicalSize::new(1440.0, 840.0)
     };
 
-    #[allow(unused_mut)]
     let mut attrs = winit::window::Window::default_attributes()
         .with_title("RustTracker Vulkan Visualizer")
         .with_theme(Some(winit::window::Theme::Dark))
@@ -427,20 +455,8 @@ async fn run_gui(
         attrs = WindowAttributesExtX11::with_name(attrs, "rusttracker", "rusttracker");
     }
 
-    #[allow(deprecated)]
-    let window = match event_loop.create_window(attrs) {
-        Ok(w) => Arc::new(w),
-        Err(e) => {
-            return Err(anyhow::anyhow!(
-                "Failed to create application window: {:?}. Please verify that a graphical session (Wayland or X11) is active.",
-                e
-            ).into());
-        }
-    };
-
-    let mut engine = VulkanEngine::new(window.clone()).await;
+    let start_time = Instant::now();
     let mut last_update = Instant::now();
-    event_loop.set_control_flow(ControlFlow::Poll);
 
     let egui_ctx = egui::Context::default();
     let mut fonts = egui::FontDefinitions::default();
@@ -463,14 +479,31 @@ async fn run_gui(
         .push("kenney_icons".to_owned());
     egui_ctx.set_fonts(fonts);
 
-    let mut egui_state = egui_winit::State::new(
-        egui_ctx.clone(),
-        egui::ViewportId::ROOT,
-        &window,
-        None,
-        None,
-        None,
-    );
+    let egui_ctx_for_init = egui_ctx.clone();
+    let init_fn =
+        move |elwt: &winit::event_loop::ActiveEventLoop| -> anyhow::Result<DesktopRuntime> {
+            let window = elwt.create_window(attrs).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to create application window: {:?}. Please verify that a graphical session (Wayland or X11) is active.",
+                e
+            )
+        })?;
+            let window = Arc::new(window);
+            let engine = pollster::block_on(VulkanEngine::new(window.clone()));
+            let egui_state = egui_winit::State::new(
+                egui_ctx_for_init,
+                egui::ViewportId::ROOT,
+                &window,
+                None,
+                None,
+                None,
+            );
+            Ok(DesktopRuntime {
+                window,
+                engine,
+                egui_state,
+            })
+        };
 
     let mut last_mouse_move = Instant::now();
     let mut is_cursor_visible = true;
@@ -542,331 +575,1277 @@ async fn run_gui(
     let mut modifiers = winit::keyboard::ModifiersState::empty();
     let mut last_cursor_pos: Option<egui::Pos2> = None;
     let mut bench_frame_count = 0u32;
-    let mut bench_start: Option<std::time::Instant> = None;
 
-    #[allow(deprecated)]
-    let _ = event_loop.run(move |event, elwt| {
-        match event {
-            Event::WindowEvent {
-                ref event,
-                window_id,
-            } if window_id == window.id() => {
-                let response = egui_state.on_window_event(&window, event);
+    let mut app = DesktopApp {
+        runtime: None,
+        init_error: None,
+        init_fn: Some(init_fn),
+        event_fn: move |rt: &mut DesktopRuntime,
+                        event: Event<()>,
+                        elwt: &winit::event_loop::ActiveEventLoop| {
+            let DesktopRuntime {
+                ref window,
+                ref mut engine,
+                ref mut egui_state,
+            } = *rt;
+            match event {
+                Event::WindowEvent {
+                    ref event,
+                    window_id,
+                } if window_id == window.id() => {
+                    let response = egui_state.on_window_event(window, event);
 
-                if let WindowEvent::CursorMoved { position, .. } = event {
-                    last_mouse_move = Instant::now();
-                    let sf = window.scale_factor() as f32;
-                    last_cursor_pos =
-                        Some(egui::pos2(position.x as f32 / sf, position.y as f32 / sf));
-                    if !is_cursor_visible {
-                        window.set_cursor_visible(true);
-                        is_cursor_visible = true;
-                    }
-                }
-
-                if let WindowEvent::HoveredFile(path) = event {
-                    let mut state = app_state.lock().unwrap();
-                    state.hovered_file = Some(path.to_string_lossy().into_owned());
-                    window.request_redraw();
-                } else if let WindowEvent::HoveredFileCancelled = event {
-                    let mut state = app_state.lock().unwrap();
-                    state.hovered_file = None;
-                    window.request_redraw();
-                }
-
-                if let WindowEvent::ModifiersChanged(m) = &event {
-                    modifiers = m.state();
-                }
-
-                let is_typing = {
-                    let state = app_state.lock().unwrap();
-                    state.is_url_dialog_open || state.is_file_picker_open
-                };
-
-                // Process global hotkeys unless user is actively typing in a text dialog
-                if !is_typing
-                    && let WindowEvent::KeyboardInput {
-                        event: kb_event, ..
-                    } = &event
-                    && kb_event.state == ElementState::Pressed
-                    && let PhysicalKey::Code(keycode) = kb_event.physical_key
-                {
-                    match keycode {
-                        WinitKeyCode::ArrowRight
-                        | WinitKeyCode::ArrowLeft
-                        | WinitKeyCode::Comma
-                        | WinitKeyCode::Period => {
-                            let mut state = app_state.lock().unwrap();
-                            let duration = state.duration_seconds.max(0.1);
-                            let mut delta = 0.0;
-                            match keycode {
-                                WinitKeyCode::ArrowRight => {
-                                    delta = if modifiers.control_key() || modifiers.super_key() {
-                                        duration * 0.01
-                                    } else {
-                                        duration * 0.001
-                                    };
-                                }
-                                WinitKeyCode::ArrowLeft => {
-                                    delta = if modifiers.control_key() || modifiers.super_key() {
-                                        -(duration * 0.01)
-                                    } else {
-                                        -(duration * 0.001)
-                                    };
-                                }
-                                WinitKeyCode::Comma => delta = -1.0 / 60.0, // ~1 frame at 60fps
-                                WinitKeyCode::Period => delta = 1.0 / 60.0,
-                                _ => {}
-                            }
-
-                            let target =
-                                (state.current_seconds + delta).clamp(0.0, state.duration_seconds);
-                            state.seek_request = Some(target);
-                            state.spectrum_history.clear();
-                            for _ in 0..120 {
-                                state.spectrum_history.push_back(vec![0.0; 1024]);
-                            }
-
-                            let sign = if delta >= 0.0 { "+" } else { "" };
-                            if delta.abs() < 0.1 {
-                                state.osd_text =
-                                    Some(format!("{}1 Frame", if delta > 0.0 { "+" } else { "-" }));
-                            } else {
-                                state.osd_text = Some(format!("{}{:.2}s", sign, delta));
-                            }
-                            state.osd_timer = 2.0;
+                    if let WindowEvent::CursorMoved { position, .. } = event {
+                        last_mouse_move = Instant::now();
+                        let sf = window.scale_factor() as f32;
+                        last_cursor_pos =
+                            Some(egui::pos2(position.x as f32 / sf, position.y as f32 / sf));
+                        if !is_cursor_visible {
+                            window.set_cursor_visible(true);
+                            is_cursor_visible = true;
                         }
-                        _ => {
-                            if !kb_event.repeat {
+                    }
+
+                    if let WindowEvent::HoveredFile(path) = event {
+                        let mut state = app_state.lock().unwrap();
+                        state.hovered_file = Some(path.to_string_lossy().into_owned());
+                        window.request_redraw();
+                    } else if let WindowEvent::HoveredFileCancelled = event {
+                        let mut state = app_state.lock().unwrap();
+                        state.hovered_file = None;
+                        window.request_redraw();
+                    }
+
+                    if let WindowEvent::ModifiersChanged(m) = &event {
+                        modifiers = m.state();
+                    }
+
+                    let is_typing = {
+                        let state = app_state.lock().unwrap();
+                        state.is_url_dialog_open || state.is_file_picker_open
+                    };
+
+                    // Process global hotkeys unless user is actively typing in a text dialog
+                    if !is_typing
+                        && let WindowEvent::KeyboardInput {
+                            event: kb_event, ..
+                        } = &event
+                        && kb_event.state == ElementState::Pressed
+                        && let PhysicalKey::Code(keycode) = kb_event.physical_key
+                    {
+                        match keycode {
+                            WinitKeyCode::ArrowRight
+                            | WinitKeyCode::ArrowLeft
+                            | WinitKeyCode::Comma
+                            | WinitKeyCode::Period => {
+                                let mut state = app_state.lock().unwrap();
+                                let duration = state.duration_seconds.max(0.1);
+                                let mut delta = 0.0;
                                 match keycode {
-                                    WinitKeyCode::Escape => {
-                                        let picker_open = app_state.lock().unwrap().show_vis_picker;
-                                        if picker_open {
-                                            app_state.lock().unwrap().show_vis_picker = false;
-                                        } else {
-                                            elwt.exit();
-                                        }
-                                    }
-                                    WinitKeyCode::KeyQ => {
-                                        // Only quit on KeyQ if Ctrl or Cmd (Super) is held to prevent accidental quits
-                                        if modifiers.control_key() || modifiers.super_key() {
-                                            elwt.exit();
-                                        }
-                                    }
-                                    WinitKeyCode::MediaPlayPause => {
-                                        let mut state = app_state.lock().unwrap();
-                                        state.is_paused = !state.is_paused;
-                                        state.osd_text = Some(if state.is_paused {
-                                            "Paused".to_string()
-                                        } else {
-                                            "Playing".to_string()
-                                        });
-                                        state.osd_timer = 2.0;
-                                    }
-                                    WinitKeyCode::MediaTrackNext => {
-                                        let mut state = app_state.lock().unwrap();
-                                        if !state.playlist.is_empty()
-                                            && state.playlist_index + 1 < state.playlist.len()
+                                    WinitKeyCode::ArrowRight => {
+                                        delta = if modifiers.control_key() || modifiers.super_key()
                                         {
-                                            state.playlist_index += 1;
-                                            state.load_request =
-                                                Some(state.playlist[state.playlist_index].clone());
-                                            state.is_paused = false;
-                                            state.osd_text = Some("Next Track".to_string());
-                                            state.osd_timer = 2.0;
-                                        }
-                                    }
-                                    WinitKeyCode::MediaTrackPrevious => {
-                                        let mut state = app_state.lock().unwrap();
-                                        if !state.playlist.is_empty() && state.playlist_index > 0 {
-                                            state.playlist_index -= 1;
-                                            state.load_request =
-                                                Some(state.playlist[state.playlist_index].clone());
-                                            state.is_paused = false;
-                                            state.osd_text = Some("Previous Track".to_string());
-                                            state.osd_timer = 2.0;
-                                        }
-                                    }
-                                    WinitKeyCode::MediaStop => {
-                                        let mut state = app_state.lock().unwrap();
-                                        state.is_paused = true;
-                                        state.seek_request = Some(0.0);
-                                        state.osd_text = Some("Stopped".to_string());
-                                        state.osd_timer = 2.0;
-                                    }
-                                    WinitKeyCode::AudioVolumeUp => {
-                                        let mut state = app_state.lock().unwrap();
-                                        let num_tracks = state.audio_tracks.len().max(1);
-                                        if state.audio_track_volumes.len() != num_tracks {
-                                            state.audio_track_volumes = vec![1.0; num_tracks];
-                                        }
-                                        for vol in &mut state.audio_track_volumes {
-                                            *vol = (*vol + 0.05).clamp(0.0, 1.0);
-                                        }
-                                        let current_vol = state
-                                            .audio_track_volumes
-                                            .first()
-                                            .copied()
-                                            .unwrap_or(1.0);
-                                        let mix: Vec<(usize, f32)> = state
-                                            .active_audio_tracks
-                                            .iter()
-                                            .map(|&idx| {
-                                                (
-                                                    idx,
-                                                    state
-                                                        .audio_track_volumes
-                                                        .get(idx)
-                                                        .copied()
-                                                        .unwrap_or(1.0),
-                                                )
-                                            })
-                                            .collect();
-                                        state.audio_mix_request = Some(mix);
-                                        state.osd_text = Some(format!(
-                                            "Volume: {}%",
-                                            (current_vol * 100.0).round() as u32
-                                        ));
-                                        state.osd_timer = 2.0;
-                                    }
-                                    WinitKeyCode::AudioVolumeDown => {
-                                        let mut state = app_state.lock().unwrap();
-                                        let num_tracks = state.audio_tracks.len().max(1);
-                                        if state.audio_track_volumes.len() != num_tracks {
-                                            state.audio_track_volumes = vec![1.0; num_tracks];
-                                        }
-                                        for vol in &mut state.audio_track_volumes {
-                                            *vol = (*vol - 0.05).clamp(0.0, 1.0);
-                                        }
-                                        let current_vol = state
-                                            .audio_track_volumes
-                                            .first()
-                                            .copied()
-                                            .unwrap_or(1.0);
-                                        let mix: Vec<(usize, f32)> = state
-                                            .active_audio_tracks
-                                            .iter()
-                                            .map(|&idx| {
-                                                (
-                                                    idx,
-                                                    state
-                                                        .audio_track_volumes
-                                                        .get(idx)
-                                                        .copied()
-                                                        .unwrap_or(1.0),
-                                                )
-                                            })
-                                            .collect();
-                                        state.audio_mix_request = Some(mix);
-                                        state.osd_text = Some(format!(
-                                            "Volume: {}%",
-                                            (current_vol * 100.0).round() as u32
-                                        ));
-                                        state.osd_timer = 2.0;
-                                    }
-                                    WinitKeyCode::AudioVolumeMute => {
-                                        let mut state = app_state.lock().unwrap();
-                                        let num_tracks = state.audio_tracks.len().max(1);
-                                        if state.audio_track_volumes.len() != num_tracks {
-                                            state.audio_track_volumes = vec![1.0; num_tracks];
-                                        }
-                                        let is_currently_zero =
-                                            state.audio_track_volumes.iter().all(|&v| v == 0.0);
-                                        let new_vol = if is_currently_zero { 1.0 } else { 0.0 };
-                                        state.audio_track_volumes.fill(new_vol);
-                                        let mix: Vec<(usize, f32)> = state
-                                            .active_audio_tracks
-                                            .iter()
-                                            .map(|&idx| {
-                                                (
-                                                    idx,
-                                                    state
-                                                        .audio_track_volumes
-                                                        .get(idx)
-                                                        .copied()
-                                                        .unwrap_or(1.0),
-                                                )
-                                            })
-                                            .collect();
-                                        state.audio_mix_request = Some(mix);
-                                        state.osd_text = Some(if new_vol == 0.0 {
-                                            "Muted".to_string()
+                                            duration * 0.01
                                         } else {
-                                            "Unmuted".to_string()
-                                        });
-                                        state.osd_timer = 2.0;
+                                            duration * 0.001
+                                        };
                                     }
-                                    WinitKeyCode::BracketLeft => {
-                                        let mut state = app_state.lock().unwrap();
-                                        state.panel_split_ratio =
-                                            (state.panel_split_ratio - 0.05).clamp(0.15, 0.85);
-                                    }
-                                    WinitKeyCode::BracketRight => {
-                                        let mut state = app_state.lock().unwrap();
-                                        state.panel_split_ratio =
-                                            (state.panel_split_ratio + 0.05).clamp(0.15, 0.85);
-                                    }
-                                    WinitKeyCode::Tab => {
-                                        let mut state = app_state.lock().unwrap();
-                                        state.show_hud = !state.show_hud;
-                                        state.osd_text = Some(format!(
-                                            "HUD: {}",
-                                            if state.show_hud { "Visible" } else { "Hidden" }
-                                        ));
-                                        state.osd_timer = 2.0;
-                                    }
-                                    WinitKeyCode::KeyF => {
-                                        let currently_fullscreen = window.fullscreen().is_some();
-                                        is_fullscreen = !currently_fullscreen;
-                                        if is_fullscreen {
-                                            window.set_fullscreen(Some(
-                                                winit::window::Fullscreen::Borderless(None),
-                                            ));
-                                            keep_awake = keepawake::Builder::default()
-                                                .display(true)
-                                                .idle(true)
-                                                .create()
-                                                .ok();
+                                    WinitKeyCode::ArrowLeft => {
+                                        delta = if modifiers.control_key() || modifiers.super_key()
+                                        {
+                                            -(duration * 0.01)
                                         } else {
-                                            window.set_fullscreen(None);
-                                            let _ = window.request_inner_size(
-                                                winit::dpi::LogicalSize::new(1024.0, 768.0),
-                                            );
-                                            keep_awake = None;
+                                            -(duration * 0.001)
+                                        };
+                                    }
+                                    WinitKeyCode::Comma => delta = -1.0 / 60.0, // ~1 frame at 60fps
+                                    WinitKeyCode::Period => delta = 1.0 / 60.0,
+                                    _ => {}
+                                }
+
+                                let target = (state.current_seconds + delta)
+                                    .clamp(0.0, state.duration_seconds);
+                                state.seek_request = Some(target);
+                                state.spectrum_history.clear();
+                                for _ in 0..120 {
+                                    state.spectrum_history.push_back(vec![0.0; 1024]);
+                                }
+
+                                let sign = if delta >= 0.0 { "+" } else { "" };
+                                if delta.abs() < 0.1 {
+                                    state.osd_text = Some(format!(
+                                        "{}1 Frame",
+                                        if delta > 0.0 { "+" } else { "-" }
+                                    ));
+                                } else {
+                                    state.osd_text = Some(format!("{}{:.2}s", sign, delta));
+                                }
+                                state.osd_timer = 2.0;
+                            }
+                            _ => {
+                                if !kb_event.repeat {
+                                    match keycode {
+                                        WinitKeyCode::Escape => {
+                                            let picker_open =
+                                                app_state.lock().unwrap().show_vis_picker;
+                                            if picker_open {
+                                                app_state.lock().unwrap().show_vis_picker = false;
+                                            } else {
+                                                elwt.exit();
+                                            }
                                         }
-                                    }
-                                    WinitKeyCode::KeyG => {
-                                        let mut state = app_state.lock().unwrap();
-                                        state.gpu_fft = !state.gpu_fft;
-                                    }
-                                    WinitKeyCode::KeyC => {
-                                        let mut state = app_state.lock().unwrap();
-                                        if state.visualizer_mode == 20 {
-                                            state.biolum_top_down = !state.biolum_top_down;
-                                            state.osd_text = Some(format!(
-                                                "Camera: {}",
-                                                if state.biolum_top_down {
-                                                    "Top-down"
-                                                } else {
-                                                    "Perspective"
-                                                }
-                                            ));
-                                            state.osd_timer = 2.0;
+                                        WinitKeyCode::KeyQ => {
+                                            // Only quit on KeyQ if Ctrl or Cmd (Super) is held to prevent accidental quits
+                                            if modifiers.control_key() || modifiers.super_key() {
+                                                elwt.exit();
+                                            }
                                         }
-                                    }
-                                    WinitKeyCode::KeyS => {
-                                        let mut state = app_state.lock().unwrap();
-                                        state.show_stats = !state.show_stats;
-                                    }
-                                    WinitKeyCode::KeyH => {
-                                        let mut state = app_state.lock().unwrap();
-                                        state.show_help = !state.show_help;
-                                    }
-                                    WinitKeyCode::KeyO => {
-                                        if is_game_mode {
+                                        WinitKeyCode::MediaPlayPause => {
                                             let mut state = app_state.lock().unwrap();
+                                            state.is_paused = !state.is_paused;
+                                            state.osd_text = Some(if state.is_paused {
+                                                "Paused".to_string()
+                                            } else {
+                                                "Playing".to_string()
+                                            });
+                                            state.osd_timer = 2.0;
+                                        }
+                                        WinitKeyCode::MediaTrackNext => {
+                                            let mut state = app_state.lock().unwrap();
+                                            if !state.playlist.is_empty()
+                                                && state.playlist_index + 1 < state.playlist.len()
+                                            {
+                                                state.playlist_index += 1;
+                                                state.load_request = Some(
+                                                    state.playlist[state.playlist_index].clone(),
+                                                );
+                                                state.is_paused = false;
+                                                state.osd_text = Some("Next Track".to_string());
+                                                state.osd_timer = 2.0;
+                                            }
+                                        }
+                                        WinitKeyCode::MediaTrackPrevious => {
+                                            let mut state = app_state.lock().unwrap();
+                                            if !state.playlist.is_empty()
+                                                && state.playlist_index > 0
+                                            {
+                                                state.playlist_index -= 1;
+                                                state.load_request = Some(
+                                                    state.playlist[state.playlist_index].clone(),
+                                                );
+                                                state.is_paused = false;
+                                                state.osd_text = Some("Previous Track".to_string());
+                                                state.osd_timer = 2.0;
+                                            }
+                                        }
+                                        WinitKeyCode::MediaStop => {
+                                            let mut state = app_state.lock().unwrap();
+                                            state.is_paused = true;
+                                            state.seek_request = Some(0.0);
+                                            state.osd_text = Some("Stopped".to_string());
+                                            state.osd_timer = 2.0;
+                                        }
+                                        WinitKeyCode::AudioVolumeUp => {
+                                            let mut state = app_state.lock().unwrap();
+                                            let num_tracks = state.audio_tracks.len().max(1);
+                                            if state.audio_track_volumes.len() != num_tracks {
+                                                state.audio_track_volumes = vec![1.0; num_tracks];
+                                            }
+                                            for vol in &mut state.audio_track_volumes {
+                                                *vol = (*vol + 0.05).clamp(0.0, 1.0);
+                                            }
+                                            let current_vol = state
+                                                .audio_track_volumes
+                                                .first()
+                                                .copied()
+                                                .unwrap_or(1.0);
+                                            let mix: Vec<(usize, f32)> = state
+                                                .active_audio_tracks
+                                                .iter()
+                                                .map(|&idx| {
+                                                    (
+                                                        idx,
+                                                        state
+                                                            .audio_track_volumes
+                                                            .get(idx)
+                                                            .copied()
+                                                            .unwrap_or(1.0),
+                                                    )
+                                                })
+                                                .collect();
+                                            state.audio_mix_request = Some(mix);
+                                            state.osd_text = Some(format!(
+                                                "Volume: {}%",
+                                                (current_vol * 100.0).round() as u32
+                                            ));
+                                            state.osd_timer = 2.0;
+                                        }
+                                        WinitKeyCode::AudioVolumeDown => {
+                                            let mut state = app_state.lock().unwrap();
+                                            let num_tracks = state.audio_tracks.len().max(1);
+                                            if state.audio_track_volumes.len() != num_tracks {
+                                                state.audio_track_volumes = vec![1.0; num_tracks];
+                                            }
+                                            for vol in &mut state.audio_track_volumes {
+                                                *vol = (*vol - 0.05).clamp(0.0, 1.0);
+                                            }
+                                            let current_vol = state
+                                                .audio_track_volumes
+                                                .first()
+                                                .copied()
+                                                .unwrap_or(1.0);
+                                            let mix: Vec<(usize, f32)> = state
+                                                .active_audio_tracks
+                                                .iter()
+                                                .map(|&idx| {
+                                                    (
+                                                        idx,
+                                                        state
+                                                            .audio_track_volumes
+                                                            .get(idx)
+                                                            .copied()
+                                                            .unwrap_or(1.0),
+                                                    )
+                                                })
+                                                .collect();
+                                            state.audio_mix_request = Some(mix);
+                                            state.osd_text = Some(format!(
+                                                "Volume: {}%",
+                                                (current_vol * 100.0).round() as u32
+                                            ));
+                                            state.osd_timer = 2.0;
+                                        }
+                                        WinitKeyCode::AudioVolumeMute => {
+                                            let mut state = app_state.lock().unwrap();
+                                            let num_tracks = state.audio_tracks.len().max(1);
+                                            if state.audio_track_volumes.len() != num_tracks {
+                                                state.audio_track_volumes = vec![1.0; num_tracks];
+                                            }
+                                            let is_currently_zero =
+                                                state.audio_track_volumes.iter().all(|&v| v == 0.0);
+                                            let new_vol = if is_currently_zero { 1.0 } else { 0.0 };
+                                            state.audio_track_volumes.fill(new_vol);
+                                            let mix: Vec<(usize, f32)> = state
+                                                .active_audio_tracks
+                                                .iter()
+                                                .map(|&idx| {
+                                                    (
+                                                        idx,
+                                                        state
+                                                            .audio_track_volumes
+                                                            .get(idx)
+                                                            .copied()
+                                                            .unwrap_or(1.0),
+                                                    )
+                                                })
+                                                .collect();
+                                            state.audio_mix_request = Some(mix);
+                                            state.osd_text = Some(if new_vol == 0.0 {
+                                                "Muted".to_string()
+                                            } else {
+                                                "Unmuted".to_string()
+                                            });
+                                            state.osd_timer = 2.0;
+                                        }
+                                        WinitKeyCode::BracketLeft => {
+                                            let mut state = app_state.lock().unwrap();
+                                            state.panel_split_ratio =
+                                                (state.panel_split_ratio - 0.05).clamp(0.15, 0.85);
+                                        }
+                                        WinitKeyCode::BracketRight => {
+                                            let mut state = app_state.lock().unwrap();
+                                            state.panel_split_ratio =
+                                                (state.panel_split_ratio + 0.05).clamp(0.15, 0.85);
+                                        }
+                                        WinitKeyCode::Tab => {
+                                            let mut state = app_state.lock().unwrap();
+                                            state.show_hud = !state.show_hud;
+                                            state.osd_text = Some(format!(
+                                                "HUD: {}",
+                                                if state.show_hud { "Visible" } else { "Hidden" }
+                                            ));
+                                            state.osd_timer = 2.0;
+                                        }
+                                        WinitKeyCode::KeyF => {
+                                            let currently_fullscreen =
+                                                window.fullscreen().is_some();
+                                            is_fullscreen = !currently_fullscreen;
+                                            if is_fullscreen {
+                                                window.set_fullscreen(Some(
+                                                    winit::window::Fullscreen::Borderless(None),
+                                                ));
+                                                keep_awake = keepawake::Builder::default()
+                                                    .display(true)
+                                                    .idle(true)
+                                                    .create()
+                                                    .ok();
+                                            } else {
+                                                window.set_fullscreen(None);
+                                                let _ = window.request_inner_size(
+                                                    winit::dpi::LogicalSize::new(1024.0, 768.0),
+                                                );
+                                                keep_awake = None;
+                                            }
+                                        }
+                                        WinitKeyCode::KeyG => {
+                                            let mut state = app_state.lock().unwrap();
+                                            state.gpu_fft = !state.gpu_fft;
+                                        }
+                                        WinitKeyCode::KeyC => {
+                                            let mut state = app_state.lock().unwrap();
+                                            if state.visualizer_mode == 20 {
+                                                state.biolum_top_down = !state.biolum_top_down;
+                                                state.osd_text = Some(format!(
+                                                    "Camera: {}",
+                                                    if state.biolum_top_down {
+                                                        "Top-down"
+                                                    } else {
+                                                        "Perspective"
+                                                    }
+                                                ));
+                                                state.osd_timer = 2.0;
+                                            }
+                                        }
+                                        WinitKeyCode::KeyS => {
+                                            let mut state = app_state.lock().unwrap();
+                                            state.show_stats = !state.show_stats;
+                                        }
+                                        WinitKeyCode::KeyH => {
+                                            let mut state = app_state.lock().unwrap();
+                                            state.show_help = !state.show_help;
+                                        }
+                                        WinitKeyCode::KeyO => {
+                                            if is_game_mode {
+                                                let mut state = app_state.lock().unwrap();
+                                                state.open_file_request = true;
+                                            } else if !rfd_pending {
+                                                rfd_pending = true;
+                                                let tx = rfd_tx.clone();
+                                                let dir = initial_dir.clone();
+                                                std::thread::spawn(move || {
+                                                    let result = rfd::FileDialog::new()
+                                                        .set_directory(&dir)
+                                                        .add_filter(
+                                                            "Audio/Video Files",
+                                                            &[
+                                                                "flac",
+                                                                "wav",
+                                                                "mp3",
+                                                                "ogg",
+                                                                "aac",
+                                                                "m4a",
+                                                                "mp4",
+                                                                "mkv",
+                                                                "avi",
+                                                                "webm",
+                                                                "opus",
+                                                                "mod",
+                                                                "s3m",
+                                                                "xm",
+                                                                "it",
+                                                                "stm",
+                                                                "669",
+                                                                "mtm",
+                                                                "med",
+                                                                "okt",
+                                                                "psm",
+                                                                "dawproject",
+                                                                "aaf",
+                                                                "mid",
+                                                                "midi",
+                                                            ],
+                                                        )
+                                                        .add_filter("All Files", &["*"])
+                                                        .pick_files();
+                                                    if let Some(paths) = result {
+                                                        let strings: Vec<String> = paths
+                                                            .iter()
+                                                            .map(|p| p.display().to_string())
+                                                            .collect();
+                                                        let _ = tx.send(strings);
+                                                    } else {
+                                                        let _ = tx.send(vec![]);
+                                                    }
+                                                });
+                                            }
+                                        }
+                                        WinitKeyCode::KeyM => {
+                                            let mut state = app_state.lock().unwrap();
+                                            state.show_vis_picker = !state.show_vis_picker;
+                                            if state.show_vis_picker {
+                                                state.vis_picker_cursor =
+                                                    state.current_visualizer_idx;
+                                                state.vis_picker_scroll_to_cursor = true;
+                                            }
+                                        }
+                                        WinitKeyCode::KeyV => {
+                                            let mut state = app_state.lock().unwrap();
+                                            if state.video_frame_rx.is_some() {
+                                                state.video_mode = (state.video_mode + 1) % 4;
+                                                let mode_name = match state.video_mode {
+                                                    0 => "Standard View",
+                                                    1 => "Video in Track Info",
+                                                    2 => "Video in Top Panel",
+                                                    3 => "Full Screen Video",
+                                                    _ => "Video",
+                                                };
+                                                state.osd_text =
+                                                    Some(format!("View: {}", mode_name));
+                                            } else {
+                                                state.show_hud = !state.show_hud;
+                                                state.video_mode = 0;
+                                                let mode_name = if state.show_hud {
+                                                    "Standard View"
+                                                } else {
+                                                    "Full Screen Visualizer"
+                                                };
+                                                state.osd_text =
+                                                    Some(format!("View: {}", mode_name));
+                                            }
+                                            state.osd_timer = 2.0;
+                                        }
+                                        WinitKeyCode::Space => {
+                                            let mut state = app_state.lock().unwrap();
+                                            if state.show_vis_picker {
+                                                // Toggle enable/disable for highlighted visualizer (idx 0 always enabled)
+                                                let idx = state.vis_picker_cursor;
+                                                if idx != 0 {
+                                                    state.vis_enabled[idx] =
+                                                        !state.vis_enabled[idx];
+                                                }
+                                            } else if state.track_ended
+                                                || (state.current_seconds
+                                                    >= state.duration_seconds - 0.1
+                                                    && state.duration_seconds > 0.0)
+                                            {
+                                                state.track_ended = false;
+                                                state.seek_request = Some(0.0);
+                                                state.spectrum_history.clear();
+                                                for _ in 0..120 {
+                                                    state
+                                                        .spectrum_history
+                                                        .push_back(vec![0.0; 1024]);
+                                                }
+                                                state.is_paused = false;
+                                            } else if state.playlist_index >= state.playlist.len()
+                                                && !state.playlist.is_empty()
+                                            {
+                                                if state.duration_seconds == 0.0 {
+                                                    state.playlist_index = state.playlist.len() - 1;
+                                                } else {
+                                                    state.playlist_index = 0;
+                                                }
+                                                state.load_request = Some(
+                                                    state.playlist[state.playlist_index].clone(),
+                                                );
+                                                state.is_paused = false;
+                                            } else {
+                                                state.is_paused = !state.is_paused;
+                                            }
+                                        }
+                                        WinitKeyCode::KeyN => {
+                                            let mut state = app_state.lock().unwrap();
+                                            if !state.playlist.is_empty()
+                                                && state.playlist_index + 1 < state.playlist.len()
+                                            {
+                                                state.playlist_index += 1;
+                                                state.load_request = Some(
+                                                    state.playlist[state.playlist_index].clone(),
+                                                );
+                                                state.is_paused = false;
+                                                state.osd_text = Some("Next Track".to_string());
+                                                state.osd_timer = 2.0;
+                                            }
+                                        }
+                                        WinitKeyCode::KeyP => {
+                                            let mut state = app_state.lock().unwrap();
+                                            if !state.playlist.is_empty()
+                                                && state.playlist_index > 0
+                                            {
+                                                state.playlist_index -= 1;
+                                                state.load_request = Some(
+                                                    state.playlist[state.playlist_index].clone(),
+                                                );
+                                                state.is_paused = false;
+                                                state.osd_text = Some("Previous Track".to_string());
+                                                state.osd_timer = 2.0;
+                                            }
+                                        }
+                                        WinitKeyCode::Enter => {
+                                            let mut state = app_state.lock().unwrap();
+                                            if state.show_vis_picker {
+                                                state.current_visualizer_idx =
+                                                    state.vis_picker_cursor;
+                                                state.visualizer_mode = crate::state::VISUALIZERS
+                                                    [state.vis_picker_cursor]
+                                                    .id;
+                                                state.osd_text = Some(
+                                                    crate::state::VISUALIZERS
+                                                        [state.vis_picker_cursor]
+                                                        .name
+                                                        .to_string(),
+                                                );
+                                                state.osd_timer = 2.0;
+                                                state.show_vis_picker = false;
+                                            }
+                                        }
+                                        WinitKeyCode::ArrowUp => {
+                                            let mut state = app_state.lock().unwrap();
+                                            if state.show_vis_picker {
+                                                if state.vis_picker_cursor == 0 {
+                                                    state.vis_picker_cursor =
+                                                        crate::state::VISUALIZERS.len() - 1;
+                                                } else {
+                                                    state.vis_picker_cursor -= 1;
+                                                }
+                                                state.vis_picker_scroll_to_cursor = true;
+                                            } else {
+                                                // Cycle to next enabled visualizer
+                                                let len = crate::state::VISUALIZERS.len();
+                                                let mut idx = state.current_visualizer_idx;
+                                                for _ in 0..len {
+                                                    idx = (idx + 1) % len;
+                                                    if state.vis_enabled[idx] {
+                                                        break;
+                                                    }
+                                                }
+                                                state.current_visualizer_idx = idx;
+                                                state.visualizer_mode =
+                                                    crate::state::VISUALIZERS[idx].id;
+                                                state.osd_text = Some(
+                                                    crate::state::VISUALIZERS[idx].name.to_string(),
+                                                );
+                                                state.osd_timer = 2.0;
+                                            }
+                                        }
+                                        WinitKeyCode::ArrowDown => {
+                                            let mut state = app_state.lock().unwrap();
+                                            if state.show_vis_picker {
+                                                state.vis_picker_cursor = (state.vis_picker_cursor
+                                                    + 1)
+                                                    % crate::state::VISUALIZERS.len();
+                                                state.vis_picker_scroll_to_cursor = true;
+                                            } else {
+                                                // Cycle to previous enabled visualizer
+                                                let len = crate::state::VISUALIZERS.len();
+                                                let mut idx = state.current_visualizer_idx;
+                                                for _ in 0..len {
+                                                    idx = if idx == 0 { len - 1 } else { idx - 1 };
+                                                    if state.vis_enabled[idx] {
+                                                        break;
+                                                    }
+                                                }
+                                                state.current_visualizer_idx = idx;
+                                                state.visualizer_mode =
+                                                    crate::state::VISUALIZERS[idx].id;
+                                                state.osd_text = Some(
+                                                    crate::state::VISUALIZERS[idx].name.to_string(),
+                                                );
+                                                state.osd_timer = 2.0;
+                                            }
+                                        }
+                                        WinitKeyCode::Digit1
+                                        | WinitKeyCode::Numpad1
+                                        | WinitKeyCode::Digit2
+                                        | WinitKeyCode::Numpad2
+                                        | WinitKeyCode::Digit3
+                                        | WinitKeyCode::Numpad3
+                                        | WinitKeyCode::Digit4
+                                        | WinitKeyCode::Numpad4
+                                        | WinitKeyCode::Digit5
+                                        | WinitKeyCode::Numpad5
+                                        | WinitKeyCode::Digit6
+                                        | WinitKeyCode::Numpad6
+                                        | WinitKeyCode::Digit7
+                                        | WinitKeyCode::Numpad7
+                                        | WinitKeyCode::Digit8
+                                        | WinitKeyCode::Numpad8
+                                        | WinitKeyCode::Digit9
+                                        | WinitKeyCode::Numpad9 => {
+                                            let track_num = match keycode {
+                                                WinitKeyCode::Digit1 | WinitKeyCode::Numpad1 => 1,
+                                                WinitKeyCode::Digit2 | WinitKeyCode::Numpad2 => 2,
+                                                WinitKeyCode::Digit3 | WinitKeyCode::Numpad3 => 3,
+                                                WinitKeyCode::Digit4 | WinitKeyCode::Numpad4 => 4,
+                                                WinitKeyCode::Digit5 | WinitKeyCode::Numpad5 => 5,
+                                                WinitKeyCode::Digit6 | WinitKeyCode::Numpad6 => 6,
+                                                WinitKeyCode::Digit7 | WinitKeyCode::Numpad7 => 7,
+                                                WinitKeyCode::Digit8 | WinitKeyCode::Numpad8 => 8,
+                                                WinitKeyCode::Digit9 | WinitKeyCode::Numpad9 => 9,
+                                                _ => 0,
+                                            };
+                                            if track_num > 0 {
+                                                let mut state = app_state.lock().unwrap();
+                                                let num_tracks = state.audio_tracks.len();
+                                                if num_tracks > 1 {
+                                                    if track_num <= num_tracks {
+                                                        let track_idx = track_num - 1;
+                                                        if state.active_audio_tracks
+                                                            != vec![track_idx]
+                                                            || state.selected_audio_track
+                                                                != track_idx
+                                                        {
+                                                            state.selected_audio_track = track_idx;
+                                                            state.active_audio_tracks =
+                                                                vec![track_idx];
+                                                            if state.audio_track_volumes.len()
+                                                                != num_tracks
+                                                            {
+                                                                state.audio_track_volumes =
+                                                                    vec![1.0; num_tracks];
+                                                            }
+                                                            state.audio_track_request =
+                                                                Some(track_idx);
+                                                            state.audio_mix_request =
+                                                                Some(vec![(track_idx, 1.0)]);
+                                                        }
+                                                    } else if track_num == num_tracks + 1 {
+                                                        // Shortcut for mixing tracks: <number of tracks + 1>
+                                                        // E.g. for a 2-track file, "3" plays the mix of all tracks!
+                                                        if state.audio_track_volumes.len()
+                                                            != num_tracks
+                                                        {
+                                                            state.audio_track_volumes =
+                                                                vec![1.0; num_tracks];
+                                                        }
+                                                        let mix: Vec<(usize, f32)> = (0
+                                                            ..num_tracks)
+                                                            .map(|idx| {
+                                                                (
+                                                                    idx,
+                                                                    state
+                                                                        .audio_track_volumes
+                                                                        .get(idx)
+                                                                        .copied()
+                                                                        .unwrap_or(1.0),
+                                                                )
+                                                            })
+                                                            .collect();
+                                                        state.active_audio_tracks =
+                                                            (0..num_tracks).collect();
+                                                        state.audio_mix_request = Some(mix);
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if let WindowEvent::DroppedFile(path) = &event {
+                        let mut state = app_state.lock().unwrap();
+                        state.hovered_file = None;
+                        let path_str = crate::lyrics::normalize_path_str(&path.to_string_lossy());
+                        let expanded = crate::playlist::expand_input_paths(&[path_str]);
+                        if !expanded.is_empty() {
+                            let is_over_ti = if let (Some(c_pos), Some(ti_rect)) =
+                                (last_cursor_pos, state.track_info_rect)
+                            {
+                                c_pos.x >= ti_rect[0]
+                                    && c_pos.x <= ti_rect[2]
+                                    && c_pos.y >= ti_rect[1]
+                                    && c_pos.y <= ti_rect[3]
+                            } else {
+                                false
+                            };
+
+                            if !state.file_loaded || state.playlist.is_empty() {
+                                // Use case 1: Splash screen -> Play immediately
+                                state.playlist = expanded.clone();
+                                state.playlist_index = 0;
+                                state.load_request = Some(state.playlist[0].clone());
+                                state.file_loaded = true;
+                            } else if is_over_ti {
+                                // Use case 3: Track Info pane -> Add to playlist
+                                state.playlist.extend(expanded.clone());
+                                let file_name = std::path::Path::new(&expanded[0])
+                                    .file_name()
+                                    .unwrap_or_default()
+                                    .to_string_lossy()
+                                    .into_owned();
+                                if expanded.len() == 1 {
+                                    state.osd_text =
+                                        Some(format!("Added to Playlist: {}", file_name));
+                                } else {
+                                    state.osd_text = Some(format!(
+                                        "Added {} tracks to Playlist",
+                                        expanded.len()
+                                    ));
+                                }
+                                state.osd_timer = 3.0;
+                            } else {
+                                // Use case 2: Main player view (outside Track Info) -> Play immediately
+                                state.playlist = expanded.clone();
+                                state.playlist_index = 0;
+                                state.load_request = Some(state.playlist[0].clone());
+                                state.file_loaded = true;
+                            }
+                        }
+                        window.request_redraw();
+                    }
+
+                    if response.consumed {
+                        return;
+                    }
+
+                    match event {
+                        WindowEvent::CloseRequested => {
+                            elwt.exit();
+                        }
+                        WindowEvent::ScaleFactorChanged { .. } => {
+                            engine.resize(window.inner_size());
+                        }
+                        WindowEvent::Resized(physical_size) => {
+                            engine.resize(*physical_size);
+                        }
+                        WindowEvent::RedrawRequested => {
+                            if is_first_frame {
+                                is_first_frame = false;
+                                app_state.lock().unwrap().is_paused = false;
+                            }
+                            let load_path = {
+                                let mut state = app_state.lock().unwrap();
+
+                                if state.audio_device_lost {
+                                    state.audio_device_lost = false;
+                                    let reload_path = if is_mic_launch {
+                                        "".to_string()
+                                    } else if state.playlist_index < state.playlist.len() {
+                                        state.playlist[state.playlist_index].clone()
+                                    } else {
+                                        state.song_title.clone()
+                                    };
+
+                                    if !reload_path.is_empty() || is_mic_launch {
+                                        state.load_request = Some(reload_path);
+                                        state.osd_text =
+                                            Some("Audio Device Reconnected".to_string());
+                                        state.osd_timer = 3.0;
+                                    }
+                                }
+
+                                let device_change = state.audio_device_change_request.take();
+                                if let Some(new_device) = device_change {
+                                    let reload_path = if is_mic_launch {
+                                        "".to_string()
+                                    } else if state.playlist_index < state.playlist.len() {
+                                        state.playlist[state.playlist_index].clone()
+                                    } else {
+                                        state.song_title.clone()
+                                    };
+
+                                    if !reload_path.is_empty() || is_mic_launch {
+                                        state.load_request = Some(reload_path);
+                                        state.osd_text =
+                                            Some(format!("Audio Output: {}", new_device));
+                                        state.osd_timer = 3.0;
+                                    }
+                                }
+
+                                if state.track_ended && state.load_request.is_none() {
+                                    if state.playlist_index + 1 < state.playlist.len() {
+                                        state.track_ended = false;
+                                        state.playlist_index += 1;
+                                        state.load_request =
+                                            Some(state.playlist[state.playlist_index].clone());
+                                    } else {
+                                        state.is_paused = true;
+                                    }
+                                }
+
+                                state.load_request.take()
+                            };
+
+                            if let Some(path) = load_path {
+                                let is_mic = is_mic_launch && path.is_empty();
+                                // Check if the path exists first!
+                                let path_exists = if path.starts_with("http") || is_mic {
+                                    true
+                                } else {
+                                    std::path::Path::new(&path).exists()
+                                };
+
+                                if !path_exists {
+                                    let mut state = app_state.lock().unwrap();
+                                    state.osd_text = Some(format!(
+                                        "File Not Found: {}",
+                                        std::path::Path::new(&path)
+                                            .file_name()
+                                            .unwrap_or_default()
+                                            .to_string_lossy()
+                                    ));
+                                    state.osd_timer = 3.0;
+
+                                    state.playlist_index += 1;
+                                    if state.playlist_index < state.playlist.len() {
+                                        state.load_request =
+                                            Some(state.playlist[state.playlist_index].clone());
+                                    } else {
+                                        if state.file_loaded {
+                                            if let Some(idx) = state
+                                                .playlist
+                                                .iter()
+                                                .position(|p| p == &state.song_title)
+                                            {
+                                                state.playlist_index = idx;
+                                            } else {
+                                                state.playlist_index =
+                                                    state.playlist_index.saturating_sub(1);
+                                            }
+                                        } else {
+                                            state.file_loaded = false;
+                                            state.artist = "Load Failed".to_string();
+                                        }
+                                    }
+                                } else {
+                                    let _ = active_stream.take(); // DROP OLD STREAM FIRST to release WASAPI lock!
+
+                                    // Cleanup old video state completely before loading the next file
+                                    engine.clear_video_state();
+                                    {
+                                        let mut state = app_state.lock().unwrap();
+                                        state.video_frame_rx = None;
+                                        state.free_video_frame_tx = None;
+                                        state.video_mode = 0;
+                                        state.stats.bitstream_active = false;
+                                        state.stats.audio_buffer_fill_pct = 0.0;
+                                        state.track_ended = false;
+                                    }
+
+                                    // We rely entirely on DSP thread messages to update tracker string state
+                                    let mut loaded_stream = None;
+                                    let mut last_err = None;
+                                    for _ in 0..5 {
+                                        match audio::start_audio_thread(
+                                            &path,
+                                            is_mic,
+                                            Arc::clone(&app_state),
+                                        ) {
+                                            Ok(stream) => {
+                                                loaded_stream = Some(stream);
+                                                break;
+                                            }
+                                            Err(e) => {
+                                                last_err = Some(e);
+                                            }
+                                        }
+                                        std::thread::sleep(std::time::Duration::from_millis(50));
+                                    }
+
+                                    if let Some(stream) = loaded_stream {
+                                        let mut state = app_state.lock().unwrap();
+                                        state.file_loaded = true;
+                                        state.song_title = if is_mic {
+                                            "Microphone Input".to_string()
+                                        } else {
+                                            path.clone()
+                                        };
+                                        state.lyrics = if is_mic {
+                                            None
+                                        } else {
+                                            crate::lyrics::load_lyrics_for_file(&path)
+                                                .map(std::sync::Arc::new)
+                                        };
+                                        state.track_ended = false;
+                                        active_stream = Some(stream);
+                                    } else {
+                                        let mut state = app_state.lock().unwrap();
+                                        state.lyrics = None;
+                                        let err_msg = last_err
+                                            .map(|e| format!("{:?}", e))
+                                            .unwrap_or_else(|| "Unknown error".to_string());
+                                        let file_name = if is_mic {
+                                            "Microphone".to_string()
+                                        } else {
+                                            std::path::Path::new(&path)
+                                                .file_name()
+                                                .unwrap_or_default()
+                                                .to_string_lossy()
+                                                .into_owned()
+                                        };
+                                        state.osd_text = Some(format!(
+                                            "Load Failed: {}\n{}",
+                                            file_name, err_msg
+                                        ));
+                                        state.osd_timer = 5.0;
+
+                                        if !is_mic {
+                                            state.playlist_index += 1;
+                                            if state.playlist_index < state.playlist.len() {
+                                                state.load_request = Some(
+                                                    state.playlist[state.playlist_index].clone(),
+                                                );
+                                            } else {
+                                                state.file_loaded = false;
+                                                state.artist = "Load Failed".to_string();
+                                            }
+                                        } else {
+                                            state.file_loaded = false;
+                                            state.artist = "Mic Failed".to_string();
+                                        }
+                                    }
+                                }
+                            }
+
+                            let now = Instant::now();
+                            let raw_dt = now.duration_since(last_update).as_secs_f32();
+                            let dt = raw_dt.min(0.1);
+                            last_update = now;
+                            let time_scale = dt * 60.0; // Decay logic built for 60fps
+                            let fps = if raw_dt > 0.0 { 1.0 / raw_dt } else { 0.0 };
+
+                            let phase_timer = Instant::now();
+                            {
+                                let mut state = app_state.lock().unwrap();
+                                state.current_fps = state.current_fps * 0.9 + fps * 0.1;
+                                state.visual_width = engine.config.width / 2;
+
+                                if !state.file_loaded {
+                                    let t = start_time.elapsed().as_secs_f32();
+                                    for i in 0..1024 {
+                                        let pct = i as f32 / 1024.0;
+                                        let wave1 = (t * 2.0 + pct * 10.0).sin();
+                                        let wave2 = (t * 1.5 - pct * 15.0).cos();
+                                        let wave3 = (t * 0.5 + pct * 5.0).sin();
+                                        let combined = (wave1 + wave2 + wave3) / 3.0; // -1 to 1
+                                        let val = (combined * 0.5 + 0.5).powf(2.0) * 0.5; // 0 to 0.5, biased low
+                                        state.raw_spectrum_data[i] = val;
+                                    }
+                                }
+
+                                if state.channel_vus.len() != state.raw_channel_vus.len() {
+                                    state.channel_vus = vec![0.0; state.raw_channel_vus.len()];
+                                }
+                                for i in 0..state.raw_channel_vus.len() {
+                                    if state.raw_channel_vus[i] > state.channel_vus[i] {
+                                        state.channel_vus[i] = state.raw_channel_vus[i];
+                                    } else {
+                                        state.channel_vus[i] = (state.channel_vus[i]
+                                            - (0.015 * time_scale))
+                                            .max(state.raw_channel_vus[i]);
+                                    }
+                                }
+
+                                if state.peak_vus.len() != state.channel_vus.len() {
+                                    state.peak_vus = vec![0.0; state.channel_vus.len()];
+                                }
+                                for i in 0..state.channel_vus.len() {
+                                    state.peak_vus[i] =
+                                        (state.peak_vus[i] - (0.005 * time_scale)).max(0.0);
+                                    if state.channel_vus[i] > state.peak_vus[i] {
+                                        state.peak_vus[i] = state.channel_vus[i];
+                                    }
+                                }
+
+                                if state.spectrum_data.len() != state.raw_spectrum_data.len() {
+                                    state.spectrum_data = vec![0.0; state.raw_spectrum_data.len()];
+                                }
+                                for i in 0..state.raw_spectrum_data.len() {
+                                    if state.raw_spectrum_data[i] > state.spectrum_data[i] {
+                                        state.spectrum_data[i] = state.raw_spectrum_data[i];
+                                    } else {
+                                        state.spectrum_data[i] = (state.spectrum_data[i]
+                                            - (1.5 * time_scale))
+                                            .max(state.raw_spectrum_data[i]);
+                                    }
+
+                                    // Smoothly decay fire heat using display refresh rate
+                                    if state.raw_spectrum_data[i] > state.fire_heat[i] {
+                                        state.fire_heat[i] = state.raw_spectrum_data[i];
+                                    } else {
+                                        state.fire_heat[i] =
+                                            (state.fire_heat[i] - (1.5 * time_scale)).max(0.0);
+                                    }
+                                }
+
+                                if state.spectrum_peaks.len() != state.spectrum_data.len() {
+                                    state.spectrum_peaks = vec![0.0; state.spectrum_data.len()];
+                                }
+                                for i in 0..state.spectrum_data.len() {
+                                    state.spectrum_peaks[i] =
+                                        (state.spectrum_peaks[i] - (0.5 * time_scale)).max(0.0);
+                                    if state.spectrum_data[i] > state.spectrum_peaks[i] {
+                                        state.spectrum_peaks[i] = state.spectrum_data[i];
+                                    }
+                                }
+                                // Scroll spectrum history
+                                if state.spectrum_history.len() > 120 {
+                                    state.spectrum_history.pop_front();
+                                }
+                                let cloned_data = state.spectrum_data.clone();
+                                state.spectrum_history.push_back(cloned_data);
+
+                                // Temporal smoothing for waveform history to prevent jerky oscilloscope motion.
+                                // Lerp the display waveform toward the raw DSP data each frame,
+                                // decoupling visual smoothness from the DSP callback rate.
+                                let raw_wave = state.raw_waveform.clone();
+                                if let Some(newest) = state.waveform_history.back_mut() {
+                                    let lerp_speed = (12.0 * dt).min(1.0); // fast attack, smooth motion
+                                    for i in 0..newest.len().min(1024) {
+                                        newest[i] += (raw_wave[i] - newest[i]) * lerp_speed;
+                                    }
+                                }
+
+                                // Gamepad analog panel scaling and scrubbing
+                                for (_id, gamepad) in gilrs.gamepads() {
+                                    let right_y = gamepad.value(gilrs::Axis::RightStickY);
+                                    if right_y.abs() > 0.1 {
+                                        let scaled_delta = right_y * dt * 1.0; // Subtract moving UP (positive Y stick)
+                                        state.panel_split_ratio = (state.panel_split_ratio
+                                            - scaled_delta)
+                                            .clamp(0.15, 0.85);
+                                    }
+
+                                    // Analog trigger scrubbing
+                                    let lt = gamepad
+                                        .button_data(gilrs::Button::LeftTrigger2)
+                                        .map(|d| d.value())
+                                        .unwrap_or(0.0);
+                                    let rt = gamepad
+                                        .button_data(gilrs::Button::RightTrigger2)
+                                        .map(|d| d.value())
+                                        .unwrap_or(0.0);
+                                    let scrub_delta = rt - lt;
+                                    if scrub_delta.abs() > 0.05 {
+                                        let scrub_amount = (scrub_delta * dt) as f64
+                                            * (state.duration_seconds * 0.1).clamp(2.0, 30.0);
+                                        let target = (state.current_seconds + scrub_amount)
+                                            .clamp(0.0, state.duration_seconds);
+                                        state.seek_request = Some(target);
+                                        state.spectrum_history.clear();
+                                        for _ in 0..120 {
+                                            state.spectrum_history.push_back(vec![0.0; 1024]);
+                                        }
+
+                                        let sign = if scrub_delta > 0.0 { "+" } else { "" };
+                                        state.osd_text = Some(format!(
+                                            "Scrubbing {}{:.1}x",
+                                            sign,
+                                            scrub_delta * 10.0
+                                        ));
+                                        state.osd_timer = 0.5;
+                                    }
+                                }
+
+                                if state.osd_timer > 0.0 {
+                                    state.osd_timer = (state.osd_timer - dt).max(0.0);
+                                    if state.osd_timer == 0.0 {
+                                        state.osd_text = None;
+                                    }
+                                }
+
+                                // Clamp panel split ratio to ensure both top and bottom panels have at least 220px height
+                                let total_h =
+                                    engine.config.height as f32 / window.scale_factor() as f32;
+                                if total_h > 0.0 {
+                                    let min_h = 220.0f32;
+                                    let min_r = (min_h / total_h).clamp(0.0, 1.0);
+                                    let max_r = ((total_h - min_h) / total_h).clamp(0.0, 1.0);
+                                    state.panel_split_ratio = state
+                                        .panel_split_ratio
+                                        .clamp(min_r.min(max_r), min_r.max(max_r));
+                                }
+
+                                engine.update(&state, dt);
+                            }
+                            let phase_lock_update_us = phase_timer.elapsed().as_micros() as f32;
+
+                            // Create a lightweight snapshot for render (skips ~1.3 MB of audio data)
+                            // and drain gamepad events in the same lock acquisition
+                            let snapshot_timer = Instant::now();
+                            let (state_copy, gamepad_events) = {
+                                let mut state = app_state.lock().unwrap();
+                                let events = state.egui_gamepad_events.clone();
+                                state.egui_gamepad_events.clear();
+                                (state.render_snapshot(), events)
+                            };
+                            let phase_snapshot_us = snapshot_timer.elapsed().as_micros() as f32;
+
+                            // Update power management / idle sleep inhibition
+                            let is_playing = !state_copy.is_paused
+                                && state_copy.file_loaded
+                                && !state_copy.track_ended;
+                            let needs_keepawake = is_playing || is_fullscreen;
+                            if needs_keepawake && keep_awake.is_none() {
+                                keep_awake = keepawake::Builder::default()
+                                    .display(
+                                        is_fullscreen
+                                            || state_copy.visualizer_mode != 0
+                                            || state_copy.video_frame_rx.is_some(),
+                                    )
+                                    .idle(true)
+                                    .create()
+                                    .ok();
+                            } else if !needs_keepawake && keep_awake.is_some() {
+                                keep_awake = None;
+                            }
+
+                            let mut action = EngineAction::None;
+                            let mut ui_time = 0.0;
+                            let mut render_time = 0.0;
+                            let mut fire_time = None;
+                            let mut fft_time = None;
+                            let mut vis_shader_time = None;
+                            let mut phase_surface_us = 0.0f32;
+                            let mut phase_egui_us = 0.0f32;
+                            let mut phase_encode_us = 0.0f32;
+                            let mut phase_submit_us = 0.0f32;
+
+                            match engine.render(
+                                window,
+                                &egui_ctx,
+                                egui_state,
+                                &state_copy,
+                                &mut file_dialog,
+                                gamepad_events,
+                            ) {
+                                Ok((
+                                    res,
+                                    ui_el,
+                                    ren_el,
+                                    fire_el,
+                                    fft_el,
+                                    vis_el,
+                                    surf,
+                                    egui_l,
+                                    enc,
+                                    sub,
+                                )) => {
+                                    action = res.clone();
+                                    ui_time = ui_el;
+                                    render_time = ren_el;
+                                    fire_time = fire_el;
+                                    fft_time = fft_el;
+                                    vis_shader_time = vis_el;
+                                    phase_surface_us = surf;
+                                    phase_egui_us = egui_l;
+                                    phase_encode_us = enc;
+                                    phase_submit_us = sub;
+                                }
+                                Err(wgpu::SurfaceStatus::Lost) => engine.resize(engine.size),
+                                Err(wgpu::SurfaceStatus::Outdated) => engine.resize(engine.size),
+                                Err(wgpu::SurfaceStatus::Timeout) => eprintln!("Surface timeout"),
+                                Err(e) => eprintln!("Surface error: {:?}", e),
+                            }
+
+                            // Consolidate all post-render state writes into a single lock
+                            let post_timer = Instant::now();
+                            let mut trigger_picker = false;
+                            {
+                                let mut state = app_state.lock().unwrap();
+                                state.vis_picker_scroll_to_cursor = false;
+
+                                // Write back timing stats
+                                if ui_time > 0.0 || render_time > 0.0 {
+                                    state.stats.ui_us = state.stats.ui_us * 0.9 + ui_time * 0.1;
+                                    state.stats.render_us =
+                                        state.stats.render_us * 0.9 + render_time * 0.1;
+                                    if let Some(sh) = fire_time {
+                                        state.stats.fire_us = state.stats.fire_us * 0.9 + sh * 0.1;
+                                    }
+                                    if let Some(vis) = vis_shader_time {
+                                        state.stats.shader_us =
+                                            state.stats.shader_us * 0.9 + vis * 0.1;
+                                    }
+                                    if let Some(ft) = fft_time {
+                                        state.stats.gpu_fft_us =
+                                            state.stats.gpu_fft_us * 0.9 + ft * 0.1;
+                                    }
+                                }
+
+                                if let Some(bench_frames) = bench {
+                                    bench_frame_count += 1;
+                                    if bench_frame_count >= bench_frames {
+                                        let vis_def = &crate::state::VISUALIZERS
+                                            [state.current_visualizer_idx];
+                                        println!("BENCHMARK_RESULT_VISUALIZER: {}", vis_def.name);
+                                        println!("BENCHMARK_RESULT_FPS: {:.2}", state.current_fps);
+                                        println!(
+                                            "BENCHMARK_RESULT_SHADER_US: {:.2}",
+                                            state.stats.shader_us
+                                        );
+                                        println!(
+                                            "BENCHMARK_RESULT_RENDER_US: {:.2}",
+                                            state.stats.render_us
+                                        );
+                                        println!(
+                                            "BENCHMARK_RESULT_UI_US: {:.2}",
+                                            state.stats.ui_us
+                                        );
+                                        println!(
+                                            "BENCHMARK_RESULT_DECODE_US: {:.2}",
+                                            state.stats.decode_us
+                                        );
+                                        println!(
+                                            "BENCHMARK_RESULT_FFT_US: {:.2}",
+                                            state.stats.fft_us
+                                        );
+                                        println!(
+                                            "BENCHMARK_RESULT_GPU_FFT_US: {:.2}",
+                                            state.stats.gpu_fft_us
+                                        );
+                                        println!(
+                                            "BENCHMARK_RESULT_FIRE_US: {:.2}",
+                                            state.stats.fire_us
+                                        );
+                                        elwt.exit();
+                                        return;
+                                    }
+                                }
+
+                                // Process engine actions
+                                match action {
+                                    EngineAction::ScrubPreview(pct, delta) => {
+                                        let target = (state.duration_seconds * pct as f64)
+                                            .clamp(0.0, state.duration_seconds);
+                                        state.scrub_target_seconds = Some(target);
+
+                                        if delta != 0.0 {
+                                            if state.osd_timer > 0.0
+                                                && state
+                                                    .osd_text
+                                                    .as_ref()
+                                                    .is_some_and(|s| s.starts_with("Scrubbing"))
+                                            {
+                                                state.cumulative_scrub += delta;
+                                            } else {
+                                                state.cumulative_scrub = delta;
+                                            }
+                                            state.osd_timer = 0.5;
+                                            let sign = if state.cumulative_scrub > 0.0 {
+                                                "+"
+                                            } else {
+                                                "-"
+                                            };
+                                            state.osd_text = Some(format!(
+                                                "Scrubbing {}{:.1}s",
+                                                sign,
+                                                state.cumulative_scrub.abs()
+                                            ));
+                                        }
+                                    }
+                                    EngineAction::ScrubEnd => {
+                                        state.scrub_target_seconds = None;
+                                    }
+                                    EngineAction::Seek(pct) => {
+                                        let target = (state.duration_seconds * pct as f64)
+                                            .clamp(0.0, state.duration_seconds);
+                                        state.seek_request = Some(target);
+                                        state.scrub_target_seconds = None;
+                                        state.spectrum_history.clear();
+                                        for _ in 0..120 {
+                                            state.spectrum_history.push_back(vec![0.0; 1024]);
+                                        }
+                                    }
+                                    EngineAction::OpenFile => {
+                                        if is_game_mode {
+                                            // SteamDeck: use egui-file-dialog (gamepad-navigable)
                                             state.open_file_request = true;
                                         } else if !rfd_pending {
+                                            // Desktop: use native OS file picker via rfd
                                             rfd_pending = true;
                                             let tx = rfd_tx.clone();
                                             let dir = initial_dir.clone();
@@ -917,1875 +1896,976 @@ async fn run_gui(
                                             });
                                         }
                                     }
-                                    WinitKeyCode::KeyM => {
-                                        let mut state = app_state.lock().unwrap();
+                                    EngineAction::LoadFiles(paths, append) => {
+                                        if append && !state.playlist.is_empty() && state.file_loaded
+                                        {
+                                            let count = paths.len();
+                                            let first_name = std::path::Path::new(&paths[0])
+                                                .file_name()
+                                                .unwrap_or_default()
+                                                .to_string_lossy()
+                                                .into_owned();
+                                            if count == 1 {
+                                                state.osd_text = Some(format!(
+                                                    "Added to Playlist: {}",
+                                                    first_name
+                                                ));
+                                            } else {
+                                                state.osd_text = Some(format!(
+                                                    "Added {} tracks to Playlist",
+                                                    count
+                                                ));
+                                            }
+                                            state.osd_timer = 3.0;
+                                            state.playlist.extend(paths);
+                                        } else if !paths.is_empty() {
+                                            state.playlist = paths;
+                                            state.playlist_index = 0;
+                                            state.load_request = Some(state.playlist[0].clone());
+                                            state.file_loaded = true;
+                                        }
+                                        state.is_file_picker_open = false;
+                                    }
+                                    EngineAction::SetAppendToPlaylist(val) => {
+                                        state.append_to_playlist = val;
+                                    }
+                                    EngineAction::SetForceStereo(val) => {
+                                        state.force_stereo_downmix = val;
+                                    }
+                                    EngineAction::SetPassthrough(val) => {
+                                        state.passthrough_enabled = val;
+                                    }
+                                    EngineAction::SetSplitRatio(val) => {
+                                        state.panel_split_ratio = val;
+                                    }
+                                    EngineAction::SetAudioDevice(device_name) => {
+                                        state.selected_audio_device = Some(device_name.clone());
+                                        state.audio_device_change_request = Some(device_name);
+                                    }
+                                    EngineAction::ToggleAudioTrackInMix(track_idx) => {
+                                        if state.audio_tracks.len() > 1
+                                            && track_idx < state.audio_tracks.len()
+                                        {
+                                            if state.active_audio_tracks.is_empty() {
+                                                state.active_audio_tracks =
+                                                    vec![state.selected_audio_track];
+                                            }
+                                            if let Some(pos) = state
+                                                .active_audio_tracks
+                                                .iter()
+                                                .position(|&t| t == track_idx)
+                                            {
+                                                if state.active_audio_tracks.len() > 1 {
+                                                    state.active_audio_tracks.remove(pos);
+                                                }
+                                            } else {
+                                                state.active_audio_tracks.push(track_idx);
+                                                state.active_audio_tracks.sort();
+                                            }
+                                            state.multi_track_mix_mode =
+                                                state.active_audio_tracks.len() > 1;
+                                            if state.audio_track_volumes.len()
+                                                != state.audio_tracks.len()
+                                            {
+                                                state.audio_track_volumes =
+                                                    vec![1.0; state.audio_tracks.len()];
+                                            }
+                                            let mix: Vec<(usize, f32)> = state
+                                                .active_audio_tracks
+                                                .iter()
+                                                .map(|&idx| {
+                                                    (
+                                                        idx,
+                                                        state
+                                                            .audio_track_volumes
+                                                            .get(idx)
+                                                            .copied()
+                                                            .unwrap_or(1.0),
+                                                    )
+                                                })
+                                                .collect();
+                                            state.audio_mix_request = Some(mix);
+                                        }
+                                    }
+                                    EngineAction::SetAudioTrackVolume(track_idx, volume) => {
+                                        if track_idx < state.audio_tracks.len() {
+                                            if state.audio_track_volumes.len()
+                                                != state.audio_tracks.len()
+                                            {
+                                                state.audio_track_volumes =
+                                                    vec![1.0; state.audio_tracks.len()];
+                                            }
+                                            state.audio_track_volumes[track_idx] =
+                                                volume.clamp(0.0, 1.0);
+                                            let mix: Vec<(usize, f32)> = state
+                                                .active_audio_tracks
+                                                .iter()
+                                                .map(|&idx| {
+                                                    (
+                                                        idx,
+                                                        state
+                                                            .audio_track_volumes
+                                                            .get(idx)
+                                                            .copied()
+                                                            .unwrap_or(1.0),
+                                                    )
+                                                })
+                                                .collect();
+                                            state.audio_mix_request = Some(mix);
+                                        }
+                                    }
+                                    EngineAction::SetAudioMixTracks(tracks) => {
+                                        state.multi_track_mix_mode = tracks.len() > 1;
+                                        state.active_audio_tracks =
+                                            tracks.iter().map(|(idx, _)| *idx).collect();
+                                        if state.audio_track_volumes.len()
+                                            != state.audio_tracks.len()
+                                        {
+                                            state.audio_track_volumes =
+                                                vec![1.0; state.audio_tracks.len()];
+                                        }
+                                        for &(idx, vol) in &tracks {
+                                            if idx < state.audio_track_volumes.len() {
+                                                state.audio_track_volumes[idx] = vol;
+                                            }
+                                        }
+                                        if let Some(&(first_idx, _)) = tracks.first() {
+                                            state.selected_audio_track = first_idx;
+                                            if tracks.len() == 1 {
+                                                state.audio_track_request = Some(first_idx);
+                                            }
+                                        }
+                                        let mix_desc = if tracks.len() > 1 {
+                                            let track_nums: Vec<String> = tracks
+                                                .iter()
+                                                .map(|(idx, _)| (idx + 1).to_string())
+                                                .collect();
+                                            format!("🎛 Mix: Tracks {}", track_nums.join("+"))
+                                        } else if let Some(&(idx, _)) = tracks.first() {
+                                            let track_title = state
+                                                .audio_tracks
+                                                .get(idx)
+                                                .map(|t| t.title.clone())
+                                                .unwrap_or_else(|| format!("Track {}", idx + 1));
+                                            format!("🎛 Audio: {}", track_title)
+                                        } else {
+                                            "🎛 Audio Mix".to_string()
+                                        };
+                                        state.osd_text = Some(mix_desc);
+                                        state.osd_timer = 2.0;
+                                        state.audio_mix_request = Some(tracks);
+                                    }
+                                    EngineAction::VisPickerSelect(idx) => {
+                                        state.current_visualizer_idx = idx;
+                                        state.visualizer_mode = crate::state::VISUALIZERS[idx].id;
+                                        state.osd_text =
+                                            Some(crate::state::VISUALIZERS[idx].name.to_string());
+                                        state.osd_timer = 2.0;
+                                        state.show_vis_picker = false;
+                                    }
+                                    EngineAction::ToggleVisPicker => {
                                         state.show_vis_picker = !state.show_vis_picker;
                                         if state.show_vis_picker {
                                             state.vis_picker_cursor = state.current_visualizer_idx;
                                             state.vis_picker_scroll_to_cursor = true;
                                         }
                                     }
-                                    WinitKeyCode::KeyV => {
-                                        let mut state = app_state.lock().unwrap();
-                                        if state.video_frame_rx.is_some() {
-                                            state.video_mode = (state.video_mode + 1) % 4;
-                                            let mode_name = match state.video_mode {
-                                                0 => "Standard View",
-                                                1 => "Video in Track Info",
-                                                2 => "Video in Top Panel",
-                                                3 => "Full Screen Video",
-                                                _ => "Video",
-                                            };
-                                            state.osd_text = Some(format!("View: {}", mode_name));
-                                        } else {
-                                            state.show_hud = !state.show_hud;
-                                            state.video_mode = 0;
-                                            let mode_name = if state.show_hud {
-                                                "Standard View"
-                                            } else {
-                                                "Full Screen Visualizer"
-                                            };
-                                            state.osd_text = Some(format!("View: {}", mode_name));
+                                    EngineAction::VisPickerToggleEnabled(idx) => {
+                                        if idx != 0 {
+                                            // Frequency Spectrum always enabled
+                                            state.vis_enabled[idx] = !state.vis_enabled[idx];
                                         }
-                                        state.osd_timer = 2.0;
                                     }
-                                    WinitKeyCode::Space => {
-                                        let mut state = app_state.lock().unwrap();
-                                        if state.show_vis_picker {
-                                            // Toggle enable/disable for highlighted visualizer (idx 0 always enabled)
-                                            let idx = state.vis_picker_cursor;
-                                            if idx != 0 {
-                                                state.vis_enabled[idx] = !state.vis_enabled[idx];
-                                            }
-                                        } else if state.track_ended
-                                            || (state.current_seconds
-                                                >= state.duration_seconds - 0.1
-                                                && state.duration_seconds > 0.0)
+                                    EngineAction::VisPickerSetCursor(idx) => {
+                                        state.vis_picker_cursor = idx;
+                                    }
+                                    EngineAction::VisPickerEnableAll => {
+                                        for i in 0..state.vis_enabled.len() {
+                                            state.vis_enabled[i] = true;
+                                        }
+                                    }
+                                    EngineAction::VisPickerEnableNone => {
+                                        for i in 0..state.vis_enabled.len() {
+                                            // Index 0 (Frequency Spectrum) is always enabled
+                                            state.vis_enabled[i] = i == 0;
+                                        }
+                                    }
+                                    EngineAction::OpenUrlDialog => {
+                                        state.is_url_dialog_open = true;
+                                        state.focus_url_input = true;
+                                        window.set_ime_allowed(true); // Hint to Wayland/SteamOS to show the virtual keyboard
+                                    }
+                                    EngineAction::ClearFocusUrlInput => {
+                                        state.focus_url_input = false;
+                                    }
+                                    EngineAction::CloseUrlDialog => {
+                                        state.is_url_dialog_open = false;
+                                        window.set_ime_allowed(false);
+                                    }
+                                    EngineAction::SetUrlInput(url) => {
+                                        state.url_input_text = url;
+                                    }
+                                    EngineAction::EditUrl(url) => {
+                                        state.url_input_text = url;
+                                        state.focus_url_input = true;
+                                        window.set_ime_allowed(true);
+                                    }
+                                    EngineAction::LoadUrl(url) => {
+                                        let mut final_url = url.clone();
+                                        if !final_url.starts_with("http://")
+                                            && !final_url.starts_with("https://")
                                         {
-                                            state.track_ended = false;
-                                            state.seek_request = Some(0.0);
-                                            state.spectrum_history.clear();
-                                            for _ in 0..120 {
-                                                state.spectrum_history.push_back(vec![0.0; 1024]);
-                                            }
-                                            state.is_paused = false;
-                                        } else if state.playlist_index >= state.playlist.len()
-                                            && !state.playlist.is_empty()
-                                        {
-                                            if state.duration_seconds == 0.0 {
-                                                state.playlist_index = state.playlist.len() - 1;
-                                            } else {
-                                                state.playlist_index = 0;
-                                            }
-                                            state.load_request =
-                                                Some(state.playlist[state.playlist_index].clone());
-                                            state.is_paused = false;
-                                        } else {
-                                            state.is_paused = !state.is_paused;
+                                            final_url = format!("https://{}", final_url);
                                         }
-                                    }
-                                    WinitKeyCode::KeyN => {
-                                        let mut state = app_state.lock().unwrap();
-                                        if !state.playlist.is_empty()
-                                            && state.playlist_index + 1 < state.playlist.len()
-                                        {
-                                            state.playlist_index += 1;
-                                            state.load_request =
-                                                Some(state.playlist[state.playlist_index].clone());
-                                            state.is_paused = false;
-                                            state.osd_text = Some("Next Track".to_string());
-                                            state.osd_timer = 2.0;
-                                        }
-                                    }
-                                    WinitKeyCode::KeyP => {
-                                        let mut state = app_state.lock().unwrap();
-                                        if !state.playlist.is_empty() && state.playlist_index > 0 {
-                                            state.playlist_index -= 1;
-                                            state.load_request =
-                                                Some(state.playlist[state.playlist_index].clone());
-                                            state.is_paused = false;
-                                            state.osd_text = Some("Previous Track".to_string());
-                                            state.osd_timer = 2.0;
-                                        }
-                                    }
-                                    WinitKeyCode::Enter => {
-                                        let mut state = app_state.lock().unwrap();
-                                        if state.show_vis_picker {
-                                            state.current_visualizer_idx = state.vis_picker_cursor;
-                                            state.visualizer_mode = crate::state::VISUALIZERS
-                                                [state.vis_picker_cursor]
-                                                .id;
-                                            state.osd_text = Some(
-                                                crate::state::VISUALIZERS[state.vis_picker_cursor]
-                                                    .name
-                                                    .to_string(),
-                                            );
-                                            state.osd_timer = 2.0;
-                                            state.show_vis_picker = false;
-                                        }
-                                    }
-                                    WinitKeyCode::ArrowUp => {
-                                        let mut state = app_state.lock().unwrap();
-                                        if state.show_vis_picker {
-                                            if state.vis_picker_cursor == 0 {
-                                                state.vis_picker_cursor =
-                                                    crate::state::VISUALIZERS.len() - 1;
-                                            } else {
-                                                state.vis_picker_cursor -= 1;
-                                            }
-                                            state.vis_picker_scroll_to_cursor = true;
-                                        } else {
-                                            // Cycle to next enabled visualizer
-                                            let len = crate::state::VISUALIZERS.len();
-                                            let mut idx = state.current_visualizer_idx;
-                                            for _ in 0..len {
-                                                idx = (idx + 1) % len;
-                                                if state.vis_enabled[idx] {
-                                                    break;
-                                                }
-                                            }
-                                            state.current_visualizer_idx = idx;
-                                            state.visualizer_mode =
-                                                crate::state::VISUALIZERS[idx].id;
-                                            state.osd_text = Some(
-                                                crate::state::VISUALIZERS[idx].name.to_string(),
-                                            );
-                                            state.osd_timer = 2.0;
-                                        }
-                                    }
-                                    WinitKeyCode::ArrowDown => {
-                                        let mut state = app_state.lock().unwrap();
-                                        if state.show_vis_picker {
-                                            state.vis_picker_cursor = (state.vis_picker_cursor + 1)
-                                                % crate::state::VISUALIZERS.len();
-                                            state.vis_picker_scroll_to_cursor = true;
-                                        } else {
-                                            // Cycle to previous enabled visualizer
-                                            let len = crate::state::VISUALIZERS.len();
-                                            let mut idx = state.current_visualizer_idx;
-                                            for _ in 0..len {
-                                                idx = if idx == 0 { len - 1 } else { idx - 1 };
-                                                if state.vis_enabled[idx] {
-                                                    break;
-                                                }
-                                            }
-                                            state.current_visualizer_idx = idx;
-                                            state.visualizer_mode =
-                                                crate::state::VISUALIZERS[idx].id;
-                                            state.osd_text = Some(
-                                                crate::state::VISUALIZERS[idx].name.to_string(),
-                                            );
-                                            state.osd_timer = 2.0;
-                                        }
-                                    }
-                                    WinitKeyCode::Digit1
-                                    | WinitKeyCode::Numpad1
-                                    | WinitKeyCode::Digit2
-                                    | WinitKeyCode::Numpad2
-                                    | WinitKeyCode::Digit3
-                                    | WinitKeyCode::Numpad3
-                                    | WinitKeyCode::Digit4
-                                    | WinitKeyCode::Numpad4
-                                    | WinitKeyCode::Digit5
-                                    | WinitKeyCode::Numpad5
-                                    | WinitKeyCode::Digit6
-                                    | WinitKeyCode::Numpad6
-                                    | WinitKeyCode::Digit7
-                                    | WinitKeyCode::Numpad7
-                                    | WinitKeyCode::Digit8
-                                    | WinitKeyCode::Numpad8
-                                    | WinitKeyCode::Digit9
-                                    | WinitKeyCode::Numpad9 => {
-                                        let track_num = match keycode {
-                                            WinitKeyCode::Digit1 | WinitKeyCode::Numpad1 => 1,
-                                            WinitKeyCode::Digit2 | WinitKeyCode::Numpad2 => 2,
-                                            WinitKeyCode::Digit3 | WinitKeyCode::Numpad3 => 3,
-                                            WinitKeyCode::Digit4 | WinitKeyCode::Numpad4 => 4,
-                                            WinitKeyCode::Digit5 | WinitKeyCode::Numpad5 => 5,
-                                            WinitKeyCode::Digit6 | WinitKeyCode::Numpad6 => 6,
-                                            WinitKeyCode::Digit7 | WinitKeyCode::Numpad7 => 7,
-                                            WinitKeyCode::Digit8 | WinitKeyCode::Numpad8 => 8,
-                                            WinitKeyCode::Digit9 | WinitKeyCode::Numpad9 => 9,
-                                            _ => 0,
-                                        };
-                                        if track_num > 0 {
-                                            let mut state = app_state.lock().unwrap();
-                                            let num_tracks = state.audio_tracks.len();
-                                            if num_tracks > 1 {
-                                                if track_num <= num_tracks {
-                                                    let track_idx = track_num - 1;
-                                                    if state.active_audio_tracks != vec![track_idx]
-                                                        || state.selected_audio_track != track_idx
-                                                    {
-                                                        state.selected_audio_track = track_idx;
-                                                        state.active_audio_tracks = vec![track_idx];
-                                                        if state.audio_track_volumes.len()
-                                                            != num_tracks
-                                                        {
-                                                            state.audio_track_volumes =
-                                                                vec![1.0; num_tracks];
-                                                        }
-                                                        state.audio_track_request = Some(track_idx);
-                                                        state.audio_mix_request =
-                                                            Some(vec![(track_idx, 1.0)]);
-                                                    }
-                                                } else if track_num == num_tracks + 1 {
-                                                    // Shortcut for mixing tracks: <number of tracks + 1>
-                                                    // E.g. for a 2-track file, "3" plays the mix of all tracks!
-                                                    if state.audio_track_volumes.len() != num_tracks
-                                                    {
-                                                        state.audio_track_volumes =
-                                                            vec![1.0; num_tracks];
-                                                    }
-                                                    let mix: Vec<(usize, f32)> = (0..num_tracks)
-                                                        .map(|idx| {
-                                                            (
-                                                                idx,
-                                                                state
-                                                                    .audio_track_volumes
-                                                                    .get(idx)
-                                                                    .copied()
-                                                                    .unwrap_or(1.0),
-                                                            )
-                                                        })
-                                                        .collect();
-                                                    state.active_audio_tracks =
-                                                        (0..num_tracks).collect();
-                                                    state.audio_mix_request = Some(mix);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    _ => {}
-                                }
-                            }
-                        }
-                    }
-                }
+                                        state.is_url_dialog_open = false;
+                                        window.set_ime_allowed(false);
+                                        state.url_input_text.clear();
+                                        state.playlist = vec![final_url.clone()];
+                                        state.playlist_index = 0;
+                                        state.load_request = Some(final_url.clone());
+                                        state.file_loaded = true;
 
-                if let WindowEvent::DroppedFile(path) = &event {
-                    let mut state = app_state.lock().unwrap();
-                    state.hovered_file = None;
-                    let path_str = crate::lyrics::normalize_path_str(&path.to_string_lossy());
-                    let expanded = crate::playlist::expand_input_paths(&[path_str]);
-                    if !expanded.is_empty() {
-                        let is_over_ti = if let (Some(c_pos), Some(ti_rect)) =
-                            (last_cursor_pos, state.track_info_rect)
-                        {
-                            c_pos.x >= ti_rect[0]
-                                && c_pos.x <= ti_rect[2]
-                                && c_pos.y >= ti_rect[1]
-                                && c_pos.y <= ti_rect[3]
-                        } else {
-                            false
-                        };
-
-                        if !state.file_loaded || state.playlist.is_empty() {
-                            // Use case 1: Splash screen -> Play immediately
-                            state.playlist = expanded.clone();
-                            state.playlist_index = 0;
-                            state.load_request = Some(state.playlist[0].clone());
-                            state.file_loaded = true;
-                        } else if is_over_ti {
-                            // Use case 3: Track Info pane -> Add to playlist
-                            state.playlist.extend(expanded.clone());
-                            let file_name = std::path::Path::new(&expanded[0])
-                                .file_name()
-                                .unwrap_or_default()
-                                .to_string_lossy()
-                                .into_owned();
-                            if expanded.len() == 1 {
-                                state.osd_text = Some(format!("Added to Playlist: {}", file_name));
-                            } else {
-                                state.osd_text =
-                                    Some(format!("Added {} tracks to Playlist", expanded.len()));
-                            }
-                            state.osd_timer = 3.0;
-                        } else {
-                            // Use case 2: Main player view (outside Track Info) -> Play immediately
-                            state.playlist = expanded.clone();
-                            state.playlist_index = 0;
-                            state.load_request = Some(state.playlist[0].clone());
-                            state.file_loaded = true;
-                        }
-                    }
-                    window.request_redraw();
-                }
-
-                if response.consumed {
-                    return;
-                }
-
-                match event {
-                    WindowEvent::CloseRequested => {
-                        elwt.exit();
-                    }
-                    WindowEvent::ScaleFactorChanged { .. } => {
-                        engine.resize(window.inner_size());
-                    }
-                    WindowEvent::Resized(physical_size) => {
-                        engine.resize(*physical_size);
-                    }
-                    WindowEvent::RedrawRequested => {
-                        if is_first_frame {
-                            is_first_frame = false;
-                            app_state.lock().unwrap().is_paused = false;
-                            if bench.is_some() {
-                                bench_start = Some(std::time::Instant::now());
-                            }
-                        }
-                        let load_path = {
-                            let mut state = app_state.lock().unwrap();
-
-                            if state.audio_device_lost {
-                                state.audio_device_lost = false;
-                                let reload_path = if is_mic_launch {
-                                    "".to_string()
-                                } else if state.playlist_index < state.playlist.len() {
-                                    state.playlist[state.playlist_index].clone()
-                                } else {
-                                    state.song_title.clone()
-                                };
-
-                                if !reload_path.is_empty() || is_mic_launch {
-                                    state.load_request = Some(reload_path);
-                                    state.osd_text = Some("Audio Device Reconnected".to_string());
-                                    state.osd_timer = 3.0;
-                                }
-                            }
-
-                            let device_change = state.audio_device_change_request.take();
-                            if let Some(new_device) = device_change {
-                                let reload_path = if is_mic_launch {
-                                    "".to_string()
-                                } else if state.playlist_index < state.playlist.len() {
-                                    state.playlist[state.playlist_index].clone()
-                                } else {
-                                    state.song_title.clone()
-                                };
-
-                                if !reload_path.is_empty() || is_mic_launch {
-                                    state.load_request = Some(reload_path);
-                                    state.osd_text = Some(format!("Audio Output: {}", new_device));
-                                    state.osd_timer = 3.0;
-                                }
-                            }
-
-                            if state.track_ended && state.load_request.is_none() {
-                                if state.playlist_index + 1 < state.playlist.len() {
-                                    state.track_ended = false;
-                                    state.playlist_index += 1;
-                                    state.load_request =
-                                        Some(state.playlist[state.playlist_index].clone());
-                                } else {
-                                    state.is_paused = true;
-                                }
-                            }
-
-                            state.load_request.take()
-                        };
-
-                        if let Some(path) = load_path {
-                            let is_mic = is_mic_launch && path.is_empty();
-                            // Check if the path exists first!
-                            let path_exists = if path.starts_with("http") || is_mic {
-                                true
-                            } else {
-                                std::path::Path::new(&path).exists()
-                            };
-
-                            if !path_exists {
-                                let mut state = app_state.lock().unwrap();
-                                state.osd_text = Some(format!(
-                                    "File Not Found: {}",
-                                    std::path::Path::new(&path)
-                                        .file_name()
-                                        .unwrap_or_default()
-                                        .to_string_lossy()
-                                ));
-                                state.osd_timer = 3.0;
-
-                                state.playlist_index += 1;
-                                if state.playlist_index < state.playlist.len() {
-                                    state.load_request =
-                                        Some(state.playlist[state.playlist_index].clone());
-                                } else {
-                                    if state.file_loaded {
                                         if let Some(idx) = state
-                                            .playlist
+                                            .url_history
                                             .iter()
-                                            .position(|p| p == &state.song_title)
+                                            .position(|(u, _)| u == &final_url)
                                         {
-                                            state.playlist_index = idx;
+                                            let item = state.url_history.remove(idx);
+                                            state.url_history.push(item);
                                         } else {
-                                            state.playlist_index =
-                                                state.playlist_index.saturating_sub(1);
+                                            state.url_history.push((
+                                                final_url.clone(),
+                                                "Network Stream".to_string(),
+                                            ));
                                         }
-                                    } else {
-                                        state.file_loaded = false;
-                                        state.artist = "Load Failed".to_string();
-                                    }
-                                }
-                            } else {
-                                active_stream = None; // DROP OLD STREAM FIRST to release WASAPI lock!
 
-                                // Cleanup old video state completely before loading the next file
-                                engine.clear_video_state();
-                                {
-                                    let mut state = app_state.lock().unwrap();
-                                    state.video_frame_rx = None;
-                                    state.free_video_frame_tx = None;
-                                    state.video_mode = 0;
-                                    state.stats.bitstream_active = false;
-                                    state.stats.audio_buffer_fill_pct = 0.0;
-                                    state.track_ended = false;
-                                }
-
-                                // We rely entirely on DSP thread messages to update tracker string state
-                                let mut loaded_stream = None;
-                                let mut last_err = None;
-                                for _ in 0..5 {
-                                    match audio::start_audio_thread(
-                                        &path,
-                                        is_mic,
-                                        Arc::clone(&app_state),
-                                    ) {
-                                        Ok(stream) => {
-                                            loaded_stream = Some(stream);
-                                            break;
+                                        let mut out = String::new();
+                                        for (u, t) in &state.url_history {
+                                            out.push_str(&format!("{}|{}\n", u, t));
                                         }
-                                        Err(e) => {
-                                            last_err = Some(e);
-                                        }
+                                        let _ = std::fs::write(
+                                            crate::state::get_history_file_path(),
+                                            out,
+                                        );
                                     }
-                                    std::thread::sleep(std::time::Duration::from_millis(50));
+                                    EngineAction::None => {}
                                 }
 
-                                if let Some(stream) = loaded_stream {
-                                    let mut state = app_state.lock().unwrap();
-                                    state.file_loaded = true;
-                                    state.song_title = if is_mic {
-                                        "Microphone Input".to_string()
-                                    } else {
-                                        path.clone()
-                                    };
-                                    state.lyrics = if is_mic {
-                                        None
-                                    } else {
-                                        crate::lyrics::load_lyrics_for_file(&path)
-                                            .map(std::sync::Arc::new)
-                                    };
-                                    state.track_ended = false;
-                                    active_stream = Some(stream);
-                                } else {
-                                    let mut state = app_state.lock().unwrap();
-                                    state.lyrics = None;
-                                    let err_msg = last_err
-                                        .map(|e| format!("{:?}", e))
-                                        .unwrap_or_else(|| "Unknown error".to_string());
-                                    let file_name = if is_mic {
-                                        "Microphone".to_string()
-                                    } else {
-                                        std::path::Path::new(&path)
-                                            .file_name()
-                                            .unwrap_or_default()
-                                            .to_string_lossy()
-                                            .into_owned()
-                                    };
-                                    state.osd_text =
-                                        Some(format!("Load Failed: {}\n{}", file_name, err_msg));
-                                    state.osd_timer = 5.0;
-
-                                    if !is_mic {
-                                        state.playlist_index += 1;
-                                        if state.playlist_index < state.playlist.len() {
-                                            state.load_request =
-                                                Some(state.playlist[state.playlist_index].clone());
-                                        } else {
-                                            state.file_loaded = false;
-                                            state.artist = "Load Failed".to_string();
-                                        }
-                                    } else {
-                                        state.file_loaded = false;
-                                        state.artist = "Mic Failed".to_string();
-                                    }
+                                // File picker state
+                                let fd_state = file_dialog.state();
+                                state.is_file_picker_open =
+                                    *fd_state == egui_file_dialog::DialogState::Open;
+                                if *fd_state == egui_file_dialog::DialogState::Cancelled {
+                                    file_dialog = egui_file_dialog::FileDialog::new()
+                                        .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                                        .initial_directory(initial_dir.clone())
+                                        .add_file_filter_extensions(
+                                            "Audio/Video Files",
+                                            vec![
+                                                "flac",
+                                                "wav",
+                                                "mp3",
+                                                "ogg",
+                                                "aac",
+                                                "m4a",
+                                                "mp4",
+                                                "mkv",
+                                                "avi",
+                                                "webm",
+                                                "opus",
+                                                "mod",
+                                                "s3m",
+                                                "xm",
+                                                "it",
+                                                "stm",
+                                                "669",
+                                                "mtm",
+                                                "med",
+                                                "okt",
+                                                "psm",
+                                                "dawproject",
+                                                "aaf",
+                                                "mid",
+                                                "midi",
+                                            ],
+                                        )
+                                        .show_all_files_filter(true)
+                                        .default_file_filter("Audio/Video Files");
                                 }
-                            }
-                        }
-
-                        let now = Instant::now();
-                        let raw_dt = now.duration_since(last_update).as_secs_f32();
-                        let dt = raw_dt.min(0.1);
-                        last_update = now;
-                        let time_scale = dt * 60.0; // Decay logic built for 60fps
-                        let fps = if raw_dt > 0.0 { 1.0 / raw_dt } else { 0.0 };
-
-                        let phase_timer = Instant::now();
-                        {
-                            let mut state = app_state.lock().unwrap();
-                            state.current_fps = state.current_fps * 0.9 + fps * 0.1;
-                            state.visual_width = engine.config.width / 2;
-
-                            if !state.file_loaded {
-                                let t = now.elapsed().as_secs_f32();
-                                for i in 0..1024 {
-                                    let pct = i as f32 / 1024.0;
-                                    let wave1 = (t * 2.0 + pct * 10.0).sin();
-                                    let wave2 = (t * 1.5 - pct * 15.0).cos();
-                                    let wave3 = (t * 0.5 + pct * 5.0).sin();
-                                    let combined = (wave1 + wave2 + wave3) / 3.0; // -1 to 1
-                                    let val = (combined * 0.5 + 0.5).powf(2.0) * 0.5; // 0 to 0.5, biased low
-                                    state.raw_spectrum_data[i] = val;
-                                }
-                            }
-
-                            if state.channel_vus.len() != state.raw_channel_vus.len() {
-                                state.channel_vus = vec![0.0; state.raw_channel_vus.len()];
-                            }
-                            for i in 0..state.raw_channel_vus.len() {
-                                if state.raw_channel_vus[i] > state.channel_vus[i] {
-                                    state.channel_vus[i] = state.raw_channel_vus[i];
-                                } else {
-                                    state.channel_vus[i] = (state.channel_vus[i]
-                                        - (0.015 * time_scale))
-                                        .max(state.raw_channel_vus[i]);
-                                }
-                            }
-
-                            if state.peak_vus.len() != state.channel_vus.len() {
-                                state.peak_vus = vec![0.0; state.channel_vus.len()];
-                            }
-                            for i in 0..state.channel_vus.len() {
-                                state.peak_vus[i] =
-                                    (state.peak_vus[i] - (0.005 * time_scale)).max(0.0);
-                                if state.channel_vus[i] > state.peak_vus[i] {
-                                    state.peak_vus[i] = state.channel_vus[i];
-                                }
-                            }
-
-                            if state.spectrum_data.len() != state.raw_spectrum_data.len() {
-                                state.spectrum_data = vec![0.0; state.raw_spectrum_data.len()];
-                            }
-                            for i in 0..state.raw_spectrum_data.len() {
-                                if state.raw_spectrum_data[i] > state.spectrum_data[i] {
-                                    state.spectrum_data[i] = state.raw_spectrum_data[i];
-                                } else {
-                                    state.spectrum_data[i] = (state.spectrum_data[i]
-                                        - (1.5 * time_scale))
-                                        .max(state.raw_spectrum_data[i]);
+                                if state.open_file_request && !state.is_file_picker_open {
+                                    state.open_file_request = false;
+                                    state.is_file_picker_open = true;
+                                    trigger_picker = true;
                                 }
 
-                                // Smoothly decay fire heat using display refresh rate
-                                if state.raw_spectrum_data[i] > state.fire_heat[i] {
-                                    state.fire_heat[i] = state.raw_spectrum_data[i];
-                                } else {
-                                    state.fire_heat[i] =
-                                        (state.fire_heat[i] - (1.5 * time_scale)).max(0.0);
-                                }
-                            }
-
-                            if state.spectrum_peaks.len() != state.spectrum_data.len() {
-                                state.spectrum_peaks = vec![0.0; state.spectrum_data.len()];
-                            }
-                            for i in 0..state.spectrum_data.len() {
-                                state.spectrum_peaks[i] =
-                                    (state.spectrum_peaks[i] - (0.5 * time_scale)).max(0.0);
-                                if state.spectrum_data[i] > state.spectrum_peaks[i] {
-                                    state.spectrum_peaks[i] = state.spectrum_data[i];
-                                }
-                            }
-                            // Scroll spectrum history
-                            if state.spectrum_history.len() > 120 {
-                                state.spectrum_history.pop_front();
-                            }
-                            let cloned_data = state.spectrum_data.clone();
-                            state.spectrum_history.push_back(cloned_data);
-
-                            // Temporal smoothing for waveform history to prevent jerky oscilloscope motion.
-                            // Lerp the display waveform toward the raw DSP data each frame,
-                            // decoupling visual smoothness from the DSP callback rate.
-                            let raw_wave = state.raw_waveform.clone();
-                            if let Some(newest) = state.waveform_history.back_mut() {
-                                let lerp_speed = (12.0 * dt).min(1.0); // fast attack, smooth motion
-                                for i in 0..newest.len().min(1024) {
-                                    newest[i] += (raw_wave[i] - newest[i]) * lerp_speed;
-                                }
-                            }
-
-                            // Gamepad analog panel scaling and scrubbing
-                            for (_id, gamepad) in gilrs.gamepads() {
-                                let right_y = gamepad.value(gilrs::Axis::RightStickY);
-                                if right_y.abs() > 0.1 {
-                                    let scaled_delta = right_y * dt * 1.0; // Subtract moving UP (positive Y stick)
-                                    state.panel_split_ratio =
-                                        (state.panel_split_ratio - scaled_delta).clamp(0.15, 0.85);
-                                }
-
-                                // Analog trigger scrubbing
-                                let lt = gamepad
-                                    .button_data(gilrs::Button::LeftTrigger2)
-                                    .map(|d| d.value())
-                                    .unwrap_or(0.0);
-                                let rt = gamepad
-                                    .button_data(gilrs::Button::RightTrigger2)
-                                    .map(|d| d.value())
-                                    .unwrap_or(0.0);
-                                let scrub_delta = rt - lt;
-                                if scrub_delta.abs() > 0.05 {
-                                    let scrub_amount = (scrub_delta * dt) as f64
-                                        * (state.duration_seconds * 0.1).clamp(2.0, 30.0);
-                                    let target = (state.current_seconds + scrub_amount)
-                                        .clamp(0.0, state.duration_seconds);
-                                    state.seek_request = Some(target);
-                                    state.spectrum_history.clear();
-                                    for _ in 0..120 {
-                                        state.spectrum_history.push_back(vec![0.0; 1024]);
-                                    }
-
-                                    let sign = if scrub_delta > 0.0 { "+" } else { "" };
-                                    state.osd_text = Some(format!(
-                                        "Scrubbing {}{:.1}x",
-                                        sign,
-                                        scrub_delta * 10.0
-                                    ));
-                                    state.osd_timer = 0.5;
-                                }
-                            }
-
-                            if state.osd_timer > 0.0 {
-                                state.osd_timer = (state.osd_timer - dt).max(0.0);
-                                if state.osd_timer == 0.0 {
-                                    state.osd_text = None;
-                                }
-                            }
-
-                            // Clamp panel split ratio to ensure both top and bottom panels have at least 220px height
-                            let total_h =
-                                engine.config.height as f32 / window.scale_factor() as f32;
-                            if total_h > 0.0 {
-                                let min_h = 220.0f32;
-                                let min_r = (min_h / total_h).clamp(0.0, 1.0);
-                                let max_r = ((total_h - min_h) / total_h).clamp(0.0, 1.0);
-                                state.panel_split_ratio = state
-                                    .panel_split_ratio
-                                    .clamp(min_r.min(max_r), min_r.max(max_r));
-                            }
-
-                            engine.update(&state, dt);
-                        }
-                        let phase_lock_update_us = phase_timer.elapsed().as_micros() as f32;
-
-                        // Create a lightweight snapshot for render (skips ~1.3 MB of audio data)
-                        // and drain gamepad events in the same lock acquisition
-                        let snapshot_timer = Instant::now();
-                        let (state_copy, gamepad_events) = {
-                            let mut state = app_state.lock().unwrap();
-                            let events = state.egui_gamepad_events.clone();
-                            state.egui_gamepad_events.clear();
-                            (state.render_snapshot(), events)
-                        };
-                        let phase_snapshot_us = snapshot_timer.elapsed().as_micros() as f32;
-
-                        // Update power management / idle sleep inhibition
-                        let is_playing = !state_copy.is_paused
-                            && state_copy.file_loaded
-                            && !state_copy.track_ended;
-                        let needs_keepawake = is_playing || is_fullscreen;
-                        if needs_keepawake && keep_awake.is_none() {
-                            keep_awake = keepawake::Builder::default()
-                                .display(
-                                    is_fullscreen
-                                        || state_copy.visualizer_mode != 0
-                                        || state_copy.video_frame_rx.is_some(),
-                                )
-                                .idle(true)
-                                .create()
-                                .ok();
-                        } else if !needs_keepawake && keep_awake.is_some() {
-                            keep_awake = None;
-                        }
-
-                        let mut action = EngineAction::None;
-                        let mut ui_time = 0.0;
-                        let mut render_time = 0.0;
-                        let mut fire_time = None;
-                        let mut fft_time = None;
-                        let mut vis_shader_time = None;
-                        let mut phase_surface_us = 0.0f32;
-                        let mut phase_egui_us = 0.0f32;
-                        let mut phase_encode_us = 0.0f32;
-
-                        match engine.render(
-                            &window,
-                            &egui_ctx,
-                            &mut egui_state,
-                            &state_copy,
-                            &mut file_dialog,
-                            gamepad_events,
-                        ) {
-                            Ok((
-                                res,
-                                ui_el,
-                                ren_el,
-                                fire_el,
-                                fft_el,
-                                vis_el,
-                                surf,
-                                egui_l,
-                                enc,
-                                _sub,
-                            )) => {
-                                action = res.clone();
-                                ui_time = ui_el;
-                                render_time = ren_el;
-                                fire_time = fire_el;
-                                fft_time = fft_el;
-                                vis_shader_time = vis_el;
-                                phase_surface_us = surf;
-                                phase_egui_us = egui_l;
-                                phase_encode_us = enc;
-                            }
-                            Err(wgpu::SurfaceStatus::Lost) => engine.resize(engine.size),
-                            Err(wgpu::SurfaceStatus::Outdated) => engine.resize(engine.size),
-                            Err(wgpu::SurfaceStatus::Timeout) => eprintln!("Surface timeout"),
-                            Err(e) => eprintln!("Surface error: {:?}", e),
-                        }
-
-                        // Consolidate all post-render state writes into a single lock
-                        let post_timer = Instant::now();
-                        let mut trigger_picker = false;
-                        {
-                            let mut state = app_state.lock().unwrap();
-                            state.vis_picker_scroll_to_cursor = false;
-
-                            // Write back timing stats
-                            if ui_time > 0.0 || render_time > 0.0 {
-                                state.stats.ui_us = state.stats.ui_us * 0.9 + ui_time * 0.1;
-                                state.stats.render_us =
-                                    state.stats.render_us * 0.9 + render_time * 0.1;
-                                if let Some(sh) = fire_time {
-                                    state.stats.fire_us = state.stats.fire_us * 0.9 + sh * 0.1;
-                                }
-                                if let Some(vis) = vis_shader_time {
-                                    state.stats.shader_us = state.stats.shader_us * 0.9 + vis * 0.1;
-                                }
-                                if let Some(ft) = fft_time {
-                                    state.stats.gpu_fft_us =
-                                        state.stats.gpu_fft_us * 0.9 + ft * 0.1;
-                                }
-                            }
-
-                            if let Some(bench_frames) = bench {
-                                bench_frame_count += 1;
-                                if bench_frame_count >= bench_frames {
-                                    let vis_def =
-                                        &crate::state::VISUALIZERS[state.current_visualizer_idx];
-                                    println!("BENCHMARK_RESULT_VISUALIZER: {}", vis_def.name);
-                                    println!("BENCHMARK_RESULT_FPS: {:.2}", state.current_fps);
-                                    println!(
-                                        "BENCHMARK_RESULT_SHADER_US: {:.2}",
-                                        state.stats.shader_us
-                                    );
-                                    println!(
-                                        "BENCHMARK_RESULT_RENDER_US: {:.2}",
-                                        state.stats.render_us
-                                    );
-                                    println!("BENCHMARK_RESULT_UI_US: {:.2}", state.stats.ui_us);
-                                    println!(
-                                        "BENCHMARK_RESULT_DECODE_US: {:.2}",
-                                        state.stats.decode_us
-                                    );
-                                    println!("BENCHMARK_RESULT_FFT_US: {:.2}", state.stats.fft_us);
-                                    println!(
-                                        "BENCHMARK_RESULT_GPU_FFT_US: {:.2}",
-                                        state.stats.gpu_fft_us
-                                    );
-                                    println!(
-                                        "BENCHMARK_RESULT_FIRE_US: {:.2}",
-                                        state.stats.fire_us
-                                    );
-                                    elwt.exit();
-                                    return;
-                                }
-                            }
-
-                            // Process engine actions
-                            match action {
-                                EngineAction::ScrubPreview(pct, delta) => {
-                                    let target = (state.duration_seconds * pct as f64)
-                                        .clamp(0.0, state.duration_seconds);
-                                    state.scrub_target_seconds = Some(target);
-
-                                    if delta != 0.0 {
-                                        if state.osd_timer > 0.0
-                                            && state
-                                                .osd_text
-                                                .as_ref()
-                                                .is_some_and(|s| s.starts_with("Scrubbing"))
+                                // Write phase timings
+                                state.stats.phase_lock_update_us = state.stats.phase_lock_update_us
+                                    * 0.9
+                                    + phase_lock_update_us * 0.1;
+                                state.stats.phase_snapshot_us =
+                                    state.stats.phase_snapshot_us * 0.9 + phase_snapshot_us * 0.1;
+                                state.stats.phase_surface_us =
+                                    state.stats.phase_surface_us * 0.9 + phase_surface_us * 0.1;
+                                state.stats.phase_egui_layout_us =
+                                    state.stats.phase_egui_layout_us * 0.9 + phase_egui_us * 0.1;
+                                state.stats.phase_encode_us =
+                                    state.stats.phase_encode_us * 0.9 + phase_encode_us * 0.1;
+                                state.stats.phase_submit_us =
+                                    state.stats.phase_submit_us * 0.9 + phase_submit_us * 0.1;
+                                state.stats.phase_post_us = state.stats.phase_post_us * 0.9
+                                    + post_timer.elapsed().as_micros() as f32 * 0.1;
+                                // Poll native file picker results
+                                if let Ok(paths) = rfd_rx.try_recv() {
+                                    rfd_pending = false;
+                                    if !paths.is_empty() {
+                                        if let Some(parent) =
+                                            std::path::Path::new(&paths[0]).parent()
                                         {
-                                            state.cumulative_scrub += delta;
-                                        } else {
-                                            state.cumulative_scrub = delta;
+                                            initial_dir = parent.to_path_buf();
                                         }
-                                        state.osd_timer = 0.5;
-                                        let sign = if state.cumulative_scrub > 0.0 {
-                                            "+"
-                                        } else {
-                                            "-"
-                                        };
-                                        state.osd_text = Some(format!(
-                                            "Scrubbing {}{:.1}s",
-                                            sign,
-                                            state.cumulative_scrub.abs()
-                                        ));
-                                    }
-                                }
-                                EngineAction::ScrubEnd => {
-                                    state.scrub_target_seconds = None;
-                                }
-                                EngineAction::Seek(pct) => {
-                                    let target = (state.duration_seconds * pct as f64)
-                                        .clamp(0.0, state.duration_seconds);
-                                    state.seek_request = Some(target);
-                                    state.scrub_target_seconds = None;
-                                    state.spectrum_history.clear();
-                                    for _ in 0..120 {
-                                        state.spectrum_history.push_back(vec![0.0; 1024]);
-                                    }
-                                }
-                                EngineAction::OpenFile => {
-                                    if is_game_mode {
-                                        // SteamDeck: use egui-file-dialog (gamepad-navigable)
-                                        state.open_file_request = true;
-                                    } else if !rfd_pending {
-                                        // Desktop: use native OS file picker via rfd
-                                        rfd_pending = true;
-                                        let tx = rfd_tx.clone();
-                                        let dir = initial_dir.clone();
-                                        std::thread::spawn(move || {
-                                            let result = rfd::FileDialog::new()
-                                                .set_directory(&dir)
-                                                .add_filter(
-                                                    "Audio/Video Files",
-                                                    &[
-                                                        "flac",
-                                                        "wav",
-                                                        "mp3",
-                                                        "ogg",
-                                                        "aac",
-                                                        "m4a",
-                                                        "mp4",
-                                                        "mkv",
-                                                        "avi",
-                                                        "webm",
-                                                        "opus",
-                                                        "mod",
-                                                        "s3m",
-                                                        "xm",
-                                                        "it",
-                                                        "stm",
-                                                        "669",
-                                                        "mtm",
-                                                        "med",
-                                                        "okt",
-                                                        "psm",
-                                                        "dawproject",
-                                                        "aaf",
-                                                        "mid",
-                                                        "midi",
-                                                    ],
-                                                )
-                                                .add_filter("All Files", &["*"])
-                                                .pick_files();
-                                            if let Some(paths) = result {
-                                                let strings: Vec<String> = paths
-                                                    .iter()
-                                                    .map(|p| p.display().to_string())
-                                                    .collect();
-                                                let _ = tx.send(strings);
-                                            } else {
-                                                let _ = tx.send(vec![]);
-                                            }
-                                        });
-                                    }
-                                }
-                                EngineAction::LoadFiles(paths, append) => {
-                                    if append && !state.playlist.is_empty() && state.file_loaded {
-                                        let count = paths.len();
-                                        let first_name = std::path::Path::new(&paths[0])
-                                            .file_name()
-                                            .unwrap_or_default()
-                                            .to_string_lossy()
-                                            .into_owned();
-                                        if count == 1 {
-                                            state.osd_text =
-                                                Some(format!("Added to Playlist: {}", first_name));
-                                        } else {
-                                            state.osd_text =
-                                                Some(format!("Added {} tracks to Playlist", count));
-                                        }
-                                        state.osd_timer = 3.0;
-                                        state.playlist.extend(paths);
-                                    } else if !paths.is_empty() {
-                                        state.playlist = paths;
-                                        state.playlist_index = 0;
-                                        state.load_request = Some(state.playlist[0].clone());
-                                        state.file_loaded = true;
-                                    }
-                                    state.is_file_picker_open = false;
-                                }
-                                EngineAction::SetAppendToPlaylist(val) => {
-                                    state.append_to_playlist = val;
-                                }
-                                EngineAction::SetForceStereo(val) => {
-                                    state.force_stereo_downmix = val;
-                                }
-                                EngineAction::SetPassthrough(val) => {
-                                    state.passthrough_enabled = val;
-                                }
-                                EngineAction::SetSplitRatio(val) => {
-                                    state.panel_split_ratio = val;
-                                }
-                                EngineAction::SetAudioDevice(device_name) => {
-                                    state.selected_audio_device = Some(device_name.clone());
-                                    state.audio_device_change_request = Some(device_name);
-                                }
-                                EngineAction::SetAudioTrack(track_idx) => {
-                                    if state.audio_tracks.len() > 1
-                                        && track_idx < state.audio_tracks.len()
-                                    {
-                                        state.selected_audio_track = track_idx;
-                                        state.active_audio_tracks = vec![track_idx];
-                                        state.multi_track_mix_mode = false;
-                                        if state.audio_track_volumes.len()
-                                            != state.audio_tracks.len()
-                                        {
-                                            state.audio_track_volumes =
-                                                vec![1.0; state.audio_tracks.len()];
-                                        }
-                                        state.audio_track_request = Some(track_idx);
-                                        state.audio_mix_request = Some(vec![(track_idx, 1.0)]);
-                                    }
-                                }
-                                EngineAction::ToggleAudioTrackInMix(track_idx) => {
-                                    if state.audio_tracks.len() > 1
-                                        && track_idx < state.audio_tracks.len()
-                                    {
-                                        if state.active_audio_tracks.is_empty() {
-                                            state.active_audio_tracks =
-                                                vec![state.selected_audio_track];
-                                        }
-                                        if let Some(pos) = state
-                                            .active_audio_tracks
-                                            .iter()
-                                            .position(|&t| t == track_idx)
-                                        {
-                                            if state.active_audio_tracks.len() > 1 {
-                                                state.active_audio_tracks.remove(pos);
-                                            }
-                                        } else {
-                                            state.active_audio_tracks.push(track_idx);
-                                            state.active_audio_tracks.sort();
-                                        }
-                                        state.multi_track_mix_mode =
-                                            state.active_audio_tracks.len() > 1;
-                                        if state.audio_track_volumes.len()
-                                            != state.audio_tracks.len()
-                                        {
-                                            state.audio_track_volumes =
-                                                vec![1.0; state.audio_tracks.len()];
-                                        }
-                                        let mix: Vec<(usize, f32)> = state
-                                            .active_audio_tracks
-                                            .iter()
-                                            .map(|&idx| {
-                                                (
-                                                    idx,
-                                                    state
-                                                        .audio_track_volumes
-                                                        .get(idx)
-                                                        .copied()
-                                                        .unwrap_or(1.0),
-                                                )
-                                            })
-                                            .collect();
-                                        state.audio_mix_request = Some(mix);
-                                    }
-                                }
-                                EngineAction::SetAudioTrackVolume(track_idx, volume) => {
-                                    if track_idx < state.audio_tracks.len() {
-                                        if state.audio_track_volumes.len()
-                                            != state.audio_tracks.len()
-                                        {
-                                            state.audio_track_volumes =
-                                                vec![1.0; state.audio_tracks.len()];
-                                        }
-                                        state.audio_track_volumes[track_idx] =
-                                            volume.clamp(0.0, 1.0);
-                                        let mix: Vec<(usize, f32)> = state
-                                            .active_audio_tracks
-                                            .iter()
-                                            .map(|&idx| {
-                                                (
-                                                    idx,
-                                                    state
-                                                        .audio_track_volumes
-                                                        .get(idx)
-                                                        .copied()
-                                                        .unwrap_or(1.0),
-                                                )
-                                            })
-                                            .collect();
-                                        state.audio_mix_request = Some(mix);
-                                    }
-                                }
-                                EngineAction::SetAudioMixMode(enabled) => {
-                                    state.multi_track_mix_mode = enabled;
-                                    if !enabled && !state.active_audio_tracks.is_empty() {
-                                        let track_idx = state.active_audio_tracks[0];
-                                        state.selected_audio_track = track_idx;
-                                        state.active_audio_tracks = vec![track_idx];
-                                        state.audio_mix_request = Some(vec![(track_idx, 1.0)]);
-                                    }
-                                }
-                                EngineAction::SetAudioMixTracks(tracks) => {
-                                    state.multi_track_mix_mode = tracks.len() > 1;
-                                    state.active_audio_tracks =
-                                        tracks.iter().map(|(idx, _)| *idx).collect();
-                                    if state.audio_track_volumes.len() != state.audio_tracks.len() {
-                                        state.audio_track_volumes =
-                                            vec![1.0; state.audio_tracks.len()];
-                                    }
-                                    for &(idx, vol) in &tracks {
-                                        if idx < state.audio_track_volumes.len() {
-                                            state.audio_track_volumes[idx] = vol;
-                                        }
-                                    }
-                                    if let Some(&(first_idx, _)) = tracks.first() {
-                                        state.selected_audio_track = first_idx;
-                                        if tracks.len() == 1 {
-                                            state.audio_track_request = Some(first_idx);
-                                        }
-                                    }
-                                    let mix_desc = if tracks.len() > 1 {
-                                        let track_nums: Vec<String> = tracks
-                                            .iter()
-                                            .map(|(idx, _)| (idx + 1).to_string())
-                                            .collect();
-                                        format!("🎛 Mix: Tracks {}", track_nums.join("+"))
-                                    } else if let Some(&(idx, _)) = tracks.first() {
-                                        let track_title = state
-                                            .audio_tracks
-                                            .get(idx)
-                                            .map(|t| t.title.clone())
-                                            .unwrap_or_else(|| format!("Track {}", idx + 1));
-                                        format!("🎛 Audio: {}", track_title)
-                                    } else {
-                                        "🎛 Audio Mix".to_string()
-                                    };
-                                    state.osd_text = Some(mix_desc);
-                                    state.osd_timer = 2.0;
-                                    state.audio_mix_request = Some(tracks);
-                                }
-                                EngineAction::SetMobileHudTab(tab) => {
-                                    state.mobile_hud_tab = tab;
-                                }
-                                EngineAction::VisPickerSelect(idx) => {
-                                    state.current_visualizer_idx = idx;
-                                    state.visualizer_mode = crate::state::VISUALIZERS[idx].id;
-                                    state.osd_text =
-                                        Some(crate::state::VISUALIZERS[idx].name.to_string());
-                                    state.osd_timer = 2.0;
-                                    state.show_vis_picker = false;
-                                }
-                                EngineAction::ToggleVisPicker => {
-                                    state.show_vis_picker = !state.show_vis_picker;
-                                    if state.show_vis_picker {
-                                        state.vis_picker_cursor = state.current_visualizer_idx;
-                                        state.vis_picker_scroll_to_cursor = true;
-                                    }
-                                }
-                                EngineAction::VisPickerToggleEnabled(idx) => {
-                                    if idx != 0 {
-                                        // Frequency Spectrum always enabled
-                                        state.vis_enabled[idx] = !state.vis_enabled[idx];
-                                    }
-                                }
-                                EngineAction::VisPickerSetCursor(idx) => {
-                                    state.vis_picker_cursor = idx;
-                                }
-                                EngineAction::VisPickerEnableAll => {
-                                    for i in 0..state.vis_enabled.len() {
-                                        state.vis_enabled[i] = true;
-                                    }
-                                }
-                                EngineAction::VisPickerEnableNone => {
-                                    for i in 0..state.vis_enabled.len() {
-                                        // Index 0 (Frequency Spectrum) is always enabled
-                                        state.vis_enabled[i] = i == 0;
-                                    }
-                                }
-                                EngineAction::OpenUrlDialog => {
-                                    state.is_url_dialog_open = true;
-                                    state.focus_url_input = true;
-                                    window.set_ime_allowed(true); // Hint to Wayland/SteamOS to show the virtual keyboard
-                                }
-                                EngineAction::ClearFocusUrlInput => {
-                                    state.focus_url_input = false;
-                                }
-                                EngineAction::CloseUrlDialog => {
-                                    state.is_url_dialog_open = false;
-                                    window.set_ime_allowed(false);
-                                }
-                                EngineAction::SetUrlInput(url) => {
-                                    state.url_input_text = url;
-                                }
-                                EngineAction::EditUrl(url) => {
-                                    state.url_input_text = url;
-                                    state.focus_url_input = true;
-                                    window.set_ime_allowed(true);
-                                }
-                                EngineAction::LoadUrl(url) => {
-                                    let mut final_url = url.clone();
-                                    if !final_url.starts_with("http://")
-                                        && !final_url.starts_with("https://")
-                                    {
-                                        final_url = format!("https://{}", final_url);
-                                    }
-                                    state.is_url_dialog_open = false;
-                                    window.set_ime_allowed(false);
-                                    state.url_input_text.clear();
-                                    state.playlist = vec![final_url.clone()];
-                                    state.playlist_index = 0;
-                                    state.load_request = Some(final_url.clone());
-                                    state.file_loaded = true;
-
-                                    if let Some(idx) =
-                                        state.url_history.iter().position(|(u, _)| u == &final_url)
-                                    {
-                                        let item = state.url_history.remove(idx);
-                                        state.url_history.push(item);
-                                    } else {
-                                        state.url_history.push((
-                                            final_url.clone(),
-                                            "Network Stream".to_string(),
-                                        ));
-                                    }
-
-                                    let mut out = String::new();
-                                    for (u, t) in &state.url_history {
-                                        out.push_str(&format!("{}|{}\n", u, t));
-                                    }
-                                    let _ =
-                                        std::fs::write(crate::state::get_history_file_path(), out);
-                                }
-                                EngineAction::None => {}
-                            }
-
-                            // File picker state
-                            let fd_state = file_dialog.state();
-                            state.is_file_picker_open =
-                                *fd_state == egui_file_dialog::DialogState::Open;
-                            if *fd_state == egui_file_dialog::DialogState::Cancelled {
-                                file_dialog = egui_file_dialog::FileDialog::new()
-                                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
-                                    .initial_directory(initial_dir.clone())
-                                    .add_file_filter_extensions(
-                                        "Audio/Video Files",
-                                        vec![
-                                            "flac",
-                                            "wav",
-                                            "mp3",
-                                            "ogg",
-                                            "aac",
-                                            "m4a",
-                                            "mp4",
-                                            "mkv",
-                                            "avi",
-                                            "webm",
-                                            "opus",
-                                            "mod",
-                                            "s3m",
-                                            "xm",
-                                            "it",
-                                            "stm",
-                                            "669",
-                                            "mtm",
-                                            "med",
-                                            "okt",
-                                            "psm",
-                                            "dawproject",
-                                            "aaf",
-                                            "mid",
-                                            "midi",
-                                        ],
-                                    )
-                                    .show_all_files_filter(true)
-                                    .default_file_filter("Audio/Video Files");
-                            }
-                            if state.open_file_request && !state.is_file_picker_open {
-                                state.open_file_request = false;
-                                state.is_file_picker_open = true;
-                                trigger_picker = true;
-                            }
-
-                            // Write phase timings
-                            state.stats.phase_lock_update_us =
-                                state.stats.phase_lock_update_us * 0.9 + phase_lock_update_us * 0.1;
-                            state.stats.phase_snapshot_us =
-                                state.stats.phase_snapshot_us * 0.9 + phase_snapshot_us * 0.1;
-                            state.stats.phase_surface_us =
-                                state.stats.phase_surface_us * 0.9 + phase_surface_us * 0.1;
-                            state.stats.phase_egui_layout_us =
-                                state.stats.phase_egui_layout_us * 0.9 + phase_egui_us * 0.1;
-                            state.stats.phase_encode_us =
-                                state.stats.phase_encode_us * 0.9 + phase_encode_us * 0.1;
-                            state.stats.phase_post_us = state.stats.phase_post_us * 0.9
-                                + post_timer.elapsed().as_micros() as f32 * 0.1;
-                            // Poll native file picker results
-                            if let Ok(paths) = rfd_rx.try_recv() {
-                                rfd_pending = false;
-                                if !paths.is_empty() {
-                                    if let Some(parent) = std::path::Path::new(&paths[0]).parent() {
-                                        initial_dir = parent.to_path_buf();
-                                    }
-                                    let expanded = crate::playlist::expand_input_paths(&paths);
-                                    let append = state.append_to_playlist;
-                                    if append && !state.playlist.is_empty() {
-                                        state.playlist.extend(expanded);
-                                    } else if !expanded.is_empty() {
-                                        state.playlist = expanded;
-                                        state.playlist_index = 0;
-                                        state.load_request = Some(state.playlist[0].clone());
-                                        state.file_loaded = true;
-                                    }
-                                    state.is_file_picker_open = false;
-                                    window.request_redraw();
-                                }
-                            }
-
-                            // Poll IPC incoming paths (from secondary instances)
-                            if let Ok(raw_paths) = ipc_rx.try_recv() {
-                                if !raw_paths.is_empty() {
-                                    let expanded = crate::playlist::expand_input_paths(&raw_paths);
-                                    if !expanded.is_empty() {
-                                        if !state.file_loaded || state.playlist.is_empty() {
-                                            state.playlist = expanded.clone();
+                                        let expanded = crate::playlist::expand_input_paths(&paths);
+                                        let append = state.append_to_playlist;
+                                        if append && !state.playlist.is_empty() {
+                                            state.playlist.extend(expanded);
+                                        } else if !expanded.is_empty() {
+                                            state.playlist = expanded;
                                             state.playlist_index = 0;
                                             state.load_request = Some(state.playlist[0].clone());
                                             state.file_loaded = true;
-                                        } else {
-                                            let first_new_idx = state.playlist.len();
-                                            state.playlist.extend(expanded.clone());
-                                            state.playlist_index = first_new_idx;
-                                            state.load_request =
-                                                Some(state.playlist[first_new_idx].clone());
-                                            state.is_paused = false;
-                                            let file_name = std::path::Path::new(&expanded[0])
-                                                .file_name()
-                                                .unwrap_or_default()
-                                                .to_string_lossy()
-                                                .into_owned();
-                                            if expanded.len() == 1 {
-                                                state.osd_text =
-                                                    Some(format!("Now Playing: {}", file_name));
-                                            } else {
-                                                state.osd_text = Some(format!(
-                                                    "Added {} tracks (Playing {})",
-                                                    expanded.len(),
-                                                    file_name
-                                                ));
-                                            }
-                                            state.osd_timer = 3.0;
                                         }
+                                        state.is_file_picker_open = false;
+                                        window.request_redraw();
+                                    }
+                                }
+
+                                // Poll IPC incoming paths (from secondary instances)
+                                if let Ok(raw_paths) = ipc_rx.try_recv() {
+                                    if !raw_paths.is_empty() {
+                                        let expanded =
+                                            crate::playlist::expand_input_paths(&raw_paths);
+                                        if !expanded.is_empty() {
+                                            if !state.file_loaded || state.playlist.is_empty() {
+                                                state.playlist = expanded.clone();
+                                                state.playlist_index = 0;
+                                                state.load_request =
+                                                    Some(state.playlist[0].clone());
+                                                state.file_loaded = true;
+                                            } else {
+                                                let first_new_idx = state.playlist.len();
+                                                state.playlist.extend(expanded.clone());
+                                                state.playlist_index = first_new_idx;
+                                                state.load_request =
+                                                    Some(state.playlist[first_new_idx].clone());
+                                                state.is_paused = false;
+                                                let file_name = std::path::Path::new(&expanded[0])
+                                                    .file_name()
+                                                    .unwrap_or_default()
+                                                    .to_string_lossy()
+                                                    .into_owned();
+                                                if expanded.len() == 1 {
+                                                    state.osd_text =
+                                                        Some(format!("Now Playing: {}", file_name));
+                                                } else {
+                                                    state.osd_text = Some(format!(
+                                                        "Added {} tracks (Playing {})",
+                                                        expanded.len(),
+                                                        file_name
+                                                    ));
+                                                }
+                                                state.osd_timer = 3.0;
+                                            }
+                                            window.set_minimized(false);
+                                            window.focus_window();
+                                            window.request_redraw();
+                                        }
+                                    } else {
                                         window.set_minimized(false);
                                         window.focus_window();
                                         window.request_redraw();
                                     }
+                                }
+                            }
+
+                            if trigger_picker {
+                                file_dialog.pick_multiple();
+                            }
+
+                            // VSync and Frame Rate pacing:
+                            // When --uncapped or --bench is specified, allow maximum unconstrained framerates.
+                            // Otherwise, pace to display refresh rate to eliminate runaway GPU power draw.
+                            let fps_limit =
+                                if let Ok(limit_str) = std::env::var("RUSTTRACKER_FPS_LIMIT") {
+                                    limit_str.parse::<f32>().ok().filter(|&fps| fps > 0.0)
+                                } else if !is_uncapped && bench.is_none() {
+                                    let target_fps = window
+                                        .current_monitor()
+                                        .and_then(|m| m.refresh_rate_millihertz())
+                                        .map(|mhz| mhz as f32 / 1000.0)
+                                        .unwrap_or(60.0);
+                                    Some(target_fps)
                                 } else {
-                                    window.set_minimized(false);
-                                    window.focus_window();
-                                    window.request_redraw();
+                                    None
+                                };
+
+                            if let Some(target_fps) = fps_limit {
+                                let target_frame_time = Duration::from_secs_f32(1.0 / target_fps);
+                                let elapsed = now.elapsed();
+                                if elapsed < target_frame_time {
+                                    let sleep_time = target_frame_time.saturating_sub(elapsed);
+                                    if sleep_time > Duration::from_millis(1) {
+                                        std::thread::sleep(sleep_time - Duration::from_millis(1));
+                                    }
+                                    while now.elapsed() < target_frame_time {
+                                        std::hint::spin_loop();
+                                    }
                                 }
                             }
+
+                            window.request_redraw();
                         }
-
-                        if trigger_picker {
-                            file_dialog.pick_multiple();
-                        }
-
-                        // VSync and Frame Rate pacing:
-                        // When --uncapped or --bench is specified, allow maximum unconstrained framerates.
-                        // Otherwise, pace to display refresh rate to eliminate runaway GPU power draw.
-                        let fps_limit =
-                            if let Ok(limit_str) = std::env::var("RUSTTRACKER_FPS_LIMIT") {
-                                limit_str.parse::<f32>().ok().filter(|&fps| fps > 0.0)
-                            } else if !is_uncapped && bench.is_none() {
-                                let target_fps = window
-                                    .current_monitor()
-                                    .and_then(|m| m.refresh_rate_millihertz())
-                                    .map(|mhz| mhz as f32 / 1000.0)
-                                    .unwrap_or(60.0);
-                                Some(target_fps)
-                            } else {
-                                None
-                            };
-
-                        if let Some(target_fps) = fps_limit {
-                            let target_frame_time = Duration::from_secs_f32(1.0 / target_fps);
-                            let elapsed = now.elapsed();
-                            if elapsed < target_frame_time {
-                                let sleep_time = target_frame_time.saturating_sub(elapsed);
-                                if sleep_time > Duration::from_millis(1) {
-                                    std::thread::sleep(sleep_time - Duration::from_millis(1));
-                                }
-                                while now.elapsed() < target_frame_time {
-                                    std::hint::spin_loop();
-                                }
+                        _ => {}
+                    }
+                }
+                Event::AboutToWait => {
+                    // Poll native file picker results immediately to eliminate UI latency
+                    if let Ok(paths) = rfd_rx.try_recv() {
+                        rfd_pending = false;
+                        if !paths.is_empty() {
+                            if let Some(parent) = std::path::Path::new(&paths[0]).parent() {
+                                initial_dir = parent.to_path_buf();
                             }
-                        }
-
-                        window.request_redraw();
-                    }
-                    _ => {}
-                }
-            }
-            Event::AboutToWait => {
-                // Poll native file picker results immediately to eliminate UI latency
-                if let Ok(paths) = rfd_rx.try_recv() {
-                    rfd_pending = false;
-                    if !paths.is_empty() {
-                        if let Some(parent) = std::path::Path::new(&paths[0]).parent() {
-                            initial_dir = parent.to_path_buf();
-                        }
-                        let expanded = crate::playlist::expand_input_paths(&paths);
-                        let mut state = app_state.lock().unwrap();
-                        let append = state.append_to_playlist;
-                        if append && !state.playlist.is_empty() {
-                            state.playlist.extend(expanded);
-                        } else if !expanded.is_empty() {
-                            state.playlist = expanded;
-                            state.playlist_index = 0;
-                            state.load_request = Some(state.playlist[0].clone());
-                            state.file_loaded = true;
-                        }
-                        state.is_file_picker_open = false;
-                        window.request_redraw();
-                    }
-                }
-
-                let is_dialog_open = *file_dialog.state() == egui_file_dialog::DialogState::Open
-                    || {
-                        let state = app_state.lock().unwrap();
-                        state.is_url_dialog_open
-                    };
-
-                {
-                    let mut state = app_state.lock().unwrap();
-
-                    let mut has_gp = false;
-                    for _ in gilrs.gamepads() {
-                        has_gp = true;
-                    }
-                    state.has_gamepad = is_game_mode || has_gp;
-
-                    if !is_game_mode {
-                        let mut g_type = crate::state::GamepadType::Xbox;
-                        for (_id, gamepad) in gilrs.gamepads() {
-                            let name = gamepad.name().to_lowercase();
-                            let vendor = gamepad.vendor_id().unwrap_or(0);
-                            if name.contains("sony")
-                                || name.contains("dualshock")
-                                || name.contains("dualsense")
-                                || name.contains("ps4")
-                                || name.contains("ps5")
-                                || name.contains("wireless controller")
-                                || vendor == 0x054C
-                            {
-                                g_type = crate::state::GamepadType::PlayStation;
-                                break;
-                            } else if name.contains("nintendo")
-                                || name.contains("pro controller")
-                                || name.contains("joy-con")
-                                || vendor == 0x057E
-                            {
-                                g_type = crate::state::GamepadType::Nintendo;
-                                break;
+                            let expanded = crate::playlist::expand_input_paths(&paths);
+                            let mut state = app_state.lock().unwrap();
+                            let append = state.append_to_playlist;
+                            if append && !state.playlist.is_empty() {
+                                state.playlist.extend(expanded);
+                            } else if !expanded.is_empty() {
+                                state.playlist = expanded;
+                                state.playlist_index = 0;
+                                state.load_request = Some(state.playlist[0].clone());
+                                state.file_loaded = true;
                             }
+                            state.is_file_picker_open = false;
+                            window.request_redraw();
                         }
-                        state.gamepad_type = g_type;
                     }
-                }
 
-                while let Some(gilrs::Event { event: g_event, .. }) = gilrs.next_event() {
-                    let is_pressed = matches!(g_event, gilrs::EventType::ButtonPressed(_, _));
-                    let is_repeated = matches!(g_event, gilrs::EventType::ButtonRepeated(_, _));
-                    if is_pressed || is_repeated {
-                        let button = match g_event {
-                            gilrs::EventType::ButtonPressed(b, _) => b,
-                            gilrs::EventType::ButtonRepeated(b, _) => b,
-                            _ => unreachable!(),
+                    let is_dialog_open =
+                        *file_dialog.state() == egui_file_dialog::DialogState::Open || {
+                            let state = app_state.lock().unwrap();
+                            state.is_url_dialog_open
                         };
 
-                        if is_repeated {
-                            match button {
-                                gilrs::Button::DPadRight => {
-                                    let mut state = app_state.lock().unwrap();
-                                    let target = (state.current_seconds + 10.0)
-                                        .clamp(0.0, state.duration_seconds);
-                                    state.seek_request = Some(target);
-                                    state.spectrum_history.clear();
-                                    for _ in 0..120 {
-                                        state.spectrum_history.push_back(vec![0.0; 1024]);
-                                    }
-                                    state.osd_text = Some("+10.0s".to_string());
-                                    state.osd_timer = 2.0;
-                                }
-                                gilrs::Button::DPadLeft => {
-                                    let mut state = app_state.lock().unwrap();
-                                    let target = (state.current_seconds - 10.0).max(0.0);
-                                    state.seek_request = Some(target);
-                                    state.spectrum_history.clear();
-                                    for _ in 0..120 {
-                                        state.spectrum_history.push_back(vec![0.0; 1024]);
-                                    }
-                                    state.osd_text = Some("-10.0s".to_string());
-                                    state.osd_timer = 2.0;
-                                }
-                                _ => {}
-                            }
-                            continue;
-                        }
-                        // System-critical buttons always work regardless of dialog state
-                        match button {
-                            gilrs::Button::Select => {
-                                elwt.exit();
-                                continue;
-                            }
-                            gilrs::Button::Start => {
-                                let currently_fullscreen = window.fullscreen().is_some();
-                                is_fullscreen = !currently_fullscreen;
-                                if is_fullscreen {
-                                    window.set_fullscreen(Some(
-                                        winit::window::Fullscreen::Borderless(None),
-                                    ));
-                                    keep_awake = keepawake::Builder::default()
-                                        .display(true)
-                                        .idle(true)
-                                        .create()
-                                        .ok();
-                                } else {
-                                    window.set_fullscreen(None);
-                                    let _ = window.request_inner_size(
-                                        winit::dpi::LogicalSize::new(1024.0, 768.0),
-                                    );
-                                    keep_awake = None;
-                                }
-                                continue;
-                            }
-                            _ => {}
-                        }
+                    {
+                        let mut state = app_state.lock().unwrap();
 
-                        if is_dialog_open {
-                            let mut state = app_state.lock().unwrap();
-                            let is_url_open = state.is_url_dialog_open;
-                            let mut push_key = |key: egui::Key| {
-                                state.egui_gamepad_events.push(egui::Event::Key {
-                                    key,
-                                    physical_key: None,
-                                    pressed: true,
-                                    repeat: false,
-                                    modifiers: egui::Modifiers::NONE,
-                                });
-                                state.egui_gamepad_events.push(egui::Event::Key {
-                                    key,
-                                    physical_key: None,
-                                    pressed: false,
-                                    repeat: false,
-                                    modifiers: egui::Modifiers::NONE,
-                                });
+                        let mut has_gp = false;
+                        for _ in gilrs.gamepads() {
+                            has_gp = true;
+                        }
+                        state.has_gamepad = is_game_mode || has_gp;
+
+                        if !is_game_mode {
+                            let mut g_type = crate::state::GamepadType::Xbox;
+                            for (_id, gamepad) in gilrs.gamepads() {
+                                let name = gamepad.name().to_lowercase();
+                                let vendor = gamepad.vendor_id().unwrap_or(0);
+                                if name.contains("sony")
+                                    || name.contains("dualshock")
+                                    || name.contains("dualsense")
+                                    || name.contains("ps4")
+                                    || name.contains("ps5")
+                                    || name.contains("wireless controller")
+                                    || vendor == 0x054C
+                                {
+                                    g_type = crate::state::GamepadType::PlayStation;
+                                    break;
+                                } else if name.contains("nintendo")
+                                    || name.contains("pro controller")
+                                    || name.contains("joy-con")
+                                    || vendor == 0x057E
+                                {
+                                    g_type = crate::state::GamepadType::Nintendo;
+                                    break;
+                                }
+                            }
+                            state.gamepad_type = g_type;
+                        }
+                    }
+
+                    while let Some(gilrs::Event { event: g_event, .. }) = gilrs.next_event() {
+                        let is_pressed = matches!(g_event, gilrs::EventType::ButtonPressed(_, _));
+                        let is_repeated = matches!(g_event, gilrs::EventType::ButtonRepeated(_, _));
+                        if is_pressed || is_repeated {
+                            let button = match g_event {
+                                gilrs::EventType::ButtonPressed(b, _) => b,
+                                gilrs::EventType::ButtonRepeated(b, _) => b,
+                                _ => unreachable!(),
                             };
+
+                            if is_repeated {
+                                match button {
+                                    gilrs::Button::DPadRight => {
+                                        let mut state = app_state.lock().unwrap();
+                                        let target = (state.current_seconds + 10.0)
+                                            .clamp(0.0, state.duration_seconds);
+                                        state.seek_request = Some(target);
+                                        state.spectrum_history.clear();
+                                        for _ in 0..120 {
+                                            state.spectrum_history.push_back(vec![0.0; 1024]);
+                                        }
+                                        state.osd_text = Some("+10.0s".to_string());
+                                        state.osd_timer = 2.0;
+                                    }
+                                    gilrs::Button::DPadLeft => {
+                                        let mut state = app_state.lock().unwrap();
+                                        let target = (state.current_seconds - 10.0).max(0.0);
+                                        state.seek_request = Some(target);
+                                        state.spectrum_history.clear();
+                                        for _ in 0..120 {
+                                            state.spectrum_history.push_back(vec![0.0; 1024]);
+                                        }
+                                        state.osd_text = Some("-10.0s".to_string());
+                                        state.osd_timer = 2.0;
+                                    }
+                                    _ => {}
+                                }
+                                continue;
+                            }
+                            // System-critical buttons always work regardless of dialog state
                             match button {
-                                gilrs::Button::DPadUp => {
-                                    if is_url_open {
-                                        state.egui_gamepad_events.push(egui::Event::Key {
-                                            key: egui::Key::Tab,
-                                            physical_key: None,
-                                            pressed: true,
-                                            repeat: false,
-                                            modifiers: egui::Modifiers::SHIFT,
-                                        });
-                                        state.egui_gamepad_events.push(egui::Event::Key {
-                                            key: egui::Key::Tab,
-                                            physical_key: None,
-                                            pressed: false,
-                                            repeat: false,
-                                            modifiers: egui::Modifiers::SHIFT,
-                                        });
+                                gilrs::Button::Select => {
+                                    elwt.exit();
+                                    continue;
+                                }
+                                gilrs::Button::Start => {
+                                    let currently_fullscreen = window.fullscreen().is_some();
+                                    is_fullscreen = !currently_fullscreen;
+                                    if is_fullscreen {
+                                        window.set_fullscreen(Some(
+                                            winit::window::Fullscreen::Borderless(None),
+                                        ));
+                                        keep_awake = keepawake::Builder::default()
+                                            .display(true)
+                                            .idle(true)
+                                            .create()
+                                            .ok();
                                     } else {
-                                        push_key(egui::Key::ArrowUp);
+                                        window.set_fullscreen(None);
+                                        let _ = window.request_inner_size(
+                                            winit::dpi::LogicalSize::new(1024.0, 768.0),
+                                        );
+                                        keep_awake = None;
                                     }
-                                    continue;
-                                }
-                                gilrs::Button::DPadDown => {
-                                    if is_url_open {
-                                        state.egui_gamepad_events.push(egui::Event::Key {
-                                            key: egui::Key::Tab,
-                                            physical_key: None,
-                                            pressed: true,
-                                            repeat: false,
-                                            modifiers: egui::Modifiers::NONE,
-                                        });
-                                        state.egui_gamepad_events.push(egui::Event::Key {
-                                            key: egui::Key::Tab,
-                                            physical_key: None,
-                                            pressed: false,
-                                            repeat: false,
-                                            modifiers: egui::Modifiers::NONE,
-                                        });
-                                    } else {
-                                        push_key(egui::Key::ArrowDown);
-                                    }
-                                    continue;
-                                }
-                                gilrs::Button::DPadLeft => {
-                                    push_key(egui::Key::ArrowLeft);
-                                    continue;
-                                }
-                                gilrs::Button::DPadRight => {
-                                    push_key(egui::Key::ArrowRight);
-                                    continue;
-                                }
-                                gilrs::Button::South => {
-                                    push_key(egui::Key::Enter);
-                                    continue;
-                                }
-                                gilrs::Button::East => {
-                                    push_key(egui::Key::Escape);
-                                    continue;
-                                }
-                                gilrs::Button::RightTrigger => {
-                                    state.egui_gamepad_events.push(egui::Event::Key {
-                                        key: egui::Key::Tab,
-                                        physical_key: None,
-                                        pressed: true,
-                                        repeat: false,
-                                        modifiers: egui::Modifiers::NONE,
-                                    });
-                                    state.egui_gamepad_events.push(egui::Event::Key {
-                                        key: egui::Key::Tab,
-                                        physical_key: None,
-                                        pressed: false,
-                                        repeat: false,
-                                        modifiers: egui::Modifiers::NONE,
-                                    });
-                                    continue;
-                                }
-                                gilrs::Button::LeftTrigger => {
-                                    state.egui_gamepad_events.push(egui::Event::Key {
-                                        key: egui::Key::Tab,
-                                        physical_key: None,
-                                        pressed: true,
-                                        repeat: false,
-                                        modifiers: egui::Modifiers::SHIFT,
-                                    });
-                                    state.egui_gamepad_events.push(egui::Event::Key {
-                                        key: egui::Key::Tab,
-                                        physical_key: None,
-                                        pressed: false,
-                                        repeat: false,
-                                        modifiers: egui::Modifiers::SHIFT,
-                                    });
                                     continue;
                                 }
                                 _ => {}
                             }
-                        } else {
-                            let is_splash = {
-                                let state = app_state.lock().unwrap();
-                                !state.file_loaded
-                            };
-                            if is_splash {
+
+                            if is_dialog_open {
                                 let mut state = app_state.lock().unwrap();
-                                let mut push_tab = |shift: bool| {
-                                    let modifiers = if shift {
-                                        egui::Modifiers::SHIFT
-                                    } else {
-                                        egui::Modifiers::NONE
-                                    };
+                                let is_url_open = state.is_url_dialog_open;
+                                let mut push_key = |key: egui::Key| {
                                     state.egui_gamepad_events.push(egui::Event::Key {
-                                        key: egui::Key::Tab,
+                                        key,
                                         physical_key: None,
                                         pressed: true,
                                         repeat: false,
-                                        modifiers,
+                                        modifiers: egui::Modifiers::NONE,
                                     });
                                     state.egui_gamepad_events.push(egui::Event::Key {
-                                        key: egui::Key::Tab,
+                                        key,
                                         physical_key: None,
                                         pressed: false,
                                         repeat: false,
-                                        modifiers,
+                                        modifiers: egui::Modifiers::NONE,
                                     });
                                 };
                                 match button {
+                                    gilrs::Button::DPadUp => {
+                                        if is_url_open {
+                                            state.egui_gamepad_events.push(egui::Event::Key {
+                                                key: egui::Key::Tab,
+                                                physical_key: None,
+                                                pressed: true,
+                                                repeat: false,
+                                                modifiers: egui::Modifiers::SHIFT,
+                                            });
+                                            state.egui_gamepad_events.push(egui::Event::Key {
+                                                key: egui::Key::Tab,
+                                                physical_key: None,
+                                                pressed: false,
+                                                repeat: false,
+                                                modifiers: egui::Modifiers::SHIFT,
+                                            });
+                                        } else {
+                                            push_key(egui::Key::ArrowUp);
+                                        }
+                                        continue;
+                                    }
+                                    gilrs::Button::DPadDown => {
+                                        if is_url_open {
+                                            state.egui_gamepad_events.push(egui::Event::Key {
+                                                key: egui::Key::Tab,
+                                                physical_key: None,
+                                                pressed: true,
+                                                repeat: false,
+                                                modifiers: egui::Modifiers::NONE,
+                                            });
+                                            state.egui_gamepad_events.push(egui::Event::Key {
+                                                key: egui::Key::Tab,
+                                                physical_key: None,
+                                                pressed: false,
+                                                repeat: false,
+                                                modifiers: egui::Modifiers::NONE,
+                                            });
+                                        } else {
+                                            push_key(egui::Key::ArrowDown);
+                                        }
+                                        continue;
+                                    }
                                     gilrs::Button::DPadLeft => {
-                                        push_tab(true);
+                                        push_key(egui::Key::ArrowLeft);
                                         continue;
                                     }
                                     gilrs::Button::DPadRight => {
-                                        push_tab(false);
+                                        push_key(egui::Key::ArrowRight);
                                         continue;
                                     }
                                     gilrs::Button::South => {
+                                        push_key(egui::Key::Enter);
+                                        continue;
+                                    }
+                                    gilrs::Button::East => {
+                                        push_key(egui::Key::Escape);
+                                        continue;
+                                    }
+                                    gilrs::Button::RightTrigger => {
                                         state.egui_gamepad_events.push(egui::Event::Key {
-                                            key: egui::Key::Enter,
+                                            key: egui::Key::Tab,
                                             physical_key: None,
                                             pressed: true,
                                             repeat: false,
                                             modifiers: egui::Modifiers::NONE,
                                         });
                                         state.egui_gamepad_events.push(egui::Event::Key {
-                                            key: egui::Key::Enter,
+                                            key: egui::Key::Tab,
                                             physical_key: None,
                                             pressed: false,
                                             repeat: false,
                                             modifiers: egui::Modifiers::NONE,
+                                        });
+                                        continue;
+                                    }
+                                    gilrs::Button::LeftTrigger => {
+                                        state.egui_gamepad_events.push(egui::Event::Key {
+                                            key: egui::Key::Tab,
+                                            physical_key: None,
+                                            pressed: true,
+                                            repeat: false,
+                                            modifiers: egui::Modifiers::SHIFT,
+                                        });
+                                        state.egui_gamepad_events.push(egui::Event::Key {
+                                            key: egui::Key::Tab,
+                                            physical_key: None,
+                                            pressed: false,
+                                            repeat: false,
+                                            modifiers: egui::Modifiers::SHIFT,
                                         });
                                         continue;
                                     }
                                     _ => {}
                                 }
+                            } else {
+                                let is_splash = {
+                                    let state = app_state.lock().unwrap();
+                                    !state.file_loaded
+                                };
+                                if is_splash {
+                                    let mut state = app_state.lock().unwrap();
+                                    let mut push_tab = |shift: bool| {
+                                        let modifiers = if shift {
+                                            egui::Modifiers::SHIFT
+                                        } else {
+                                            egui::Modifiers::NONE
+                                        };
+                                        state.egui_gamepad_events.push(egui::Event::Key {
+                                            key: egui::Key::Tab,
+                                            physical_key: None,
+                                            pressed: true,
+                                            repeat: false,
+                                            modifiers,
+                                        });
+                                        state.egui_gamepad_events.push(egui::Event::Key {
+                                            key: egui::Key::Tab,
+                                            physical_key: None,
+                                            pressed: false,
+                                            repeat: false,
+                                            modifiers,
+                                        });
+                                    };
+                                    match button {
+                                        gilrs::Button::DPadLeft => {
+                                            push_tab(true);
+                                            continue;
+                                        }
+                                        gilrs::Button::DPadRight => {
+                                            push_tab(false);
+                                            continue;
+                                        }
+                                        gilrs::Button::South => {
+                                            state.egui_gamepad_events.push(egui::Event::Key {
+                                                key: egui::Key::Enter,
+                                                physical_key: None,
+                                                pressed: true,
+                                                repeat: false,
+                                                modifiers: egui::Modifiers::NONE,
+                                            });
+                                            state.egui_gamepad_events.push(egui::Event::Key {
+                                                key: egui::Key::Enter,
+                                                physical_key: None,
+                                                pressed: false,
+                                                repeat: false,
+                                                modifiers: egui::Modifiers::NONE,
+                                            });
+                                            continue;
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+
+                            match button {
+                                gilrs::Button::LeftTrigger => {
+                                    // L1 Bumper
+                                    let mut state = app_state.lock().unwrap();
+                                    if !state.playlist.is_empty()
+                                        && state.playlist.len() > 1
+                                        && state.playlist_index > 0
+                                    {
+                                        state.playlist_index -= 1;
+                                        state.load_request =
+                                            Some(state.playlist[state.playlist_index].clone());
+                                        state.is_paused = false;
+                                        state.osd_text = Some("Previous Track".to_string());
+                                        state.osd_timer = 2.0;
+                                    } else {
+                                        let target = (state.current_seconds - 60.0).max(0.0);
+                                        state.seek_request = Some(target);
+                                        state.spectrum_history.clear();
+                                        for _ in 0..120 {
+                                            state.spectrum_history.push_back(vec![0.0; 1024]);
+                                        }
+                                        state.osd_text = Some("-60.0s".to_string());
+                                        state.osd_timer = 2.0;
+                                    }
+                                }
+                                gilrs::Button::RightTrigger => {
+                                    // R1 Bumper
+                                    let mut state = app_state.lock().unwrap();
+                                    if !state.playlist.is_empty()
+                                        && state.playlist.len() > 1
+                                        && state.playlist_index + 1 < state.playlist.len()
+                                    {
+                                        state.playlist_index += 1;
+                                        state.load_request =
+                                            Some(state.playlist[state.playlist_index].clone());
+                                        state.is_paused = false;
+                                        state.osd_text = Some("Next Track".to_string());
+                                        state.osd_timer = 2.0;
+                                    } else {
+                                        let target = (state.current_seconds + 60.0)
+                                            .clamp(0.0, state.duration_seconds);
+                                        state.seek_request = Some(target);
+                                        state.spectrum_history.clear();
+                                        for _ in 0..120 {
+                                            state.spectrum_history.push_back(vec![0.0; 1024]);
+                                        }
+                                        state.osd_text = Some("+60.0s".to_string());
+                                        state.osd_timer = 2.0;
+                                    }
+                                }
+                                gilrs::Button::North => {
+                                    // 'Y' or Triangle
+                                    let mut state = app_state.lock().unwrap();
+                                    state.open_file_request = true;
+                                }
+                                gilrs::Button::West => {
+                                    // 'X' or Square
+                                    let mut state = app_state.lock().unwrap();
+                                    if state.video_frame_rx.is_some() {
+                                        state.video_mode = (state.video_mode + 1) % 4;
+                                        let mode_name = match state.video_mode {
+                                            0 => "Standard View",
+                                            1 => "Video in Track Info",
+                                            2 => "Video in Top Panel",
+                                            3 => "Full Screen Video",
+                                            _ => "Video",
+                                        };
+                                        state.osd_text = Some(format!("View: {}", mode_name));
+                                    } else {
+                                        state.show_hud = !state.show_hud;
+                                        state.video_mode = 0;
+                                        let mode_name = if state.show_hud {
+                                            "Standard View"
+                                        } else {
+                                            "Full Screen Visualizer"
+                                        };
+                                        state.osd_text = Some(format!("View: {}", mode_name));
+                                    }
+                                    state.osd_timer = 2.0;
+                                }
+                                gilrs::Button::East => {
+                                    // 'B' or Circle
+                                    let mut state = app_state.lock().unwrap();
+                                    if state.show_vis_picker {
+                                        state.show_vis_picker = false;
+                                    } else {
+                                        state.show_stats = !state.show_stats;
+                                    }
+                                }
+                                gilrs::Button::DPadRight => {
+                                    let mut state = app_state.lock().unwrap();
+                                    if !state.show_vis_picker {
+                                        let target = (state.current_seconds + 10.0)
+                                            .clamp(0.0, state.duration_seconds);
+                                        state.seek_request = Some(target);
+                                        state.spectrum_history.clear();
+                                        for _ in 0..120 {
+                                            state.spectrum_history.push_back(vec![0.0; 1024]);
+                                        }
+                                        state.osd_text = Some("+10.0s".to_string());
+                                        state.osd_timer = 2.0;
+                                    }
+                                }
+                                gilrs::Button::DPadLeft => {
+                                    let mut state = app_state.lock().unwrap();
+                                    if !state.show_vis_picker {
+                                        let target = (state.current_seconds - 10.0).max(0.0);
+                                        state.seek_request = Some(target);
+                                        state.spectrum_history.clear();
+                                        for _ in 0..120 {
+                                            state.spectrum_history.push_back(vec![0.0; 1024]);
+                                        }
+                                        state.osd_text = Some("-10.0s".to_string());
+                                        state.osd_timer = 2.0;
+                                    }
+                                }
+                                gilrs::Button::DPadUp => {
+                                    let mut state = app_state.lock().unwrap();
+                                    if state.show_vis_picker {
+                                        if state.vis_picker_cursor == 0 {
+                                            state.vis_picker_cursor =
+                                                crate::state::VISUALIZERS.len() - 1;
+                                        } else {
+                                            state.vis_picker_cursor -= 1;
+                                        }
+                                        state.vis_picker_scroll_to_cursor = true;
+                                    } else {
+                                        let len = crate::state::VISUALIZERS.len();
+                                        let mut idx = state.current_visualizer_idx;
+                                        for _ in 0..len {
+                                            idx = (idx + 1) % len;
+                                            if state.vis_enabled[idx] {
+                                                break;
+                                            }
+                                        }
+                                        state.current_visualizer_idx = idx;
+                                        state.visualizer_mode = crate::state::VISUALIZERS[idx].id;
+                                        state.osd_text =
+                                            Some(crate::state::VISUALIZERS[idx].name.to_string());
+                                        state.osd_timer = 2.0;
+                                    }
+                                }
+                                gilrs::Button::DPadDown => {
+                                    let mut state = app_state.lock().unwrap();
+                                    if state.show_vis_picker {
+                                        state.vis_picker_cursor = (state.vis_picker_cursor + 1)
+                                            % crate::state::VISUALIZERS.len();
+                                        state.vis_picker_scroll_to_cursor = true;
+                                    } else {
+                                        let len = crate::state::VISUALIZERS.len();
+                                        let mut idx = state.current_visualizer_idx;
+                                        for _ in 0..len {
+                                            idx = if idx == 0 { len - 1 } else { idx - 1 };
+                                            if state.vis_enabled[idx] {
+                                                break;
+                                            }
+                                        }
+                                        state.current_visualizer_idx = idx;
+                                        state.visualizer_mode = crate::state::VISUALIZERS[idx].id;
+                                        state.osd_text =
+                                            Some(crate::state::VISUALIZERS[idx].name.to_string());
+                                        state.osd_timer = 2.0;
+                                    }
+                                }
+                                gilrs::Button::South => {
+                                    let mut state = app_state.lock().unwrap();
+                                    if state.show_vis_picker {
+                                        state.current_visualizer_idx = state.vis_picker_cursor;
+                                        state.visualizer_mode =
+                                            crate::state::VISUALIZERS[state.vis_picker_cursor].id;
+                                        state.osd_text = Some(
+                                            crate::state::VISUALIZERS[state.vis_picker_cursor]
+                                                .name
+                                                .to_string(),
+                                        );
+                                        state.osd_timer = 2.0;
+                                        state.show_vis_picker = false;
+                                    } else if state.track_ended
+                                        || (state.current_seconds >= state.duration_seconds - 0.1
+                                            && state.duration_seconds > 0.0)
+                                    {
+                                        state.track_ended = false;
+                                        state.seek_request = Some(0.0);
+                                        state.spectrum_history.clear();
+                                        for _ in 0..120 {
+                                            state.spectrum_history.push_back(vec![0.0; 1024]);
+                                        }
+                                        state.is_paused = false;
+                                    } else if state.playlist_index >= state.playlist.len()
+                                        && !state.playlist.is_empty()
+                                    {
+                                        if state.duration_seconds == 0.0 {
+                                            state.playlist_index = state.playlist.len() - 1;
+                                        } else {
+                                            state.playlist_index = 0;
+                                        }
+                                        state.load_request =
+                                            Some(state.playlist[state.playlist_index].clone());
+                                        state.is_paused = false;
+                                    } else {
+                                        state.is_paused = !state.is_paused;
+                                    }
+                                }
+                                _ => {}
                             }
                         }
+                    }
 
-                        match button {
-                            gilrs::Button::LeftTrigger => {
-                                // L1 Bumper
-                                let mut state = app_state.lock().unwrap();
-                                if !state.playlist.is_empty()
-                                    && state.playlist.len() > 1
-                                    && state.playlist_index > 0
-                                {
-                                    state.playlist_index -= 1;
-                                    state.load_request =
-                                        Some(state.playlist[state.playlist_index].clone());
-                                    state.is_paused = false;
-                                    state.osd_text = Some("Previous Track".to_string());
-                                    state.osd_timer = 2.0;
-                                } else {
-                                    let target = (state.current_seconds - 60.0).max(0.0);
-                                    state.seek_request = Some(target);
-                                    state.spectrum_history.clear();
-                                    for _ in 0..120 {
-                                        state.spectrum_history.push_back(vec![0.0; 1024]);
-                                    }
-                                    state.osd_text = Some("-60.0s".to_string());
-                                    state.osd_timer = 2.0;
-                                }
-                            }
-                            gilrs::Button::RightTrigger => {
-                                // R1 Bumper
-                                let mut state = app_state.lock().unwrap();
-                                if !state.playlist.is_empty()
-                                    && state.playlist.len() > 1
-                                    && state.playlist_index + 1 < state.playlist.len()
-                                {
-                                    state.playlist_index += 1;
-                                    state.load_request =
-                                        Some(state.playlist[state.playlist_index].clone());
-                                    state.is_paused = false;
-                                    state.osd_text = Some("Next Track".to_string());
-                                    state.osd_timer = 2.0;
-                                } else {
-                                    let target = (state.current_seconds + 60.0)
-                                        .clamp(0.0, state.duration_seconds);
-                                    state.seek_request = Some(target);
-                                    state.spectrum_history.clear();
-                                    for _ in 0..120 {
-                                        state.spectrum_history.push_back(vec![0.0; 1024]);
-                                    }
-                                    state.osd_text = Some("+60.0s".to_string());
-                                    state.osd_timer = 2.0;
-                                }
-                            }
-                            gilrs::Button::North => {
-                                // 'Y' or Triangle
-                                let mut state = app_state.lock().unwrap();
-                                state.open_file_request = true;
-                            }
-                            gilrs::Button::West => {
-                                // 'X' or Square
-                                let mut state = app_state.lock().unwrap();
-                                if state.video_frame_rx.is_some() {
-                                    state.video_mode = (state.video_mode + 1) % 4;
-                                    let mode_name = match state.video_mode {
-                                        0 => "Standard View",
-                                        1 => "Video in Track Info",
-                                        2 => "Video in Top Panel",
-                                        3 => "Full Screen Video",
-                                        _ => "Video",
-                                    };
-                                    state.osd_text = Some(format!("View: {}", mode_name));
-                                } else {
-                                    state.show_hud = !state.show_hud;
-                                    state.video_mode = 0;
-                                    let mode_name = if state.show_hud {
-                                        "Standard View"
-                                    } else {
-                                        "Full Screen Visualizer"
-                                    };
-                                    state.osd_text = Some(format!("View: {}", mode_name));
-                                }
-                                state.osd_timer = 2.0;
-                            }
-                            gilrs::Button::East => {
-                                // 'B' or Circle
-                                let mut state = app_state.lock().unwrap();
-                                if state.show_vis_picker {
-                                    state.show_vis_picker = false;
-                                } else {
-                                    state.show_stats = !state.show_stats;
-                                }
-                            }
-                            gilrs::Button::DPadRight => {
-                                let mut state = app_state.lock().unwrap();
-                                if !state.show_vis_picker {
-                                    let target = (state.current_seconds + 10.0)
-                                        .clamp(0.0, state.duration_seconds);
-                                    state.seek_request = Some(target);
-                                    state.spectrum_history.clear();
-                                    for _ in 0..120 {
-                                        state.spectrum_history.push_back(vec![0.0; 1024]);
-                                    }
-                                    state.osd_text = Some("+10.0s".to_string());
-                                    state.osd_timer = 2.0;
-                                }
-                            }
-                            gilrs::Button::DPadLeft => {
-                                let mut state = app_state.lock().unwrap();
-                                if !state.show_vis_picker {
-                                    let target = (state.current_seconds - 10.0).max(0.0);
-                                    state.seek_request = Some(target);
-                                    state.spectrum_history.clear();
-                                    for _ in 0..120 {
-                                        state.spectrum_history.push_back(vec![0.0; 1024]);
-                                    }
-                                    state.osd_text = Some("-10.0s".to_string());
-                                    state.osd_timer = 2.0;
-                                }
-                            }
-                            gilrs::Button::DPadUp => {
-                                let mut state = app_state.lock().unwrap();
-                                if state.show_vis_picker {
-                                    if state.vis_picker_cursor == 0 {
-                                        state.vis_picker_cursor =
-                                            crate::state::VISUALIZERS.len() - 1;
-                                    } else {
-                                        state.vis_picker_cursor -= 1;
-                                    }
-                                    state.vis_picker_scroll_to_cursor = true;
-                                } else {
-                                    let len = crate::state::VISUALIZERS.len();
-                                    let mut idx = state.current_visualizer_idx;
-                                    for _ in 0..len {
-                                        idx = (idx + 1) % len;
-                                        if state.vis_enabled[idx] {
-                                            break;
-                                        }
-                                    }
-                                    state.current_visualizer_idx = idx;
-                                    state.visualizer_mode = crate::state::VISUALIZERS[idx].id;
-                                    state.osd_text =
-                                        Some(crate::state::VISUALIZERS[idx].name.to_string());
-                                    state.osd_timer = 2.0;
-                                }
-                            }
-                            gilrs::Button::DPadDown => {
-                                let mut state = app_state.lock().unwrap();
-                                if state.show_vis_picker {
-                                    state.vis_picker_cursor = (state.vis_picker_cursor + 1)
-                                        % crate::state::VISUALIZERS.len();
-                                    state.vis_picker_scroll_to_cursor = true;
-                                } else {
-                                    let len = crate::state::VISUALIZERS.len();
-                                    let mut idx = state.current_visualizer_idx;
-                                    for _ in 0..len {
-                                        idx = if idx == 0 { len - 1 } else { idx - 1 };
-                                        if state.vis_enabled[idx] {
-                                            break;
-                                        }
-                                    }
-                                    state.current_visualizer_idx = idx;
-                                    state.visualizer_mode = crate::state::VISUALIZERS[idx].id;
-                                    state.osd_text =
-                                        Some(crate::state::VISUALIZERS[idx].name.to_string());
-                                    state.osd_timer = 2.0;
-                                }
-                            }
-                            gilrs::Button::South => {
-                                let mut state = app_state.lock().unwrap();
-                                if state.show_vis_picker {
-                                    state.current_visualizer_idx = state.vis_picker_cursor;
-                                    state.visualizer_mode =
-                                        crate::state::VISUALIZERS[state.vis_picker_cursor].id;
-                                    state.osd_text = Some(
-                                        crate::state::VISUALIZERS[state.vis_picker_cursor]
-                                            .name
-                                            .to_string(),
-                                    );
-                                    state.osd_timer = 2.0;
-                                    state.show_vis_picker = false;
-                                } else if state.track_ended
-                                    || (state.current_seconds >= state.duration_seconds - 0.1
-                                        && state.duration_seconds > 0.0)
-                                {
-                                    state.track_ended = false;
-                                    state.seek_request = Some(0.0);
-                                    state.spectrum_history.clear();
-                                    for _ in 0..120 {
-                                        state.spectrum_history.push_back(vec![0.0; 1024]);
-                                    }
-                                    state.is_paused = false;
-                                } else if state.playlist_index >= state.playlist.len()
-                                    && !state.playlist.is_empty()
-                                {
-                                    if state.duration_seconds == 0.0 {
-                                        state.playlist_index = state.playlist.len() - 1;
-                                    } else {
-                                        state.playlist_index = 0;
-                                    }
-                                    state.load_request =
-                                        Some(state.playlist[state.playlist_index].clone());
-                                    state.is_paused = false;
-                                } else {
-                                    state.is_paused = !state.is_paused;
-                                }
-                            }
-                            _ => {}
+                    if is_fullscreen {
+                        if is_cursor_visible && last_mouse_move.elapsed().as_secs_f32() > 2.0 {
+                            window.set_cursor_visible(false);
+                            is_cursor_visible = false;
                         }
+                    } else if !is_cursor_visible {
+                        window.set_cursor_visible(true);
+                        is_cursor_visible = true;
                     }
-                }
 
-                if is_fullscreen {
-                    if is_cursor_visible && last_mouse_move.elapsed().as_secs_f32() > 2.0 {
-                        window.set_cursor_visible(false);
-                        is_cursor_visible = false;
-                    }
-                } else if !is_cursor_visible {
-                    window.set_cursor_visible(true);
-                    is_cursor_visible = true;
+                    window.request_redraw();
                 }
-
-                window.request_redraw();
+                _ => {}
             }
-            _ => {}
-        }
-    });
+        },
+    };
+    event_loop.run_app(&mut app)?;
+    if let Some(err) = app.init_error {
+        return Err(err.into());
+    }
     Ok(())
 }
 
-#[allow(unused_variables, unused_assignments)]
 fn run_tui<B: Backend>(
     terminal: &mut Terminal<B>,
     app_state: Arc<Mutex<AppState>>,
@@ -2885,7 +2965,7 @@ where
                     }
                 }
             } else {
-                active_stream = None; // DROP OLD STREAM FIRST
+                let _ = active_stream.take(); // DROP OLD STREAM FIRST
                 {
                     let mut state = app_state.lock().unwrap();
                     state.stats.bitstream_active = false;
@@ -2957,6 +3037,8 @@ where
             }
         }
         {
+            let tui_dt = last_tick.elapsed().as_secs_f32().clamp(0.001, 0.1);
+            let time_scale = tui_dt * 60.0;
             let mut state = app_state.lock().unwrap();
 
             // Smoothing physics for VUs (Inertia)
@@ -2968,7 +3050,7 @@ where
                     state.channel_vus[i] = state.raw_channel_vus[i];
                 } else {
                     state.channel_vus[i] =
-                        (state.channel_vus[i] - 0.015).max(state.raw_channel_vus[i]);
+                        (state.channel_vus[i] - 0.015 * time_scale).max(state.raw_channel_vus[i]);
                 }
             }
 
@@ -2977,7 +3059,7 @@ where
                 state.peak_vus = vec![0.0; state.channel_vus.len()];
             }
             for i in 0..state.channel_vus.len() {
-                state.peak_vus[i] = (state.peak_vus[i] - 0.005).max(0.0);
+                state.peak_vus[i] = (state.peak_vus[i] - 0.005 * time_scale).max(0.0);
                 if state.channel_vus[i] > state.peak_vus[i] {
                     state.peak_vus[i] = state.channel_vus[i];
                 }
@@ -2992,7 +3074,7 @@ where
                     state.spectrum_data[i] = state.raw_spectrum_data[i];
                 } else {
                     state.spectrum_data[i] =
-                        (state.spectrum_data[i] - 1.5).max(state.raw_spectrum_data[i]);
+                        (state.spectrum_data[i] - 1.5 * time_scale).max(state.raw_spectrum_data[i]);
                 }
             }
 
@@ -3001,7 +3083,7 @@ where
                 state.spectrum_peaks = vec![0.0; state.spectrum_data.len()];
             }
             for i in 0..state.spectrum_data.len() {
-                state.spectrum_peaks[i] = (state.spectrum_peaks[i] - 0.5).max(0.0);
+                state.spectrum_peaks[i] = (state.spectrum_peaks[i] - 0.5 * time_scale).max(0.0);
                 if state.spectrum_data[i] > state.spectrum_peaks[i] {
                     state.spectrum_peaks[i] = state.spectrum_data[i];
                 }
@@ -3062,6 +3144,7 @@ where
             } else {
                 match key.code {
                     KeyCode::Char('q') => {
+                        drop(active_stream);
                         return Ok(());
                     }
                     KeyCode::Char('d') => {

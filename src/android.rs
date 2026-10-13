@@ -91,6 +91,7 @@ struct AndroidRustTrackerApp {
     engine: Option<VulkanEngine>,
     egui_ctx: egui::Context,
     egui_state: Option<egui_winit::State>,
+    file_dialog: egui_file_dialog::FileDialog,
     touch_controller: TouchGestureController,
     active_stream: Option<crate::audio::PlaybackHandle>,
     last_frame_time: Instant,
@@ -443,14 +444,12 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                     state.render_snapshot()
                 };
 
-                let mut file_dialog = egui_file_dialog::FileDialog::new();
-
                 match eng.render(
                     &win,
                     &self.egui_ctx,
                     st,
                     &state_copy,
-                    &mut file_dialog,
+                    &mut self.file_dialog,
                     Vec::new(),
                 ) {
                     Ok((
@@ -458,8 +457,8 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                         ui_time,
                         render_time,
                         fire_time,
-                        vis_shader_time,
                         fft_time,
+                        vis_shader_time,
                         _smoke_time,
                         _ferro_time,
                         _biolum_time,
@@ -467,6 +466,7 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                     )) => {
                         {
                             let mut state = self.app_state.lock().unwrap();
+                            state.vis_picker_scroll_to_cursor = false;
                             state.stats.ui_us = state.stats.ui_us * 0.9 + ui_time * 0.1;
                             state.stats.render_us = state.stats.render_us * 0.9 + render_time * 0.1;
                             if let Some(sh) = fire_time {
@@ -513,8 +513,14 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                                     }
                                 }
                             }
-                            EngineAction::SetMobileHudTab(tab) => {
-                                self.app_state.lock().unwrap().mobile_hud_tab = tab;
+                            EngineAction::SetAppendToPlaylist(val) => {
+                                self.app_state.lock().unwrap().append_to_playlist = val;
+                            }
+                            EngineAction::SetPassthrough(val) => {
+                                self.app_state.lock().unwrap().passthrough_enabled = val;
+                            }
+                            EngineAction::SetSplitRatio(val) => {
+                                self.app_state.lock().unwrap().panel_split_ratio = val;
                             }
                             EngineAction::ScrubPreview(pct, delta) => {
                                 let mut state = self.app_state.lock().unwrap();
@@ -559,29 +565,6 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                             }
                             EngineAction::SetForceStereo(force) => {
                                 self.app_state.lock().unwrap().force_stereo_downmix = force;
-                            }
-                            EngineAction::SetAudioTrack(track_idx) => {
-                                let mut state = self.app_state.lock().unwrap();
-                                if state.audio_tracks.len() > 1
-                                    && track_idx < state.audio_tracks.len()
-                                {
-                                    state.selected_audio_track = track_idx;
-                                    state.active_audio_tracks = vec![track_idx];
-                                    state.multi_track_mix_mode = false;
-                                    if state.audio_track_volumes.len() != state.audio_tracks.len() {
-                                        state.audio_track_volumes =
-                                            vec![1.0; state.audio_tracks.len()];
-                                    }
-                                    state.audio_track_request = Some(track_idx);
-                                    state.audio_mix_request = Some(vec![(track_idx, 1.0)]);
-                                    crate::android::log_android(
-                                        3,
-                                        &format!(
-                                            "[RustTracker] SetAudioTrack: track_idx={}",
-                                            track_idx
-                                        ),
-                                    );
-                                }
                             }
                             EngineAction::ToggleAudioTrackInMix(track_idx) => {
                                 let mut state = self.app_state.lock().unwrap();
@@ -659,16 +642,6 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                                     state.audio_mix_request = Some(mix);
                                 }
                             }
-                            EngineAction::SetAudioMixMode(enabled) => {
-                                let mut state = self.app_state.lock().unwrap();
-                                state.multi_track_mix_mode = enabled;
-                                if !enabled && !state.active_audio_tracks.is_empty() {
-                                    let track_idx = state.active_audio_tracks[0];
-                                    state.selected_audio_track = track_idx;
-                                    state.active_audio_tracks = vec![track_idx];
-                                    state.audio_mix_request = Some(vec![(track_idx, 1.0)]);
-                                }
-                            }
                             EngineAction::SetAudioMixTracks(tracks) => {
                                 let mut state = self.app_state.lock().unwrap();
                                 state.multi_track_mix_mode = tracks.len() > 1;
@@ -715,7 +688,102 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                                 );
                                 state.audio_mix_request = Some(tracks);
                             }
-                            _ => {}
+                            EngineAction::VisPickerSelect(idx) => {
+                                let mut state = self.app_state.lock().unwrap();
+                                if idx < VISUALIZERS.len() {
+                                    state.current_visualizer_idx = idx;
+                                    state.visualizer_mode = VISUALIZERS[idx].id;
+                                    state.osd_text = Some(VISUALIZERS[idx].name.to_string());
+                                    state.osd_timer = 2.0;
+                                    state.show_vis_picker = false;
+                                }
+                            }
+                            EngineAction::ToggleVisPicker => {
+                                let mut state = self.app_state.lock().unwrap();
+                                state.show_vis_picker = !state.show_vis_picker;
+                                if state.show_vis_picker {
+                                    state.vis_picker_cursor = state.current_visualizer_idx;
+                                    state.vis_picker_scroll_to_cursor = true;
+                                }
+                            }
+                            EngineAction::VisPickerToggleEnabled(idx) => {
+                                let mut state = self.app_state.lock().unwrap();
+                                if idx != 0 && idx < state.vis_enabled.len() {
+                                    state.vis_enabled[idx] = !state.vis_enabled[idx];
+                                }
+                            }
+                            EngineAction::VisPickerSetCursor(idx) => {
+                                self.app_state.lock().unwrap().vis_picker_cursor = idx;
+                            }
+                            EngineAction::VisPickerEnableAll => {
+                                let mut state = self.app_state.lock().unwrap();
+                                for enabled in &mut state.vis_enabled {
+                                    *enabled = true;
+                                }
+                            }
+                            EngineAction::VisPickerEnableNone => {
+                                let mut state = self.app_state.lock().unwrap();
+                                for (i, enabled) in state.vis_enabled.iter_mut().enumerate() {
+                                    *enabled = i == 0;
+                                }
+                            }
+                            EngineAction::OpenUrlDialog => {
+                                let mut state = self.app_state.lock().unwrap();
+                                state.is_url_dialog_open = true;
+                                state.focus_url_input = true;
+                                win.set_ime_allowed(true);
+                            }
+                            EngineAction::ClearFocusUrlInput => {
+                                self.app_state.lock().unwrap().focus_url_input = false;
+                            }
+                            EngineAction::CloseUrlDialog => {
+                                self.app_state.lock().unwrap().is_url_dialog_open = false;
+                                win.set_ime_allowed(false);
+                            }
+                            EngineAction::SetUrlInput(url) => {
+                                self.app_state.lock().unwrap().url_input_text = url;
+                            }
+                            EngineAction::EditUrl(url) => {
+                                let mut state = self.app_state.lock().unwrap();
+                                state.url_input_text = url;
+                                state.focus_url_input = true;
+                                win.set_ime_allowed(true);
+                            }
+                            EngineAction::LoadUrl(url) => {
+                                let mut final_url = url;
+                                if !final_url.starts_with("http://")
+                                    && !final_url.starts_with("https://")
+                                {
+                                    final_url = format!("https://{}", final_url);
+                                }
+                                win.set_ime_allowed(false);
+                                {
+                                    let mut state = self.app_state.lock().unwrap();
+                                    state.is_url_dialog_open = false;
+                                    state.url_input_text.clear();
+                                    state.playlist = vec![final_url.clone()];
+                                    state.playlist_index = 0;
+                                    state.load_request = Some(final_url.clone());
+                                    state.file_loaded = true;
+                                    if let Some(idx) =
+                                        state.url_history.iter().position(|(u, _)| u == &final_url)
+                                    {
+                                        let item = state.url_history.remove(idx);
+                                        state.url_history.push(item);
+                                    } else {
+                                        state
+                                            .url_history
+                                            .push((final_url, "Network Stream".to_string()));
+                                    }
+                                    let mut out = String::new();
+                                    for (u, t) in &state.url_history {
+                                        out.push_str(&format!("{}|{}\n", u, t));
+                                    }
+                                    let _ =
+                                        std::fs::write(crate::state::get_history_file_path(), out);
+                                }
+                            }
+                            EngineAction::SetAudioDevice(_) | EngineAction::None => {}
                         }
                     }
                     Err(wgpu::SurfaceStatus::Lost | wgpu::SurfaceStatus::Outdated) => {
@@ -1167,9 +1235,7 @@ fn android_main(app: AndroidApp) {
     init_android_stdio_redirection();
 
     if let Some(data_path) = app.internal_data_path() {
-        unsafe {
-            std::env::set_var("RUSTTRACKER_CACHE_DIR", data_path);
-        }
+        let _ = crate::state::CACHE_DIR_OVERRIDE.set(data_path);
     }
 
     std::panic::set_hook(Box::new(|panic_info| {
@@ -1217,6 +1283,7 @@ fn android_main(app: AndroidApp) {
         engine: None,
         egui_ctx,
         egui_state: None,
+        file_dialog: egui_file_dialog::FileDialog::new(),
         touch_controller: TouchGestureController::new(),
         active_stream: None,
         last_frame_time: Instant::now(),

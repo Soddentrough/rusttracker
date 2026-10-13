@@ -82,23 +82,14 @@ fn intersect_aabb(ro: vec3<f32>, rd: vec3<f32>, box_min: vec3<f32>, box_max: vec
     return vec2<f32>(t_near, t_far);
 }
 
-// Palette for subtle thin-film interference on crests
-fn iridescence_palette(t: f32) -> vec3<f32> {
-    let a = vec3<f32>(0.5, 0.5, 0.5);
-    let b = vec3<f32>(0.5, 0.5, 0.5);
-    let c = vec3<f32>(1.0, 1.0, 1.0);
-    let d = vec3<f32>(0.0, 0.333, 0.667);
-    return a + b * cos(6.2831853 * (c * t + d));
-}
-
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let uv = in.uv;
     let aspect = audio.aspect_ratio;
     let screen_p = (uv * 2.0 - 1.0) * vec2<f32>(aspect, -1.0);
 
-    // Subtle audio-driven camera orbit
-    let time = audio.time;
+    // Subtle audio-driven camera orbit using continuous smooth_time
+    let time = select(audio.time, audio.smooth_time, audio.smooth_time > 0.0);
     let cam_orbit = time * 0.12;
     let cam_dist = 4.2;
     let cam_h = 2.45 + sin(time * 0.25) * 0.2;
@@ -115,8 +106,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let bg_grad = clamp(0.04 - 0.025 * length(screen_p), 0.005, 0.06);
     var col = vec3<f32>(bg_grad * 0.8, bg_grad * 0.85, bg_grad * 1.1);
 
-    // Under-dish glow reflection on floor
-    let sub_bass = clamp(audio.spectrum[0].x * 1.6, 0.0, 2.0);
+    // Under-dish glow reflection on floor (normalized from [0, 100] spectrum scale)
+    let sub_bass = clamp((audio.spectrum[0].x + audio.spectrum[0].y) / 110.0, 0.0, 1.8);
     let floor_glow = exp(-length(screen_p - vec2<f32>(0.0, -0.4)) * 1.8) * (0.04 + sub_bass * 0.08);
     col += vec3<f32>(0.1, 0.06, 0.18) * floor_glow;
 
@@ -215,7 +206,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Iridescent Thin-Film Sheen on Sharp Magnetic Spike Tips
         let spike_crest = smoothstep(0.35, 1.1, spike_h);
         let irid_t = fract(dot(normal, vec3<f32>(1.0, 2.0, 1.0)) * 0.65 + time * 0.1);
-        let irid_col = iridescence_palette(irid_t) * spike_crest * (0.35 + sub_bass * 0.45);
+        let irid_col = iridescence_cos(irid_t) * spike_crest * (0.35 + sub_bass * 0.45);
 
         // Environment reflection
         let ref_dir = reflect(-view_dir, normal);
@@ -228,11 +219,24 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         fluid_col += (env_sky + env_floor) * fresnel;
         fluid_col += irid_col * pow(1.0 - NdotV, 3.0);
 
-        // Dish rim & lip shading
-        if (r_xz > DISH_RADIUS - 0.08) {
+        // Dish rim & 16-pole azimuthal electromagnetic coil segments
+        if (r_xz > DISH_RADIUS - 0.14) {
             let rim_factor = smoothstep(DISH_RADIUS - 0.08, DISH_RADIUS, r_xz);
             let rim_metal = vec3<f32>(0.18, 0.19, 0.22) * (0.35 + 0.65 * NdotL1);
             fluid_col = mix(fluid_col, rim_metal, rim_factor);
+
+            let azimuth = atan2(hit_p.z, hit_p.x);
+            let angle_norm = fract((azimuth + 3.14159265) / 6.2831853);
+            let pole_f = angle_norm * 16.0;
+            let pole_idx = u32(pole_f) % 16u;
+            let pole_fract = fract(pole_f);
+            // Gap between the 16 discrete copper/neon stator poles around the rim
+            let seg_mask = smoothstep(0.08, 0.16, pole_fract) * (1.0 - smoothstep(0.84, 0.92, pole_fract));
+            let radial_led_band = smoothstep(DISH_RADIUS - 0.14, DISH_RADIUS - 0.09, r_xz) *
+                                  (1.0 - smoothstep(DISH_RADIUS - 0.04, DISH_RADIUS - 0.01, r_xz));
+            let pole_spec = clamp(audio.spectrum[pole_idx / 4u][pole_idx % 4u] / 55.0, 0.0, 1.5);
+            let pole_hue_col = mix(vec3<f32>(1.0, 0.35, 0.05), vec3<f32>(0.08, 0.85, 1.0), f32(pole_idx) / 15.0);
+            fluid_col += pole_hue_col * seg_mask * radial_led_band * (0.15 + pole_spec * 1.6);
         }
 
         // Atmospheric depth fog

@@ -3,8 +3,6 @@
 @group(0) @binding(0)
 var<uniform> audio: AudioUniforms;
 
-// Packed to exactly 32 bytes to match the host allocation (100_000 * 32B).
-// pos.w = mass, vel.w = EMA-smoothed spectrum value (filters transients for standing waves)
 struct Particle {
     pos: vec4<f32>,
     vel: vec4<f32>,
@@ -31,81 +29,80 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     var p = particles[idx];
 
-    // Initialize if pos is exactly 0
     if (length(p.pos.xyz) < 0.001 && length(p.vel.xyz) < 0.001) {
         let rng1 = fract(sin(f32(idx) * 12.9898) * 43758.5453);
         let rng2 = fract(sin(f32(idx) * 78.233) * 43758.5453);
-        let angle = rng1 * 6.28318;
+        let angle = rng1 * 6.2831853;
         let r = sqrt(rng2) * 5.0;
         p.pos = vec4<f32>(cos(angle) * r, 0.1, sin(angle) * r, 1.0);
         p.vel = vec4<f32>(0.0);
     }
 
-    // Physics — framerate-independent timestep (real frame dt, clamped)
     let dt = clamp(audio.frame_dt, 0.001, 0.033);
-    var force = vec3<f32>(0.0, -9.8, 0.0); // Gravity
+    var force = vec3<f32>(0.0, -9.8, 0.0);
 
-    // Frequency-driven magnetic field
+    // Quantize particle azimuth to 16 discrete magnetic poles around the dish
+    // so particles coalesce into distinct Rosensweig ferrofluid spikes instead of concentric rings!
     let angle = atan2(p.pos.z, p.pos.x);
-    let abs_angle = abs(angle);
-    let spec_idx = min(u32((abs_angle / 3.14159) * 127.0), 127u);
-    let raw_spec = clamp(audio.spectrum[spec_idx / 4u][spec_idx % 4u], 0.0, 1.0);
+    let num_poles = 16.0;
+    let sector_step = 6.2831853 / num_poles;
+    let pole_idx_signed = round(angle / sector_step);
+    let pole_angle = pole_idx_signed * sector_step;
+    let abs_angle = abs(pole_angle);
 
-    // Temporal EMA smoothing — standing wave filter
-    // Slow attack (0.03): transient hits are ignored, only sustained frequencies build peaks
-    // Moderate decay (0.08): fluid relaxes gracefully when a frequency stops
-    // Rates are per-16ms-step; converted to the real dt so behavior is fps-independent
+    // Normalize audio.spectrum [0..100] -> [0..1.25] instead of clamping raw [0..100] at 1.0!
+    let spec_idx = min(u32((abs_angle / 3.14159265) * 255.0), 255u);
+    let raw_spec = clamp(audio.spectrum[spec_idx / 4u][spec_idx % 4u] / 72.0, 0.0, 1.25);
+
     let dt_scale = dt / 0.016;
-    let rate = 1.0 - pow(1.0 - select(0.08, 0.03, raw_spec > p.vel.w), dt_scale);
+    let rate = 1.0 - pow(1.0 - select(0.09, 0.045, raw_spec > p.vel.w), dt_scale);
     p.vel.w = mix(p.vel.w, raw_spec, rate);
     let spec_val = p.vel.w;
-    
-    // Dynamic magnet position based on smoothed frequency
-    let mag_r = 0.5 + spec_val * 4.0;
-    let mag_h = -0.5 + spec_val * 3.0;
-    let mag_pos = vec3<f32>(cos(angle) * mag_r, mag_h, sin(angle) * mag_r);
-    
+
+    // Two concentric spike rings + central bass pole based on particle ID
+    let ring_tier = idx % 3u;
+    var mag_r = 1.2 + spec_val * 2.6;
+    if ring_tier == 1u {
+        mag_r = 2.4 + spec_val * 2.2;
+    } else if ring_tier == 2u && (idx % 9u == 0u) {
+        mag_r = 0.25 + spec_val * 1.1;
+    }
+    let mag_h = -0.35 + spec_val * 2.85;
+    let mag_pos = vec3<f32>(cos(pole_angle) * mag_r, mag_h, sin(pole_angle) * mag_r);
+
     let dir = mag_pos - p.pos.xyz;
     let dist_sq = dot(dir, dir);
-    let mag_force = (spec_val * 200.0 + 20.0) / (dist_sq + 0.5);
+    let mag_force = (spec_val * 210.0 + 22.0) / (dist_sq + 0.45);
     force += normalize(dir) * mag_force;
-    
-    // Subtle fluid turbulence — reduced to avoid fighting standing wave formation
-    let t_time = audio.time * 0.3;
+
+    let t_time = audio.smooth_time * 0.35;
     let turbulence = vec3<f32>(
         sin(p.pos.z * 3.0 + t_time) * cos(p.pos.y * 2.0),
         cos(p.pos.x * 3.0 - t_time) * sin(p.pos.z * 2.0),
         sin(p.pos.x * 3.0 + t_time) * cos(p.pos.y * 2.0)
     );
-    force += turbulence * (3.0 + spec_val * 8.0);
-    
-    // Central electromagnet to keep the fluid pooled together
+    force += turbulence * (2.8 + spec_val * 7.5);
+
     let center_dir = vec3<f32>(0.0, -1.0, 0.0) - p.pos.xyz;
     force += normalize(center_dir) * (60.0 / (dot(center_dir, center_dir) + 1.0));
 
-    // Floor collision
     if (p.pos.y < 0.0) {
         p.pos.y = 0.0;
         p.vel.y *= -0.5;
         force.y += 9.8;
     }
 
-    // Spring back to origin slightly to keep them in bounds
     force -= p.pos.xyz * 5.0;
 
-    // Integration with viscous damping (0.91 per 16ms step = thick fluid),
-    // converted to the real dt so damping strength is fps-independent
     p.vel = vec4<f32>((p.vel.xyz + force * dt) * pow(0.91, dt_scale), p.vel.w);
     p.pos = vec4<f32>(p.pos.xyz + p.vel.xyz * dt, p.pos.w);
 
     particles[idx] = p;
 
-    // Scatter to 2D grid with 5×5 splat for continuous fluid coverage
-    // Each particle covers a wide blob to prevent gaps in the density field
     let grid_size = 512;
     let grid_x = i32(p.pos.x * 25.0 + 256.0);
     let grid_z = i32(p.pos.z * 25.0 + 256.0);
-    
+
     for (var di = -2; di <= 2; di++) {
         for (var dj = -2; dj <= 2; dj++) {
             let gx = grid_x + di;

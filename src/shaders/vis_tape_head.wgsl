@@ -23,12 +23,12 @@ struct ThemePalette {
 fn get_palette_by_id(id: u32) -> ThemePalette {
     var p: ThemePalette;
     if id == 0u {
-        // Cyberpunk Neon (Cyan & Synth Magenta)
+        // Cyberpunk Neon (Cyan Left & Synth Magenta Right)
         p.bg = vec3<f32>(0.015, 0.02, 0.035);
         p.grid = vec3<f32>(0.025, 0.045, 0.065);
         p.center_axis = vec3<f32>(0.04, 0.09, 0.12);
         p.wave_l = vec3<f32>(0.15, 0.95, 1.0);
-        p.wave_r = vec3<f32>(1.0, 0.20, 0.60);
+        p.wave_r = vec3<f32>(1.0, 0.22, 0.65);
         p.wave_fill = vec3<f32>(0.08, 0.35, 0.50);
         p.playhead = vec3<f32>(0.35, 0.85, 1.0);
         p.spark_core = vec3<f32>(1.0, 1.0, 1.0);
@@ -40,8 +40,8 @@ fn get_palette_by_id(id: u32) -> ThemePalette {
         p.bg = vec3<f32>(0.025, 0.018, 0.01);
         p.grid = vec3<f32>(0.05, 0.035, 0.015);
         p.center_axis = vec3<f32>(0.10, 0.07, 0.025);
-        p.wave_l = vec3<f32>(1.0, 0.75, 0.15);
-        p.wave_r = vec3<f32>(1.0, 0.45, 0.05);
+        p.wave_l = vec3<f32>(1.0, 0.78, 0.18);
+        p.wave_r = vec3<f32>(1.0, 0.42, 0.08);
         p.wave_fill = vec3<f32>(0.35, 0.18, 0.03);
         p.playhead = vec3<f32>(1.0, 0.85, 0.3);
         p.spark_core = vec3<f32>(1.0, 0.98, 0.9);
@@ -54,7 +54,7 @@ fn get_palette_by_id(id: u32) -> ThemePalette {
         p.grid = vec3<f32>(0.02, 0.05, 0.03);
         p.center_axis = vec3<f32>(0.04, 0.11, 0.06);
         p.wave_l = vec3<f32>(0.2, 1.0, 0.45);
-        p.wave_r = vec3<f32>(0.1, 0.85, 0.75);
+        p.wave_r = vec3<f32>(0.12, 0.85, 0.82);
         p.wave_fill = vec3<f32>(0.06, 0.32, 0.15);
         p.playhead = vec3<f32>(0.4, 1.0, 0.6);
         p.spark_core = vec3<f32>(0.9, 1.0, 0.9);
@@ -79,7 +79,6 @@ fn get_palette_by_id(id: u32) -> ThemePalette {
 }
 
 fn get_active_palette(t: f32) -> ThemePalette {
-    // Smooth palette cycle every ~70 seconds
     let cycle = (t * 0.055) % 4.0;
     let idx = u32(floor(cycle));
     let frac = fract(cycle);
@@ -101,32 +100,6 @@ fn get_active_palette(t: f32) -> ThemePalette {
     res.ember_a = mix(p0.ember_a, p1.ember_a, s_frac);
     res.ember_b = mix(p0.ember_b, p1.ember_b, s_frac);
     return res;
-}
-
-fn get_bayer_4x4(px: u32, py: u32) -> f32 {
-    let x = px % 4u;
-    let y = py % 4u;
-    if y == 0u {
-        if x == 0u { return 0.0 / 16.0; }
-        else if x == 1u { return 8.0 / 16.0; }
-        else if x == 2u { return 2.0 / 16.0; }
-        else { return 10.0 / 16.0; }
-    } else if y == 1u {
-        if x == 0u { return 12.0 / 16.0; }
-        else if x == 1u { return 4.0 / 16.0; }
-        else if x == 2u { return 14.0 / 16.0; }
-        else { return 6.0 / 16.0; }
-    } else if y == 2u {
-        if x == 0u { return 3.0 / 16.0; }
-        else if x == 1u { return 11.0 / 16.0; }
-        else if x == 2u { return 1.0 / 16.0; }
-        else { return 9.0 / 16.0; }
-    } else {
-        if x == 0u { return 15.0 / 16.0; }
-        else if x == 1u { return 7.0 / 16.0; }
-        else if x == 2u { return 13.0 / 16.0; }
-        else { return 5.0 / 16.0; }
-    }
 }
 
 struct TimelineSlice {
@@ -176,20 +149,12 @@ fn sample_timeline_smooth(pos: f32) -> TimelineSlice {
 
 fn get_slice_pos_for_px(p: f32, playhead_p: f32, max_w: f32) -> f32 {
     if p < playhead_p {
-        let prog = p / playhead_p;
+        let prog = p / max(playhead_p, 1.0);
         return clamp(20.0 + prog * 80.0, 0.0, 100.0);
     } else {
-        let prog = (p - playhead_p) / (max_w - playhead_p);
+        let prog = (p - playhead_p) / max(max_w - playhead_p, 1.0);
         return clamp(100.0 + prog * 498.0, 100.0, 599.0);
     }
-}
-
-// Pseudo-random hash
-fn hash11(p: f32) -> f32 {
-    var p3 = fract(p * 0.1031);
-    p3 = p3 * (p3 + 33.33);
-    p3 = p3 * (p3 + p3);
-    return fract(p3);
 }
 
 @fragment
@@ -206,35 +171,49 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let palette = get_active_palette(audio.smooth_time);
 
     let playhead_x_norm = 0.15;
-    let playhead_px = u32(playhead_x_norm * grid_size.x); // ~72 px
-    let mid_py = u32(grid_size.y * 0.5);                  // 135 px
+    let playhead_px = u32(playhead_x_norm * grid_size.x);
+    let mid_py = u32(grid_size.y * 0.5);
 
     // Extract instantaneous NOW slice (slice 100 = 0.0s offset)
     let now_slice = get_timeline_slice(100u);
-    let now_max_linear = max(max(abs(now_slice.min_l), abs(now_slice.max_l)), max(abs(now_slice.min_r), abs(now_slice.max_r)));
-    let now_max = pow(clamp(now_max_linear, 0.0, 1.0), 0.55);
+    let now_l_linear = max(abs(now_slice.min_l), abs(now_slice.max_l));
+    let now_r_linear = max(abs(now_slice.min_r), abs(now_slice.max_r));
+    let now_l = pow(clamp(now_l_linear, 0.0, 1.0), 0.55);
+    let now_r = pow(clamp(now_r_linear, 0.0, 1.0), 0.55);
     let now_bass = clamp(now_slice.bass * 1.5, 0.0, 1.0);
     let now_treble = clamp(now_slice.treble * 1.5, 0.0, 1.0);
 
-    // 1. Base Background Grid & Graticule
+    // 1. Base Background Grid, Graticule & Scrolling Studer/Nagra Tape Timecode Sprockets
     let is_major_grid = (px % 32u == 0u) || (py % 32u == 0u);
     let is_dot_grid = (px % 8u == 0u) && (py % 8u == 0u);
     let is_center_axis = (py == mid_py);
 
     var col = palette.bg;
     if is_center_axis {
-        col = palette.center_axis;
+        col = palette.center_axis * 1.35;
     } else if is_major_grid {
         col = palette.grid;
     } else if is_dot_grid {
         col = palette.grid * 0.75;
     }
 
+    // Scrolling tape transport calibration ticks along top and bottom rails
+    let tape_scroll_px = u32(floor(audio.smooth_time * 82.0)) + px;
+    if py >= 3u && py <= 6u {
+        if (tape_scroll_px % 16u == 0u) || (tape_scroll_px % 4u == 0u && py == 4u) {
+            col = mix(col, palette.wave_l * 0.55, 0.7);
+        }
+    } else if py >= u32(grid_size.y) - 7u && py <= u32(grid_size.y) - 4u {
+        if (tape_scroll_px % 16u == 0u) || (tape_scroll_px % 4u == 0u && py == u32(grid_size.y) - 5u) {
+            col = mix(col, palette.wave_r * 0.55, 0.7);
+        }
+    }
+
     // 2. Continuous Sub-Pixel Lookahead Mapping
     let is_history = px < playhead_px;
     var history_fade: f32 = 1.0;
     if is_history {
-        let hist_prog = f32(px) / f32(playhead_px);
+        let hist_prog = f32(px) / f32(max(playhead_px, 1u));
         history_fade = pow(hist_prog, 1.3);
     }
 
@@ -244,64 +223,74 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let slice = sample_timeline_smooth(pos_curr);
     let slice_next = sample_timeline_smooth(pos_next);
 
-    // 3. Dynamic Waveform Amplitudes (Perceptual |v|^0.55 scaling to fill vertical space)
-    let amp_scale = 120.0; // Max reach in virtual pixels (120 px out of 135 px half-height)
+    // 3. Dual-Track Stereo Envelopes:
+    // Upper track (above mid_py) driven by Left channel (`wave_l`),
+    // Lower track (below mid_py) driven by Right channel (`wave_r`),
+    // with a subtle secondary ghost trace of the opposite channel for stereo phase comparison!
+    let amp_scale = 120.0;
 
-    let s_max = max(pow(clamp(slice.max_l, 0.0, 1.0), 0.55), pow(clamp(slice.max_r, 0.0, 1.0), 0.55));
-    let s_min = max(pow(clamp(-slice.min_l, 0.0, 1.0), 0.55), pow(clamp(-slice.min_r, 0.0, 1.0), 0.55));
-    let next_max = max(pow(clamp(slice_next.max_l, 0.0, 1.0), 0.55), pow(clamp(slice_next.max_r, 0.0, 1.0), 0.55));
-    let next_min = max(pow(clamp(-slice_next.min_l, 0.0, 1.0), 0.55), pow(clamp(-slice_next.min_r, 0.0, 1.0), 0.55));
+    let l_curr = pow(clamp(max(slice.max_l, -slice.min_l), 0.0, 1.0), 0.55);
+    let r_curr = pow(clamp(max(slice.max_r, -slice.min_r), 0.0, 1.0), 0.55);
+    let l_next = pow(clamp(max(slice_next.max_l, -slice_next.min_l), 0.0, 1.0), 0.55);
+    let r_next = pow(clamp(max(slice_next.max_r, -slice_next.min_r), 0.0, 1.0), 0.55);
 
-    let py_top = u32(clamp(f32(mid_py) - s_max * amp_scale, 0.0, grid_size.y - 1.0));
-    let py_bot = u32(clamp(f32(mid_py) + s_min * amp_scale, 0.0, grid_size.y - 1.0));
-    let next_py_top = u32(clamp(f32(mid_py) - next_max * amp_scale, 0.0, grid_size.y - 1.0));
-    let next_py_bot = u32(clamp(f32(mid_py) + next_min * amp_scale, 0.0, grid_size.y - 1.0));
+    let py_top = u32(clamp(f32(mid_py) - l_curr * amp_scale, 0.0, grid_size.y - 1.0));
+    let py_bot = u32(clamp(f32(mid_py) + r_curr * amp_scale, 0.0, grid_size.y - 1.0));
+    let next_py_top = u32(clamp(f32(mid_py) - l_next * amp_scale, 0.0, grid_size.y - 1.0));
+    let next_py_bot = u32(clamp(f32(mid_py) + r_next * amp_scale, 0.0, grid_size.y - 1.0));
 
-    // Connect adjacent slices with clean continuous envelope lines
     let min_yt = min(py_top, next_py_top);
     let max_yt = max(py_top, next_py_top);
     let min_yb = min(py_bot, next_py_bot);
     let max_yb = max(py_bot, next_py_bot);
 
-    // 4. Waveform Body Phosphor Fill (Full Waveform Extent)
+    let is_upper = py <= mid_py;
+    let track_wave_col = select(palette.wave_r, palette.wave_l, is_upper);
+    let track_fill_col = mix(palette.wave_fill, track_wave_col * 0.42, 0.45);
+
+    // 4. Waveform Body Phosphor Fill
     let in_body = (py >= min_yt && py <= max_yb);
     if in_body {
         let d_center = abs(f32(py) - f32(mid_py)) / (grid_size.y * 0.5);
         let fill_atten = pow(clamp(1.0 - d_center * 0.65, 0.0, 1.0), 1.5);
-        let fill_col = palette.wave_fill * fill_atten * 0.50 * history_fade;
+        let fill_col = track_fill_col * fill_atten * 0.52 * history_fade;
         col = max(col, fill_col);
     }
 
-    // 5. RMS Core Energy (Dense Audio Body)
-    let s_rms = max(slice.rms_l, slice.rms_r);
-    let s_rms_scaled = pow(clamp(s_rms * 1.5, 0.0, 1.0), 0.55);
-    let rms_top = u32(clamp(f32(mid_py) - s_rms_scaled * amp_scale * 0.7, 0.0, grid_size.y - 1.0));
-    let rms_bot = u32(clamp(f32(mid_py) + s_rms_scaled * amp_scale * 0.7, 0.0, grid_size.y - 1.0));
+    // 5. Dual Stereo RMS Core Energy (Dense Audio Body)
+    let rms_l_scaled = pow(clamp(slice.rms_l * 1.5, 0.0, 1.0), 0.55);
+    let rms_r_scaled = pow(clamp(slice.rms_r * 1.5, 0.0, 1.0), 0.55);
+    let rms_top = u32(clamp(f32(mid_py) - rms_l_scaled * amp_scale * 0.72, 0.0, grid_size.y - 1.0));
+    let rms_bot = u32(clamp(f32(mid_py) + rms_r_scaled * amp_scale * 0.72, 0.0, grid_size.y - 1.0));
 
     if (py >= rms_top && py <= rms_bot) {
-        col = col + palette.wave_l * 0.18 * history_fade;
+        col = col + track_wave_col * 0.22 * history_fade;
     }
 
-    // Peak Boundary Laser Outlines
-    if (py >= min_yt && py <= max_yt) || (py >= min_yb && py <= max_yb) {
+    // Peak Boundary Laser Outlines (Left on top in wave_l, Right on bottom in wave_r)
+    if py >= min_yt && py <= max_yt {
         col = max(col, palette.wave_l * history_fade);
-    } else if abs(i32(py) - i32(py_top)) == 1 || abs(i32(py) - i32(py_bot)) == 1 {
-        col = col + palette.wave_l * 0.40 * history_fade;
+    } else if abs(i32(py) - i32(py_top)) == 1 {
+        col = col + palette.wave_l * 0.42 * history_fade;
     }
 
-    // 6. The Optical Playhead Bar (Left X = 15%)
-    let is_playhead_col = (px == playhead_px);
+    if py >= min_yb && py <= max_yb {
+        col = max(col, palette.wave_r * history_fade);
+    } else if abs(i32(py) - i32(py_bot)) == 1 {
+        col = col + palette.wave_r * 0.42 * history_fade;
+    }
+
+    // 6. The Optical Playhead Bar & Magnetic Flux Head Gap (Left X = 15%)
+    let dx_playhead = abs(i32(px) - i32(playhead_px));
     let dist_mid_norm = abs(f32(py) - f32(mid_py)) / (grid_size.y * 0.5);
     let now_slit_energy = mix(now_bass, now_treble, dist_mid_norm);
 
-    if is_playhead_col {
+    if px == playhead_px {
         let is_tick = (py % 6u == 0u);
         let base_slit = select(palette.playhead * 0.45, palette.playhead, is_tick);
         let slit_flare = palette.playhead * pow(now_slit_energy, 1.2) * 1.8;
         col = max(col, base_slit + slit_flare);
     } else {
-        // Horizontal light bleed from playhead slit
-        let dx_playhead = abs(i32(px) - i32(playhead_px));
         let flare_w = i32(3.0 + now_slit_energy * 8.0 + now_bass * 6.0);
         if dx_playhead <= flare_w {
             let att = pow(1.0 - f32(dx_playhead) / f32(flare_w + 1), 2.0);
@@ -310,103 +299,106 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
     }
 
-    // Playhead Top & Bottom Caliper Brackets
-    if (py <= 16u || py >= (u32(grid_size.y) - 17u)) {
+    // Playhead Top & Bottom Caliper Brackets (Studer Tape Head Guides)
+    if (py <= 16u || py >= (u32(grid_size.y) - 17u)) && dx_playhead <= 4 {
         let anchor_y = select(u32(grid_size.y) - 12u, 11u, py <= 16u);
         let dy_c = abs(i32(py) - i32(anchor_y));
-        let dx_c = abs(i32(px) - i32(playhead_px));
-        if (dx_c + dy_c) <= 4 {
+        if (dx_playhead + dy_c) <= 4 {
             col = palette.spark_core;
         }
     }
 
-    // 7. Cathode Spark / Transient Impact Point (Mirrored Dual Sparks on Top & Bottom)
-    let hit_h = u32(round(now_max * amp_scale));
-    let hit_py_top = select(mid_py, mid_py - hit_h, mid_py >= hit_h);
-    let hit_py_bot = min(u32(grid_size.y - 1.0), mid_py + hit_h);
+    // 7. Cathode Spark / Transient Impact Points (Left Track Top, Right Track Bottom)
+    let hit_h_l = u32(round(now_l * amp_scale));
+    let hit_h_r = u32(round(now_r * amp_scale));
+    let hit_py_top = select(mid_py, mid_py - hit_h_l, mid_py >= hit_h_l);
+    let hit_py_bot = min(u32(grid_size.y - 1.0), mid_py + hit_h_r);
 
-    let dx_hit = abs(i32(px) - i32(playhead_px));
     let dy_hit_top = abs(i32(py) - i32(hit_py_top));
     let dy_hit_bot = abs(i32(py) - i32(hit_py_bot));
-    let dist_hit_top = sqrt(f32(dx_hit * dx_hit + dy_hit_top * dy_hit_top));
-    let dist_hit_bot = sqrt(f32(dx_hit * dx_hit + dy_hit_bot * dy_hit_bot));
+    let dist_hit_top = sqrt(f32(dx_playhead * dx_playhead + dy_hit_top * dy_hit_top));
+    let dist_hit_bot = sqrt(f32(dx_playhead * dx_playhead + dy_hit_bot * dy_hit_bot));
     let dist_hit = min(dist_hit_top, dist_hit_bot);
 
     let spark_rad = 6.0 + now_bass * 16.0;
     if dist_hit < spark_rad * 2.0 {
         let norm_d = dist_hit / (spark_rad * 2.0);
         let halo = pow(1.0 - norm_d, 2.2) * (1.0 + now_bass * 1.5);
-        col = col + palette.spark_halo * halo * 0.8;
+        let halo_tint = select(palette.wave_r, palette.wave_l, dist_hit_top <= dist_hit_bot);
+        col = col + mix(palette.spark_halo, halo_tint, 0.45) * halo * 0.85;
         if norm_d < 0.22 {
             let core = (1.0 - norm_d / 0.22) * 2.5;
             col = col + palette.spark_core * core;
         }
     }
 
-    // Diamond Spark Center (Ignites symmetrically on top & bottom spark nodes)
+    // Diamond Spark Center
     let diamond_size = i32(2.0 + now_bass * 3.0);
-    if (dx_hit + dy_hit_top) <= diamond_size || (dx_hit + dy_hit_bot) <= diamond_size {
+    if (dx_playhead + dy_hit_top) <= diamond_size || (dx_playhead + dy_hit_bot) <= diamond_size {
         col = palette.spark_core;
     }
 
     // Horizontal Laser Streak across both sparks
     let streak_len = i32(16.0 + now_treble * 50.0);
-    if (dy_hit_top == 0 || dy_hit_bot == 0) && dx_hit <= streak_len {
-        let att = (1.0 - f32(dx_hit) / f32(streak_len)) * (0.35 + now_treble * 0.75);
+    if (dy_hit_top == 0 || dy_hit_bot == 0) && dx_playhead <= streak_len {
+        let att = (1.0 - f32(dx_playhead) / f32(streak_len)) * (0.35 + now_treble * 0.75);
         col = col + palette.spark_halo * att;
     }
 
-    // Micro Electric Plasma Discharge Arcs
-    let arc_seed = floor(audio.smooth_time * 24.0);
-    for (var a = 0; a < 4; a = a + 1) {
-        let f_a = f32(a);
-        let arc_rnd_x = i32(hash11(arc_seed + f_a * 13.1) * 6.0) - 3;
-        let arc_rnd_y = i32(hash11(arc_seed + f_a * 29.7) * 8.0) - 4;
-        let is_arc_top = (i32(px) == i32(playhead_px) + arc_rnd_x) && (i32(py) == i32(hit_py_top) + arc_rnd_y);
-        let is_arc_bot = (i32(px) == i32(playhead_px) + arc_rnd_x) && (i32(py) == i32(hit_py_bot) - arc_rnd_y);
-        if is_arc_top || is_arc_bot {
-            col = palette.spark_core;
+    // Micro Electric Plasma Discharge Arcs (gated to playhead neighborhood)
+    if dx_playhead <= 4 {
+        let arc_seed = floor(audio.smooth_time * 24.0);
+        for (var a = 0; a < 4; a = a + 1) {
+            let f_a = f32(a);
+            let arc_rnd_x = i32(hash11_common(arc_seed + f_a * 13.1) * 6.0) - 3;
+            let arc_rnd_y = i32(hash11_common(arc_seed + f_a * 29.7) * 8.0) - 4;
+            let is_arc_top = (i32(px) == i32(playhead_px) + arc_rnd_x) && (i32(py) == i32(hit_py_top) + arc_rnd_y);
+            let is_arc_bot = (i32(px) == i32(playhead_px) + arc_rnd_x) && (i32(py) == i32(hit_py_bot) - arc_rnd_y);
+            if is_arc_top || is_arc_bot {
+                col = palette.spark_core;
+            }
         }
     }
 
-    // Embers / Sparks Spraying Leftward into History from both Top and Bottom
-    let ember_time = audio.smooth_time * 8.0;
-    let base_ember_cycle = floor(ember_time);
-    let ember_frac = fract(ember_time);
+    // Embers / Sparks Spraying Leftward into History (gated to history side px <= playhead_px)
+    if px <= playhead_px {
+        let ember_time = audio.smooth_time * 8.0;
+        let base_ember_cycle = floor(ember_time);
+        let ember_frac = fract(ember_time);
 
-    let num_embers = 18u;
-    for (var e = 0u; e < num_embers; e = e + 1u) {
-        let f_e = f32(e);
-        let seed = base_ember_cycle + f_e * 17.31;
-        let vx = -(hash11(seed * 1.1) * 35.0 + 8.0 + now_treble * 30.0);
-        let vy = (hash11(seed * 2.3) * 2.0 - 1.0) * (12.0 + now_bass * 14.0);
-        let life = clamp(1.0 - ember_frac + hash11(seed * 3.7) * 0.3, 0.0, 1.0);
-        
-        let ember_x = i32(playhead_px) + i32(vx * (1.0 - life));
-        let ember_y_top = i32(hit_py_top) + i32(vy * (1.0 - life) + (vy * vy * 0.015));
-        let ember_y_bot = i32(hit_py_bot) - i32(vy * (1.0 - life) + (vy * vy * 0.015));
-        
-        let is_emb_top = (i32(px) == ember_x) && (i32(py) == ember_y_top);
-        let is_emb_bot = (i32(px) == ember_x) && (i32(py) == ember_y_bot);
+        let num_embers = 18u;
+        for (var e = 0u; e < num_embers; e = e + 1u) {
+            let f_e = f32(e);
+            let seed = base_ember_cycle + f_e * 17.31;
+            let vx = -(hash11_common(seed * 1.1) * 35.0 + 8.0 + now_treble * 30.0);
+            let vy = (hash11_common(seed * 2.3) * 2.0 - 1.0) * (12.0 + now_bass * 14.0);
+            let life = clamp(1.0 - ember_frac + hash11_common(seed * 3.7) * 0.3, 0.0, 1.0);
 
-        if is_emb_top || is_emb_bot {
-            let heat = life * (0.6 + now_treble * 0.6);
-            let ember_col = select(palette.ember_b, palette.ember_a, hash11(seed * 4.9) > 0.5);
-            col = max(col, ember_col * heat);
+            let ember_x = i32(playhead_px) + i32(vx * (1.0 - life));
+            let ember_y_top = i32(hit_py_top) + i32(vy * (1.0 - life) + (vy * vy * 0.015));
+            let ember_y_bot = i32(hit_py_bot) - i32(vy * (1.0 - life) + (vy * vy * 0.015));
+
+            let is_emb_top = (i32(px) == ember_x) && (i32(py) == ember_y_top);
+            let is_emb_bot = (i32(px) == ember_x) && (i32(py) == ember_y_bot);
+
+            if is_emb_top || is_emb_bot {
+                let heat = life * (0.6 + now_treble * 0.6);
+                let ember_col = select(palette.ember_b, palette.ember_a, is_emb_top);
+                col = max(col, ember_col * heat);
+            }
         }
     }
 
-    // 8. Apply CRT Effects & ACES Tonemapping
+    // 8. ACES Tonemapping BEFORE CRT post-processing (standard pipeline order)
+    var final_color = aces_tonemap(col);
+
     var crt_settings = get_default_crt();
     crt_settings.scanline_intensity = 0.12;
-    crt_settings.vignette_scale = 1.80;     // Wide vignette preserving full-screen coverage
+    crt_settings.vignette_scale = 1.80;
     crt_settings.vignette_softness = 0.95;
     crt_settings.noise_intensity = 0.018;
 
-    var final_color = apply_crt_effects(col, in.uv, in.clip_position.xy, audio.smooth_time, crt_settings);
-    final_color = aces_tonemap(final_color);
+    final_color = apply_crt_effects(final_color, in.uv, in.clip_position.xy, audio.smooth_time, crt_settings);
 
     return vec4<f32>(final_color, 1.0);
 }
-
-

@@ -89,23 +89,26 @@ fn intersect_cylinder(ro: vec3<f32>, rd: vec3<f32>, radius: f32) -> vec2<f32> {
     return vec2<f32>(t0, t1);
 }
 
-// Prismatic chromatic dispersion palette for beveled crystal edges
-fn prism_palette(t: f32) -> vec3<f32> {
-    let a = vec3<f32>(0.5, 0.5, 0.5);
-    let b = vec3<f32>(0.5, 0.5, 0.5);
-    let c = vec3<f32>(1.0, 1.0, 1.0);
-    let d = vec3<f32>(0.0, 0.333, 0.667);
-    return a + b * cos(6.2831853 * (c * t + d));
-}
-
-// Dynamic underwater caustic texture based on wave curvature
+// Dynamic underwater caustic & cymatic Chladni interference pattern
 fn calculate_caustics(pos: vec2<f32>, time: f32, bass: f32) -> f32 {
     let p = pos * 4.8;
     let w1 = sin(p.x * 2.4 + p.y * 1.9 + time * 2.8);
     let w2 = cos(p.x * 3.3 - p.y * 2.6 - time * 2.2);
     let w3 = sin((p.x + p.y) * 4.4 + time * 3.4);
     let caustic_pattern = pow(max(0.0, (w1 + w2 + w3 + 1.5) / 4.5), 6.0) * 4.8;
-    return caustic_pattern * (1.0 + bass * 1.8);
+    return caustic_pattern * (1.0 + bass * 1.4);
+}
+
+fn eval_cymatic_floor_grid(floor_p: vec2<f32>, time: f32, sub_bass: f32, mids: f32, highs: f32) -> vec3<f32> {
+    let r = length(floor_p);
+    let theta = atan2(floor_p.y, floor_p.x);
+    // Chladni radial + azimuthal standing-wave laser nodal lines on the transducer plate
+    let nodal = cos(r * 7.5 - time * 1.8) * cos(theta * 4.0) + 0.55 * sin(r * 11.0 + time * 1.2) * sin(theta * 6.0);
+    let chladni_line = exp(-abs(nodal) * 14.0) * smoothstep(VESSEL_INNER_R, VESSEL_INNER_R - 0.35, r);
+    // Concentric calibration rings on the optical transducer stage
+    let ring_grid = exp(-abs(fract(r * 1.5) - 0.5) * 28.0) * 0.35;
+    let cymatic_col = mix(vec3<f32>(0.08, 0.72, 1.15), vec3<f32>(0.65, 0.30, 1.25), clamp(highs * 0.7, 0.0, 1.0));
+    return cymatic_col * (chladni_line * (0.25 + mids * 0.65 + highs * 0.45) + ring_grid * (0.15 + sub_bass * 0.25));
 }
 
 @fragment
@@ -114,8 +117,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let aspect = audio.aspect_ratio;
     let screen_p = (uv * 2.0 - 1.0) * vec2<f32>(aspect, -1.0);
 
-    let time = audio.time;
-    let sub_bass = clamp(audio.spectrum[0].x * 1.8 + audio.channels[0].x * 0.9, 0.0, 2.5);
+    let time = select(audio.time, audio.smooth_time, audio.smooth_time > 0.0);
+    let sub_bass = clamp(audio.spectrum[0].x / 55.0 + audio.channels[0].x * 0.9, 0.0, 2.2);
+    let mids = clamp((audio.spectrum[8].x + audio.spectrum[16].x) / 110.0, 0.0, 1.5);
+    let highs = clamp((audio.spectrum[32].x + audio.spectrum[48].x) / 110.0, 0.0, 1.4);
 
     // Smooth studio camera setup: elevated ~25 degrees looking down into the optical vessel
     let cam_orbit = time * 0.07;
@@ -201,7 +206,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         if (is_glass_rim || p_enter.y > VESSEL_HEIGHT - 0.08) {
             let rim_phase = fract(dot(n_glass_outer, vec3<f32>(2.2, 1.5, 2.2)) * 0.8 + time * 0.06);
             let rim_glint = pow(max(0.0, dot(n_glass_outer, h_soft)), 48.0) * 4.2;
-            outer_glass_spec += prism_palette(rim_phase) * rim_glint * (0.9 + sub_bass * 0.6);
+            outer_glass_spec += iridescence_cos(rim_phase) * rim_glint * (0.9 + sub_bass * 0.6);
         }
     }
 
@@ -298,17 +303,22 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let ref_dir = reflect(-view_dir, normal);
         let env_reflection = max(0.0, ref_dir.y) * vec3<f32>(0.12, 0.20, 0.32) * 1.6;
 
-        // Refraction & Beer-Lambert Volumetric Depth Absorption
+        // Snell's Law Refraction (IOR 1.0 -> 1.333) & Beer-Lambert Volumetric Depth Absorption
+        let refr_dir = refract(rd, normal, 1.0 / 1.333);
         let water_depth = max(0.05, hit_p.y - BASIN_FLOOR_Y);
+        let t_refr_floor = water_depth / max(0.08, -refr_dir.y);
+        let floor_p = hit_p.xz + refr_dir.xz * min(t_refr_floor, 2.2);
         let alpha = vec3<f32>(0.36, 0.07, 0.012);
-        let transmission = exp(-alpha * (water_depth * 4.6));
+        let transmission = exp(-alpha * (t_refr_floor * 3.8));
 
-        // Transducer Floor & Caustic Light Projection
-        let caustics = calculate_caustics(hit_p.xz, time, sub_bass);
-        let transducer_plate = vec3<f32>(0.02, 0.03, 0.05) + vec3<f32>(0.28, 0.72, 1.05) * (caustics * 0.20);
+        // Refracted Transducer Floor, Wave-Curvature Caustics & Cymatic Chladni Laser Grid
+        let slope_focus = clamp(1.0 + (abs(normal.x) + abs(normal.z)) * 3.2, 1.0, 2.8);
+        let caustics = calculate_caustics(floor_p, time, sub_bass) * slope_focus;
+        let cymatic_grid = eval_cymatic_floor_grid(floor_p, time, sub_bass, mids, highs);
+        let transducer_plate = vec3<f32>(0.02, 0.03, 0.05) + vec3<f32>(0.28, 0.72, 1.05) * (caustics * 0.16) + cymatic_grid;
 
-        // Acoustic Center Transducer Luminescence
-        let center_dist = length(hit_p.xz);
+        // Acoustic Center Transducer Luminescence (evaluated at refracted floor coordinate)
+        let center_dist = length(floor_p);
         let ring_pulse = exp(-pow(center_dist - 0.75, 2.0) * 6.0) * sub_bass * 0.75;
         let bass_core = exp(-center_dist * 2.2) * sub_bass * 0.85;
         let transducer_emission = (ring_pulse + bass_core) * vec3<f32>(0.18, 0.75, 1.15);
@@ -336,7 +346,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let transmission = exp(-alpha * (water_path * 2.8));
 
         let caustics = calculate_caustics(hit_p.xz, time, sub_bass);
-        let floor_plate = vec3<f32>(0.02, 0.03, 0.05) + vec3<f32>(0.25, 0.65, 0.95) * (caustics * 0.18);
+        let cymatic_grid = eval_cymatic_floor_grid(hit_p.xz, time, sub_bass, mids, highs);
+        let floor_plate = vec3<f32>(0.02, 0.03, 0.05) + vec3<f32>(0.25, 0.65, 0.95) * (caustics * 0.16) + cymatic_grid;
 
         let center_dist = length(hit_p.xz);
         let ring_pulse = exp(-pow(center_dist - 0.75, 2.0) * 6.0) * sub_bass * 0.75;

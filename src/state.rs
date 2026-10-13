@@ -1,4 +1,11 @@
 use std::collections::VecDeque;
+use std::path::PathBuf;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicU32};
+
+pub static UNCAPPED_PRESENT_MODE: AtomicBool = AtomicBool::new(false);
+pub static BENCH_FRAMES_OVERRIDE: AtomicU32 = AtomicU32::new(0);
+pub static CACHE_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GamepadType {
@@ -70,8 +77,7 @@ pub struct PerformanceStats {
     pub phase_surface_us: f32,     // render(): get_current_texture()
     pub phase_egui_layout_us: f32, // render(): egui ctx.run() UI layout
     pub phase_encode_us: f32,      // render(): GPU command encoding (compute + render passes)
-    #[allow(dead_code)]
-    pub phase_submit_us: f32, // render(): queue.submit() + present
+    pub phase_submit_us: f32,      // render(): queue.submit() + present
     pub phase_post_us: f32,        // Main loop: post-render state writeback
 }
 
@@ -110,16 +116,12 @@ impl std::fmt::Debug for VideoFrame {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-#[allow(dead_code)]
 pub enum Geometry {
     Grid { width: u32, depth: u32 },
-    UnitBox,
     UnitQuad,
     NeonRoom,
     SynthwaveRacerScene,
     VuMeterRack,
-    NeonCorridorFrames,
-    StormRainVolume,
     GlassLyricsScene,
 }
 
@@ -134,7 +136,6 @@ pub struct VisualizerDef {
     pub id: u32,
     pub name: &'static str,
     pub filename: &'static str,
-    #[allow(dead_code)]
     pub description: &'static str,
     pub pipeline_type: PipelineType,
     pub requires_history: bool,
@@ -262,7 +263,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         filename: "vis_solar.wgsl",
         description: "Audio-reactive raymarched sun",
         pipeline_type: PipelineType::FullscreenQuad,
-        requires_history: true,
+        requires_history: false,
         requires_fire: false,
         requires_resynth: false,
         requires_ferrofluidsim: false,
@@ -320,7 +321,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
             },
             instances: 1,
         },
-        requires_history: true,
+        requires_history: false,
         requires_fire: false,
         requires_resynth: false,
         requires_ferrofluidsim: false,
@@ -336,7 +337,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
             geometry: Geometry::SynthwaveRacerScene,
             instances: 1,
         },
-        requires_history: true,
+        requires_history: false,
         requires_fire: false,
         requires_resynth: false,
         requires_ferrofluidsim: false,
@@ -418,7 +419,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_resynth: false,
         requires_ferrofluidsim: false,
         requires_flip_ferrofluid: false,
-        requires_flip_water: false,
+        requires_flip_water: true,
     },
     VisualizerDef {
         id: 27,

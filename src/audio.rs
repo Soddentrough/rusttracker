@@ -6,7 +6,6 @@ use rustfft::{FftPlanner, num_complex::Complex};
 use std::fs::File;
 #[cfg(not(target_os = "android"))]
 use std::io::Cursor;
-#[allow(unused_imports)]
 use std::io::Read;
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -23,7 +22,6 @@ use rustysynth::{MidiFile, MidiFileSequencer, SoundFont, Synthesizer, Synthesize
 use crate::state::AppState;
 use crossbeam_channel::{Receiver, Sender, bounded, unbounded};
 
-#[allow(dead_code)]
 pub enum PlaybackHandle {
     Cpal(cpal::Stream, Arc<std::sync::atomic::AtomicBool>),
     Bitstream(
@@ -39,7 +37,8 @@ pub enum PlaybackHandle {
 impl Drop for PlaybackHandle {
     fn drop(&mut self) {
         match self {
-            PlaybackHandle::Cpal(_, stop_token) => {
+            PlaybackHandle::Cpal(stream, stop_token) => {
+                let _ = &stream;
                 stop_token.store(true, std::sync::atomic::Ordering::SeqCst);
             }
             PlaybackHandle::Bitstream(handle_opt, stop_token) => {
@@ -143,6 +142,12 @@ pub fn calculate_power_of_two_window_size(sample_rate: u32) -> usize {
     window_size.clamp(2048, 65536)
 }
 
+fn dsp_recycle_channel() -> &'static (Sender<DspMessage>, Receiver<DspMessage>) {
+    static POOL: std::sync::OnceLock<(Sender<DspMessage>, Receiver<DspMessage>)> =
+        std::sync::OnceLock::new();
+    POOL.get_or_init(|| bounded(8))
+}
+
 pub fn spawn_dsp_thread(
     rx: Receiver<DspMessage>,
     shared_state: Arc<Mutex<AppState>>,
@@ -174,7 +179,7 @@ pub fn spawn_dsp_thread(
         ];
         let mut magnitudes = vec![0.0f32; window_size / 2];
 
-        // Precompute log-spaced bin interpolation mapping for GPU spectrum
+        // Precompute log-spaced bin interpolation mapping for mono & GPU spectrum
         let resolution = sample_rate as f32 / window_size as f32; // Hz per FFT bin
         let min_freq = 20.0f32;
         let max_f = max_frequency.max(min_freq * 2.0);
@@ -186,20 +191,44 @@ pub fn spawn_dsp_thread(
             i1: usize,
             frac: f32,
         }
+        struct MonoBinRange {
+            start: usize,
+            safe_end: usize,
+            nearest: usize,
+            use_range: bool,
+        }
         let mut log_bin_mappings = Vec::with_capacity(num_bins);
+        let mut mono_bin_ranges = Vec::with_capacity(num_bins);
         for i in 0..num_bins {
-            let t = i as f32 / num_bins as f32;
-            let freq = min_freq * (max_f / min_freq).powf(t);
-            let idx = freq / resolution;
+            let t0 = i as f32 / num_bins as f32;
+            let t1 = (i + 1) as f32 / num_bins as f32;
+            let freq_start = min_freq * (max_f / min_freq).powf(t0);
+            let freq_end = min_freq * (max_f / min_freq).powf(t1);
+
+            let idx = freq_start / resolution;
             let idx_clamped = idx.clamp(0.0, (nyquist - 1) as f32);
             let i0 = idx_clamped.floor() as usize;
             let i1 = (i0 + 1).min(nyquist - 1);
             let frac = idx_clamped - i0 as f32;
             log_bin_mappings.push(BinMapping { i0, i1, frac });
+
+            let idx_end = freq_end / resolution;
+            let use_range = (idx_end - idx) >= 1.0;
+            let start = idx.ceil() as usize;
+            let safe_end = ((idx_end.floor() as usize) + 1).min(nyquist);
+            let nearest = (((idx + idx_end) * 0.5).round() as usize).min(nyquist.saturating_sub(1));
+            mono_bin_ranges.push(MonoBinRange {
+                start,
+                safe_end,
+                nearest,
+                use_range,
+            });
         }
 
         let n_sqrt = (window_size as f32).sqrt();
         let mut last_waveform_push = Instant::now();
+        let mut need_gpu_spectrum = false;
+        let recycle_tx = &dsp_recycle_channel().0;
 
         while let Ok(msg) = rx.recv() {
             let fft_start = Instant::now();
@@ -217,66 +246,53 @@ pub fn spawn_dsp_thread(
             fft.process(&mut complex_buf);
 
             // Compute magnitudes (only first half — up to Nyquist)
-            for i in 0..window_size / 2 {
+            for i in 0..nyquist {
                 magnitudes[i] = complex_buf[i].norm() / n_sqrt;
             }
 
-            // Logarithmic binning into 1024 display bins (mono)
-            binned_data.fill(0.0);
-            for (i, bin) in binned_data.iter_mut().enumerate().take(num_bins) {
-                let freq_start = min_freq * (max_f / min_freq).powf(i as f32 / num_bins as f32);
-                let freq_end = min_freq * (max_f / min_freq).powf((i + 1) as f32 / num_bins as f32);
-
-                let idx_start = freq_start / resolution;
-                let idx_end = freq_end / resolution;
-
+            // Logarithmic binning into 1024 display bins (mono) using precomputed ranges
+            for (bin, range) in binned_data.iter_mut().zip(mono_bin_ranges.iter()) {
                 let mut max_val: f32 = 0.0;
-
-                if idx_end - idx_start >= 1.0 {
-                    let start = idx_start.ceil() as usize;
-                    let end = idx_end.floor() as usize;
-                    let safe_end = (end + 1).min(nyquist);
-                    if start < safe_end {
-                        for &mag in &magnitudes[start..safe_end] {
+                if range.use_range {
+                    if range.start < range.safe_end {
+                        for &mag in &magnitudes[range.start..range.safe_end] {
                             max_val = max_val.max(mag);
                         }
                     }
                 } else {
-                    let nearest = ((idx_start + idx_end) / 2.0).round() as usize;
-                    if nearest < nyquist {
-                        max_val = magnitudes[nearest];
-                    }
+                    max_val = magnitudes[range.nearest];
                 }
-
                 *bin = (max_val * 100.0).clamp(0.0, 100.0);
             }
 
-            // 2. Process multi-channel FFT for GPU visualizers (always run on background thread)
-            gpu_spectrum.fill(0.0);
+            // 2. Process multi-channel FFT ONLY when active visualizer requires GPU spectrum (ID 6 or requires_resynth)
             let num_channels = msg.channel_audio_data.len().min(32);
-            for c in 0..num_channels {
-                let channel_data = &msg.channel_audio_data[c];
-                for i in 0..window_size {
-                    let sample = *channel_data.get(i).unwrap_or(&0.0);
-                    complex_buf[i] = Complex {
-                        re: sample * hann_window[i],
-                        im: 0.0,
-                    };
-                }
-                fft.process(&mut complex_buf);
+            if need_gpu_spectrum {
+                gpu_spectrum.fill(0.0);
+                for c in 0..num_channels {
+                    let channel_data = &msg.channel_audio_data[c];
+                    for i in 0..window_size {
+                        let sample = *channel_data.get(i).unwrap_or(&0.0);
+                        complex_buf[i] = Complex {
+                            re: sample * hann_window[i],
+                            im: 0.0,
+                        };
+                    }
+                    fft.process(&mut complex_buf);
 
-                for (i, mapping) in log_bin_mappings.iter().enumerate() {
-                    let c0 = complex_buf[mapping.i0];
-                    let c1 = complex_buf[mapping.i1];
-                    let re = c0.re * (1.0 - mapping.frac) + c1.re * mapping.frac;
-                    let im = c0.im * (1.0 - mapping.frac) + c1.im * mapping.frac;
+                    for (i, mapping) in log_bin_mappings.iter().enumerate() {
+                        let c0 = complex_buf[mapping.i0];
+                        let c1 = complex_buf[mapping.i1];
+                        let re = c0.re * (1.0 - mapping.frac) + c1.re * mapping.frac;
+                        let im = c0.im * (1.0 - mapping.frac) + c1.im * mapping.frac;
 
-                    let norm_re = re / n_sqrt;
-                    let norm_im = im / n_sqrt;
+                        let norm_re = re / n_sqrt;
+                        let norm_im = im / n_sqrt;
 
-                    let out_idx = c * 1024 * 2 + i * 2;
-                    gpu_spectrum[out_idx] = norm_re;
-                    gpu_spectrum[out_idx + 1] = norm_im;
+                        let out_idx = c * 1024 * 2 + i * 2;
+                        gpu_spectrum[out_idx] = norm_re;
+                        gpu_spectrum[out_idx + 1] = norm_im;
+                    }
                 }
             }
 
@@ -284,6 +300,9 @@ pub fn spawn_dsp_thread(
 
             // Sync to UI state
             if let Ok(mut state) = shared_state.lock() {
+                let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
+                need_gpu_spectrum = vis_def.id == 6 || vis_def.requires_resynth;
+
                 // Decay/smooth the execution stats for readability
                 state.stats.fft_us = state.stats.fft_us * 0.9 + fft_elapsed * 0.1;
 
@@ -294,13 +313,18 @@ pub fn spawn_dsp_thread(
                 }
 
                 state.raw_channel_vus.clear();
-                for vu in msg.channel_vus {
-                    state.raw_channel_vus.push(vu);
-                }
+                state.raw_channel_vus.extend_from_slice(&msg.channel_vus);
 
                 state.raw_spectrum_data.copy_from_slice(&binned_data);
-                state.gpu_spectrum_data = gpu_spectrum.clone();
-                state.raw_audio_channels = msg.channel_audio_data;
+                if need_gpu_spectrum {
+                    if state.gpu_spectrum_data.len() != gpu_spectrum.len() {
+                        state.gpu_spectrum_data.resize(gpu_spectrum.len(), 0.0);
+                    }
+                    state.gpu_spectrum_data.copy_from_slice(&gpu_spectrum);
+                }
+                if state.raw_audio_channels.len() != num_channels {
+                    state.raw_audio_channels.resize_with(num_channels, Vec::new);
+                }
 
                 // --- Waveform extraction (Zero-Crossing Edge Trigger) ---
                 let visual_width = state.visual_width.clamp(128, 4096) as usize;
@@ -376,7 +400,10 @@ pub fn spawn_dsp_thread(
                 } else {
                     state.current_seconds = msg.current_seconds;
                 }
-                state.current_tracker_row_string = msg.current_row_string;
+                state.current_tracker_row_string.clear();
+                state
+                    .current_tracker_row_string
+                    .push_str(&msg.current_row_string);
 
                 // --- Lookahead Timeline Extraction (600 slices: -1.0s past to +5.0s future) ---
                 if state.lookahead_timeline.len() != 600 * 8 {
@@ -499,6 +526,7 @@ pub fn spawn_dsp_thread(
                     state.current_tracker_row = msg.current_row;
                 }
             }
+            let _ = recycle_tx.try_send(msg);
         }
     });
 }
@@ -760,6 +788,8 @@ struct MidiSource {
     title: String,
     tracker_data: Vec<Vec<String>>,
     tempo: i32,
+    tempo_map: Vec<(u32, f64, f64)>,
+    ticks_per_beat: f64,
     left_buf: Vec<f32>,
     right_buf: Vec<f32>,
     midi_file: Arc<MidiFile>,
@@ -808,6 +838,7 @@ impl MidiSource {
         let mut title = String::new();
 
         let mut absolute_events = Vec::new();
+        let mut raw_tempo_changes: Vec<(u32, f64)> = Vec::new();
         let ticks_per_beat = match smf.header.timing {
             midly::Timing::Metrical(ticks) => ticks.as_int() as f64,
             _ => 480.0,
@@ -827,6 +858,10 @@ impl MidiSource {
                         if artist.is_empty() {
                             artist = String::from_utf8_lossy(text).to_string();
                         }
+                    }
+                    TrackEventKind::Meta(MetaMessage::Tempo(micros)) => {
+                        let us = micros.as_int().max(1) as f64;
+                        raw_tempo_changes.push((current_tick, us));
                     }
                     TrackEventKind::Midi { channel, message } => match message {
                         MidiMessage::NoteOn { key, vel } => {
@@ -854,19 +889,33 @@ impl MidiSource {
             }
         }
 
+        raw_tempo_changes.sort_by_key(|e| e.0);
+        let mut tempo_map: Vec<(u32, f64, f64)> = vec![(0, 0.0, 500_000.0)];
+        for (tick, us_per_beat) in raw_tempo_changes {
+            let &(prev_tick, prev_sec, prev_us) = tempo_map.last().unwrap();
+            if tick == prev_tick {
+                tempo_map.last_mut().unwrap().2 = us_per_beat;
+            } else {
+                let delta_beats = (tick - prev_tick) as f64 / ticks_per_beat;
+                let sec = prev_sec + delta_beats * (prev_us / 1_000_000.0);
+                tempo_map.push((tick, sec, us_per_beat));
+            }
+        }
+
+        let initial_bpm = (60_000_000.0 / tempo_map[0].2).round() as i32;
+
         absolute_events.sort_by_key(|e| e.0);
 
-        let tempo = 500000.0;
-        let mut current_tick = 0;
-        let mut current_time = 0.0;
-
-        let mut parsed_events = Vec::new();
+        let mut parsed_events = Vec::with_capacity(absolute_events.len());
+        let mut tempo_idx = 0;
         for (tick, channel, _key, vel, is_on) in absolute_events {
-            let delta_ticks = tick - current_tick;
+            while tempo_idx + 1 < tempo_map.len() && tempo_map[tempo_idx + 1].0 <= tick {
+                tempo_idx += 1;
+            }
+            let (base_tick, base_sec, us_per_beat) = tempo_map[tempo_idx];
+            let delta_ticks = tick.saturating_sub(base_tick);
             let beats = delta_ticks as f64 / ticks_per_beat;
-            let seconds = beats * (tempo / 1000000.0);
-            current_time += seconds;
-            current_tick = tick;
+            let current_time = base_sec + beats * (us_per_beat / 1_000_000.0);
 
             parsed_events.push(MidiEvent {
                 time_sec: current_time,
@@ -924,7 +973,9 @@ impl MidiSource {
             artist,
             title,
             tracker_data,
-            tempo: 120,
+            tempo: initial_bpm,
+            tempo_map,
+            ticks_per_beat,
             left_buf: vec![0.0; 8192],
             right_buf: vec![0.0; 8192],
             midi_file: midi,
@@ -1051,6 +1102,16 @@ impl AudioSource for MidiSource {
         "MIDI".to_string()
     }
     fn get_tempo(&mut self) -> i32 {
+        let pos = self.get_position_seconds();
+        let mut us = self.tempo_map.first().map(|e| e.2).unwrap_or(500_000.0);
+        for &(_, sec, tempo_us) in &self.tempo_map {
+            if sec <= pos {
+                us = tempo_us;
+            } else {
+                break;
+            }
+        }
+        self.tempo = (60_000_000.0 / us).round() as i32;
         self.tempo
     }
     fn get_speed(&mut self) -> i32 {
@@ -1073,7 +1134,23 @@ impl AudioSource for MidiSource {
         0
     }
     fn get_current_row(&mut self) -> i32 {
-        (self.get_position_seconds() * (self.tempo as f64 / 60.0) * 4.0) as i32
+        let pos = self.get_position_seconds();
+        let mut base_tick = 0u32;
+        let mut base_sec = 0.0;
+        let mut us = 500_000.0;
+        for &(t, sec, tempo_us) in &self.tempo_map {
+            if sec <= pos {
+                base_tick = t;
+                base_sec = sec;
+                us = tempo_us;
+            } else {
+                break;
+            }
+        }
+        let delta_sec = (pos - base_sec).max(0.0);
+        let delta_ticks = (delta_sec / (us / 1_000_000.0)) * self.ticks_per_beat;
+        let current_tick = base_tick as f64 + delta_ticks;
+        (current_tick / (self.ticks_per_beat / 4.0)) as i32
     }
 
     fn get_tracker_channels(&mut self) -> Option<i32> {
@@ -1099,7 +1176,6 @@ impl AudioSource for MidiSource {
 // ---------------------------------------------------------
 struct ActiveSymphoniaTrack {
     track_idx: usize,
-    #[allow(dead_code)]
     track_id: u32,
     decoder: Box<dyn Decoder>,
     sample_buf: SampleBuffer<f32>,
@@ -1126,7 +1202,7 @@ where
 }
 
 #[inline(always)]
-pub(crate) fn get_downmixed_sample(
+pub fn get_downmixed_sample(
     track_channels: u16,
     base_slice: &[f32],
     hardware_channels: usize,
@@ -1152,6 +1228,24 @@ pub(crate) fn get_downmixed_sample(
             let r = base_slice.get(1).copied().unwrap_or(0.0);
             (l + r) * 0.5
         }
+        // 3.0 / 2.1 (FL, FR, FC/LFE) to Stereo (L, R)
+        (3, 2, 0) => {
+            let fl = base_slice.first().copied().unwrap_or(0.0);
+            let fc = base_slice.get(2).copied().unwrap_or(0.0);
+            (fl + INV_SQRT2 * fc) * INV_SQRT2
+        }
+        (3, 2, 1) => {
+            let fr = base_slice.get(1).copied().unwrap_or(0.0);
+            let fc = base_slice.get(2).copied().unwrap_or(0.0);
+            (fr + INV_SQRT2 * fc) * INV_SQRT2
+        }
+        // 3.0 / 2.1 to Mono
+        (3, 1, 0) => {
+            let fl = base_slice.first().copied().unwrap_or(0.0);
+            let fr = base_slice.get(1).copied().unwrap_or(0.0);
+            let fc = base_slice.get(2).copied().unwrap_or(0.0);
+            (fl + fr + INV_SQRT2 * fc) * 0.4
+        }
         // Quad (FL, FR, BL, BR) to Stereo (L, R)
         (4, 2, 0) => {
             let fl = base_slice.first().copied().unwrap_or(0.0);
@@ -1162,6 +1256,36 @@ pub(crate) fn get_downmixed_sample(
             let fr = base_slice.get(1).copied().unwrap_or(0.0);
             let br = base_slice.get(3).copied().unwrap_or(0.0);
             (fr + INV_SQRT2 * br) * INV_SQRT2
+        }
+        // Quad to Mono
+        (4, 1, 0) => {
+            let fl = base_slice.first().copied().unwrap_or(0.0);
+            let fr = base_slice.get(1).copied().unwrap_or(0.0);
+            let bl = base_slice.get(2).copied().unwrap_or(0.0);
+            let br = base_slice.get(3).copied().unwrap_or(0.0);
+            (fl + fr + bl + br) * 0.25
+        }
+        // 5.0 (FL, FR, FC, BL, BR) to Stereo (L, R)
+        (5, 2, 0) => {
+            let fl = base_slice.first().copied().unwrap_or(0.0);
+            let fc = base_slice.get(2).copied().unwrap_or(0.0);
+            let bl = base_slice.get(3).copied().unwrap_or(0.0);
+            (fl + INV_SQRT2 * fc + INV_SQRT2 * bl) * INV_SQRT2
+        }
+        (5, 2, 1) => {
+            let fr = base_slice.get(1).copied().unwrap_or(0.0);
+            let fc = base_slice.get(2).copied().unwrap_or(0.0);
+            let br = base_slice.get(4).copied().unwrap_or(0.0);
+            (fr + INV_SQRT2 * fc + INV_SQRT2 * br) * INV_SQRT2
+        }
+        // 5.0 to Mono
+        (5, 1, 0) => {
+            let fl = base_slice.first().copied().unwrap_or(0.0);
+            let fr = base_slice.get(1).copied().unwrap_or(0.0);
+            let fc = base_slice.get(2).copied().unwrap_or(0.0);
+            let bl = base_slice.get(3).copied().unwrap_or(0.0);
+            let br = base_slice.get(4).copied().unwrap_or(0.0);
+            (fl + fr + SQRT2 * fc + bl + br) * 0.35
         }
         // 5.1 (FL, FR, FC, LFE, BL, BR) to Stereo (L, R)
         (6, 2, 0) => {
@@ -1187,6 +1311,34 @@ pub(crate) fn get_downmixed_sample(
             let bl = base_slice.get(4).copied().unwrap_or(0.0);
             let br = base_slice.get(5).copied().unwrap_or(0.0);
             (fl + fr + SQRT2 * fc + bl + br + lfe) * 0.35
+        }
+        // 6.1 (FL, FR, FC, LFE, BC, SL, SR) to Stereo (L, R)
+        (7, 2, 0) => {
+            let fl = base_slice.first().copied().unwrap_or(0.0);
+            let fc = base_slice.get(2).copied().unwrap_or(0.0);
+            let lfe = base_slice.get(3).copied().unwrap_or(0.0);
+            let bc = base_slice.get(4).copied().unwrap_or(0.0);
+            let sl = base_slice.get(5).copied().unwrap_or(0.0);
+            (fl + INV_SQRT2 * fc + 0.5 * bc + INV_SQRT2 * sl + 0.5 * lfe) * 0.6
+        }
+        (7, 2, 1) => {
+            let fr = base_slice.get(1).copied().unwrap_or(0.0);
+            let fc = base_slice.get(2).copied().unwrap_or(0.0);
+            let lfe = base_slice.get(3).copied().unwrap_or(0.0);
+            let bc = base_slice.get(4).copied().unwrap_or(0.0);
+            let sr = base_slice.get(6).copied().unwrap_or(0.0);
+            (fr + INV_SQRT2 * fc + 0.5 * bc + INV_SQRT2 * sr + 0.5 * lfe) * 0.6
+        }
+        // 6.1 to Mono
+        (7, 1, 0) => {
+            let fl = base_slice.first().copied().unwrap_or(0.0);
+            let fr = base_slice.get(1).copied().unwrap_or(0.0);
+            let fc = base_slice.get(2).copied().unwrap_or(0.0);
+            let lfe = base_slice.get(3).copied().unwrap_or(0.0);
+            let bc = base_slice.get(4).copied().unwrap_or(0.0);
+            let sl = base_slice.get(5).copied().unwrap_or(0.0);
+            let sr = base_slice.get(6).copied().unwrap_or(0.0);
+            (fl + fr + SQRT2 * fc + bc + sl + sr + lfe) * 0.3
         }
         // 7.1 (FL, FR, FC, LFE, BL, BR, SL, SR) to Stereo
         (8, 2, 0) => {
@@ -1693,7 +1845,6 @@ impl AudioSource for SymphoniaSource {
 #[cfg(not(target_os = "android"))]
 struct ActiveFfmpegTrack {
     track_idx: usize,
-    #[allow(dead_code)]
     stream_index: usize,
     decoder: ffmpeg_next::decoder::Audio,
     resampler: ffmpeg_next::software::resampling::Context,
@@ -2973,7 +3124,7 @@ pub fn extract_mp4_track_names(path: &str) -> Vec<String> {
     names
 }
 
-pub(crate) fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(
+pub fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(
     file: R,
     probe_ext: &str,
     display_ext: &str,
@@ -3038,11 +3189,13 @@ pub(crate) fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(
                 symphonia::core::codecs::CODEC_TYPE_ALAC => "ALAC".to_string(),
                 _ => format!("{:?}", track.codec_params.codec),
             };
-            let sym_channels = track.codec_params.channels.unwrap_or(
-                symphonia::core::audio::Channels::FRONT_LEFT
-                    | symphonia::core::audio::Channels::FRONT_RIGHT,
-            );
-            let channels = sym_channels.count() as u16;
+            let channels = if let Some(ch) = track.codec_params.channels {
+                ch.count() as u16
+            } else if let Some(layout) = track.codec_params.channel_layout {
+                layout.into_channels().count() as u16
+            } else {
+                2
+            };
             let rate = track.codec_params.sample_rate.unwrap_or(44100);
             let ch_desc = match channels {
                 1 => "Mono".to_string(),
@@ -3100,11 +3253,13 @@ pub(crate) fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(
 
     let track = selected_track.context("No supported audio track found")?;
     let track_id = track.id;
-    let sym_channels = track.codec_params.channels.unwrap_or(
-        symphonia::core::audio::Channels::FRONT_LEFT
-            | symphonia::core::audio::Channels::FRONT_RIGHT,
-    );
-    let channels = sym_channels.count() as u16;
+    let channels = if let Some(ch) = track.codec_params.channels {
+        ch.count() as u16
+    } else if let Some(layout) = track.codec_params.channel_layout {
+        layout.into_channels().count() as u16
+    } else {
+        2
+    };
     let intrinsic_sample_rate = track.codec_params.sample_rate.unwrap_or(44100);
     let time_base = track
         .codec_params
@@ -3126,10 +3281,14 @@ pub(crate) fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(
             && let Ok(dec) =
                 symphonia::default::get_codecs().make(&t.codec_params, &DecoderOptions::default())
         {
-            let t_sym_channels = t.codec_params.channels.unwrap_or(
-                symphonia::core::audio::Channels::FRONT_LEFT
-                    | symphonia::core::audio::Channels::FRONT_RIGHT,
-            );
+            let t_sym_channels = t
+                .codec_params
+                .channels
+                .or_else(|| t.codec_params.channel_layout.map(|l| l.into_channels()))
+                .unwrap_or(
+                    symphonia::core::audio::Channels::FRONT_LEFT
+                        | symphonia::core::audio::Channels::FRONT_RIGHT,
+                );
             let t_channels = t_sym_channels.count() as u16;
             let t_sample_rate = t.codec_params.sample_rate.unwrap_or(44100);
             let t_time_base = t
@@ -3801,48 +3960,12 @@ pub fn start_audio_thread(
 
                 {
                     let mut state = shared_state_closure.lock().unwrap();
-                    state.current_seconds = 0.0;
-                    state.lookahead_queue.clear();
-                    state.lookahead_sample_buffer.clear();
-                    state.lookahead_buffer_start_time = 0.0;
-                    state.lookahead_timeline = vec![0.0; 600 * 8];
-                    state.waveform_history.clear();
-                    state.raw_waveform.fill(0.0);
-                    state.track_ended = false;
-                    state.artist = audio_source.get_artist();
-                    state.module_type = audio_source.get_type();
-                    state.duration_seconds = audio_source.get_duration_seconds();
-                    let tracker_channels = audio_source.get_tracker_channels();
-                    state.num_channels = if let Some(tc) = tracker_channels {
-                        tc + 2
-                    } else {
-                        audio_source.get_num_channels()
-                    };
-                    state.hardware_channels = config.channels as i32;
-                    state.channel_vus = vec![0.0; state.num_channels as usize];
-                    state.peak_vus = vec![0.0; state.num_channels as usize];
-                    state.bpm = audio_source.get_tempo();
-                    state.speed = audio_source.get_speed();
-                    state.video_info = audio_source.get_video_info();
-                    state.max_frequency = audio_source
-                        .get_intrinsic_sample_rate()
-                        .map(|r| r as f32 / 2.0)
-                        .unwrap_or(10000.0);
-                    state.current_sample_rate = config.sample_rate as f32;
-                    state.num_samples = audio_source.get_num_samples();
-                    state.num_instruments = audio_source.get_num_instruments();
-                    state.num_patterns = audio_source.get_num_patterns();
-                    state.bitrate = audio_source.get_bitrate();
-                    state.audio_tracks = audio_source.get_audio_tracks();
-                    state.selected_audio_track = audio_source.get_selected_audio_track();
-                    state.active_audio_tracks = audio_source.get_active_audio_tracks();
-                    state.audio_track_volumes = vec![1.0; state.audio_tracks.len()];
-                    state.multi_track_mix_mode = state.active_audio_tracks.len() > 1;
-                    state.audio_track_request = None;
-                    state.audio_mix_request = None;
-                    state.has_video_stream = audio_source.has_video_stream();
-                    state.tracker_channels = tracker_channels;
-                    state.tracker_patterns_by_order = audio_source.pre_format_tracker_data();
+                    populate_state_from_audio_source(
+                        &mut state,
+                        audio_source.as_mut(),
+                        config.channels as i32,
+                        config.sample_rate,
+                    );
                 }
 
                 let max_frequency = { shared_state_closure.lock().unwrap().max_frequency };
@@ -3932,48 +4055,12 @@ pub fn start_audio_thread(
 
                 {
                     let mut state = shared_state.lock().unwrap();
-                    state.current_seconds = 0.0;
-                    state.lookahead_queue.clear();
-                    state.lookahead_sample_buffer.clear();
-                    state.lookahead_buffer_start_time = 0.0;
-                    state.lookahead_timeline = vec![0.0; 600 * 8];
-                    state.waveform_history.clear();
-                    state.raw_waveform.fill(0.0);
-                    state.track_ended = false;
-                    state.artist = audio_source.get_artist();
-                    state.module_type = audio_source.get_type();
-                    state.duration_seconds = audio_source.get_duration_seconds();
-                    let tracker_channels = audio_source.get_tracker_channels();
-                    state.num_channels = if let Some(tc) = tracker_channels {
-                        tc + 2
-                    } else {
-                        audio_source.get_num_channels()
-                    };
-                    state.hardware_channels = 2;
-                    state.channel_vus = vec![0.0; state.num_channels as usize];
-                    state.peak_vus = vec![0.0; state.num_channels as usize];
-                    state.bpm = audio_source.get_tempo();
-                    state.speed = audio_source.get_speed();
-                    state.video_info = audio_source.get_video_info();
-                    state.max_frequency = audio_source
-                        .get_intrinsic_sample_rate()
-                        .map(|r| r as f32 / 2.0)
-                        .unwrap_or(10000.0);
-                    state.current_sample_rate = sample_rate as f32;
-                    state.num_samples = audio_source.get_num_samples();
-                    state.num_instruments = audio_source.get_num_instruments();
-                    state.num_patterns = audio_source.get_num_patterns();
-                    state.bitrate = audio_source.get_bitrate();
-                    state.audio_tracks = audio_source.get_audio_tracks();
-                    state.selected_audio_track = audio_source.get_selected_audio_track();
-                    state.active_audio_tracks = audio_source.get_active_audio_tracks();
-                    state.audio_track_volumes = vec![1.0; state.audio_tracks.len()];
-                    state.multi_track_mix_mode = state.active_audio_tracks.len() > 1;
-                    state.audio_track_request = None;
-                    state.audio_mix_request = None;
-                    state.has_video_stream = audio_source.has_video_stream();
-                    state.tracker_channels = tracker_channels;
-                    state.tracker_patterns_by_order = audio_source.pre_format_tracker_data();
+                    populate_state_from_audio_source(
+                        &mut state,
+                        audio_source.as_mut(),
+                        2,
+                        sample_rate,
+                    );
                 }
 
                 let max_frequency = { shared_state.lock().unwrap().max_frequency };
@@ -4001,6 +4088,56 @@ pub fn start_audio_thread(
             }
         }
     }
+}
+
+fn populate_state_from_audio_source(
+    state: &mut AppState,
+    audio_source: &mut dyn AudioSource,
+    hardware_channels: i32,
+    sample_rate: u32,
+) {
+    state.current_seconds = 0.0;
+    state.lookahead_queue.clear();
+    state.lookahead_sample_buffer.clear();
+    state.lookahead_buffer_start_time = 0.0;
+    state.lookahead_timeline = vec![0.0; 600 * 8];
+    state.waveform_history.clear();
+    state.raw_waveform.fill(0.0);
+    state.track_ended = false;
+    state.artist = audio_source.get_artist();
+    state.module_type = audio_source.get_type();
+    state.duration_seconds = audio_source.get_duration_seconds();
+    let tracker_channels = audio_source.get_tracker_channels();
+    state.num_channels = if let Some(tc) = tracker_channels {
+        tc + 2
+    } else {
+        audio_source.get_num_channels()
+    };
+    state.hardware_channels = hardware_channels;
+    state.channel_vus = vec![0.0; state.num_channels as usize];
+    state.peak_vus = vec![0.0; state.num_channels as usize];
+    state.bpm = audio_source.get_tempo();
+    state.speed = audio_source.get_speed();
+    state.video_info = audio_source.get_video_info();
+    state.max_frequency = audio_source
+        .get_intrinsic_sample_rate()
+        .map(|r| r as f32 / 2.0)
+        .unwrap_or(10000.0);
+    state.current_sample_rate = sample_rate as f32;
+    state.num_samples = audio_source.get_num_samples();
+    state.num_instruments = audio_source.get_num_instruments();
+    state.num_patterns = audio_source.get_num_patterns();
+    state.bitrate = audio_source.get_bitrate();
+    state.audio_tracks = audio_source.get_audio_tracks();
+    state.selected_audio_track = audio_source.get_selected_audio_track();
+    state.active_audio_tracks = audio_source.get_active_audio_tracks();
+    state.audio_track_volumes = vec![1.0; state.audio_tracks.len()];
+    state.multi_track_mix_mode = state.active_audio_tracks.len() > 1;
+    state.audio_track_request = None;
+    state.audio_mix_request = None;
+    state.has_video_stream = audio_source.has_video_stream();
+    state.tracker_channels = tracker_channels;
+    state.tracker_patterns_by_order = audio_source.pre_format_tracker_data();
 }
 
 fn push_chunk_lookahead_slices(
@@ -4222,22 +4359,236 @@ pub fn push_planar_lookahead_slices(
     }
 }
 
-fn run_dummy(
+fn process_decoder_state_requests(
+    state: &mut AppState,
+    audio_source: &mut dyn AudioSource,
+    ready_rx: &Receiver<AudioChunk>,
+    free_tx: &Sender<AudioChunk>,
+    mut clear_video_packets: impl FnMut(),
+) -> bool {
+    let mut seeked = false;
+    if let Some(mix_req) = state.audio_mix_request.take()
+        && state.audio_tracks.len() > 1
+        && !mix_req.is_empty()
+    {
+        let mut new_active: Vec<usize> = mix_req.iter().map(|&(idx, _)| idx).collect();
+        new_active.sort();
+        let current_active = audio_source.get_active_audio_tracks();
+        let tracks_changed = new_active != current_active;
+        let play_pos = state.current_seconds;
+        if audio_source.set_active_audio_tracks(&mix_req).is_ok() {
+            if tracks_changed {
+                audio_source.set_position_seconds(play_pos);
+                state.audio_track_request = None;
+            }
+            state.active_audio_tracks = audio_source.get_active_audio_tracks();
+            if let Some(&first_idx) = state.active_audio_tracks.first() {
+                state.selected_audio_track = first_idx;
+            }
+            state.num_channels = audio_source.get_num_channels();
+            let ch_count = state.num_channels as usize;
+            state.channel_vus.resize(ch_count, 0.0);
+            state.peak_vus.resize(ch_count, 0.0);
+            state.module_type = audio_source.get_type();
+            state.bitrate = audio_source.get_bitrate();
+            state.multi_track_mix_mode = state.active_audio_tracks.len() > 1;
+
+            if state.audio_track_volumes.len() != state.audio_tracks.len() {
+                state.audio_track_volumes = vec![1.0; state.audio_tracks.len()];
+            }
+            for &(idx, vol) in &mix_req {
+                if idx < state.audio_track_volumes.len() {
+                    state.audio_track_volumes[idx] = vol;
+                }
+            }
+
+            if tracks_changed {
+                let mix_desc = if state.active_audio_tracks.len() > 1 {
+                    let track_nums: Vec<String> = state
+                        .active_audio_tracks
+                        .iter()
+                        .map(|idx| (idx + 1).to_string())
+                        .collect();
+                    format!("🎛 Audio Mix: Tracks {}", track_nums.join("+"))
+                } else {
+                    let idx = state.selected_audio_track;
+                    let track_title = state
+                        .audio_tracks
+                        .get(idx)
+                        .map(|t| t.title.clone())
+                        .unwrap_or_else(|| format!("Track {}", idx + 1));
+                    if track_title.to_lowercase().starts_with("track") {
+                        format!("🎛 {}", track_title)
+                    } else {
+                        format!("🎛 Track {}: {}", idx + 1, track_title)
+                    }
+                };
+                state.osd_text = Some(mix_desc);
+                state.osd_timer = 3.0;
+
+                state.lookahead_queue.clear();
+                state.lookahead_sample_buffer.clear();
+                state.lookahead_timeline.fill(0.0);
+                state.lookahead_buffer_start_time = play_pos;
+                state.waveform_history.clear();
+
+                while let Ok(c) = ready_rx.try_recv() {
+                    let _ = free_tx.try_send(c);
+                }
+                seeked = true;
+            }
+        }
+    }
+    if let Some(track_idx) = state.audio_track_request.take()
+        && state.audio_tracks.len() > 1
+        && track_idx < state.audio_tracks.len()
+        && (audio_source.get_active_audio_tracks() != vec![track_idx])
+    {
+        let play_pos = state.current_seconds;
+        if audio_source.select_audio_track(track_idx).is_ok() {
+            audio_source.set_position_seconds(play_pos);
+            state.selected_audio_track = track_idx;
+            state.active_audio_tracks = vec![track_idx];
+            state.multi_track_mix_mode = false;
+            state.num_channels = audio_source.get_num_channels();
+            let ch_count = state.num_channels as usize;
+            state.channel_vus.resize(ch_count, 0.0);
+            state.peak_vus.resize(ch_count, 0.0);
+            state.module_type = audio_source.get_type();
+            state.bitrate = audio_source.get_bitrate();
+            let track_title = state
+                .audio_tracks
+                .get(track_idx)
+                .map(|t| t.title.clone())
+                .unwrap_or_else(|| format!("Track {}", track_idx + 1));
+            let display_title = if track_title.to_lowercase().starts_with("track") {
+                format!("🎛 {}", track_title)
+            } else {
+                format!("🎛 Track {}: {}", track_idx + 1, track_title)
+            };
+            state.osd_text = Some(display_title);
+            state.osd_timer = 3.0;
+
+            state.lookahead_queue.clear();
+            state.lookahead_sample_buffer.clear();
+            state.lookahead_timeline.fill(0.0);
+            state.lookahead_buffer_start_time = play_pos;
+            state.waveform_history.clear();
+
+            while let Ok(c) = ready_rx.try_recv() {
+                let _ = free_tx.try_send(c);
+            }
+            seeked = true;
+        }
+    }
+    if let Some(pos) = state.seek_request.take() {
+        audio_source.set_position_seconds(pos);
+        state.current_seconds = pos;
+        state.track_ended = false;
+        state.seek_epoch += 1;
+        state.lookahead_queue.clear();
+        state.lookahead_sample_buffer.clear();
+        state.lookahead_timeline.fill(0.0);
+        state.lookahead_buffer_start_time = pos;
+        state.waveform_history.clear();
+        while let Ok(c) = ready_rx.try_recv() {
+            let _ = free_tx.try_send(c);
+        }
+        clear_video_packets();
+        seeked = true;
+    }
+    seeked
+}
+
+fn decode_single_audio_chunk(
+    audio_source: &mut dyn AudioSource,
+    chunk: &mut AudioChunk,
+    hardware_channels: usize,
+    sample_rate: u32,
+    chunk_frames: usize,
+) -> (usize, f32, u32) {
+    let chunk_start_seconds = audio_source.get_position_seconds();
+    let decode_start = Instant::now();
+    let frames_read = audio_source.read_frames(
+        hardware_channels,
+        sample_rate,
+        &mut chunk.samples[..chunk_frames * hardware_channels],
+    );
+    let decode_elapsed = decode_start.elapsed().as_micros() as f32;
+
+    chunk.valid_frames = frames_read;
+    chunk.current_order = audio_source.get_current_order();
+    chunk.current_row = audio_source.get_current_row();
+    chunk.bpm = audio_source.get_tempo();
+    chunk.speed = audio_source.get_speed();
+    chunk.current_seconds = chunk_start_seconds;
+    chunk.current_row_string.clear();
+    chunk
+        .current_row_string
+        .push_str(&audio_source.get_current_row_string());
+    chunk.tracker_channels = audio_source.get_tracker_channels();
+    chunk.spatial_channels = audio_source.get_num_channels();
+    chunk.track_ended = frames_read == 0;
+
+    let mut left_peak = 0.0_f32;
+    let mut right_peak = 0.0_f32;
+    let mut clips = 0u32;
+    for i in 0..frames_read {
+        let l_val = chunk.samples[i * hardware_channels];
+        left_peak = left_peak.max(l_val.abs());
+        if l_val.abs() > 1.0001 {
+            clips += 1;
+        }
+
+        if hardware_channels > 1 {
+            let r_val = chunk.samples[i * hardware_channels + 1];
+            right_peak = right_peak.max(r_val.abs());
+            if r_val.abs() > 1.0001 {
+                clips += 1;
+            }
+        } else {
+            right_peak = left_peak;
+        }
+    }
+    chunk.left_peak = left_peak;
+    chunk.right_peak = right_peak;
+
+    chunk.channel_vus.clear();
+    if let Some(num_mod_channels) = chunk.tracker_channels {
+        chunk.channel_vus.push(left_peak);
+        for i in 0..num_mod_channels {
+            chunk
+                .channel_vus
+                .push(audio_source.get_current_channel_vu_mono(i));
+        }
+        chunk.channel_vus.push(right_peak);
+    } else {
+        for i in 0..chunk.spatial_channels {
+            chunk
+                .channel_vus
+                .push(audio_source.get_current_channel_vu_mono(i));
+        }
+    }
+
+    (frames_read, decode_elapsed, clips)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_media_decoder_threads(
     mut audio_source: Box<dyn AudioSource>,
     shared_state: Arc<Mutex<AppState>>,
-    tx: Sender<DspMessage>,
+    stop_token: Arc<std::sync::atomic::AtomicBool>,
+    ready_tx: Sender<AudioChunk>,
+    ready_rx: Receiver<AudioChunk>,
+    free_tx: Sender<AudioChunk>,
+    free_rx: Receiver<AudioChunk>,
+    hardware_channels: usize,
     sample_rate: u32,
-    window_size: usize,
+    chunk_frames: usize,
+    pool_size: usize,
+    prime_chunks: usize,
     _current_path: &str,
-) -> Result<PlaybackHandle> {
-    let stop_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let stop_token_clone = stop_token.clone();
-    let hardware_channels = 2;
-    let chunk_frames = 1024;
-    let pool_size = ((sample_rate as usize * 8) / chunk_frames).clamp(384, 1024);
-
-    let (ready_tx, ready_rx) = bounded::<AudioChunk>(pool_size);
-    let (free_tx, free_rx) = unbounded::<AudioChunk>();
+) {
     #[cfg(not(target_os = "android"))]
     let (video_packet_tx, video_packet_rx) = bounded::<(u64, ffmpeg_next::Packet)>(4096);
     #[cfg(target_os = "android")]
@@ -4518,6 +4869,25 @@ fn run_dummy(
         });
     }
 
+    for _ in 0..prime_chunks {
+        if let Ok(mut chunk) = free_rx.try_recv() {
+            let (frames_read, _, _) = decode_single_audio_chunk(
+                audio_source.as_mut(),
+                &mut chunk,
+                hardware_channels,
+                sample_rate,
+                chunk_frames,
+            );
+            if frames_read > 0 {
+                chunk.track_ended = false;
+                let _ = ready_tx.try_send(chunk);
+            } else {
+                let _ = free_tx.try_send(chunk);
+                break;
+            }
+        }
+    }
+
     let state_for_decoder = shared_state.clone();
     let ready_rx_for_decoder = ready_rx.clone();
     let free_tx_for_decoder = free_tx.clone();
@@ -4531,131 +4901,15 @@ fn run_dummy(
                     return;
                 }
                 if let Ok(mut state) = state_for_decoder.try_lock() {
-                    if let Some(mix_req) = state.audio_mix_request.take()
-                        && state.audio_tracks.len() > 1
-                        && !mix_req.is_empty()
-                    {
-                        let mut new_active: Vec<usize> =
-                            mix_req.iter().map(|&(idx, _)| idx).collect();
-                        new_active.sort();
-                        let current_active = audio_source.get_active_audio_tracks();
-                        let tracks_changed = new_active != current_active;
-                        let play_pos = state.current_seconds;
-                        if audio_source.set_active_audio_tracks(&mix_req).is_ok() {
-                            if tracks_changed {
-                                audio_source.set_position_seconds(play_pos);
-                                state.audio_track_request = None;
-                            }
-                            state.active_audio_tracks = audio_source.get_active_audio_tracks();
-                            if let Some(&first_idx) = state.active_audio_tracks.first() {
-                                state.selected_audio_track = first_idx;
-                            }
-                            state.num_channels = audio_source.get_num_channels();
-                            let ch_count = state.num_channels as usize;
-                            state.channel_vus.resize(ch_count, 0.0);
-                            state.peak_vus.resize(ch_count, 0.0);
-                            state.module_type = audio_source.get_type();
-                            state.bitrate = audio_source.get_bitrate();
-                            state.multi_track_mix_mode = state.active_audio_tracks.len() > 1;
-
-                            if state.audio_track_volumes.len() != state.audio_tracks.len() {
-                                state.audio_track_volumes = vec![1.0; state.audio_tracks.len()];
-                            }
-                            for &(idx, vol) in &mix_req {
-                                if idx < state.audio_track_volumes.len() {
-                                    state.audio_track_volumes[idx] = vol;
-                                }
-                            }
-
-                            if tracks_changed {
-                                let mix_desc = if state.active_audio_tracks.len() > 1 {
-                                    let track_nums: Vec<String> = state
-                                        .active_audio_tracks
-                                        .iter()
-                                        .map(|idx| (idx + 1).to_string())
-                                        .collect();
-                                    format!("🎛 Audio Mix: Tracks {}", track_nums.join("+"))
-                                } else {
-                                    let idx = state.selected_audio_track;
-                                    let track_title = state
-                                        .audio_tracks
-                                        .get(idx)
-                                        .map(|t| t.title.clone())
-                                        .unwrap_or_else(|| format!("Track {}", idx + 1));
-                                    if track_title.to_lowercase().starts_with("track") {
-                                        format!("🎛 {}", track_title)
-                                    } else {
-                                        format!("🎛 Track {}: {}", idx + 1, track_title)
-                                    }
-                                };
-                                state.osd_text = Some(mix_desc);
-                                state.osd_timer = 3.0;
-
-                                state.lookahead_queue.clear();
-                                state.lookahead_sample_buffer.clear();
-                                state.lookahead_timeline.fill(0.0);
-                                state.lookahead_buffer_start_time = play_pos;
-                                state.waveform_history.clear();
-
-                                while let Ok(c) = ready_rx_for_decoder.try_recv() {
-                                    let _ = free_tx_for_decoder.try_send(c);
-                                }
-                            }
-                        }
-                    }
-                    if let Some(track_idx) = state.audio_track_request.take()
-                        && state.audio_tracks.len() > 1
-                        && track_idx < state.audio_tracks.len()
-                        && (audio_source.get_active_audio_tracks() != vec![track_idx])
-                    {
-                        let play_pos = state.current_seconds;
-                        if audio_source.select_audio_track(track_idx).is_ok() {
-                            audio_source.set_position_seconds(play_pos);
-                            state.selected_audio_track = track_idx;
-                            state.active_audio_tracks = vec![track_idx];
-                            state.multi_track_mix_mode = false;
-                            state.num_channels = audio_source.get_num_channels();
-                            let ch_count = state.num_channels as usize;
-                            state.channel_vus.resize(ch_count, 0.0);
-                            state.peak_vus.resize(ch_count, 0.0);
-                            state.module_type = audio_source.get_type();
-                            state.bitrate = audio_source.get_bitrate();
-                            let track_title = state
-                                .audio_tracks
-                                .get(track_idx)
-                                .map(|t| t.title.clone())
-                                .unwrap_or_else(|| format!("Track {}", track_idx + 1));
-                            let display_title = if track_title.to_lowercase().starts_with("track") {
-                                format!("🎛 {}", track_title)
-                            } else {
-                                format!("🎛 Track {}: {}", track_idx + 1, track_title)
-                            };
-                            state.osd_text = Some(display_title);
-                            state.osd_timer = 3.0;
-
-                            state.lookahead_queue.clear();
-                            state.lookahead_sample_buffer.clear();
-                            state.lookahead_timeline.fill(0.0);
-                            state.lookahead_buffer_start_time = play_pos;
-                            state.waveform_history.clear();
-
-                            while let Ok(c) = ready_rx_for_decoder.try_recv() {
-                                let _ = free_tx_for_decoder.try_send(c);
-                            }
-                        }
-                    }
-                    if let Some(pos) = state.seek_request.take() {
-                        audio_source.set_position_seconds(pos);
-                        state.current_seconds = pos;
-                        state.track_ended = false;
-                        state.seek_epoch += 1;
-                        state.lookahead_queue.clear();
-                        state.lookahead_sample_buffer.clear();
-                        while let Ok(c) = ready_rx_for_decoder.try_recv() {
-                            let _ = free_tx_for_decoder.try_send(c);
-                        }
-                        while video_rx_for_decoder.try_recv().is_ok() {}
-                    }
+                    process_decoder_state_requests(
+                        &mut state,
+                        audio_source.as_mut(),
+                        &ready_rx_for_decoder,
+                        &free_tx_for_decoder,
+                        || {
+                            while video_rx_for_decoder.try_recv().is_ok() {}
+                        },
+                    );
                 }
                 match free_rx.recv_timeout(std::time::Duration::from_millis(10)) {
                     Ok(c) => break c,
@@ -4664,66 +4918,13 @@ fn run_dummy(
                 }
             };
 
-            let chunk_start_seconds = audio_source.get_position_seconds();
-            let decode_start = Instant::now();
-            let frames_read = audio_source.read_frames(
+            let (frames_read, decode_elapsed, clips) = decode_single_audio_chunk(
+                audio_source.as_mut(),
+                &mut chunk,
                 hardware_channels,
                 sample_rate,
-                &mut chunk.samples[..chunk_frames * hardware_channels],
+                chunk_frames,
             );
-            let decode_elapsed = decode_start.elapsed().as_micros() as f32;
-
-            chunk.valid_frames = frames_read;
-            chunk.current_order = audio_source.get_current_order();
-            chunk.current_row = audio_source.get_current_row();
-            chunk.bpm = audio_source.get_tempo();
-            chunk.speed = audio_source.get_speed();
-            chunk.current_seconds = chunk_start_seconds;
-            chunk.current_row_string.clear();
-            chunk
-                .current_row_string
-                .push_str(&audio_source.get_current_row_string());
-            chunk.tracker_channels = audio_source.get_tracker_channels();
-            chunk.spatial_channels = audio_source.get_num_channels();
-            chunk.track_ended = frames_read == 0;
-
-            let mut left_peak = 0.0_f32;
-            let mut right_peak = 0.0_f32;
-            let mut clips = 0;
-            for i in 0..frames_read {
-                let l_val = chunk.samples[i * hardware_channels];
-                left_peak = left_peak.max(l_val.abs());
-                if l_val.abs() > 1.0001 {
-                    clips += 1;
-                }
-
-                if hardware_channels > 1 {
-                    let r_val = chunk.samples[i * hardware_channels + 1];
-                    right_peak = right_peak.max(r_val.abs());
-                    if r_val.abs() > 1.0001 {
-                        clips += 1;
-                    }
-                } else {
-                    right_peak = left_peak;
-                }
-            }
-            chunk.left_peak = left_peak;
-            chunk.right_peak = right_peak;
-
-            let mut channel_vus = Vec::new();
-            if let Some(num_mod_channels) = chunk.tracker_channels {
-                channel_vus.push(left_peak);
-                for i in 0..num_mod_channels {
-                    channel_vus.push(audio_source.get_current_channel_vu_mono(i));
-                }
-                channel_vus.push(right_peak);
-            } else {
-                for i in 0..chunk.spatial_channels {
-                    channel_vus.push(audio_source.get_current_channel_vu_mono(i));
-                }
-            }
-            chunk.channel_vus.clear();
-            chunk.channel_vus.extend_from_slice(&channel_vus);
 
             let current_artist = audio_source.get_artist();
             if let Ok(mut state) = state_for_decoder.try_lock() {
@@ -4759,137 +4960,15 @@ fn run_dummy(
                 }
                 let mut seeked = false;
                 if let Ok(mut state) = state_for_decoder.try_lock() {
-                    if let Some(mix_req) = state.audio_mix_request.take()
-                        && state.audio_tracks.len() > 1
-                        && !mix_req.is_empty()
-                    {
-                        let mut new_active: Vec<usize> =
-                            mix_req.iter().map(|&(idx, _)| idx).collect();
-                        new_active.sort();
-                        let current_active = audio_source.get_active_audio_tracks();
-                        let tracks_changed = new_active != current_active;
-                        let play_pos = state.current_seconds;
-                        if audio_source.set_active_audio_tracks(&mix_req).is_ok() {
-                            if tracks_changed {
-                                audio_source.set_position_seconds(play_pos);
-                                state.audio_track_request = None;
-                            }
-                            state.active_audio_tracks = audio_source.get_active_audio_tracks();
-                            if let Some(&first_idx) = state.active_audio_tracks.first() {
-                                state.selected_audio_track = first_idx;
-                            }
-                            state.num_channels = audio_source.get_num_channels();
-                            let ch_count = state.num_channels as usize;
-                            state.channel_vus.resize(ch_count, 0.0);
-                            state.peak_vus.resize(ch_count, 0.0);
-                            state.module_type = audio_source.get_type();
-                            state.bitrate = audio_source.get_bitrate();
-                            state.multi_track_mix_mode = state.active_audio_tracks.len() > 1;
-
-                            if state.audio_track_volumes.len() != state.audio_tracks.len() {
-                                state.audio_track_volumes = vec![1.0; state.audio_tracks.len()];
-                            }
-                            for &(idx, vol) in &mix_req {
-                                if idx < state.audio_track_volumes.len() {
-                                    state.audio_track_volumes[idx] = vol;
-                                }
-                            }
-
-                            if tracks_changed {
-                                let mix_desc = if state.active_audio_tracks.len() > 1 {
-                                    let track_nums: Vec<String> = state
-                                        .active_audio_tracks
-                                        .iter()
-                                        .map(|idx| (idx + 1).to_string())
-                                        .collect();
-                                    format!("🎛 Audio Mix: Tracks {}", track_nums.join("+"))
-                                } else {
-                                    let idx = state.selected_audio_track;
-                                    let track_title = state
-                                        .audio_tracks
-                                        .get(idx)
-                                        .map(|t| t.title.clone())
-                                        .unwrap_or_else(|| format!("Track {}", idx + 1));
-                                    if track_title.to_lowercase().starts_with("track") {
-                                        format!("🎛 {}", track_title)
-                                    } else {
-                                        format!("🎛 Track {}: {}", idx + 1, track_title)
-                                    }
-                                };
-                                state.osd_text = Some(mix_desc);
-                                state.osd_timer = 3.0;
-
-                                state.lookahead_queue.clear();
-                                state.lookahead_sample_buffer.clear();
-                                state.lookahead_timeline.fill(0.0);
-                                state.lookahead_buffer_start_time = play_pos;
-                                state.waveform_history.clear();
-
-                                while let Ok(c) = ready_rx_for_decoder.try_recv() {
-                                    let _ = free_tx_for_decoder.try_send(c);
-                                }
-                                seeked = true;
-                            }
-                        }
-                    }
-                    if let Some(track_idx) = state.audio_track_request.take()
-                        && state.audio_tracks.len() > 1
-                        && track_idx < state.audio_tracks.len()
-                        && (audio_source.get_active_audio_tracks() != vec![track_idx])
-                    {
-                        let play_pos = state.current_seconds;
-                        if audio_source.select_audio_track(track_idx).is_ok() {
-                            audio_source.set_position_seconds(play_pos);
-                            state.selected_audio_track = track_idx;
-                            state.active_audio_tracks = vec![track_idx];
-                            state.multi_track_mix_mode = false;
-                            state.num_channels = audio_source.get_num_channels();
-                            let ch_count = state.num_channels as usize;
-                            state.channel_vus.resize(ch_count, 0.0);
-                            state.peak_vus.resize(ch_count, 0.0);
-                            state.module_type = audio_source.get_type();
-                            state.bitrate = audio_source.get_bitrate();
-                            let track_title = state
-                                .audio_tracks
-                                .get(track_idx)
-                                .map(|t| t.title.clone())
-                                .unwrap_or_else(|| format!("Track {}", track_idx + 1));
-                            let display_title = if track_title.to_lowercase().starts_with("track") {
-                                format!("🎛 {}", track_title)
-                            } else {
-                                format!("🎛 Track {}: {}", track_idx + 1, track_title)
-                            };
-                            state.osd_text = Some(display_title);
-                            state.osd_timer = 3.0;
-
-                            state.lookahead_queue.clear();
-                            state.lookahead_sample_buffer.clear();
-                            state.lookahead_timeline.fill(0.0);
-                            state.lookahead_buffer_start_time = play_pos;
-                            state.waveform_history.clear();
-
-                            while let Ok(c) = ready_rx_for_decoder.try_recv() {
-                                let _ = free_tx_for_decoder.try_send(c);
-                            }
-                            seeked = true;
-                        }
-                    }
-                    if let Some(pos) = state.seek_request.take() {
-                        audio_source.set_position_seconds(pos);
-                        state.current_seconds = pos;
-                        state.track_ended = false;
-                        state.seek_epoch += 1;
-                        state.lookahead_queue.clear();
-                        state.lookahead_sample_buffer.clear();
-                        state.lookahead_timeline.fill(0.0);
-                        state.lookahead_buffer_start_time = pos;
-                        state.waveform_history.clear();
-                        while let Ok(c) = ready_rx_for_decoder.try_recv() {
-                            let _ = free_tx_for_decoder.try_send(c);
-                        }
-                        while video_rx_for_decoder.try_recv().is_ok() {}
-                        seeked = true;
-                    }
+                    seeked = process_decoder_state_requests(
+                        &mut state,
+                        audio_source.as_mut(),
+                        &ready_rx_for_decoder,
+                        &free_tx_for_decoder,
+                        || {
+                            while video_rx_for_decoder.try_recv().is_ok() {}
+                        },
+                    );
                 }
                 if seeked {
                     let _ = free_tx_for_decoder.try_send(chunk_to_send);
@@ -4911,6 +4990,40 @@ fn run_dummy(
             }
         }
     });
+}
+
+fn run_dummy(
+    audio_source: Box<dyn AudioSource>,
+    shared_state: Arc<Mutex<AppState>>,
+    tx: Sender<DspMessage>,
+    sample_rate: u32,
+    window_size: usize,
+    current_path: &str,
+) -> Result<PlaybackHandle> {
+    let stop_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let stop_token_clone = stop_token.clone();
+    let hardware_channels = 2;
+    let chunk_frames = 1024;
+    let pool_size = ((sample_rate as usize * 8) / chunk_frames).clamp(384, 1024);
+
+    let (ready_tx, ready_rx) = bounded::<AudioChunk>(pool_size);
+    let (free_tx, free_rx) = unbounded::<AudioChunk>();
+
+    spawn_media_decoder_threads(
+        audio_source,
+        shared_state.clone(),
+        stop_token.clone(),
+        ready_tx,
+        ready_rx.clone(),
+        free_tx.clone(),
+        free_rx,
+        hardware_channels,
+        sample_rate,
+        chunk_frames,
+        pool_size,
+        0,
+        current_path,
+    );
 
     let shared_state_dummy = shared_state.clone();
 
@@ -4918,10 +5031,8 @@ fn run_dummy(
         let mut fft_buffer: Vec<f32> = vec![0.0; window_size];
         let mut channel_fft_buffers: Vec<Vec<f32>> =
             vec![vec![0.0; window_size]; hardware_channels];
-        let mut windowed_buffer: Vec<f32> = vec![0.0; window_size];
-        let mut windowed_channels: Vec<Vec<f32>> = vec![vec![0.0; window_size]; hardware_channels];
-        let mut spare_channels: Vec<Vec<f32>> = vec![vec![0.0; window_size]; hardware_channels];
         let mut fft_index = 0;
+        let recycle_rx = dsp_recycle_channel().1.clone();
 
         let mut was_paused = false;
 
@@ -4965,30 +5076,21 @@ fn run_dummy(
                         fft_index = (fft_index + 1) % window_size;
                     }
 
-                    for i in 0..window_size {
-                        let idx = (fft_index + i) % window_size;
-                        windowed_buffer[i] = fft_buffer[idx];
-                        for c in 0..hardware_channels {
-                            windowed_channels[c][i] = channel_fft_buffers[c][idx];
-                        }
-                    }
-
-                    std::mem::swap(&mut windowed_channels, &mut spare_channels);
-
-                    let msg = DspMessage {
-                        audio_data: windowed_buffer.clone(),
-                        channel_vus: chunk.channel_vus.clone(),
-                        current_order: chunk.current_order,
-                        current_row: chunk.current_row,
-                        bpm: chunk.bpm,
-                        speed: chunk.speed,
-                        current_seconds: chunk.current_seconds,
-                        current_row_string: chunk.current_row_string.clone(),
-                        channel_audio_data: std::mem::replace(
-                            &mut spare_channels,
-                            vec![vec![0.0; window_size]; hardware_channels],
-                        ),
-                    };
+                    let msg = build_recycled_dsp_message(
+                        &recycle_rx,
+                        &fft_buffer,
+                        &channel_fft_buffers,
+                        fft_index,
+                        window_size,
+                        hardware_channels,
+                        &chunk.channel_vus,
+                        chunk.current_order,
+                        chunk.current_row,
+                        chunk.bpm,
+                        chunk.speed,
+                        chunk.current_seconds,
+                        &chunk.current_row_string,
+                    );
 
                     let _ = tx.try_send(msg);
 
@@ -5012,6 +5114,77 @@ fn run_dummy(
     });
 
     Ok(PlaybackHandle::Dummy(Some(thread_handle), stop_token))
+}
+
+#[inline(always)]
+fn copy_ring_buffer(dst: &mut [f32], src: &[f32], split_idx: usize) {
+    let window_size = dst.len();
+    let split = split_idx.min(window_size);
+    let tail_len = window_size - split;
+    dst[..tail_len].copy_from_slice(&src[split..window_size]);
+    dst[tail_len..window_size].copy_from_slice(&src[..split]);
+}
+
+#[allow(clippy::too_many_arguments)]
+#[inline]
+fn build_recycled_dsp_message(
+    recycle_rx: &Receiver<DspMessage>,
+    fft_buffer: &[f32],
+    channel_fft_buffers: &[Vec<f32>],
+    fft_index: usize,
+    window_size: usize,
+    hardware_channels: usize,
+    channel_vus: &[f32],
+    current_order: i32,
+    current_row: i32,
+    bpm: i32,
+    speed: i32,
+    current_seconds: f64,
+    current_row_string: &str,
+) -> DspMessage {
+    let mut msg = recycle_rx.try_recv().unwrap_or_else(|_| DspMessage {
+        audio_data: vec![0.0; window_size],
+        channel_vus: Vec::with_capacity(hardware_channels.max(16)),
+        current_order: 0,
+        current_row: 0,
+        bpm: 0,
+        speed: 0,
+        current_seconds: 0.0,
+        current_row_string: String::with_capacity(256),
+        channel_audio_data: vec![vec![0.0; window_size]; hardware_channels],
+    });
+
+    if msg.audio_data.len() != window_size {
+        msg.audio_data.resize(window_size, 0.0);
+    }
+    copy_ring_buffer(&mut msg.audio_data, fft_buffer, fft_index);
+
+    if msg.channel_audio_data.len() != hardware_channels {
+        msg.channel_audio_data
+            .resize_with(hardware_channels, || vec![0.0; window_size]);
+    }
+    for (dst_ch, src_ch) in msg
+        .channel_audio_data
+        .iter_mut()
+        .zip(channel_fft_buffers.iter())
+        .take(hardware_channels)
+    {
+        if dst_ch.len() != window_size {
+            dst_ch.resize(window_size, 0.0);
+        }
+        copy_ring_buffer(dst_ch, src_ch, fft_index);
+    }
+
+    msg.channel_vus.clear();
+    msg.channel_vus.extend_from_slice(channel_vus);
+    msg.current_order = current_order;
+    msg.current_row = current_row;
+    msg.bpm = bpm;
+    msg.speed = speed;
+    msg.current_seconds = current_seconds;
+    msg.current_row_string.clear();
+    msg.current_row_string.push_str(current_row_string);
+    msg
 }
 
 struct AudioChunk {
@@ -5041,7 +5214,7 @@ fn run<T>(
     sample_rate: u32,
     _max_frequency: f32,
     window_size: usize,
-    _current_path: &str,
+    current_path: &str,
 ) -> Result<(cpal::Stream, Arc<std::sync::atomic::AtomicBool>)>
 where
     T: cpal::Sample + cpal::FromSample<f32> + cpal::SizedSample,
@@ -5055,20 +5228,15 @@ where
     let (ready_tx, ready_rx) = bounded::<AudioChunk>(pool_size);
     let (free_tx, free_rx) = unbounded::<AudioChunk>();
 
-    #[cfg(not(target_os = "android"))]
-    let (video_packet_tx, video_packet_rx) = bounded::<(u64, ffmpeg_next::Packet)>(4096);
-    #[cfg(target_os = "android")]
-    let (_video_packet_tx, video_packet_rx) = bounded::<(u64, ())>(1);
-
     let mut current_chunk: Option<AudioChunk> = None;
     let mut chunk_frame_pos = 0;
 
     let mut fft_buffer: Vec<f32> = vec![0.0; window_size];
     let mut channel_fft_buffers: Vec<Vec<f32>> = vec![vec![0.0; window_size]; hardware_channels];
-    let mut windowed_buffer: Vec<f32> = vec![0.0; window_size];
-    let mut windowed_channels: Vec<Vec<f32>> = vec![vec![0.0; window_size]; hardware_channels];
-    let mut spare_channels: Vec<Vec<f32>> = vec![vec![0.0; window_size]; hardware_channels];
     let mut fft_index = 0;
+    let recycle_rx = dsp_recycle_channel().1.clone();
+    let dsp_send_interval = (sample_rate as usize / 120).max(1);
+    let mut frames_since_last_dsp_send = dsp_send_interval;
 
     let mut last_channel_vus = Vec::new();
     let mut last_current_order = 0;
@@ -5177,36 +5345,28 @@ where
                 }
             }
 
-            // Re-use pre-allocated windowed_channels instead of heap-allocating per callback
-            for i in 0..window_size {
-                let idx = (fft_index + i) % window_size;
-                windowed_buffer[i] = fft_buffer[idx];
-                for c in 0..hardware_channels {
-                    windowed_channels[c][i] = channel_fft_buffers[c][idx];
-                }
+            frames_since_last_dsp_send += frames_written;
+            if frames_since_last_dsp_send >= dsp_send_interval {
+                frames_since_last_dsp_send = 0;
+                let play_time =
+                    last_current_seconds + (chunk_frame_pos as f64 / sample_rate as f64);
+                let msg = build_recycled_dsp_message(
+                    &recycle_rx,
+                    &fft_buffer,
+                    &channel_fft_buffers,
+                    fft_index,
+                    window_size,
+                    hardware_channels,
+                    &last_channel_vus,
+                    last_current_order,
+                    last_current_row,
+                    last_bpm,
+                    last_speed,
+                    play_time,
+                    &last_current_row_string,
+                );
+                let _ = tx_cb.try_send(msg);
             }
-
-            // Swap filled buffers with spare set — zero allocations in the hot path
-            std::mem::swap(&mut windowed_channels, &mut spare_channels);
-            // spare_channels now has the filled data, windowed_channels has the empties
-
-            let play_time = last_current_seconds + (chunk_frame_pos as f64 / sample_rate as f64);
-            let msg = DspMessage {
-                audio_data: windowed_buffer.clone(),
-                channel_vus: last_channel_vus.clone(),
-                current_order: last_current_order,
-                current_row: last_current_row,
-                bpm: last_bpm,
-                speed: last_speed,
-                current_seconds: play_time,
-                current_row_string: last_current_row_string.clone(),
-                channel_audio_data: std::mem::replace(
-                    &mut spare_channels,
-                    vec![vec![0.0; window_size]; hardware_channels],
-                ),
-            };
-
-            let _ = tx_cb.try_send(msg);
         },
         move |err| {
             match &err {
@@ -5236,741 +5396,22 @@ where
     )?;
 
     // Only take the audio source once stream creation has succeeded
-    let mut audio_source = audio_source_opt.take().unwrap();
-    #[cfg(not(target_os = "android"))]
-    audio_source.attach_video_queue(video_packet_tx);
-
-    #[cfg(target_os = "android")]
-    if audio_source.has_video_stream() {
-        crate::android_video::decoder::start_android_video_thread(
-            _current_path,
-            shared_state.clone(),
-            stop_token.clone(),
-        );
-    }
-
-    #[cfg(not(target_os = "android"))]
-    if let Some((params, time_base, rotation)) = audio_source.take_video_parameters() {
-        let (video_frame_tx, video_frame_rx) = bounded::<crate::state::VideoFrame>(16);
-        let (free_video_frame_tx, free_video_frame_rx) = unbounded::<crate::state::VideoFrame>();
-
-        for _ in 0..16 {
-            let _ = free_video_frame_tx.try_send(crate::state::VideoFrame {
-                pts: 0.0,
-                width: 0,
-                height: 0,
-                rotation,
-                y_plane: Vec::new(),
-                u_plane: Vec::new(),
-                v_plane: Vec::new(),
-                y_stride: 0,
-                u_stride: 0,
-                v_stride: 0,
-                bit_depth: 8,
-                color_space: 0,
-                color_range: 0,
-                color_trc: 0,
-            });
-        }
-
-        if let Ok(mut state) = shared_state.lock() {
-            state.video_frame_rx = Some(video_frame_rx);
-            state.free_video_frame_tx = Some(free_video_frame_tx.clone());
-        }
-
-        let state_for_video = shared_state.clone();
-        let video_packet_rx_for_video = video_packet_rx.clone();
-        let stop_token_video = stop_token.clone();
-        std::thread::spawn(move || {
-            if let Ok(context) = ffmpeg_next::codec::context::Context::from_parameters(params)
-                && let Ok(mut decoder) = context.decoder().video()
-            {
-                let tb = time_base.numerator() as f64 / time_base.denominator() as f64;
-                let mut local_epoch = 0;
-                let mut fallback_pts_seconds = 0.0;
-                let mut is_first_frame_after_seek = false;
-
-                while !stop_token_video.load(std::sync::atomic::Ordering::Relaxed) {
-                    match video_packet_rx_for_video
-                        .recv_timeout(std::time::Duration::from_millis(50))
-                    {
-                        Ok((packet_epoch, packet)) => {
-                            {
-                                let state = state_for_video.lock().unwrap();
-                                if state.seek_epoch > local_epoch {
-                                    decoder.flush();
-                                    local_epoch = state.seek_epoch;
-                                    is_first_frame_after_seek = true;
-                                }
-                            }
-
-                            if packet_epoch < local_epoch {
-                                continue;
-                            }
-
-                            if decoder.send_packet(&packet).is_ok() {
-                                let mut decoded = ffmpeg_next::frame::Video::empty();
-                                while decoder.receive_frame(&mut decoded).is_ok() {
-                                    if stop_token_video.load(std::sync::atomic::Ordering::Relaxed) {
-                                        return;
-                                    }
-                                    let mut pts = decoded
-                                        .timestamp()
-                                        .map(|t| t as f64 * tb)
-                                        .or_else(|| decoded.pts().map(|p| p as f64 * tb))
-                                        .unwrap_or(-1.0);
-
-                                    if pts < 0.0 {
-                                        pts = fallback_pts_seconds;
-                                        fallback_pts_seconds += 1.0 / 30.0;
-                                    } else {
-                                        fallback_pts_seconds = pts + (1.0 / 30.0);
-                                    }
-
-                                    let mut skip_push = false;
-                                    if is_first_frame_after_seek {
-                                        is_first_frame_after_seek = false;
-                                    } else {
-                                        let sync_start = std::time::Instant::now();
-                                        loop {
-                                            if stop_token_video
-                                                .load(std::sync::atomic::Ordering::Relaxed)
-                                            {
-                                                return;
-                                            }
-                                            let (
-                                                cached_seconds,
-                                                current_epoch,
-                                                is_paused,
-                                                track_ended,
-                                            ) = {
-                                                let state = state_for_video.lock().unwrap();
-                                                (
-                                                    state.current_seconds,
-                                                    state.seek_epoch,
-                                                    state.is_paused,
-                                                    state.track_ended,
-                                                )
-                                            };
-
-                                            if track_ended || current_epoch > local_epoch {
-                                                skip_push = true;
-                                                break;
-                                            }
-
-                                            if pts < cached_seconds - 0.05 {
-                                                skip_push = true;
-                                                break;
-                                            }
-
-                                            if pts <= cached_seconds + 0.05 {
-                                                break;
-                                            }
-
-                                            if sync_start.elapsed()
-                                                > std::time::Duration::from_millis(500)
-                                            {
-                                                skip_push = true;
-                                                break;
-                                            }
-
-                                            let sleep_dur = if is_paused { 50 } else { 5 };
-                                            std::thread::sleep(std::time::Duration::from_millis(
-                                                sleep_dur,
-                                            ));
-                                        }
-                                    }
-
-                                    if skip_push {
-                                        continue;
-                                    }
-
-                                    let mut frame_opt = None;
-                                    loop {
-                                        if stop_token_video
-                                            .load(std::sync::atomic::Ordering::Relaxed)
-                                        {
-                                            return;
-                                        }
-                                        let (current_epoch, is_paused, track_ended) = {
-                                            let state = state_for_video.lock().unwrap();
-                                            (state.seek_epoch, state.is_paused, state.track_ended)
-                                        };
-                                        if track_ended || current_epoch > local_epoch {
-                                            skip_push = true;
-                                            break;
-                                        }
-                                        match free_video_frame_rx
-                                            .recv_timeout(std::time::Duration::from_millis(10))
-                                        {
-                                            Ok(f) => {
-                                                frame_opt = Some(f);
-                                                break;
-                                            }
-                                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                                                let sleep_dur = if is_paused { 50 } else { 5 };
-                                                std::thread::sleep(
-                                                    std::time::Duration::from_millis(sleep_dur),
-                                                );
-                                            }
-                                            Err(
-                                                crossbeam_channel::RecvTimeoutError::Disconnected,
-                                            ) => {
-                                                return;
-                                            }
-                                        }
-                                    }
-
-                                    if skip_push {
-                                        continue;
-                                    }
-
-                                    if let Some(mut frame) = frame_opt {
-                                        frame.pts = pts;
-                                        frame.width = decoded.width();
-                                        frame.height = decoded.height();
-                                        frame.rotation = rotation;
-
-                                        let format_name = format!("{:?}", decoded.format());
-                                        frame.bit_depth = if format_name.contains("10LE") {
-                                            10
-                                        } else if format_name.contains("12LE") {
-                                            12
-                                        } else {
-                                            8
-                                        };
-                                        frame.color_space = decoded.color_space() as u32;
-                                        frame.color_range = decoded.color_range() as u32;
-                                        frame.color_trc =
-                                            decoded.color_transfer_characteristic() as u32;
-
-                                        frame.y_stride = decoded.stride(0);
-                                        frame.u_stride = decoded.stride(1);
-                                        frame.v_stride = decoded.stride(2);
-
-                                        let height = decoded.height() as usize;
-                                        let y_len = frame.y_stride * height;
-                                        let u_len = frame.u_stride * (height / 2);
-                                        let v_len = frame.v_stride * (height / 2);
-
-                                        frame.y_plane.clear();
-                                        let y_plane = decoded.data(0);
-                                        let y_copy_len = y_len.min(y_plane.len());
-                                        frame.y_plane.extend_from_slice(&y_plane[..y_copy_len]);
-                                        if y_copy_len < y_len {
-                                            frame.y_plane.resize(y_len, 0);
-                                        }
-
-                                        frame.u_plane.clear();
-                                        let u_plane = decoded.data(1);
-                                        let u_copy_len = u_len.min(u_plane.len());
-                                        frame.u_plane.extend_from_slice(&u_plane[..u_copy_len]);
-                                        if u_copy_len < u_len {
-                                            frame.u_plane.resize(u_len, 0);
-                                        }
-
-                                        frame.v_plane.clear();
-                                        let v_plane = decoded.data(2);
-                                        let v_copy_len = v_len.min(v_plane.len());
-                                        frame.v_plane.extend_from_slice(&v_plane[..v_copy_len]);
-                                        if v_copy_len < v_len {
-                                            frame.v_plane.resize(v_len, 0);
-                                        }
-
-                                        if let Err(crossbeam_channel::TrySendError::Full(f)) =
-                                            video_frame_tx.try_send(frame)
-                                        {
-                                            let _ = free_video_frame_tx.try_send(f);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-                    }
-                }
-            }
-        });
-    }
-
-    for _ in 0..pool_size {
-        let _ = free_tx.try_send(AudioChunk {
-            samples: vec![0.0; chunk_frames * hardware_channels],
-            valid_frames: 0,
-            channel_vus: Vec::with_capacity(32),
-            left_peak: 0.0,
-            right_peak: 0.0,
-            current_order: 0,
-            current_row: 0,
-            bpm: 0,
-            speed: 0,
-            current_seconds: 0.0,
-            current_row_string: String::with_capacity(128),
-            tracker_channels: None,
-            spatial_channels: 0,
-            track_ended: false,
-        });
-    }
-
-    // Pre-decode a few chunks to prime the audio queue so CPAL immediately has samples upon start
-    for _ in 0..4 {
-        if let Ok(mut chunk) = free_rx.try_recv() {
-            let chunk_start_seconds = audio_source.get_position_seconds();
-            let frames_read = audio_source.read_frames(
-                hardware_channels,
-                sample_rate,
-                &mut chunk.samples[..chunk_frames * hardware_channels],
-            );
-            if frames_read > 0 {
-                chunk.valid_frames = frames_read;
-                chunk.current_order = audio_source.get_current_order();
-                chunk.current_row = audio_source.get_current_row();
-                chunk.bpm = audio_source.get_tempo();
-                chunk.speed = audio_source.get_speed();
-                chunk.current_seconds = chunk_start_seconds;
-                chunk.current_row_string.clear();
-                chunk
-                    .current_row_string
-                    .push_str(&audio_source.get_current_row_string());
-                chunk.tracker_channels = audio_source.get_tracker_channels();
-                chunk.spatial_channels = audio_source.get_num_channels();
-                chunk.track_ended = false;
-
-                let mut left_peak = 0.0_f32;
-                let mut right_peak = 0.0_f32;
-                for i in 0..frames_read {
-                    let l_val = chunk.samples[i * hardware_channels];
-                    left_peak = left_peak.max(l_val.abs());
-                    if hardware_channels > 1 {
-                        let r_val = chunk.samples[i * hardware_channels + 1];
-                        right_peak = right_peak.max(r_val.abs());
-                    } else {
-                        right_peak = left_peak;
-                    }
-                }
-                chunk.left_peak = left_peak;
-                chunk.right_peak = right_peak;
-
-                let mut channel_vus = Vec::new();
-                if let Some(num_mod_channels) = chunk.tracker_channels {
-                    channel_vus.push(left_peak);
-                    for i in 0..num_mod_channels {
-                        channel_vus.push(audio_source.get_current_channel_vu_mono(i));
-                    }
-                    channel_vus.push(right_peak);
-                } else {
-                    for i in 0..chunk.spatial_channels {
-                        channel_vus.push(audio_source.get_current_channel_vu_mono(i));
-                    }
-                }
-                chunk.channel_vus.clear();
-                chunk.channel_vus.extend_from_slice(&channel_vus);
-
-                let _ = ready_tx.try_send(chunk);
-            } else {
-                let _ = free_tx.try_send(chunk);
-                break;
-            }
-        }
-    }
-
-    let state_for_decoder = shared_state.clone();
-    let ready_rx_for_decoder = ready_rx.clone();
-    let free_tx_for_decoder = free_tx.clone();
-    let video_rx_for_decoder = video_packet_rx.clone();
-    let stop_token_decoder = stop_token.clone();
-
-    std::thread::spawn(move || {
-        while !stop_token_decoder.load(std::sync::atomic::Ordering::Relaxed) {
-            let mut chunk = loop {
-                if stop_token_decoder.load(std::sync::atomic::Ordering::Relaxed) {
-                    return;
-                }
-                if let Ok(mut state) = state_for_decoder.try_lock() {
-                    if let Some(mix_req) = state.audio_mix_request.take()
-                        && state.audio_tracks.len() > 1
-                        && !mix_req.is_empty()
-                    {
-                        let mut new_active: Vec<usize> =
-                            mix_req.iter().map(|&(idx, _)| idx).collect();
-                        new_active.sort();
-                        let current_active = audio_source.get_active_audio_tracks();
-                        let tracks_changed = new_active != current_active;
-                        let play_pos = state.current_seconds;
-                        if audio_source.set_active_audio_tracks(&mix_req).is_ok() {
-                            if tracks_changed {
-                                audio_source.set_position_seconds(play_pos);
-                                state.audio_track_request = None;
-                            }
-                            state.active_audio_tracks = audio_source.get_active_audio_tracks();
-                            if let Some(&first_idx) = state.active_audio_tracks.first() {
-                                state.selected_audio_track = first_idx;
-                            }
-                            state.num_channels = audio_source.get_num_channels();
-                            let ch_count = state.num_channels as usize;
-                            state.channel_vus.resize(ch_count, 0.0);
-                            state.peak_vus.resize(ch_count, 0.0);
-                            state.module_type = audio_source.get_type();
-                            state.bitrate = audio_source.get_bitrate();
-                            state.multi_track_mix_mode = state.active_audio_tracks.len() > 1;
-
-                            if state.audio_track_volumes.len() != state.audio_tracks.len() {
-                                state.audio_track_volumes = vec![1.0; state.audio_tracks.len()];
-                            }
-                            for &(idx, vol) in &mix_req {
-                                if idx < state.audio_track_volumes.len() {
-                                    state.audio_track_volumes[idx] = vol;
-                                }
-                            }
-
-                            if tracks_changed {
-                                let mix_desc = if state.active_audio_tracks.len() > 1 {
-                                    let track_nums: Vec<String> = state
-                                        .active_audio_tracks
-                                        .iter()
-                                        .map(|idx| (idx + 1).to_string())
-                                        .collect();
-                                    format!("🎛 Audio Mix: Tracks {}", track_nums.join("+"))
-                                } else {
-                                    let idx = state.selected_audio_track;
-                                    let track_title = state
-                                        .audio_tracks
-                                        .get(idx)
-                                        .map(|t| t.title.clone())
-                                        .unwrap_or_else(|| format!("Track {}", idx + 1));
-                                    if track_title.to_lowercase().starts_with("track") {
-                                        format!("🎛 {}", track_title)
-                                    } else {
-                                        format!("🎛 Track {}: {}", idx + 1, track_title)
-                                    }
-                                };
-                                state.osd_text = Some(mix_desc);
-                                state.osd_timer = 3.0;
-
-                                state.lookahead_queue.clear();
-                                state.lookahead_sample_buffer.clear();
-                                state.lookahead_timeline.fill(0.0);
-                                state.lookahead_buffer_start_time = play_pos;
-                                state.waveform_history.clear();
-
-                                while let Ok(c) = ready_rx_for_decoder.try_recv() {
-                                    let _ = free_tx_for_decoder.try_send(c);
-                                }
-                            }
-                        }
-                    }
-                    if let Some(track_idx) = state.audio_track_request.take()
-                        && state.audio_tracks.len() > 1
-                        && track_idx < state.audio_tracks.len()
-                        && (audio_source.get_active_audio_tracks() != vec![track_idx])
-                    {
-                        let play_pos = state.current_seconds;
-                        if audio_source.select_audio_track(track_idx).is_ok() {
-                            audio_source.set_position_seconds(play_pos);
-                            state.selected_audio_track = track_idx;
-                            state.active_audio_tracks = vec![track_idx];
-                            state.multi_track_mix_mode = false;
-                            state.num_channels = audio_source.get_num_channels();
-                            let ch_count = state.num_channels as usize;
-                            state.channel_vus.resize(ch_count, 0.0);
-                            state.peak_vus.resize(ch_count, 0.0);
-                            state.module_type = audio_source.get_type();
-                            state.bitrate = audio_source.get_bitrate();
-                            let track_title = state
-                                .audio_tracks
-                                .get(track_idx)
-                                .map(|t| t.title.clone())
-                                .unwrap_or_else(|| format!("Track {}", track_idx + 1));
-                            let display_title = if track_title.to_lowercase().starts_with("track") {
-                                format!("🎛 {}", track_title)
-                            } else {
-                                format!("🎛 Track {}: {}", track_idx + 1, track_title)
-                            };
-                            state.osd_text = Some(display_title);
-                            state.osd_timer = 3.0;
-
-                            state.lookahead_queue.clear();
-                            state.lookahead_sample_buffer.clear();
-                            state.lookahead_timeline.fill(0.0);
-                            state.lookahead_buffer_start_time = play_pos;
-                            state.waveform_history.clear();
-
-                            while let Ok(c) = ready_rx_for_decoder.try_recv() {
-                                let _ = free_tx_for_decoder.try_send(c);
-                            }
-                        }
-                    }
-                    if let Some(pos) = state.seek_request.take() {
-                        audio_source.set_position_seconds(pos);
-                        state.current_seconds = pos;
-                        state.track_ended = false;
-                        state.seek_epoch += 1;
-                        state.lookahead_queue.clear();
-                        state.lookahead_sample_buffer.clear();
-                        state.lookahead_timeline.fill(0.0);
-                        state.lookahead_buffer_start_time = pos;
-                        state.waveform_history.clear();
-                        while let Ok(c) = ready_rx_for_decoder.try_recv() {
-                            let _ = free_tx_for_decoder.try_send(c);
-                        }
-                        while video_rx_for_decoder.try_recv().is_ok() {}
-                    }
-                }
-                match free_rx.recv_timeout(std::time::Duration::from_millis(10)) {
-                    Ok(c) => break c,
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
-                }
-            };
-
-            let chunk_start_seconds = audio_source.get_position_seconds();
-            let decode_start = Instant::now();
-            let frames_read = audio_source.read_frames(
-                hardware_channels,
-                sample_rate,
-                &mut chunk.samples[..chunk_frames * hardware_channels],
-            );
-            let decode_elapsed = decode_start.elapsed().as_micros() as f32;
-
-            chunk.valid_frames = frames_read;
-            chunk.current_order = audio_source.get_current_order();
-            chunk.current_row = audio_source.get_current_row();
-            chunk.bpm = audio_source.get_tempo();
-            chunk.speed = audio_source.get_speed();
-            chunk.current_seconds = chunk_start_seconds;
-            chunk.current_row_string.clear();
-            chunk
-                .current_row_string
-                .push_str(&audio_source.get_current_row_string());
-            chunk.tracker_channels = audio_source.get_tracker_channels();
-            chunk.spatial_channels = audio_source.get_num_channels();
-            chunk.track_ended = frames_read == 0;
-
-            let mut left_peak = 0.0_f32;
-            let mut right_peak = 0.0_f32;
-            let mut clips = 0;
-            for i in 0..frames_read {
-                let l_val = chunk.samples[i * hardware_channels];
-                left_peak = left_peak.max(l_val.abs());
-                if l_val.abs() > 1.0001 {
-                    clips += 1;
-                }
-
-                if hardware_channels > 1 {
-                    let r_val = chunk.samples[i * hardware_channels + 1];
-                    right_peak = right_peak.max(r_val.abs());
-                    if r_val.abs() > 1.0001 {
-                        clips += 1;
-                    }
-                } else {
-                    right_peak = left_peak;
-                }
-            }
-            chunk.left_peak = left_peak;
-            chunk.right_peak = right_peak;
-
-            let mut channel_vus = Vec::new();
-            if let Some(num_mod_channels) = chunk.tracker_channels {
-                channel_vus.push(left_peak);
-                for i in 0..num_mod_channels {
-                    channel_vus.push(audio_source.get_current_channel_vu_mono(i));
-                }
-                channel_vus.push(right_peak);
-            } else {
-                for i in 0..chunk.spatial_channels {
-                    channel_vus.push(audio_source.get_current_channel_vu_mono(i));
-                }
-            }
-            chunk.channel_vus.clear();
-            chunk.channel_vus.extend_from_slice(&channel_vus);
-
-            let current_artist = audio_source.get_artist();
-            if let Ok(mut state) = state_for_decoder.try_lock() {
-                if current_artist != "Unknown" && !current_artist.is_empty() {
-                    if let Some((artist_part, title_part)) = current_artist.split_once(" - ") {
-                        if state.artist != artist_part || state.song_title != title_part {
-                            state.artist = artist_part.to_string();
-                            state.song_title = title_part.to_string();
-                        }
-                    } else if state.artist != current_artist {
-                        state.artist = current_artist.clone();
-                    }
-                }
-                state.stats.decode_us = state.stats.decode_us * 0.9 + decode_elapsed * 0.1;
-                let fill_pct = (ready_rx_for_decoder.len() as f32 / pool_size as f32) * 100.0;
-                state.stats.audio_buffer_fill_pct = fill_pct;
-                let video_pct = (video_rx_for_decoder.len() as f32 / 4096.0) * 100.0;
-                state.stats.video_buffer_fill_pct = video_pct;
-                state.stats.clipping_events += clips;
-                push_chunk_lookahead_slices(
-                    &mut state,
-                    &chunk,
-                    frames_read,
-                    hardware_channels,
-                    sample_rate,
-                );
-            }
-
-            let mut chunk_to_send = chunk;
-            loop {
-                if stop_token_decoder.load(std::sync::atomic::Ordering::Relaxed) {
-                    return;
-                }
-                let mut seeked = false;
-                if let Ok(mut state) = state_for_decoder.try_lock() {
-                    if let Some(mix_req) = state.audio_mix_request.take()
-                        && state.audio_tracks.len() > 1
-                        && !mix_req.is_empty()
-                    {
-                        let mut new_active: Vec<usize> =
-                            mix_req.iter().map(|&(idx, _)| idx).collect();
-                        new_active.sort();
-                        let current_active = audio_source.get_active_audio_tracks();
-                        let tracks_changed = new_active != current_active;
-                        let play_pos = state.current_seconds;
-                        if audio_source.set_active_audio_tracks(&mix_req).is_ok() {
-                            if tracks_changed {
-                                audio_source.set_position_seconds(play_pos);
-                                state.audio_track_request = None;
-                            }
-                            state.active_audio_tracks = audio_source.get_active_audio_tracks();
-                            if let Some(&first_idx) = state.active_audio_tracks.first() {
-                                state.selected_audio_track = first_idx;
-                            }
-                            state.num_channels = audio_source.get_num_channels();
-                            let ch_count = state.num_channels as usize;
-                            state.channel_vus.resize(ch_count, 0.0);
-                            state.peak_vus.resize(ch_count, 0.0);
-                            state.module_type = audio_source.get_type();
-                            state.bitrate = audio_source.get_bitrate();
-                            state.multi_track_mix_mode = state.active_audio_tracks.len() > 1;
-
-                            if state.audio_track_volumes.len() != state.audio_tracks.len() {
-                                state.audio_track_volumes = vec![1.0; state.audio_tracks.len()];
-                            }
-                            for &(idx, vol) in &mix_req {
-                                if idx < state.audio_track_volumes.len() {
-                                    state.audio_track_volumes[idx] = vol;
-                                }
-                            }
-
-                            if tracks_changed {
-                                let mix_desc = if state.active_audio_tracks.len() > 1 {
-                                    let track_nums: Vec<String> = state
-                                        .active_audio_tracks
-                                        .iter()
-                                        .map(|idx| (idx + 1).to_string())
-                                        .collect();
-                                    format!("🎛 Audio Mix: Tracks {}", track_nums.join("+"))
-                                } else {
-                                    let idx = state.selected_audio_track;
-                                    let track_title = state
-                                        .audio_tracks
-                                        .get(idx)
-                                        .map(|t| t.title.clone())
-                                        .unwrap_or_else(|| format!("Track {}", idx + 1));
-                                    if track_title.to_lowercase().starts_with("track") {
-                                        format!("🎛 {}", track_title)
-                                    } else {
-                                        format!("🎛 Track {}: {}", idx + 1, track_title)
-                                    }
-                                };
-                                state.osd_text = Some(mix_desc);
-                                state.osd_timer = 3.0;
-
-                                state.lookahead_queue.clear();
-                                state.lookahead_sample_buffer.clear();
-                                state.lookahead_timeline.fill(0.0);
-                                state.lookahead_buffer_start_time = play_pos;
-                                state.waveform_history.clear();
-
-                                while let Ok(c) = ready_rx_for_decoder.try_recv() {
-                                    let _ = free_tx_for_decoder.try_send(c);
-                                }
-                                seeked = true;
-                            }
-                        }
-                    }
-                    if let Some(track_idx) = state.audio_track_request.take()
-                        && state.audio_tracks.len() > 1
-                        && track_idx < state.audio_tracks.len()
-                        && (audio_source.get_active_audio_tracks() != vec![track_idx])
-                    {
-                        let play_pos = state.current_seconds;
-                        if audio_source.select_audio_track(track_idx).is_ok() {
-                            audio_source.set_position_seconds(play_pos);
-                            state.selected_audio_track = track_idx;
-                            state.active_audio_tracks = vec![track_idx];
-                            state.multi_track_mix_mode = false;
-                            state.num_channels = audio_source.get_num_channels();
-                            let ch_count = state.num_channels as usize;
-                            state.channel_vus.resize(ch_count, 0.0);
-                            state.peak_vus.resize(ch_count, 0.0);
-                            state.module_type = audio_source.get_type();
-                            state.bitrate = audio_source.get_bitrate();
-                            let track_title = state
-                                .audio_tracks
-                                .get(track_idx)
-                                .map(|t| t.title.clone())
-                                .unwrap_or_else(|| format!("Track {}", track_idx + 1));
-                            let display_title = if track_title.to_lowercase().starts_with("track") {
-                                format!("🎛 {}", track_title)
-                            } else {
-                                format!("🎛 Track {}: {}", track_idx + 1, track_title)
-                            };
-                            state.osd_text = Some(display_title);
-                            state.osd_timer = 3.0;
-
-                            state.lookahead_queue.clear();
-                            state.lookahead_sample_buffer.clear();
-                            state.lookahead_timeline.fill(0.0);
-                            state.lookahead_buffer_start_time = play_pos;
-                            state.waveform_history.clear();
-
-                            while let Ok(c) = ready_rx_for_decoder.try_recv() {
-                                let _ = free_tx_for_decoder.try_send(c);
-                            }
-                            seeked = true;
-                        }
-                    }
-                    if let Some(pos) = state.seek_request.take() {
-                        audio_source.set_position_seconds(pos);
-                        state.current_seconds = pos;
-                        state.track_ended = false;
-                        state.seek_epoch += 1;
-                        state.lookahead_queue.clear();
-                        state.lookahead_sample_buffer.clear();
-                        state.lookahead_timeline.fill(0.0);
-                        state.lookahead_buffer_start_time = pos;
-                        state.waveform_history.clear();
-                        while let Ok(c) = ready_rx_for_decoder.try_recv() {
-                            let _ = free_tx_for_decoder.try_send(c);
-                        }
-                        while video_rx_for_decoder.try_recv().is_ok() {}
-                        seeked = true;
-                    }
-                }
-                if seeked {
-                    let _ = free_tx_for_decoder.try_send(chunk_to_send);
-                    break;
-                }
-                match ready_tx.send_timeout(chunk_to_send, std::time::Duration::from_millis(10)) {
-                    Ok(_) => break,
-                    Err(crossbeam_channel::SendTimeoutError::Timeout(c)) => {
-                        chunk_to_send = c;
-                    }
-                    Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
-                        return;
-                    }
-                }
-            }
-
-            if frames_read == 0 {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-            }
-        }
-    });
+    let audio_source = audio_source_opt.take().unwrap();
+    spawn_media_decoder_threads(
+        audio_source,
+        shared_state,
+        stop_token.clone(),
+        ready_tx,
+        ready_rx,
+        free_tx,
+        free_rx,
+        hardware_channels,
+        sample_rate,
+        chunk_frames,
+        pool_size,
+        4,
+        current_path,
+    );
 
     Ok((stream, stop_token))
 }
@@ -5990,10 +5431,10 @@ where
 
     let mut fft_buffer: Vec<f32> = vec![0.0; window_size];
     let mut channel_fft_buffers: Vec<Vec<f32>> = vec![vec![0.0; window_size]; channels];
-    let mut windowed_buffer: Vec<f32> = vec![0.0; window_size];
-    let mut windowed_channels: Vec<Vec<f32>> = vec![vec![0.0; window_size]; channels];
-    let mut spare_channels: Vec<Vec<f32>> = vec![vec![0.0; window_size]; channels];
     let mut fft_index = 0;
+    let recycle_rx = dsp_recycle_channel().1.clone();
+    let dsp_send_interval = (config.sample_rate as usize / 120).max(1);
+    let mut frames_since_last_dsp_send = dsp_send_interval;
 
     let mut was_paused = false;
 
@@ -6015,6 +5456,7 @@ where
 
             let mut left_peak = 0.0_f32;
             let mut right_peak = 0.0_f32;
+            let mut frames_written = 0;
 
             for frame in data.chunks(channels) {
                 let left = frame[0].into();
@@ -6033,43 +5475,42 @@ where
                     };
                 }
                 fft_index = (fft_index + 1) % window_size;
+                frames_written += 1;
             }
 
-            for i in 0..window_size {
-                let idx = (fft_index + i) % window_size;
-                windowed_buffer[i] = fft_buffer[idx];
-                for c in 0..channels {
-                    windowed_channels[c][i] = channel_fft_buffers[c][idx];
-                }
+            frames_since_last_dsp_send += frames_written;
+            if frames_since_last_dsp_send >= dsp_send_interval {
+                frames_since_last_dsp_send = 0;
+                let mut channel_vus = [0.0f32; 2];
+                let vu_slice = if channels >= 2 {
+                    channel_vus[0] = left_peak;
+                    channel_vus[1] = right_peak;
+                    &channel_vus[..2]
+                } else if channels == 1 {
+                    channel_vus[0] = left_peak;
+                    &channel_vus[..1]
+                } else {
+                    &channel_vus[..0]
+                };
+
+                let msg = build_recycled_dsp_message(
+                    &recycle_rx,
+                    &fft_buffer,
+                    &channel_fft_buffers,
+                    fft_index,
+                    window_size,
+                    channels,
+                    vu_slice,
+                    0,
+                    0,
+                    0,
+                    0,
+                    0.0,
+                    "",
+                );
+
+                let _ = tx.try_send(msg);
             }
-
-            // Swap filled buffers with spare set — zero allocations in the hot path
-            std::mem::swap(&mut windowed_channels, &mut spare_channels);
-
-            let mut channel_vus = Vec::new();
-            if channels >= 1 {
-                channel_vus.push(left_peak);
-            }
-            if channels >= 2 {
-                channel_vus.push(right_peak);
-            }
-
-            let msg = DspMessage {
-                audio_data: windowed_buffer.clone(),
-                channel_vus,
-                current_order: 0,
-                current_row: 0,
-                bpm: 0,
-                speed: 0,
-                current_seconds: 0.0,
-                current_row_string: String::new(),
-                channel_audio_data: std::mem::replace(
-                    &mut spare_channels,
-                    vec![vec![0.0; window_size]; channels],
-                ),
-            };
-
-            let _ = tx.try_send(msg);
         },
         move |err| match &err {
             cpal::StreamError::DeviceNotAvailable => {

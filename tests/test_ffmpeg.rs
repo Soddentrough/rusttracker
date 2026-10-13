@@ -4,18 +4,22 @@ use ffmpeg_next as ffmpeg;
 fn test_ffmpeg() {
     let _ = ffmpeg::init();
     let file_path = "audio_tests/AAC 5.1.mp4";
-    let ictx = match ffmpeg::format::input(&file_path) {
-        Ok(ictx) => ictx,
-        Err(e) => {
-            println!("Failed to open {}: {}", file_path, e);
-            return;
-        }
-    };
+    assert!(
+        std::path::Path::new(file_path).exists(),
+        "Expected fixture {} to exist",
+        file_path
+    );
+    let ictx = ffmpeg::format::input(&file_path).expect("Failed to open AAC 5.1.mp4 via FFmpeg");
 
-    let video_stream = ictx.streams().best(ffmpeg::media::Type::Video);
-    println!("Video stream: {}", video_stream.is_some());
-    let audio_stream = ictx.streams().best(ffmpeg::media::Type::Audio);
-    println!("Audio stream: {}", audio_stream.is_some());
+    let audio_stream = ictx
+        .streams()
+        .best(ffmpeg::media::Type::Audio)
+        .expect("Expected best audio stream in AAC 5.1.mp4");
+    let ctx = ffmpeg::codec::context::Context::from_parameters(audio_stream.parameters())
+        .expect("Failed to create codec context");
+    let dec = ctx.decoder().audio().expect("Failed to open audio decoder");
+    assert_eq!(dec.channels(), 6, "Expected 6-channel 5.1 audio stream");
+    assert!(dec.rate() > 0, "Expected non-zero sample rate");
 }
 
 #[test]

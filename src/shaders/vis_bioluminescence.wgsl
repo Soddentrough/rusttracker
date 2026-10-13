@@ -28,6 +28,7 @@ struct VertexOutput3D {
     @location(1) energy: f32,
     @location(2) depth: f32,
     @location(3) @interpolate(linear) ndc: vec2<f32>,
+    @location(4) crest_t: f32,
 }
 
 @vertex
@@ -43,11 +44,12 @@ fn vs_main_3d(in: VertexInput, @builtin(instance_index) inst_idx: u32) -> Vertex
         out.energy = 0.0;
         out.depth = 0.0;
         out.ndc = vec2<f32>(0.0);
+        out.crest_t = 0.0;
         return out;
     }
     
     // Scale particle based on energy (pulsing effect) and clamp to prevent excessive blowouts
-    let size = 0.035 + clamp(p.vel.w, 0.0, 1.5) * 0.09;
+    let size = 0.035 + clamp(p.vel.w, 0.0, 1.6) * 0.088;
     
     // Billboard the vertex: offset particle center in view space
     var view_pos = camera.view_matrix * vec4<f32>(p.pos.xyz, 1.0);
@@ -63,6 +65,7 @@ fn vs_main_3d(in: VertexInput, @builtin(instance_index) inst_idx: u32) -> Vertex
         out.energy = 0.0;
         out.depth = 0.0;
         out.ndc = vec2<f32>(0.0);
+        out.crest_t = 0.0;
         return out;
     }
     
@@ -79,14 +82,9 @@ fn vs_main_3d(in: VertexInput, @builtin(instance_index) inst_idx: u32) -> Vertex
     out.energy = p.vel.w;
     out.depth = depth;
     out.ndc = distorted_ndc;
+    out.crest_t = clamp((p.pos.y + 0.45) / 1.35, 0.0, 1.0);
     
     return out;
-}
-
-fn hash21(p: vec2<f32>) -> f32 {
-    var p3 = fract(vec3<f32>(p.xyx) * 0.1031);
-    p3 = p3 + dot(p3, p3.yzx + 33.33);
-    return fract((p3.x + p3.y) * p3.z);
 }
 
 @fragment
@@ -105,10 +103,18 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
         discard;
     }
     
-    // Bioluminescent color gradient
-    let core_col = vec3<f32>(0.7, 1.0, 1.0); // Bright cyan-white core
-    let mid_col  = vec3<f32>(0.0, 0.75, 1.0); // Vivid electric cyan
-    let edge_col = vec3<f32>(0.0, 0.15, 0.7); // Deep sea indigo/blue edge
+    // Dinoflagellate bioluminescent color palette:
+    // Shifts from deep emerald-teal in troughs -> electric luciferin cyan on swells ->
+    // iridescent violet-magenta on high-energy breaking wave crests.
+    let excitation = clamp((in.energy - 0.12) / 1.5, 0.0, 1.0);
+    let crest_shift = clamp(in.crest_t * 0.65 + excitation * 0.55, 0.0, 1.0);
+
+    let core_col = mix(vec3<f32>(0.65, 1.0, 0.95), vec3<f32>(0.92, 0.96, 1.0), crest_shift);
+    let mid_teal = vec3<f32>(0.0, 0.85, 0.68);
+    let mid_cyan = vec3<f32>(0.0, 0.76, 1.0);
+    let mid_violet = vec3<f32>(0.42, 0.35, 1.0);
+    let mid_col = mix(mix(mid_teal, mid_cyan, smoothstep(0.0, 0.55, crest_shift)), mid_violet, smoothstep(0.65, 1.0, crest_shift));
+    let edge_col = mix(vec3<f32>(0.0, 0.16, 0.55), vec3<f32>(0.18, 0.06, 0.72), crest_shift);
     
     // Radial color interpolation
     let t = dist * 2.0; // scale to 0.0 - 1.0
@@ -133,12 +139,12 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     let scanline = 0.86 + 0.14 * cos(in.clip_position.y * 3.14159);
     final_color = final_color * scanline;
     
-    // CRT Filter: Flicker
-    let flicker = 0.98 + 0.02 * sin(audio.time * 115.0);
+    // CRT Filter: Smooth 24Hz phosphor refresh modulation (non-aliasing)
+    let flicker = 0.985 + 0.015 * sin(audio.smooth_time * 24.0);
     final_color = final_color * flicker;
     
-    // CRT Filter: Analog static noise
-    let noise_val = hash21(in.clip_position.xy + fract(audio.smooth_time) * 149.0);
+    // CRT Filter: Analog static noise using _common.wgsl hash21_crt
+    let noise_val = hash21_crt(in.clip_position.xy + fract(audio.smooth_time) * 149.0);
     let static_noise = noise_val * 0.022 * bezel_mask;
     final_color = final_color + vec3<f32>(static_noise);
     

@@ -11,7 +11,7 @@ pub type BitstreamLaunchResult = (
 #[cfg(target_os = "linux")]
 pub fn start_bitstream_thread(
     file_path: &str,
-    _shared_state: std::sync::Arc<std::sync::Mutex<crate::state::AppState>>,
+    shared_state: std::sync::Arc<std::sync::Mutex<crate::state::AppState>>,
     tx: crossbeam_channel::Sender<crate::audio::DspMessage>,
     stop_token: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> anyhow::Result<BitstreamLaunchResult> {
@@ -137,9 +137,25 @@ pub fn start_bitstream_thread(
     let ffmpeg_thread = std::thread::spawn(move || {
         println!("[bitstream] FFmpeg thread started on Linux.");
 
-        let mut octx = ffmpeg_next::format::output_as(&pipe_path_clone, "spdif").unwrap();
+        let mut octx = match ffmpeg_next::format::output_as(&pipe_path_clone, "spdif") {
+            Ok(ctx) => ctx,
+            Err(e) => {
+                eprintln!("[bitstream] Failed to open spdif output pipe: {}", e);
+                let _ = child.kill();
+                let _ = std::fs::remove_file(&pipe_path_clone);
+                return;
+            }
+        };
         let ost_index = {
-            let mut ost = octx.add_stream(ffmpeg_next::codec::Id::None).unwrap();
+            let mut ost = match octx.add_stream(ffmpeg_next::codec::Id::None) {
+                Ok(s) => s,
+                Err(e) => {
+                    eprintln!("[bitstream] Failed to add spdif stream: {}", e);
+                    let _ = child.kill();
+                    let _ = std::fs::remove_file(&pipe_path_clone);
+                    return;
+                }
+            };
             ost.set_parameters(parameters.clone());
             ost.index()
         };
@@ -152,13 +168,20 @@ pub fn start_bitstream_thread(
             let _ = std::fs::remove_file(&pipe_path_clone);
             return;
         }
-        let ost_time_base = octx.stream(ost_index).unwrap().time_base();
+        let Some(ost_stream) = octx.stream(ost_index) else {
+            let _ = child.kill();
+            let _ = std::fs::remove_file(&pipe_path_clone);
+            return;
+        };
+        let ost_time_base = ost_stream.time_base();
 
         let decoder_context =
             match ffmpeg_next::codec::context::Context::from_parameters(parameters.clone()) {
                 Ok(c) => c,
                 Err(e) => {
                     println!("[bitstream] Failed to create decoder context: {}", e);
+                    let _ = child.kill();
+                    let _ = std::fs::remove_file(&pipe_path_clone);
                     return;
                 }
             };
@@ -166,6 +189,8 @@ pub fn start_bitstream_thread(
             Ok(d) => d,
             Err(e) => {
                 println!("[bitstream] Failed to create decoder: {}", e);
+                let _ = child.kill();
+                let _ = std::fs::remove_file(&pipe_path_clone);
                 return;
             }
         };
@@ -188,6 +213,8 @@ pub fn start_bitstream_thread(
             Ok(r) => r,
             Err(e) => {
                 println!("[bitstream] Failed to create resampler: {}", e);
+                let _ = child.kill();
+                let _ = std::fs::remove_file(&pipe_path_clone);
                 return;
             }
         };
@@ -200,95 +227,146 @@ pub fn start_bitstream_thread(
 
         let mut current_seconds = 0.0;
 
-        for (stream, mut packet) in ictx.packets() {
-            if stop_token.load(std::sync::atomic::Ordering::Relaxed) {
-                println!("[bitstream] Stop token received, stopping bitstream.");
-                break;
-            }
-            if stream.index() == best_audio_index {
-                let vis_packet = packet.clone();
+        'stream_loop: loop {
+            let mut seek_target_opt: Option<f64> = None;
 
-                if let Some(pts) = packet.pts() {
-                    current_seconds = pts as f64 * f64::from(stream.time_base());
+            for (stream, mut packet) in ictx.packets() {
+                if stop_token.load(std::sync::atomic::Ordering::Relaxed) {
+                    println!("[bitstream] Stop token received, stopping bitstream.");
+                    break 'stream_loop;
                 }
 
-                packet.rescale_ts(stream.time_base(), ost_time_base);
-                packet.set_stream(ost_index);
-                if packet.write(&mut octx).is_err() {
-                    break; // Pipe broken
+                loop {
+                    if stop_token.load(std::sync::atomic::Ordering::Relaxed) {
+                        break 'stream_loop;
+                    }
+                    let (paused, seek_req) = if let Ok(mut state) = shared_state.try_lock() {
+                        (state.is_paused, state.seek_request.take())
+                    } else {
+                        (false, None)
+                    };
+                    if let Some(target_sec) = seek_req {
+                        seek_target_opt = Some(target_sec);
+                        break;
+                    }
+                    if !paused {
+                        break;
+                    }
+                    if let Ok(mut state) = shared_state.try_lock() {
+                        state.raw_channel_vus.fill(0.0);
+                        state.raw_spectrum_data.fill(0.0);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(15));
                 }
 
-                if decoder.send_packet(&vis_packet).is_ok() {
-                    let mut frame = ffmpeg_next::frame::Audio::empty();
-                    while decoder.receive_frame(&mut frame).is_ok() {
-                        let mut resampled = ffmpeg_next::frame::Audio::empty();
-                        if resampler.run(&frame, &mut resampled).is_ok() {
-                            let planes = resampled.channels() as usize;
-                            if accumulator.len() != planes {
-                                accumulator = vec![Vec::new(); planes];
-                            }
+                if seek_target_opt.is_some() {
+                    break;
+                }
 
-                            let mut fresh_samples = 0;
-                            for (p, acc) in accumulator.iter_mut().enumerate().take(planes) {
-                                let data = resampled.plane::<f32>(p);
-                                if p == 0 {
-                                    fresh_samples = data.len();
+                if stream.index() == best_audio_index {
+                    let vis_packet = packet.clone();
+
+                    if let Some(pts) = packet.pts() {
+                        current_seconds = pts as f64 * f64::from(stream.time_base());
+                    }
+
+                    packet.rescale_ts(stream.time_base(), ost_time_base);
+                    packet.set_stream(ost_index);
+                    if packet.write(&mut octx).is_err() {
+                        break 'stream_loop; // Pipe broken
+                    }
+
+                    if decoder.send_packet(&vis_packet).is_ok() {
+                        let mut frame = ffmpeg_next::frame::Audio::empty();
+                        while decoder.receive_frame(&mut frame).is_ok() {
+                            let mut resampled = ffmpeg_next::frame::Audio::empty();
+                            if resampler.run(&frame, &mut resampled).is_ok() {
+                                let planes = resampled.channels() as usize;
+                                if accumulator.len() != planes {
+                                    accumulator = vec![Vec::new(); planes];
                                 }
-                                acc.extend_from_slice(data);
-                                let excess = acc.len().saturating_sub(window_size);
-                                if excess > 0 {
-                                    acc.drain(0..excess);
-                                }
-                            }
 
-                            samples_since_last_send += fresh_samples;
-
-                            if accumulator.first().map(|a| a.len()).unwrap_or(0) == window_size
-                                && samples_since_last_send >= update_interval
-                            {
-                                samples_since_last_send = 0;
-                                let mut channel_audio_data = Vec::with_capacity(planes);
-                                let mut channel_vus = Vec::with_capacity(planes);
-                                let eval_len = fresh_samples.max(update_interval).min(window_size);
-
-                                for acc in accumulator.iter().take(planes) {
-                                    let window = acc.clone();
-                                    let mut peak = 0.0f32;
-                                    let start_idx = window.len().saturating_sub(eval_len);
-                                    for &s in &window[start_idx..] {
-                                        peak = peak.max(s.abs());
+                                let mut fresh_samples = 0;
+                                for (p, acc) in accumulator.iter_mut().enumerate().take(planes) {
+                                    let data = resampled.plane::<f32>(p);
+                                    if p == 0 {
+                                        fresh_samples = data.len();
                                     }
-                                    channel_vus.push(peak.clamp(0.0, 1.0));
-                                    channel_audio_data.push(window);
-                                }
-
-                                let mut mono_audio_data = vec![0.0f32; window_size];
-                                for acc in accumulator.iter().take(planes) {
-                                    for (i, &sample) in acc.iter().take(window_size).enumerate() {
-                                        mono_audio_data[i] += sample;
+                                    acc.extend_from_slice(data);
+                                    let excess = acc.len().saturating_sub(window_size);
+                                    if excess > 0 {
+                                        acc.drain(0..excess);
                                     }
                                 }
-                                let inv_planes = 1.0 / planes as f32;
-                                for s in &mut mono_audio_data {
-                                    *s *= inv_planes;
-                                }
 
-                                let _ = tx.try_send(crate::audio::DspMessage {
-                                    audio_data: mono_audio_data,
-                                    channel_vus,
-                                    current_order: 0,
-                                    current_row: 0,
-                                    bpm: 0,
-                                    speed: 0,
-                                    current_seconds,
-                                    current_row_string: "".to_string(),
-                                    channel_audio_data,
-                                });
+                                samples_since_last_send += fresh_samples;
+
+                                if accumulator.first().map(|a| a.len()).unwrap_or(0) == window_size
+                                    && samples_since_last_send >= update_interval
+                                {
+                                    samples_since_last_send = 0;
+                                    let mut channel_audio_data = Vec::with_capacity(planes);
+                                    let mut channel_vus = Vec::with_capacity(planes);
+                                    let eval_len =
+                                        fresh_samples.max(update_interval).min(window_size);
+
+                                    for acc in accumulator.iter().take(planes) {
+                                        let window = acc.clone();
+                                        let mut peak = 0.0f32;
+                                        let start_idx = window.len().saturating_sub(eval_len);
+                                        for &s in &window[start_idx..] {
+                                            peak = peak.max(s.abs());
+                                        }
+                                        channel_vus.push(peak.clamp(0.0, 1.0));
+                                        channel_audio_data.push(window);
+                                    }
+
+                                    let mut mono_audio_data = vec![0.0f32; window_size];
+                                    for acc in accumulator.iter().take(planes) {
+                                        for (i, &sample) in acc.iter().take(window_size).enumerate()
+                                        {
+                                            mono_audio_data[i] += sample;
+                                        }
+                                    }
+                                    let inv_planes = 1.0 / planes as f32;
+                                    for s in &mut mono_audio_data {
+                                        *s *= inv_planes;
+                                    }
+
+                                    let _ = tx.try_send(crate::audio::DspMessage {
+                                        audio_data: mono_audio_data,
+                                        channel_vus,
+                                        current_order: 0,
+                                        current_row: 0,
+                                        bpm: 0,
+                                        speed: 0,
+                                        current_seconds,
+                                        current_row_string: "".to_string(),
+                                        channel_audio_data,
+                                    });
+                                }
                             }
                         }
                     }
                 }
             }
+
+            if let Some(target_sec) = seek_target_opt {
+                let target_ts = (target_sec * ffmpeg_next::ffi::AV_TIME_BASE as f64) as i64;
+                let _ = ictx.seek(target_ts, ..target_ts);
+                decoder.flush();
+                for acc in &mut accumulator {
+                    acc.clear();
+                }
+                samples_since_last_send = 0;
+                current_seconds = target_sec;
+                if let Ok(mut state) = shared_state.try_lock() {
+                    state.current_seconds = target_sec;
+                }
+                continue 'stream_loop;
+            }
+
+            break 'stream_loop;
         }
         let _ = octx.write_trailer();
         let _ = child.kill();
@@ -312,180 +390,18 @@ pub fn start_bitstream_thread(
 mod macos_bitstream {
     use crate::audio::DspMessage;
     use crate::state::AppState;
-    use anyhow::{Context, Result};
+    use anyhow::Result;
     use crossbeam_channel::Sender;
-    use std::mem;
-    use std::ptr;
     use std::sync::{Arc, Mutex, atomic::AtomicBool};
 
-    type OSStatus = i32;
-    type AudioObjectID = u32;
-    type AudioDeviceID = AudioObjectID;
-    type AudioObjectPropertySelector = u32;
-    type AudioObjectPropertyScope = u32;
-    type AudioObjectPropertyElement = u32;
-
-    #[repr(C)]
-    struct AudioObjectPropertyAddress {
-        mSelector: AudioObjectPropertySelector,
-        mScope: AudioObjectPropertyScope,
-        mElement: AudioObjectPropertyElement,
-    }
-
-    const kAudioObjectSystemObject: AudioObjectID = 1;
-    const kAudioObjectPropertyScopeGlobal: AudioObjectPropertyScope = 0x676c6f62; // 'glob'
-    const kAudioObjectPropertyElementMain: AudioObjectPropertyElement = 0;
-
-    const kAudioHardwarePropertyDefaultOutputDevice: AudioObjectPropertySelector = 0x6465666f; // 'defo'
-    const kAudioDevicePropertyHogMode: AudioObjectPropertySelector = 0x6f686f67; // 'ohog'
-
-    #[link(name = "CoreAudio", kind = "framework")]
-    unsafe extern "C" {
-        fn AudioObjectGetPropertyData(
-            inObjectID: AudioObjectID,
-            inAddress: *const AudioObjectPropertyAddress,
-            inQualifierDataSize: u32,
-            inQualifierData: *const std::ffi::c_void,
-            ioDataSize: *mut u32,
-            outData: *mut std::ffi::c_void,
-        ) -> OSStatus;
-
-        fn AudioObjectSetPropertyData(
-            inObjectID: AudioObjectID,
-            inAddress: *const AudioObjectPropertyAddress,
-            inQualifierDataSize: u32,
-            inQualifierData: *const std::ffi::c_void,
-            inDataSize: u32,
-            inData: *const std::ffi::c_void,
-        ) -> OSStatus;
-    }
-
     pub fn start_bitstream_thread(
-        file_path: &str,
+        _file_path: &str,
         _shared_state: Arc<Mutex<AppState>>,
         _tx: Sender<DspMessage>,
-        stop_token: Arc<AtomicBool>,
+        _stop_token: Arc<AtomicBool>,
     ) -> Result<super::BitstreamLaunchResult> {
-        println!("[bitstream] Initializing macOS CoreAudio passthrough (Hog Mode)...");
-
-        println!("[bitstream] Probing audio stream via ffmpeg-next...");
-        ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Quiet);
-        ffmpeg_next::init().context("Failed to initialize ffmpeg-next")?;
-
-        let mut dict = ffmpeg_next::Dictionary::new();
-        dict.set("probesize", "5000000");
-        dict.set("analyzeduration", "5000000");
-        let mut ictx = ffmpeg_next::format::input_with_dictionary(&file_path, dict)
-            .context("Failed to open input file")?;
-
-        let best_audio = ictx
-            .streams()
-            .best(ffmpeg_next::media::Type::Audio)
-            .ok_or_else(|| anyhow::anyhow!("No audio stream found"))?;
-
-        let codec_id = best_audio.parameters().id();
-        let codec_name = match codec_id {
-            ffmpeg_next::codec::Id::TRUEHD => "truehd",
-            ffmpeg_next::codec::Id::EAC3 => "eac3",
-            ffmpeg_next::codec::Id::DTS => "dts",
-            ffmpeg_next::codec::Id::AC3 => "ac3",
-            _ => {
-                return Err(anyhow::anyhow!(
-                    "Unsupported codec for bitstreaming: {:?}",
-                    codec_id
-                ));
-            }
-        }
-        .to_string();
-
-        let has_video = ictx
-            .streams()
-            .best(ffmpeg_next::media::Type::Video)
-            .is_some();
-        let parameters = best_audio.parameters();
-
-        let probe_ctx = ffmpeg_next::codec::context::Context::from_parameters(parameters.clone())
-            .context("Failed to create probe context")?;
-        let probe_decoder = probe_ctx
-            .decoder()
-            .audio()
-            .context("Failed to create probe decoder")?;
-        let decoder_sample_rate = probe_decoder.rate();
-        println!(
-            "[bitstream] Codec: {}, Decoder Rate: {} Hz",
-            codec_name, decoder_sample_rate
-        );
-
-        let mut device_id: AudioDeviceID = 0;
-        let mut data_size = mem::size_of::<AudioDeviceID>() as u32;
-        let address = AudioObjectPropertyAddress {
-            mSelector: kAudioHardwarePropertyDefaultOutputDevice,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain,
-        };
-
-        let status = unsafe {
-            AudioObjectGetPropertyData(
-                kAudioObjectSystemObject,
-                &address,
-                0,
-                ptr::null(),
-                &mut data_size,
-                &mut device_id as *mut _ as *mut std::ffi::c_void,
-            )
-        };
-
-        if status != 0 {
-            return Err(anyhow::anyhow!(
-                "Failed to query default output device. CoreAudio OSStatus: {}",
-                status
-            ));
-        }
-        println!("[bitstream] Default output device ID: {}", device_id);
-
-        println!(
-            "[bitstream] Requesting CoreAudio Hog Mode for device {}...",
-            device_id
-        );
-        let hog_address = AudioObjectPropertyAddress {
-            mSelector: kAudioDevicePropertyHogMode,
-            mScope: kAudioObjectPropertyScopeGlobal,
-            mElement: kAudioObjectPropertyElementMain,
-        };
-
-        let my_pid = std::process::id() as i32;
-        let status = unsafe {
-            AudioObjectSetPropertyData(
-                device_id,
-                &hog_address,
-                0,
-                ptr::null(),
-                mem::size_of::<i32>() as u32,
-                &my_pid as *const _ as *const std::ffi::c_void,
-            )
-        };
-
-        if status != 0 {
-            return Err(anyhow::anyhow!(
-                "Failed to acquire Hog Mode (OSStatus: {}). The device may be in use by another process.",
-                status
-            ));
-        }
-
-        // Release Hog Mode immediately and return clean informative error
-        let release_pid: i32 = -1;
-        unsafe {
-            let _ = AudioObjectSetPropertyData(
-                device_id,
-                &hog_address,
-                0,
-                ptr::null(),
-                mem::size_of::<i32>() as u32,
-                &release_pid as *const _ as *const std::ffi::c_void,
-            );
-        };
         Err(anyhow::anyhow!(
-            "macOS CoreAudio bitstream HAL packetization (IEC 61937) is currently under active development. Standard decoded PCM playback is recommended on macOS."
+            "macOS CoreAudio bitstream HAL packetization (IEC 61937) is not supported. Standard decoded PCM playback will be used."
         ))
     }
 }
@@ -897,7 +813,6 @@ mod wasapi_bitstream {
         }
     }
 
-    #[allow(dead_code)]
     pub fn list_devices() -> Result<()> {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);

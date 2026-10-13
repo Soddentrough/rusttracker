@@ -10,7 +10,7 @@ RustTracker leverages a **3-Thread DSP Architecture** and **Hardware-Accelerated
 
 ## 🚀 Features
 
-* **24+ Advanced Hardware Visualizers:** Cinematic WGPU compute and fragment shaders mapped tightly to acoustic frequencies (Ferrofluid, 3D Fire, 3D Synthwave Racer, 3D VU Meter Rack, 3D Glass Water Lyrics, CRT Oscilloscope, Bioluminescence, Neon Corridor, Matrix Rain, and more).
+* **21 Hardware Visualizers:** Cinematic WGPU compute and fragment shaders mapped tightly to acoustic frequencies (Ferrofluid, 3D Fire, 3D Synthwave Racer, 3D VU Meter Rack, 3D Glass Water Lyrics, Water Splash, CRT Oscilloscope, Bioluminescence, Neon Corridor, Matrix Rain, and more).
 * **Multi-Platform Support:** Native support for **Linux (Fedora/RHEL & Ubuntu/Debian)**, **Android (Mobile & Tablet)**, **Windows 10/11**, **macOS**, and **Steam Deck (Gaming Mode)**.
 * **Universal Media Playback:**
   * **Tracker Modules:** `.MOD`, `.S3M`, `.IT`, `.XM` with real-time piano-roll pattern editor and synchronized channel VU meters.
@@ -64,24 +64,38 @@ RustTracker features a specialized dual-pane interface optimized for mobile and 
 
 | Action | Desktop Key | Gamepad (Xbox / Steam Deck) |
 | :--- | :--- | :--- |
-| **Play / Pause** | `Space` | `A` / `South Button` |
-| **Seek Forward / Backward** | `Right` / `Left` Arrow | `D-Pad Right` / `D-Pad Left` |
-| **Volume Up / Down** | `Up` / `Down` Arrow | `D-Pad Up` / `D-Pad Down` |
-| **Next / Previous Visualizer** | `]` / `[` or `Page Down` / `Page Up` | `Right Bumper (RB)` / `Left Bumper (LB)` |
-| **Cycle HUD Tabs** | `1`, `2`, `3`, `4` | `Y` / `North Button` |
-| **Cycle Audio Track** | `T` | `X` / `West Button` |
-| **Toggle HUD Visibility** | `Tab` | `Right Stick Click (R3)` |
-| **Toggle Performance Stats** | `S` | `Back / View Button` |
-| **Toggle Video Layout Mode** | `V` | `Left Stick Click (L3)` |
-| **Toggle Mute** | `M` | `Left Trigger (LT)` |
-| **Fullscreen Toggle** | `F` or `Alt + Enter` | — |
+| **Play / Pause** | `Space` | `A` (`South`) or `Start` |
+| **Seek Backward / Forward** | `Left` / `Right` Arrow | `Left Trigger (LT)` / `Right Trigger (RT)` (analog scrub) |
+| **Prev / Next Track (or Tracker Order)** | `Up` / `Down` Arrow (`[` / `]` for Order) | `D-Pad Left` / `D-Pad Right` |
+| **Prev / Next Visualizer** | `Page Up` / `Page Down` or `,` / `.` | `D-Pad Up` / `D-Pad Down` |
+| **Visualizer Picker Popup** | `V` | `Y` (`North Button`) |
+| **Cycle Display Mode (`Both` ➔ `HUD` ➔ `Vis`)** | `Tab` | `B` (`East Button`) |
+| **Cycle Audio Track** | `A` | `Right Stick Click (R3)` |
+| **Toggle Performance Stats** | `S` | `Select / Back Button` |
+| **Open File Dialog** | `O` | `X` (`West Button`) |
+| **Open Stream / URL Dialog** | `U` | `Left Stick Click (L3)` |
+| **Toggle Playlist Drawer** | `P` | `Left Bumper (LB)` |
+| **Cycle Repeat Mode** | `R` | `Right Bumper (RB)` |
+| **Fullscreen Toggle** | `F` or `F11` | — |
+| **Quit** | `Q` or `Escape` | — |
 
 ---
 
-## ⚙️ Environment Variables & Tuning
+## ⚙️ Command-Line Options & Environment Variables
 
-* **`RUSTTRACKER_FPS_LIMIT=<fps>`**: Set a software framerate cap (e.g. `RUSTTRACKER_FPS_LIMIT=120` for power saving on laptops/handhelds). Defaults to uncapped hardware rate (2,000+ FPS).
+### Command-Line Flags
+* **`--tui`**: Launch in terminal UI (TUI) spectrum analyzer and tracker mode.
+* **`--mic`**: Capture live microphone input instead of playing a file.
+* **`--vis <id>`**: Start directly on the specified hardware visualizer ID.
+* **`--uncapped`**: Disable VSync/refresh-rate pacing and run at uncapped hardware frame rates (`Immediate` present mode).
+* **`--bench [frames]`**: Run automated benchmark loop for a given frame count (default `300`) with GPU timestamp profiling enabled.
+* **`--fullscreen` / `--windowed`**: Force fullscreen or windowed startup mode.
+
+### Environment Variables
+* **`RUSTTRACKER_FPS_LIMIT=<fps>`**: Set an explicit software framerate cap (e.g. `RUSTTRACKER_FPS_LIMIT=120`). By default, RustTracker paces to the active display refresh rate (or VSync).
 * **`RUSTTRACKER_PROFILE=1`**: Enables GPU hardware timestamp profiling (`wgpu::Features::TIMESTAMP_QUERY`) in the Stats overlay (`S` key) to measure exact per-shader microsecond timings.
+* **`RUSTTRACKER_PRESENT_MODE=<fifo|mailbox|immediate>`**: Override the WGPU surface present mode.
+* **`RUSTTRACKER_PIPELINE_CACHE=0`**: Disable on-disk Vulkan/WGPU pipeline cache loading and saving.
 
 ---
 

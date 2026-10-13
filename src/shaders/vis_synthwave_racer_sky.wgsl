@@ -12,9 +12,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Y positive UP, centered coordinates
     let p = (in.uv - vec2<f32>(0.5)) * vec2<f32>(aspect, -1.0);
 
-    let bass_pulse = clamp(audio.spectrum[2].x * 1.5, 0.0, 1.2);
-    let mid_pulse = clamp(audio.spectrum[25].x * 1.6, 0.0, 1.2);
-    let treble_pulse = clamp(audio.spectrum[80].x * 1.8, 0.0, 1.2);
+    let bass_pulse = clamp((audio.spectrum[1].x + audio.spectrum[2].x + audio.spectrum[3].x) / 180.0, 0.0, 1.2);
+    let mid_pulse = clamp((audio.spectrum[20].x + audio.spectrum[28].x) / 130.0, 0.0, 1.2);
+    let treble_pulse = clamp((audio.spectrum[70].x + audio.spectrum[85].x) / 120.0, 0.0, 1.2);
 
     let horizon_y = 0.02; // Horizon line matching 3D camera line of sight
 
@@ -47,7 +47,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             let d = length(star_local - star_offset);
             let star_point = smoothstep_r(0.18, 0.0, d);
             let star_twinkle = sin(audio.smooth_time * 3.5 + star_rnd * 40.0) * 0.4 + 0.6;
-            sky_col += vec3<f32>(0.92, 0.96, 1.0) * star_point * star_twinkle * (0.6 + treble_pulse * 0.6);
+            sky_col += vec3<f32>(0.92, 0.96, 1.0) * star_point * star_twinkle * (0.6 + treble_pulse * 0.7);
         }
     }
 
@@ -62,20 +62,20 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let rel_y = (p.y - (sun_center.y - sun_radius)) / (sun_radius * 2.0);
         
         let blind_freq = 24.0;
-        let blind_phase = fract((p.y - horizon_y) * blind_freq);
+        let blind_phase = fract((p.y - horizon_y) * blind_freq - audio.smooth_time * (0.45 + bass_pulse * 0.35));
         let blind_gap = mix(0.55, 0.04, smoothstep(0.05, 0.75, rel_y));
         let is_slit = (rel_y < 0.70) && (blind_phase < blind_gap);
 
         if (!is_slit) {
             let sun_c = mix(vec3<f32>(1.0, 0.90, 0.20), vec3<f32>(1.0, 0.04, 0.48), clamp(rel_y * 1.25, 0.0, 1.0));
             let sun_edge = smoothstep_r(sun_radius, sun_radius - 0.015, sun_dist);
-            sky_col = mix(sky_col, sun_c * (2.4 + bass_pulse * 0.7), sun_edge);
+            sky_col = mix(sky_col, sun_c * (2.2 + bass_pulse * 0.85), sun_edge);
         }
     }
 
     // Volumetric Sun Corona / Glow Halo
     let corona_f = 1.0 / (1.0 + pow(sun_dist / sun_radius, 2.4));
-    sky_col += vec3<f32>(1.0, 0.14, 0.42) * corona_f * (0.85 + bass_pulse * 0.65);
+    sky_col += vec3<f32>(1.0, 0.14, 0.42) * corona_f * (0.80 + bass_pulse * 0.70);
 
     // =========================================================================
     // 3. DISTANT JAGGED MOUNTAIN PEAKS (Far Range + Holographic Grid)

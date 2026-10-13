@@ -500,17 +500,30 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     // 4. HUGE Spectrum Analyzer
     let spec_height = main_chunks[1].height.saturating_sub(2) as usize;
     let spec_width = main_chunks[1].width.saturating_sub(2) as usize;
-    let chars_per_spec = (spec_width / state.spectrum_data.len().max(1)).max(1);
+    let spec_len = state.spectrum_data.len();
+    let num_cols = spec_width.clamp(1, spec_len.max(1));
+    let chars_per_spec = (spec_width / num_cols).max(1);
     let mut spec_lines = Vec::new();
 
     for row in (0..spec_height.saturating_sub(1)).rev() {
-        let mut spans = Vec::new();
-        let threshold = (row as f32) / ((spec_height - 1) as f32) * 100.0;
-        let next_threshold = ((row + 1) as f32) / ((spec_height - 1) as f32) * 100.0;
+        let mut spans = Vec::with_capacity(num_cols);
+        let denom = spec_height.saturating_sub(1).max(1) as f32;
+        let threshold = (row as f32) / denom * 100.0;
+        let next_threshold = ((row + 1) as f32) / denom * 100.0;
 
-        for i in 0..state.spectrum_data.len() {
-            let val = state.spectrum_data[i];
-            let peak = state.spectrum_peaks[i];
+        for col in 0..num_cols {
+            let start_bin = (col * spec_len) / num_cols;
+            let end_bin = (((col + 1) * spec_len) / num_cols)
+                .max(start_bin + 1)
+                .min(spec_len);
+            let mut val = 0.0f32;
+            let mut peak = 0.0f32;
+            for b in start_bin..end_bin {
+                val = val.max(state.spectrum_data[b]);
+                if b < state.spectrum_peaks.len() {
+                    peak = peak.max(state.spectrum_peaks[b]);
+                }
+            }
 
             let symbol = if peak >= threshold && peak < next_threshold {
                 "▄"
@@ -548,10 +561,10 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         spec_lines.push(Line::from(spans));
     }
 
-    // Spectrum Labels (Overlay onto a single string to prevent truncation)
+    // Spectrum Labels (Logarithmic 20Hz..20kHz mapped to terminal columns)
     let mut label_line = vec![' '; spec_width];
-    let mut write_label = |bin: usize, text: &str| {
-        let mut start_idx = bin * chars_per_spec;
+    let mut write_label = |col: usize, text: &str| {
+        let mut start_idx = col * chars_per_spec;
         if start_idx + text.len() > spec_width {
             start_idx = spec_width.saturating_sub(text.len());
         }
@@ -562,12 +575,13 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         }
     };
 
-    if state.spectrum_data.len() >= 128 {
-        write_label(0, "0Hz");
-        write_label(128 / 4, "2.5kHz");
-        write_label(128 / 2, "5kHz");
-        write_label(128 * 3 / 4, "7.5kHz");
-        write_label(127, "10kHz");
+    if num_cols >= 16 {
+        // Log scale: freq = 20 * 1000^(frac) => frac = log10(freq / 20) / 3.0
+        write_label(0, "20Hz");
+        write_label(((num_cols as f32) * 0.233) as usize, "100Hz");
+        write_label(((num_cols as f32) * 0.566) as usize, "1kHz");
+        write_label(((num_cols as f32) * 0.799) as usize, "5kHz");
+        write_label(num_cols.saturating_sub(1), "20kHz");
     }
 
     let label_str: String = label_line.into_iter().collect();
