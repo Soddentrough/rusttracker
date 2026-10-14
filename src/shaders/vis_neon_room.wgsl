@@ -70,10 +70,9 @@ fn get_spatial_color(ch: u32) -> vec3<f32> {
 fn get_channel_level(ch: u32) -> f32 {
     let idx = min(ch, 11u);
     if (audio.num_spatial_channels > 2u) {
-        if (idx < audio.num_spatial_channels) {
-            return audio.spatial_channels[idx / 4u][idx % 4u];
-        }
-        return 0.0;
+        let actual_ch = min(audio.num_spatial_channels, 16u);
+        let src_ch = idx % actual_ch;
+        return audio.spatial_channels[src_ch / 4u][src_ch % 4u];
     }
     let ch_l = audio.spatial_channels[0].x;
     let ch_r = select(ch_l, audio.spatial_channels[0].y, audio.num_spatial_channels >= 2u);
@@ -106,17 +105,18 @@ fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
     // while the inner cone and dustcap (cone_center_weight == 1.0) pump dynamically!
     var displacement = 0.0;
     if (mat_id >= 1.8 && mat_id <= 3.5) {
-        let pump_osc = 0.65 + 0.35 * sin(audio.smooth_time * 38.0 + f32(ch_idx) * 1.1);
-        let radial_excursion = 0.08 + 0.92 * cone_center_weight;
+        let pump_osc = 0.60 + 0.40 * sin(audio.smooth_time * 36.0 + f32(ch_idx) * 1.2);
+        let radial_excursion = 0.10 + 0.90 * cone_center_weight;
+        let drive = max(ch_energy, 0.0);
         if (ch_idx == 3u) {
             // LFE subwoofer has deep physical excursion
-            displacement = (ch_energy * 0.50 + bass_pulse * 0.50) * 0.26 * pump_osc * radial_excursion;
+            displacement = (drive * 0.85 + bass_pulse * 0.65) * 0.42 * pump_osc * radial_excursion;
         } else if (mat_id < 2.5) {
             // Bass woofers
-            displacement = (ch_energy * 0.65 + bass_pulse * 0.35) * 0.16 * pump_osc * radial_excursion;
+            displacement = (drive * 0.90 + bass_pulse * 0.45) * 0.32 * pump_osc * radial_excursion;
         } else {
             // Midrange cones
-            displacement = ch_energy * 0.10 * pump_osc * radial_excursion;
+            displacement = (drive * 0.80) * 0.22 * pump_osc * radial_excursion;
         }
     }
     

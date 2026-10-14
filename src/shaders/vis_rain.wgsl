@@ -5,10 +5,14 @@
 // --- Connected main & forked lightning bolt with horizontal X-culling ---
 // Returns vec2(main_bolt_glow, branch_bolt_glow)
 fn lightning_bolt_forked(uv: vec2<f32>, seed: f32, intensity: f32) -> vec2<f32> {
-    // Early-out for inactive channels or pixels outside the bolt's horizontal corridor
-    if (intensity < 0.01 || abs(uv.x) > 0.72) {
+    // Early-out for inactive channels or pixels far outside the strike zone
+    let corridor_limit = 0.85;
+    let dist_x = abs(uv.x);
+    if (intensity < 0.01 || dist_x > corridor_limit) {
         return vec2<f32>(0.0);
     }
+    // Smooth horizontal window prevents hard rectangular step seams
+    let edge_fade = smoothstep_r(corridor_limit, corridor_limit * 0.45, dist_x);
 
     var main_bolt = 0.0;
     var branch_bolt = 0.0;
@@ -57,7 +61,7 @@ fn lightning_bolt_forked(uv: vec2<f32>, seed: f32, intensity: f32) -> vec2<f32> 
         }
     }
 
-    return vec2<f32>(main_bolt, branch_bolt) * intensity;
+    return vec2<f32>(main_bolt, branch_bolt) * (intensity * edge_fade);
 }
 
 @fragment

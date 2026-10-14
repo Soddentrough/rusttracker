@@ -5703,11 +5703,11 @@ impl VulkanEngine {
             smooth_time: self.play_time as f32,
             heatmap_row: self.heatmap_row,
             fft_channels: state.raw_audio_channels.len() as u32,
-            num_spatial_channels: state
-                .channel_vus
-                .len()
-                .saturating_sub(state.tracker_channels.unwrap_or(0) as usize)
-                as u32,
+            num_spatial_channels: if let Some(tc) = state.tracker_channels.filter(|&n| n > 0) {
+                (tc as u32).min(16)
+            } else {
+                state.channel_vus.len().min(16) as u32
+            },
             ui_meters_rect: self.meters_uv_rect,
             ui_heatmap_rect: self.heatmap_uv_rect,
             ui_fire_rect: self.fire_uv_rect,
@@ -5800,9 +5800,17 @@ impl VulkanEngine {
         }
 
         // 2. Populate Raw Spatial Channels (strict spatial mapping without UI reordering)
-        if state.tracker_channels.is_some() {
-            // For tracker files, channel_vus is [L_Peak, Track1..N, R_Peak]
-            if state.channel_vus.len() >= 2 {
+        if let Some(num_tracks) = state.tracker_channels.filter(|&n| n > 0) {
+            // For tracker files, channel_vus is [L_Peak, Track1..N, R_Peak].
+            // Map individual tracker tracks into spatial channels so surround/room visualizers
+            // light up each speaker with its actual instrument track!
+            let tracks_count = (num_tracks as usize).min(state.channel_vus.len().saturating_sub(2));
+            if tracks_count > 0 {
+                let count = tracks_count.min(16);
+                for i in 0..count {
+                    uniforms.spatial_channels[i] = state.channel_vus[i + 1];
+                }
+            } else if state.channel_vus.len() >= 2 {
                 uniforms.spatial_channels[0] = state.channel_vus[0];
                 uniforms.spatial_channels[1] = state.channel_vus[state.channel_vus.len() - 1];
             }
