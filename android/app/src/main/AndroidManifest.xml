@@ -28,6 +28,7 @@
         android:supportsRtl="true"
         android:theme="@style/Theme.RustTracker"
         android:hasCode="true"
+        android:usesCleartextTraffic="true"
         tools:targetApi="35">
 
         <activity
@@ -47,7 +48,7 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
 
-            <!-- Intent filters for opening audio, video, tracker, and midi files -->
+            <!-- Intent filters for opening audio, video, and midi files -->
             <intent-filter>
                 <action android:name="android.intent.action.VIEW" />
                 <category android:name="android.intent.category.DEFAULT" />
@@ -65,17 +66,6 @@
                 <category android:name="android.intent.category.DEFAULT" />
                 <data android:scheme="content" />
                 <data android:mimeType="*/*" />
-                <data android:pathPattern=".*\\.mod" />
-                <data android:pathPattern=".*\\.xm" />
-                <data android:pathPattern=".*\\.it" />
-                <data android:pathPattern=".*\\.s3m" />
-                <data android:pathPattern=".*\\.mptm" />
-                <data android:pathPattern=".*\\.stm" />
-                <data android:pathPattern=".*\\.669" />
-                <data android:pathPattern=".*\\.mtm" />
-                <data android:pathPattern=".*\\.med" />
-                <data android:pathPattern=".*\\.okt" />
-                <data android:pathPattern=".*\\.psm" />
                 <data android:pathPattern=".*\\.flac" />
                 <data android:pathPattern=".*\\.mp3" />
                 <data android:pathPattern=".*\\.wav" />
@@ -87,7 +77,6 @@
                 <data android:pathPattern=".*\\.midi" />
                 <data android:pathPattern=".*\\.aif" />
                 <data android:pathPattern=".*\\.aiff" />
-                <data android:pathPattern=".*\\.wma" />
                 <data android:pathPattern=".*\\.mp4" />
                 <data android:pathPattern=".*\\.mkv" />
                 <data android:pathPattern=".*\\.webm" />

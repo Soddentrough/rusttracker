@@ -3669,7 +3669,6 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
     #[cfg(not(target_os = "android"))]
     ffmpeg_next::format::network::init();
 
-    #[cfg(not(target_os = "android"))]
     if file_path.starts_with("http") {
         let mut actual_path = file_path.to_string();
         if let Ok(mut resp) = ureq::get(&actual_path).call() {
@@ -3681,7 +3680,6 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
                 .to_lowercase();
             if content_type.contains("audio/x-scpls") || actual_path.ends_with(".pls") {
                 let mut body = String::new();
-                use std::io::Read;
                 if resp
                     .body_mut()
                     .as_reader()
@@ -3700,7 +3698,6 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
                 || actual_path.ends_with(".m3u8")
             {
                 let mut body = String::new();
-                use std::io::Read;
                 if resp
                     .body_mut()
                     .as_reader()
@@ -3717,10 +3714,50 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
             }
         }
 
-        let ffmpeg_result = try_ffmpeg(&actual_path, true);
-        if let Ok(source) = ffmpeg_result {
+        #[cfg(not(target_os = "android"))]
+        if let Ok(source) = try_ffmpeg(&actual_path, true) {
             return Ok(source);
         }
+
+        if let Ok(resp) = ureq::get(&actual_path).call() {
+            let content_type = resp
+                .headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok())
+                .unwrap_or("")
+                .to_lowercase();
+            let probe_ext = if content_type.contains("mpeg") || content_type.contains("mp3") {
+                "mp3"
+            } else if content_type.contains("aac") {
+                "aac"
+            } else if content_type.contains("ogg") || content_type.contains("vorbis") || content_type.contains("opus") {
+                "ogg"
+            } else if content_type.contains("flac") {
+                "flac"
+            } else if content_type.contains("wav") {
+                "wav"
+            } else {
+                std::path::Path::new(actual_path.split('?').next().unwrap_or(&actual_path))
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("mp3")
+            };
+            let display_ext = probe_ext.to_uppercase();
+
+            struct SyncStreamReader<R>(std::sync::Mutex<R>);
+            impl<R: std::io::Read> std::io::Read for SyncStreamReader<R> {
+                fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                    self.0.get_mut().unwrap().read(buf)
+                }
+            }
+
+            let reader = SyncStreamReader(std::sync::Mutex::new(resp.into_body().into_reader()));
+            let ro_source = symphonia::core::io::ReadOnlySource::new(reader);
+            if let Ok(source) = try_symphonia(ro_source, probe_ext, &display_ext, None, None) {
+                return Ok(source);
+            }
+        }
+
         return Err(anyhow::anyhow!("Failed to open network stream"));
     }
 

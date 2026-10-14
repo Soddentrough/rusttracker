@@ -39,6 +39,7 @@ pub struct TouchGestureController {
     last_tap_time: Option<Instant>,
     last_tap_pos: Option<(f32, f32)>,
     pending_single_tap: Option<((f32, f32), Instant)>,
+    scale_factor: f32,
 
     // Multi-touch tracking
     active_touches: HashMap<u64, (f32, f32, Instant)>,
@@ -62,9 +63,16 @@ impl TouchGestureController {
             last_tap_time: None,
             last_tap_pos: None,
             pending_single_tap: None,
+            scale_factor: 1.0,
             active_touches: HashMap::new(),
             max_touch_count: 0,
             multi_finger_start_time: None,
+        }
+    }
+
+    pub fn set_scale_factor(&mut self, scale_factor: f32) {
+        if scale_factor > 0.0 {
+            self.scale_factor = scale_factor;
         }
     }
 
@@ -78,6 +86,10 @@ impl TouchGestureController {
     ) -> Option<TouchGesture> {
         let x = touch.location.x as f32;
         let y = touch.location.y as f32;
+        let sf = self.scale_factor.max(1.0);
+        let swipe_min_px = 45.0 * sf;
+        let tap_max_move_px = 24.0 * sf;
+        let double_tap_max_dist_px = 42.0 * sf;
 
         match touch.phase {
             TouchPhase::Started => {
@@ -154,9 +166,9 @@ impl TouchGestureController {
                 self.touch_start_pos = None;
                 self.touch_start_time = None;
 
-                // Check for fast swipe gestures (dx or dy > 50px in < 600ms)
+                // Check for fast swipe gestures (dx or dy > 45dp in < 600ms)
                 if dt < 0.6 {
-                    if dx.abs() > 50.0 && dx.abs() > dy.abs() * 1.2 {
+                    if dx.abs() > swipe_min_px && dx.abs() > dy.abs() * 1.2 {
                         if is_portrait {
                             let in_top_pane = start_y < split_y;
                             if in_top_pane {
@@ -179,7 +191,7 @@ impl TouchGestureController {
                                 return Some(TouchGesture::LandscapeSwipeRight);
                             }
                         }
-                    } else if dy.abs() > 50.0 && dy.abs() > dx.abs() * 1.2 {
+                    } else if dy.abs() > swipe_min_px && dy.abs() > dx.abs() * 1.2 {
                         if is_portrait {
                             let in_top_pane = start_y < split_y;
                             if in_top_pane {
@@ -205,15 +217,15 @@ impl TouchGestureController {
                     }
                 }
 
-                // Check for tap gestures (moved < 25px in < 250ms)
-                if dist < 25.0 && dt < 0.25 {
+                // Check for tap gestures (moved < 24dp in < 280ms)
+                if dist < tap_max_move_px && dt < 0.28 {
                     let now = Instant::now();
                     if let (Some(last_time), Some((lx, ly))) =
                         (self.last_tap_time, self.last_tap_pos)
                     {
                         let tap_dist = ((x - lx).powi(2) + (y - ly).powi(2)).sqrt();
-                        if now.duration_since(last_time) < Duration::from_millis(250)
-                            && tap_dist < 35.0
+                        if now.duration_since(last_time) < Duration::from_millis(280)
+                            && tap_dist < double_tap_max_dist_px
                         {
                             self.last_tap_time = None;
                             self.last_tap_pos = None;
@@ -244,7 +256,7 @@ impl TouchGestureController {
     /// Check if a pending single tap has expired
     pub fn update_pending_tap(&mut self) -> Option<TouchGesture> {
         if let Some(((x, y), tap_time)) = self.pending_single_tap
-            && tap_time.elapsed() >= Duration::from_millis(250)
+            && tap_time.elapsed() >= Duration::from_millis(280)
         {
             self.pending_single_tap = None;
             return Some(TouchGesture::SingleTap { x, y });
@@ -391,5 +403,53 @@ mod tests {
             1200.0,
         );
         assert_eq!(g_down, Some(TouchGesture::TopPaneSwipeDown));
+    }
+
+    #[test]
+    fn test_high_dpi_double_tap_and_swipe() {
+        let mut controller = TouchGestureController::new();
+        controller.set_scale_factor(3.0);
+
+        // On a 3.0x DPI screen, a 45px finger roll during a tap (~15dp) is still a tap,
+        // and a second tap 90px away (~30dp) registers as a DoubleTap.
+        controller.handle_touch(
+            &make_touch(TouchPhase::Started, 0, 500.0, 1500.0),
+            1080.0,
+            2400.0,
+            true,
+            1200.0,
+        );
+        assert_eq!(
+            controller.handle_touch(
+                &make_touch(TouchPhase::Ended, 0, 530.0, 1530.0),
+                1080.0,
+                2400.0,
+                true,
+                1200.0,
+            ),
+            None
+        );
+
+        controller.handle_touch(
+            &make_touch(TouchPhase::Started, 0, 590.0, 1530.0),
+            1080.0,
+            2400.0,
+            true,
+            1200.0,
+        );
+        let dbl = controller.handle_touch(
+            &make_touch(TouchPhase::Ended, 0, 595.0, 1535.0),
+            1080.0,
+            2400.0,
+            true,
+            1200.0,
+        );
+        assert_eq!(
+            dbl,
+            Some(TouchGesture::DoubleTap {
+                x: 595.0,
+                y: 1535.0
+            })
+        );
     }
 }

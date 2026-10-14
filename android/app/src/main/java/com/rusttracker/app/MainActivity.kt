@@ -45,27 +45,7 @@ class MainActivity : GameActivity() {
             "audio/mid",
             "audio/sp-midi",
             "application/midi",
-            "application/x-midi",
-            "audio/x-mod",
-            "audio/mod",
-            "audio/x-xm",
-            "audio/xm",
-            "audio/x-s3m",
-            "audio/s3m",
-            "audio/x-it",
-            "audio/it",
-            "audio/x-stm",
-            "audio/x-med",
-            "audio/x-mptm",
-            "audio/x-669",
-            "audio/x-mtm",
-            "audio/x-far",
-            "audio/x-ult",
-            "audio/x-okt",
-            "application/x-mod",
-            "application/x-xm",
-            "application/x-s3m",
-            "application/x-it"
+            "application/x-midi"
         )
     }
 
@@ -79,6 +59,9 @@ class MainActivity : GameActivity() {
         
         ensureSoundfontExtracted()
 
+        // Keep screen awake during visualizations and playback
+        window.addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+
         // Configure edge-to-edge full screen
         WindowCompat.setDecorFitsSystemWindows(window, false)
         val insetsController = WindowCompat.getInsetsController(window, window.decorView)
@@ -86,7 +69,9 @@ class MainActivity : GameActivity() {
 
         onBackPressedDispatcher.addCallback(this, object : androidx.activity.OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                finish()
+                if (!nativeOnBackPressed()) {
+                    finish()
+                }
             }
         })
 
@@ -192,13 +177,14 @@ class MainActivity : GameActivity() {
                     return@Thread
                 }
 
-                // Clean up old cached files (older than 1 hour)
+                // Clean up previous cached media files (keep only the newly selected file and at most 1 prior file)
                 try {
-                    val oneHourAgo = System.currentTimeMillis() - 3600_000L
-                    cacheDir.listFiles()?.forEach { file ->
-                        if (file.name.startsWith("track_") && file != finalFile && file.lastModified() < oneHourAgo) {
-                            file.delete()
-                        }
+                    val oldTracks = cacheDir.listFiles()
+                        ?.filter { it.name.startsWith("track_") && it != finalFile }
+                        ?.sortedByDescending { it.lastModified() }
+                        ?: emptyList()
+                    oldTracks.drop(1).forEach { file ->
+                        file.delete()
                     }
                 } catch (_: Exception) {}
 
@@ -211,5 +197,6 @@ class MainActivity : GameActivity() {
     }
 
     private external fun nativeOnFileSelected(filePath: String)
+    private external fun nativeOnBackPressed(): Boolean
     private external fun nativeOnDestroy()
 }

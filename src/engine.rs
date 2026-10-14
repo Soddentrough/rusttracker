@@ -6674,10 +6674,11 @@ impl VulkanEngine {
 
         let full_output = egui_ctx.run_ui(raw_input, |ctx| {
             if state.is_url_dialog_open {
+                let url_modal_w = (ctx.viewport_rect().width() - 24.0).clamp(260.0, 600.0);
                 egui::Window::new("Open Network Stream")
                     .collapsible(false)
                     .resizable(false)
-                    .default_width(600.0)
+                    .fixed_size([url_modal_w, 260.0])
                     .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                     .show(ctx, |ui| {
                         ui.label("Enter Stream URL (e.g. .pls, .m3u, or direct stream link):");
@@ -6731,8 +6732,13 @@ impl VulkanEngine {
 
 
             if state.show_stats {
+                let stats_top_y = if ctx.viewport_rect().width() < ctx.viewport_rect().height() {
+                    48.0
+                } else {
+                    10.0
+                };
                 egui::Window::new("Stats")
-                    .anchor(egui::Align2::RIGHT_TOP, [-10.0, 10.0])
+                    .anchor(egui::Align2::RIGHT_TOP, [-10.0, stats_top_y])
                     .title_bar(false)
                     .resizable(false)
                     .collapsible(false)
@@ -6927,25 +6933,36 @@ impl VulkanEngine {
             }
 
             if state.show_vis_picker {
+                let screen_rect = ctx.viewport_rect();
+                let modal_w = (screen_rect.width() - 24.0).clamp(260.0, 540.0);
+                let modal_h = (screen_rect.height() - 64.0).clamp(280.0, 500.0);
+                let is_narrow_modal = modal_w < 440.0;
+                let margin_px = if is_narrow_modal { 12.0 } else { 20.0 };
+                let scroll_max_h = (modal_h - 86.0).max(160.0);
+
                 egui::Window::new("Visualizer Modules")
                     .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                     .title_bar(false)
                     .resizable(false)
                     .collapsible(false)
-                    .fixed_size([540.0, 500.0])
+                    .fixed_size([modal_w, modal_h])
                     .frame(egui::Frame::window(&ctx.global_style())
                         .fill(egui::Color32::from_black_alpha(230))
                         .corner_radius(12.0)
-                        .inner_margin(20.0))
+                        .inner_margin(margin_px))
                     .show(ctx, |ui| {
                         ui.horizontal(|ui| {
                             ui.label(
                                 egui::RichText::new("🎨 Visualization Modules")
                                     .color(egui::Color32::WHITE)
                                     .strong()
-                                    .size(20.0)
+                                    .size(if is_narrow_modal { 16.5 } else { 20.0 })
                             );
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.add(egui::Button::new(egui::RichText::new("✕").size(14.0).color(egui::Color32::LIGHT_GRAY)).frame(false)).clicked() {
+                                    engine_action = EngineAction::ToggleVisPicker;
+                                }
+                                ui.add_space(4.0);
                                 if ui.link("None").clicked() {
                                     engine_action = EngineAction::VisPickerEnableNone;
                                 }
@@ -6953,12 +6970,19 @@ impl VulkanEngine {
                                 if ui.link("All").clicked() {
                                     engine_action = EngineAction::VisPickerEnableAll;
                                 }
-                                ui.label(egui::RichText::new("Rotation:").color(egui::Color32::from_gray(150)).size(13.0));
+                                if !is_narrow_modal {
+                                    ui.label(egui::RichText::new("Rotation:").color(egui::Color32::from_gray(150)).size(13.0));
+                                }
                             });
                         });
                         ui.add_space(2.0);
+                        let hint_str = if cfg!(target_os = "android") || is_narrow_modal {
+                            "Tap row to select  •  Tap ✅ to toggle rotation  •  ✕ to close"
+                        } else {
+                            "Enter to select  •  Space to toggle rotation  •  Esc to close"
+                        };
                         ui.label(
-                            egui::RichText::new("Enter to select  •  Space to toggle rotation  •  Esc to close")
+                            egui::RichText::new(hint_str)
                                 .color(egui::Color32::from_gray(130))
                                 .size(11.0)
                         );
@@ -6967,7 +6991,7 @@ impl VulkanEngine {
                         ui.add_space(4.0);
 
                         egui::ScrollArea::vertical()
-                            .max_height(420.0)
+                            .max_height(scroll_max_h)
                             .show(ui, |ui| {
                                 for (i, vis) in crate::state::VISUALIZERS.iter().enumerate() {
                                     let is_cursor = i == state.vis_picker_cursor;
@@ -7024,7 +7048,7 @@ impl VulkanEngine {
                                                 egui::RichText::new(vis.name)
                                                     .color(name_color)
                                                     .strong()
-                                                    .size(15.0)
+                                                    .size(if is_narrow_modal { 14.0 } else { 15.0 })
                                             );
 
                                             // Active indicator
@@ -7037,21 +7061,23 @@ impl VulkanEngine {
                                             }
 
                                             // Description (right-aligned)
-                                            ui.with_layout(
-                                                egui::Layout::right_to_left(egui::Align::Center),
-                                                |ui| {
-                                                    let desc_color = if !is_enabled {
-                                                        egui::Color32::from_gray(60)
-                                                    } else {
-                                                        egui::Color32::from_gray(120)
-                                                    };
-                                                    ui.label(
-                                                        egui::RichText::new(vis.description)
-                                                            .color(desc_color)
-                                                            .size(11.5)
-                                                    );
-                                                }
-                                            );
+                                            if !is_narrow_modal {
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(egui::Align::Center),
+                                                    |ui| {
+                                                        let desc_color = if !is_enabled {
+                                                            egui::Color32::from_gray(60)
+                                                        } else {
+                                                            egui::Color32::from_gray(120)
+                                                        };
+                                                        ui.label(
+                                                            egui::RichText::new(vis.description)
+                                                                .color(desc_color)
+                                                                .size(11.5)
+                                                        );
+                                                    }
+                                                );
+                                            }
                                         });
                                     });
 
@@ -8122,7 +8148,18 @@ impl VulkanEngine {
                                         }
                                     };
 
-                                    let display_title = if state.song_title.is_empty() {
+                                    let strip_android_cache_prefix = |s: &str| -> String {
+                                        if let Some(rest) = s.strip_prefix("track_")
+                                            && let Some(idx) = rest.find('_')
+                                            && idx > 0
+                                            && rest[..idx].chars().all(|c| c.is_ascii_digit())
+                                        {
+                                            return rest[idx + 1..].to_string();
+                                        }
+                                        s.to_string()
+                                    };
+
+                                    let raw_display_title = if state.song_title.is_empty() {
                                         "Unknown Title".to_string()
                                     } else {
                                         let p = std::path::Path::new(&state.song_title);
@@ -8132,6 +8169,7 @@ impl VulkanEngine {
                                             state.song_title.clone()
                                         }
                                     };
+                                    let display_title = strip_android_cache_prefix(&raw_display_title);
 
                                     let current_path_str = if state.playlist_index < state.playlist.len() {
                                         state.playlist[state.playlist_index].clone()
@@ -8143,7 +8181,8 @@ impl VulkanEngine {
                                     let file_name = if is_network {
                                         display_title.clone()
                                     } else {
-                                        file_path.file_name().unwrap_or_default().to_string_lossy().to_string()
+                                        let raw_fname = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                                        strip_android_cache_prefix(&raw_fname)
                                     };
                                     let file_dir = if is_network {
                                         current_path_str.clone()
@@ -8195,11 +8234,14 @@ impl VulkanEngine {
                                                     render_smooth_marquee(ui, &file_name, 14.0, false);
                                                     ui.end_row();
 
-                                                    // 4. File Directory / URL
-                                                    let folder_label = if is_network { "Stream:" } else { "Folder:" };
-                                                    ui.label(egui::RichText::new(folder_label).color(egui::Color32::from_rgb(160, 180, 200)));
-                                                    render_smooth_marquee(ui, &file_dir, 14.0, false);
-                                                    ui.end_row();
+                                                    // 4. File Directory / URL (skip internal Android cache path)
+                                                    let is_android_cache_dir = file_dir.contains("com.rusttracker.app/cache");
+                                                    if !is_android_cache_dir {
+                                                        let folder_label = if is_network { "Stream:" } else { "Folder:" };
+                                                        ui.label(egui::RichText::new(folder_label).color(egui::Color32::from_rgb(160, 180, 200)));
+                                                        render_smooth_marquee(ui, &file_dir, 14.0, false);
+                                                        ui.end_row();
+                                                    }
 
                                                     // 5 & 6. Format, Bitrate & Channels
                                                     let effective_bitrate = state.bitrate.or_else(|| {
@@ -8682,18 +8724,31 @@ impl VulkanEngine {
         if state.show_hud && state.video_mode != 3 {
             let total_height = ctx.content_rect().height();
             let total_width = ctx.content_rect().width();
+            let drag_h = if is_portrait { 24.0 } else { 12.0 };
 
             let drag_y = out_top_panel_rect.map(|r| r.bottom()).unwrap_or(total_height * state.panel_split_ratio);
 
             egui::Area::new("split_drag_area".into())
-                .fixed_pos(egui::pos2(0.0, drag_y - 6.0))
+                .fixed_pos(egui::pos2(0.0, drag_y - drag_h * 0.5))
                 .order(egui::Order::Foreground)
                 .show(ctx, |ui| {
                     let drag_rect = egui::Rect::from_min_size(
                         ui.min_rect().min,
-                        egui::vec2(total_width, 12.0)
+                        egui::vec2(total_width, drag_h)
                     );
                     let response = ui.allocate_rect(drag_rect, egui::Sense::click_and_drag());
+                    if is_portrait {
+                        let pill_color = if response.dragged() {
+                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 180)
+                        } else {
+                            egui::Color32::from_rgba_unmultiplied(200, 210, 225, 70)
+                        };
+                        let pill_rect = egui::Rect::from_center_size(
+                            drag_rect.center(),
+                            egui::vec2(38.0, 4.0),
+                        );
+                        ui.painter().rect_filled(pill_rect, 2.0, pill_color);
+                    }
                     if response.hovered() || response.dragged() {
                         ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
                     }

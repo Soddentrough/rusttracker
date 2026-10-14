@@ -18,6 +18,7 @@ use crate::state::{AppState, VISUALIZERS};
 use crate::touch::{TouchGesture, TouchGestureController};
 
 static FILE_PICKER_CHANNEL: OnceLock<(Sender<String>, Mutex<Receiver<String>>)> = OnceLock::new();
+static GLOBAL_APP_STATE: OnceLock<Arc<Mutex<AppState>>> = OnceLock::new();
 
 #[derive(Debug)]
 pub enum AppCustomEvent {
@@ -33,6 +34,49 @@ fn get_file_channel() -> &'static (Sender<String>, Mutex<Receiver<String>>) {
         let (tx, rx) = channel();
         (tx, Mutex::new(rx))
     })
+}
+
+fn handle_back_navigation(app_state: &Arc<Mutex<AppState>>) -> bool {
+    if let Ok(mut state) = app_state.lock() {
+        if state.is_url_dialog_open {
+            state.is_url_dialog_open = false;
+            return true;
+        }
+        if state.show_vis_picker {
+            state.show_vis_picker = false;
+            return true;
+        }
+        if state.show_help {
+            state.show_help = false;
+            return true;
+        }
+        if state.show_stats {
+            state.show_stats = false;
+            return true;
+        }
+        if state.video_mode == 3 {
+            state.video_mode = 0;
+            return true;
+        }
+        if state.file_loaded && !state.show_hud {
+            state.show_hud = true;
+            return true;
+        }
+    }
+    false
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_rusttracker_app_MainActivity_nativeOnBackPressed<'local>(
+    _env: JNIEnv<'local>,
+    _class: JClass<'local>,
+) -> jni::sys::jboolean {
+    if let Some(app_state) = GLOBAL_APP_STATE.get()
+        && handle_back_navigation(app_state)
+    {
+        return jni::sys::JNI_TRUE;
+    }
+    jni::sys::JNI_FALSE
 }
 
 #[unsafe(no_mangle)]
@@ -94,6 +138,7 @@ struct AndroidRustTrackerApp {
     file_dialog: egui_file_dialog::FileDialog,
     touch_controller: TouchGestureController,
     active_stream: Option<crate::audio::PlaybackHandle>,
+    start_time: Instant,
     last_frame_time: Instant,
     is_suspended: bool,
     frame_count: u64,
@@ -217,7 +262,7 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
         };
         if window_id != win.id() {
             return;
-        }
+        };
 
         if let Some(ref mut st) = self.egui_state {
             let _ = st.on_window_event(&win, &event);
@@ -234,8 +279,13 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                     },
                 ..
             } => {
-                eprintln!("[RustTracker] Back/Escape key pressed, exiting event loop...");
-                event_loop.exit();
+                if handle_back_navigation(&self.app_state) {
+                    win.set_ime_allowed(false);
+                    win.request_redraw();
+                } else {
+                    eprintln!("[RustTracker] Back/Escape key pressed, exiting event loop...");
+                    event_loop.exit();
+                }
             }
             WindowEvent::Resized(physical_size) => {
                 eprintln!("[RustTracker] Android Window Resized: {:?}", physical_size);
@@ -248,9 +298,13 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
             }
             WindowEvent::Touch(touch) => {
                 let size = win.inner_size();
+                let scale_factor = (win.scale_factor() as f32).max(1.0);
+                self.touch_controller.set_scale_factor(scale_factor);
                 let is_portrait = size.width < size.height;
                 let split_ratio = self.app_state.lock().unwrap().panel_split_ratio;
-                let split_y = size.height as f32 * split_ratio;
+                let min_h_px = 220.0 * scale_factor;
+                let split_y = (size.height as f32 * split_ratio)
+                    .clamp(min_h_px, (size.height as f32 - min_h_px).max(min_h_px));
                 let has_video = self.app_state.lock().unwrap().has_video_stream
                     || self
                         .engine
@@ -271,6 +325,7 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                         has_video,
                         size.width as f32,
                         size.height as f32,
+                        scale_factor,
                     ) {
                         trigger_android_file_picker(&self.android_app);
                     }
@@ -285,6 +340,8 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                 self.last_frame_time = Instant::now();
 
                 let size = win.inner_size();
+                let scale_factor = (win.scale_factor() as f32).max(1.0);
+                self.touch_controller.set_scale_factor(scale_factor);
                 let has_video = self.app_state.lock().unwrap().has_video_stream
                     || self
                         .engine
@@ -299,8 +356,8 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                         is_portrait
                             && self.app_state.lock().unwrap().mobile_hud_tab
                                 == crate::state::MobileHudTab::Info
-                            && y < 200.0
-                            && x > (size.width as f32 * 0.70)
+                            && y < (115.0 * scale_factor)
+                            && x > (size.width as f32 * 0.65)
                     } else {
                         false
                     };
@@ -314,6 +371,7 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                             has_video,
                             size.width as f32,
                             size.height as f32,
+                            scale_factor,
                         )
                     {
                         trigger_android_file_picker(&self.android_app);
@@ -332,10 +390,31 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                     }
                 }
 
-                // Check for track ended / playlist auto-advance / pending load requests
+                // Check for audio device reconnect / track ended / playlist auto-advance / pending load requests
                 let pending_load = {
                     let mut state = self.app_state.lock().unwrap();
-                    if state.track_ended {
+                    if state.audio_device_lost {
+                        state.audio_device_lost = false;
+                        if state.playlist_index < state.playlist.len() {
+                            let reload = state.playlist[state.playlist_index].clone();
+                            if !reload.is_empty() {
+                                state.load_request = Some(reload);
+                                state.osd_text = Some("Audio Output Reconnected".to_string());
+                                state.osd_timer = 3.0;
+                            }
+                        }
+                    }
+                    if let Some(new_dev) = state.audio_device_change_request.take()
+                        && state.playlist_index < state.playlist.len()
+                    {
+                        let reload = state.playlist[state.playlist_index].clone();
+                        if !reload.is_empty() {
+                            state.load_request = Some(reload);
+                            state.osd_text = Some(format!("Audio Output: {}", new_dev));
+                            state.osd_timer = 3.0;
+                        }
+                    }
+                    if state.track_ended && state.load_request.is_none() {
                         if state.playlist_index + 1 < state.playlist.len() {
                             state.track_ended = false;
                             state.playlist_index += 1;
@@ -371,6 +450,19 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                 let state_copy = {
                     let mut state = self.app_state.lock().unwrap();
                     let time_scale = (dt * 60.0).clamp(0.2, 5.0);
+
+                    if !state.file_loaded {
+                        let t = self.start_time.elapsed().as_secs_f32();
+                        for i in 0..1024 {
+                            let pct = i as f32 / 1024.0;
+                            let wave1 = (t * 2.0 + pct * 10.0).sin();
+                            let wave2 = (t * 1.5 - pct * 15.0).cos();
+                            let wave3 = (t * 0.5 + pct * 5.0).sin();
+                            let combined = (wave1 + wave2 + wave3) / 3.0;
+                            let val = (combined * 0.5 + 0.5).powf(2.0) * 0.5;
+                            state.raw_spectrum_data[i] = val;
+                        }
+                    }
 
                     // VU decay
                     if state.channel_vus.len() != state.raw_channel_vus.len() {
@@ -783,7 +875,12 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                                         std::fs::write(crate::state::get_history_file_path(), out);
                                 }
                             }
-                            EngineAction::SetAudioDevice(_) | EngineAction::None => {}
+                            EngineAction::SetAudioDevice(dev) => {
+                                let mut state = self.app_state.lock().unwrap();
+                                state.selected_audio_device = Some(dev.clone());
+                                state.audio_device_change_request = Some(dev);
+                            }
+                            EngineAction::None => {}
                         }
                     }
                     Err(wgpu::SurfaceStatus::Lost | wgpu::SurfaceStatus::Outdated) => {
@@ -797,6 +894,8 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                         eprintln!("[RustTracker] Android Render error: {:?}", err);
                     }
                 }
+
+                win.request_redraw();
             }
             _ => {}
         }
@@ -804,19 +903,10 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         if !self.is_suspended {
-            let target_frame_duration = std::time::Duration::from_micros(16_666); // 60 FPS target
-            let elapsed = self.last_frame_time.elapsed();
-            if elapsed < target_frame_duration {
-                let remaining = target_frame_duration - elapsed;
-                event_loop.set_control_flow(ControlFlow::WaitUntil(
-                    std::time::Instant::now() + remaining,
-                ));
-            } else {
-                if let Some(ref win) = self.window {
-                    win.request_redraw();
-                }
-                event_loop.set_control_flow(ControlFlow::Poll);
+            if let Some(ref win) = self.window {
+                win.request_redraw();
             }
+            event_loop.set_control_flow(ControlFlow::Wait);
         } else {
             event_loop.set_control_flow(ControlFlow::Wait);
         }
@@ -830,8 +920,10 @@ impl AndroidRustTrackerApp {
         has_video: bool,
         window_width: f32,
         window_height: f32,
+        scale_factor: f32,
     ) -> Option<EngineAction> {
         let mut state = app_state.lock().unwrap();
+        let sf = scale_factor.max(1.0);
         match gesture {
             // Top pane swipe in portrait: cycle HUD tabs (Channels -> Heatmap/Lyrics -> Info -> Video)
             TouchGesture::TopPaneSwipeLeft => {
@@ -983,8 +1075,8 @@ impl AndroidRustTrackerApp {
                 // Check if top right [📂 OPEN FILE] button was tapped in Track Info pane
                 if is_portrait
                     && state.mobile_hud_tab == crate::state::MobileHudTab::Info
-                    && y < 200.0
-                    && x > window_width * 0.70
+                    && y < (115.0 * sf)
+                    && x > window_width * 0.65
                 {
                     return Some(EngineAction::OpenFile);
                 }
@@ -995,16 +1087,10 @@ impl AndroidRustTrackerApp {
                 }
 
                 // Restrict pause/play single tap functionality to the bottom panel only
-                let min_h_pixels = 220.0f32 * (window_height / 855.0).max(1.0);
-                let top_panel_height = if is_portrait {
-                    (window_height * state.panel_split_ratio).clamp(
-                        min_h_pixels,
-                        (window_height - min_h_pixels).max(min_h_pixels),
-                    )
-                } else {
-                    0.0
-                };
-                let in_bottom_panel = !state.show_hud || y >= (top_panel_height + 40.0);
+                let min_h_pixels = 220.0f32 * sf;
+                let top_panel_height = (window_height * state.panel_split_ratio)
+                    .clamp(min_h_pixels, (window_height - min_h_pixels).max(min_h_pixels));
+                let in_bottom_panel = !state.show_hud || y >= (top_panel_height + 24.0 * sf);
 
                 if in_bottom_panel {
                     state.is_paused = !state.is_paused;
@@ -1070,9 +1156,9 @@ impl AndroidRustTrackerApp {
             }
             TouchGesture::DoubleTap { x: _, y } => {
                 // Double tap toggles HUD visibility when in the bottom panel (or anywhere if HUD is hidden)
-                let min_h = 220.0f32;
+                let min_h_pixels = 220.0f32 * sf;
                 let top_panel_height = (window_height * state.panel_split_ratio)
-                    .clamp(min_h, (window_height - min_h).max(min_h));
+                    .clamp(min_h_pixels, (window_height - min_h_pixels).max(min_h_pixels));
                 let in_bottom_panel = !state.show_hud || y >= top_panel_height;
 
                 if in_bottom_panel {
@@ -1142,11 +1228,25 @@ impl AndroidRustTrackerApp {
                 state.file_loaded = true;
                 state.is_paused = false;
                 state.track_ended = false;
-                state.song_title = std::path::Path::new(path)
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .to_string();
+                let raw_name = if path.starts_with("http://") || path.starts_with("https://") {
+                    path.to_string()
+                } else {
+                    std::path::Path::new(path)
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                        .to_string()
+                };
+                let clean_name = if let Some(rest) = raw_name.strip_prefix("track_")
+                    && let Some(idx) = rest.find('_')
+                    && idx > 0
+                    && rest[..idx].chars().all(|c| c.is_ascii_digit())
+                {
+                    rest[idx + 1..].to_string()
+                } else {
+                    raw_name
+                };
+                state.song_title = clean_name;
                 state.playlist = vec![path.to_string()];
                 state.playlist_index = 0;
                 state.lyrics = crate::lyrics::load_lyrics_for_file(path).map(std::sync::Arc::new);
@@ -1272,6 +1372,7 @@ fn android_main(app: AndroidApp) {
         .unwrap() = Some(proxy);
 
     let app_state = Arc::new(Mutex::new(AppState::new("RustTracker Mobile".to_string())));
+    let _ = GLOBAL_APP_STATE.set(Arc::clone(&app_state));
     let egui_ctx = create_egui_context();
 
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -1286,6 +1387,7 @@ fn android_main(app: AndroidApp) {
         file_dialog: egui_file_dialog::FileDialog::new(),
         touch_controller: TouchGestureController::new(),
         active_stream: None,
+        start_time: Instant::now(),
         last_frame_time: Instant::now(),
         is_suspended: false,
         frame_count: 0,
