@@ -868,11 +868,17 @@ async fn run_perf_test() {
                     } else {
                         rp.set_vertex_buffer(0, grid_vertex_buffer.slice(..));
                         rp.set_index_buffer(grid_index_buffer.slice(..), IndexFormat::Uint32);
-                        let instances = match vis_def.pipeline_type {
-                            crate::state::PipelineType::Mesh3D { instances, .. } => instances,
-                            _ => 1,
+                        let (draw_index_count, instances) = match vis_def.pipeline_type {
+                            crate::state::PipelineType::Mesh3D {
+                                geometry: crate::state::Geometry::Grid { width, depth },
+                                instances,
+                            } => ((width * depth * 6).min(grid_index_count), instances),
+                            crate::state::PipelineType::Mesh3D { instances, .. } => {
+                                (grid_index_count, instances)
+                            }
+                            _ => (grid_index_count, 1),
                         };
-                        rp.draw_indexed(0..grid_index_count, 0, 0..instances);
+                        rp.draw_indexed(0..draw_index_count, 0, 0..instances);
                     }
                     if let Some(lp) = &lamp_pipeline {
                         rp.set_pipeline(lp);
@@ -953,11 +959,17 @@ async fn run_perf_test() {
                     } else {
                         rp.set_vertex_buffer(0, grid_vertex_buffer.slice(..));
                         rp.set_index_buffer(grid_index_buffer.slice(..), IndexFormat::Uint32);
-                        let instances = match vis_def.pipeline_type {
-                            crate::state::PipelineType::Mesh3D { instances, .. } => instances,
-                            _ => 1,
+                        let (draw_index_count, instances) = match vis_def.pipeline_type {
+                            crate::state::PipelineType::Mesh3D {
+                                geometry: crate::state::Geometry::Grid { width, depth },
+                                instances,
+                            } => ((width * depth * 6).min(grid_index_count), instances),
+                            crate::state::PipelineType::Mesh3D { instances, .. } => {
+                                (grid_index_count, instances)
+                            }
+                            _ => (grid_index_count, 1),
                         };
-                        rp.draw_indexed(0..grid_index_count, 0, 0..instances);
+                        rp.draw_indexed(0..draw_index_count, 0, 0..instances);
                     }
                     if let Some(lp) = &lamp_pipeline {
                         rp.set_pipeline(lp);
@@ -4309,43 +4321,45 @@ async fn run_3d_freq_oscilloscope_snapshot() {
     });
     queue.write_buffer(&uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
-    // Populate gpu_spectrum with realistic multi-band musical harmonics (bass, synth chords, lead overtones)
+    // Populate gpu_spectrum with realistic stereo L/R musical harmonics (on the norm/sqrt(N) scale of src/audio.rs)
     let mut gpu_spectrum_data = vec![0.0f32; 32 * 1024 * 2];
     for b in 0..1024usize {
         let t = (b as f32) / 1024.0;
         let freq_hz = 20.0 * (t * 8.965784).exp2();
-        let eq_boost = (freq_hz / 20.0).sqrt();
+        let eq_boost = (freq_hz / 45.0).powf(0.28);
 
-        // Create distinct musical note & chord peaks across the 32 bands
         let band = b / 32;
         let bin_in_band = b % 32;
-        let band_env = match band {
-            0..=3 => 1.15,   // Deep sub-bass & kick fundamental
-            4..=6 => 0.35,   // Warm low-bass groove
-            7..=10 => 0.90,  // Punchy bassline & low-mid synth
-            11..=13 => 0.30, // Mid valley
-            14..=18 => 0.95, // Rich mid-range chord & lead
-            19..=22 => 0.40, // Upper-mid breath
-            23..=27 => 0.72, // Crisp arpeggio overtones
-            _ => 0.38,       // Airy treble shimmer
+
+        // Asymmetric stereo panning (like a 4-channel Amiga MOD where L and R have distinct instruments)
+        let (env_l, env_r) = match band {
+            0..=3 => (0.95, 0.85),   // Deep sub-bass & kick fundamental (centered)
+            4..=6 => (0.25, 0.15),   // Low-bass valley
+            7..=10 => (0.88, 0.30),  // Left-panned synth bassline
+            11..=13 => (0.18, 0.78), // Right-panned rhythm chord
+            14..=18 => (0.75, 0.92), // Stereo mid-range lead & vocal sample
+            19..=22 => (0.65, 0.22), // Left-panned upper-mid stab
+            23..=27 => (0.25, 0.80), // Right-panned arpeggio overtones
+            _ => (0.45, 0.55),       // Crisp treble hi-hat shimmer
         };
 
-        let is_primary = bin_in_band == 5 || bin_in_band == 17;
-        let is_secondary = bin_in_band == 11 || bin_in_band == 25;
-        let partial_amp = if is_primary {
-            0.42 * band_env * (0.65 + 0.35 * ((b as f32) * 0.41).sin().abs())
+        let is_primary = bin_in_band == 4 || bin_in_band == 16;
+        let is_secondary = bin_in_band == 8 || bin_in_band == 24;
+        let shape = if is_primary {
+            1.0
         } else if is_secondary {
-            0.22 * band_env * (0.5 + 0.5 * ((b as f32) * 0.79).cos().abs())
+            0.55
         } else {
-            0.008 * band_env
+            0.08
         };
 
-        let mag = partial_amp / eq_boost;
+        let mag_l = (env_l * shape * 8.5) / eq_boost;
+        let mag_r = (env_r * shape * 8.5) / eq_boost;
         let phase = (b as f32) * 0.73;
-        gpu_spectrum_data[b * 2] = mag * phase.cos();
-        gpu_spectrum_data[b * 2 + 1] = mag * phase.sin();
-        gpu_spectrum_data[(1024 + b) * 2] = mag * (phase + 0.4).cos();
-        gpu_spectrum_data[(1024 + b) * 2 + 1] = mag * (phase + 0.4).sin();
+        gpu_spectrum_data[b * 2] = mag_l * phase.cos();
+        gpu_spectrum_data[b * 2 + 1] = mag_l * phase.sin();
+        gpu_spectrum_data[(1024 + b) * 2] = mag_r * (phase + 0.6).cos();
+        gpu_spectrum_data[(1024 + b) * 2 + 1] = mag_r * (phase + 0.6).sin();
     }
 
     let gpu_spectrum_buffer = device.create_buffer(&BufferDescriptor {
@@ -4665,7 +4679,14 @@ async fn run_3d_freq_oscilloscope_snapshot() {
             entry_point: Some("fs_main"),
             targets: &[Some(ColorTargetState {
                 format: color_format,
-                blend: Some(BlendState::REPLACE),
+                blend: Some(BlendState {
+                    color: BlendComponent {
+                        src_factor: BlendFactor::One,
+                        dst_factor: BlendFactor::One,
+                        operation: BlendOperation::Add,
+                    },
+                    alpha: BlendComponent::OVER,
+                }),
                 write_mask: ColorWrites::ALL,
             })],
             compilation_options: PipelineCompilationOptions::default(),
@@ -4681,7 +4702,7 @@ async fn run_3d_freq_oscilloscope_snapshot() {
         },
         depth_stencil: Some(DepthStencilState {
             format: TextureFormat::Depth32Float,
-            depth_write_enabled: Some(true),
+            depth_write_enabled: Some(false),
             depth_compare: Some(CompareFunction::LessEqual),
             stencil: StencilState::default(),
             bias: DepthBiasState::default(),
@@ -4691,9 +4712,9 @@ async fn run_3d_freq_oscilloscope_snapshot() {
         cache: None,
     });
 
-    // Build exact 511 x 62 Grid mesh matching VisualizerDef for ID 4
+    // Build exact 511 x 1 Grid mesh matching VisualizerDef for ID 4
     let grid_width = 511u32;
-    let grid_depth = 2u32;
+    let grid_depth = 1u32;
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
     for z in 0..=grid_depth {
@@ -4720,7 +4741,7 @@ async fn run_3d_freq_oscilloscope_snapshot() {
     }
 
     let grid_vertex_buffer = device.create_buffer(&BufferDescriptor {
-        label: Some("Grid 511x2 Vertex Buffer"),
+        label: Some("Grid 511x1 Vertex Buffer"),
         size: (vertices.len() * std::mem::size_of::<crate::engine::Vertex>()) as u64,
         usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
         mapped_at_creation: false,
@@ -4728,7 +4749,7 @@ async fn run_3d_freq_oscilloscope_snapshot() {
     queue.write_buffer(&grid_vertex_buffer, 0, bytemuck::cast_slice(&vertices));
 
     let grid_index_buffer = device.create_buffer(&BufferDescriptor {
-        label: Some("Grid 511x2 Index Buffer"),
+        label: Some("Grid 511x1 Index Buffer"),
         size: (indices.len() * std::mem::size_of::<u32>()) as u64,
         usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
         mapped_at_creation: false,

@@ -222,11 +222,11 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         id: 4,
         name: "3D Freq Oscilloscope",
         filename: "vis_3doscilloscope_freq.wgsl",
-        description: "3D topographical frequency view",
+        description: "3D stereo frequency oscilloscope",
         pipeline_type: PipelineType::Mesh3D {
             geometry: Geometry::Grid {
                 width: 511,
-                depth: 2,
+                depth: 1,
             },
             instances: 32,
         },
