@@ -21,12 +21,10 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     let x_norm = f32(point_idx) / f32(num_points - 1u);
     let has_right = audio.fft_channels >= 2u;
-
     let band_t = f32(line_idx) / 31.0;
-    let base_cycles = 2.6 + 9.9 * pow(band_t, 1.35);
-    let x_l = x_norm - 0.24;
-    let x_r = x_norm - 0.76;
-    let standing_offset = f32(line_idx) * 0.20;
+    let base_cycles = 3.2 + 8.8 * pow(band_t, 1.25);
+    let x_l = x_norm - 0.25;
+    let x_r = x_norm - 0.75;
 
     var wave_sum_l = 0.0;
     var wave_sum_r = 0.0;
@@ -35,7 +33,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var peak_l = 0.0;
     var peak_r = 0.0;
 
-    // Pool all 32 bins across the band using fixed standing-wave phase (no horizontal scrolling)
+    // Pool all 32 bins across the band using fixed symmetric standing-wave phase (no horizontal scroll, no diagonal skew)
     for (var b = start_bin; b < end_bin; b = b + 1u) {
         let c_l = gpu_spectrum[b];
         let c_r = select(c_l, gpu_spectrum[1024u + b], has_right);
@@ -48,30 +46,27 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let ratio_l = select(1.0, clamp(raw_l / lr_avg, 0.15, 1.85), raw_l + raw_r > 0.01);
         let ratio_r = select(1.0, clamp(raw_r / lr_avg, 0.15, 1.85), raw_l + raw_r > 0.01);
 
-        let base_l = max(raw_l, spec_bin * ratio_l);
-        let base_r = max(raw_r, spec_bin * ratio_r);
+        let base_l = max(raw_l, spec_bin * ratio_l * 0.55);
+        let base_r = max(raw_r, spec_bin * ratio_r * 0.55);
 
         let t = f32(b) * 0.0009765625;
         let freq_hz = 20.0 * exp2(t * 8.965784);
 
-        // Perceptual tilt so mid and treble bands translate to balanced physical wave height alongside bass
-        let eq_boost = pow(freq_hz / 55.0, 0.26);
+        // Gentle perceptual tilt so mid and treble bands translate to balanced physical wave height alongside bass
+        let eq_boost = pow(freq_hz / 65.0, 0.20);
 
-        let mag_l = max(base_l * eq_boost - 0.85, 0.0);
-        let mag_r = max(base_r * eq_boost - 0.85, 0.0);
+        let mag_l = max(base_l * eq_boost - 1.2, 0.0);
+        let mag_r = max(raw_r * eq_boost - 1.2, max(base_r * eq_boost - 1.2, 0.0));
 
         let bin_t = f32(b - start_bin) / 31.0;
-        let spatial_cycles = base_cycles + (bin_t - 0.5) * 0.65;
+        let spatial_cycles = base_cycles + (bin_t - 0.5) * 0.55;
 
-        // Synthetic fixed standing phase — keeps waveforms from scrolling horizontally
-        let phase_l = x_l * spatial_cycles * 6.2831853 + standing_offset;
-        let phase_r = x_r * spatial_cycles * 6.2831853 + standing_offset + 0.35;
+        // Symmetric standing phase around Left (0.25) and Right (0.75) channel centers with zero cross-row skew
+        let phase_l = x_l * spatial_cycles * 6.2831853;
+        let phase_r = x_r * spatial_cycles * 6.2831853;
 
-        let harmonic_l = (cos(phase_l) + 0.20 * sin(2.0 * phase_l)) * 0.88;
-        let harmonic_r = (cos(phase_r) + 0.20 * sin(2.0 * phase_r)) * 0.88;
-
-        wave_sum_l += mag_l * harmonic_l;
-        wave_sum_r += mag_r * harmonic_r;
+        wave_sum_l += mag_l * cos(phase_l);
+        wave_sum_r += mag_r * cos(phase_r);
         weight_sum_l += mag_l;
         weight_sum_r += mag_r;
         peak_l = max(peak_l, mag_l);
@@ -84,12 +79,12 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let carrier_l = wave_sum_l / max(weight_sum_l, 0.0001);
     let carrier_r = wave_sum_r / max(weight_sum_r, 0.0001);
 
-    // Translate audio energy [0..100] into physical wave height:
-    // Quiet bands stay flat, moderate tracker notes (energy 6..20) reach 45..85% height, loud peaks reach 100%
-    let band_energy_l = mix(mean_l, peak_l, 0.76);
-    let band_energy_r = mix(mean_r, peak_r, 0.76);
-    let env_l = pow(clamp(band_energy_l / 19.0, 0.0, 1.15), 0.72);
-    let env_r = pow(clamp(band_energy_r / 19.0, 0.0, 1.15), 0.72);
+    // Map [0..100] audio energy with natural dynamic contrast so broadband background noise
+    // stays low while active musical notes rise clearly without pegging all 32 rows at a ceiling
+    let band_energy_l = mix(mean_l, peak_l, 0.72);
+    let band_energy_r = mix(mean_r, peak_r, 0.72);
+    let env_l = pow(clamp(band_energy_l / 34.0, 0.0, 1.15), 0.95);
+    let env_r = pow(clamp(band_energy_r / 34.0, 0.0, 1.15), 0.95);
 
     let val_l = tanh(carrier_l * 1.12) * env_l;
     let val_r = tanh(carrier_r * 1.12) * env_r;

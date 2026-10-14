@@ -4356,8 +4356,8 @@ async fn run_3d_freq_oscilloscope_snapshot() {
             0.05
         };
 
-        let mag_l = (env_l * shape * 0.22) / eq_boost;
-        let mag_r = (env_r * shape * 0.22) / eq_boost;
+        let mag_l = (env_l * shape * 0.42) / eq_boost;
+        let mag_r = (env_r * shape * 0.42) / eq_boost;
         let phase = (b as f32) * 0.42;
         gpu_spectrum_data[b * 2] = mag_l * phase.cos();
         gpu_spectrum_data[b * 2 + 1] = mag_l * phase.sin();

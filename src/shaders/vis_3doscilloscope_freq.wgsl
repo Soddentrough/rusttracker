@@ -25,19 +25,10 @@ struct VertexOutput3D {
     @location(5) screen_dist: f32,
 }
 
-fn get_raw_wave_pair(line_idx: u32, point_idx: u32) -> vec2<f32> {
+fn get_resynthesized_wave_pair(line_idx: u32, point_idx: u32) -> vec2<f32> {
     let base_offset = 16u * 1024u;
     let flat_idx = min(line_idx, 31u) * 512u + min(point_idx, 511u);
     return gpu_spectrum[base_offset + flat_idx];
-}
-
-fn get_resynthesized_wave_pair(line_idx: u32, point_idx: u32) -> vec2<f32> {
-    let prev_idx = select(0u, line_idx - 1u, line_idx > 0u);
-    let next_idx = min(line_idx + 1u, 31u);
-    let p_prev = get_raw_wave_pair(prev_idx, point_idx);
-    let p_cur  = get_raw_wave_pair(line_idx, point_idx);
-    let p_next = get_raw_wave_pair(next_idx, point_idx);
-    return p_prev * 0.22 + p_cur * 0.56 + p_next * 0.22;
 }
 
 fn sample_joined_wave(line_idx: u32, u_coord: f32) -> f32 {
@@ -51,13 +42,11 @@ fn sample_joined_wave(line_idx: u32, u_coord: f32) -> f32 {
         frac
     );
     // Single joined horizontal line across the full display width:
-    // Left channel (pair.x) localized on the left half, Right channel (pair.y) localized on the right half,
-    // connected by a smooth stereo bridge across the center so the lines are continuous edge-to-edge.
-    let env_left  = smoothstep(0.0, 0.035, u_coord) * (1.0 - smoothstep(0.34, 0.49, u_coord));
-    let env_right = smoothstep(0.51, 0.66, u_coord) * smoothstep(0.0, 0.035, 1.0 - u_coord);
-    let center_d  = (u_coord - 0.5) / 0.065;
-    let env_bridge = exp(-center_d * center_d) * 0.12;
-    return pair.x * env_left + pair.y * env_right + (pair.x + pair.y) * 0.5 * env_bridge;
+    // Left channel (pair.x) on the left half, Right channel (pair.y) on the right half,
+    // joined cleanly across the center without opposite-slope kinks or a wide flat trough.
+    let env_left  = smoothstep(0.0, 0.06, u_coord) * (1.0 - smoothstep(0.42, 0.495, u_coord));
+    let env_right = smoothstep(0.505, 0.58, u_coord) * smoothstep(0.0, 0.06, 1.0 - u_coord);
+    return pair.x * env_left + pair.y * env_right;
 }
 
 @vertex
@@ -78,14 +67,15 @@ fn vs_main_3d(in: VertexInput, @builtin(instance_index) instance_idx: u32) -> Ve
 
     let aspect = max(audio.aspect_ratio, 0.1);
 
-    // Perspective-compensated Z spacing on the shallow 3D Oscilloscope stage so back rows
-    // never bunch into a horizon line and all 32 frequency bands have clear vertical separation
-    let z_t = pow(band_norm, 0.50);
+    // Rational perspective-compensated Z parameter on a true flat 3D plane:
+    // Interpolating z, y_stage, and x_span with the exact same z_t keeps the 3D stage 100% planar
+    // with straight perspective side borders and even vertical spacing from back to front.
+    let z_t = (band_norm * 2.2) / (1.0 + band_norm * 1.2);
     let z = mix(7.2, -2.30, z_t);
-    let y_stage = mix(1.08, -0.34, band_norm);
+    let y_stage = mix(1.05, -0.34, z_t);
 
-    // Scale world-space wave height with depth so active bands reach strong physical height (~15% screen height)
-    let amp_scale = mix(1.42, 0.36, pow(band_norm, 0.62));
+    // Scale world-space wave height with depth so active bands reach strong physical height
+    let amp_scale = mix(1.42, 0.36, z_t);
 
     // Scale world X span linearly with z_t and aspect ratio so every row covers the full display width symmetrically
     let x_span = mix(8.85, 2.65, z_t) * aspect;
@@ -143,15 +133,12 @@ fn vs_main_3d(in: VertexInput, @builtin(instance_index) instance_idx: u32) -> Ve
     let ndc_pos_2d = ndc_cur - norm_ndc * (signed_d * beam_half_ndc);
     let clip_pos = vec4<f32>(ndc_pos_2d * w_cur, v_base.z * p_22 + p_32, w_cur);
 
-    // Apply CRT barrel distortion in clip space
+    // Keep straight unbent projection (no barrel distortion bowing the horizontal lines)
     let ndc = clip_pos.xy / max(clip_pos.w, 0.0001);
-    let r2 = dot(ndc, ndc);
-    let distorted_ndc = ndc * (1.0 + r2 * 0.035);
-    let final_clip_pos = vec4<f32>(distorted_ndc * clip_pos.w, clip_pos.z, clip_pos.w);
 
     out.world_pos = p_cur;
-    out.clip_position = final_clip_pos;
-    out.ndc_pos = vec3<f32>(distorted_ndc, u_coord);
+    out.clip_position = clip_pos;
+    out.ndc_pos = vec3<f32>(ndc, u_coord);
     out.uv = vec2<f32>(u_coord, v_coord);
     out.band_norm = band_norm;
     out.hit_val = wave_val;
