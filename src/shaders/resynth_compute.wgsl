@@ -23,15 +23,19 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let has_right = audio.fft_channels >= 2u;
 
     let band_t = f32(line_idx) / 31.0;
+    let base_cycles = 2.6 + 9.9 * pow(band_t, 1.35);
+    let x_l = x_norm - 0.24;
+    let x_r = x_norm - 0.76;
+    let standing_offset = f32(line_idx) * 0.20;
 
+    var wave_sum_l = 0.0;
+    var wave_sum_r = 0.0;
     var weight_sum_l = 0.0;
     var weight_sum_r = 0.0;
     var peak_l = 0.0;
     var peak_r = 0.0;
-    var centroid_l = 0.0;
-    var centroid_r = 0.0;
 
-    // Pool all 32 bins across the band for full harmonic sensitivity and physical energy
+    // Pool all 32 bins across the band using fixed standing-wave phase (no horizontal scrolling)
     for (var b = start_bin; b < end_bin; b = b + 1u) {
         let c_l = gpu_spectrum[b];
         let c_r = select(c_l, gpu_spectrum[1024u + b], has_right);
@@ -57,36 +61,28 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let mag_r = max(base_r * eq_boost - 0.85, 0.0);
 
         let bin_t = f32(b - start_bin) / 31.0;
+        let spatial_cycles = base_cycles + (bin_t - 0.5) * 0.65;
+
+        // Synthetic fixed standing phase — keeps waveforms from scrolling horizontally
+        let phase_l = x_l * spatial_cycles * 6.2831853 + standing_offset;
+        let phase_r = x_r * spatial_cycles * 6.2831853 + standing_offset + 0.35;
+
+        let harmonic_l = (cos(phase_l) + 0.20 * sin(2.0 * phase_l)) * 0.88;
+        let harmonic_r = (cos(phase_r) + 0.20 * sin(2.0 * phase_r)) * 0.88;
+
+        wave_sum_l += mag_l * harmonic_l;
+        wave_sum_r += mag_r * harmonic_r;
         weight_sum_l += mag_l;
         weight_sum_r += mag_r;
         peak_l = max(peak_l, mag_l);
         peak_r = max(peak_r, mag_r);
-        centroid_l += mag_l * bin_t;
-        centroid_r += mag_r * bin_t;
     }
 
     let mean_l = weight_sum_l / 32.0;
     let mean_r = weight_sum_r / 32.0;
-    let cent_l = select(0.5, centroid_l / max(weight_sum_l, 0.0001), weight_sum_l > 0.001);
-    let cent_r = select(0.5, centroid_r / max(weight_sum_r, 0.0001), weight_sum_r > 0.001);
 
-    // Deeper frequencies at the back (line_idx = 0 -> ~2.6 cycles across full width)
-    // to higher frequencies at the front (line_idx = 31 -> ~12.5 cycles across full width)
-    let base_cycles = 2.6 + 9.9 * pow(band_t, 1.35);
-    let cycles_l = base_cycles + (cent_l - 0.5) * 0.45;
-    let cycles_r = base_cycles + (cent_r - 0.5) * 0.45;
-
-    // Center spatial phase on the Left lobe (u = 0.24) and Right lobe (u = 0.76) with a constant
-    // cross-band phase progression so adjacent rows form coherent 3D wave ridges at any playback time
-    let x_l = x_norm - 0.24;
-    let x_r = x_norm - 0.76;
-    let time_phase = -audio.smooth_time * 3.4 + f32(line_idx) * 0.22;
-
-    let phase_l = x_l * cycles_l * 6.2831853 + time_phase + (cent_l - 0.5) * 0.35;
-    let phase_r = x_r * cycles_r * 6.2831853 + time_phase + (cent_r - 0.5) * 0.35 + 0.35;
-
-    let carrier_l = (cos(phase_l) + 0.22 * sin(2.0 * phase_l + cent_l * 1.2)) * 0.86;
-    let carrier_r = (cos(phase_r) + 0.22 * sin(2.0 * phase_r + cent_r * 1.2)) * 0.86;
+    let carrier_l = wave_sum_l / max(weight_sum_l, 0.0001);
+    let carrier_r = wave_sum_r / max(weight_sum_r, 0.0001);
 
     // Translate audio energy [0..100] into physical wave height:
     // Quiet bands stay flat, moderate tracker notes (energy 6..20) reach 45..85% height, loud peaks reach 100%
