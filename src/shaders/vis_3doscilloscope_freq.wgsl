@@ -25,10 +25,19 @@ struct VertexOutput3D {
     @location(5) screen_dist: f32,
 }
 
-fn get_resynthesized_wave_pair(line_idx: u32, point_idx: u32) -> vec2<f32> {
+fn get_raw_wave_pair(line_idx: u32, point_idx: u32) -> vec2<f32> {
     let base_offset = 16u * 1024u;
     let flat_idx = min(line_idx, 31u) * 512u + min(point_idx, 511u);
     return gpu_spectrum[base_offset + flat_idx];
+}
+
+fn get_resynthesized_wave_pair(line_idx: u32, point_idx: u32) -> vec2<f32> {
+    let prev_idx = select(0u, line_idx - 1u, line_idx > 0u);
+    let next_idx = min(line_idx + 1u, 31u);
+    let p_prev = get_raw_wave_pair(prev_idx, point_idx);
+    let p_cur  = get_raw_wave_pair(line_idx, point_idx);
+    let p_next = get_raw_wave_pair(next_idx, point_idx);
+    return p_prev * 0.22 + p_cur * 0.56 + p_next * 0.22;
 }
 
 fn sample_joined_wave(line_idx: u32, u_coord: f32) -> f32 {
@@ -41,12 +50,14 @@ fn sample_joined_wave(line_idx: u32, u_coord: f32) -> f32 {
         get_resynthesized_wave_pair(line_idx, i1),
         frac
     );
-    // Place Left channel on the left side and Right channel on the right side of the same joined line
-    let lr_mix = smoothstep(0.28, 0.72, u_coord);
-    let w = mix(pair.x, pair.y, lr_mix);
-    // Smooth window taper only at the far left and far right bezel edges
-    let taper = smoothstep(0.0, 0.09, u_coord) * smoothstep(0.0, 0.09, 1.0 - u_coord);
-    return w * taper;
+    // Single joined horizontal line across the full display width:
+    // Left channel (pair.x) localized on the left half, Right channel (pair.y) localized on the right half,
+    // connected by a smooth stereo bridge across the center so the lines are continuous edge-to-edge.
+    let env_left  = smoothstep(0.0, 0.035, u_coord) * (1.0 - smoothstep(0.34, 0.49, u_coord));
+    let env_right = smoothstep(0.51, 0.66, u_coord) * smoothstep(0.0, 0.035, 1.0 - u_coord);
+    let center_d  = (u_coord - 0.5) / 0.065;
+    let env_bridge = exp(-center_d * center_d) * 0.12;
+    return pair.x * env_left + pair.y * env_right + (pair.x + pair.y) * 0.5 * env_bridge;
 }
 
 @vertex
@@ -65,13 +76,19 @@ fn vs_main_3d(in: VertexInput, @builtin(instance_index) instance_idx: u32) -> Ve
     let wave_prev = sample_joined_wave(line_idx, max(u_coord - du, 0.0));
     let wave_next = sample_joined_wave(line_idx, min(u_coord + du, 1.0));
 
-    // Terraced 3D stage: deep sub-bass at the back (band_norm = 0.0), high treble at the front (band_norm = 1.0)
-    let y_stage = mix(4.85, -0.35, pow(band_norm, 0.84));
-    let amp_scale = mix(1.45, 0.58, pow(band_norm, 0.75));
-    let z = mix(9.4, -1.35, band_norm);
+    let aspect = max(audio.aspect_ratio, 0.1);
 
-    // Single joined mesh stretching continuously across the visible field from left to right
-    let x_span = mix(17.20, 4.80, band_norm);
+    // Perspective-compensated Z spacing on the shallow 3D Oscilloscope stage so back rows
+    // never bunch into a horizon line and all 32 frequency bands have clear vertical separation
+    let z_t = pow(band_norm, 0.50);
+    let z = mix(7.2, -2.30, z_t);
+    let y_stage = mix(1.08, -0.34, band_norm);
+
+    // Scale world-space wave height with depth so active bands reach strong physical height (~15% screen height)
+    let amp_scale = mix(1.42, 0.36, pow(band_norm, 0.62));
+
+    // Scale world X span linearly with z_t and aspect ratio so every row covers the full display width symmetrically
+    let x_span = mix(8.85, 2.65, z_t) * aspect;
     let x_cur  = mix(-x_span, x_span, u_coord);
     let dx_step = (2.0 * x_span) * du;
 
@@ -79,12 +96,11 @@ fn vs_main_3d(in: VertexInput, @builtin(instance_index) instance_idx: u32) -> Ve
     let p_base  = vec3<f32>(x_cur, y_stage, z);
     let p_cur   = vec3<f32>(x_cur, y_crest, z);
 
-    // Smoothly rotate camera around center using seek-monotonic smooth_time
-    let rot_angle = sin(audio.smooth_time * 0.2) * 0.14;
-    let cam_dist_val = 4.00;
-    let cam_height = 2.20;
-    let ro = vec3<f32>(sin(rot_angle) * cam_dist_val, cam_height, -cos(rot_angle) * cam_dist_val);
-    let cam_target = vec3<f32>(0.0, 0.20, 2.0);
+    // Shallow camera angle matching 3D Oscilloscope, centered horizontally so full-width lines stay level
+    let cam_dist_val = 4.6;
+    let cam_height = 2.2;
+    let ro = vec3<f32>(0.0, cam_height, -cam_dist_val);
+    let cam_target = vec3<f32>(0.0, 0.0, 1.2);
 
     let f = normalize(cam_target - ro);
     let s = normalize(cross(vec3<f32>(0.0, 1.0, 0.0), f));
@@ -97,7 +113,6 @@ fn vs_main_3d(in: VertexInput, @builtin(instance_index) instance_idx: u32) -> Ve
         vec4<f32>(-dot(s, ro), -dot(u, ro), dot(f, ro), 1.0)
     );
 
-    let aspect = max(audio.aspect_ratio, 0.1);
     let p_00 = 1.0 / (0.9 * aspect);
     let p_11 = 1.11111111;
     let p_22 = -1.0001;
@@ -115,14 +130,13 @@ fn vs_main_3d(in: VertexInput, @builtin(instance_index) instance_idx: u32) -> Ve
     // Screen-space tangent & upward normal at constant depth w_cur
     let dx_screen = max((2.0 * dx_step * s.x * p_00 / w_cur) * aspect, 0.001);
     let dy_screen = ((wave_next - wave_prev) * amp_scale * u.y * p_11) / w_cur;
-    let tang = normalize(vec2<f32>(max(dx_screen, abs(dy_screen) * 0.55), dy_screen));
+    let tang = normalize(vec2<f32>(max(dx_screen, abs(dy_screen) * 0.65), dy_screen));
     let norm_unit = vec2<f32>(-tang.y, tang.x);
     let norm_ndc = vec2<f32>(norm_unit.x / aspect, norm_unit.y);
 
-    // Crisp CRT line ribbon half-width in NDC
-    let r_crest = length(ndc_cur);
-    let depth_scale = mix(0.76, 1.15, band_norm);
-    let beam_half_ndc = 0.0092 * depth_scale * (1.0 + smoothstep(0.3, 1.15, r_crest) * 0.38);
+    // Multi-pixel NDC ribbon width: thick enough at the back to prevent scanline shimmering,
+    // and clean at the front so high-frequency peaks stay crisp
+    let beam_half_ndc = mix(0.0115, 0.0095, band_norm);
 
     // signed_d: -1.0 at top edge (v = 0.0), 0.0 at exact line center (v = 0.5), +1.0 at bottom edge (v = 1.0)
     let signed_d = v_coord * 2.0 - 1.0;
@@ -132,7 +146,7 @@ fn vs_main_3d(in: VertexInput, @builtin(instance_index) instance_idx: u32) -> Ve
     // Apply CRT barrel distortion in clip space
     let ndc = clip_pos.xy / max(clip_pos.w, 0.0001);
     let r2 = dot(ndc, ndc);
-    let distorted_ndc = ndc * (1.0 + r2 * 0.038);
+    let distorted_ndc = ndc * (1.0 + r2 * 0.035);
     let final_clip_pos = vec4<f32>(distorted_ndc * clip_pos.w, clip_pos.z, clip_pos.w);
 
     out.world_pos = p_cur;
@@ -149,50 +163,49 @@ fn vs_main_3d(in: VertexInput, @builtin(instance_index) instance_idx: u32) -> Ve
 @fragment
 fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     let crt_uv = in.ndc_pos.xy;
-    let r = length(crt_uv);
 
     if abs(crt_uv.x) > 1.05 || abs(crt_uv.y) > 1.05 {
         discard;
     }
 
-    let bezel = smoothstep_r(1.28, 0.88, r);
+    let edge_box = max(abs(crt_uv.x), abs(crt_uv.y));
+    let bezel = smoothstep_r(1.04, 0.94, edge_box);
     let u_coord = in.uv.x;
     let band_norm = in.band_norm;
     let d = clamp(abs(in.screen_dist), 0.0, 1.0);
-    let lr_mix = smoothstep(0.28, 0.72, u_coord);
+    let lr_mix = smoothstep(0.35, 0.65, u_coord);
 
-    // Distinct frequency-depth & stereo phosphor palette (unclipped in Rgba8Unorm so hue is preserved):
+    // Distinct frequency-depth & stereo phosphor palette:
     // Back (sub-bass 20Hz): deep ruby-copper ember
     // Middle (mids): rich warm amber-orange
-    // Front (treble 10kHz): bright golden-amber with smooth Left-to-Right stereo tint across the joined line
-    let wave_height = clamp(abs(in.hit_val) * 1.6, 0.0, 1.0);
-    let bass_col = mix(vec3<f32>(0.82, 0.14, 0.02), vec3<f32>(0.72, 0.22, 0.04), lr_mix);
-    let mid_col  = mix(vec3<f32>(0.98, 0.38, 0.05), vec3<f32>(0.92, 0.50, 0.09), lr_mix);
-    let high_col = mix(vec3<f32>(1.00, 0.68, 0.20), vec3<f32>(0.96, 0.80, 0.32), lr_mix);
+    // Front (treble 10kHz): bright golden-amber with subtle Left-to-Right stereo tint across the joined line
+    let wave_height = clamp(abs(in.hit_val) * 1.35, 0.0, 1.0);
+    let bass_col = mix(vec3<f32>(0.86, 0.18, 0.03), vec3<f32>(0.76, 0.26, 0.05), lr_mix);
+    let mid_col  = mix(vec3<f32>(0.98, 0.42, 0.06), vec3<f32>(0.92, 0.54, 0.10), lr_mix);
+    let high_col = mix(vec3<f32>(1.00, 0.70, 0.20), vec3<f32>(0.96, 0.82, 0.32), lr_mix);
 
     let band_col = mix(
         mix(bass_col, mid_col, smoothstep(0.0, 0.55, band_norm)),
         high_col,
         smoothstep(0.45, 1.0, band_norm)
     );
-    let line_col = mix(band_col, high_col, wave_height * 0.38);
+    let line_col = mix(band_col, high_col, wave_height * 0.40);
 
-    // Distance & outer bezel edge attenuation (continuous across the center, fades only at far left/right edges)
-    let depth_fade = mix(0.42, 0.96, pow(band_norm, 0.65));
-    let end_fade = smoothstep(0.0, 0.05, u_coord) * smoothstep(0.0, 0.05, 1.0 - u_coord);
-    let boundary_fade = depth_fade * end_fade;
+    // Calm reference glow on flat baselines (~0.36) surging to full incandescent brightness on active peaks
+    let activity_gain = mix(0.36, 1.05, smoothstep(0.0, 0.50, wave_height));
+    let depth_fade = mix(0.68, 0.98, pow(band_norm, 0.55));
+    let end_fade = smoothstep(0.0, 0.02, u_coord) * smoothstep(0.0, 0.02, 1.0 - u_coord);
+    let boundary_fade = depth_fade * end_fade * activity_gain;
 
-    // Anti-aliased CRT beam core (exp(-d*d*28)) + soft phosphor halo reaching strictly 0.0 at d = 1.0
-    let edge_blur = 1.0 + smoothstep(0.3, 1.15, r) * 0.55;
+    // Multi-pixel anti-aliased CRT beam core (broader at the back to prevent shimmering, crisp at the front)
+    let core_sharpness = mix(9.5, 16.0, band_norm);
     let edge_zero = (1.0 - d) * (1.0 - d);
-    let core = exp(-d * d * (28.0 / (edge_blur * edge_blur))) * edge_zero;
-    let halo = exp(-d * 3.2) * edge_zero * (0.20 + wave_height * 0.24);
+    let core = exp(-d * d * core_sharpness) * edge_zero;
+    let halo = exp(-d * 4.2) * edge_zero * (0.10 + wave_height * 0.16);
 
-    let core_hot = vec3<f32>(1.00, 0.92, 0.68) * (core * core * (0.22 + wave_height * 0.38));
-    var color = (line_col * (core * 0.82 + halo) + core_hot) * boundary_fade;
-
-    let scanline = 0.88 + 0.12 * cos(in.clip_position.y * 3.14159);
-    color *= scanline * bezel;
+    let core_hot = vec3<f32>(1.00, 0.92, 0.65) * (core * core * (0.12 + wave_height * 0.36));
+    var color = (line_col * (core * 0.74 + halo) + core_hot) * boundary_fade * bezel;
+    color = color / (vec3<f32>(1.0) + color * 0.22);
 
     return vec4<f32>(color, 1.0);
 }

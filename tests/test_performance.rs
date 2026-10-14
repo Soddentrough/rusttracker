@@ -4331,35 +4331,38 @@ async fn run_3d_freq_oscilloscope_snapshot() {
         let band = b / 32;
         let bin_in_band = b % 32;
 
-        // Asymmetric stereo panning (like a 4-channel Amiga MOD where L and R have distinct instruments)
+        // Realistic musical band selectivity (active instruments separated by quiet spectral valleys)
         let (env_l, env_r) = match band {
-            0..=3 => (0.95, 0.85),   // Deep sub-bass & kick fundamental (centered)
-            4..=6 => (0.25, 0.15),   // Low-bass valley
-            7..=10 => (0.88, 0.30),  // Left-panned synth bassline
-            11..=13 => (0.18, 0.78), // Right-panned rhythm chord
-            14..=18 => (0.75, 0.92), // Stereo mid-range lead & vocal sample
-            19..=22 => (0.65, 0.22), // Left-panned upper-mid stab
-            23..=27 => (0.25, 0.80), // Right-panned arpeggio overtones
-            _ => (0.45, 0.55),       // Crisp treble hi-hat shimmer
+            0..=2 => (1.10, 1.00),   // Deep sub-bass & kick fundamental (centered)
+            3..=5 => (0.04, 0.04),   // Quiet valley above sub-bass
+            6..=9 => (1.05, 0.12),   // Left-panned synth bassline
+            10..=11 => (0.04, 0.04), // Quiet valley
+            12..=15 => (0.10, 0.98), // Right-panned rhythm chord
+            16..=17 => (0.04, 0.04), // Quiet valley
+            18..=21 => (0.88, 0.95), // Stereo mid-range lead
+            22..=24 => (0.04, 0.04), // Quiet valley
+            25..=27 => (0.78, 0.14), // Left-panned upper-mid stab
+            28 => (0.04, 0.04),      // Quiet valley
+            _ => (0.18, 0.82),       // Right-panned treble hi-hat & arpeggio shimmer
         };
 
-        let is_primary = bin_in_band == 4 || bin_in_band == 16;
-        let is_secondary = bin_in_band == 8 || bin_in_band == 24;
+        let is_primary = bin_in_band == 6 || bin_in_band == 18;
+        let is_secondary = bin_in_band == 12 || bin_in_band == 24;
         let shape = if is_primary {
             1.0
         } else if is_secondary {
             0.55
         } else {
-            0.08
+            0.05
         };
 
-        let mag_l = (env_l * shape * 8.5) / eq_boost;
-        let mag_r = (env_r * shape * 8.5) / eq_boost;
-        let phase = (b as f32) * 0.73;
+        let mag_l = (env_l * shape * 0.22) / eq_boost;
+        let mag_r = (env_r * shape * 0.22) / eq_boost;
+        let phase = (b as f32) * 0.42;
         gpu_spectrum_data[b * 2] = mag_l * phase.cos();
         gpu_spectrum_data[b * 2 + 1] = mag_l * phase.sin();
-        gpu_spectrum_data[(1024 + b) * 2] = mag_r * (phase + 0.6).cos();
-        gpu_spectrum_data[(1024 + b) * 2 + 1] = mag_r * (phase + 0.6).sin();
+        gpu_spectrum_data[(1024 + b) * 2] = mag_r * (phase + 0.5).cos();
+        gpu_spectrum_data[(1024 + b) * 2 + 1] = mag_r * (phase + 0.5).sin();
     }
 
     let gpu_spectrum_buffer = device.create_buffer(&BufferDescriptor {

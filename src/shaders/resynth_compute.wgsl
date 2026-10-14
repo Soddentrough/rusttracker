@@ -20,65 +20,83 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let end_bin = start_bin + bins_per_line;
 
     let x_norm = f32(point_idx) / f32(num_points - 1u);
-    let x_centered = x_norm - 0.5;
     let has_right = audio.fft_channels >= 2u;
 
     let band_t = f32(line_idx) / 31.0;
 
-    var wave_sum_l = 0.0;
-    var wave_sum_r = 0.0;
     var weight_sum_l = 0.0;
     var weight_sum_r = 0.0;
     var peak_l = 0.0;
     var peak_r = 0.0;
+    var centroid_l = 0.0;
+    var centroid_r = 0.0;
 
-    // Sample 8 evenly spaced sub-bins across the 32-bin band (stride 4) for crisp harmonic structure
-    for (var b = start_bin; b < end_bin; b = b + 4u) {
+    // Pool all 32 bins across the band for full harmonic sensitivity and physical energy
+    for (var b = start_bin; b < end_bin; b = b + 1u) {
         let c_l = gpu_spectrum[b];
         let c_r = select(c_l, gpu_spectrum[1024u + b], has_right);
 
-        // Normalize Hann-windowed FFT magnitude (where full-scale sine is ~12..16 in length(c))
-        let raw_l = length(c_l) * 0.085;
-        let raw_r = length(c_r) * 0.085;
+        // Convert complex FFT magnitude to the standard [0..100] spectrum scale (matching audio.rs line 272)
+        let raw_l = length(c_l) * 100.0;
+        let raw_r = length(c_r) * 100.0;
+        let spec_bin = audio.spectrum[b >> 2u][b & 3u];
+        let lr_avg = max((raw_l + raw_r) * 0.5, 0.001);
+        let ratio_l = select(1.0, clamp(raw_l / lr_avg, 0.15, 1.85), raw_l + raw_r > 0.01);
+        let ratio_r = select(1.0, clamp(raw_r / lr_avg, 0.15, 1.85), raw_l + raw_r > 0.01);
+
+        let base_l = max(raw_l, spec_bin * ratio_l);
+        let base_r = max(raw_r, spec_bin * ratio_r);
 
         let t = f32(b) * 0.0009765625;
         let freq_hz = 20.0 * exp2(t * 8.965784);
 
-        // Gentle perceptual tilt (+1.8dB/oct) so treble bands are visible without blowing out noise
-        let eq_boost = pow(freq_hz / 45.0, 0.28);
+        // Perceptual tilt so mid and treble bands translate to balanced physical wave height alongside bass
+        let eq_boost = pow(freq_hz / 55.0, 0.26);
 
-        let mag_l = max(raw_l * eq_boost - 0.010, 0.0);
-        let mag_r = max(raw_r * eq_boost - 0.010, 0.0);
+        let mag_l = max(base_l * eq_boost - 0.85, 0.0);
+        let mag_r = max(base_r * eq_boost - 0.85, 0.0);
 
-        // Deeper frequencies at the back (line_idx = 0 -> ~1.6 cycles across full field)
-        // to higher frequencies at the front (line_idx = 31 -> ~23 cycles across full field)
         let bin_t = f32(b - start_bin) / 31.0;
-        let spatial_cycles = 1.6 + 19.5 * pow(band_t, 1.75) + bin_t * (0.45 + 1.8 * band_t);
-
-        let temporal_rate = 1.8 + band_t * 5.2 + bin_t * 0.6;
-        let partial_offset = f32(b - start_bin) * 0.37 + f32(line_idx) * 0.58;
-        let base_phase = x_centered * spatial_cycles * 6.2831853 - audio.smooth_time * temporal_rate + partial_offset;
-
-        wave_sum_l += mag_l * cos(base_phase);
-        wave_sum_r += mag_r * cos(base_phase + 0.25);
         weight_sum_l += mag_l;
         weight_sum_r += mag_r;
         peak_l = max(peak_l, mag_l);
         peak_r = max(peak_r, mag_r);
+        centroid_l += mag_l * bin_t;
+        centroid_r += mag_r * bin_t;
     }
 
-    let mean_l = weight_sum_l * 0.125;
-    let mean_r = weight_sum_r * 0.125;
+    let mean_l = weight_sum_l / 32.0;
+    let mean_r = weight_sum_r / 32.0;
+    let cent_l = select(0.5, centroid_l / max(weight_sum_l, 0.0001), weight_sum_l > 0.001);
+    let cent_r = select(0.5, centroid_r / max(weight_sum_r, 0.0001), weight_sum_r > 0.001);
 
-    // Normalize carrier wave so log-bin oversampling at low frequencies never inflates amplitude
-    let carrier_l = wave_sum_l / max(weight_sum_l * 0.45 + peak_l * 0.55, 0.0001);
-    let carrier_r = wave_sum_r / max(weight_sum_r * 0.45 + peak_r * 0.55, 0.0001);
+    // Deeper frequencies at the back (line_idx = 0 -> ~2.6 cycles across full width)
+    // to higher frequencies at the front (line_idx = 31 -> ~12.5 cycles across full width)
+    let base_cycles = 2.6 + 9.9 * pow(band_t, 1.35);
+    let cycles_l = base_cycles + (cent_l - 0.5) * 0.45;
+    let cycles_r = base_cycles + (cent_r - 0.5) * 0.45;
 
-    let env_l = tanh(mix(mean_l, peak_l, 0.65) * 1.35);
-    let env_r = tanh(mix(mean_r, peak_r, 0.65) * 1.35);
+    // Center spatial phase on the Left lobe (u = 0.24) and Right lobe (u = 0.76) with a constant
+    // cross-band phase progression so adjacent rows form coherent 3D wave ridges at any playback time
+    let x_l = x_norm - 0.24;
+    let x_r = x_norm - 0.76;
+    let time_phase = -audio.smooth_time * 3.4 + f32(line_idx) * 0.22;
 
-    let val_l = clamp(carrier_l, -1.15, 1.15) * env_l;
-    let val_r = clamp(carrier_r, -1.15, 1.15) * env_r;
+    let phase_l = x_l * cycles_l * 6.2831853 + time_phase + (cent_l - 0.5) * 0.35;
+    let phase_r = x_r * cycles_r * 6.2831853 + time_phase + (cent_r - 0.5) * 0.35 + 0.35;
+
+    let carrier_l = (cos(phase_l) + 0.22 * sin(2.0 * phase_l + cent_l * 1.2)) * 0.86;
+    let carrier_r = (cos(phase_r) + 0.22 * sin(2.0 * phase_r + cent_r * 1.2)) * 0.86;
+
+    // Translate audio energy [0..100] into physical wave height:
+    // Quiet bands stay flat, moderate tracker notes (energy 6..20) reach 45..85% height, loud peaks reach 100%
+    let band_energy_l = mix(mean_l, peak_l, 0.76);
+    let band_energy_r = mix(mean_r, peak_r, 0.76);
+    let env_l = pow(clamp(band_energy_l / 19.0, 0.0, 1.15), 0.72);
+    let env_r = pow(clamp(band_energy_r / 19.0, 0.0, 1.15), 0.72);
+
+    let val_l = tanh(carrier_l * 1.12) * env_l;
+    let val_r = tanh(carrier_r * 1.12) * env_r;
 
     let base_offset = 16u * 1024u;
     let flat_idx = line_idx * 512u + point_idx;

@@ -288,11 +288,30 @@ pub fn spawn_dsp_thread(
                         }
                         fft.process(&mut complex_buf);
 
-                        for (i, mapping) in log_bin_mappings.iter().enumerate() {
-                            let c0 = complex_buf[mapping.i0];
-                            let c1 = complex_buf[mapping.i1];
-                            let re = c0.re * (1.0 - mapping.frac) + c1.re * mapping.frac;
-                            let im = c0.im * (1.0 - mapping.frac) + c1.im * mapping.frac;
+                        for (i, (mapping, range)) in log_bin_mappings
+                            .iter()
+                            .zip(mono_bin_ranges.iter())
+                            .enumerate()
+                        {
+                            let (re, im) = if range.use_range && range.start < range.safe_end {
+                                let mut best = complex_buf[range.start];
+                                let mut best_norm_sq = best.norm_sqr();
+                                for &val in &complex_buf[range.start + 1..range.safe_end] {
+                                    let nsq = val.norm_sqr();
+                                    if nsq > best_norm_sq {
+                                        best_norm_sq = nsq;
+                                        best = val;
+                                    }
+                                }
+                                (best.re, best.im)
+                            } else {
+                                let c0 = complex_buf[mapping.i0];
+                                let c1 = complex_buf[mapping.i1];
+                                (
+                                    c0.re * (1.0 - mapping.frac) + c1.re * mapping.frac,
+                                    c0.im * (1.0 - mapping.frac) + c1.im * mapping.frac,
+                                )
+                            };
 
                             let norm_re = re / n_sqrt;
                             let norm_im = im / n_sqrt;
@@ -304,11 +323,30 @@ pub fn spawn_dsp_thread(
                     }
                 } else {
                     // Fallback to mono channel FFT mapped to channel 0
-                    for (i, mapping) in log_bin_mappings.iter().enumerate() {
-                        let c0 = complex_buf[mapping.i0];
-                        let c1 = complex_buf[mapping.i1];
-                        let re = c0.re * (1.0 - mapping.frac) + c1.re * mapping.frac;
-                        let im = c0.im * (1.0 - mapping.frac) + c1.im * mapping.frac;
+                    for (i, (mapping, range)) in log_bin_mappings
+                        .iter()
+                        .zip(mono_bin_ranges.iter())
+                        .enumerate()
+                    {
+                        let (re, im) = if range.use_range && range.start < range.safe_end {
+                            let mut best = complex_buf[range.start];
+                            let mut best_norm_sq = best.norm_sqr();
+                            for &val in &complex_buf[range.start + 1..range.safe_end] {
+                                let nsq = val.norm_sqr();
+                                if nsq > best_norm_sq {
+                                    best_norm_sq = nsq;
+                                    best = val;
+                                }
+                            }
+                            (best.re, best.im)
+                        } else {
+                            let c0 = complex_buf[mapping.i0];
+                            let c1 = complex_buf[mapping.i1];
+                            (
+                                c0.re * (1.0 - mapping.frac) + c1.re * mapping.frac,
+                                c0.im * (1.0 - mapping.frac) + c1.im * mapping.frac,
+                            )
+                        };
 
                         let norm_re = re / n_sqrt;
                         let norm_im = im / n_sqrt;
