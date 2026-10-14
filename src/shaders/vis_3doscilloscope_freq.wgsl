@@ -72,9 +72,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let hit_x = ro.x + rd.x * t;
         let hit_z = ro.z + rd.z * t;
 
-        // Spatial AABB early-out: wave X is in [-8, 8] and wave Z (height) is bounded by tanh * 1.2 within [-1.65, 1.65].
-        // Skipping rays that miss the plane's active corridor avoids ~70% of storage buffer reads & 3D projections.
-        if abs(hit_x) > 8.35 || abs(hit_z) > 1.75 {
+        // Corridor bounds check: wave X is in [-8, 8], wave Z height is bounded in [-1.5, 1.5]
+        if abs(hit_x) > 9.5 || abs(hit_z) > 3.0 {
             continue;
         }
 

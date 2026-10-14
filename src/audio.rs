@@ -227,7 +227,14 @@ pub fn spawn_dsp_thread(
 
         let n_sqrt = (window_size as f32).sqrt();
         let mut last_waveform_push = Instant::now();
-        let mut need_gpu_spectrum = false;
+        let mut need_gpu_spectrum = {
+            if let Ok(state) = shared_state.lock() {
+                let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
+                vis_def.id == 6 || vis_def.requires_resynth
+            } else {
+                false
+            }
+        };
         let recycle_tx = &dsp_recycle_channel().0;
 
         while let Ok(msg) = rx.recv() {
@@ -269,17 +276,34 @@ pub fn spawn_dsp_thread(
             let num_channels = msg.channel_audio_data.len().min(32);
             if need_gpu_spectrum {
                 gpu_spectrum.fill(0.0);
-                for c in 0..num_channels {
-                    let channel_data = &msg.channel_audio_data[c];
-                    for i in 0..window_size {
-                        let sample = *channel_data.get(i).unwrap_or(&0.0);
-                        complex_buf[i] = Complex {
-                            re: sample * hann_window[i],
-                            im: 0.0,
-                        };
-                    }
-                    fft.process(&mut complex_buf);
+                if num_channels > 0 {
+                    for c in 0..num_channels {
+                        let channel_data = &msg.channel_audio_data[c];
+                        for i in 0..window_size {
+                            let sample = *channel_data.get(i).unwrap_or(&0.0);
+                            complex_buf[i] = Complex {
+                                re: sample * hann_window[i],
+                                im: 0.0,
+                            };
+                        }
+                        fft.process(&mut complex_buf);
 
+                        for (i, mapping) in log_bin_mappings.iter().enumerate() {
+                            let c0 = complex_buf[mapping.i0];
+                            let c1 = complex_buf[mapping.i1];
+                            let re = c0.re * (1.0 - mapping.frac) + c1.re * mapping.frac;
+                            let im = c0.im * (1.0 - mapping.frac) + c1.im * mapping.frac;
+
+                            let norm_re = re / n_sqrt;
+                            let norm_im = im / n_sqrt;
+
+                            let out_idx = c * 1024 * 2 + i * 2;
+                            gpu_spectrum[out_idx] = norm_re;
+                            gpu_spectrum[out_idx + 1] = norm_im;
+                        }
+                    }
+                } else {
+                    // Fallback to mono channel FFT mapped to channel 0
                     for (i, mapping) in log_bin_mappings.iter().enumerate() {
                         let c0 = complex_buf[mapping.i0];
                         let c1 = complex_buf[mapping.i1];
@@ -289,7 +313,7 @@ pub fn spawn_dsp_thread(
                         let norm_re = re / n_sqrt;
                         let norm_im = im / n_sqrt;
 
-                        let out_idx = c * 1024 * 2 + i * 2;
+                        let out_idx = i * 2;
                         gpu_spectrum[out_idx] = norm_re;
                         gpu_spectrum[out_idx + 1] = norm_im;
                     }

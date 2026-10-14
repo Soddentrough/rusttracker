@@ -41,38 +41,41 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let dt = clamp(audio.frame_dt, 0.001, 0.033);
     var force = vec3<f32>(0.0, -9.8, 0.0);
 
-    // Quantize particle azimuth to 16 discrete magnetic poles around the dish
-    // so particles coalesce into distinct Rosensweig ferrofluid spikes instead of concentric rings!
+    // Organic magnetic field: softly steer particle toward nearest pole without rigid quantization
     let angle = atan2(p.pos.z, p.pos.x);
-    let num_poles = 16.0;
+    let num_poles = 12.0;
     let sector_step = 6.2831853 / num_poles;
     let pole_idx_signed = round(angle / sector_step);
-    let pole_angle = pole_idx_signed * sector_step;
-    let abs_angle = abs(pole_angle);
+    let target_pole_angle = pole_idx_signed * sector_step;
+    // Blend: 70% toward nearest pole for organic Rosensweig spike clustering, 30% natural angle for fluid continuity
+    let pole_angle = mix(angle, target_pole_angle, 0.72);
+    let abs_angle = abs(angle);
 
-    // Normalize audio.spectrum [0..100] -> [0..1.25] instead of clamping raw [0..100] at 1.0!
+    // Normalize audio.spectrum [0..100] -> [0..1.2]
     let spec_idx = min(u32((abs_angle / 3.14159265) * 255.0), 255u);
-    let raw_spec = clamp(audio.spectrum[spec_idx / 4u][spec_idx % 4u] / 72.0, 0.0, 1.25);
+    let raw_spec = clamp(audio.spectrum[spec_idx / 4u][spec_idx % 4u] / 65.0, 0.0, 1.3);
 
     let dt_scale = dt / 0.016;
-    let rate = 1.0 - pow(1.0 - select(0.09, 0.045, raw_spec > p.vel.w), dt_scale);
+    let rate = 1.0 - pow(1.0 - select(0.08, 0.04, raw_spec > p.vel.w), dt_scale);
     p.vel.w = mix(p.vel.w, raw_spec, rate);
     let spec_val = p.vel.w;
 
-    // Two concentric spike rings + central bass pole based on particle ID
-    let ring_tier = idx % 3u;
-    var mag_r = 1.2 + spec_val * 2.6;
+    // Organic magnetic peaks: radial distance and height based on spectrum and particle tier
+    let ring_tier = idx % 4u;
+    var mag_r = 1.4 + spec_val * 2.2;
     if ring_tier == 1u {
-        mag_r = 2.4 + spec_val * 2.2;
-    } else if ring_tier == 2u && (idx % 9u == 0u) {
-        mag_r = 0.25 + spec_val * 1.1;
+        mag_r = 2.6 + spec_val * 1.8;
+    } else if ring_tier == 2u {
+        mag_r = 0.5 + spec_val * 1.4;
+    } else {
+        mag_r = 3.6 + spec_val * 1.2;
     }
-    let mag_h = -0.35 + spec_val * 2.85;
+    let mag_h = -0.2 + spec_val * 2.6;
     let mag_pos = vec3<f32>(cos(pole_angle) * mag_r, mag_h, sin(pole_angle) * mag_r);
 
     let dir = mag_pos - p.pos.xyz;
     let dist_sq = dot(dir, dir);
-    let mag_force = (spec_val * 210.0 + 22.0) / (dist_sq + 0.45);
+    let mag_force = (spec_val * 175.0 + 18.0) / (dist_sq + 0.85);
     force += normalize(dir) * mag_force;
 
     let t_time = audio.smooth_time * 0.35;

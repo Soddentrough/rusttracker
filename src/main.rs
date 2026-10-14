@@ -641,22 +641,20 @@ async fn run_gui(
                                 let mut state = app_state.lock().unwrap();
                                 let duration = state.duration_seconds.max(0.1);
                                 let mut delta = 0.0;
+                                let step = if modifiers.control_key() || modifiers.super_key() {
+                                    60.0f64.min(duration).max(5.0)
+                                } else if modifiers.shift_key() {
+                                    30.0f64.min(duration).max(1.0)
+                                } else {
+                                    5.0f64.min(duration).max(0.5)
+                                };
+
                                 match keycode {
                                     WinitKeyCode::ArrowRight => {
-                                        delta = if modifiers.control_key() || modifiers.super_key()
-                                        {
-                                            duration * 0.01
-                                        } else {
-                                            duration * 0.001
-                                        };
+                                        delta = step;
                                     }
                                     WinitKeyCode::ArrowLeft => {
-                                        delta = if modifiers.control_key() || modifiers.super_key()
-                                        {
-                                            -(duration * 0.01)
-                                        } else {
-                                            -(duration * 0.001)
-                                        };
+                                        delta = -step;
                                     }
                                     WinitKeyCode::Comma => delta = -1.0 / 60.0, // ~1 frame at 60fps
                                     WinitKeyCode::Period => delta = 1.0 / 60.0,
@@ -678,7 +676,7 @@ async fn run_gui(
                                         if delta > 0.0 { "+" } else { "-" }
                                     ));
                                 } else {
-                                    state.osd_text = Some(format!("{}{:.2}s", sign, delta));
+                                    state.osd_text = Some(format!("{}{:.1}s", sign, delta));
                                 }
                                 state.osd_timer = 2.0;
                             }

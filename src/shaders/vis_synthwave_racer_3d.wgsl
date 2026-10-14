@@ -357,7 +357,7 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     }
 
     // Distance Atmospheric Vaporwave Fog (Blending cleanly into warm golden-crimson sunset horizon)
-    let fog_f = smoothstep(45.0, 240.0, in.world_pos.z);
+    let fog_f = smoothstep(90.0, 380.0, in.world_pos.z);
     let sun_align = exp(-abs(in.world_pos.x) * 0.016);
     let fog_c = mix(vec3<f32>(0.26, 0.03, 0.32), vec3<f32>(0.72, 0.18, 0.28), sun_align * 0.65);
     color = mix(color, fog_c, fog_f);

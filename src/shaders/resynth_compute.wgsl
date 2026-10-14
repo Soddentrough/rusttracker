@@ -51,8 +51,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         val += (mag * eq_boost) * cos(phase);
     }
 
-    // Scale and soft-clip via tanh so HF-heavy passages never clip downstream
-    val = tanh((val / 90.5) * 1.55);
+    // Scale and soft-clip via tanh so both quiet tracks and loud passages produce clear, lively waveforms
+    val = tanh(val * 0.45);
 
     let base_offset = 16u * 1024u;
     let flat_idx = line_idx * 512u + point_idx;

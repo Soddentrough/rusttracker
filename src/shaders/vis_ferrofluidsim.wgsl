@@ -83,13 +83,14 @@ fn get_density(p: vec2<f32>) -> f32 {
 
 fn map(p: vec3<f32>) -> f32 {
     let dist_from_center = length(p.xz);
-    if (dist_from_center > PUDDLE_RADIUS + 0.5) {
+    if (dist_from_center > PUDDLE_RADIUS + 0.8) {
         return (p.y + 0.5) * LIPSCHITZ;
     }
 
     let particle_h = get_density(p.xz);
-    let base_h = BASE_HEIGHT * smoothstep_r(PUDDLE_RADIUS, PUDDLE_RADIUS * 0.5, dist_from_center);
-    let h = max(particle_h, base_h);
+    let base_h = BASE_HEIGHT * smoothstep_r(PUDDLE_RADIUS + 0.5, PUDDLE_RADIUS * 0.4, dist_from_center);
+    let radial_fade = smoothstep_r(PUDDLE_RADIUS + 0.6, PUDDLE_RADIUS * 0.8, dist_from_center);
+    let h = max(particle_h * radial_fade, base_h);
     return (p.y + 0.5 - h) * LIPSCHITZ;
 }
 

@@ -53,8 +53,11 @@ fn doom_palette(h: f32) -> vec3<f32> {
     if (h < 0.005) {
         return vec3<f32>(0.0, 0.0, 0.0);
     }
-    let idx = clamp(u32(round(h * 36.0)), 0u, 36u);
-    return DOOM_PALETTE[idx];
+    let scaled = clamp(h * 36.0, 0.0, 36.0);
+    let idx0 = u32(floor(scaled));
+    let idx1 = min(idx0 + 1u, 36u);
+    let frac = fract(scaled);
+    return mix(DOOM_PALETTE[idx0], DOOM_PALETTE[idx1], frac);
 }
 
 @fragment
@@ -63,44 +66,37 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // --- Aspect-Ratio-Adaptive Square Retro Pixels ---
     let aspect = max(audio.aspect_ratio, 0.1);
-    let v_height = 180.0;
+    let v_height = 240.0;
     let v_width = max(floor(v_height * aspect), 1.0);
     let virt_res = vec2<f32>(v_width, v_height);
 
     let pixel_coord = floor(uv * virt_res);
     let pixel_uv = (pixel_coord + 0.5) / virt_res;
 
-    // Sample temperature from simulation grid (1024 x 576)
-    let tex_coord = vec2<i32>(
-        clamp(i32(pixel_uv.x * 1024.0), 0, 1023),
-        clamp(i32(pixel_uv.y * 576.0), 0, 575)
-    );
-    let heat = textureLoad(fire_grid_tex, tex_coord, 0).r;
+    // Bilinear blend of nearby simulation grid cells (1024 x 576)
+    let grid_uv = pixel_uv * vec2<f32>(1023.0, 575.0);
+    let base_coord = vec2<i32>(floor(grid_uv));
+    let frac_uv = fract(grid_uv);
+    let c00 = textureLoad(fire_grid_tex, clamp(base_coord, vec2<i32>(0), vec2<i32>(1023, 575)), 0).r;
+    let c10 = textureLoad(fire_grid_tex, clamp(base_coord + vec2<i32>(1, 0), vec2<i32>(0), vec2<i32>(1023, 575)), 0).r;
+    let c01 = textureLoad(fire_grid_tex, clamp(base_coord + vec2<i32>(0, 1), vec2<i32>(0), vec2<i32>(1023, 575)), 0).r;
+    let c11 = textureLoad(fire_grid_tex, clamp(base_coord + vec2<i32>(1, 1), vec2<i32>(0), vec2<i32>(1023, 575)), 0).r;
+    let heat = mix(mix(c00, c10, frac_uv.x), mix(c01, c11, frac_uv.x), frac_uv.y);
 
     var color = doom_palette(clamp(heat, 0.0, 1.0));
 
-    // --- Retro Pixel Grid Separation ---
-    let cell_frac = fract(uv * virt_res);
-    let grid_x = smoothstep(0.0, 0.07, cell_frac.x) * smoothstep_r(1.0, 0.93, cell_frac.x);
-    let grid_y = smoothstep(0.0, 0.07, cell_frac.y) * smoothstep_r(1.0, 0.93, cell_frac.y);
-    color *= 0.82 + 0.18 * grid_x * grid_y;
-
-    // --- CRT Scanlines (per virtual pixel row) ---
+    // --- CRT Scanlines (subtle analog feel, no harsh checkerboard grid) ---
     let scanline_phase = fract(uv.y * virt_res.y);
-    let scanline = 0.80 + 0.20 * smoothstep(0.0, 0.32, scanline_phase)
-                                 * smoothstep_r(1.0, 0.68, scanline_phase);
+    let scanline = 0.90 + 0.10 * cos(scanline_phase * 6.2831853);
     color *= scanline;
 
-    // --- RGB Phosphor Triad Sub-Pixel Tint ---
+    // Subtle phosphor triad sheen
     let sub_pixel = fract(uv.x * virt_res.x * 3.0);
-    var phosphor: vec3<f32>;
-    if sub_pixel < 0.333 {
-        phosphor = vec3<f32>(1.08, 0.96, 0.96);
-    } else if sub_pixel < 0.666 {
-        phosphor = vec3<f32>(0.96, 1.08, 0.96);
-    } else {
-        phosphor = vec3<f32>(0.96, 0.96, 1.08);
-    }
+    let phosphor = 0.97 + 0.03 * vec3<f32>(
+        select(0.0, 1.0, sub_pixel < 0.333),
+        select(0.0, 1.0, sub_pixel >= 0.333 && sub_pixel < 0.666),
+        select(0.0, 1.0, sub_pixel >= 0.666)
+    );
     color *= phosphor;
 
     // Warm incandescent bloom for white-hot flame cores
