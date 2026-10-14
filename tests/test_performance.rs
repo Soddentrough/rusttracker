@@ -200,7 +200,7 @@ async fn run_perf_test() {
             },
             BindGroupLayoutEntry {
                 binding: 4,
-                visibility: ShaderStages::FRAGMENT,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
                 ty: BindingType::Buffer {
                     ty: BufferBindingType::Storage { read_only: true },
                     has_dynamic_offset: false,
@@ -4196,4 +4196,651 @@ async fn run_flip_lyrics_animation() {
     println!(
         "Saved test_flip_lyrics_impact.png, test_flip_lyrics.webp, and test_flip_lyrics.gif successfully!"
     );
+}
+
+#[test]
+fn test_render_3d_freq_oscilloscope_snapshot() {
+    pollster::block_on(run_3d_freq_oscilloscope_snapshot());
+}
+
+async fn run_3d_freq_oscilloscope_snapshot() {
+    let instance = Instance::new(InstanceDescriptor {
+        backends: Backends::PRIMARY,
+        flags: InstanceFlags::default(),
+        backend_options: BackendOptions::default(),
+        display: None,
+        memory_budget_thresholds: MemoryBudgetThresholds::default(),
+    });
+
+    let adapter = instance
+        .request_adapter(&RequestAdapterOptions {
+            power_preference: PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+        })
+        .await
+        .unwrap();
+
+    let (device, queue) = adapter
+        .request_device(&DeviceDescriptor {
+            label: Some("3D Freq Oscilloscope Snapshot Device"),
+            required_features: Features::empty(),
+            required_limits: Limits::default(),
+            memory_hints: MemoryHints::default(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let width = 1920u32;
+    let height = 1080u32;
+    let color_format = TextureFormat::Rgba8UnormSrgb;
+
+    let render_target = device.create_texture(&TextureDescriptor {
+        label: Some("3D Freq Scope RenderTarget"),
+        size: Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: color_format,
+        usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let color_view = render_target.create_view(&TextureViewDescriptor::default());
+
+    let depth_texture = device.create_texture(&TextureDescriptor {
+        label: Some("3D Freq Scope Depth"),
+        size: Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Depth32Float,
+        usage: TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let depth_view = depth_texture.create_view(&TextureViewDescriptor::default());
+
+    let uniforms = crate::engine::AudioUniforms {
+        spectrum: [0.25; 1024],
+        fire_heat: [0.0; 1024],
+        channels: [0.85; 32],
+        channel_peaks: [0.92; 32],
+        spatial_channels: [0.8; 16],
+        display_order: [0; 16],
+        channel_phases: [0.0; 32],
+        num_channels: 16,
+        mode: 4,
+        time: 4.2,
+        duration: 200.0,
+        smooth_time: 4.2,
+        heatmap_row: 0,
+        fft_channels: 2,
+        num_spatial_channels: 2,
+        ui_meters_rect: [0.0; 4],
+        ui_heatmap_rect: [0.0; 4],
+        ui_fire_rect: [0.0; 4],
+        waveform_resolution: 1024,
+        waveform_history_size: 144,
+        frame_count: 300,
+        step_fraction: 0.25,
+        steps_to_fill: 1,
+        aspect_ratio: (width as f32) / (height as f32),
+        frame_dt: 0.016,
+        history_cam_z: 15.0,
+        fire_intensity: 1.0,
+        _pad1: 0.0,
+        _pad2: 0.0,
+        _pad3: 0.0,
+    };
+
+    let uniform_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("Uniforms"),
+        size: std::mem::size_of::<crate::engine::AudioUniforms>() as u64,
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+
+    // Populate gpu_spectrum with realistic multi-band musical harmonics (bass, synth chords, lead overtones)
+    let mut gpu_spectrum_data = vec![0.0f32; 32 * 1024 * 2];
+    for b in 0..1024usize {
+        let t = (b as f32) / 1024.0;
+        let freq_hz = 20.0 * (t * 8.965784).exp2();
+        let eq_boost = (freq_hz / 20.0).sqrt();
+
+        // Create distinct musical note & chord peaks across the 32 bands
+        let band = b / 32;
+        let bin_in_band = b % 32;
+        let band_env = match band {
+            0..=3 => 1.15,   // Deep sub-bass & kick fundamental
+            4..=6 => 0.35,   // Warm low-bass groove
+            7..=10 => 0.90,  // Punchy bassline & low-mid synth
+            11..=13 => 0.30, // Mid valley
+            14..=18 => 0.95, // Rich mid-range chord & lead
+            19..=22 => 0.40, // Upper-mid breath
+            23..=27 => 0.72, // Crisp arpeggio overtones
+            _ => 0.38,       // Airy treble shimmer
+        };
+
+        let is_primary = bin_in_band == 5 || bin_in_band == 17;
+        let is_secondary = bin_in_band == 11 || bin_in_band == 25;
+        let partial_amp = if is_primary {
+            0.42 * band_env * (0.65 + 0.35 * ((b as f32) * 0.41).sin().abs())
+        } else if is_secondary {
+            0.22 * band_env * (0.5 + 0.5 * ((b as f32) * 0.79).cos().abs())
+        } else {
+            0.008 * band_env
+        };
+
+        let mag = partial_amp / eq_boost;
+        let phase = (b as f32) * 0.73;
+        gpu_spectrum_data[b * 2] = mag * phase.cos();
+        gpu_spectrum_data[b * 2 + 1] = mag * phase.sin();
+        gpu_spectrum_data[(1024 + b) * 2] = mag * (phase + 0.4).cos();
+        gpu_spectrum_data[(1024 + b) * 2 + 1] = mag * (phase + 0.4).sin();
+    }
+
+    let gpu_spectrum_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("GPU FFT Spectrum Buffer"),
+        size: (32 * 1024 * 8) as u64,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(
+        &gpu_spectrum_buffer,
+        0,
+        bytemuck::cast_slice(&gpu_spectrum_data),
+    );
+
+    // Run resynth_compute.wgsl to synthesize the 32x512 frequency waveforms into gpu_spectrum[16*1024..]
+    let resynth_bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("resynth_bind_group_layout"),
+        entries: &[
+            BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 1,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+    let resynth_bind_group = device.create_bind_group(&BindGroupDescriptor {
+        label: Some("resynth_bind_group"),
+        layout: &resynth_bind_group_layout,
+        entries: &[
+            BindGroupEntry {
+                binding: 0,
+                resource: gpu_spectrum_buffer.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 1,
+                resource: uniform_buffer.as_entire_binding(),
+            },
+        ],
+    });
+    let resynth_src = resolve_shader_includes(include_str!("../src/shaders/resynth_compute.wgsl"));
+    let resynth_module = device.create_shader_module(ShaderModuleDescriptor {
+        label: Some("Resynth Compute Module"),
+        source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&resynth_src)),
+    });
+    let resynth_pipe_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+        label: Some("resynth_pipe_layout"),
+        bind_group_layouts: &[Some(&resynth_bind_group_layout)],
+        immediate_size: 0,
+    });
+    let resynth_pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
+        label: Some("Resynth Compute Pipeline"),
+        layout: Some(&resynth_pipe_layout),
+        module: &resynth_module,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+
+    // Audio & Camera bind groups for 3D render
+    let dummy_waveform = device.create_buffer(&BufferDescriptor {
+        label: Some("Dummy Waveform"),
+        size: 1024,
+        usage: BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let dummy_tex = device.create_texture(&TextureDescriptor {
+        label: Some("Dummy Tex"),
+        size: Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::R32Float,
+        usage: TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let dummy_view = dummy_tex.create_view(&TextureViewDescriptor::default());
+    let dummy_storage = device.create_buffer(&BufferDescriptor {
+        label: Some("Dummy Storage"),
+        size: 1024,
+        usage: BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+
+    let bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("audio_bind_group_layout"),
+        entries: &[
+            BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 1,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 2,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: false },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 3,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: false },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 4,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 5,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+
+    let uniform_bind_group = device.create_bind_group(&BindGroupDescriptor {
+        label: Some("audio_bind_group"),
+        layout: &bind_group_layout,
+        entries: &[
+            BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 1,
+                resource: dummy_waveform.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 2,
+                resource: BindingResource::TextureView(&dummy_view),
+            },
+            BindGroupEntry {
+                binding: 3,
+                resource: BindingResource::TextureView(&dummy_view),
+            },
+            BindGroupEntry {
+                binding: 4,
+                resource: gpu_spectrum_buffer.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 5,
+                resource: dummy_storage.as_entire_binding(),
+            },
+        ],
+    });
+
+    let smoke_texture = device.create_texture(&TextureDescriptor {
+        label: Some("Neon Smoke Texture"),
+        size: Extent3d {
+            width: 64,
+            height: 64,
+            depth_or_array_layers: 64,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D3,
+        format: TextureFormat::Rgba16Float,
+        usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let smoke_texture_view = smoke_texture.create_view(&TextureViewDescriptor::default());
+    let smoke_sampler = device.create_sampler(&SamplerDescriptor::default());
+    let smoke_render_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("Smoke Render Layout"),
+        entries: &[
+            BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D3,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 1,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+    let smoke_render_bind_group = device.create_bind_group(&BindGroupDescriptor {
+        label: Some("Smoke Render Bind Group"),
+        layout: &smoke_render_layout,
+        entries: &[
+            BindGroupEntry {
+                binding: 0,
+                resource: BindingResource::TextureView(&smoke_texture_view),
+            },
+            BindGroupEntry {
+                binding: 1,
+                resource: BindingResource::Sampler(&smoke_sampler),
+            },
+        ],
+    });
+
+    let camera_bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("Camera Bind Group Layout"),
+        entries: &[BindGroupLayoutEntry {
+            binding: 0,
+            visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+            ty: BindingType::Buffer {
+                ty: BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+    let camera_uniforms = crate::engine::CameraUniforms {
+        view_matrix: glam::Mat4::IDENTITY.to_cols_array_2d(),
+        proj_matrix: glam::Mat4::IDENTITY.to_cols_array_2d(),
+    };
+    let camera_uniform_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("Camera Uniforms"),
+        size: std::mem::size_of::<crate::engine::CameraUniforms>() as u64,
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(
+        &camera_uniform_buffer,
+        0,
+        bytemuck::cast_slice(&[camera_uniforms]),
+    );
+    let camera_bind_group = device.create_bind_group(&BindGroupDescriptor {
+        label: Some("Camera Bind Group"),
+        layout: &camera_bind_group_layout,
+        entries: &[BindGroupEntry {
+            binding: 0,
+            resource: camera_uniform_buffer.as_entire_binding(),
+        }],
+    });
+
+    let render_pipeline_layout_3d = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+        label: Some("3D Render Pipeline Layout"),
+        bind_group_layouts: &[
+            Some(&bind_group_layout),
+            Some(&smoke_render_layout),
+            Some(&camera_bind_group_layout),
+        ],
+        immediate_size: 0,
+    });
+
+    let shader_src =
+        resolve_shader_includes(include_str!("../src/shaders/vis_3doscilloscope_freq.wgsl"));
+    let shader_module = device.create_shader_module(ShaderModuleDescriptor {
+        label: Some("3D Freq Oscilloscope Shader"),
+        source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&shader_src)),
+    });
+
+    let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+        label: Some("3D Freq Oscilloscope Pipeline"),
+        layout: Some(&render_pipeline_layout_3d),
+        vertex: VertexState {
+            module: &shader_module,
+            entry_point: Some("vs_main_3d"),
+            buffers: &[crate::engine::Vertex::desc()],
+            compilation_options: PipelineCompilationOptions::default(),
+        },
+        fragment: Some(FragmentState {
+            module: &shader_module,
+            entry_point: Some("fs_main"),
+            targets: &[Some(ColorTargetState {
+                format: color_format,
+                blend: Some(BlendState::REPLACE),
+                write_mask: ColorWrites::ALL,
+            })],
+            compilation_options: PipelineCompilationOptions::default(),
+        }),
+        primitive: PrimitiveState {
+            topology: PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: Some(DepthStencilState {
+            format: TextureFormat::Depth32Float,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(CompareFunction::LessEqual),
+            stencil: StencilState::default(),
+            bias: DepthBiasState::default(),
+        }),
+        multisample: MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    // Build exact 511 x 62 Grid mesh matching VisualizerDef for ID 4
+    let grid_width = 511u32;
+    let grid_depth = 2u32;
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    for z in 0..=grid_depth {
+        for x in 0..=grid_width {
+            let px = x as f32 - (grid_width as f32) / 2.0;
+            let pz = z as f32 - (grid_depth as f32) / 2.0;
+            vertices.push(crate::engine::Vertex {
+                position: [px, 0.0, pz],
+                normal: [0.0, 1.0, 0.0],
+                tex_coords: [x as f32 / grid_width as f32, z as f32 / grid_depth as f32],
+            });
+        }
+    }
+    for z in 0..grid_depth {
+        for x in 0..grid_width {
+            let start = z * (grid_width + 1) + x;
+            indices.push(start);
+            indices.push(start + 1);
+            indices.push(start + grid_width + 1);
+            indices.push(start + 1);
+            indices.push(start + grid_width + 2);
+            indices.push(start + grid_width + 1);
+        }
+    }
+
+    let grid_vertex_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("Grid 511x2 Vertex Buffer"),
+        size: (vertices.len() * std::mem::size_of::<crate::engine::Vertex>()) as u64,
+        usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&grid_vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+
+    let grid_index_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("Grid 511x2 Index Buffer"),
+        size: (indices.len() * std::mem::size_of::<u32>()) as u64,
+        usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&grid_index_buffer, 0, bytemuck::cast_slice(&indices));
+    let grid_index_count = indices.len() as u32;
+
+    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
+    {
+        let mut cp = encoder.begin_compute_pass(&ComputePassDescriptor {
+            label: Some("Resynth Compute Pass"),
+            timestamp_writes: None,
+        });
+        cp.set_pipeline(&resynth_pipeline);
+        cp.set_bind_group(0, Some(&resynth_bind_group), &[]);
+        cp.dispatch_workgroups(32, 2, 1);
+    }
+    {
+        let mut rp = encoder.begin_render_pass(&RenderPassDescriptor {
+            label: Some("3D Freq Scope Render Pass"),
+            color_attachments: &[Some(RenderPassColorAttachment {
+                view: &color_view,
+                resolve_target: None,
+                ops: Operations {
+                    load: LoadOp::Clear(Color::BLACK),
+                    store: StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                view: &depth_view,
+                depth_ops: Some(Operations {
+                    load: LoadOp::Clear(1.0),
+                    store: StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        rp.set_pipeline(&pipeline);
+        rp.set_bind_group(0, &uniform_bind_group, &[]);
+        rp.set_bind_group(1, &smoke_render_bind_group, &[]);
+        rp.set_bind_group(2, &camera_bind_group, &[]);
+        rp.set_vertex_buffer(0, grid_vertex_buffer.slice(..));
+        rp.set_index_buffer(grid_index_buffer.slice(..), IndexFormat::Uint32);
+        rp.draw_indexed(0..grid_index_count, 0, 0..32);
+    }
+
+    let bytes_per_pixel = 4u32;
+    let unpadded_bytes_per_row = width * bytes_per_pixel;
+    let align = 256u32;
+    let bytes_per_row = (unpadded_bytes_per_row + align - 1) & !(align - 1);
+
+    let out_buf = device.create_buffer(&BufferDescriptor {
+        label: Some("Readback Buf"),
+        size: (bytes_per_row * height) as u64,
+        usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    encoder.copy_texture_to_buffer(
+        TexelCopyTextureInfo {
+            texture: &render_target,
+            mip_level: 0,
+            origin: Origin3d::ZERO,
+            aspect: TextureAspect::All,
+        },
+        TexelCopyBufferInfo {
+            buffer: &out_buf,
+            layout: TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(height),
+            },
+        },
+        Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(Some(encoder.finish()));
+
+    let slice = out_buf.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(MapMode::Read, move |res| {
+        tx.send(res).unwrap();
+    });
+    let _ = device.poll(PollType::Wait {
+        submission_index: None,
+        timeout: None,
+    });
+    rx.recv().unwrap().unwrap();
+
+    let data = slice.get_mapped_range();
+    let mut img = image::ImageBuffer::<image::Rgba<u8>, _>::new(width, height);
+    for y in 0..height {
+        let row_start = (y * bytes_per_row) as usize;
+        for x in 0..width {
+            let px_start = row_start + (x * bytes_per_pixel) as usize;
+            let r = data[px_start];
+            let g = data[px_start + 1];
+            let b = data[px_start + 2];
+            let a = data[px_start + 3];
+            img.put_pixel(x, y, image::Rgba([r, g, b, a]));
+        }
+    }
+    drop(data);
+    out_buf.unmap();
+
+    let out_path = std::env::temp_dir().join("vis_3doscilloscope_freq_mesh3d.png");
+    img.save(&out_path).unwrap();
+    println!("Saved 3D Freq Oscilloscope snapshot to {:?}", out_path);
 }

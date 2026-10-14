@@ -2874,7 +2874,7 @@ impl VulkanEngine {
                 },
                 wgpu::BindGroupLayoutEntry {
                     binding: 4,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Storage { read_only: true },
                         has_dynamic_offset: false,
@@ -9354,7 +9354,7 @@ impl VulkanEngine {
                 .min(self.render_pipelines.len() - 1);
             let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
 
-            if vis_def.id == 12 || vis_def.id == 3 || vis_def.id == 23 {
+            if vis_def.id == 12 || vis_def.id == 3 || vis_def.id == 4 || vis_def.id == 23 {
                 render_pass.set_pipeline(&self.clear_black_pipeline);
                 render_pass.draw(0..3, 0..1);
             } else if vis_def.id == 20 {
@@ -10039,6 +10039,26 @@ mod tests {
                 e.emit_to_string(&scope_resolved)
             );
         }
+
+        let freq_scope_resolved =
+            resolve_shader_includes(include_str!("shaders/vis_3doscilloscope_freq.wgsl"));
+        if let Err(e) = wgpu::naga::front::wgsl::parse_str(&freq_scope_resolved) {
+            panic!(
+                "vis_3doscilloscope_freq WGSL error:\n{}",
+                e.emit_to_string(&freq_scope_resolved)
+            );
+        }
+        let freq_vis = crate::state::VISUALIZERS
+            .iter()
+            .find(|v| v.id == 4)
+            .expect("Visualizer ID 4 (3D Freq Oscilloscope) must exist");
+        assert!(
+            matches!(
+                freq_vis.pipeline_type,
+                crate::state::PipelineType::Mesh3D { .. }
+            ),
+            "3D Freq Oscilloscope must use PipelineType::Mesh3D"
+        );
     }
 
     #[test]

@@ -223,7 +223,13 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         name: "3D Freq Oscilloscope",
         filename: "vis_3doscilloscope_freq.wgsl",
         description: "3D topographical frequency view",
-        pipeline_type: PipelineType::FullscreenQuad,
+        pipeline_type: PipelineType::Mesh3D {
+            geometry: Geometry::Grid {
+                width: 511,
+                depth: 2,
+            },
+            instances: 32,
+        },
         requires_history: false,
         requires_fire: false,
         requires_resynth: true,
@@ -616,7 +622,6 @@ impl AppState {
             let mobile_disabled_ids = [
                 1,  // CRT Oscilloscope (23.8ms on mobile)
                 2, // 3D CRT Oscilloscope (38.2ms on mobile -> replaced by 3D Oscilloscope Raster at 178 FPS)
-                4, // 3D Freq Oscilloscope (23.3ms on mobile)
                 9, // Chrome Ferrofluid (raymarched liquid metal is too heavy for mobile GPUs and drains battery)
                 10, // Ferrofluid Particle Sim
                 11, // Neon Corridor
@@ -635,7 +640,6 @@ impl AppState {
             let steam_deck_disabled_ids = [
                 1,  // CRT Oscilloscope
                 2,  // 3D CRT Oscilloscope
-                4,  // 3D Freq Oscilloscope
                 9,  // Chrome Ferrofluid
                 10, // Ferrofluid Particle Sim
                 11, // Neon Corridor
