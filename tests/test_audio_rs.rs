@@ -129,3 +129,200 @@ fn test_synthwave_lyrics_visualization_with_audio() {
         );
     }
 }
+
+#[test]
+fn test_all_audio_test_files() {
+    let mut files: Vec<String> = Vec::new();
+    for root_file in ["test_sine.wav", "test_multichannel_sweep.wav"] {
+        if std::path::Path::new(root_file).exists() {
+            files.push(root_file.to_string());
+        }
+    }
+    if let Ok(entries) = std::fs::read_dir("audio_tests") {
+        let mut dir_files: Vec<String> = entries
+            .flatten()
+            .filter_map(|e| {
+                let p = e.path();
+                if !p.is_file() {
+                    return None;
+                }
+                let len = e.metadata().map(|m| m.len()).unwrap_or(0);
+                if len == 0 {
+                    return None;
+                }
+                let ext = p
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_lowercase();
+                if ext == "lrc" || ext == "txt" || ext == "json" {
+                    return None;
+                }
+                Some(p.to_string_lossy().into_owned())
+            })
+            .collect();
+        dir_files.sort();
+        files.extend(dir_files);
+    }
+
+    println!("Testing {} sample files...", files.len());
+    let mut failures = Vec::new();
+
+    for path in &files {
+        println!("\n=== Testing: {} ===", path);
+        let load_res = std::panic::catch_unwind(|| audio::load_audio_source(path));
+        match load_res {
+            Err(panic_err) => {
+                let msg = format!("{}: PANIC in load_audio_source: {:?}", path, panic_err);
+                println!("  FAIL: {}", msg);
+                failures.push(msg);
+                continue;
+            }
+            Ok(Err(e)) => {
+                let msg = format!("{}: load_audio_source error: {:?}", path, e);
+                println!("  FAIL: {}", msg);
+                failures.push(msg);
+                continue;
+            }
+            Ok(Ok(mut src)) => {
+                let ch = src.get_num_channels().max(1) as usize;
+                let rate = src.get_intrinsic_sample_rate().unwrap_or(48000);
+                let dur = src.get_duration_seconds();
+                let mod_type = src.get_type();
+                let has_vid = src.has_video_stream();
+                println!(
+                    "  Loaded: type={}, ch={}, rate={}Hz, dur={:.2}s, has_video={}",
+                    mod_type, ch, rate, dur, has_vid
+                );
+
+                // Read up to 40 chunks (stereo downmix AND native channels)
+                let read_res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    let mut buf = vec![0.0f32; 1024 * 2];
+                    let mut total_frames = 0usize;
+                    let mut max_abs = 0.0f32;
+                    let mut max_vu = 0.0f32;
+                    let vu_channels = src.get_tracker_channels().unwrap_or(ch as i32);
+                    for _ in 0..40 {
+                        let n = src.read_frames(2, rate, &mut buf);
+                        if n == 0 {
+                            break;
+                        }
+                        total_frames += n;
+                        for &s in &buf[..n * 2] {
+                            max_abs = max_abs.max(s.abs());
+                        }
+                        for c in 0..vu_channels {
+                            max_vu = max_vu.max(src.get_current_channel_vu_mono(c));
+                        }
+                    }
+                    // If intro is quiet (e.g. movie trailer / MIDI intro), also probe at 5.0s
+                    if max_abs < 0.001 && dur > 6.0 {
+                        src.set_position_seconds(5.0);
+                        for _ in 0..40 {
+                            let n = src.read_frames(2, rate, &mut buf);
+                            if n == 0 {
+                                break;
+                            }
+                            total_frames += n;
+                            for &s in &buf[..n * 2] {
+                                max_abs = max_abs.max(s.abs());
+                            }
+                            for c in 0..vu_channels {
+                                max_vu = max_vu.max(src.get_current_channel_vu_mono(c));
+                            }
+                        }
+                    }
+                    let pos = src.get_position_seconds();
+                    (total_frames, max_abs, max_vu, pos)
+                }));
+
+                match read_res {
+                    Err(panic_err) => {
+                        let msg = format!("{}: PANIC in read_frames(2ch): {:?}", path, panic_err);
+                        println!("  FAIL: {}", msg);
+                        failures.push(msg);
+                    }
+                    Ok((total_frames, max_abs, max_vu, pos)) => {
+                        println!(
+                            "  read_frames(2ch): frames={}, max_abs={:.6}, max_vu={:.6}, pos={:.3}s",
+                            total_frames, max_abs, max_vu, pos
+                        );
+                        if total_frames == 0 {
+                            failures.push(format!("{}: read_frames returned 0 frames", path));
+                        }
+                        if !path.contains("portrait_test_90") && max_abs == 0.0 {
+                            failures.push(format!(
+                                "{}: decoded audio is completely silent (max_abs=0)",
+                                path
+                            ));
+                        }
+                        if !path.contains("portrait_test_90") && max_vu == 0.0 {
+                            failures.push(format!(
+                                "{}: channel VUs remained 0 during playback (max_vu=0)",
+                                path
+                            ));
+                        }
+                    }
+                }
+
+                // Also test start_audio_thread end-to-end playback pipeline!
+                let shared_state = std::sync::Arc::new(std::sync::Mutex::new(
+                    state::AppState::new(path.clone()),
+                ));
+                {
+                    let mut st = shared_state.lock().unwrap();
+                    st.is_paused = false;
+                }
+                match audio::start_audio_thread(path, false, shared_state.clone()) {
+                    Err(e) => {
+                        let msg = format!("{}: start_audio_thread failed: {:?}", path, e);
+                        println!("  FAIL: {}", msg);
+                        failures.push(msg);
+                    }
+                    Ok(handle) => {
+                        std::thread::sleep(std::time::Duration::from_millis(250));
+                        let (hw_ch, cur_rate, num_ch, cur_sec, mod_t, spec_max, vu_len, raw_ch_len) = {
+                            let st = shared_state.lock().unwrap();
+                            let sm = st
+                                .raw_spectrum_data
+                                .iter()
+                                .copied()
+                                .fold(0.0f32, f32::max);
+                            (
+                                st.hardware_channels,
+                                st.current_sample_rate,
+                                st.num_channels,
+                                st.current_seconds,
+                                st.module_type.clone(),
+                                sm,
+                                st.raw_channel_vus.len(),
+                                st.raw_audio_channels
+                                    .first()
+                                    .map(|v| v.len())
+                                    .unwrap_or(0),
+                            )
+                        };
+                        println!(
+                            "  start_audio_thread: mod={}, num_ch={}, hw_ch={}, rate={}Hz, pos={:.3}s, spec_max={:.2}, vu_len={}, raw_ch0_len={}",
+                            mod_t, num_ch, hw_ch, cur_rate, cur_sec, spec_max, vu_len, raw_ch_len
+                        );
+                        if raw_ch_len == 0 {
+                            failures.push(format!(
+                                "{}: state.raw_audio_channels[0] was empty during playback",
+                                path
+                            ));
+                        }
+                        drop(handle);
+                    }
+                }
+            }
+        }
+    }
+
+    if !failures.is_empty() {
+        panic!("Sample file failures:\n  {}", failures.join("\n  "));
+    }
+}
+
+
+

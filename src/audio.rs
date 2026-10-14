@@ -325,6 +325,15 @@ pub fn spawn_dsp_thread(
                 if state.raw_audio_channels.len() != num_channels {
                     state.raw_audio_channels.resize_with(num_channels, Vec::new);
                 }
+                for (dst, src) in state
+                    .raw_audio_channels
+                    .iter_mut()
+                    .zip(msg.channel_audio_data.iter())
+                    .take(num_channels)
+                {
+                    dst.clear();
+                    dst.extend_from_slice(src);
+                }
 
                 // --- Waveform extraction (Zero-Crossing Edge Trigger) ---
                 let visual_width = state.visual_width.clamp(128, 4096) as usize;
@@ -799,18 +808,32 @@ unsafe impl Send for MidiSource {}
 
 impl MidiSource {
     pub fn new(file_path: &str, soundfont_path: &str, sample_rate: i32) -> anyhow::Result<Self> {
+        static CACHED_SOUNDFONT: std::sync::OnceLock<
+            std::sync::Mutex<Option<(String, Arc<SoundFont>)>>,
+        > = std::sync::OnceLock::new();
+        let cache = CACHED_SOUNDFONT.get_or_init(|| std::sync::Mutex::new(None));
+        let sf2_arc_opt = {
+            let mut guard = cache.lock().unwrap();
+            if let Some((cached_path, sf2)) = guard.as_ref()
+                && cached_path == soundfont_path
+            {
+                Some(sf2.clone())
+            } else if let Ok(mut sf2_file) = File::open(soundfont_path)
+                && let Ok(sf2) = SoundFont::new(&mut sf2_file)
+            {
+                let arc = Arc::new(sf2);
+                *guard = Some((soundfont_path.to_string(), arc.clone()));
+                Some(arc)
+            } else {
+                None
+            }
+        };
+
         let mut artist_suffix = "";
-        let sf2_file_opt = File::open(soundfont_path).ok();
-        let mut sequencer = if let Some(mut sf2_file) = sf2_file_opt {
-            if let Ok(sf2) = SoundFont::new(&mut sf2_file) {
-                let sf2 = Arc::new(sf2);
-                let settings = SynthesizerSettings::new(sample_rate);
-                if let Ok(synth) = Synthesizer::new(&sf2, &settings) {
-                    Some(MidiFileSequencer::new(synth))
-                } else {
-                    artist_suffix = " (No SoundFont)";
-                    None
-                }
+        let mut sequencer = if let Some(sf2) = sf2_arc_opt {
+            let settings = SynthesizerSettings::new(sample_rate);
+            if let Ok(synth) = Synthesizer::new(&sf2, &settings) {
+                Some(MidiFileSequencer::new(synth))
             } else {
                 artist_suffix = " (No SoundFont)";
                 None
@@ -889,6 +912,121 @@ impl MidiSource {
             }
         }
 
+        // Permissive SMF fallback for files (e.g., XMI2MID conversions) where midly stops early
+        // due to 8-bit controller values like `B1 00 FF`.
+        if absolute_events.is_empty() && data.len() >= 14 && &data[0..4] == b"MThd" {
+            let mut pos = 8 + u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
+            while pos + 8 <= data.len() {
+                let chunk_id = &data[pos..pos + 4];
+                let chunk_len =
+                    u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
+                        as usize;
+                pos += 8;
+                let track_end = (pos + chunk_len).min(data.len());
+                if chunk_id == b"MTrk" {
+                    let mut p = pos;
+                    let mut tick = 0u32;
+                    let mut last_status = 0u8;
+                    let read_varlen = |buf: &[u8], idx: &mut usize, end: usize| -> Option<u32> {
+                        let mut val = 0u32;
+                        for _ in 0..4 {
+                            if *idx >= end {
+                                return None;
+                            }
+                            let b = buf[*idx];
+                            *idx += 1;
+                            val = (val << 7) | ((b & 0x7F) as u32);
+                            if (b & 0x80) == 0 {
+                                return Some(val);
+                            }
+                        }
+                        Some(val)
+                    };
+                    while p < track_end {
+                        let Some(delta) = read_varlen(&data, &mut p, track_end) else {
+                            break;
+                        };
+                        tick = tick.saturating_add(delta);
+                        if p >= track_end {
+                            break;
+                        }
+                        let first = data[p];
+                        p += 1;
+                        if (first & 0x80) == 0 {
+                            let cmd = last_status & 0xF0;
+                            let ch = last_status & 0x0F;
+                            let d1 = first & 0x7F;
+                            if cmd == 0xC0 || cmd == 0xD0 {
+                                continue;
+                            }
+                            if p >= track_end {
+                                break;
+                            }
+                            let d2 = data[p] & 0x7F;
+                            p += 1;
+                            if cmd == 0x90 {
+                                absolute_events.push((tick, ch, d1, d2, d2 > 0));
+                            } else if cmd == 0x80 {
+                                absolute_events.push((tick, ch, d1, d2, false));
+                            }
+                        } else if first == 0xF0 || first == 0xF7 {
+                            let Some(len) = read_varlen(&data, &mut p, track_end) else {
+                                break;
+                            };
+                            p = (p + len as usize).min(track_end);
+                        } else if first == 0xFF {
+                            if p >= track_end {
+                                break;
+                            }
+                            let meta_type = data[p];
+                            p += 1;
+                            let Some(len) = read_varlen(&data, &mut p, track_end) else {
+                                break;
+                            };
+                            let meta_end = (p + len as usize).min(track_end);
+                            let slice = &data[p..meta_end];
+                            p = meta_end;
+                            if meta_type == 0x2F {
+                                break;
+                            } else if meta_type == 0x51 && slice.len() == 3 {
+                                let us =
+                                    u32::from_be_bytes([0, slice[0], slice[1], slice[2]]).max(1)
+                                        as f64;
+                                raw_tempo_changes.push((tick, us));
+                            } else if meta_type == 0x03 && title.is_empty() {
+                                title = String::from_utf8_lossy(slice).to_string();
+                            } else if meta_type == 0x01 && artist.is_empty() {
+                                artist = String::from_utf8_lossy(slice).to_string();
+                            }
+                        } else {
+                            last_status = first;
+                            let cmd = first & 0xF0;
+                            let ch = first & 0x0F;
+                            if p >= track_end {
+                                break;
+                            }
+                            let d1 = data[p] & 0x7F;
+                            p += 1;
+                            if cmd == 0xC0 || cmd == 0xD0 {
+                                continue;
+                            }
+                            if p >= track_end {
+                                break;
+                            }
+                            let d2 = data[p] & 0x7F;
+                            p += 1;
+                            if cmd == 0x90 {
+                                absolute_events.push((tick, ch, d1, d2, d2 > 0));
+                            } else if cmd == 0x80 {
+                                absolute_events.push((tick, ch, d1, d2, false));
+                            }
+                        }
+                    }
+                }
+                pos = track_end;
+            }
+        }
+
         raw_tempo_changes.sort_by_key(|e| e.0);
         let mut tempo_map: Vec<(u32, f64, f64)> = vec![(0, 0.0, 500_000.0)];
         for (tick, us_per_beat) in raw_tempo_changes {
@@ -907,8 +1045,12 @@ impl MidiSource {
         absolute_events.sort_by_key(|e| e.0);
 
         let mut parsed_events = Vec::with_capacity(absolute_events.len());
+        let mut pattern_rows: Vec<Vec<String>> = Vec::new();
+        let notes = [
+            "C-", "C#", "D-", "D#", "E-", "F-", "F#", "G-", "G#", "A-", "A#", "B-",
+        ];
         let mut tempo_idx = 0;
-        for (tick, channel, _key, vel, is_on) in absolute_events {
+        for (tick, channel, key, vel, is_on) in absolute_events {
             while tempo_idx + 1 < tempo_map.len() && tempo_map[tempo_idx + 1].0 <= tick {
                 tempo_idx += 1;
             }
@@ -923,30 +1065,17 @@ impl MidiSource {
                 velocity: vel,
                 is_note_on: is_on,
             });
-        }
 
-        let mut pattern_rows: Vec<Vec<String>> = Vec::new();
-        for track in &smf.tracks {
-            let mut tick = 0;
-            for event in track {
-                tick += event.delta.as_int();
-                if let TrackEventKind::Midi { channel, message } = &event.kind
-                    && let MidiMessage::NoteOn { key, vel } = message
-                    && *vel > 0
-                {
-                    let row_idx = (tick as f64 / (ticks_per_beat / 4.0)) as usize;
-                    while pattern_rows.len() <= row_idx {
-                        pattern_rows.push(vec!["... .. ..".to_string(); 16]);
-                    }
-                    let notes = [
-                        "C-", "C#", "D-", "D#", "E-", "F-", "F#", "G-", "G#", "A-", "A#", "B-",
-                    ];
-                    let octave = key.as_int() / 12;
-                    let note = key.as_int() % 12;
-                    let note_name = format!("{}{}", notes[note as usize], octave);
-                    let note_str = format!("{} .. {:02X}", note_name, vel.as_int());
-                    pattern_rows[row_idx][channel.as_int() as usize] = note_str;
+            if is_on && (channel as usize) < 16 {
+                let row_idx = (tick as f64 / (ticks_per_beat / 4.0)) as usize;
+                while pattern_rows.len() <= row_idx {
+                    pattern_rows.push(vec!["... .. ..".to_string(); 16]);
                 }
+                let octave = key / 12;
+                let note = key % 12;
+                let note_name = format!("{}{}", notes[note as usize], octave);
+                let note_str = format!("{} .. {:02X}", note_name, vel);
+                pattern_rows[row_idx][channel as usize] = note_str;
             }
         }
 
@@ -1368,6 +1497,36 @@ pub fn get_downmixed_sample(
             let sl = base_slice.get(6).copied().unwrap_or(0.0);
             let sr = base_slice.get(7).copied().unwrap_or(0.0);
             (fl + fr + SQRT2 * fc + bl + br + sl + sr + lfe) * 0.28
+        }
+        // >8 channels (7.1.4, Ambisonics, etc.) to Stereo
+        (tc, 2, 0) if tc > 8 => {
+            let fl = base_slice.first().copied().unwrap_or(0.0);
+            let fc = base_slice.get(2).copied().unwrap_or(0.0);
+            let lfe = base_slice.get(3).copied().unwrap_or(0.0);
+            let bl = base_slice.get(4).copied().unwrap_or(0.0);
+            let sl = base_slice.get(6).copied().unwrap_or(0.0);
+            let mut sum = fl + INV_SQRT2 * (fc + bl + sl) + 0.5 * lfe;
+            for idx in (8..tc as usize).step_by(2) {
+                sum += INV_SQRT2 * base_slice.get(idx).copied().unwrap_or(0.0);
+            }
+            sum * (2.0 / (tc as f32).sqrt()).min(0.6)
+        }
+        (tc, 2, 1) if tc > 8 => {
+            let fr = base_slice.get(1).copied().unwrap_or(0.0);
+            let fc = base_slice.get(2).copied().unwrap_or(0.0);
+            let lfe = base_slice.get(3).copied().unwrap_or(0.0);
+            let br = base_slice.get(5).copied().unwrap_or(0.0);
+            let sr = base_slice.get(7).copied().unwrap_or(0.0);
+            let mut sum = fr + INV_SQRT2 * (fc + br + sr) + 0.5 * lfe;
+            for idx in (9..tc as usize).step_by(2) {
+                sum += INV_SQRT2 * base_slice.get(idx).copied().unwrap_or(0.0);
+            }
+            sum * (2.0 / (tc as f32).sqrt()).min(0.6)
+        }
+        // >8 channels to Mono
+        (tc, 1, 0) if tc > 8 => {
+            let sum: f32 = base_slice.iter().take(tc as usize).copied().sum();
+            sum / (tc as f32).sqrt()
         }
         // General fallback: if channel index exists in source, take it
         (tc, _, c) if c < tc as usize => base_slice.get(c).copied().unwrap_or(0.0),
@@ -1889,6 +2048,19 @@ struct FfmpegSource {
 }
 
 #[cfg(not(target_os = "android"))]
+fn safe_ffmpeg_channel_layout(
+    layout: ffmpeg_next::channel_layout::ChannelLayout,
+    channels: u16,
+) -> ffmpeg_next::channel_layout::ChannelLayout {
+    let ch = channels.max(1) as i32;
+    if !layout.is_empty() && layout.channels() == ch {
+        layout
+    } else {
+        ffmpeg_next::channel_layout::ChannelLayout::default(ch)
+    }
+}
+
+#[cfg(not(target_os = "android"))]
 impl FfmpegSource {
     fn fill_buffers(&mut self) -> bool {
         let mut progress = false;
@@ -1906,6 +2078,31 @@ impl FfmpegSource {
             }
             let mut decoded = ffmpeg_next::frame::Audio::empty();
             while track.decoder.receive_frame(&mut decoded).is_ok() {
+                let dec_ch = decoded.channels().max(1);
+                let dec_rate = if decoded.rate() > 0 {
+                    decoded.rate()
+                } else {
+                    self.output_sample_rate
+                };
+                let dec_layout = safe_ffmpeg_channel_layout(decoded.channel_layout(), dec_ch);
+                if (track.channels != dec_ch
+                    || track.resampler.input().format != decoded.format()
+                    || track.resampler.input().rate != dec_rate
+                    || track.resampler.input().channel_layout != dec_layout)
+                    && let Ok(new_resamp) = ffmpeg_next::software::resampling::context::Context::get(
+                        decoded.format(),
+                        dec_layout,
+                        dec_rate,
+                        ffmpeg_next::format::sample::Sample::F32(
+                            ffmpeg_next::format::sample::Type::Packed,
+                        ),
+                        dec_layout,
+                        self.output_sample_rate,
+                    )
+                {
+                    track.resampler = new_resamp;
+                    track.channels = dec_ch;
+                }
                 let mut resampled = ffmpeg_next::frame::Audio::empty();
                 if track.resampler.run(&decoded, &mut resampled).is_ok() {
                     let data = resampled.plane::<f32>(0);
@@ -2003,6 +2200,33 @@ impl FfmpegSource {
                         let _ = track.decoder.send_packet(&packet);
                         let mut decoded = ffmpeg_next::frame::Audio::empty();
                         while track.decoder.receive_frame(&mut decoded).is_ok() {
+                            let dec_ch = decoded.channels().max(1);
+                            let dec_rate = if decoded.rate() > 0 {
+                                decoded.rate()
+                            } else {
+                                self.output_sample_rate
+                            };
+                            let dec_layout =
+                                safe_ffmpeg_channel_layout(decoded.channel_layout(), dec_ch);
+                            if (track.channels != dec_ch
+                                || track.resampler.input().format != decoded.format()
+                                || track.resampler.input().rate != dec_rate
+                                || track.resampler.input().channel_layout != dec_layout)
+                                && let Ok(new_resamp) =
+                                    ffmpeg_next::software::resampling::context::Context::get(
+                                        decoded.format(),
+                                        dec_layout,
+                                        dec_rate,
+                                        ffmpeg_next::format::sample::Sample::F32(
+                                            ffmpeg_next::format::sample::Type::Packed,
+                                        ),
+                                        dec_layout,
+                                        self.output_sample_rate,
+                                    )
+                            {
+                                track.resampler = new_resamp;
+                                track.channels = dec_ch;
+                            }
                             let mut resampled = ffmpeg_next::frame::Audio::empty();
                             if track.resampler.run(&decoded, &mut resampled).is_ok() {
                                 let data = resampled.plane::<f32>(0);
@@ -2054,6 +2278,15 @@ impl FfmpegSource {
             }
         }
 
+        if let Some(primary) = self.active_tracks.get(&self.primary_stream_index)
+            && self.channels != primary.channels
+        {
+            self.channels = primary.channels;
+            if self.channel_vus.len() < self.channels as usize {
+                self.channel_vus.resize(self.channels as usize, 0.0);
+            }
+        }
+
         if let Some(target_pos) = self.target_seek_time {
             let all_reached = self
                 .active_tracks
@@ -2080,14 +2313,26 @@ impl AudioSource for FfmpegSource {
         if sample_rate > 0 && sample_rate != self.output_sample_rate {
             self.output_sample_rate = sample_rate;
             for track in self.active_tracks.values_mut() {
+                let layout =
+                    safe_ffmpeg_channel_layout(track.decoder.channel_layout(), track.channels);
+                let fmt = if track.decoder.format() == ffmpeg_next::format::sample::Sample::None {
+                    track.resampler.input().format
+                } else {
+                    track.decoder.format()
+                };
+                let in_rate = if track.decoder.rate() > 0 {
+                    track.decoder.rate()
+                } else {
+                    track.resampler.input().rate
+                };
                 if let Ok(resamp) = ffmpeg_next::software::resampling::context::Context::get(
-                    track.decoder.format(),
-                    track.decoder.channel_layout(),
-                    track.decoder.rate(),
+                    fmt,
+                    layout,
+                    in_rate,
                     ffmpeg_next::format::sample::Sample::F32(
                         ffmpeg_next::format::sample::Type::Packed,
                     ),
-                    track.decoder.channel_layout(),
+                    layout,
                     self.output_sample_rate,
                 ) {
                     track.resampler = resamp;
@@ -2866,7 +3111,10 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
                 ffmpeg_next::codec::context::Context::from_parameters(p.clone())
                 && let Ok(dec) = ctx.decoder().audio()
             {
-                (dec.channels(), dec.rate())
+                (
+                    dec.channels().max(1),
+                    if dec.rate() > 0 { dec.rate() } else { 48000 },
+                )
             } else {
                 (2, 48000)
             };
@@ -2988,14 +3236,25 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
             && let Ok(ctx) = ffmpeg_next::codec::context::Context::from_parameters(st.parameters())
             && let Ok(dec) = ctx.decoder().audio()
         {
-            let ch = dec.channels();
+            let ch = dec.channels().max(1);
+            let layout = safe_ffmpeg_channel_layout(dec.channel_layout(), ch);
+            let fmt = if dec.format() == ffmpeg_next::format::sample::Sample::None {
+                ffmpeg_next::format::sample::Sample::F32(ffmpeg_next::format::sample::Type::Planar)
+            } else {
+                dec.format()
+            };
+            let in_rate = if dec.rate() > 0 {
+                dec.rate()
+            } else {
+                sample_rate.max(48000)
+            };
             if let Ok(resamp) = ffmpeg_next::software::resampling::context::Context::get(
-                dec.format(),
-                dec.channel_layout(),
-                dec.rate(),
+                fmt,
+                layout,
+                in_rate,
                 ffmpeg_next::format::sample::Sample::F32(ffmpeg_next::format::sample::Type::Packed),
-                dec.channel_layout(),
-                sample_rate,
+                layout,
+                sample_rate.max(48000),
             ) {
                 let vol = if t_idx == selected_track_idx {
                     1.0
@@ -3175,7 +3434,11 @@ pub fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(
     let mut audio_track_count = 0;
 
     for track in format.tracks().iter() {
-        if track.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL
+        let is_false_mp3 = track.codec_params.codec == symphonia::core::codecs::CODEC_TYPE_MP3
+            && !probe_ext.is_empty()
+            && !matches!(probe_ext, "mp3" | "mp2" | "mp1" | "mpga" | "mpeg" | "wav");
+        if !is_false_mp3
+            && track.codec_params.codec != symphonia::core::codecs::CODEC_TYPE_NULL
             && symphonia::default::get_codecs()
                 .make(&track.codec_params, &DecoderOptions::default())
                 .is_ok()
@@ -3445,9 +3708,27 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
 
     let video_info = None; // Symphonia doesn't do video
 
-    // 1. Prioritize FFmpeg for video containers (MKV, MP4, WEBM, MOV, AVI) on desktop to ensure video streams are processed.
+    // 1. Prioritize FFmpeg for video containers (MKV, MP4, WEBM, MOV, AVI) and raw surround bitstreams (DTS-HD, DTS, AC3, E-AC3, TrueHD) on desktop.
     #[cfg(not(target_os = "android"))]
-    if ext == "mkv" || ext == "mp4" || ext == "webm" || ext == "mov" || ext == "avi" {
+    if matches!(
+        ext.as_str(),
+        "mkv"
+            | "mp4"
+            | "webm"
+            | "mov"
+            | "avi"
+            | "mka"
+            | "m2ts"
+            | "ts"
+            | "mts"
+            | "dtshd"
+            | "dts"
+            | "ac3"
+            | "eac3"
+            | "thd"
+            | "truehd"
+            | "mlp"
+    ) {
         match try_ffmpeg(file_path, false) {
             Ok(source) => return Ok(source),
             Err(err) => {
@@ -3629,8 +3910,31 @@ pub fn start_audio_thread(
 ) -> Result<PlaybackHandle> {
     #[cfg(not(target_os = "android"))]
     if !mic {
+        let ext = std::path::Path::new(file_path)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_lowercase();
+        let can_bitstream = matches!(
+            ext.as_str(),
+            "mkv"
+                | "mp4"
+                | "m2ts"
+                | "ts"
+                | "mts"
+                | "mov"
+                | "avi"
+                | "mka"
+                | "dtshd"
+                | "dts"
+                | "ac3"
+                | "eac3"
+                | "thd"
+                | "truehd"
+                | "mlp"
+        );
         let passthrough = shared_state.lock().unwrap().passthrough_enabled;
-        if passthrough {
+        if passthrough && can_bitstream {
             let (tx, rx) = bounded::<DspMessage>(32);
             let stop_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
             if let Ok((handle, decoder_rate, channels, codec_name, has_video, artist, duration)) =
@@ -3901,9 +4205,11 @@ pub fn start_audio_thread(
                 .map(|desc| desc.name().to_string())
                 .unwrap_or_else(|_| "Unknown Device".to_string());
 
-            // Re-load the audio source for this attempt to ensure it is fresh
+            // Reuse initial audio source for the first attempt, or reload if retrying on fallback device
             let mut attempt_audio_source_opt = if mic {
                 None
+            } else if let Some(src) = audio_source_opt.take() {
+                Some(src)
             } else {
                 Some(load_audio_source(file_path)?)
             };
@@ -4879,6 +5185,15 @@ fn spawn_media_decoder_threads(
                 chunk_frames,
             );
             if frames_read > 0 {
+                if let Ok(mut state) = shared_state.try_lock() {
+                    push_chunk_lookahead_slices(
+                        &mut state,
+                        &chunk,
+                        frames_read,
+                        hardware_channels,
+                        sample_rate,
+                    );
+                }
                 chunk.track_ended = false;
                 let _ = ready_tx.try_send(chunk);
             } else {
@@ -5322,6 +5637,11 @@ where
 
                     let to_copy = std::cmp::min(frames_available, frames_needed);
 
+                    let mono_norm = if hardware_channels > 2 {
+                        1.0 / (hardware_channels as f32).sqrt()
+                    } else {
+                        1.0 / (hardware_channels.max(1) as f32)
+                    };
                     for i in 0..to_copy {
                         let src_frame_idx = chunk_frame_pos + i;
                         let dst_frame_idx = frames_written + i;
@@ -5334,7 +5654,7 @@ where
                             mono += sample;
                             channel_fft_buffers[c][fft_index] = sample;
                         }
-                        mono /= hardware_channels as f32;
+                        mono *= mono_norm;
 
                         fft_buffer[fft_index] = mono;
                         fft_index = (fft_index + 1) % window_size;
