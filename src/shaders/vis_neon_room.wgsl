@@ -47,20 +47,20 @@ const SPEAKER_COLORS: array<vec3<f32>, 12> = array<vec3<f32>, 12>(
     vec3<f32>(1.0, 0.45, 0.85)   // 11: Top Rear Right (Hot Pink)
 );
 
-// Speaker source positions in room (7.1.4 Dolby Atmos spatial layout)
+// Speaker source positions in room (matching exact centers in generate_neon_room_mesh)
 const SPEAKER_POS: array<vec3<f32>, 12> = array<vec3<f32>, 12>(
-    vec3<f32>(-3.8, 0.2, 5.5),   // FL (0)
-    vec3<f32>( 3.8, 0.2, 5.5),   // FR (1)
-    vec3<f32>( 0.0, -0.6, 6.8),  // C (2)
-    vec3<f32>( 0.0, -1.0, 5.2),  // Sub (3)
-    vec3<f32>(-6.2, 0.5, 0.5),   // SL (4)
-    vec3<f32>( 6.2, 0.5, 0.5),   // SR (5)
-    vec3<f32>(-4.2, 0.2, -4.5),  // RL (6)
-    vec3<f32>( 4.2, 0.2, -4.5),  // RR (7)
-    vec3<f32>(-3.2, 4.05, 3.5),  // TFL (8)
-    vec3<f32>( 3.2, 4.05, 3.5),  // TFR (9)
-    vec3<f32>(-3.2, 4.05, -2.5), // TRL (10)
-    vec3<f32>( 3.2, 4.05, -2.5)  // TRR (11)
+    vec3<f32>(-3.8, -0.25,  5.5), // FL (0)
+    vec3<f32>( 3.8, -0.25,  5.5), // FR (1)
+    vec3<f32>( 0.0, -0.85,  6.8), // C (2)
+    vec3<f32>( 0.0, -1.05,  5.2), // Sub (3)
+    vec3<f32>(-6.2,  0.50,  0.5), // SL (4)
+    vec3<f32>( 6.2,  0.50,  0.5), // SR (5)
+    vec3<f32>(-4.2,  0.10, -4.8), // RL (6)
+    vec3<f32>( 4.2,  0.10, -4.8), // RR (7)
+    vec3<f32>(-3.2,  4.32,  3.5), // TFL (8)
+    vec3<f32>( 3.2,  4.32,  3.5), // TFR (9)
+    vec3<f32>(-3.2,  4.32, -2.5), // TRL (10)
+    vec3<f32>( 3.2,  4.32, -2.5)  // TRR (11)
 );
 
 fn get_spatial_color(ch: u32) -> vec3<f32> {
@@ -69,19 +69,62 @@ fn get_spatial_color(ch: u32) -> vec3<f32> {
 
 fn get_channel_level(ch: u32) -> f32 {
     let idx = min(ch, 11u);
+    let bass_e = clamp((audio.spectrum[0].x + audio.spectrum[1].x + audio.spectrum[2].x) / 195.0, 0.0, 1.0);
+    let lowmid_e = clamp((audio.spectrum[3].x + audio.spectrum[5].x) / 130.0, 0.0, 1.0);
+    let mid_e = clamp((audio.spectrum[10].x + audio.spectrum[16].x) / 120.0, 0.0, 1.0);
+    let high_e = clamp((audio.spectrum[32].x + audio.spectrum[64].x) / 110.0, 0.0, 1.0);
+
+    // 4-Channel Tracker Module (MOD) or 4.0 Quad: map the 4 discrete tracks directly to the
+    // 4 primary corner/surround speakers (FL=T1, FR=T2, SL/RL=T3, SR/RR=T4), Center=Lead Mix, Sub=Bass!
+    if (audio.num_spatial_channels == 4u) {
+        let t0 = audio.spatial_channels[0].x;
+        let t1 = audio.spatial_channels[0].y;
+        let t2 = audio.spatial_channels[0].z;
+        let t3 = audio.spatial_channels[0].w;
+        switch idx {
+            case 0u: { return t0; } // Front Left = Track 1
+            case 1u: { return t1; } // Front Right = Track 2
+            case 2u: { return clamp((t0 + t1 + t2 + t3) * 0.25 + mid_e * 0.30, 0.0, 1.0); } // Center Stage
+            case 3u: { return clamp(bass_e * 0.85 + max(max(t0, t1), max(t2, t3)) * 0.30, 0.0, 1.0); } // Subwoofer
+            case 4u: { return t2; } // Surround Left = Track 3
+            case 5u: { return t3; } // Surround Right = Track 4
+            case 6u: { return clamp(t2 * 0.85 + t0 * 0.25, 0.0, 1.0); } // Rear Left
+            case 7u: { return clamp(t3 * 0.85 + t1 * 0.25, 0.0, 1.0); } // Rear Right
+            case 8u: { return t0; } // Ceiling Front Left = Track 1
+            case 9u: { return t1; } // Ceiling Front Right = Track 2
+            case 10u: { return t2; } // Ceiling Rear Left = Track 3
+            default: { return t3; } // Ceiling Rear Right = Track 4
+        }
+    }
+
     if (audio.num_spatial_channels > 2u) {
+        // 5.1 Surround (6 channels): map 0..5 directly, mirror Ls/Rs to RL/RR (6..7) and heights (8..11)
+        if (audio.num_spatial_channels == 6u && audio.num_channels == 6u) {
+            if (idx < 6u) {
+                return audio.spatial_channels[idx / 4u][idx % 4u];
+            } else if (idx == 6u) {
+                return audio.spatial_channels[1].x; // Mirror Ls to RL
+            } else if (idx == 7u) {
+                return audio.spatial_channels[1].y; // Mirror Rs to RR
+            } else {
+                let base_idx = idx - 8u;
+                return clamp(audio.spatial_channels[0][base_idx] * 0.65 + high_e * 0.40, 0.0, 1.0);
+            }
+        }
+        // Multi-track tracker (6..16 channels) or 7.1 / 7.1.4 surround
         let actual_ch = min(audio.num_spatial_channels, 16u);
         let src_ch = idx % actual_ch;
-        return audio.spatial_channels[src_ch / 4u][src_ch % 4u];
+        let ch_val = audio.spatial_channels[src_ch / 4u][src_ch % 4u];
+        if (idx == 3u && audio.num_spatial_channels < audio.num_channels) {
+            return clamp(ch_val * 0.55 + bass_e * 0.65, 0.0, 1.0);
+        }
+        return ch_val;
     }
+
     let ch_l = audio.spatial_channels[0].x;
     let ch_r = select(ch_l, audio.spatial_channels[0].y, audio.num_spatial_channels >= 2u);
     let phase_l = audio.channel_phases[0].x;
     let phase_r = audio.channel_phases[0].y;
-    let bass_e = clamp((audio.spectrum[0].x + audio.spectrum[1].x) / 140.0, 0.0, 1.0);
-    let lowmid_e = clamp((audio.spectrum[3].x + audio.spectrum[5].x) / 130.0, 0.0, 1.0);
-    let mid_e = clamp((audio.spectrum[10].x + audio.spectrum[16].x) / 120.0, 0.0, 1.0);
-    let high_e = clamp((audio.spectrum[32].x + audio.spectrum[64].x) / 110.0, 0.0, 1.0);
     return stereo_upmix_12(idx, ch_l, ch_r, phase_l, phase_r, bass_e, lowmid_e, mid_e, high_e);
 }
 
@@ -89,38 +132,52 @@ fn get_channel_level(ch: u32) -> f32 {
 fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
     var out: VertexOutput3D;
     
-    let ch_idx = u32(round(in.tex_coords.x));
+    let ch_idx = min(u32(round(in.tex_coords.x)), 11u);
     let raw_mat = in.tex_coords.y;
-    // Cone vertices encode base material (2.0, 3.0, 4.0) + 0.25 at the inner apex
+    // Cone vertices encode base material (2.0, 3.0, 4.0) + 0.18..0.25 toward inner dustcap apex
     let is_cone = raw_mat >= 1.8 && raw_mat <= 4.4;
     let mat_id = select(raw_mat, floor(raw_mat + 0.05), is_cone);
     let cone_center_weight = select(0.0, clamp((raw_mat - mat_id) * 4.0, 0.0, 1.0), is_cone);
     
-    let ch_energy = get_channel_level(ch_idx);
-    // Normalize audio.spectrum[1].x from 0..100 scale to 0..1.2 so cones don't fly across the room
+    let ch_energy = clamp(get_channel_level(ch_idx), 0.0, 1.2);
     let bass_pulse = clamp((audio.spectrum[0].x + audio.spectrum[1].x) / 140.0, 0.0, 1.2);
     
-    // Woofer / mid cone physical displacement along normal:
-    // Outer surround rim (cone_center_weight == 0.0) stays anchored to the cabinet baffle,
-    // while the inner cone and dustcap (cone_center_weight == 1.0) pump dynamically!
+    var pos = in.position;
+    let is_speaker = (mat_id > 1.1 && mat_id < 4.5) || (mat_id > 5.1 && mat_id < 5.3);
+
+    // 1. Whole-Speaker Physical Movement (Cabinet Pulse, Radial Expansion & Beat Bounce)
+    if (is_speaker) {
+        let sp_center = SPEAKER_POS[ch_idx];
+        let rel = pos - sp_center;
+        let vib = 0.65 + 0.35 * sin(audio.smooth_time * 28.0 + f32(ch_idx) * 1.3);
+        let scale_xz = 1.0 + ch_energy * 0.20 * vib;
+        let scale_y  = 1.0 + ch_energy * 0.14 * vib;
+        let bounce_dir = select(1.0, -1.0, ch_idx >= 8u);
+        let hop_y = bounce_dir * ch_energy * 0.15 * abs(sin(audio.smooth_time * 16.0 + f32(ch_idx) * 1.1));
+        pos = sp_center + vec3<f32>(rel.x * scale_xz, rel.y * scale_y + hop_y, rel.z * scale_xz);
+    }
+
+    // 2. Aggressive Woofer / Midrange / Tweeter Cone Piston Excursion along Normal
     var displacement = 0.0;
-    if (mat_id >= 1.8 && mat_id <= 3.5) {
-        let pump_osc = 0.60 + 0.40 * sin(audio.smooth_time * 36.0 + f32(ch_idx) * 1.2);
-        let radial_excursion = 0.10 + 0.90 * cone_center_weight;
-        let drive = max(ch_energy, 0.0);
+    if (is_cone) {
+        let pump_osc = 0.55 + 0.45 * sin(audio.smooth_time * 44.0 + f32(ch_idx) * 1.5);
+        let radial_excursion = 0.14 + 0.86 * cone_center_weight;
         if (ch_idx == 3u) {
-            // LFE subwoofer has deep physical excursion
-            displacement = (drive * 0.85 + bass_pulse * 0.65) * 0.42 * pump_osc * radial_excursion;
+            // LFE dual 15" subwoofer has massive physical excursion
+            displacement = (ch_energy * 0.90 + bass_pulse * 0.65) * 0.46 * pump_osc * radial_excursion;
         } else if (mat_id < 2.5) {
             // Bass woofers
-            displacement = (drive * 0.90 + bass_pulse * 0.45) * 0.32 * pump_osc * radial_excursion;
-        } else {
+            displacement = (ch_energy * 0.95 + bass_pulse * 0.35) * 0.38 * pump_osc * radial_excursion;
+        } else if (mat_id < 3.5) {
             // Midrange cones
-            displacement = (drive * 0.80) * 0.22 * pump_osc * radial_excursion;
+            displacement = ch_energy * 0.30 * pump_osc * radial_excursion;
+        } else {
+            // Tweeter domes
+            displacement = ch_energy * 0.18 * pump_osc * radial_excursion;
         }
     }
     
-    let displaced_pos = in.position + in.normal * displacement;
+    let displaced_pos = pos + in.normal * displacement;
     out.world_pos = displaced_pos;
     out.world_normal = in.normal;
     out.uv = in.tex_coords;
@@ -143,7 +200,7 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     // Pre-fetch all 12 spatial speaker levels once per fragment
     var ch_levels: array<f32, 12>;
     for (var k = 0u; k < 12u; k = k + 1u) {
-        ch_levels[k] = get_channel_level(k);
+        ch_levels[k] = clamp(get_channel_level(k), 0.0, 1.0);
     }
     let ch_energy = ch_levels[ch_idx];
     let bass_norm = clamp((audio.spectrum[0].x + audio.spectrum[1].x) / 140.0, 0.0, 1.2);
@@ -157,6 +214,7 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     let V = normalize(ro - P);
     
     // Dynamic multi-point lighting accumulated from all 12 active speakers
+    // Strictly scaled by each speaker's active energy so silent channels stay dark
     var point_light_diffuse = vec3<f32>(0.0);
     var point_light_specular = vec3<f32>(0.0);
     let spec_power = select(24.0, 64.0, mat_id < 1.0);
@@ -169,7 +227,7 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
         let dist_sq = dot(L_vec, L_vec);
         let L_dir = L_vec * inverseSqrt(max(dist_sq, 1e-6));
         
-        let atten = (s_energy * 2.8 + 0.15) / (dist_sq * 0.45 + 1.2);
+        let atten = (s_energy * s_energy * 3.8 + 0.03) / (dist_sq * 0.42 + 1.1);
         let NdotL = max(dot(N, L_dir), 0.0);
         point_light_diffuse += s_col * NdotL * atten;
         
@@ -183,33 +241,30 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     var roughness = 0.6;
     
     if (mat_id < 0.2) {
-        // === Material 0.0: Floor Stage Grid & Travelling Signal Traces ===
+        // === Material 0.0: Studio Floor Grid & Channel-Reactive Acoustic Pressure Rings ===
         let grid_size = 1.0;
         let gx = abs(fract(P.x / grid_size) - 0.5);
         let gz = abs(fract(P.z / grid_size) - 0.5);
-        let line_w = 0.03;
+        let line_w = 0.028;
         let grid_line = smoothstep_r(line_w, 0.0, min(gx, gz));
-        
-        // Travelling neon light packets racing along the floor grid lines from stage to surrounds
-        let packet_z = smoothstep(0.82, 0.98, sin(P.z * 1.4 - audio.smooth_time * 7.5));
-        let packet_x = smoothstep(0.82, 0.98, cos(abs(P.x) * 1.4 - audio.smooth_time * 6.5));
-        let trace_pulse = grid_line * max(packet_z, packet_x) * (0.25 + bass_norm * 0.95);
 
-        let floor_base = vec3<f32>(0.015, 0.015, 0.025);
-        let floor_grid_col = vec3<f32>(0.08, 0.18, 0.35);
-        albedo = mix(floor_base, floor_grid_col, grid_line * 0.7);
-        roughness = 0.22;
-        emission += mix(vec3<f32>(0.0, 0.85, 1.0), vec3<f32>(1.0, 0.15, 0.75), clamp(abs(P.x) / 9.0, 0.0, 1.0)) * trace_pulse * 0.55;
+        let floor_base = vec3<f32>(0.012, 0.013, 0.020);
+        let floor_grid_col = vec3<f32>(0.06, 0.14, 0.28);
+        albedo = mix(floor_base, floor_grid_col, grid_line * 0.65);
+        roughness = 0.18;
         
-        // Acoustic wavefront rings expanding across the floor from active stage & surround speakers
+        // Localized acoustic pressure rings around each speaker, strictly driven by that speaker's real audio energy
         for (var i = 0u; i < 8u; i = i + 1u) {
-            let s_pos = SPEAKER_POS[i];
-            let s_col = SPEAKER_COLORS[i];
             let s_energy = ch_levels[i];
-            let d_sp = length(P.xz - s_pos.xz);
-            let wave_time = fract(audio.smooth_time * 1.8 - d_sp * 0.25);
-            let wave_ring = smoothstep_r(0.22, 0.0, abs(wave_time - 0.5)) * smoothstep_r(9.0, 0.0, d_sp);
-            emission += s_col * wave_ring * s_energy * 0.42;
+            if (s_energy > 0.04) {
+                let s_pos = SPEAKER_POS[i];
+                let s_col = SPEAKER_COLORS[i];
+                let d_sp = length(P.xz - s_pos.xz);
+                let ring_phase = fract(d_sp * 0.55 - audio.smooth_time * (1.2 + s_energy * 2.5));
+                let wave_ring = smoothstep_r(0.18, 0.0, abs(ring_phase - 0.5)) * smoothstep_r(5.5, 0.4, d_sp);
+                let base_pool = exp(-d_sp * 0.85) * (0.4 + 0.6 * grid_line);
+                emission += s_col * (wave_ring * 0.65 + base_pool * 0.55) * (s_energy * s_energy);
+            }
         }
         
     } else if (mat_id < 0.8) {
@@ -226,53 +281,89 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
         let wall_grid_y = abs(fract(uv_wall.y * 0.5) - 0.5);
         let grid_lines = smoothstep_r(0.03, 0.0, min(wall_grid_x, wall_grid_y));
         
-        // Subtle acoustic fabric texture & panel bevels
         let panel_pattern = sin(uv_wall.x * 3.14159) * sin(uv_wall.y * 3.14159) * 0.015;
         let wall_base = vec3<f32>(0.018, 0.02, 0.03) + vec3<f32>(panel_pattern);
         let wall_neon_accent = vec3<f32>(0.08, 0.16, 0.35);
         albedo = mix(wall_base, wall_neon_accent, grid_lines * 0.7);
         roughness = 0.65;
         
-    } else if (mat_id < 1.5) {
-        // === Material 1.0: Speaker Cabinet / Pedestals (Sleek Matte Black) ===
-        albedo = vec3<f32>(0.025, 0.025, 0.03);
+    } else if (mat_id < 1.1) {
+        // === Material 1.0: Static Stage Platform Riser ===
+        albedo = vec3<f32>(0.022, 0.022, 0.028);
         roughness = 0.35;
+
+    } else if (mat_id < 1.5) {
+        // === Material 1.2: Active Speaker Cabinets (with Segmented Vertical VU Meter & Color Shift) ===
+        let sp_pos = SPEAKER_POS[ch_idx];
+        var h_u = clamp((P.y - (sp_pos.y - 1.05)) / 2.1, 0.0, 1.0);
+        if (ch_idx == 4u || ch_idx == 5u) {
+            h_u = clamp((P.y - (sp_pos.y - 0.58)) / 1.16, 0.0, 1.0);
+        } else if (ch_idx == 2u || ch_idx == 3u) {
+            h_u = clamp((P.y - (sp_pos.y - 0.45)) / 0.90, 0.0, 1.0);
+        } else if (ch_idx >= 8u) {
+            h_u = clamp(1.0 - (P.y - 4.08) / 0.46, 0.0, 1.0);
+        }
+
+        // 14-segment LED level meter climbing up the speaker body with ch_energy
+        let seg_f = fract(h_u * 14.0);
+        let led_seg = smoothstep(0.14, 0.24, seg_f) * smoothstep_r(0.88, 0.78, seg_f);
+        let is_lit = smoothstep_r(ch_energy + 0.05, ch_energy - 0.02, h_u) * smoothstep(0.02, 0.08, ch_energy);
+        // Shift color from signature channel hue at base to hot white-gold at peak
+        let peak_tint = vec3<f32>(1.0, 0.92, 0.60);
+        let dynamic_col = mix(ch_col, peak_tint, smoothstep(0.55, 0.98, h_u) * ch_energy);
+
+        albedo = mix(vec3<f32>(0.020, 0.022, 0.028), dynamic_col * 0.25, ch_energy * 0.7);
+        emission = dynamic_col * (led_seg * is_lit * 1.45 + pow(ch_energy, 1.6) * 0.35);
+        roughness = 0.25;
         
     } else if (mat_id < 2.5) {
-        // === Material 2.0: Active Bass Woofer Diaphragms (Ribbed Cone + Dustcap + Rubber Surround) ===
+        // === Material 2.0: Active Bass Woofer Diaphragms (Ribbed Cone + Glowing Dustcap + Travelling Wave) ===
         let cw = in.cone_center_weight;
-        let is_surround = smoothstep_r(0.16, 0.06, cw);
-        let is_dustcap = smoothstep(0.68, 0.76, cw);
-        let cone_ribs = 0.85 + 0.15 * sin(cw * 36.0);
-        let cone_base = vec3<f32>(0.035, 0.035, 0.045) * cone_ribs;
-        let glow_intensity = (ch_energy * 2.4 + bass_norm * 1.1) * (1.0 - is_surround * 0.7) * (0.65 + 0.65 * is_dustcap);
-        emission = ch_col * glow_intensity;
-        albedo = mix(cone_base, ch_col * 0.35, clamp(ch_energy, 0.0, 1.0));
-        roughness = mix(0.22, 0.08, is_dustcap);
+        let is_surround = smoothstep_r(0.16, 0.04, cw);
+        let is_dustcap = smoothstep(0.65, 0.75, cw);
+        let cone_ribs = 0.80 + 0.20 * sin(cw * 38.0 - audio.smooth_time * 22.0 * step(0.05, ch_energy));
+        let cone_base = vec3<f32>(0.030, 0.032, 0.042) * cone_ribs;
+        let hot_core = vec3<f32>(1.0, 0.95, 0.85);
+        let active_col = mix(ch_col, hot_core, is_dustcap * clamp(ch_energy * 0.85, 0.0, 0.75));
+        let glow_intensity = pow(ch_energy, 1.15) * 3.8 * (1.0 - is_surround * 0.5) * (0.65 + 0.75 * is_dustcap) * cone_ribs;
+        emission = active_col * (0.04 + glow_intensity);
+        albedo = mix(cone_base, active_col * 0.45, clamp(ch_energy, 0.0, 1.0));
+        roughness = mix(0.20, 0.06, is_dustcap);
         
     } else if (mat_id < 3.5) {
-        // === Material 3.0: Active Midrange Diaphragms (Ribbed Kevlar/Carbon Cone + Phase Plug) ===
+        // === Material 3.0: Active Midrange Diaphragms (Ribbed Kevlar Cone + Phase Plug) ===
         let cw = in.cone_center_weight;
-        let is_plug = smoothstep(0.70, 0.78, cw);
-        let cone_ribs = 0.88 + 0.12 * sin(cw * 28.0);
-        let mid_glow = ch_energy * (2.2 + 0.8 * is_plug) * cone_ribs;
-        emission = ch_col * mid_glow;
-        albedo = vec3<f32>(0.05) * cone_ribs;
-        roughness = mix(0.28, 0.10, is_plug);
+        let is_plug = smoothstep(0.68, 0.76, cw);
+        let cone_ribs = 0.82 + 0.18 * sin(cw * 30.0 - audio.smooth_time * 26.0 * step(0.05, ch_energy));
+        let hot_core = vec3<f32>(1.0, 0.96, 0.90);
+        let active_col = mix(ch_col, hot_core, is_plug * clamp(ch_energy * 0.8, 0.0, 0.7));
+        let mid_glow = pow(ch_energy, 1.15) * (3.4 + 1.2 * is_plug) * cone_ribs;
+        emission = active_col * (0.04 + mid_glow);
+        albedo = mix(vec3<f32>(0.04) * cone_ribs, active_col * 0.4, clamp(ch_energy, 0.0, 1.0));
+        roughness = mix(0.24, 0.08, is_plug);
         
     } else if (mat_id < 4.5) {
         // === Material 4.0: Titanium / Beryllium Tweeter Dome ===
         let cw = in.cone_center_weight;
-        let dome_glow = 0.7 + 0.6 * cw;
-        emission = ch_col * (ch_energy * 2.2 + treble_norm * 1.4) * dome_glow;
+        let dome_glow = 0.75 + 0.65 * cw;
+        let active_col = mix(ch_col, vec3<f32>(1.0, 0.98, 0.95), clamp(ch_energy * 0.65, 0.0, 0.65));
+        emission = active_col * (0.05 + pow(ch_energy, 1.1) * 3.6) * dome_glow;
         albedo = vec3<f32>(0.10, 0.11, 0.13);
-        roughness = 0.08;
+        roughness = 0.06;
         
-    } else if (mat_id < 5.5) {
-        // === Material 5.0: Emissive Neon Halo / Guide Rails ===
-        emission = ch_col * (1.6 + ch_energy * 2.4);
-        albedo = ch_col;
+    } else if (mat_id < 5.1) {
+        // === Material 5.0: Architectural Room Neon Rails & Panel Frames ===
+        emission = ch_col * (0.75 + ch_energy * 1.4);
+        albedo = ch_col * 0.5;
         roughness = 0.1;
+
+    } else if (mat_id < 5.5) {
+        // === Material 5.2: Speaker Driver Bezels & Cabinet Corner Neon Strips ===
+        // Dim standby ember when silent, blazing neon + white-hot core when active!
+        let hot_boost = vec3<f32>(1.0, 0.95, 0.88) * max(ch_energy - 0.55, 0.0) * 2.8;
+        emission = ch_col * (0.08 + pow(ch_energy, 1.2) * 4.2) + hot_boost;
+        albedo = ch_col;
+        roughness = 0.08;
         
     } else if (mat_id < 6.5) {
         // === Material 6.0: Acoustic Diffuser Slats (Rich Walnut Texture, Triplanar) ===

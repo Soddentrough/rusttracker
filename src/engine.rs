@@ -575,7 +575,7 @@ fn room_add_cone(
     ch: f32,
     mat: f32,
 ) {
-    let segs = 14;
+    let segs = 18;
     let cos_r = rot_y.cos();
     let sin_r = rot_y.sin();
     let rotate_pt = |p: [f32; 3]| -> [f32; 3] {
@@ -589,19 +589,48 @@ fn room_add_cone(
         [rx, n[1], rz]
     };
 
-    let apex = rotate_pt([0.0, 0.0, -depth]);
+    let n = rotate_norm([0.0, 0.0, 1.0]);
+    let apex = rotate_pt([0.0, 0.0, 0.02]);
+    let r_cap = radius * 0.40;
+    let z_throat = -depth;
+
     for i in 0..segs {
         let a0 = (i as f32) / (segs as f32) * std::f32::consts::TAU;
         let a1 = ((i + 1) as f32) / (segs as f32) * std::f32::consts::TAU;
-        let p0 = rotate_pt([a0.cos() * radius, a0.sin() * radius, 0.0]);
-        let p1 = rotate_pt([a1.cos() * radius, a1.sin() * radius, 0.0]);
+        let c0 = a0.cos();
+        let s0 = a0.sin();
+        let c1 = a1.cos();
+        let s1 = a1.sin();
 
-        let n = rotate_norm([0.0, 0.0, 1.0]);
+        // 1. Inner protruding dustcap dome (high excursion weight: 0.72..1.0)
+        let cap0 = rotate_pt([c0 * r_cap, s0 * r_cap, z_throat]);
+        let cap1 = rotate_pt([c1 * r_cap, s1 * r_cap, z_throat]);
         let start = vertices.len() as u32;
         vertices.push(Vertex {
             position: apex,
             normal: n,
             tex_coords: [ch, mat + 0.25],
+        });
+        vertices.push(Vertex {
+            position: cap0,
+            normal: n,
+            tex_coords: [ch, mat + 0.18],
+        });
+        vertices.push(Vertex {
+            position: cap1,
+            normal: n,
+            tex_coords: [ch, mat + 0.18],
+        });
+        indices.extend_from_slice(&[start, start + 1, start + 2]);
+
+        // 2. Conical ribbed diaphragm from dustcap throat out to surround rim (weight: 0.72 -> 0.0)
+        let p0 = rotate_pt([c0 * radius, s0 * radius, 0.0]);
+        let p1 = rotate_pt([c1 * radius, s1 * radius, 0.0]);
+        let d_start = vertices.len() as u32;
+        vertices.push(Vertex {
+            position: cap0,
+            normal: n,
+            tex_coords: [ch, mat + 0.18],
         });
         vertices.push(Vertex {
             position: p0,
@@ -613,13 +642,105 @@ fn room_add_cone(
             normal: n,
             tex_coords: [ch, mat],
         });
+        vertices.push(Vertex {
+            position: cap1,
+            normal: n,
+            tex_coords: [ch, mat + 0.18],
+        });
+        indices.extend_from_slice(&[
+            d_start,
+            d_start + 1,
+            d_start + 2,
+            d_start,
+            d_start + 2,
+            d_start + 3,
+        ]);
+
+        // 3. Bold emissive neon basket bezel ring (mat = 5.2)
+        let r_out = radius * 1.22;
+        let p0_out = rotate_pt([c0 * r_out, s0 * r_out, 0.015]);
+        let p1_out = rotate_pt([c1 * r_out, s1 * r_out, 0.015]);
+        room_add_quad(vertices, indices, p0, p1, p1_out, p0_out, n, ch, 5.2);
+    }
+}
+
+fn room_add_ceiling_cone(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    center: [f32; 3],
+    radius: f32,
+    depth: f32,
+    ch: f32,
+    mat: f32,
+) {
+    let segs = 16;
+    let n = [0.0, -1.0, 0.0];
+    let apex = [center[0], center[1] - 0.02, center[2]];
+    let r_cap = radius * 0.40;
+    for i in 0..segs {
+        let a0 = (i as f32) / (segs as f32) * std::f32::consts::TAU;
+        let a1 = ((i + 1) as f32) / (segs as f32) * std::f32::consts::TAU;
+        let c0 = a0.cos();
+        let s0 = a0.sin();
+        let c1 = a1.cos();
+        let s1 = a1.sin();
+
+        let cap0 = [center[0] + c0 * r_cap, center[1] + depth, center[2] + s0 * r_cap];
+        let cap1 = [center[0] + c1 * r_cap, center[1] + depth, center[2] + s1 * r_cap];
+        let start = vertices.len() as u32;
+        vertices.push(Vertex {
+            position: apex,
+            normal: n,
+            tex_coords: [ch, mat + 0.25],
+        });
+        vertices.push(Vertex {
+            position: cap0,
+            normal: n,
+            tex_coords: [ch, mat + 0.18],
+        });
+        vertices.push(Vertex {
+            position: cap1,
+            normal: n,
+            tex_coords: [ch, mat + 0.18],
+        });
         indices.extend_from_slice(&[start, start + 1, start + 2]);
 
-        // Emissive halo ring
-        let r_out = radius * 1.16;
-        let p0_out = rotate_pt([a0.cos() * r_out, a0.sin() * r_out, 0.015]);
-        let p1_out = rotate_pt([a1.cos() * r_out, a1.sin() * r_out, 0.015]);
-        room_add_quad(vertices, indices, p0, p1, p1_out, p0_out, n, ch, 5.0);
+        let p0 = [center[0] + c0 * radius, center[1], center[2] + s0 * radius];
+        let p1 = [center[0] + c1 * radius, center[1], center[2] + s1 * radius];
+        let d_start = vertices.len() as u32;
+        vertices.push(Vertex {
+            position: cap0,
+            normal: n,
+            tex_coords: [ch, mat + 0.18],
+        });
+        vertices.push(Vertex {
+            position: p0,
+            normal: n,
+            tex_coords: [ch, mat],
+        });
+        vertices.push(Vertex {
+            position: p1,
+            normal: n,
+            tex_coords: [ch, mat],
+        });
+        vertices.push(Vertex {
+            position: cap1,
+            normal: n,
+            tex_coords: [ch, mat + 0.18],
+        });
+        indices.extend_from_slice(&[
+            d_start,
+            d_start + 1,
+            d_start + 2,
+            d_start,
+            d_start + 2,
+            d_start + 3,
+        ]);
+
+        let r_out = radius * 1.24;
+        let p0_out = [center[0] + c0 * r_out, center[1] - 0.01, center[2] + s0 * r_out];
+        let p1_out = [center[0] + c1 * r_out, center[1] - 0.01, center[2] + s1 * r_out];
+        room_add_quad(vertices, indices, p0, p1, p1_out, p0_out, n, ch, 5.2);
     }
 }
 
@@ -631,143 +752,153 @@ fn room_add_speaker_tower(
     ch: f32,
     is_tower: bool,
 ) {
+    let cos_r = rot_y.cos();
+    let sin_r = rot_y.sin();
+    let local_to_world = |lx: f32, ly: f32, lz: f32| -> [f32; 3] {
+        let rx = lx * cos_r + lz * sin_r;
+        let rz = -lx * sin_r + lz * cos_r;
+        [rx + pos[0], ly + pos[1], rz + pos[2]]
+    };
+
     if is_tower {
-        // Pedestal base & Cabinet
+        // Pedestal base & Cabinet (mat = 1.2 for active speaker cabinet)
         room_add_box(
             vertices,
             indices,
-            [pos[0], pos[1] - 0.7, pos[2]],
-            [0.95, 0.12, 1.05],
+            [pos[0], pos[1] - 1.12, pos[2]],
+            [0.98, 0.12, 1.05],
             rot_y,
             ch,
-            1.0,
+            1.2,
         );
-        room_add_box(vertices, indices, pos, [0.80, 2.2, 0.90], rot_y, ch, 1.0);
+        room_add_box(vertices, indices, pos, [0.84, 2.2, 0.90], rot_y, ch, 1.2);
 
-        // Baffle front face is at offset +0.45 in local Z
-        let cos_r = rot_y.cos();
-        let sin_r = rot_y.sin();
-        let local_to_world = |lx: f32, ly: f32, lz: f32| -> [f32; 3] {
-            let rx = lx * cos_r + lz * sin_r;
-            let rz = -lx * sin_r + lz * cos_r;
-            [rx + pos[0], ly + pos[1], rz + pos[2]]
-        };
+        // Bipolar Front (+0.46) and Rear (-0.46) Driver Arrays so cones are visible from all camera orbit angles
+        for &(face_z, face_rot) in &[(0.46f32, rot_y), (-0.46f32, rot_y + std::f32::consts::PI)] {
+            // Lower Bass Woofer (mat = 2.0)
+            room_add_cone(
+                vertices,
+                indices,
+                local_to_world(0.0, -0.52, face_z),
+                0.31,
+                0.13,
+                face_rot,
+                ch,
+                2.0,
+            );
+            // Midrange Cone (mat = 3.0)
+            room_add_cone(
+                vertices,
+                indices,
+                local_to_world(0.0, 0.22, face_z),
+                0.22,
+                0.09,
+                face_rot,
+                ch,
+                3.0,
+            );
+            // Tweeter Dome (mat = 4.0)
+            room_add_cone(
+                vertices,
+                indices,
+                local_to_world(0.0, 0.76, face_z),
+                0.11,
+                0.04,
+                face_rot,
+                ch,
+                4.0,
+            );
+        }
 
-        // Lower Bass Woofer (mat = 2.0)
-        room_add_cone(
-            vertices,
-            indices,
-            local_to_world(0.0, -0.45, 0.46),
-            0.28,
-            0.12,
-            rot_y,
-            ch,
-            2.0,
-        );
-        // Midrange Cone (mat = 3.0)
-        room_add_cone(
-            vertices,
-            indices,
-            local_to_world(0.0, 0.25, 0.46),
-            0.19,
-            0.08,
-            rot_y,
-            ch,
-            3.0,
-        );
-        // Tweeter Dome (mat = 4.0)
-        room_add_cone(
-            vertices,
-            indices,
-            local_to_world(0.0, 0.72, 0.46),
-            0.09,
-            0.03,
-            rot_y,
-            ch,
-            4.0,
-        );
-
-        // Decorative vertical neon accent strip on cabinet sides
+        // Emissive vertical neon accent rails on all 4 vertical cabinet corners & base halo (mat = 5.2)
+        for &sx in &[-0.43f32, 0.43f32] {
+            for &sz in &[-0.43f32, 0.43f32] {
+                room_add_box(
+                    vertices,
+                    indices,
+                    local_to_world(sx, 0.0, sz),
+                    [0.04, 2.18, 0.04],
+                    rot_y,
+                    ch,
+                    5.2,
+                );
+            }
+        }
         room_add_box(
             vertices,
             indices,
-            local_to_world(-0.41, 0.0, 0.0),
-            [0.03, 2.0, 0.03],
+            local_to_world(0.0, -1.08, 0.0),
+            [1.02, 0.04, 1.08],
             rot_y,
             ch,
-            5.0,
-        );
-        room_add_box(
-            vertices,
-            indices,
-            local_to_world(0.41, 0.0, 0.0),
-            [0.03, 2.0, 0.03],
-            rot_y,
-            ch,
-            5.0,
+            5.2,
         );
     } else {
         // Stand-mounted surround monitor
-        // Stand pole
         room_add_box(
             vertices,
             indices,
             [pos[0], pos[1] - 0.9, pos[2]],
-            [0.08, 1.6, 0.08],
+            [0.10, 1.6, 0.10],
             rot_y,
             ch,
-            1.0,
+            1.2,
         );
         room_add_box(
             vertices,
             indices,
             [pos[0], pos[1] - 1.7, pos[2]],
-            [0.7, 0.06, 0.7],
+            [0.75, 0.06, 0.75],
             rot_y,
             ch,
-            1.0,
+            1.2,
         );
-        // Monitor box
-        room_add_box(vertices, indices, pos, [0.65, 1.1, 0.65], rot_y, ch, 1.0);
+        // Monitor box (mat = 1.2)
+        room_add_box(vertices, indices, pos, [0.72, 1.18, 0.68], rot_y, ch, 1.2);
 
-        let cos_r = rot_y.cos();
-        let sin_r = rot_y.sin();
-        let local_to_world = |lx: f32, ly: f32, lz: f32| -> [f32; 3] {
-            let rx = lx * cos_r + lz * sin_r;
-            let rz = -lx * sin_r + lz * cos_r;
-            [rx + pos[0], ly + pos[1], rz + pos[2]]
-        };
-        // Woofer
-        room_add_cone(
-            vertices,
-            indices,
-            local_to_world(0.0, -0.15, 0.33),
-            0.22,
-            0.09,
-            rot_y,
-            ch,
-            2.0,
-        );
-        // Tweeter
-        room_add_cone(
-            vertices,
-            indices,
-            local_to_world(0.0, 0.32, 0.33),
-            0.08,
-            0.03,
-            rot_y,
-            ch,
-            4.0,
-        );
-        // Neon perimeter halo
+        // Bipolar Front (+0.35) and Rear (-0.35) drivers
+        for &(face_z, face_rot) in &[(0.35f32, rot_y), (-0.35f32, rot_y + std::f32::consts::PI)] {
+            // Woofer
+            room_add_cone(
+                vertices,
+                indices,
+                local_to_world(0.0, -0.16, face_z),
+                0.25,
+                0.10,
+                face_rot,
+                ch,
+                2.0,
+            );
+            // Tweeter
+            room_add_cone(
+                vertices,
+                indices,
+                local_to_world(0.0, 0.34, face_z),
+                0.10,
+                0.04,
+                face_rot,
+                ch,
+                4.0,
+            );
+        }
+        // Neon perimeter halos & corner strips (mat = 5.2)
         room_add_box(
             vertices,
             indices,
-            local_to_world(0.0, -0.56, 0.0),
-            [0.66, 0.03, 0.66],
+            local_to_world(0.0, -0.60, 0.0),
+            [0.76, 0.04, 0.72],
             rot_y,
             ch,
-            5.0,
+            5.2,
+        );
+        room_add_box(
+            vertices,
+            indices,
+            local_to_world(0.0, 0.60, 0.0),
+            [0.76, 0.04, 0.72],
+            rot_y,
+            ch,
+            5.2,
         );
     }
 }
@@ -1045,245 +1176,217 @@ pub(crate) fn generate_neon_room_mesh() -> (Vec<Vertex>, Vec<u32>) {
         5.0,
     );
 
-    // 4. SPATIAL SPEAKERS (7.1.4 Surround Placement)
-    // Channel 0: Front Left (Tower)
+    // 4. SPATIAL SPEAKERS (7.1.4 Surround Placement — all oriented inward toward the listening sweet spot / camera)
+    // Channel 0: Front Left (Tower) — angled toward room center & camera (-Z, +X)
     room_add_speaker_tower(
         &mut vertices,
         &mut indices,
         [-3.8, -0.25, 5.5],
-        -0.42,
+        std::f32::consts::PI - 0.38,
         0.0,
         true,
     );
-    // Channel 1: Front Right (Tower)
+    // Channel 1: Front Right (Tower) — angled toward room center & camera (-Z, -X)
     room_add_speaker_tower(
         &mut vertices,
         &mut indices,
         [3.8, -0.25, 5.5],
-        0.42,
+        -std::f32::consts::PI + 0.38,
         1.0,
         true,
     );
 
-    // Channel 2: Center Channel (Horizontal Cabinet on Riser)
+    // Channel 2: Center Channel (Horizontal Cabinet on Riser, front baffle at Z = 6.46 facing -Z)
     room_add_box(
         &mut vertices,
         &mut indices,
         [0.0, -0.85, 6.8],
-        [1.7, 0.55, 0.65],
+        [1.8, 0.60, 0.66],
         0.0,
         2.0,
-        1.0,
+        1.2,
     );
     room_add_cone(
         &mut vertices,
         &mut indices,
-        [-0.52, -0.85, 7.13],
-        0.18,
-        0.07,
-        0.0,
-        2.0,
-        3.0,
-    );
-    room_add_cone(
-        &mut vertices,
-        &mut indices,
-        [0.52, -0.85, 7.13],
-        0.18,
-        0.07,
-        0.0,
+        [-0.54, -0.85, 6.46],
+        0.21,
+        0.08,
+        std::f32::consts::PI,
         2.0,
         3.0,
     );
     room_add_cone(
         &mut vertices,
         &mut indices,
-        [0.0, -0.85, 7.13],
-        0.09,
-        0.03,
-        0.0,
+        [0.54, -0.85, 6.46],
+        0.21,
+        0.08,
+        std::f32::consts::PI,
+        2.0,
+        3.0,
+    );
+    room_add_cone(
+        &mut vertices,
+        &mut indices,
+        [0.0, -0.85, 6.46],
+        0.11,
+        0.04,
+        std::f32::consts::PI,
         2.0,
         4.0,
     );
     room_add_box(
         &mut vertices,
         &mut indices,
-        [0.0, -1.14, 6.8],
-        [1.75, 0.03, 0.68],
+        [0.0, -1.16, 6.8],
+        [1.86, 0.04, 0.70],
         0.0,
         2.0,
-        5.0,
+        5.2,
+    );
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, -0.54, 6.8],
+        [1.86, 0.04, 0.70],
+        0.0,
+        2.0,
+        5.2,
     );
 
-    // Channel 3: Massive LFE Dual Subwoofer
+    // Channel 3: Massive LFE Dual Subwoofer (front baffle at Z = 4.64 facing -Z toward camera)
     room_add_box(
         &mut vertices,
         &mut indices,
         [0.0, -1.05, 5.2],
-        [2.4, 0.85, 1.1],
+        [2.5, 0.92, 1.1],
         0.0,
         3.0,
-        1.0,
+        1.2,
     );
     room_add_cone(
         &mut vertices,
         &mut indices,
-        [-0.62, -1.05, 5.76],
-        0.36,
-        0.16,
-        0.0,
+        [-0.64, -1.05, 4.64],
+        0.38,
+        0.17,
+        std::f32::consts::PI,
         3.0,
         2.0,
     );
     room_add_cone(
         &mut vertices,
         &mut indices,
-        [0.62, -1.05, 5.76],
-        0.36,
-        0.16,
-        0.0,
+        [0.64, -1.05, 4.64],
+        0.38,
+        0.17,
+        std::f32::consts::PI,
         3.0,
         2.0,
     );
-    // Subwoofer bass reflex port & neon trim
+    // Subwoofer bass reflex port & neon trim on front face (Z = 4.64)
     room_add_box(
         &mut vertices,
         &mut indices,
-        [0.0, -0.75, 5.76],
-        [0.35, 0.08, 0.05],
+        [0.0, -0.72, 4.64],
+        [0.42, 0.08, 0.05],
         0.0,
         3.0,
-        5.0,
+        5.2,
     );
     room_add_box(
         &mut vertices,
         &mut indices,
-        [0.0, -1.48, 5.2],
-        [2.45, 0.04, 1.15],
+        [0.0, -1.50, 5.2],
+        [2.56, 0.05, 1.16],
         0.0,
         3.0,
-        5.0,
+        5.2,
+    );
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, -0.58, 5.2],
+        [2.56, 0.05, 1.16],
+        0.0,
+        3.0,
+        5.2,
     );
 
-    // Channel 4: Surround Left (Stand Monitor)
+    // Channel 4: Surround Left (Stand Monitor) — angled inward (+X) and toward camera (-Z)
     room_add_speaker_tower(
         &mut vertices,
         &mut indices,
         [-6.2, 0.5, 0.5],
-        -1.42,
+        2.05,
         4.0,
         false,
     );
-    // Channel 5: Surround Right (Stand Monitor)
+    // Channel 5: Surround Right (Stand Monitor) — angled inward (-X) and toward camera (-Z)
     room_add_speaker_tower(
         &mut vertices,
         &mut indices,
         [6.2, 0.5, 0.5],
-        1.42,
+        -2.05,
         5.0,
         false,
     );
 
-    // Channel 6: Rear Left (Rear Surround Tower)
+    // Channel 6: Rear Left (Rear Surround Bipolar Tower) — angled inward (+X, -Z / +Z)
     room_add_speaker_tower(
         &mut vertices,
         &mut indices,
         [-4.2, 0.1, -4.8],
-        -2.65,
+        2.25,
         6.0,
         true,
     );
-    // Channel 7: Rear Right (Rear Surround Tower)
+    // Channel 7: Rear Right (Rear Surround Bipolar Tower) — angled inward (-X, -Z / +Z)
     room_add_speaker_tower(
         &mut vertices,
         &mut indices,
         [4.2, 0.1, -4.8],
-        2.65,
+        -2.25,
         7.0,
         true,
     );
 
-    // Channels 8..11: Overhead Ceiling Atmos Height Speakers
-    // Top Front Left (8)
-    room_add_box(
-        &mut vertices,
-        &mut indices,
-        [-3.2, 4.3, 3.5],
-        [0.65, 0.45, 0.65],
-        0.0,
-        8.0,
-        1.0,
-    );
-    room_add_cone(
-        &mut vertices,
-        &mut indices,
-        [-3.2, 4.05, 3.5],
-        0.20,
-        0.08,
-        0.0,
-        8.0,
-        2.0,
-    );
-    // Top Front Right (9)
-    room_add_box(
-        &mut vertices,
-        &mut indices,
-        [3.2, 4.3, 3.5],
-        [0.65, 0.45, 0.65],
-        0.0,
-        9.0,
-        1.0,
-    );
-    room_add_cone(
-        &mut vertices,
-        &mut indices,
-        [3.2, 4.05, 3.5],
-        0.20,
-        0.08,
-        0.0,
-        9.0,
-        2.0,
-    );
-    // Top Rear Left (10)
-    room_add_box(
-        &mut vertices,
-        &mut indices,
-        [-3.2, 4.3, -2.5],
-        [0.65, 0.45, 0.65],
-        0.0,
-        10.0,
-        1.0,
-    );
-    room_add_cone(
-        &mut vertices,
-        &mut indices,
-        [-3.2, 4.05, -2.5],
-        0.20,
-        0.08,
-        0.0,
-        10.0,
-        2.0,
-    );
-    // Top Rear Right (11)
-    room_add_box(
-        &mut vertices,
-        &mut indices,
-        [3.2, 4.3, -2.5],
-        [0.65, 0.45, 0.65],
-        0.0,
-        11.0,
-        1.0,
-    );
-    room_add_cone(
-        &mut vertices,
-        &mut indices,
-        [3.2, 4.05, -2.5],
-        0.20,
-        0.08,
-        0.0,
-        11.0,
-        2.0,
-    );
+    // Channels 8..11: Overhead Ceiling Atmos Height Speakers (downward-firing cones + neon trim)
+    for &(ch_id, cx, cz) in &[
+        (8.0f32, -3.2f32, 3.5f32),
+        (9.0f32, 3.2f32, 3.5f32),
+        (10.0f32, -3.2f32, -2.5f32),
+        (11.0f32, 3.2f32, -2.5f32),
+    ] {
+        room_add_box(
+            &mut vertices,
+            &mut indices,
+            [cx, 4.32, cz],
+            [0.72, 0.46, 0.72],
+            0.0,
+            ch_id,
+            1.2,
+        );
+        room_add_box(
+            &mut vertices,
+            &mut indices,
+            [cx, 4.09, cz],
+            [0.76, 0.04, 0.76],
+            0.0,
+            ch_id,
+            5.2,
+        );
+        room_add_ceiling_cone(
+            &mut vertices,
+            &mut indices,
+            [cx, 4.07, cz],
+            0.25,
+            0.09,
+            ch_id,
+            2.0,
+        );
+    }
 
     (vertices, indices)
 }
@@ -5799,7 +5902,16 @@ impl VulkanEngine {
             }
         }
 
-        // 2. Populate Raw Spatial Channels (strict spatial mapping without UI reordering)
+        // 2. Populate Raw Spatial Channels (strict spatial mapping without UI reordering,
+        // blending fast raw_channel_vus for crisp per-note speaker cone & light transients)
+        let get_fast_vu = |idx: usize| -> f32 {
+            let smoothed = state.channel_vus.get(idx).copied().unwrap_or(0.0);
+            if let Some(&raw) = state.raw_channel_vus.get(idx) {
+                raw * 0.72 + smoothed * 0.28
+            } else {
+                smoothed
+            }
+        };
         if let Some(num_tracks) = state.tracker_channels.filter(|&n| n > 0) {
             // For tracker files, channel_vus is [L_Peak, Track1..N, R_Peak].
             // Map individual tracker tracks into spatial channels so surround/room visualizers
@@ -5808,16 +5920,16 @@ impl VulkanEngine {
             if tracks_count > 0 {
                 let count = tracks_count.min(16);
                 for i in 0..count {
-                    uniforms.spatial_channels[i] = state.channel_vus[i + 1];
+                    uniforms.spatial_channels[i] = get_fast_vu(i + 1);
                 }
             } else if state.channel_vus.len() >= 2 {
-                uniforms.spatial_channels[0] = state.channel_vus[0];
-                uniforms.spatial_channels[1] = state.channel_vus[state.channel_vus.len() - 1];
+                uniforms.spatial_channels[0] = get_fast_vu(0);
+                uniforms.spatial_channels[1] = get_fast_vu(state.channel_vus.len() - 1);
             }
         } else {
             let spatial_count = state.channel_vus.len().min(16);
             for i in 0..spatial_count {
-                uniforms.spatial_channels[i] = state.channel_vus[i];
+                uniforms.spatial_channels[i] = get_fast_vu(i);
             }
         }
 
