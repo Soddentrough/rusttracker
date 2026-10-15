@@ -3099,6 +3099,7 @@ impl VulkanEngine {
                 25 => include_str!("shaders/vis_spectrum_led.wgsl"),
                 27 => include_str!("shaders/vis_flip_ferrofluid.wgsl"),
                 28 => include_str!("shaders/vis_glass_water.wgsl"),
+                29 => include_str!("shaders/vis_spectrum_canyon.wgsl"),
                 _ => include_str!("shaders/vis_spectrum.wgsl"),
             }
         };
@@ -5192,6 +5193,92 @@ impl VulkanEngine {
                         start_idx + 2,
                         start_idx + 3,
                     ]);
+                    (vertices, indices)
+                }
+                crate::state::Geometry::UnitBox => {
+                    let mut vertices = Vec::with_capacity(24);
+                    let mut indices = Vec::with_capacity(36);
+                    let faces: [([f32; 3], [[f32; 3]; 4]); 6] = [
+                        // Front (+Z) — normal.z > 0.5
+                        (
+                            [0.0, 0.0, 1.0],
+                            [
+                                [-0.5, -0.5, 0.5],
+                                [0.5, -0.5, 0.5],
+                                [0.5, 0.5, 0.5],
+                                [-0.5, 0.5, 0.5],
+                            ],
+                        ),
+                        // Back (-Z)
+                        (
+                            [0.0, 0.0, -1.0],
+                            [
+                                [0.5, -0.5, -0.5],
+                                [-0.5, -0.5, -0.5],
+                                [-0.5, 0.5, -0.5],
+                                [0.5, 0.5, -0.5],
+                            ],
+                        ),
+                        // Left (-X)
+                        (
+                            [-1.0, 0.0, 0.0],
+                            [
+                                [-0.5, -0.5, -0.5],
+                                [-0.5, -0.5, 0.5],
+                                [-0.5, 0.5, 0.5],
+                                [-0.5, 0.5, -0.5],
+                            ],
+                        ),
+                        // Right (+X)
+                        (
+                            [1.0, 0.0, 0.0],
+                            [
+                                [0.5, -0.5, 0.5],
+                                [0.5, -0.5, -0.5],
+                                [0.5, 0.5, -0.5],
+                                [0.5, 0.5, 0.5],
+                            ],
+                        ),
+                        // Top (+Y)
+                        (
+                            [0.0, 1.0, 0.0],
+                            [
+                                [-0.5, 0.5, 0.5],
+                                [0.5, 0.5, 0.5],
+                                [0.5, 0.5, -0.5],
+                                [-0.5, 0.5, -0.5],
+                            ],
+                        ),
+                        // Bottom (-Y)
+                        (
+                            [0.0, -1.0, 0.0],
+                            [
+                                [-0.5, -0.5, -0.5],
+                                [0.5, -0.5, -0.5],
+                                [0.5, -0.5, 0.5],
+                                [-0.5, -0.5, 0.5],
+                            ],
+                        ),
+                    ];
+                    let uvs = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+                    for (normal, quad) in faces {
+                        let base = vertices.len() as u32;
+                        for (i, pos) in quad.into_iter().enumerate() {
+                            vertices.push(Vertex {
+                                position: pos,
+                                normal,
+                                tex_coords: uvs[i],
+                            });
+                        }
+                        indices.extend_from_slice(&[
+                            base,
+                            base + 1,
+                            base + 2,
+                            base,
+                            base + 2,
+                            base + 3,
+                        ]);
+                    }
                     (vertices, indices)
                 }
                 crate::state::Geometry::NeonRoom => generate_neon_room_mesh(),
@@ -9325,17 +9412,18 @@ impl VulkanEngine {
             } else {
                 48.0_f32.to_radians()
             };
-            let fov_y = if state.visualizer_mode == 19 || state.visualizer_mode == 23 {
-                base_fov
-            } else if aspect < 1.0 {
-                (base_fov / aspect.clamp(0.65, 1.0)).min(if state.visualizer_mode == 22 {
-                    85.0_f32.to_radians()
+            let fov_y =
+                if state.visualizer_mode == 19 || state.visualizer_mode == 23 || state.visualizer_mode == 29 {
+                    base_fov
+                } else if aspect < 1.0 {
+                    (base_fov / aspect.clamp(0.65, 1.0)).min(if state.visualizer_mode == 22 {
+                        85.0_f32.to_radians()
+                    } else {
+                        75.0_f32.to_radians()
+                    })
                 } else {
-                    75.0_f32.to_radians()
-                })
-            } else {
-                base_fov
-            };
+                    base_fov
+                };
             let proj = glam::Mat4::perspective_rh_gl(fov_y, aspect, 0.1, 1000.0);
             let view = if state.visualizer_mode == 20 && state.biolum_top_down {
                 glam::Mat4::look_at_rh(
@@ -9397,6 +9485,13 @@ impl VulkanEngine {
                     glam::Vec3::new(0.0, 0.4, 2.5),
                     glam::Vec3::new(0.0, 1.0, 0.0),
                 )
+            } else if state.visualizer_mode == 29 {
+                // 3D Prismatic Spectrum Canyon: Centered perspective camera looking down +Z canyon
+                glam::Mat4::look_at_rh(
+                    glam::Vec3::new(0.0, 0.0, -6.5),
+                    glam::Vec3::new(0.0, 0.0, 20.0),
+                    glam::Vec3::new(0.0, 1.0, 0.0),
+                )
             } else {
                 glam::Mat4::look_at_rh(
                     glam::Vec3::new(0.0, 1.5, -2.0),
@@ -9422,7 +9517,12 @@ impl VulkanEngine {
                 .min(self.render_pipelines.len() - 1);
             let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
 
-            if vis_def.id == 12 || vis_def.id == 3 || vis_def.id == 4 || vis_def.id == 23 {
+            if vis_def.id == 12
+                || vis_def.id == 3
+                || vis_def.id == 4
+                || vis_def.id == 23
+                || vis_def.id == 29
+            {
                 render_pass.set_pipeline(&self.clear_black_pipeline);
                 render_pass.draw(0..3, 0..1);
             } else if vis_def.id == 20 {

@@ -699,6 +699,7 @@ async fn run_perf_test() {
             25 => include_str!("../src/shaders/vis_spectrum_led.wgsl"),
             27 => include_str!("../src/shaders/vis_flip_ferrofluid.wgsl"),
             28 => include_str!("../src/shaders/vis_glass_water.wgsl"),
+            29 => include_str!("../src/shaders/vis_spectrum_canyon.wgsl"),
             _ => include_str!("../src/shaders/vis_spectrum.wgsl"),
         }
     };
@@ -873,6 +874,10 @@ async fn run_perf_test() {
                                 geometry: crate::state::Geometry::Grid { width, depth },
                                 instances,
                             } => ((width * depth * 6).min(grid_index_count), instances),
+                            crate::state::PipelineType::Mesh3D {
+                                geometry: crate::state::Geometry::UnitBox,
+                                instances,
+                            } => (36, instances),
                             crate::state::PipelineType::Mesh3D { instances, .. } => {
                                 (grid_index_count, instances)
                             }
@@ -964,6 +969,10 @@ async fn run_perf_test() {
                                 geometry: crate::state::Geometry::Grid { width, depth },
                                 instances,
                             } => ((width * depth * 6).min(grid_index_count), instances),
+                            crate::state::PipelineType::Mesh3D {
+                                geometry: crate::state::Geometry::UnitBox,
+                                instances,
+                            } => (36, instances),
                             crate::state::PipelineType::Mesh3D { instances, .. } => {
                                 (grid_index_count, instances)
                             }
@@ -4868,3 +4877,631 @@ async fn run_3d_freq_oscilloscope_snapshot() {
     img.save(&out_path).unwrap();
     println!("Saved 3D Freq Oscilloscope snapshot to {:?}", out_path);
 }
+
+#[test]
+fn test_vis_spectrum_canyon_snapshot() {
+    let instance = Instance::new(InstanceDescriptor {
+        backends: Backends::PRIMARY,
+        flags: InstanceFlags::default(),
+        backend_options: BackendOptions::default(),
+        display: None,
+        memory_budget_thresholds: MemoryBudgetThresholds::default(),
+    });
+
+    let adapter = match pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
+        power_preference: PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+    })) {
+        Ok(a) => a,
+        Err(_) => {
+            println!("No GPU adapter found, skipping test.");
+            return;
+        }
+    };
+
+    let (device, queue) = pollster::block_on(adapter.request_device(&DeviceDescriptor {
+        label: Some("Spectrum Canyon Test Device"),
+        required_features: Features::empty(),
+        required_limits: Limits::default(),
+        memory_hints: MemoryHints::default(),
+        ..Default::default()
+    }))
+    .unwrap();
+
+    let width = 1280u32;
+    let height = 720u32;
+    let aspect = (width as f32) / (height as f32);
+    let color_format = TextureFormat::Rgba8UnormSrgb;
+
+    let render_target = device.create_texture(&TextureDescriptor {
+        label: Some("Spectrum Canyon Target"),
+        size: Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: color_format,
+        usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let color_view = render_target.create_view(&TextureViewDescriptor::default());
+
+    let depth_texture = device.create_texture(&TextureDescriptor {
+        label: Some("Spectrum Canyon Depth"),
+        size: Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Depth32Float,
+        usage: TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let depth_view = depth_texture.create_view(&TextureViewDescriptor::default());
+
+    let mut uniforms = crate::engine::AudioUniforms {
+        spectrum: [0.0; 1024],
+        fire_heat: [0.0; 1024],
+        channels: [0.75; 32],
+        channel_peaks: [0.85; 32],
+        spatial_channels: [0.0; 16],
+        display_order: [0; 16],
+        channel_phases: [0.0; 32],
+        num_channels: 2,
+        mode: 29,
+        time: 31.0,
+        duration: 180.0,
+        smooth_time: 31.0,
+        heatmap_row: 64,
+        fft_channels: 2,
+        num_spatial_channels: 2,
+        ui_meters_rect: [0.0; 4],
+        ui_heatmap_rect: [0.0; 4],
+        ui_fire_rect: [0.0; 4],
+        waveform_resolution: 1024,
+        waveform_history_size: 60,
+        frame_count: 1860,
+        step_fraction: 0.25,
+        steps_to_fill: 1,
+        aspect_ratio: aspect,
+        frame_dt: 0.016,
+        history_cam_z: 32.0,
+        fire_intensity: 1.0,
+        _pad1: 0.0,
+        _pad2: 0.0,
+        _pad3: 0.0,
+    };
+
+    for i in 0..1024 {
+        let f = (i as f32) / 1024.0;
+        let bass_boost = (-f * 6.5).exp() * 92.0;
+        let mid_groove = (-(f - 0.22).powi(2) / 0.025).exp() * 68.0;
+        let high_sparkle = (-(f - 0.58).powi(2) / 0.06).exp() * 48.0;
+        let harmonic_ripple = ((i as f32 * 0.37).sin() * 0.5 + 0.5) * 28.0;
+        let val = (bass_boost + mid_groove + high_sparkle + harmonic_ripple).clamp(8.0, 100.0);
+        uniforms.spectrum[i] = val;
+        uniforms.fire_heat[i] = (val * 1.12).min(100.0);
+    }
+
+    let uniform_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("Audio Uniform Buffer"),
+        size: std::mem::size_of::<crate::engine::AudioUniforms>() as u64,
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+
+    // Populate 256x1024 history texture with animated spectral waves
+    let history_texture = device.create_texture(&TextureDescriptor {
+        label: Some("History Texture"),
+        size: Extent3d {
+            width: 256,
+            height: 1024,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::R32Float,
+        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let mut history_data = vec![0.0f32; 256 * 1024];
+    for row in 0..1024usize {
+        for bin in 0..256usize {
+            let f = (bin as f32) / 256.0;
+            let wave = ((row as f32 * 0.14 + bin as f32 * 0.23).sin() * 0.5 + 0.5) * 35.0;
+            let env = (-f * 3.2).exp() * 65.0 + 15.0;
+            history_data[row * 256 + bin] = (env + wave).clamp(5.0, 100.0);
+        }
+    }
+    queue.write_texture(
+        TexelCopyTextureInfo {
+            texture: &history_texture,
+            mip_level: 0,
+            origin: Origin3d::ZERO,
+            aspect: TextureAspect::All,
+        },
+        bytemuck::cast_slice(&history_data),
+        TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(256 * 4),
+            rows_per_image: Some(1024),
+        },
+        Extent3d {
+            width: 256,
+            height: 1024,
+            depth_or_array_layers: 1,
+        },
+    );
+    let history_view = history_texture.create_view(&TextureViewDescriptor::default());
+
+    let dummy_waveform = device.create_buffer(&BufferDescriptor {
+        label: Some("Dummy Waveform"),
+        size: 1024,
+        usage: BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let dummy_storage = device.create_buffer(&BufferDescriptor {
+        label: Some("Dummy Storage"),
+        size: 1024,
+        usage: BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+
+    let bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("audio_bind_group_layout"),
+        entries: &[
+            BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 1,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 2,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: false },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 3,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: false },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 4,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 5,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+
+    let uniform_bind_group = device.create_bind_group(&BindGroupDescriptor {
+        label: Some("audio_bind_group"),
+        layout: &bind_group_layout,
+        entries: &[
+            BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 1,
+                resource: dummy_waveform.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 2,
+                resource: BindingResource::TextureView(&history_view),
+            },
+            BindGroupEntry {
+                binding: 3,
+                resource: BindingResource::TextureView(&history_view),
+            },
+            BindGroupEntry {
+                binding: 4,
+                resource: dummy_storage.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 5,
+                resource: dummy_storage.as_entire_binding(),
+            },
+        ],
+    });
+
+    let smoke_texture = device.create_texture(&TextureDescriptor {
+        label: Some("Smoke Texture"),
+        size: Extent3d {
+            width: 4,
+            height: 4,
+            depth_or_array_layers: 4,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D3,
+        format: TextureFormat::Rgba16Float,
+        usage: TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let smoke_view = smoke_texture.create_view(&TextureViewDescriptor::default());
+    let smoke_sampler = device.create_sampler(&SamplerDescriptor::default());
+    let smoke_render_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("Smoke Layout"),
+        entries: &[
+            BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: true },
+                    view_dimension: TextureViewDimension::D3,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 1,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+    let smoke_bind_group = device.create_bind_group(&BindGroupDescriptor {
+        label: Some("Smoke BG"),
+        layout: &smoke_render_layout,
+        entries: &[
+            BindGroupEntry {
+                binding: 0,
+                resource: BindingResource::TextureView(&smoke_view),
+            },
+            BindGroupEntry {
+                binding: 1,
+                resource: BindingResource::Sampler(&smoke_sampler),
+            },
+        ],
+    });
+
+    let camera_bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("Camera Layout"),
+        entries: &[BindGroupLayoutEntry {
+            binding: 0,
+            visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+            ty: BindingType::Buffer {
+                ty: BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+    let fov_y = 48.0_f32.to_radians();
+    let proj = glam::Mat4::perspective_rh_gl(fov_y, aspect, 0.1, 1000.0);
+    let view = glam::Mat4::look_at_rh(
+        glam::Vec3::new(0.0, 0.0, -6.5),
+        glam::Vec3::new(0.0, 0.0, 20.0),
+        glam::Vec3::new(0.0, 1.0, 0.0),
+    );
+    let camera_uniforms = crate::engine::CameraUniforms {
+        view_matrix: view.to_cols_array_2d(),
+        proj_matrix: proj.to_cols_array_2d(),
+    };
+    let camera_uniform_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("Camera Uniforms"),
+        size: std::mem::size_of::<crate::engine::CameraUniforms>() as u64,
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(
+        &camera_uniform_buffer,
+        0,
+        bytemuck::cast_slice(&[camera_uniforms]),
+    );
+    let camera_bind_group = device.create_bind_group(&BindGroupDescriptor {
+        label: Some("Camera BG"),
+        layout: &camera_bind_group_layout,
+        entries: &[BindGroupEntry {
+            binding: 0,
+            resource: camera_uniform_buffer.as_entire_binding(),
+        }],
+    });
+
+    let render_pipeline_layout_3d = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+        label: Some("3D Render Pipeline Layout"),
+        bind_group_layouts: &[
+            Some(&bind_group_layout),
+            Some(&smoke_render_layout),
+            Some(&camera_bind_group_layout),
+        ],
+        immediate_size: 0,
+    });
+
+    let shader_src =
+        resolve_shader_includes(include_str!("../src/shaders/vis_spectrum_canyon.wgsl"));
+    let shader_module = device.create_shader_module(ShaderModuleDescriptor {
+        label: Some("Spectrum Canyon Shader"),
+        source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&shader_src)),
+    });
+
+    let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+        label: Some("Spectrum Canyon Pipeline"),
+        layout: Some(&render_pipeline_layout_3d),
+        vertex: VertexState {
+            module: &shader_module,
+            entry_point: Some("vs_main_3d"),
+            buffers: &[crate::engine::Vertex::desc()],
+            compilation_options: PipelineCompilationOptions::default(),
+        },
+        fragment: Some(FragmentState {
+            module: &shader_module,
+            entry_point: Some("fs_main"),
+            targets: &[Some(ColorTargetState {
+                format: color_format,
+                blend: Some(BlendState::REPLACE),
+                write_mask: ColorWrites::ALL,
+            })],
+            compilation_options: PipelineCompilationOptions::default(),
+        }),
+        primitive: PrimitiveState {
+            topology: PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: Some(DepthStencilState {
+            format: TextureFormat::Depth32Float,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(CompareFunction::LessEqual),
+            stencil: StencilState::default(),
+            bias: DepthBiasState::default(),
+        }),
+        multisample: MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    // Build UnitBox mesh (24 vertices, 36 indices)
+    let mut vertices = Vec::with_capacity(24);
+    let mut indices = Vec::with_capacity(36);
+    let faces: [([f32; 3], [[f32; 3]; 4]); 6] = [
+        (
+            [0.0, 0.0, 1.0],
+            [
+                [-0.5, -0.5, 0.5],
+                [0.5, -0.5, 0.5],
+                [0.5, 0.5, 0.5],
+                [-0.5, 0.5, 0.5],
+            ],
+        ),
+        (
+            [0.0, 0.0, -1.0],
+            [
+                [0.5, -0.5, -0.5],
+                [-0.5, -0.5, -0.5],
+                [-0.5, 0.5, -0.5],
+                [0.5, 0.5, -0.5],
+            ],
+        ),
+        (
+            [-1.0, 0.0, 0.0],
+            [
+                [-0.5, -0.5, -0.5],
+                [-0.5, -0.5, 0.5],
+                [-0.5, 0.5, 0.5],
+                [-0.5, 0.5, -0.5],
+            ],
+        ),
+        (
+            [1.0, 0.0, 0.0],
+            [
+                [0.5, -0.5, 0.5],
+                [0.5, -0.5, -0.5],
+                [0.5, 0.5, -0.5],
+                [0.5, 0.5, 0.5],
+            ],
+        ),
+        (
+            [0.0, 1.0, 0.0],
+            [
+                [-0.5, 0.5, 0.5],
+                [0.5, 0.5, 0.5],
+                [0.5, 0.5, -0.5],
+                [-0.5, 0.5, -0.5],
+            ],
+        ),
+        (
+            [0.0, -1.0, 0.0],
+            [
+                [-0.5, -0.5, -0.5],
+                [0.5, -0.5, -0.5],
+                [0.5, -0.5, 0.5],
+                [-0.5, -0.5, 0.5],
+            ],
+        ),
+    ];
+    let uvs = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+    for (normal, quad) in faces {
+        let base = vertices.len() as u32;
+        for (i, pos) in quad.into_iter().enumerate() {
+            vertices.push(crate::engine::Vertex {
+                position: pos,
+                normal,
+                tex_coords: uvs[i],
+            });
+        }
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+
+    let box_vertex_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("UnitBox Vertex Buffer"),
+        size: (vertices.len() * std::mem::size_of::<crate::engine::Vertex>()) as u64,
+        usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&box_vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+
+    let box_index_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("UnitBox Index Buffer"),
+        size: (indices.len() * std::mem::size_of::<u32>()) as u64,
+        usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&box_index_buffer, 0, bytemuck::cast_slice(&indices));
+    let box_index_count = indices.len() as u32;
+
+    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
+    {
+        let mut rp = encoder.begin_render_pass(&RenderPassDescriptor {
+            label: Some("Spectrum Canyon Render Pass"),
+            color_attachments: &[Some(RenderPassColorAttachment {
+                view: &color_view,
+                resolve_target: None,
+                ops: Operations {
+                    load: LoadOp::Clear(Color::BLACK),
+                    store: StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                view: &depth_view,
+                depth_ops: Some(Operations {
+                    load: LoadOp::Clear(1.0),
+                    store: StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        rp.set_pipeline(&pipeline);
+        rp.set_bind_group(0, &uniform_bind_group, &[]);
+        rp.set_bind_group(1, &smoke_bind_group, &[]);
+        rp.set_bind_group(2, &camera_bind_group, &[]);
+        rp.set_vertex_buffer(0, box_vertex_buffer.slice(..));
+        rp.set_index_buffer(box_index_buffer.slice(..), IndexFormat::Uint32);
+        rp.draw_indexed(0..box_index_count, 0, 0..8193);
+    }
+
+    let bytes_per_pixel = 4u32;
+    let unpadded_bytes_per_row = width * bytes_per_pixel;
+    let align = 256u32;
+    let bytes_per_row = (unpadded_bytes_per_row + align - 1) & !(align - 1);
+
+    let out_buf = device.create_buffer(&BufferDescriptor {
+        label: Some("Readback Buf"),
+        size: (bytes_per_row * height) as u64,
+        usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    encoder.copy_texture_to_buffer(
+        TexelCopyTextureInfo {
+            texture: &render_target,
+            mip_level: 0,
+            origin: Origin3d::ZERO,
+            aspect: TextureAspect::All,
+        },
+        TexelCopyBufferInfo {
+            buffer: &out_buf,
+            layout: TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(height),
+            },
+        },
+        Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(Some(encoder.finish()));
+
+    let slice = out_buf.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(MapMode::Read, move |res| {
+        tx.send(res).unwrap();
+    });
+    let _ = device.poll(PollType::Wait {
+        submission_index: None,
+        timeout: None,
+    });
+    rx.recv().unwrap().unwrap();
+
+    let data = slice.get_mapped_range();
+    let mut img = image::ImageBuffer::<image::Rgba<u8>, _>::new(width, height);
+    let mut non_black_pixels = 0usize;
+    for y in 0..height {
+        let row_start = (y * bytes_per_row) as usize;
+        for x in 0..width {
+            let px_start = row_start + (x * bytes_per_pixel) as usize;
+            let r = data[px_start];
+            let g = data[px_start + 1];
+            let b = data[px_start + 2];
+            let a = data[px_start + 3];
+            if r > 20 || g > 20 || b > 20 {
+                non_black_pixels += 1;
+            }
+            img.put_pixel(x, y, image::Rgba([r, g, b, a]));
+        }
+    }
+    drop(data);
+    out_buf.unmap();
+
+    assert!(
+        non_black_pixels > (width as usize * height as usize) / 4,
+        "Expected vibrant 3D canyon output, got only {} non-black pixels",
+        non_black_pixels
+    );
+
+    let out_path = std::path::PathBuf::from("target/vis_spectrum_canyon.png");
+    img.save(&out_path).unwrap();
+    println!("Saved Prismatic Spectrum Canyon snapshot to {:?}", out_path);
+}
+

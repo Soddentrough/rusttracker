@@ -119,6 +119,7 @@ impl std::fmt::Debug for VideoFrame {
 pub enum Geometry {
     Grid { width: u32, depth: u32 },
     UnitQuad,
+    UnitBox,
     NeonRoom,
     SynthwaveRacerScene,
     VuMeterRack,
@@ -452,6 +453,22 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_ferrofluidsim: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: true,
+    },
+    VisualizerDef {
+        id: 29,
+        name: "Prismatic Spectrum Canyon",
+        filename: "vis_spectrum_canyon.wgsl",
+        description: "3D mirrored perspective rainbow spectrum canyon with segmented LED bars",
+        pipeline_type: PipelineType::Mesh3D {
+            geometry: Geometry::UnitBox,
+            instances: 8193,
+        },
+        requires_history: false,
+        requires_fire: false,
+        requires_resynth: false,
+        requires_ferrofluidsim: false,
+        requires_flip_ferrofluid: false,
+        requires_flip_water: false,
     },
 ];
 
