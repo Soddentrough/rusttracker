@@ -3273,6 +3273,8 @@ impl VulkanEngine {
                                 },
                                 alpha: wgpu::BlendComponent::OVER,
                             }
+                        } else if vis_def.id == 3 {
+                            wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING
                         } else {
                             wgpu::BlendState::REPLACE
                         }),
@@ -10117,13 +10119,14 @@ mod tests {
         let freq_vis = crate::state::VISUALIZERS
             .iter()
             .find(|v| v.id == 4)
-            .expect("Visualizer ID 4 (3D Freq Oscilloscope) must exist");
+            .expect("Visualizer ID 4 (Strings) must exist");
+        assert_eq!(freq_vis.name, "Strings");
         assert!(
             matches!(
                 freq_vis.pipeline_type,
                 crate::state::PipelineType::Mesh3D { .. }
             ),
-            "3D Freq Oscilloscope must use PipelineType::Mesh3D"
+            "Strings visualizer must use PipelineType::Mesh3D"
         );
     }
 

@@ -220,9 +220,9 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
     },
     VisualizerDef {
         id: 4,
-        name: "3D Freq Oscilloscope",
+        name: "Strings",
         filename: "vis_3doscilloscope_freq.wgsl",
-        description: "3D stereo frequency oscilloscope",
+        description: "3D stereo vibrating frequency strings",
         pipeline_type: PipelineType::Mesh3D {
             geometry: Geometry::Grid {
                 width: 511,

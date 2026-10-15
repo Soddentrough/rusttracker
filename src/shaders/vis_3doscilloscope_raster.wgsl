@@ -47,9 +47,17 @@ fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
     // Sub-row fractional Z glide eliminates stepped waterfall jumps between history pushes
     let v_scrolled = clamp(v_coord - audio.step_fraction / max_hist_f, 0.0, 1.0);
 
+    // Smoothly taper spike height to 0 at the leading/outer edges (squared so height drops
+    // faster than brightness, preventing dimmed front rows from ever standing up in front of bright rows)
+    let front_taper = smoothstep_r(0.99, 0.78, v_coord);
+    let back_taper = smoothstep(0.0, 0.14, v_scrolled);
+    let side_taper = smoothstep_r(0.5, 0.42, abs(u_coord - 0.5));
+    let edge_env = front_taper * back_taper * side_taper;
+    let height_taper = edge_env * edge_env;
+
     // Scale coordinates into 3D world coordinates
     let x = (u_coord - 0.5) * 19.2;
-    let y = wave_val * 1.25;
+    let y = wave_val * 1.25 * height_taper;
     let z = mix(9.48, -2.6, v_scrolled);
 
     let p3 = vec3<f32>(x, y, z);
@@ -94,8 +102,8 @@ fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
     out.clip_position = final_clip_pos;
     out.ndc_pos = vec3<f32>(distorted_ndc, clip_pos.z / max(clip_pos.w, 0.0001));
     out.uv = vec2<f32>(u_coord, v_scrolled);
-    out.local_z = y;
-    out.hit_val = wave_val;
+    out.local_z = v_coord;
+    out.hit_val = wave_val * height_taper;
     out.cam_dist = length(p3 - ro);
 
     return out;
@@ -142,39 +150,43 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     let line_dist = min(grid.x, grid.y) / (1.0 + total_coc);
     let wire = get_wire(line_dist, inv_coc_05, inv_coc_02, inv_coc_01, bloom_boost);
 
-    // Warm amber-to-incandescent cream phosphor palette with front-row transient highlight
-    let amber_lo = vec3<f32>(0.58, 0.17, 0.02);
+    // Use physical mesh coordinate in.local_z (v_coord in 0..1) so the leading edge always hits exact 0.0 at v = 1.0
+    let v_mesh = max(in.uv.y, in.local_z);
+    let age_fade = mix(0.08, 1.0, in.uv.y);
+    let edge_fade = smoothstep_r(0.5, 0.42, abs(in.uv.x - 0.5));
+    let depth_fade = smoothstep(0.0, 0.18, in.uv.y);
+    let front_fade = smoothstep_r(0.995, 0.78, v_mesh);
+    let boundary_fade = edge_fade * depth_fade * front_fade;
+    let fade_sq = boundary_fade * boundary_fade;
+
+    // Warm amber-to-incandescent cream phosphor palette (fades through warm copper at boundaries, never gray)
+    let amber_ember = vec3<f32>(0.38, 0.07, 0.004);
+    let amber_lo = mix(amber_ember, vec3<f32>(0.58, 0.17, 0.02), boundary_fade);
     let amber_hi = vec3<f32>(1.05, 0.58, 0.10);
     let amber_peak = vec3<f32>(1.35, 0.92, 0.38);
-    let front_glow = smoothstep(0.82, 0.98, in.uv.y);
-    let line_amber = mix(mix(amber_lo, amber_hi, wave_height), amber_peak, wave_height * wave_height * 0.65 + front_glow * 0.25);
+    let line_amber = mix(mix(amber_lo, amber_hi, wave_height), amber_peak, wave_height * wave_height * 0.65);
 
-    let age_fade = mix(0.08, 1.0, in.uv.y);
-    let edge_fade = smoothstep_r(0.5, 0.46, abs(in.uv.x - 0.5));
-    let depth_fade = smoothstep(0.0, 0.18, in.uv.y);
-    let front_fade = smoothstep_r(1.0, 0.84, in.uv.y);
-    let boundary_fade = edge_fade * depth_fade * front_fade;
-
-    var color = line_amber * wire * age_fade * boundary_fade * 1.65;
+    var color = line_amber * wire * age_fade * fade_sq * 1.65;
 
     // Ambient CRT screen glow
-    let ambient_glow = vec3<f32>(0.02, 0.01, 0.003) * bezel * boundary_fade;
+    let ambient_glow = vec3<f32>(0.02, 0.01, 0.003) * bezel * fade_sq;
     color += ambient_glow;
 
-    // Realistic CRT glass reflection overlay
+    // Realistic CRT glass reflection overlay (masked by fade_sq so mesh edges never leave a gray step)
     let norm = normalize(vec3<f32>(crt_uv * 0.18, 1.0));
     let light_source = normalize(vec3<f32>(-0.4, 0.7, -0.6));
     let reflection_spec = pow(max(dot(norm, light_source), 0.0), 32.0) * 0.08;
     let reflection_ambient = (1.0 - r * 0.4) * 0.015;
-    let glass_reflection = vec3<f32>(0.85, 0.92, 1.0) * (reflection_spec + reflection_ambient) * bezel;
+    let glass_reflection = vec3<f32>(0.85, 0.92, 1.0) * (reflection_spec + reflection_ambient) * bezel * fade_sq;
     color += glass_reflection;
 
     color *= bezel;
 
     let noise_val = hash21_crt(in.clip_position.xy + fract(audio.smooth_time) * 113.0);
-    let noise_color = vec3<f32>(0.8, 0.35, 0.05) * noise_val * 0.008 * bezel * boundary_fade;
+    let noise_color = vec3<f32>(0.8, 0.35, 0.05) * noise_val * 0.008 * bezel * fade_sq;
     color += noise_color;
 
-    let final_color = aces_tonemap(color);
-    return vec4<f32>(final_color, 1.0);
+    let alpha = clamp(boundary_fade * bezel, 0.0, 1.0);
+    let final_color = aces_tonemap(color) * alpha;
+    return vec4<f32>(final_color, alpha);
 }
