@@ -231,7 +231,8 @@ pub fn spawn_dsp_thread(
         let recycle_tx = &dsp_recycle_channel().0;
 
         while let Ok(msg) = rx.recv() {
-            let (need_gpu_spectrum, skip_fft, stale_epoch) = if let Ok(state) = shared_state.lock() {
+            let (need_gpu_spectrum, skip_fft, stale_epoch) = if let Ok(state) = shared_state.lock()
+            {
                 if msg.seek_epoch < state.seek_epoch {
                     (false, true, true)
                 } else {
@@ -2545,7 +2546,11 @@ impl AudioSource for FfmpegSource {
                                 break;
                             }
                             // Try filling additional batches (especially if skipping video packets during seek)
-                            let extra_batches = if self.target_seek_time.is_some() { 4 } else { 1 };
+                            let extra_batches = if self.target_seek_time.is_some() {
+                                4
+                            } else {
+                                1
+                            };
                             let mut filled = false;
                             for _ in 0..extra_batches {
                                 if self.fill_buffers() || self.is_eof {
@@ -3467,7 +3472,10 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
     }
 
     if let Some(c_kbps) = container_kbps {
-        if video_stream_index.is_none() && audio_track_bitrates.len() == 1 && audio_track_bitrates[0].is_none() {
+        if video_stream_index.is_none()
+            && audio_track_bitrates.len() == 1
+            && audio_track_bitrates[0].is_none()
+        {
             audio_track_bitrates[0] = Some(c_kbps);
         } else if let Some(v_kbps) = video_bitrate_kbps
             && audio_track_bitrates.len() == 1

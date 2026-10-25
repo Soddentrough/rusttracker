@@ -498,8 +498,7 @@ pub fn start_bitstream_thread(
             if stream.index() == best_audio_index {
                 let vis_packet = packet.clone();
                 let pkt_tb = stream.time_base();
-                audio_pkt_bytes_accum =
-                    audio_pkt_bytes_accum.saturating_add(packet.size() as u64);
+                audio_pkt_bytes_accum = audio_pkt_bytes_accum.saturating_add(packet.size() as u64);
 
                 if let Some(pts) = packet.pts().or_else(|| packet.dts()) {
                     let pkt_sec = pts as f64 * f64::from(pkt_tb);
@@ -510,8 +509,7 @@ pub fn start_bitstream_thread(
                     if let Some(start_t) = audio_pkt_window_start {
                         let win_dur = pkt_sec - start_t;
                         if win_dur >= 0.5 {
-                            let kbps = ((audio_pkt_bytes_accum as f64 * 8.0)
-                                / (win_dur * 1000.0))
+                            let kbps = ((audio_pkt_bytes_accum as f64 * 8.0) / (win_dur * 1000.0))
                                 .round() as u32;
                             if kbps > 0
                                 && let Ok(mut state) = shared_state.try_lock()
@@ -626,8 +624,7 @@ pub fn start_bitstream_thread(
                                     let mut mono = vec![0.0f32; window_size];
                                     for acc in accumulator.iter().take(planes) {
                                         let off = window_size.saturating_sub(acc.len());
-                                        for (i, &sample) in
-                                            acc.iter().take(window_size).enumerate()
+                                        for (i, &sample) in acc.iter().take(window_size).enumerate()
                                         {
                                             mono[off + i] += sample;
                                         }
@@ -1934,8 +1931,7 @@ mod wasapi_bitstream {
 
                                                         sample_offset += step;
                                                         samples_since_last_send += step;
-                                                        if samples_since_last_send
-                                                            < update_interval
+                                                        if samples_since_last_send < update_interval
                                                         {
                                                             continue;
                                                         }
@@ -1963,9 +1959,8 @@ mod wasapi_bitstream {
                                                             accumulator.iter().take(target_ch)
                                                         {
                                                             let mut peak = 0.0f32;
-                                                            let start_idx = acc
-                                                                .len()
-                                                                .saturating_sub(eval_len);
+                                                            let start_idx =
+                                                                acc.len().saturating_sub(eval_len);
                                                             for &s in &acc[start_idx..] {
                                                                 peak = peak.max(s.abs());
                                                             }
@@ -2219,8 +2214,7 @@ mod wasapi_bitstream {
 
                                     let rate_f64 = profile_clone.rate.max(1) as f64;
                                     let est_samples = frame.samples();
-                                    let est_dur =
-                                        est_samples as f64 / frame.rate().max(1) as f64;
+                                    let est_dur = est_samples as f64 / frame.rate().max(1) as f64;
                                     if let Some(target_pos) = *target_seek_time {
                                         if *current_seconds + est_dur <= target_pos {
                                             *current_seconds += est_dur;
@@ -2364,10 +2358,8 @@ mod wasapi_bitstream {
                                                     for acc in
                                                         accumulator.iter().take(target_channels)
                                                     {
-                                                        for (i, &sample) in acc
-                                                            .iter()
-                                                            .take(window_size)
-                                                            .enumerate()
+                                                        for (i, &sample) in
+                                                            acc.iter().take(window_size).enumerate()
                                                         {
                                                             mono[i] += sample;
                                                         }
@@ -2398,10 +2390,8 @@ mod wasapi_bitstream {
                                     }
                                 };
 
-                            let mut current_seek_epoch = shared_state_lpcm
-                                .lock()
-                                .map(|s| s.seek_epoch)
-                                .unwrap_or(0);
+                            let mut current_seek_epoch =
+                                shared_state_lpcm.lock().map(|s| s.seek_epoch).unwrap_or(0);
                             let mut is_eof = false;
                             let mut seek_in_progress = true;
                             let mut target_seek_time: Option<f64> = None;
