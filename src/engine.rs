@@ -6771,9 +6771,15 @@ impl VulkanEngine {
             } else {
                 (vs.width, vs.height)
             };
+            let disp_bits = if vs.bit_depth == 16 { 10 } else { vs.bit_depth };
+            let hw_suffix = if !state.stats.video_hw_decoder.is_empty() {
+                format!(" | {}", state.stats.video_hw_decoder)
+            } else {
+                String::new()
+            };
             video_info_str = Some(format!(
-                "{}x{} | {} {}-bit {}",
-                disp_w, disp_h, cs, vs.bit_depth, cr
+                "{}x{} | {} {}-bit {}{}",
+                disp_w, disp_h, cs, disp_bits, cr, hw_suffix
             ));
         }
 
@@ -7812,54 +7818,80 @@ impl VulkanEngine {
                     )
                     .exact_size(top_h)
                     .show_inside(ctx, |ui| {
-                        if state.video_mode == 2 && self.video_state.is_some() {
-                            // Video occupies the entire top panel
-                        } else {
-                            let render_progress_bar = |col: &mut egui::Ui, out_fire_rect: &mut Option<egui::Rect>, engine_action: &mut EngineAction| {
-                                // Custom Fire/Charred Progress Bar
-                                let (rect, response) = col.allocate_exact_size(egui::vec2(col.available_width(), 16.0), egui::Sense::click_and_drag());
-                                *out_fire_rect = Some(rect);
+                        let render_progress_bar = |col: &mut egui::Ui, out_fire_rect: &mut Option<egui::Rect>, engine_action: &mut EngineAction| {
+                            // Custom Fire/Charred Progress Bar
+                            let (rect, response) = col.allocate_exact_size(
+                                egui::vec2(col.available_width(), 16.0),
+                                egui::Sense::click_and_drag(),
+                            );
+                            *out_fire_rect = Some(rect);
 
-                                if response.drag_stopped() || response.clicked() {
-                                    if let Some(mouse_pos) = response.interact_pointer_pos() {
-                                        let rel_x = (mouse_pos.x - rect.left()).clamp(0.0, rect.width());
-                                        let pct = rel_x / rect.width();
-                                        *engine_action = EngineAction::Seek(pct);
-                                    }
-                                } else if response.dragged() {
-                                    if let Some(mouse_pos) = response.interact_pointer_pos() {
-                                        let rel_x = (mouse_pos.x - rect.left()).clamp(0.0, rect.width());
-                                        let pct = rel_x / rect.width();
-                                        *engine_action = EngineAction::ScrubPreview(pct, 0.0);
-                                    }
-                                } else if !response.is_pointer_button_down_on() && state.scrub_target_seconds.is_some() {
-                                    *engine_action = EngineAction::ScrubEnd;
+                            if response.hovered() || response.dragged() {
+                                col.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+
+                            let pointer_pos = response
+                                .interact_pointer_pos()
+                                .or_else(|| col.ctx().pointer_latest_pos());
+                            let pct_from_pos = pointer_pos.map(|mouse_pos| {
+                                let width = rect.width().max(1.0);
+                                let rel_x = (mouse_pos.x - rect.left()).clamp(0.0, width);
+                                (rel_x / width).clamp(0.0, 1.0)
+                            });
+
+                            if response.drag_stopped() || response.clicked() {
+                                if let Some(pct) = pct_from_pos {
+                                    *engine_action = EngineAction::Seek(pct);
+                                } else if let Some(target_secs) = state.scrub_target_seconds
+                                    && state.duration_seconds > 0.0
+                                {
+                                    let pct = (target_secs / state.duration_seconds).clamp(0.0, 1.0) as f32;
+                                    *engine_action = EngineAction::Seek(pct);
                                 }
+                            } else if response.dragged() || response.is_pointer_button_down_on() {
+                                if let Some(pct) = pct_from_pos {
+                                    *engine_action = EngineAction::ScrubPreview(pct, 0.0);
+                                }
+                            } else if state.scrub_target_seconds.is_some() {
+                                *engine_action = EngineAction::ScrubEnd;
+                            }
 
-                                let painter = col.painter();
-                                let format_time = |secs: f64| -> String {
-                                    let m = (secs / 60.0).floor() as u32;
-                                    let s = (secs % 60.0).floor() as u32;
-                                    let f = (secs.fract() * 10.0).floor() as u32;
-                                    format!("{:02}:{:02}.{}", m, s, f)
-                                };
-
-                                let display_secs = state.scrub_target_seconds.unwrap_or(state.current_seconds);
-                                let time_text = if state.duration_seconds <= 0.0 {
-                                    format!("{} / LIVE", format_time(display_secs))
-                                } else {
-                                    format!("{} / {}", format_time(display_secs), format_time(state.duration_seconds))
-                                };
-
-                                painter.text(
-                                    rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    time_text,
-                                    egui::FontId::proportional(11.0),
-                                    egui::Color32::WHITE,
-                                );
+                            let painter = col.painter();
+                            let display_secs = state.scrub_target_seconds.unwrap_or(state.current_seconds);
+                            let force_hours = state.duration_seconds >= 3600.0 || display_secs >= 3600.0;
+                            let time_text = if state.duration_seconds <= 0.0 {
+                                format!(
+                                    "{} / LIVE",
+                                    crate::state::format_timeline_time(display_secs, force_hours)
+                                )
+                            } else {
+                                format!(
+                                    "{} / {}",
+                                    crate::state::format_timeline_time(display_secs, force_hours),
+                                    crate::state::format_timeline_time(state.duration_seconds, force_hours)
+                                )
                             };
 
+                            painter.text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                time_text,
+                                egui::FontId::proportional(11.0),
+                                egui::Color32::WHITE,
+                            );
+                        };
+
+                        if state.video_mode == 2 && (self.video_state.is_some() || state.has_video_stream) {
+                            // Video occupies the top panel with a full-width timeline bar at the bottom
+                            let video_h = (ui.available_height() - 22.0).max(40.0);
+                            let (v_rect, _) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), video_h),
+                                egui::Sense::hover(),
+                            );
+                            out_video_rect = Some(v_rect);
+                            ui.add_space(4.0);
+                            render_progress_bar(ui, &mut out_fire_rect, &mut engine_action);
+                        } else {
                             let render_col_channels = |col: &mut egui::Ui, out_meters_rect: &mut Option<egui::Rect>, out_fire_rect: &mut Option<egui::Rect>, engine_action: &mut EngineAction| {
                                 if !is_portrait {
                                     col.heading("Channels");
@@ -7868,7 +7900,7 @@ impl VulkanEngine {
                                 let meters_height = if is_portrait {
                                     col.available_height()
                                 } else {
-                                    col.available_height() - 25.0
+                                    (col.available_height() - 30.0).max(20.0)
                                 };
                                 let (channel_rect, _) = col.allocate_exact_size(
                                     egui::vec2(col.available_width(), meters_height),
@@ -8423,9 +8455,11 @@ impl VulkanEngine {
                                                     if state.duration_seconds <= 0.0 {
                                                         ui.label("Live Stream");
                                                     } else {
-                                                        let mins = (state.duration_seconds / 60.0).floor() as u32;
-                                                        let secs = (state.duration_seconds % 60.0).floor() as u32;
-                                                        ui.label(format!("{:.1}s ({:02}:{:02})", state.duration_seconds, mins, secs));
+                                                        let formatted = crate::state::format_timeline_time(
+                                                            state.duration_seconds,
+                                                            state.duration_seconds >= 3600.0,
+                                                        );
+                                                        ui.label(format!("{} ({:.1}s)", formatted, state.duration_seconds));
                                                     }
                                                     ui.end_row();
 
@@ -8829,12 +8863,17 @@ impl VulkanEngine {
         if state.show_hud && state.video_mode != 3 {
             let total_height = ctx.content_rect().height();
             let total_width = ctx.content_rect().width();
-            let drag_h = if is_portrait { 24.0 } else { 12.0 };
+            let drag_h = if is_portrait { 24.0 } else { 8.0 };
 
             let drag_y = out_top_panel_rect.map(|r| r.bottom()).unwrap_or(total_height * state.panel_split_ratio);
+            let drag_top_y = if is_portrait {
+                drag_y - drag_h * 0.5
+            } else {
+                drag_y - 2.0
+            };
 
             egui::Area::new("split_drag_area".into())
-                .fixed_pos(egui::pos2(0.0, drag_y - drag_h * 0.5))
+                .fixed_pos(egui::pos2(0.0, drag_top_y))
                 .order(egui::Order::Foreground)
                 .show(ctx, |ui| {
                     let drag_rect = egui::Rect::from_min_size(
@@ -9078,6 +9117,17 @@ impl VulkanEngine {
         } else {
             self.heatmap_uv_rect = [0.0; 4];
         }
+
+        // Write updated HUD rect uniforms immediately so Frame 1 (and any layout change)
+        // renders the HUD panels in-place without waiting for the next frame's update()
+        const UI_RECTS_OFFSET: wgpu::BufferAddress =
+            std::mem::offset_of!(AudioUniforms, ui_meters_rect) as wgpu::BufferAddress;
+        let ui_rects_data = [self.meters_uv_rect, self.heatmap_uv_rect, self.fire_uv_rect];
+        self.queue.write_buffer(
+            &self.uniform_buffer,
+            UI_RECTS_OFFSET,
+            bytemuck::cast_slice(&ui_rects_data),
+        );
 
         egui_state.handle_platform_output(window, full_output.platform_output);
         let clipped_primitives =
@@ -9373,9 +9423,9 @@ impl VulkanEngine {
                     depth_slice: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.1,
-                            g: 0.1,
-                            b: 0.1,
+                            r: 0.012,
+                            g: 0.012,
+                            b: 0.014,
                             a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
@@ -9642,7 +9692,7 @@ impl VulkanEngine {
                 } else if state.video_mode == 1 {
                     out_track_info_rect
                 } else if state.video_mode == 2 {
-                    out_top_panel_rect
+                    out_video_rect.or(out_top_panel_rect)
                 } else {
                     None // mode 3: full screen
                 };

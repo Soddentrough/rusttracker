@@ -2181,6 +2181,7 @@ impl FfmpegSource {
                         let frame_dur = actual_frames as f64 / self.output_sample_rate as f64;
                         if track.current_time + frame_dur <= target_pos {
                             track.current_time += frame_dur;
+                            progress = true;
                         } else if track.current_time < target_pos {
                             let skip_sec = target_pos - track.current_time;
                             let skip_frames =
@@ -2254,10 +2255,12 @@ impl FfmpegSource {
                             || track.stream_index == self.primary_stream_index
                             || (need_t0 && track.track_idx == 0))
                     {
-                        if track.seek_in_progress
-                            && let Some(pkt_pts) = packet.pts()
-                        {
-                            track.current_time = pkt_pts as f64 * track.time_base;
+                        if track.seek_in_progress {
+                            if let Some(pkt_pts) = packet.pts().or_else(|| packet.dts()) {
+                                track.current_time = pkt_pts as f64 * track.time_base;
+                            } else {
+                                track.current_time = self.current_time;
+                            }
                             track.seek_in_progress = false;
                         }
                         let _ = track.decoder.send_packet(&packet);
@@ -2308,6 +2311,7 @@ impl FfmpegSource {
                                         actual_frames as f64 / self.output_sample_rate as f64;
                                     if track.current_time + frame_dur <= target_pos {
                                         track.current_time += frame_dur;
+                                        progress = true;
                                     } else if track.current_time < target_pos {
                                         let skip_sec = target_pos - track.current_time;
                                         let skip_frames =
@@ -2666,7 +2670,11 @@ impl AudioSource for FfmpegSource {
                 );
             }
         }
-        self.target_seek_time = Some(pos);
+        self.target_seek_time = if self.video_stream_index.is_some() {
+            None
+        } else {
+            Some(pos)
+        };
         for track in self.active_tracks.values_mut() {
             track.decoder.flush();
             track.sample_buf.clear();
@@ -4988,7 +4996,12 @@ fn decode_single_audio_chunk(
     chunk.current_row = audio_source.get_current_row();
     chunk.bpm = audio_source.get_tempo();
     chunk.speed = audio_source.get_speed();
-    chunk.current_seconds = chunk_start_seconds;
+    chunk.current_seconds = if audio_source.has_video_stream() && frames_read > 0 {
+        (audio_source.get_position_seconds() - (frames_read as f64 / sample_rate.max(1) as f64))
+            .max(0.0)
+    } else {
+        chunk_start_seconds
+    };
     chunk.current_row_string.clear();
     chunk
         .current_row_string
@@ -5047,6 +5060,123 @@ pub type VideoPacketChannel = (
 );
 
 #[cfg(not(target_os = "android"))]
+fn open_video_decoder(
+    params: &ffmpeg_next::codec::Parameters,
+    allow_hw: bool,
+) -> Result<(ffmpeg_next::decoder::Video, Option<String>), ffmpeg_next::Error> {
+    if allow_hw {
+        #[cfg(target_os = "windows")]
+        let preferred_hw: &[(ffmpeg_next::ffi::AVHWDeviceType, &str)] = &[
+            (
+                ffmpeg_next::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_D3D11VA,
+                "HW (D3D11VA)",
+            ),
+            (
+                ffmpeg_next::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_DXVA2,
+                "HW (DXVA2)",
+            ),
+            (
+                ffmpeg_next::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN,
+                "HW (Vulkan)",
+            ),
+        ];
+        #[cfg(target_os = "linux")]
+        let preferred_hw: &[(ffmpeg_next::ffi::AVHWDeviceType, &str)] = &[
+            (
+                ffmpeg_next::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI,
+                "HW (VAAPI)",
+            ),
+            (
+                ffmpeg_next::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VULKAN,
+                "HW (Vulkan)",
+            ),
+            (
+                ffmpeg_next::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VDPAU,
+                "HW (VDPAU)",
+            ),
+        ];
+        #[cfg(target_os = "macos")]
+        let preferred_hw: &[(ffmpeg_next::ffi::AVHWDeviceType, &str)] = &[(
+            ffmpeg_next::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VIDEOTOOLBOX,
+            "HW (VideoToolbox)",
+        )];
+        #[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+        let preferred_hw: &[(ffmpeg_next::ffi::AVHWDeviceType, &str)] = &[];
+
+        let codec_ptr =
+            unsafe { ffmpeg_next::ffi::avcodec_find_decoder((*params.as_ptr()).codec_id) };
+        if !codec_ptr.is_null() {
+            for &(hw_type, label) in preferred_hw {
+                let mut supported = false;
+                let mut idx = 0;
+                loop {
+                    let cfg = unsafe { ffmpeg_next::ffi::avcodec_get_hw_config(codec_ptr, idx) };
+                    if cfg.is_null() {
+                        break;
+                    }
+                    let methods = unsafe { (*cfg).methods };
+                    let dev_type = unsafe { (*cfg).device_type };
+                    if (methods
+                        & (ffmpeg_next::ffi::AV_CODEC_HW_CONFIG_METHOD_HW_DEVICE_CTX as i32))
+                        != 0
+                        && dev_type == hw_type
+                    {
+                        supported = true;
+                        break;
+                    }
+                    idx += 1;
+                }
+
+                if !supported {
+                    continue;
+                }
+
+                let mut hw_device_ctx: *mut ffmpeg_next::ffi::AVBufferRef = std::ptr::null_mut();
+                let err = unsafe {
+                    ffmpeg_next::ffi::av_hwdevice_ctx_create(
+                        &mut hw_device_ctx,
+                        hw_type,
+                        std::ptr::null(),
+                        std::ptr::null_mut(),
+                        0,
+                    )
+                };
+                if err == 0 && !hw_device_ctx.is_null() {
+                    if let Ok(mut context) =
+                        ffmpeg_next::codec::context::Context::from_parameters(params.clone())
+                    {
+                        unsafe {
+                            (*context.as_mut_ptr()).hw_device_ctx =
+                                ffmpeg_next::ffi::av_buffer_ref(hw_device_ctx);
+                            ffmpeg_next::ffi::av_buffer_unref(&mut hw_device_ctx);
+                        }
+                        if let Ok(decoder) = context.decoder().video() {
+                            return Ok((decoder, Some(label.to_string())));
+                        }
+                    } else {
+                        unsafe {
+                            ffmpeg_next::ffi::av_buffer_unref(&mut hw_device_ctx);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut context = ffmpeg_next::codec::context::Context::from_parameters(params.clone())?;
+    let hw_threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(8)
+        .clamp(2, 16);
+    context.set_threading(ffmpeg_next::codec::threading::Config {
+        kind: ffmpeg_next::codec::threading::Type::Frame,
+        count: hw_threads,
+    });
+    let decoder = context.decoder().video()?;
+    Ok((decoder, None))
+}
+
+#[cfg(not(target_os = "android"))]
 pub fn spawn_video_decoder_thread(
     params: ffmpeg_next::codec::Parameters,
     time_base: ffmpeg_next::Rational,
@@ -5087,14 +5217,17 @@ pub fn spawn_video_decoder_thread(
     let video_packet_rx_for_video = video_packet_rx.clone();
     let stop_token_video = stop_token;
     std::thread::spawn(move || {
-        if let Ok(context) = ffmpeg_next::codec::context::Context::from_parameters(params)
-            && let Ok(mut decoder) = context.decoder().video()
-        {
+        if let Ok((mut decoder, mut hw_label)) = open_video_decoder(&params, true) {
+            if let Ok(mut state) = state_for_video.lock() {
+                state.stats.video_hw_decoder =
+                    hw_label.clone().unwrap_or_else(|| "CPU".to_string());
+            }
             let tb = time_base.numerator() as f64 / time_base.denominator() as f64;
             let mut local_epoch = 0;
             let mut fallback_pts_seconds = 0.0;
             // Deliver the very first decoded frame immediately (even while paused at startup)
             let mut is_first_frame_after_seek = true;
+            let mut decoded_any_frame = false;
             let mut scaler: Option<(
                 ffmpeg_next::format::Pixel,
                 u32,
@@ -5118,9 +5251,56 @@ pub fn spawn_video_decoder_thread(
                             continue;
                         }
 
-                        if decoder.send_packet(&packet).is_ok() {
+                        let decode_start = std::time::Instant::now();
+                        let mut send_ok = decoder.send_packet(&packet).is_ok();
+                        if !send_ok
+                            && hw_label.is_some()
+                            && !decoded_any_frame
+                            && let Ok((sw_dec, _)) = open_video_decoder(&params, false)
+                        {
+                            decoder = sw_dec;
+                            hw_label = None;
+                            if let Ok(mut state) = state_for_video.lock() {
+                                state.stats.video_hw_decoder = "CPU".to_string();
+                            }
+                            send_ok = decoder.send_packet(&packet).is_ok();
+                        }
+
+                        if send_ok {
                             let mut decoded = ffmpeg_next::frame::Video::empty();
-                            while decoder.receive_frame(&mut decoded).is_ok() {
+                            loop {
+                                match decoder.receive_frame(&mut decoded) {
+                                    Ok(()) => {}
+                                    Err(ffmpeg_next::Error::Other { errno })
+                                        if errno == ffmpeg_next::ffi::EAGAIN =>
+                                    {
+                                        break;
+                                    }
+                                    Err(ffmpeg_next::Error::Eof) => break,
+                                    Err(_) => {
+                                        if hw_label.is_some()
+                                            && !decoded_any_frame
+                                            && let Ok((sw_dec, _)) =
+                                                open_video_decoder(&params, false)
+                                        {
+                                            decoder = sw_dec;
+                                            hw_label = None;
+                                            if let Ok(mut state) = state_for_video.lock() {
+                                                state.stats.video_hw_decoder = "CPU".to_string();
+                                            }
+                                            if decoder.send_packet(&packet).is_ok()
+                                                && decoder.receive_frame(&mut decoded).is_ok()
+                                            {
+                                                // Recovered via CPU fallback on the first packet
+                                            } else {
+                                                break;
+                                            }
+                                        } else {
+                                            break;
+                                        }
+                                    }
+                                }
+
                                 if stop_token_video.load(std::sync::atomic::Ordering::Relaxed) {
                                     return;
                                 }
@@ -5140,6 +5320,12 @@ pub fn spawn_video_decoder_thread(
                                 let mut skip_push = false;
                                 if is_first_frame_after_seek {
                                     is_first_frame_after_seek = false;
+                                    if pts >= 0.0
+                                        && let Ok(mut state) = state_for_video.lock()
+                                        && state.seek_epoch == local_epoch
+                                    {
+                                        state.current_seconds = pts;
+                                    }
                                 } else {
                                     loop {
                                         if stop_token_video
@@ -5225,108 +5411,256 @@ pub fn spawn_video_decoder_thread(
                                 }
 
                                 if let Some(mut frame) = frame_opt {
-                                    let is_planar_420 = matches!(
-                                        decoded.format(),
-                                        ffmpeg_next::format::Pixel::YUV420P
-                                            | ffmpeg_next::format::Pixel::YUVJ420P
-                                            | ffmpeg_next::format::Pixel::YUV420P10LE
-                                            | ffmpeg_next::format::Pixel::YUV420P12LE
-                                    ) && decoded.planes() >= 3;
-
-                                    let mut converted = ffmpeg_next::frame::Video::empty();
-                                    let src_frame: &ffmpeg_next::frame::Video = if is_planar_420 {
-                                        &decoded
-                                    } else {
-                                        let w = decoded.width();
-                                        let h = decoded.height();
-                                        let fmt = decoded.format();
-                                        let needs_new_scaler =
-                                            scaler.as_ref().is_none_or(|(sf, sw, sh, _)| {
-                                                *sf != fmt || *sw != w || *sh != h
-                                            });
-                                        if needs_new_scaler {
-                                            scaler = ffmpeg_next::software::scaling::Context::get(
-                                                fmt,
-                                                w,
-                                                h,
-                                                ffmpeg_next::format::Pixel::YUV420P,
-                                                w,
-                                                h,
-                                                ffmpeg_next::software::scaling::Flags::BILINEAR,
+                                    let transfer_start = std::time::Instant::now();
+                                    let is_hw_frame =
+                                        unsafe { !(*decoded.as_ptr()).hw_frames_ctx.is_null() };
+                                    let mut hw_sw_frame = ffmpeg_next::frame::Video::empty();
+                                    if is_hw_frame {
+                                        let ret = unsafe {
+                                            ffmpeg_next::ffi::av_hwframe_transfer_data(
+                                                hw_sw_frame.as_mut_ptr(),
+                                                decoded.as_ptr(),
+                                                0,
                                             )
-                                            .ok()
-                                            .map(|ctx| (fmt, w, h, ctx));
-                                        }
-                                        if let Some((_, _, _, ref mut sws)) = scaler
-                                            && sws.run(&decoded, &mut converted).is_ok()
-                                            && converted.planes() >= 3
-                                        {
-                                            &converted
-                                        } else {
+                                        };
+                                        if ret < 0 {
                                             let _ = free_video_frame_tx.try_send(frame);
+                                            if hw_label.is_some()
+                                                && !decoded_any_frame
+                                                && let Ok((sw_dec, _)) =
+                                                    open_video_decoder(&params, false)
+                                            {
+                                                decoder = sw_dec;
+                                                hw_label = None;
+                                                if let Ok(mut state) = state_for_video.lock() {
+                                                    state.stats.video_hw_decoder =
+                                                        "CPU".to_string();
+                                                }
+                                            }
                                             continue;
                                         }
-                                    };
+                                    } else if hw_label.is_some() && !decoded_any_frame {
+                                        hw_label = None;
+                                        if let Ok(mut state) = state_for_video.lock() {
+                                            state.stats.video_hw_decoder = "CPU".to_string();
+                                        }
+                                    }
+                                    decoded_any_frame = true;
+
+                                    let active_decoded: &ffmpeg_next::frame::Video =
+                                        if is_hw_frame { &hw_sw_frame } else { &decoded };
 
                                     frame.pts = pts;
-                                    frame.width = src_frame.width();
-                                    frame.height = src_frame.height();
+                                    frame.width = active_decoded.width();
+                                    frame.height = active_decoded.height();
                                     frame.rotation = rotation;
-
-                                    let format_name = format!("{:?}", src_frame.format());
-                                    frame.bit_depth = if format_name.contains("10LE") {
-                                        10
-                                    } else if format_name.contains("12LE") {
-                                        12
-                                    } else {
-                                        8
-                                    };
                                     frame.color_space = decoded.color_space() as u32;
                                     frame.color_range = decoded.color_range() as u32;
                                     frame.color_trc =
                                         decoded.color_transfer_characteristic() as u32;
 
-                                    frame.y_stride = src_frame.stride(0);
-                                    frame.u_stride = src_frame.stride(1);
-                                    frame.v_stride = src_frame.stride(2);
+                                    let pix_fmt = active_decoded.format();
+                                    let is_nv12 = pix_fmt == ffmpeg_next::format::Pixel::NV12
+                                        && active_decoded.planes() >= 2;
+                                    let is_p010 = pix_fmt == ffmpeg_next::format::Pixel::P010LE
+                                        && active_decoded.planes() >= 2;
 
-                                    let height = src_frame.height() as usize;
-                                    let y_len = frame.y_stride * height;
-                                    let u_len = frame.u_stride * (height / 2);
-                                    let v_len = frame.v_stride * (height / 2);
+                                    if is_nv12 {
+                                        let w = active_decoded.width() as usize;
+                                        let h = active_decoded.height() as usize;
+                                        let half_w = w / 2;
+                                        let half_h = h / 2;
 
-                                    frame.y_plane.clear();
-                                    let y_plane = src_frame.data(0);
-                                    let y_copy_len = y_len.min(y_plane.len());
-                                    frame.y_plane.extend_from_slice(&y_plane[..y_copy_len]);
-                                    if y_copy_len < y_len {
-                                        frame.y_plane.resize(y_len, 0);
+                                        frame.bit_depth = 8;
+                                        frame.y_stride = active_decoded.stride(0);
+                                        frame.u_stride = half_w;
+                                        frame.v_stride = half_w;
+
+                                        let y_len = frame.y_stride * h;
+                                        frame.y_plane.clear();
+                                        let y_src = active_decoded.data(0);
+                                        let y_copy = y_len.min(y_src.len());
+                                        frame.y_plane.extend_from_slice(&y_src[..y_copy]);
+                                        if y_copy < y_len {
+                                            frame.y_plane.resize(y_len, 0);
+                                        }
+
+                                        frame.u_plane.resize(half_w * half_h, 128);
+                                        frame.v_plane.resize(half_w * half_h, 128);
+                                        let uv_stride = active_decoded.stride(1);
+                                        let uv_src = active_decoded.data(1);
+                                        for row in 0..half_h {
+                                            let src_row_start = row * uv_stride;
+                                            let dst_row_start = row * half_w;
+                                            if src_row_start + half_w * 2 <= uv_src.len() {
+                                                let src_row = &uv_src
+                                                    [src_row_start..src_row_start + half_w * 2];
+                                                let u_row = &mut frame.u_plane
+                                                    [dst_row_start..dst_row_start + half_w];
+                                                let v_row = &mut frame.v_plane
+                                                    [dst_row_start..dst_row_start + half_w];
+                                                for col in 0..half_w {
+                                                    u_row[col] = src_row[col * 2];
+                                                    v_row[col] = src_row[col * 2 + 1];
+                                                }
+                                            }
+                                        }
+                                    } else if is_p010 {
+                                        let w = active_decoded.width() as usize;
+                                        let h = active_decoded.height() as usize;
+                                        let half_w = w / 2;
+                                        let half_h = h / 2;
+                                        let c_row_bytes = half_w * 2;
+
+                                        // MSB-aligned 10-bit surface (bits [15:6])
+                                        frame.bit_depth = 16;
+                                        frame.y_stride = active_decoded.stride(0);
+                                        frame.u_stride = c_row_bytes;
+                                        frame.v_stride = c_row_bytes;
+
+                                        let y_len = frame.y_stride * h;
+                                        frame.y_plane.clear();
+                                        let y_src = active_decoded.data(0);
+                                        let y_copy = y_len.min(y_src.len());
+                                        frame.y_plane.extend_from_slice(&y_src[..y_copy]);
+                                        if y_copy < y_len {
+                                            frame.y_plane.resize(y_len, 0);
+                                        }
+
+                                        frame.u_plane.resize(c_row_bytes * half_h, 0);
+                                        frame.v_plane.resize(c_row_bytes * half_h, 0);
+                                        let uv_stride = active_decoded.stride(1);
+                                        let uv_src = active_decoded.data(1);
+                                        for row in 0..half_h {
+                                            let src_row_start = row * uv_stride;
+                                            let dst_row_start = row * c_row_bytes;
+                                            if src_row_start + half_w * 4 <= uv_src.len() {
+                                                let src_row = &uv_src
+                                                    [src_row_start..src_row_start + half_w * 4];
+                                                let u_row = &mut frame.u_plane
+                                                    [dst_row_start..dst_row_start + c_row_bytes];
+                                                let v_row = &mut frame.v_plane
+                                                    [dst_row_start..dst_row_start + c_row_bytes];
+                                                for col in 0..half_w {
+                                                    let s = col * 4;
+                                                    let d = col * 2;
+                                                    u_row[d] = src_row[s];
+                                                    u_row[d + 1] = src_row[s + 1];
+                                                    v_row[d] = src_row[s + 2];
+                                                    v_row[d + 1] = src_row[s + 3];
+                                                }
+                                            }
+                                        }
+                                    } else {
+                                        let is_planar_420 = matches!(
+                                            pix_fmt,
+                                            ffmpeg_next::format::Pixel::YUV420P
+                                                | ffmpeg_next::format::Pixel::YUVJ420P
+                                                | ffmpeg_next::format::Pixel::YUV420P10LE
+                                                | ffmpeg_next::format::Pixel::YUV420P12LE
+                                        ) && active_decoded.planes() >= 3;
+
+                                        let mut converted = ffmpeg_next::frame::Video::empty();
+                                        let src_frame: &ffmpeg_next::frame::Video = if is_planar_420
+                                        {
+                                            active_decoded
+                                        } else {
+                                            let w = active_decoded.width();
+                                            let h = active_decoded.height();
+                                            let fmt = pix_fmt;
+                                            let needs_new_scaler =
+                                                scaler.as_ref().is_none_or(|(sf, sw, sh, _)| {
+                                                    *sf != fmt || *sw != w || *sh != h
+                                                });
+                                            if needs_new_scaler {
+                                                scaler =
+                                                    ffmpeg_next::software::scaling::Context::get(
+                                                        fmt,
+                                                        w,
+                                                        h,
+                                                        ffmpeg_next::format::Pixel::YUV420P,
+                                                        w,
+                                                        h,
+                                                        ffmpeg_next::software::scaling::Flags::BILINEAR,
+                                                    )
+                                                    .ok()
+                                                    .map(|ctx| (fmt, w, h, ctx));
+                                            }
+                                            if let Some((_, _, _, ref mut sws)) = scaler
+                                                && sws.run(active_decoded, &mut converted).is_ok()
+                                                && converted.planes() >= 3
+                                            {
+                                                &converted
+                                            } else {
+                                                let _ = free_video_frame_tx.try_send(frame);
+                                                continue;
+                                            }
+                                        };
+
+                                        let format_name = format!("{:?}", src_frame.format());
+                                        frame.bit_depth = if format_name.contains("10LE") {
+                                            10
+                                        } else if format_name.contains("12LE") {
+                                            12
+                                        } else {
+                                            8
+                                        };
+
+                                        frame.y_stride = src_frame.stride(0);
+                                        frame.u_stride = src_frame.stride(1);
+                                        frame.v_stride = src_frame.stride(2);
+
+                                        let height = src_frame.height() as usize;
+                                        let y_len = frame.y_stride * height;
+                                        let u_len = frame.u_stride * (height / 2);
+                                        let v_len = frame.v_stride * (height / 2);
+
+                                        frame.y_plane.clear();
+                                        let y_plane = src_frame.data(0);
+                                        let y_copy_len = y_len.min(y_plane.len());
+                                        frame.y_plane.extend_from_slice(&y_plane[..y_copy_len]);
+                                        if y_copy_len < y_len {
+                                            frame.y_plane.resize(y_len, 0);
+                                        }
+
+                                        frame.u_plane.clear();
+                                        let u_plane = src_frame.data(1);
+                                        let u_copy_len = u_len.min(u_plane.len());
+                                        frame.u_plane.extend_from_slice(&u_plane[..u_copy_len]);
+                                        if u_copy_len < u_len {
+                                            frame.u_plane.resize(u_len, 0);
+                                        }
+
+                                        frame.v_plane.clear();
+                                        let v_plane = src_frame.data(2);
+                                        let v_copy_len = v_len.min(v_plane.len());
+                                        frame.v_plane.extend_from_slice(&v_plane[..v_copy_len]);
+                                        if v_copy_len < v_len {
+                                            frame.v_plane.resize(v_len, 0);
+                                        }
                                     }
 
-                                    frame.u_plane.clear();
-                                    let u_plane = src_frame.data(1);
-                                    let u_copy_len = u_len.min(u_plane.len());
-                                    frame.u_plane.extend_from_slice(&u_plane[..u_copy_len]);
-                                    if u_copy_len < u_len {
-                                        frame.u_plane.resize(u_len, 0);
-                                    }
-
-                                    frame.v_plane.clear();
-                                    let v_plane = src_frame.data(2);
-                                    let v_copy_len = v_len.min(v_plane.len());
-                                    frame.v_plane.extend_from_slice(&v_plane[..v_copy_len]);
-                                    if v_copy_len < v_len {
-                                        frame.v_plane.resize(v_len, 0);
-                                    }
-
+                                    let frame_work_us = transfer_start.elapsed().as_micros() as f32;
                                     if let Err(crossbeam_channel::TrySendError::Full(f)) =
                                         video_frame_tx.try_send(frame)
                                     {
                                         let _ = free_video_frame_tx.try_send(f);
                                     }
+                                    if let Ok(mut state) = state_for_video.try_lock() {
+                                        let pkt_pct = (video_packet_rx_for_video.len() as f32
+                                            / 128.0)
+                                            * 100.0;
+                                        state.stats.video_buffer_fill_pct =
+                                            pkt_pct.clamp(0.0, 100.0);
+                                        if state.stats.bitstream_active {
+                                            state.stats.decode_us =
+                                                state.stats.decode_us * 0.9 + frame_work_us * 0.1;
+                                        }
+                                    }
                                 }
                             }
                         }
+                        let _ = decode_start;
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
                     Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
@@ -5437,13 +5771,14 @@ fn spawn_media_decoder_threads(
     let stop_token_decoder = stop_token.clone();
 
     std::thread::spawn(move || {
+        let mut just_seeked = false;
         while !stop_token_decoder.load(std::sync::atomic::Ordering::Relaxed) {
             let mut chunk = loop {
                 if stop_token_decoder.load(std::sync::atomic::Ordering::Relaxed) {
                     return;
                 }
-                if let Ok(mut state) = state_for_decoder.try_lock() {
-                    process_decoder_state_requests(
+                if let Ok(mut state) = state_for_decoder.try_lock()
+                    && process_decoder_state_requests(
                         &mut state,
                         audio_source.as_mut(),
                         &ready_rx_for_decoder,
@@ -5451,7 +5786,9 @@ fn spawn_media_decoder_threads(
                         || {
                             while video_rx_for_decoder.try_recv().is_ok() {}
                         },
-                    );
+                    )
+                {
+                    just_seeked = true;
                 }
                 match free_rx.recv_timeout(std::time::Duration::from_millis(10)) {
                     Ok(c) => break c,
@@ -5470,6 +5807,10 @@ fn spawn_media_decoder_threads(
 
             let current_artist = audio_source.get_artist();
             if let Ok(mut state) = state_for_decoder.try_lock() {
+                if just_seeked && frames_read > 0 {
+                    state.current_seconds = chunk.current_seconds;
+                    just_seeked = false;
+                }
                 if current_artist != "Unknown" && !current_artist.is_empty() {
                     if let Some((artist_part, title_part)) = current_artist.split_once(" - ") {
                         if state.artist != artist_part || state.song_title != title_part {
@@ -5483,7 +5824,8 @@ fn spawn_media_decoder_threads(
                 state.stats.decode_us = state.stats.decode_us * 0.9 + decode_elapsed * 0.1;
                 let fill_pct = (ready_rx_for_decoder.len() as f32 / pool_size as f32) * 100.0;
                 state.stats.audio_buffer_fill_pct = fill_pct;
-                let video_pct = (video_rx_for_decoder.len() as f32 / 4096.0) * 100.0;
+                let video_pct =
+                    ((video_rx_for_decoder.len() as f32 / 128.0) * 100.0).clamp(0.0, 100.0);
                 state.stats.video_buffer_fill_pct = video_pct;
                 state.stats.clipping_events += clips;
                 push_chunk_lookahead_slices(
@@ -5513,6 +5855,7 @@ fn spawn_media_decoder_threads(
                     );
                 }
                 if seeked {
+                    just_seeked = true;
                     let _ = free_tx_for_decoder.try_send(chunk_to_send);
                     break;
                 }

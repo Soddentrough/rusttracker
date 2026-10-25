@@ -70,6 +70,7 @@ pub struct PerformanceStats {
     pub clipping_events: u32,
     pub bitstream_active: bool,
     pub bitstream_format: String,
+    pub video_hw_decoder: String,
 
     // Fine-grained frame phase timings (microseconds)
     pub phase_lock_update_us: f32, // Main loop: lock + smoothing + engine.update()
@@ -899,5 +900,23 @@ impl AppState {
             track_info_rect: self.track_info_rect,
             mobile_hud_tab: self.mobile_hud_tab,
         }
+    }
+}
+
+/// Format a playback timestamp or duration in seconds as `H:MM:SS` (when >= 1 hour
+/// or `force_hours` is true) or `MM:SS` (when < 1 hour).
+pub fn format_timeline_time(secs: f64, force_hours: bool) -> String {
+    let total_secs = if !secs.is_finite() || secs <= 0.0 {
+        0
+    } else {
+        secs.floor() as u64
+    };
+    let hours = total_secs / 3600;
+    let mins = (total_secs % 3600) / 60;
+    let rem_secs = total_secs % 60;
+    if hours > 0 || force_hours {
+        format!("{}:{:02}:{:02}", hours, mins, rem_secs)
+    } else {
+        format!("{:02}:{:02}", mins, rem_secs)
     }
 }

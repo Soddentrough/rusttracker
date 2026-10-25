@@ -422,12 +422,13 @@ pub fn draw(f: &mut Frame, state: &AppState) {
     ]));
 
     // 10. Length
+    let force_hours = state.duration_seconds >= 3600.0 || state.current_seconds >= 3600.0;
     lines.push(Line::from(vec![
         Span::raw("Length: "),
         Span::raw(if state.duration_seconds <= 0.0 {
             "LIVE".to_string()
         } else {
-            format!("{:.1}s", state.duration_seconds)
+            crate::state::format_timeline_time(state.duration_seconds, force_hours)
         }),
     ]));
 
@@ -604,13 +605,22 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         0.0
     };
 
+    let gauge_label = if state.duration_seconds <= 0.0 {
+        format!(
+            "{} / LIVE",
+            crate::state::format_timeline_time(state.current_seconds, force_hours)
+        )
+    } else {
+        format!(
+            "{} / {}",
+            crate::state::format_timeline_time(state.current_seconds, force_hours),
+            crate::state::format_timeline_time(state.duration_seconds, force_hours)
+        )
+    };
     let gauge = ratatui::widgets::Gauge::default()
         .gauge_style(Style::default().fg(Color::Cyan).bg(Color::Rgb(30, 30, 30)))
         .percent((progress * 100.0) as u16)
-        .label(format!(
-            "{:.1}s / {:.1}s",
-            state.current_seconds, state.duration_seconds
-        ));
+        .label(gauge_label);
 
     f.render_widget(gauge, main_chunks[2]);
 

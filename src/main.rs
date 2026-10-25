@@ -455,13 +455,24 @@ fn constrain_window_to_monitor(
     let avail_w = mon_phys.width;
     let avail_h = mon_phys.height.saturating_sub(taskbar_margin_phys).max(240);
 
+    let mon_logical_w = mon_phys.width as f64 / scale;
+    let mon_logical_h = mon_phys.height as f64 / scale;
+    let safe_max_logical_w = (mon_logical_w - 48.0).min(mon_logical_w * 0.94).max(320.0);
+    let safe_max_logical_h = (mon_logical_h - 96.0).min(mon_logical_h * 0.88).max(240.0);
+
     let outer = window.outer_size();
     let inner = window.inner_size();
     let frame_w = outer.width.saturating_sub(inner.width);
     let frame_h = outer.height.saturating_sub(inner.height);
 
-    let max_inner_phys_w = avail_w.saturating_sub(frame_w).max(320);
-    let max_inner_phys_h = avail_h.saturating_sub(frame_h).max(240);
+    let max_inner_phys_w = avail_w
+        .saturating_sub(frame_w)
+        .min((safe_max_logical_w.floor() * scale).round() as u32)
+        .max(320);
+    let max_inner_phys_h = avail_h
+        .saturating_sub(frame_h)
+        .min((safe_max_logical_h.floor() * scale).round() as u32)
+        .max(240);
 
     let want_phys_w = desired_logical_w
         .map(|w| (w * scale).round() as u32)
@@ -594,6 +605,7 @@ async fn run_gui(
     let mut attrs = winit::window::Window::default_attributes()
         .with_title("RustTracker Vulkan Visualizer")
         .with_theme(Some(winit::window::Theme::Dark))
+        .with_visible(false)
         .with_inner_size(initial_size)
         .with_min_inner_size(winit::dpi::LogicalSize::new(1024.0, 600.0))
         .with_window_icon(Some(window_icon));
@@ -633,9 +645,11 @@ async fn run_gui(
     egui_ctx.set_fonts(fonts);
 
     let egui_ctx_for_init = egui_ctx.clone();
+    let app_state_for_init = Arc::clone(&app_state);
     let init_fn =
         move |elwt: &winit::event_loop::ActiveEventLoop| -> anyhow::Result<DesktopRuntime> {
             let mut attrs = attrs;
+            let mut had_monitor_geometry = false;
             if !is_fullscreen {
                 let monitor = elwt
                     .primary_monitor()
@@ -647,6 +661,7 @@ async fn run_gui(
                     .with_min_inner_size(min_size);
                 if let Some(pos) = init_pos {
                     attrs = attrs.with_position(pos);
+                    had_monitor_geometry = true;
                 }
             }
             let window = elwt.create_window(attrs).map_err(|e| {
@@ -655,7 +670,7 @@ async fn run_gui(
                 e
             )
         })?;
-            if !is_fullscreen {
+            if !is_fullscreen && !had_monitor_geometry {
                 constrain_window_to_monitor(
                     &window,
                     Some(desired_logical_w),
@@ -664,15 +679,36 @@ async fn run_gui(
                 );
             }
             let window = Arc::new(window);
-            let engine = pollster::block_on(VulkanEngine::new(window.clone()));
-            let egui_state = egui_winit::State::new(
-                egui_ctx_for_init,
+            let mut engine = pollster::block_on(VulkanEngine::new(window.clone()));
+            let mut egui_state = egui_winit::State::new(
+                egui_ctx_for_init.clone(),
                 egui::ViewportId::ROOT,
                 &window,
                 None,
                 None,
                 None,
             );
+            // Pre-render and present the initial frame while the window is still hidden
+            // so the OS compositor never flashes an unpainted white window on startup.
+            if std::env::var("CAPTURE_FRAME").is_err() {
+                let state_snapshot = {
+                    let mut state = app_state_for_init.lock().unwrap();
+                    state.visual_width = engine.config.width / 2;
+                    engine.update(&state, 1.0 / 60.0);
+                    state.render_snapshot()
+                };
+                let mut init_dialog = egui_file_dialog::FileDialog::new();
+                let _ = engine.render(
+                    &window,
+                    &egui_ctx_for_init,
+                    &mut egui_state,
+                    &state_snapshot,
+                    &mut init_dialog,
+                    Vec::new(),
+                );
+            }
+            window.set_visible(true);
+            window.request_redraw();
             Ok(DesktopRuntime {
                 window,
                 engine,
@@ -692,6 +728,7 @@ async fn run_gui(
             .ok();
     }
     let mut is_first_frame = true;
+    let mut last_mouse_scrub_seek = Instant::now();
 
     let mut gilrs =
         gilrs::Gilrs::new().unwrap_or_else(|_| gilrs::GilrsBuilder::new().build().unwrap());
@@ -1504,9 +1541,6 @@ async fn run_gui(
                         WindowEvent::RedrawRequested => {
                             if is_first_frame {
                                 is_first_frame = false;
-                                if !is_fullscreen {
-                                    constrain_window_to_monitor(window, None, None, false);
-                                }
                                 app_state.lock().unwrap().is_paused = false;
                             }
                             let load_path = {
@@ -2008,6 +2042,18 @@ async fn run_gui(
                                             .clamp(0.0, state.duration_seconds);
                                         state.scrub_target_seconds = Some(target);
 
+                                        if delta == 0.0
+                                            && state.duration_seconds > 0.0
+                                            && last_mouse_scrub_seek.elapsed()
+                                                >= Duration::from_millis(80)
+                                            && (target - state.current_seconds).abs() > 0.25
+                                        {
+                                            state.seek_request = Some(target);
+                                            state.current_seconds = target;
+                                            state.track_ended = false;
+                                            last_mouse_scrub_seek = Instant::now();
+                                        }
+
                                         if delta != 0.0 {
                                             if state.osd_timer > 0.0
                                                 && state
@@ -2033,12 +2079,22 @@ async fn run_gui(
                                         }
                                     }
                                     EngineAction::ScrubEnd => {
-                                        state.scrub_target_seconds = None;
+                                        if let Some(target) = state.scrub_target_seconds.take() {
+                                            state.seek_request = Some(target);
+                                            state.current_seconds = target;
+                                            state.track_ended = false;
+                                            state.spectrum_history.clear();
+                                            for _ in 0..120 {
+                                                state.spectrum_history.push_back(vec![0.0; 1024]);
+                                            }
+                                        }
                                     }
                                     EngineAction::Seek(pct) => {
                                         let target = (state.duration_seconds * pct as f64)
                                             .clamp(0.0, state.duration_seconds);
                                         state.seek_request = Some(target);
+                                        state.current_seconds = target;
+                                        state.track_ended = false;
                                         state.scrub_target_seconds = None;
                                         state.spectrum_history.clear();
                                         for _ in 0..120 {

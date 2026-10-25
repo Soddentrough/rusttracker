@@ -136,6 +136,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         bit_depth_scale = 65535.0 / 1023.0;
     } else if (params.bit_depth == 12u) {
         bit_depth_scale = 65535.0 / 4095.0;
+    } else if (params.bit_depth == 16u) {
+        // MSB-aligned 10-bit hardware surface (P010LE)
+        bit_depth_scale = 65535.0 / 65472.0;
     }
     y *= bit_depth_scale;
     u *= bit_depth_scale;
