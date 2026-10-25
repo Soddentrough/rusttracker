@@ -1088,8 +1088,10 @@ impl AndroidRustTrackerApp {
 
                 // Restrict pause/play single tap functionality to the bottom panel only
                 let min_h_pixels = 220.0f32 * sf;
-                let top_panel_height = (window_height * state.panel_split_ratio)
-                    .clamp(min_h_pixels, (window_height - min_h_pixels).max(min_h_pixels));
+                let top_panel_height = (window_height * state.panel_split_ratio).clamp(
+                    min_h_pixels,
+                    (window_height - min_h_pixels).max(min_h_pixels),
+                );
                 let in_bottom_panel = !state.show_hud || y >= (top_panel_height + 24.0 * sf);
 
                 if in_bottom_panel {
@@ -1157,8 +1159,10 @@ impl AndroidRustTrackerApp {
             TouchGesture::DoubleTap { x: _, y } => {
                 // Double tap toggles HUD visibility when in the bottom panel (or anywhere if HUD is hidden)
                 let min_h_pixels = 220.0f32 * sf;
-                let top_panel_height = (window_height * state.panel_split_ratio)
-                    .clamp(min_h_pixels, (window_height - min_h_pixels).max(min_h_pixels));
+                let top_panel_height = (window_height * state.panel_split_ratio).clamp(
+                    min_h_pixels,
+                    (window_height - min_h_pixels).max(min_h_pixels),
+                );
                 let in_bottom_panel = !state.show_hud || y >= top_panel_height;
 
                 if in_bottom_panel {

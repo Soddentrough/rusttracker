@@ -352,6 +352,158 @@ where
     }
 }
 
+/// Computes clamped initial inner logical size, minimum inner logical size, and centered outer
+/// physical position so that the window (including titlebar/borders and OS taskbar reserve)
+/// never exceeds the monitor's display area or draws outside the display area on load.
+fn clamp_window_geometry_to_monitor(
+    mon_phys_w: u32,
+    mon_phys_h: u32,
+    mon_pos_x: i32,
+    mon_pos_y: i32,
+    scale: f64,
+    desired_logical_w: f64,
+    desired_logical_h: f64,
+) -> ((f64, f64), (f64, f64), (i32, i32)) {
+    let scale = scale.max(1.0);
+    let mon_logical_w = mon_phys_w as f64 / scale;
+    let mon_logical_h = mon_phys_h as f64 / scale;
+
+    // Reserve logical margin for window decorations (borders + titlebar) and OS taskbar/dock
+    let max_inner_w = (mon_logical_w - 48.0).min(mon_logical_w * 0.94).max(320.0);
+    let max_inner_h = (mon_logical_h - 96.0).min(mon_logical_h * 0.88).max(240.0);
+
+    let target_w = desired_logical_w.min(max_inner_w).floor();
+    let target_h = desired_logical_h.min(max_inner_h).floor();
+    let min_w = 1024.0_f64.min(target_w);
+    let min_h = 600.0_f64.min(target_h);
+
+    let est_outer_w = ((target_w + 16.0) * scale).round() as i32;
+    let est_outer_h = ((target_h + 38.0) * scale).round() as i32;
+    let usable_phys_w = mon_phys_w as i32;
+    let taskbar_phys = (48.0 * scale).round() as i32;
+    let usable_phys_h = (mon_phys_h as i32 - taskbar_phys).max(est_outer_h);
+
+    let pos_x = mon_pos_x + ((usable_phys_w - est_outer_w).max(0) / 2);
+    let pos_y = mon_pos_y + ((usable_phys_h - est_outer_h).max(0) / 2);
+
+    ((target_w, target_h), (min_w, min_h), (pos_x, pos_y))
+}
+
+fn compute_initial_window_geometry(
+    monitor: Option<winit::monitor::MonitorHandle>,
+    desired_logical_w: f64,
+    desired_logical_h: f64,
+) -> (
+    winit::dpi::LogicalSize<f64>,
+    winit::dpi::LogicalSize<f64>,
+    Option<winit::dpi::PhysicalPosition<i32>>,
+) {
+    if let Some(mon) = monitor {
+        let mon_phys = mon.size();
+        if mon_phys.width > 0 && mon_phys.height > 0 {
+            let mon_pos = mon.position();
+            let scale = mon.scale_factor();
+            let ((target_w, target_h), (min_w, min_h), (pos_x, pos_y)) =
+                clamp_window_geometry_to_monitor(
+                    mon_phys.width,
+                    mon_phys.height,
+                    mon_pos.x,
+                    mon_pos.y,
+                    scale,
+                    desired_logical_w,
+                    desired_logical_h,
+                );
+            return (
+                winit::dpi::LogicalSize::new(target_w, target_h),
+                winit::dpi::LogicalSize::new(min_w, min_h),
+                Some(winit::dpi::PhysicalPosition::new(pos_x, pos_y)),
+            );
+        }
+    }
+    (
+        winit::dpi::LogicalSize::new(desired_logical_w, desired_logical_h),
+        winit::dpi::LogicalSize::new(
+            1024.0_f64.min(desired_logical_w),
+            600.0_f64.min(desired_logical_h),
+        ),
+        None,
+    )
+}
+
+fn constrain_window_to_monitor(
+    window: &winit::window::Window,
+    desired_logical_w: Option<f64>,
+    desired_logical_h: Option<f64>,
+    center: bool,
+) {
+    let Some(mon) = window
+        .current_monitor()
+        .or_else(|| window.primary_monitor())
+        .or_else(|| window.available_monitors().next())
+    else {
+        return;
+    };
+
+    let scale = window.scale_factor().max(1.0);
+    let mon_phys = mon.size();
+    let mon_pos = mon.position();
+    if mon_phys.width == 0 || mon_phys.height == 0 {
+        return;
+    }
+
+    let taskbar_margin_phys = (48.0 * scale).round() as u32;
+    let avail_w = mon_phys.width;
+    let avail_h = mon_phys.height.saturating_sub(taskbar_margin_phys).max(240);
+
+    let outer = window.outer_size();
+    let inner = window.inner_size();
+    let frame_w = outer.width.saturating_sub(inner.width);
+    let frame_h = outer.height.saturating_sub(inner.height);
+
+    let max_inner_phys_w = avail_w.saturating_sub(frame_w).max(320);
+    let max_inner_phys_h = avail_h.saturating_sub(frame_h).max(240);
+
+    let want_phys_w = desired_logical_w
+        .map(|w| (w * scale).round() as u32)
+        .unwrap_or(inner.width);
+    let want_phys_h = desired_logical_h
+        .map(|h| (h * scale).round() as u32)
+        .unwrap_or(inner.height);
+
+    let new_inner_w = want_phys_w.min(max_inner_phys_w);
+    let new_inner_h = want_phys_h.min(max_inner_phys_h);
+
+    let min_logical_w = 1024.0_f64.min(new_inner_w as f64 / scale);
+    let min_logical_h = 600.0_f64.min(new_inner_h as f64 / scale);
+    window.set_min_inner_size(Some(winit::dpi::LogicalSize::new(
+        min_logical_w,
+        min_logical_h,
+    )));
+
+    if new_inner_w != inner.width || new_inner_h != inner.height {
+        let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(new_inner_w, new_inner_h));
+    }
+
+    let final_outer_w = (new_inner_w + frame_w) as i32;
+    let final_outer_h = (new_inner_h + frame_h) as i32;
+    let min_x = mon_pos.x;
+    let min_y = mon_pos.y;
+    let max_x = mon_pos.x + avail_w as i32;
+    let max_y = mon_pos.y + avail_h as i32;
+
+    if center {
+        let pos_x = min_x + ((avail_w as i32 - final_outer_w).max(0) / 2);
+        let pos_y = min_y + ((avail_h as i32 - final_outer_h).max(0) / 2);
+        window.set_outer_position(winit::dpi::PhysicalPosition::new(pos_x, pos_y));
+    } else if let Ok(pos) = window.outer_position() {
+        let clamped_x = pos.x.min(max_x - final_outer_w).max(min_x);
+        let clamped_y = pos.y.min(max_y - final_outer_h).max(min_y);
+        if clamped_x != pos.x || clamped_y != pos.y {
+            window.set_outer_position(winit::dpi::PhysicalPosition::new(clamped_x, clamped_y));
+        }
+    }
+}
+
 async fn run_gui(
     args: Args,
     app_state: Arc<Mutex<AppState>>,
@@ -432,11 +584,12 @@ async fn run_gui(
         || std::env::var("STEAM_DECK").is_ok()
         || is_steam_deck;
 
-    let initial_size = if is_game_mode {
-        winit::dpi::LogicalSize::new(1280.0, 800.0)
+    let (desired_logical_w, desired_logical_h) = if is_game_mode {
+        (1280.0, 800.0)
     } else {
-        winit::dpi::LogicalSize::new(1440.0, 840.0)
+        (1440.0, 840.0)
     };
+    let initial_size = winit::dpi::LogicalSize::new(desired_logical_w, desired_logical_h);
 
     let mut attrs = winit::window::Window::default_attributes()
         .with_title("RustTracker Vulkan Visualizer")
@@ -482,12 +635,34 @@ async fn run_gui(
     let egui_ctx_for_init = egui_ctx.clone();
     let init_fn =
         move |elwt: &winit::event_loop::ActiveEventLoop| -> anyhow::Result<DesktopRuntime> {
+            let mut attrs = attrs;
+            if !is_fullscreen {
+                let monitor = elwt
+                    .primary_monitor()
+                    .or_else(|| elwt.available_monitors().next());
+                let (init_size, min_size, init_pos) =
+                    compute_initial_window_geometry(monitor, desired_logical_w, desired_logical_h);
+                attrs = attrs
+                    .with_inner_size(init_size)
+                    .with_min_inner_size(min_size);
+                if let Some(pos) = init_pos {
+                    attrs = attrs.with_position(pos);
+                }
+            }
             let window = elwt.create_window(attrs).map_err(|e| {
             anyhow::anyhow!(
                 "Failed to create application window: {:?}. Please verify that a graphical session (Wayland or X11) is active.",
                 e
             )
         })?;
+            if !is_fullscreen {
+                constrain_window_to_monitor(
+                    &window,
+                    Some(desired_logical_w),
+                    Some(desired_logical_h),
+                    true,
+                );
+            }
             let window = Arc::new(window);
             let engine = pollster::block_on(VulkanEngine::new(window.clone()));
             let egui_state = egui_winit::State::new(
@@ -544,9 +719,20 @@ async fn run_gui(
                 "aac",
                 "m4a",
                 "mp4",
+                "m4v",
+                "mov",
                 "mkv",
                 "avi",
                 "webm",
+                "ts",
+                "m2ts",
+                "mts",
+                "flv",
+                "wmv",
+                "mpg",
+                "mpeg",
+                "ogv",
+                "3gp",
                 "opus",
                 "mod",
                 "s3m",
@@ -879,8 +1065,11 @@ async fn run_gui(
                                                     .ok();
                                             } else {
                                                 window.set_fullscreen(None);
-                                                let _ = window.request_inner_size(
-                                                    winit::dpi::LogicalSize::new(1024.0, 768.0),
+                                                constrain_window_to_monitor(
+                                                    window,
+                                                    Some(desired_logical_w),
+                                                    Some(desired_logical_h),
+                                                    true,
                                                 );
                                                 keep_awake = None;
                                             }
@@ -933,9 +1122,20 @@ async fn run_gui(
                                                                 "aac",
                                                                 "m4a",
                                                                 "mp4",
+                                                                "m4v",
+                                                                "mov",
                                                                 "mkv",
                                                                 "avi",
                                                                 "webm",
+                                                                "ts",
+                                                                "m2ts",
+                                                                "mts",
+                                                                "flv",
+                                                                "wmv",
+                                                                "mpg",
+                                                                "mpeg",
+                                                                "ogv",
+                                                                "3gp",
                                                                 "opus",
                                                                 "mod",
                                                                 "s3m",
@@ -978,7 +1178,9 @@ async fn run_gui(
                                         }
                                         WinitKeyCode::KeyV => {
                                             let mut state = app_state.lock().unwrap();
-                                            if state.video_frame_rx.is_some() {
+                                            if state.video_frame_rx.is_some()
+                                                || state.has_video_stream
+                                            {
                                                 state.video_mode = (state.video_mode + 1) % 4;
                                                 let mode_name = match state.video_mode {
                                                     0 => "Standard View",
@@ -1302,6 +1504,9 @@ async fn run_gui(
                         WindowEvent::RedrawRequested => {
                             if is_first_frame {
                                 is_first_frame = false;
+                                if !is_fullscreen {
+                                    constrain_window_to_monitor(window, None, None, false);
+                                }
                                 app_state.lock().unwrap().is_paused = false;
                             }
                             let load_path = {
@@ -1407,6 +1612,8 @@ async fn run_gui(
                                         let mut state = app_state.lock().unwrap();
                                         state.video_frame_rx = None;
                                         state.free_video_frame_tx = None;
+                                        state.has_video_stream = false;
+                                        state.video_info = None;
                                         state.video_mode = 0;
                                         state.stats.bitstream_active = false;
                                         state.stats.audio_buffer_fill_pct = 0.0;
@@ -2450,8 +2657,11 @@ async fn run_gui(
                                             .ok();
                                     } else {
                                         window.set_fullscreen(None);
-                                        let _ = window.request_inner_size(
-                                            winit::dpi::LogicalSize::new(1024.0, 768.0),
+                                        constrain_window_to_monitor(
+                                            window,
+                                            Some(desired_logical_w),
+                                            Some(desired_logical_h),
+                                            true,
                                         );
                                         keep_awake = None;
                                     }
@@ -2691,7 +2901,7 @@ async fn run_gui(
                                 gilrs::Button::West => {
                                     // 'X' or Square
                                     let mut state = app_state.lock().unwrap();
-                                    if state.video_frame_rx.is_some() {
+                                    if state.video_frame_rx.is_some() || state.has_video_stream {
                                         state.video_mode = (state.video_mode + 1) % 4;
                                         let mode_name = match state.video_mode {
                                             0 => "Standard View",
@@ -3241,5 +3451,68 @@ where
         if last_tick.elapsed() >= tick_rate {
             last_tick = Instant::now();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::clamp_window_geometry_to_monitor;
+
+    #[test]
+    fn test_window_geometry_fits_1080p_at_150_percent_scale() {
+        // 1920x1080 at 150% DPI scaling -> 1280x720 logical monitor area
+        let ((w, h), (min_w, min_h), (pos_x, pos_y)) =
+            clamp_window_geometry_to_monitor(1920, 1080, 0, 0, 1.5, 1440.0, 840.0);
+
+        let est_outer_phys_w = ((w + 16.0) * 1.5).round() as i32;
+        let est_outer_phys_h = ((h + 38.0) * 1.5).round() as i32;
+
+        assert!(w < 1280.0 && h < 720.0);
+        assert!(min_w <= w && min_h <= h);
+        assert!(pos_x >= 0 && pos_y >= 0);
+        assert!(pos_x + est_outer_phys_w <= 1920);
+        assert!(pos_y + est_outer_phys_h <= 1080);
+    }
+
+    #[test]
+    fn test_window_geometry_fits_1080p_at_125_percent_scale() {
+        // 1920x1080 at 125% DPI scaling -> 1536x864 logical monitor area
+        let ((w, h), (min_w, min_h), (pos_x, pos_y)) =
+            clamp_window_geometry_to_monitor(1920, 1080, 0, 0, 1.25, 1440.0, 840.0);
+
+        let est_outer_phys_w = ((w + 16.0) * 1.25).round() as i32;
+        let est_outer_phys_h = ((h + 38.0) * 1.25).round() as i32;
+
+        assert!(w <= 1440.0 && h < 840.0);
+        assert!(min_w <= w && min_h <= h);
+        assert!(pos_x >= 0 && pos_y >= 0);
+        assert!(pos_x + est_outer_phys_w <= 1920);
+        assert!(pos_y + est_outer_phys_h <= 1080);
+    }
+
+    #[test]
+    fn test_window_geometry_fits_1366x768_display() {
+        let ((w, h), (min_w, min_h), (pos_x, pos_y)) =
+            clamp_window_geometry_to_monitor(1366, 768, 0, 0, 1.0, 1440.0, 840.0);
+
+        let est_outer_phys_w = (w + 16.0).round() as i32;
+        let est_outer_phys_h = (h + 38.0).round() as i32;
+
+        assert!(w < 1366.0 && h < 768.0);
+        assert!(min_w <= w && min_h <= h);
+        assert!(pos_x >= 0 && pos_y >= 0);
+        assert!(pos_x + est_outer_phys_w <= 1366);
+        assert!(pos_y + est_outer_phys_h <= 768);
+    }
+
+    #[test]
+    fn test_window_geometry_preserves_default_on_large_display() {
+        let ((w, h), (min_w, min_h), (pos_x, pos_y)) =
+            clamp_window_geometry_to_monitor(2560, 1440, -2560, 0, 1.0, 1440.0, 840.0);
+
+        assert_eq!((w, h), (1440.0, 840.0));
+        assert_eq!((min_w, min_h), (1024.0, 600.0));
+        assert!(pos_x >= -2560 && pos_x + 1456 <= 0);
+        assert!(pos_y >= 0 && pos_y + 878 <= 1440);
     }
 }

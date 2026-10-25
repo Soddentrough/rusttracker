@@ -685,8 +685,16 @@ fn room_add_ceiling_cone(
         let c1 = a1.cos();
         let s1 = a1.sin();
 
-        let cap0 = [center[0] + c0 * r_cap, center[1] + depth, center[2] + s0 * r_cap];
-        let cap1 = [center[0] + c1 * r_cap, center[1] + depth, center[2] + s1 * r_cap];
+        let cap0 = [
+            center[0] + c0 * r_cap,
+            center[1] + depth,
+            center[2] + s0 * r_cap,
+        ];
+        let cap1 = [
+            center[0] + c1 * r_cap,
+            center[1] + depth,
+            center[2] + s1 * r_cap,
+        ];
         let start = vertices.len() as u32;
         vertices.push(Vertex {
             position: apex,
@@ -738,8 +746,16 @@ fn room_add_ceiling_cone(
         ]);
 
         let r_out = radius * 1.24;
-        let p0_out = [center[0] + c0 * r_out, center[1] - 0.01, center[2] + s0 * r_out];
-        let p1_out = [center[0] + c1 * r_out, center[1] - 0.01, center[2] + s1 * r_out];
+        let p0_out = [
+            center[0] + c0 * r_out,
+            center[1] - 0.01,
+            center[2] + s0 * r_out,
+        ];
+        let p1_out = [
+            center[0] + c1 * r_out,
+            center[1] - 0.01,
+            center[2] + s1 * r_out,
+        ];
         room_add_quad(vertices, indices, p0, p1, p1_out, p0_out, n, ch, 5.2);
     }
 }
@@ -9412,18 +9428,20 @@ impl VulkanEngine {
             } else {
                 48.0_f32.to_radians()
             };
-            let fov_y =
-                if state.visualizer_mode == 19 || state.visualizer_mode == 23 || state.visualizer_mode == 29 {
-                    base_fov
-                } else if aspect < 1.0 {
-                    (base_fov / aspect.clamp(0.65, 1.0)).min(if state.visualizer_mode == 22 {
-                        85.0_f32.to_radians()
-                    } else {
-                        75.0_f32.to_radians()
-                    })
+            let fov_y = if state.visualizer_mode == 19
+                || state.visualizer_mode == 23
+                || state.visualizer_mode == 29
+            {
+                base_fov
+            } else if aspect < 1.0 {
+                (base_fov / aspect.clamp(0.65, 1.0)).min(if state.visualizer_mode == 22 {
+                    85.0_f32.to_radians()
                 } else {
-                    base_fov
-                };
+                    75.0_f32.to_radians()
+                })
+            } else {
+                base_fov
+            };
             let proj = glam::Mat4::perspective_rh_gl(fov_y, aspect, 0.1, 1000.0);
             let view = if state.visualizer_mode == 20 && state.biolum_top_down {
                 glam::Mat4::look_at_rh(
@@ -10137,6 +10155,17 @@ mod tests {
         assert!(raw_source.contains("vs_main_3d"));
         assert!(raw_source.contains("fs_main"));
         assert!(raw_source.contains("camera.view_matrix"));
+
+        // Verify ID 23 is disabled by default in AppState
+        let state = crate::state::AppState::new("Test App".to_string());
+        let lyrics_idx = crate::state::VISUALIZERS
+            .iter()
+            .position(|v| v.id == 23)
+            .unwrap();
+        assert!(
+            !state.vis_enabled[lyrics_idx],
+            "3D Glass Water Lyrics (ID 23) should be disabled by default"
+        );
     }
 
     #[test]

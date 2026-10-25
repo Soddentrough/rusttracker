@@ -17,6 +17,16 @@ pub fn start_bitstream_thread(
 ) -> anyhow::Result<BitstreamLaunchResult> {
     use anyhow::Context;
 
+    if shared_state
+        .lock()
+        .map(|s| s.force_stereo_downmix)
+        .unwrap_or(false)
+    {
+        return Err(anyhow::anyhow!(
+            "Force stereo downmix enabled; skipping passthrough"
+        ));
+    }
+
     println!("[bitstream] Probing codec via ffmpeg-next on Linux...");
     ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Quiet);
     ffmpeg_next::init().context("Failed to initialize ffmpeg-next")?;
@@ -60,10 +70,8 @@ pub fn start_bitstream_thread(
             .unwrap_or_default()
     };
 
-    let has_video = ictx
-        .streams()
-        .best(ffmpeg_next::media::Type::Video)
-        .is_some();
+    let video_setup = crate::audio::probe_video_stream(&ictx);
+    let has_video = video_setup.is_some();
 
     let parameters = best_audio.parameters();
     let best_audio_index = best_audio.index();
@@ -131,6 +139,19 @@ pub fn start_bitstream_thread(
             status
         ));
     }
+
+    let (video_stream_index, video_packet_tx, video_packet_rx) = if let Some(vs) = video_setup {
+        let (tx_v, rx_v) = crate::audio::spawn_video_decoder_thread(
+            vs.params,
+            vs.time_base,
+            vs.rotation,
+            shared_state.clone(),
+            stop_token.clone(),
+        );
+        (Some(vs.stream_index), Some(tx_v), Some(rx_v))
+    } else {
+        (None, None, None)
+    };
 
     let pipe_path_clone = pipe_path.clone();
 
@@ -226,6 +247,7 @@ pub fn start_bitstream_thread(
         let mut samples_since_last_send = 0;
 
         let mut current_seconds = 0.0;
+        let mut current_seek_epoch = shared_state.lock().map(|s| s.seek_epoch).unwrap_or(0);
 
         'stream_loop: loop {
             let mut seek_target_opt: Option<f64> = None;
@@ -261,6 +283,13 @@ pub fn start_bitstream_thread(
 
                 if seek_target_opt.is_some() {
                     break;
+                }
+
+                if Some(stream.index()) == video_stream_index {
+                    if let Some(ref v_tx) = video_packet_tx {
+                        let _ = v_tx.try_send((current_seek_epoch, packet.clone()));
+                    }
+                    continue;
                 }
 
                 if stream.index() == best_audio_index {
@@ -352,6 +381,9 @@ pub fn start_bitstream_thread(
             }
 
             if let Some(target_sec) = seek_target_opt {
+                if let Some(ref v_rx) = video_packet_rx {
+                    while v_rx.try_recv().is_ok() {}
+                }
                 let target_ts = (target_sec * ffmpeg_next::ffi::AV_TIME_BASE as f64) as i64;
                 let _ = ictx.seek(target_ts, ..target_ts);
                 decoder.flush();
@@ -360,7 +392,9 @@ pub fn start_bitstream_thread(
                 }
                 samples_since_last_send = 0;
                 current_seconds = target_sec;
-                if let Ok(mut state) = shared_state.try_lock() {
+                if let Ok(mut state) = shared_state.lock() {
+                    state.seek_epoch += 1;
+                    current_seek_epoch = state.seek_epoch;
                     state.current_seconds = target_sec;
                 }
                 continue 'stream_loop;
@@ -636,13 +670,8 @@ mod wasapi_bitstream {
                     sample_format: ffmpeg_next::format::sample::Sample::None,
                 }],
             )),
-            // Uncompressed Multi-Channel LPCM
-            id if id == ffmpeg_next::codec::Id::FLAC
-                || id == ffmpeg_next::codec::Id::ALAC
-                || id == ffmpeg_next::codec::Id::WAVPACK
-                || format!("{:?}", id).starts_with("PCM_")
-                || src_channels > 2 =>
-            {
+            // Uncompressed Multi-Channel LPCM (only when >2 channels; stereo uses shared mode)
+            id if src_channels > 2 => {
                 let codec_name = match id {
                     ffmpeg_next::codec::Id::FLAC => "flac",
                     ffmpeg_next::codec::Id::ALAC => "alac",
@@ -847,6 +876,16 @@ mod wasapi_bitstream {
         tx: Sender<DspMessage>,
         stop_token: Arc<AtomicBool>,
     ) -> Result<super::BitstreamLaunchResult> {
+        if shared_state
+            .lock()
+            .map(|s| s.force_stereo_downmix)
+            .unwrap_or(false)
+        {
+            return Err(anyhow::anyhow!(
+                "Force stereo downmix enabled; skipping WASAPI Exclusive"
+            ));
+        }
+
         // ── Probe codec via ffmpeg-next (pure FFmpeg, NO COM on caller thread) ──
         println!("[bitstream] Probing audio stream via ffmpeg-next on Windows...");
         ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Quiet);
@@ -882,10 +921,8 @@ mod wasapi_bitstream {
 
         let (codec_name, stream_type, profiles) =
             detect_codec_profile(codec_id, src_channels, decoder_sample_rate)?;
-        let has_video = ictx
-            .streams()
-            .best(ffmpeg_next::media::Type::Video)
-            .is_some();
+        let video_setup = crate::audio::probe_video_stream(&ictx);
+        let has_video = video_setup.is_some();
         let meta_duration = if ictx.duration() > 0 {
             ictx.duration() as f64 / ffmpeg_next::ffi::AV_TIME_BASE as f64
         } else {
@@ -1165,6 +1202,20 @@ mod wasapi_bitstream {
                 let stop_token_ffmpeg = stop_token_pump.clone();
                 let profile_clone = profile.clone();
 
+                let (video_stream_index, video_packet_tx, video_packet_rx) =
+                    if let Some(vs) = video_setup {
+                        let (tx_v, rx_v) = crate::audio::spawn_video_decoder_thread(
+                            vs.params,
+                            vs.time_base,
+                            vs.rotation,
+                            shared_state_pump.clone(),
+                            stop_token_pump.clone(),
+                        );
+                        (Some(vs.stream_index), Some(tx_v), Some(rx_v))
+                    } else {
+                        (None, None, None)
+                    };
+
                 let ffmpeg_thread = match stream_type {
                     WasapiStreamType::CompressedBitstream => {
                         use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
@@ -1290,9 +1341,20 @@ mod wasapi_bitstream {
                                 ffmpeg_next::channel_layout::ChannelLayout::default(0);
                             let mut cur_in_rate = 0;
 
+                            let current_seek_epoch = shared_state_worker
+                                .lock()
+                                .map(|s| s.seek_epoch)
+                                .unwrap_or(0);
+
                             for (stream, mut packet) in ictx.packets() {
                                 if stop_token_worker.load(std::sync::atomic::Ordering::Relaxed) {
                                     break;
+                                }
+                                if Some(stream.index()) == video_stream_index {
+                                    if let Some(ref v_tx) = video_packet_tx {
+                                        let _ = v_tx.try_send((current_seek_epoch, packet.clone()));
+                                    }
+                                    continue;
                                 }
                                 if stream.index() == best_audio_index {
                                     let vis_packet = packet.clone();
@@ -1752,6 +1814,9 @@ mod wasapi_bitstream {
                                 if let Some((pos, epoch)) = seek_req {
                                     current_seek_epoch = epoch;
                                     is_eof = false;
+                                    if let Some(ref v_rx) = video_packet_rx {
+                                        while v_rx.try_recv().is_ok() {}
+                                    }
 
                                     let target_pts = if stream_time_base > 0.0 {
                                         (pos / stream_time_base) as i64
@@ -1795,7 +1860,12 @@ mod wasapi_bitstream {
 
                                 match ictx.packets().next() {
                                     Some((stream, packet)) => {
-                                        if stream.index() == best_audio_index {
+                                        if Some(stream.index()) == video_stream_index {
+                                            if let Some(ref v_tx) = video_packet_tx {
+                                                let _ = v_tx
+                                                    .try_send((current_seek_epoch, packet.clone()));
+                                            }
+                                        } else if stream.index() == best_audio_index {
                                             let pts = packet.pts().or_else(|| packet.dts());
                                             if let Some(p) = pts {
                                                 current_seconds = p as f64 * stream_time_base;
@@ -1959,16 +2029,17 @@ mod wasapi_bitstream {
                             break;
                         }
 
-                        let seek_from_state = {
+                        let (is_paused, seek_from_state) = {
                             if let Ok(state) = shared_state_pump.lock() {
-                                if state.seek_epoch > local_epoch {
+                                let seek = if state.seek_epoch > local_epoch {
                                     local_epoch = state.seek_epoch;
                                     Some(state.current_seconds)
                                 } else {
                                     None
-                                }
+                                };
+                                (state.is_paused, seek)
                             } else {
-                                None
+                                (false, None)
                             }
                         };
 
@@ -1995,6 +2066,23 @@ mod wasapi_bitstream {
                             if wait_result.0 != WAIT_OBJECT_0 {
                                 break;
                             }
+                        }
+
+                        if is_paused {
+                            if started {
+                                unsafe {
+                                    if let Ok(buf) = render_client.GetBuffer(available) {
+                                        ptr::write_bytes(buf, 0, bytes_needed);
+                                        let _ = render_client.ReleaseBuffer(
+                                            available,
+                                            AUDCLNT_BUFFERFLAGS_SILENT.0 as u32,
+                                        );
+                                    }
+                                }
+                            } else {
+                                std::thread::sleep(std::time::Duration::from_millis(15));
+                            }
+                            continue;
                         }
 
                         while buffer_queue.len() < target_prebuffer && !eof {

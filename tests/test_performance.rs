@@ -5504,4 +5504,3 @@ fn test_vis_spectrum_canyon_snapshot() {
     img.save(&out_path).unwrap();
     println!("Saved Prismatic Spectrum Canyon snapshot to {:?}", out_path);
 }
-

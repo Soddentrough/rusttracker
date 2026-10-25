@@ -631,6 +631,11 @@ impl AppState {
             vis_enabled[idx] = false;
         }
 
+        // 3D Glass Water Lyrics (ID 23): disabled by default (HUD lyrics remain active in the main panel)
+        if let Some(idx) = VISUALIZERS.iter().position(|v| v.id == 23) {
+            vis_enabled[idx] = false;
+        }
+
         // Lissajous Laser is now working and fully optimized, so it remains enabled by default.
 
         #[cfg(target_os = "android")]

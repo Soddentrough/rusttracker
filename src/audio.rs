@@ -870,9 +870,8 @@ unsafe impl Send for MidiSource {}
 
 impl MidiSource {
     pub fn new(file_path: &str, soundfont_path: &str, sample_rate: i32) -> anyhow::Result<Self> {
-        static CACHED_SOUNDFONT: std::sync::OnceLock<
-            std::sync::Mutex<Option<(String, Arc<SoundFont>)>>,
-        > = std::sync::OnceLock::new();
+        type CachedSoundFont = std::sync::Mutex<Option<(String, Arc<SoundFont>)>>;
+        static CACHED_SOUNDFONT: std::sync::OnceLock<CachedSoundFont> = std::sync::OnceLock::new();
         let cache = CACHED_SOUNDFONT.get_or_init(|| std::sync::Mutex::new(None));
         let sf2_arc_opt = {
             let mut guard = cache.lock().unwrap();
@@ -980,9 +979,12 @@ impl MidiSource {
             let mut pos = 8 + u32::from_be_bytes([data[4], data[5], data[6], data[7]]) as usize;
             while pos + 8 <= data.len() {
                 let chunk_id = &data[pos..pos + 4];
-                let chunk_len =
-                    u32::from_be_bytes([data[pos + 4], data[pos + 5], data[pos + 6], data[pos + 7]])
-                        as usize;
+                let chunk_len = u32::from_be_bytes([
+                    data[pos + 4],
+                    data[pos + 5],
+                    data[pos + 6],
+                    data[pos + 7],
+                ]) as usize;
                 pos += 8;
                 let track_end = (pos + chunk_len).min(data.len());
                 if chunk_id == b"MTrk" {
@@ -1051,9 +1053,8 @@ impl MidiSource {
                             if meta_type == 0x2F {
                                 break;
                             } else if meta_type == 0x51 && slice.len() == 3 {
-                                let us =
-                                    u32::from_be_bytes([0, slice[0], slice[1], slice[2]]).max(1)
-                                        as f64;
+                                let us = u32::from_be_bytes([0, slice[0], slice[1], slice[2]])
+                                    .max(1) as f64;
                                 raw_tempo_changes.push((tick, us));
                             } else if meta_type == 0x03 && title.is_empty() {
                                 title = String::from_utf8_lossy(slice).to_string();
@@ -2751,7 +2752,7 @@ impl AudioSource for FfmpegSource {
     fn take_video_parameters(
         &mut self,
     ) -> Option<(ffmpeg_next::codec::Parameters, ffmpeg_next::Rational, u32)> {
-        if let (Some(p), Some(tb)) = (self.video_params.take(), self.video_time_base.take()) {
+        if let (Some(p), Some(tb)) = (self.video_params.take(), self.video_time_base) {
             return Some((p, tb, self.video_rotation));
         }
         None
@@ -2842,6 +2843,7 @@ struct VideoOnlySource {
     video_time_base: Option<ffmpeg_next::Rational>,
     video_rotation: u32,
     current_time: f64,
+    last_video_pts: f64,
     duration: f64,
     video_info: Option<String>,
     ext_type: String,
@@ -2931,15 +2933,28 @@ impl AudioSource for VideoOnlySource {
             *v = 0.0;
         }
 
+        let tb_f64 = self
+            .video_time_base
+            .map(|tb| tb.numerator() as f64 / tb.denominator().max(1) as f64)
+            .unwrap_or(1.0 / 30.0);
+        let target_pts = self.current_time + (frames_to_write as f64 / sample_rate as f64) + 0.25;
         let mut packets_read = 0;
-        while packets_read < 20 {
+        while packets_read < 16 && self.last_video_pts <= target_pts {
             if let Some((stream, packet)) = self.ictx.packets().next() {
-                if stream.index() == self.video_stream_index
-                    && let Some(tx) = &self.video_tx
-                {
-                    let _ = tx.try_send((self.video_epoch, packet.clone()));
+                if stream.index() == self.video_stream_index {
+                    if let Some(ts) = packet.dts().or_else(|| packet.pts()) {
+                        let pkt_sec = ts as f64 * tb_f64;
+                        if pkt_sec > self.last_video_pts {
+                            self.last_video_pts = pkt_sec;
+                        }
+                    } else {
+                        self.last_video_pts += 1.0 / 30.0;
+                    }
+                    if let Some(tx) = &self.video_tx {
+                        let _ = tx.try_send((self.video_epoch, packet.clone()));
+                    }
+                    packets_read += 1;
                 }
-                packets_read += 1;
             } else {
                 break;
             }
@@ -2973,6 +2988,7 @@ impl AudioSource for VideoOnlySource {
             );
         }
         self.current_time = pos;
+        self.last_video_pts = pos;
         self.video_epoch += 1;
     }
 
@@ -3023,7 +3039,7 @@ impl AudioSource for VideoOnlySource {
     fn take_video_parameters(
         &mut self,
     ) -> Option<(ffmpeg_next::codec::Parameters, ffmpeg_next::Rational, u32)> {
-        if let (Some(p), Some(tb)) = (self.video_params.take(), self.video_time_base.take()) {
+        if let (Some(p), Some(tb)) = (self.video_params.take(), self.video_time_base) {
             Some((p, tb, self.video_rotation))
         } else {
             None
@@ -3033,6 +3049,87 @@ impl AudioSource for VideoOnlySource {
     fn has_video_stream(&self) -> bool {
         true
     }
+}
+
+#[cfg(not(target_os = "android"))]
+#[derive(Clone)]
+pub struct VideoStreamSetup {
+    pub stream_index: usize,
+    pub params: ffmpeg_next::codec::Parameters,
+    pub time_base: ffmpeg_next::Rational,
+    pub rotation: u32,
+    pub info: String,
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn probe_video_stream(ictx: &ffmpeg_next::format::context::Input) -> Option<VideoStreamSetup> {
+    let v_stream = ictx.streams().best(ffmpeg_next::media::Type::Video)?;
+    let stream_index = v_stream.index();
+    let params = v_stream.parameters();
+    let time_base = v_stream.time_base();
+    let mut rotation = 0u32;
+
+    // 1. Check metadata dictionary for "rotate" tag
+    if let Some(rot_str) = v_stream.metadata().get("rotate")
+        && let Ok(rot_deg) = rot_str.parse::<i32>()
+    {
+        let norm = ((rot_deg % 360) + 360) % 360;
+        if norm == 90 || norm == 180 || norm == 270 {
+            rotation = norm as u32;
+        }
+    }
+    // 2. Check stream side data for DisplayMatrix
+    if rotation == 0 {
+        for sd in v_stream.side_data() {
+            if sd.kind() == ffmpeg_next::codec::packet::side_data::Type::DisplayMatrix {
+                let data = sd.data();
+                if data.len() >= 36 {
+                    let m0 = i32::from_ne_bytes([data[0], data[1], data[2], data[3]]);
+                    let m1 = i32::from_ne_bytes([data[4], data[5], data[6], data[7]]);
+                    let a = m0 as f64 / 65536.0;
+                    let b = m1 as f64 / 65536.0;
+                    let rot_deg = (-b.atan2(a).to_degrees()).round() as i32;
+                    let norm = ((rot_deg % 360) + 360) % 360;
+                    if norm == 90 || norm == 180 || norm == 270 {
+                        rotation = norm as u32;
+                    }
+                }
+            }
+        }
+    }
+
+    let info =
+        if let Ok(v_ctx) = ffmpeg_next::codec::context::Context::from_parameters(params.clone()) {
+            if let Ok(v_dec) = v_ctx.decoder().video() {
+                let (disp_w, disp_h) = if rotation == 90 || rotation == 270 {
+                    (v_dec.height(), v_dec.width())
+                } else {
+                    (v_dec.width(), v_dec.height())
+                };
+                format!(
+                    "{} ({}x{})",
+                    v_dec
+                        .codec()
+                        .map(|c| c.name().to_string())
+                        .unwrap_or("H264".to_string())
+                        .to_uppercase(),
+                    disp_w,
+                    disp_h
+                )
+            } else {
+                "Unsupported Codec".to_string()
+            }
+        } else {
+            "Unsupported Codec".to_string()
+        };
+
+    Some(VideoStreamSetup {
+        stream_index,
+        params,
+        time_base,
+        rotation,
+        info,
+    })
 }
 
 #[cfg(not(target_os = "android"))]
@@ -3074,65 +3171,12 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
     let mut video_params = None;
     let mut video_tb = None;
     let mut video_rotation = 0u32;
-    if let Some(v_stream) = ictx.streams().best(ffmpeg_next::media::Type::Video) {
-        video_stream_index = Some(v_stream.index());
-        video_params = Some(v_stream.parameters());
-        video_tb = Some(v_stream.time_base());
-
-        // 1. Check metadata dictionary for "rotate" tag
-        if let Some(rot_str) = v_stream.metadata().get("rotate")
-            && let Ok(rot_deg) = rot_str.parse::<i32>()
-        {
-            let norm = ((rot_deg % 360) + 360) % 360;
-            if norm == 90 || norm == 180 || norm == 270 {
-                video_rotation = norm as u32;
-            }
-        }
-        // 2. Check stream side data for DisplayMatrix
-        if video_rotation == 0 {
-            for sd in v_stream.side_data() {
-                if sd.kind() == ffmpeg_next::codec::packet::side_data::Type::DisplayMatrix {
-                    let data = sd.data();
-                    if data.len() >= 36 {
-                        let m0 = i32::from_ne_bytes([data[0], data[1], data[2], data[3]]);
-                        let m1 = i32::from_ne_bytes([data[4], data[5], data[6], data[7]]);
-                        let a = m0 as f64 / 65536.0;
-                        let b = m1 as f64 / 65536.0;
-                        let rot_deg = (-b.atan2(a).to_degrees()).round() as i32;
-                        let norm = ((rot_deg % 360) + 360) % 360;
-                        if norm == 90 || norm == 180 || norm == 270 {
-                            video_rotation = norm as u32;
-                        }
-                    }
-                }
-            }
-        }
-
-        if let Ok(v_ctx) =
-            ffmpeg_next::codec::context::Context::from_parameters(v_stream.parameters())
-        {
-            if let Ok(v_dec) = v_ctx.decoder().video() {
-                let (disp_w, disp_h) = if video_rotation == 90 || video_rotation == 270 {
-                    (v_dec.height(), v_dec.width())
-                } else {
-                    (v_dec.width(), v_dec.height())
-                };
-                video_info = Some(format!(
-                    "{} ({}x{})",
-                    v_dec
-                        .codec()
-                        .map(|c| c.name().to_string())
-                        .unwrap_or("H264".to_string())
-                        .to_uppercase(),
-                    disp_w,
-                    disp_h
-                ));
-            } else {
-                video_info = Some("Unsupported Codec".to_string());
-            }
-        } else {
-            video_info = Some("Unsupported Codec".to_string());
-        }
+    if let Some(vs) = probe_video_stream(&ictx) {
+        video_stream_index = Some(vs.stream_index);
+        video_params = Some(vs.params);
+        video_tb = Some(vs.time_base);
+        video_rotation = vs.rotation;
+        video_info = Some(vs.info);
     }
 
     let mut audio_tracks = Vec::new();
@@ -3251,6 +3295,7 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
                 video_time_base: video_tb,
                 video_rotation,
                 current_time: 0.0,
+                last_video_pts: 0.0,
                 duration,
                 video_info,
                 ext_type: ext,
@@ -3768,7 +3813,10 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
                 "mp3"
             } else if content_type.contains("aac") {
                 "aac"
-            } else if content_type.contains("ogg") || content_type.contains("vorbis") || content_type.contains("opus") {
+            } else if content_type.contains("ogg")
+                || content_type.contains("vorbis")
+                || content_type.contains("opus")
+            {
                 "ogg"
             } else if content_type.contains("flac") {
                 "flac"
@@ -3813,9 +3861,16 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
         ext.as_str(),
         "mkv"
             | "mp4"
+            | "m4v"
             | "webm"
             | "mov"
             | "avi"
+            | "flv"
+            | "wmv"
+            | "mpg"
+            | "mpeg"
+            | "ogv"
+            | "3gp"
             | "mka"
             | "m2ts"
             | "ts"
@@ -4106,6 +4161,7 @@ pub fn start_audio_thread(
                     state.hardware_channels = ch;
                     state.channel_vus = vec![0.0; ch as usize];
                     state.peak_vus = vec![0.0; ch as usize];
+                    state.has_video_stream = has_video;
                     state.video_info = Some(format!("{}{}", display_name, video_suffix));
                 }
 
@@ -4430,6 +4486,9 @@ pub fn start_audio_thread(
                     return Ok((stream, stop_token));
                 }
                 Err(err) => {
+                    if audio_source_opt.is_none() {
+                        audio_source_opt = attempt_audio_source_opt;
+                    }
                     eprintln!(
                         "Warning: Failed to create/play audio stream on device '{}': {:?}",
                         device_name, err
@@ -4453,7 +4512,10 @@ pub fn start_audio_thread(
                 err
             );
 
-            if let Some(mut audio_source) = audio_source_opt.take() {
+            if let Some(mut audio_source) = audio_source_opt
+                .take()
+                .or_else(|| load_audio_source(file_path).ok())
+            {
                 let sample_rate = target_rate;
                 let window_size = calculate_power_of_two_window_size(sample_rate);
                 let (tx, rx) = bounded::<DspMessage>(32);
@@ -4978,6 +5040,304 @@ fn decode_single_audio_chunk(
     (frames_read, decode_elapsed, clips)
 }
 
+#[cfg(not(target_os = "android"))]
+pub type VideoPacketChannel = (
+    Sender<(u64, ffmpeg_next::Packet)>,
+    Receiver<(u64, ffmpeg_next::Packet)>,
+);
+
+#[cfg(not(target_os = "android"))]
+pub fn spawn_video_decoder_thread(
+    params: ffmpeg_next::codec::Parameters,
+    time_base: ffmpeg_next::Rational,
+    rotation: u32,
+    shared_state: Arc<Mutex<AppState>>,
+    stop_token: Arc<std::sync::atomic::AtomicBool>,
+) -> VideoPacketChannel {
+    let (video_packet_tx, video_packet_rx) = bounded::<(u64, ffmpeg_next::Packet)>(4096);
+    let (video_frame_tx, video_frame_rx) = bounded::<crate::state::VideoFrame>(16);
+    let (free_video_frame_tx, free_video_frame_rx) = unbounded::<crate::state::VideoFrame>();
+
+    for _ in 0..16 {
+        let _ = free_video_frame_tx.try_send(crate::state::VideoFrame {
+            pts: 0.0,
+            width: 0,
+            height: 0,
+            rotation,
+            y_plane: Vec::new(),
+            u_plane: Vec::new(),
+            v_plane: Vec::new(),
+            y_stride: 0,
+            u_stride: 0,
+            v_stride: 0,
+            bit_depth: 8,
+            color_space: 0,
+            color_range: 0,
+            color_trc: 0,
+        });
+    }
+
+    if let Ok(mut state) = shared_state.lock() {
+        state.video_frame_rx = Some(video_frame_rx);
+        state.free_video_frame_tx = Some(free_video_frame_tx.clone());
+        state.has_video_stream = true;
+    }
+
+    let state_for_video = shared_state;
+    let video_packet_rx_for_video = video_packet_rx.clone();
+    let stop_token_video = stop_token;
+    std::thread::spawn(move || {
+        if let Ok(context) = ffmpeg_next::codec::context::Context::from_parameters(params)
+            && let Ok(mut decoder) = context.decoder().video()
+        {
+            let tb = time_base.numerator() as f64 / time_base.denominator() as f64;
+            let mut local_epoch = 0;
+            let mut fallback_pts_seconds = 0.0;
+            // Deliver the very first decoded frame immediately (even while paused at startup)
+            let mut is_first_frame_after_seek = true;
+            let mut scaler: Option<(
+                ffmpeg_next::format::Pixel,
+                u32,
+                u32,
+                ffmpeg_next::software::scaling::Context,
+            )> = None;
+
+            while !stop_token_video.load(std::sync::atomic::Ordering::Relaxed) {
+                match video_packet_rx_for_video.recv_timeout(std::time::Duration::from_millis(50)) {
+                    Ok((packet_epoch, packet)) => {
+                        {
+                            let state = state_for_video.lock().unwrap();
+                            if state.seek_epoch > local_epoch {
+                                decoder.flush();
+                                local_epoch = state.seek_epoch;
+                                is_first_frame_after_seek = true;
+                            }
+                        }
+
+                        if packet_epoch < local_epoch {
+                            continue;
+                        }
+
+                        if decoder.send_packet(&packet).is_ok() {
+                            let mut decoded = ffmpeg_next::frame::Video::empty();
+                            while decoder.receive_frame(&mut decoded).is_ok() {
+                                if stop_token_video.load(std::sync::atomic::Ordering::Relaxed) {
+                                    return;
+                                }
+                                let mut pts = decoded
+                                    .timestamp()
+                                    .map(|t| t as f64 * tb)
+                                    .or_else(|| decoded.pts().map(|p| p as f64 * tb))
+                                    .unwrap_or(-1.0);
+
+                                if pts < 0.0 {
+                                    pts = fallback_pts_seconds;
+                                    fallback_pts_seconds += 1.0 / 30.0;
+                                } else {
+                                    fallback_pts_seconds = pts + (1.0 / 30.0);
+                                }
+
+                                let mut skip_push = false;
+                                if is_first_frame_after_seek {
+                                    is_first_frame_after_seek = false;
+                                } else {
+                                    loop {
+                                        if stop_token_video
+                                            .load(std::sync::atomic::Ordering::Relaxed)
+                                        {
+                                            return;
+                                        }
+                                        let (cached_seconds, current_epoch, is_paused, track_ended) = {
+                                            let state = state_for_video.lock().unwrap();
+                                            (
+                                                state.current_seconds,
+                                                state.seek_epoch,
+                                                state.is_paused,
+                                                state.track_ended,
+                                            )
+                                        };
+
+                                        if track_ended || current_epoch > local_epoch {
+                                            skip_push = true;
+                                            break;
+                                        }
+
+                                        if pts < cached_seconds - 0.15 {
+                                            skip_push = true;
+                                            break;
+                                        }
+
+                                        if pts <= cached_seconds + 0.05 {
+                                            break;
+                                        }
+
+                                        // Only skip if PTS is wildly ahead due to a broken container discontinuity (>30s)
+                                        if pts > cached_seconds + 30.0 {
+                                            skip_push = true;
+                                            break;
+                                        }
+
+                                        let sleep_dur = if is_paused { 25 } else { 4 };
+                                        std::thread::sleep(std::time::Duration::from_millis(
+                                            sleep_dur,
+                                        ));
+                                    }
+                                }
+
+                                if skip_push {
+                                    continue;
+                                }
+
+                                let mut frame_opt = None;
+                                loop {
+                                    if stop_token_video.load(std::sync::atomic::Ordering::Relaxed) {
+                                        return;
+                                    }
+                                    let (current_epoch, is_paused, track_ended) = {
+                                        let state = state_for_video.lock().unwrap();
+                                        (state.seek_epoch, state.is_paused, state.track_ended)
+                                    };
+                                    if track_ended || current_epoch > local_epoch {
+                                        skip_push = true;
+                                        break;
+                                    }
+                                    match free_video_frame_rx
+                                        .recv_timeout(std::time::Duration::from_millis(10))
+                                    {
+                                        Ok(f) => {
+                                            frame_opt = Some(f);
+                                            break;
+                                        }
+                                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                                            let sleep_dur = if is_paused { 25 } else { 5 };
+                                            std::thread::sleep(std::time::Duration::from_millis(
+                                                sleep_dur,
+                                            ));
+                                        }
+                                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                                            return;
+                                        }
+                                    }
+                                }
+
+                                if skip_push {
+                                    continue;
+                                }
+
+                                if let Some(mut frame) = frame_opt {
+                                    let is_planar_420 = matches!(
+                                        decoded.format(),
+                                        ffmpeg_next::format::Pixel::YUV420P
+                                            | ffmpeg_next::format::Pixel::YUVJ420P
+                                            | ffmpeg_next::format::Pixel::YUV420P10LE
+                                            | ffmpeg_next::format::Pixel::YUV420P12LE
+                                    ) && decoded.planes() >= 3;
+
+                                    let mut converted = ffmpeg_next::frame::Video::empty();
+                                    let src_frame: &ffmpeg_next::frame::Video = if is_planar_420 {
+                                        &decoded
+                                    } else {
+                                        let w = decoded.width();
+                                        let h = decoded.height();
+                                        let fmt = decoded.format();
+                                        let needs_new_scaler =
+                                            scaler.as_ref().is_none_or(|(sf, sw, sh, _)| {
+                                                *sf != fmt || *sw != w || *sh != h
+                                            });
+                                        if needs_new_scaler {
+                                            scaler = ffmpeg_next::software::scaling::Context::get(
+                                                fmt,
+                                                w,
+                                                h,
+                                                ffmpeg_next::format::Pixel::YUV420P,
+                                                w,
+                                                h,
+                                                ffmpeg_next::software::scaling::Flags::BILINEAR,
+                                            )
+                                            .ok()
+                                            .map(|ctx| (fmt, w, h, ctx));
+                                        }
+                                        if let Some((_, _, _, ref mut sws)) = scaler
+                                            && sws.run(&decoded, &mut converted).is_ok()
+                                            && converted.planes() >= 3
+                                        {
+                                            &converted
+                                        } else {
+                                            let _ = free_video_frame_tx.try_send(frame);
+                                            continue;
+                                        }
+                                    };
+
+                                    frame.pts = pts;
+                                    frame.width = src_frame.width();
+                                    frame.height = src_frame.height();
+                                    frame.rotation = rotation;
+
+                                    let format_name = format!("{:?}", src_frame.format());
+                                    frame.bit_depth = if format_name.contains("10LE") {
+                                        10
+                                    } else if format_name.contains("12LE") {
+                                        12
+                                    } else {
+                                        8
+                                    };
+                                    frame.color_space = decoded.color_space() as u32;
+                                    frame.color_range = decoded.color_range() as u32;
+                                    frame.color_trc =
+                                        decoded.color_transfer_characteristic() as u32;
+
+                                    frame.y_stride = src_frame.stride(0);
+                                    frame.u_stride = src_frame.stride(1);
+                                    frame.v_stride = src_frame.stride(2);
+
+                                    let height = src_frame.height() as usize;
+                                    let y_len = frame.y_stride * height;
+                                    let u_len = frame.u_stride * (height / 2);
+                                    let v_len = frame.v_stride * (height / 2);
+
+                                    frame.y_plane.clear();
+                                    let y_plane = src_frame.data(0);
+                                    let y_copy_len = y_len.min(y_plane.len());
+                                    frame.y_plane.extend_from_slice(&y_plane[..y_copy_len]);
+                                    if y_copy_len < y_len {
+                                        frame.y_plane.resize(y_len, 0);
+                                    }
+
+                                    frame.u_plane.clear();
+                                    let u_plane = src_frame.data(1);
+                                    let u_copy_len = u_len.min(u_plane.len());
+                                    frame.u_plane.extend_from_slice(&u_plane[..u_copy_len]);
+                                    if u_copy_len < u_len {
+                                        frame.u_plane.resize(u_len, 0);
+                                    }
+
+                                    frame.v_plane.clear();
+                                    let v_plane = src_frame.data(2);
+                                    let v_copy_len = v_len.min(v_plane.len());
+                                    frame.v_plane.extend_from_slice(&v_plane[..v_copy_len]);
+                                    if v_copy_len < v_len {
+                                        frame.v_plane.resize(v_len, 0);
+                                    }
+
+                                    if let Err(crossbeam_channel::TrySendError::Full(f)) =
+                                        video_frame_tx.try_send(frame)
+                                    {
+                                        let _ = free_video_frame_tx.try_send(f);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+        }
+    });
+
+    (video_packet_tx, video_packet_rx)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn spawn_media_decoder_threads(
     mut audio_source: Box<dyn AudioSource>,
@@ -4994,12 +5354,8 @@ fn spawn_media_decoder_threads(
     prime_chunks: usize,
     _current_path: &str,
 ) {
-    #[cfg(not(target_os = "android"))]
-    let (video_packet_tx, video_packet_rx) = bounded::<(u64, ffmpeg_next::Packet)>(4096);
     #[cfg(target_os = "android")]
     let (_video_packet_tx, video_packet_rx) = bounded::<(u64, ())>(1);
-    #[cfg(not(target_os = "android"))]
-    audio_source.attach_video_queue(video_packet_tx);
 
     #[cfg(target_os = "android")]
     if audio_source.has_video_stream() {
@@ -5011,249 +5367,21 @@ fn spawn_media_decoder_threads(
     }
 
     #[cfg(not(target_os = "android"))]
-    if let Some((params, time_base, rotation)) = audio_source.take_video_parameters() {
-        let (video_frame_tx, video_frame_rx) = bounded::<crate::state::VideoFrame>(16);
-        let (free_video_frame_tx, free_video_frame_rx) = unbounded::<crate::state::VideoFrame>();
-
-        for _ in 0..16 {
-            let _ = free_video_frame_tx.try_send(crate::state::VideoFrame {
-                pts: 0.0,
-                width: 0,
-                height: 0,
+    let video_packet_rx =
+        if let Some((params, time_base, rotation)) = audio_source.take_video_parameters() {
+            let (video_packet_tx, video_packet_rx) = spawn_video_decoder_thread(
+                params,
+                time_base,
                 rotation,
-                y_plane: Vec::new(),
-                u_plane: Vec::new(),
-                v_plane: Vec::new(),
-                y_stride: 0,
-                u_stride: 0,
-                v_stride: 0,
-                bit_depth: 8,
-                color_space: 0,
-                color_range: 0,
-                color_trc: 0,
-            });
-        }
-
-        if let Ok(mut state) = shared_state.lock() {
-            state.video_frame_rx = Some(video_frame_rx);
-            state.free_video_frame_tx = Some(free_video_frame_tx.clone());
-        }
-
-        let state_for_video = shared_state.clone();
-        let video_packet_rx_for_video = video_packet_rx.clone();
-        let stop_token_video = stop_token.clone();
-        std::thread::spawn(move || {
-            if let Ok(context) = ffmpeg_next::codec::context::Context::from_parameters(params)
-                && let Ok(mut decoder) = context.decoder().video()
-            {
-                let tb = time_base.numerator() as f64 / time_base.denominator() as f64;
-                let mut local_epoch = 0;
-                let mut fallback_pts_seconds = 0.0;
-                let mut is_first_frame_after_seek = false;
-
-                while !stop_token_video.load(std::sync::atomic::Ordering::Relaxed) {
-                    match video_packet_rx_for_video
-                        .recv_timeout(std::time::Duration::from_millis(50))
-                    {
-                        Ok((packet_epoch, packet)) => {
-                            {
-                                let state = state_for_video.lock().unwrap();
-                                if state.seek_epoch > local_epoch {
-                                    decoder.flush();
-                                    local_epoch = state.seek_epoch;
-                                    is_first_frame_after_seek = true;
-                                }
-                            }
-
-                            if packet_epoch < local_epoch {
-                                continue;
-                            }
-
-                            if decoder.send_packet(&packet).is_ok() {
-                                let mut decoded = ffmpeg_next::frame::Video::empty();
-                                while decoder.receive_frame(&mut decoded).is_ok() {
-                                    if stop_token_video.load(std::sync::atomic::Ordering::Relaxed) {
-                                        return;
-                                    }
-                                    let mut pts = decoded
-                                        .timestamp()
-                                        .map(|t| t as f64 * tb)
-                                        .or_else(|| decoded.pts().map(|p| p as f64 * tb))
-                                        .unwrap_or(-1.0);
-
-                                    if pts < 0.0 {
-                                        pts = fallback_pts_seconds;
-                                        fallback_pts_seconds += 1.0 / 30.0;
-                                    } else {
-                                        fallback_pts_seconds = pts + (1.0 / 30.0);
-                                    }
-
-                                    let mut skip_push = false;
-                                    if is_first_frame_after_seek {
-                                        is_first_frame_after_seek = false;
-                                    } else {
-                                        let sync_start = std::time::Instant::now();
-                                        loop {
-                                            if stop_token_video
-                                                .load(std::sync::atomic::Ordering::Relaxed)
-                                            {
-                                                return;
-                                            }
-                                            let (
-                                                cached_seconds,
-                                                current_epoch,
-                                                is_paused,
-                                                track_ended,
-                                            ) = {
-                                                let state = state_for_video.lock().unwrap();
-                                                (
-                                                    state.current_seconds,
-                                                    state.seek_epoch,
-                                                    state.is_paused,
-                                                    state.track_ended,
-                                                )
-                                            };
-
-                                            if track_ended || current_epoch > local_epoch {
-                                                skip_push = true;
-                                                break;
-                                            }
-
-                                            if pts < cached_seconds - 0.05 {
-                                                skip_push = true;
-                                                break;
-                                            }
-
-                                            if pts <= cached_seconds + 0.05 {
-                                                break;
-                                            }
-
-                                            if sync_start.elapsed()
-                                                > std::time::Duration::from_millis(500)
-                                            {
-                                                skip_push = true;
-                                                break;
-                                            }
-
-                                            let sleep_dur = if is_paused { 50 } else { 5 };
-                                            std::thread::sleep(std::time::Duration::from_millis(
-                                                sleep_dur,
-                                            ));
-                                        }
-                                    }
-
-                                    if skip_push {
-                                        continue;
-                                    }
-
-                                    let mut frame_opt = None;
-                                    loop {
-                                        if stop_token_video
-                                            .load(std::sync::atomic::Ordering::Relaxed)
-                                        {
-                                            return;
-                                        }
-                                        let (current_epoch, is_paused, track_ended) = {
-                                            let state = state_for_video.lock().unwrap();
-                                            (state.seek_epoch, state.is_paused, state.track_ended)
-                                        };
-                                        if track_ended || current_epoch > local_epoch {
-                                            skip_push = true;
-                                            break;
-                                        }
-                                        match free_video_frame_rx
-                                            .recv_timeout(std::time::Duration::from_millis(10))
-                                        {
-                                            Ok(f) => {
-                                                frame_opt = Some(f);
-                                                break;
-                                            }
-                                            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
-                                                let sleep_dur = if is_paused { 50 } else { 5 };
-                                                std::thread::sleep(
-                                                    std::time::Duration::from_millis(sleep_dur),
-                                                );
-                                            }
-                                            Err(
-                                                crossbeam_channel::RecvTimeoutError::Disconnected,
-                                            ) => {
-                                                return;
-                                            }
-                                        }
-                                    }
-
-                                    if skip_push {
-                                        continue;
-                                    }
-
-                                    if let Some(mut frame) = frame_opt {
-                                        frame.pts = pts;
-                                        frame.width = decoded.width();
-                                        frame.height = decoded.height();
-                                        frame.rotation = rotation;
-
-                                        let format_name = format!("{:?}", decoded.format());
-                                        frame.bit_depth = if format_name.contains("10LE") {
-                                            10
-                                        } else if format_name.contains("12LE") {
-                                            12
-                                        } else {
-                                            8
-                                        };
-                                        frame.color_space = decoded.color_space() as u32;
-                                        frame.color_range = decoded.color_range() as u32;
-                                        frame.color_trc =
-                                            decoded.color_transfer_characteristic() as u32;
-
-                                        frame.y_stride = decoded.stride(0);
-                                        frame.u_stride = decoded.stride(1);
-                                        frame.v_stride = decoded.stride(2);
-
-                                        let height = decoded.height() as usize;
-                                        let y_len = frame.y_stride * height;
-                                        let u_len = frame.u_stride * (height / 2);
-                                        let v_len = frame.v_stride * (height / 2);
-
-                                        frame.y_plane.clear();
-                                        let y_plane = decoded.data(0);
-                                        let y_copy_len = y_len.min(y_plane.len());
-                                        frame.y_plane.extend_from_slice(&y_plane[..y_copy_len]);
-                                        if y_copy_len < y_len {
-                                            frame.y_plane.resize(y_len, 0);
-                                        }
-
-                                        frame.u_plane.clear();
-                                        let u_plane = decoded.data(1);
-                                        let u_copy_len = u_len.min(u_plane.len());
-                                        frame.u_plane.extend_from_slice(&u_plane[..u_copy_len]);
-                                        if u_copy_len < u_len {
-                                            frame.u_plane.resize(u_len, 0);
-                                        }
-
-                                        frame.v_plane.clear();
-                                        let v_plane = decoded.data(2);
-                                        let v_copy_len = v_len.min(v_plane.len());
-                                        frame.v_plane.extend_from_slice(&v_plane[..v_copy_len]);
-                                        if v_copy_len < v_len {
-                                            frame.v_plane.resize(v_len, 0);
-                                        }
-
-                                        if let Err(crossbeam_channel::TrySendError::Full(f)) =
-                                            video_frame_tx.try_send(frame)
-                                        {
-                                            let _ = free_video_frame_tx.try_send(f);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-                        Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-                    }
-                }
-            }
-        });
-    }
+                shared_state.clone(),
+                stop_token.clone(),
+            );
+            audio_source.attach_video_queue(video_packet_tx);
+            video_packet_rx
+        } else {
+            let (_tx, rx) = bounded::<(u64, ffmpeg_next::Packet)>(1);
+            rx
+        };
 
     for _ in 0..pool_size {
         let _ = free_tx.try_send(AudioChunk {

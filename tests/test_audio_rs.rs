@@ -71,14 +71,24 @@ fn test_video_transition_and_fallback() {
     let handle = audio::start_audio_thread(video_path, false, shared_state.clone())
         .expect("Failed to start video audio thread");
     std::thread::sleep(std::time::Duration::from_millis(300));
-    {
+    let rx = {
         let st = shared_state.lock().unwrap();
         assert!(
             st.has_video_stream,
             "Expected has_video_stream to be true for {}",
             video_path
         );
-    }
+        st.video_frame_rx
+            .clone()
+            .expect("Expected video_frame_rx to be populated for video file")
+    };
+    let frame = rx
+        .recv_timeout(std::time::Duration::from_secs(2))
+        .expect("Expected at least one decoded VideoFrame from video decoder thread");
+    assert!(
+        frame.width > 0 && frame.height > 0 && !frame.y_plane.is_empty(),
+        "Expected valid decoded video frame dimensions and Y plane"
+    );
     drop(handle);
 }
 
@@ -266,9 +276,8 @@ fn test_all_audio_test_files() {
                 }
 
                 // Also test start_audio_thread end-to-end playback pipeline!
-                let shared_state = std::sync::Arc::new(std::sync::Mutex::new(
-                    state::AppState::new(path.clone()),
-                ));
+                let shared_state =
+                    std::sync::Arc::new(std::sync::Mutex::new(state::AppState::new(path.clone())));
                 {
                     let mut st = shared_state.lock().unwrap();
                     st.is_paused = false;
@@ -283,11 +292,7 @@ fn test_all_audio_test_files() {
                         std::thread::sleep(std::time::Duration::from_millis(250));
                         let (hw_ch, cur_rate, num_ch, cur_sec, mod_t, spec_max, vu_len, raw_ch_len) = {
                             let st = shared_state.lock().unwrap();
-                            let sm = st
-                                .raw_spectrum_data
-                                .iter()
-                                .copied()
-                                .fold(0.0f32, f32::max);
+                            let sm = st.raw_spectrum_data.iter().copied().fold(0.0f32, f32::max);
                             (
                                 st.hardware_channels,
                                 st.current_sample_rate,
@@ -296,10 +301,7 @@ fn test_all_audio_test_files() {
                                 st.module_type.clone(),
                                 sm,
                                 st.raw_channel_vus.len(),
-                                st.raw_audio_channels
-                                    .first()
-                                    .map(|v| v.len())
-                                    .unwrap_or(0),
+                                st.raw_audio_channels.first().map(|v| v.len()).unwrap_or(0),
                             )
                         };
                         println!(
@@ -323,6 +325,3 @@ fn test_all_audio_test_files() {
         panic!("Sample file failures:\n  {}", failures.join("\n  "));
     }
 }
-
-
-
