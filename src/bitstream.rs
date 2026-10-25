@@ -73,6 +73,7 @@ pub fn start_bitstream_thread(
     let video_setup = crate::audio::probe_video_stream(&ictx);
     let has_video = video_setup.is_some();
 
+    let mut audio_bitrate_kbps = crate::audio::probe_stream_bitrate_kbps(&best_audio);
     let parameters = best_audio.parameters();
     let best_audio_index = best_audio.index();
 
@@ -83,6 +84,45 @@ pub fn start_bitstream_thread(
         .audio()
         .context("Failed to create probe decoder")?;
     let decoder_sample_rate = probe_decoder.rate();
+    if audio_bitrate_kbps.is_none() && probe_decoder.bit_rate() > 0 {
+        audio_bitrate_kbps = Some((probe_decoder.bit_rate() / 1000).max(1) as u32);
+    }
+
+    let video_fps = video_setup.as_ref().map(|vs| vs.fps).unwrap_or(0.0);
+    let mut video_bitrate_kbps = video_setup.as_ref().and_then(|vs| vs.bitrate_kbps);
+    let container_kbps = if ictx.bit_rate() > 0 {
+        Some((ictx.bit_rate() / 1000).max(1) as u32)
+    } else {
+        None
+    };
+    if video_bitrate_kbps.is_none()
+        && has_video
+        && let Some(c_kbps) = container_kbps
+    {
+        let a_kbps = audio_bitrate_kbps.unwrap_or(0);
+        video_bitrate_kbps = Some(if c_kbps > a_kbps {
+            c_kbps - a_kbps
+        } else {
+            c_kbps
+        });
+    }
+    if audio_bitrate_kbps.is_none()
+        && let Some(c_kbps) = container_kbps
+    {
+        if !has_video {
+            audio_bitrate_kbps = Some(c_kbps);
+        } else if let Some(v_kbps) = video_bitrate_kbps
+            && c_kbps > v_kbps
+        {
+            audio_bitrate_kbps = Some(c_kbps - v_kbps);
+        }
+    }
+    if let Ok(mut state) = shared_state.lock() {
+        state.bitrate = audio_bitrate_kbps;
+        state.stats.audio_bitrate_kbps = audio_bitrate_kbps;
+        state.stats.video_fps = video_fps;
+        state.stats.video_bitrate_kbps = video_bitrate_kbps;
+    }
 
     let pw_rate = if codec_name == "truehd" || codec_name == "dts" {
         192000
@@ -140,68 +180,153 @@ pub fn start_bitstream_thread(
         ));
     }
 
-    let (video_stream_index, video_packet_tx, video_packet_rx) = if let Some(vs) = video_setup {
-        let (tx_v, rx_v) = crate::audio::spawn_video_decoder_thread(
-            vs.params,
-            vs.time_base,
-            vs.rotation,
-            shared_state.clone(),
-            stop_token.clone(),
-        );
-        (Some(vs.stream_index), Some(tx_v), Some(rx_v))
-    } else {
-        (None, None, None)
-    };
+    let (video_stream_index, video_time_base, video_packet_tx, video_packet_rx) =
+        if let Some(vs) = video_setup {
+            let tb = vs.time_base;
+            let (tx_v, rx_v) = crate::audio::spawn_video_decoder_thread(
+                vs.params,
+                vs.time_base,
+                vs.rotation,
+                shared_state.clone(),
+                stop_token.clone(),
+            );
+            (Some(vs.stream_index), Some(tb), Some(tx_v), Some(rx_v))
+        } else {
+            (None, None, None, None)
+        };
 
     let pipe_path_clone = pipe_path.clone();
 
     let ffmpeg_thread = std::thread::spawn(move || {
         println!("[bitstream] FFmpeg thread started on Linux.");
 
-        let mut octx = match ffmpeg_next::format::output_as(&pipe_path_clone, "spdif") {
-            Ok(ctx) => ctx,
-            Err(e) => {
-                eprintln!("[bitstream] Failed to open spdif output pipe: {}", e);
-                let _ = child.kill();
-                let _ = std::fs::remove_file(&pipe_path_clone);
-                return;
-            }
-        };
-        let ost_index = {
-            let mut ost = match octx.add_stream(ffmpeg_next::codec::Id::None) {
-                Ok(s) => s,
+        struct SpdifItem {
+            epoch: u64,
+            packet: ffmpeg_next::Packet,
+            time_base: ffmpeg_next::Rational,
+            dsp_messages: Vec<crate::audio::DspMessage>,
+            is_eof: bool,
+        }
+
+        let (spdif_tx, spdif_rx) = crossbeam_channel::bounded::<SpdifItem>(512);
+        let pipe_path_for_pump = pipe_path_clone.clone();
+        let params_for_pump = parameters.clone();
+        let stop_for_pump = stop_token.clone();
+        let state_for_pump = shared_state.clone();
+        let tx_for_pump = tx.clone();
+        let spdif_rx_for_pump = spdif_rx.clone();
+
+        let spdif_pump_handle = std::thread::spawn(move || {
+            let mut octx = match ffmpeg_next::format::output_as(&pipe_path_for_pump, "spdif") {
+                Ok(ctx) => ctx,
                 Err(e) => {
-                    eprintln!("[bitstream] Failed to add spdif stream: {}", e);
-                    let _ = child.kill();
-                    let _ = std::fs::remove_file(&pipe_path_clone);
+                    eprintln!("[bitstream] Failed to open spdif output pipe: {}", e);
                     return;
                 }
             };
-            ost.set_parameters(parameters.clone());
-            ost.index()
-        };
+            let ost_index = {
+                let mut ost = match octx.add_stream(ffmpeg_next::codec::Id::None) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("[bitstream] Failed to add spdif stream: {}", e);
+                        return;
+                    }
+                };
+                ost.set_parameters(params_for_pump);
+                ost.index()
+            };
 
-        let mut dict = ffmpeg_next::Dictionary::new();
-        dict.set("flush_packets", "1");
-        if octx.write_header_with(dict).is_err() {
-            println!("[bitstream] Failed to write header to pipe");
-            let _ = child.kill();
-            let _ = std::fs::remove_file(&pipe_path_clone);
-            return;
-        }
-        let Some(ost_stream) = octx.stream(ost_index) else {
-            let _ = child.kill();
-            let _ = std::fs::remove_file(&pipe_path_clone);
-            return;
-        };
-        let ost_time_base = ost_stream.time_base();
+            let mut dict = ffmpeg_next::Dictionary::new();
+            dict.set("flush_packets", "1");
+            if octx.write_header_with(dict).is_err() {
+                println!("[bitstream] Failed to write header to pipe");
+                return;
+            }
+            let Some(ost_stream) = octx.stream(ost_index) else {
+                return;
+            };
+            let ost_time_base = ost_stream.time_base();
+
+            let mut sent_paused_preview_epoch: Option<u64> = None;
+
+            loop {
+                if stop_for_pump.load(std::sync::atomic::Ordering::Relaxed) {
+                    break;
+                }
+                let (is_paused, latest_epoch) = if let Ok(state) = state_for_pump.try_lock() {
+                    (state.is_paused, state.seek_epoch)
+                } else {
+                    (false, 0)
+                };
+
+                if is_paused {
+                    if let Ok(mut state) = state_for_pump.try_lock() {
+                        state.raw_channel_vus.fill(0.0);
+                        state.raw_spectrum_data.fill(0.0);
+                    }
+                    // If a seek occurred while paused, drain stale packets and emit the first post-seek DspMessage
+                    while let Ok(item) = spdif_rx_for_pump.try_recv() {
+                        if item.epoch < latest_epoch {
+                            continue;
+                        }
+                        if sent_paused_preview_epoch != Some(item.epoch)
+                            && let Some(first_msg) = item.dsp_messages.first()
+                        {
+                            let _ = tx_for_pump.try_send(first_msg.clone());
+                            sent_paused_preview_epoch = Some(item.epoch);
+                        }
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(15));
+                    continue;
+                }
+
+                match spdif_rx_for_pump.recv_timeout(std::time::Duration::from_millis(25)) {
+                    Ok(mut item) => {
+                        let cur_epoch = state_for_pump
+                            .try_lock()
+                            .map(|s| s.seek_epoch)
+                            .unwrap_or(latest_epoch);
+                        if item.epoch < cur_epoch {
+                            continue;
+                        }
+                        if item.is_eof {
+                            if let Ok(mut state) = state_for_pump.lock()
+                                && state.seek_epoch == item.epoch
+                            {
+                                state.track_ended = true;
+                            }
+                            continue;
+                        }
+                        item.packet.rescale_ts(item.time_base, ost_time_base);
+                        item.packet.set_stream(ost_index);
+                        if item.packet.write(&mut octx).is_err() {
+                            break;
+                        }
+                        for msg in item.dsp_messages {
+                            let _ = tx_for_pump.try_send(msg);
+                        }
+                        if let Ok(mut state) = state_for_pump.try_lock() {
+                            state.stats.audio_buffer_fill_pct =
+                                ((spdif_rx_for_pump.len() as f32 / 512.0) * 100.0)
+                                    .clamp(0.0, 100.0);
+                        }
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            let _ = octx.write_trailer();
+        });
 
         let decoder_context =
             match ffmpeg_next::codec::context::Context::from_parameters(parameters.clone()) {
                 Ok(c) => c,
                 Err(e) => {
                     println!("[bitstream] Failed to create decoder context: {}", e);
+                    drop(spdif_tx);
                     let _ = child.kill();
+                    let _ = spdif_pump_handle.join();
                     let _ = std::fs::remove_file(&pipe_path_clone);
                     return;
                 }
@@ -210,7 +335,9 @@ pub fn start_bitstream_thread(
             Ok(d) => d,
             Err(e) => {
                 println!("[bitstream] Failed to create decoder: {}", e);
+                drop(spdif_tx);
                 let _ = child.kill();
+                let _ = spdif_pump_handle.join();
                 let _ = std::fs::remove_file(&pipe_path_clone);
                 return;
             }
@@ -234,177 +361,335 @@ pub fn start_bitstream_thread(
             Ok(r) => r,
             Err(e) => {
                 println!("[bitstream] Failed to create resampler: {}", e);
+                drop(spdif_tx);
                 let _ = child.kill();
+                let _ = spdif_pump_handle.join();
                 let _ = std::fs::remove_file(&pipe_path_clone);
                 return;
             }
         };
 
-        let decoder_rate = decoder.rate() as f32;
-        let window_size = crate::audio::calculate_power_of_two_window_size(decoder.rate());
+        let decoder_rate_u32 = decoder.rate().max(1);
+        let decoder_rate = decoder_rate_u32 as f32;
+        let window_size = crate::audio::calculate_power_of_two_window_size(decoder_rate_u32);
         let update_interval = (decoder_rate / 60.0).ceil() as usize;
         let mut accumulator: Vec<Vec<f32>> = Vec::new();
         let mut samples_since_last_send = 0;
 
         let mut current_seconds = 0.0;
         let mut current_seek_epoch = shared_state.lock().map(|s| s.seek_epoch).unwrap_or(0);
+        let mut seek_in_progress = true;
+        let mut target_seek_time: Option<f64> = None;
+        let mut is_eof = false;
+        let mut audio_pkt_bytes_accum: u64 = 0;
+        let mut audio_pkt_window_start: Option<f64> = None;
 
         'stream_loop: loop {
-            let mut seek_target_opt: Option<f64> = None;
+            if stop_token.load(std::sync::atomic::Ordering::Relaxed) {
+                println!("[bitstream] Stop token received, stopping bitstream.");
+                break 'stream_loop;
+            }
 
-            for (stream, mut packet) in ictx.packets() {
+            // Pace lookahead decoding up to +7.5s ahead of current playback time while checking seek requests
+            let mut seek_target_opt: Option<f64> = None;
+            loop {
                 if stop_token.load(std::sync::atomic::Ordering::Relaxed) {
-                    println!("[bitstream] Stop token received, stopping bitstream.");
                     break 'stream_loop;
                 }
-
-                loop {
-                    if stop_token.load(std::sync::atomic::Ordering::Relaxed) {
-                        break 'stream_loop;
-                    }
-                    let (paused, seek_req) = if let Ok(mut state) = shared_state.try_lock() {
-                        (state.is_paused, state.seek_request.take())
-                    } else {
-                        (false, None)
-                    };
-                    if let Some(target_sec) = seek_req {
-                        seek_target_opt = Some(target_sec);
-                        break;
-                    }
-                    if !paused {
-                        break;
-                    }
-                    if let Ok(mut state) = shared_state.try_lock() {
-                        state.raw_channel_vus.fill(0.0);
-                        state.raw_spectrum_data.fill(0.0);
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(15));
-                }
-
-                if seek_target_opt.is_some() {
+                let (seek_req, playback_sec) = if let Ok(mut state) = shared_state.lock() {
+                    (state.seek_request.take(), state.current_seconds)
+                } else {
+                    (None, current_seconds)
+                };
+                if let Some(target_sec) = seek_req {
+                    seek_target_opt = Some(target_sec);
                     break;
                 }
-
-                if Some(stream.index()) == video_stream_index {
-                    if let Some(ref v_tx) = video_packet_tx {
-                        let _ = v_tx.try_send((current_seek_epoch, packet.clone()));
-                    }
+                if is_eof
+                    || (target_seek_time.is_none()
+                        && current_seconds > playback_sec + 7.5
+                        && spdif_rx.len() > 8)
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
                     continue;
                 }
-
-                if stream.index() == best_audio_index {
-                    let vis_packet = packet.clone();
-
-                    if let Some(pts) = packet.pts() {
-                        current_seconds = pts as f64 * f64::from(stream.time_base());
-                    }
-
-                    packet.rescale_ts(stream.time_base(), ost_time_base);
-                    packet.set_stream(ost_index);
-                    if packet.write(&mut octx).is_err() {
-                        break 'stream_loop; // Pipe broken
-                    }
-
-                    if decoder.send_packet(&vis_packet).is_ok() {
-                        let mut frame = ffmpeg_next::frame::Audio::empty();
-                        while decoder.receive_frame(&mut frame).is_ok() {
-                            let mut resampled = ffmpeg_next::frame::Audio::empty();
-                            if resampler.run(&frame, &mut resampled).is_ok() {
-                                let planes = resampled.channels() as usize;
-                                if accumulator.len() != planes {
-                                    accumulator = vec![Vec::new(); planes];
-                                }
-
-                                let mut fresh_samples = 0;
-                                for (p, acc) in accumulator.iter_mut().enumerate().take(planes) {
-                                    let data = resampled.plane::<f32>(p);
-                                    if p == 0 {
-                                        fresh_samples = data.len();
-                                    }
-                                    acc.extend_from_slice(data);
-                                    let excess = acc.len().saturating_sub(window_size);
-                                    if excess > 0 {
-                                        acc.drain(0..excess);
-                                    }
-                                }
-
-                                samples_since_last_send += fresh_samples;
-
-                                if accumulator.first().map(|a| a.len()).unwrap_or(0) == window_size
-                                    && samples_since_last_send >= update_interval
-                                {
-                                    samples_since_last_send = 0;
-                                    let mut channel_audio_data = Vec::with_capacity(planes);
-                                    let mut channel_vus = Vec::with_capacity(planes);
-                                    let eval_len =
-                                        fresh_samples.max(update_interval).min(window_size);
-
-                                    for acc in accumulator.iter().take(planes) {
-                                        let window = acc.clone();
-                                        let mut peak = 0.0f32;
-                                        let start_idx = window.len().saturating_sub(eval_len);
-                                        for &s in &window[start_idx..] {
-                                            peak = peak.max(s.abs());
-                                        }
-                                        channel_vus.push(peak.clamp(0.0, 1.0));
-                                        channel_audio_data.push(window);
-                                    }
-
-                                    let mut mono_audio_data = vec![0.0f32; window_size];
-                                    for acc in accumulator.iter().take(planes) {
-                                        for (i, &sample) in acc.iter().take(window_size).enumerate()
-                                        {
-                                            mono_audio_data[i] += sample;
-                                        }
-                                    }
-                                    let inv_planes = 1.0 / planes as f32;
-                                    for s in &mut mono_audio_data {
-                                        *s *= inv_planes;
-                                    }
-
-                                    let _ = tx.try_send(crate::audio::DspMessage {
-                                        audio_data: mono_audio_data,
-                                        channel_vus,
-                                        current_order: 0,
-                                        current_row: 0,
-                                        bpm: 0,
-                                        speed: 0,
-                                        current_seconds,
-                                        current_row_string: "".to_string(),
-                                        channel_audio_data,
-                                    });
-                                }
-                            }
-                        }
-                    }
-                }
+                break;
             }
 
             if let Some(target_sec) = seek_target_opt {
                 if let Some(ref v_rx) = video_packet_rx {
                     while v_rx.try_recv().is_ok() {}
                 }
-                let target_ts = (target_sec * ffmpeg_next::ffi::AV_TIME_BASE as f64) as i64;
-                let _ = ictx.seek(target_ts, ..target_ts);
+                while spdif_rx.try_recv().is_ok() {}
+
+                let (seek_stream_idx, target_pts) =
+                    if let (Some(v_idx), Some(tb)) = (video_stream_index, video_time_base) {
+                        let tb_f64 = tb.numerator() as f64 / tb.denominator().max(1) as f64;
+                        (v_idx as i32, (target_sec / tb_f64).max(0.0) as i64)
+                    } else {
+                        (
+                            -1,
+                            (target_sec * ffmpeg_next::ffi::AV_TIME_BASE as f64).max(0.0) as i64,
+                        )
+                    };
+                unsafe {
+                    let ret = ffmpeg_next::ffi::av_seek_frame(
+                        ictx.as_mut_ptr(),
+                        seek_stream_idx,
+                        target_pts,
+                        ffmpeg_next::ffi::AVSEEK_FLAG_BACKWARD,
+                    );
+                    if ret < 0 {
+                        let fallback_pts =
+                            (target_sec * ffmpeg_next::ffi::AV_TIME_BASE as f64).max(0.0) as i64;
+                        ffmpeg_next::ffi::av_seek_frame(
+                            ictx.as_mut_ptr(),
+                            -1,
+                            fallback_pts,
+                            ffmpeg_next::ffi::AVSEEK_FLAG_BACKWARD,
+                        );
+                    }
+                }
                 decoder.flush();
                 for acc in &mut accumulator {
                     acc.clear();
                 }
                 samples_since_last_send = 0;
                 current_seconds = target_sec;
+                seek_in_progress = true;
+                target_seek_time = Some(target_sec);
+                is_eof = false;
+                audio_pkt_bytes_accum = 0;
+                audio_pkt_window_start = None;
                 if let Ok(mut state) = shared_state.lock() {
                     state.seek_epoch += 1;
                     current_seek_epoch = state.seek_epoch;
                     state.current_seconds = target_sec;
+                    state.track_ended = false;
+                    state.lookahead_queue.clear();
+                    state.lookahead_sample_buffer.clear();
+                    state.lookahead_timeline.fill(0.0);
+                    state.lookahead_buffer_start_time = target_sec;
+                    state.waveform_history.clear();
+                    state.raw_waveform.fill(0.0);
                 }
                 continue 'stream_loop;
             }
 
-            break 'stream_loop;
+            let Some((stream, packet)) = ictx.packets().next() else {
+                is_eof = true;
+                let _ = spdif_tx.try_send(SpdifItem {
+                    epoch: current_seek_epoch,
+                    packet: ffmpeg_next::Packet::empty(),
+                    time_base: ffmpeg_next::Rational::new(1, 1),
+                    dsp_messages: Vec::new(),
+                    is_eof: true,
+                });
+                continue 'stream_loop;
+            };
+
+            if Some(stream.index()) == video_stream_index {
+                if let Some(ref v_tx) = video_packet_tx {
+                    let _ = v_tx.try_send((current_seek_epoch, packet.clone()));
+                }
+                continue 'stream_loop;
+            }
+
+            if stream.index() == best_audio_index {
+                let vis_packet = packet.clone();
+                let pkt_tb = stream.time_base();
+                audio_pkt_bytes_accum =
+                    audio_pkt_bytes_accum.saturating_add(packet.size() as u64);
+
+                if let Some(pts) = packet.pts().or_else(|| packet.dts()) {
+                    let pkt_sec = pts as f64 * f64::from(pkt_tb);
+                    if seek_in_progress || (pkt_sec - current_seconds).abs() > 0.25 {
+                        current_seconds = pkt_sec;
+                        seek_in_progress = false;
+                    }
+                    if let Some(start_t) = audio_pkt_window_start {
+                        let win_dur = pkt_sec - start_t;
+                        if win_dur >= 0.5 {
+                            let kbps = ((audio_pkt_bytes_accum as f64 * 8.0)
+                                / (win_dur * 1000.0))
+                                .round() as u32;
+                            if kbps > 0
+                                && let Ok(mut state) = shared_state.try_lock()
+                                && state.stats.audio_bitrate_kbps.is_none()
+                            {
+                                state.bitrate = Some(kbps);
+                                state.stats.audio_bitrate_kbps = Some(kbps);
+                            }
+                            audio_pkt_window_start = Some(pkt_sec);
+                            audio_pkt_bytes_accum = 0;
+                        }
+                    } else {
+                        audio_pkt_window_start = Some(pkt_sec);
+                        audio_pkt_bytes_accum = 0;
+                    }
+                }
+
+                let mut pkt_dsp_messages = Vec::new();
+                let mut skip_spdif_packet = false;
+
+                if decoder.send_packet(&vis_packet).is_ok() {
+                    let mut frame = ffmpeg_next::frame::Audio::empty();
+                    while decoder.receive_frame(&mut frame).is_ok() {
+                        let mut resampled = ffmpeg_next::frame::Audio::empty();
+                        if resampler.run(&frame, &mut resampled).is_ok() {
+                            let fresh_samples = resampled.samples();
+                            let planes = resampled.channels() as usize;
+                            if fresh_samples == 0 || planes == 0 {
+                                continue;
+                            }
+                            let frame_dur = fresh_samples as f64 / decoder_rate_u32 as f64;
+                            if let Some(target_pos) = target_seek_time {
+                                if current_seconds + frame_dur <= target_pos {
+                                    current_seconds += frame_dur;
+                                    skip_spdif_packet = true;
+                                    continue;
+                                } else {
+                                    if current_seconds < target_pos {
+                                        current_seconds = target_pos;
+                                    }
+                                    target_seek_time = None;
+                                    skip_spdif_packet = false;
+                                }
+                            }
+
+                            if accumulator.len() != planes {
+                                accumulator = vec![Vec::new(); planes];
+                            }
+
+                            let mut fresh_planes = Vec::with_capacity(planes);
+                            for (p, acc) in accumulator.iter_mut().enumerate().take(planes) {
+                                let data = &resampled.plane::<f32>(p)[..fresh_samples];
+                                fresh_planes.push(data.to_vec());
+                                acc.extend_from_slice(data);
+                                let excess = acc.len().saturating_sub(window_size);
+                                if excess > 0 {
+                                    acc.drain(0..excess);
+                                }
+                            }
+
+                            if let Ok(mut state) = shared_state.lock()
+                                && state.seek_epoch == current_seek_epoch
+                            {
+                                crate::audio::push_planar_lookahead_slices(
+                                    &mut state,
+                                    &fresh_planes,
+                                    decoder_rate_u32,
+                                    current_seconds,
+                                );
+                            }
+
+                            current_seconds += frame_dur;
+                            samples_since_last_send += fresh_samples;
+                            let acc_len = accumulator.first().map(|a| a.len()).unwrap_or(0);
+
+                            if acc_len > 0 && samples_since_last_send >= update_interval {
+                                samples_since_last_send = 0;
+                                let skip_fft = shared_state
+                                    .try_lock()
+                                    .map(|s| {
+                                        s.video_mode == 3
+                                            && (s.has_video_stream || s.video_frame_rx.is_some())
+                                    })
+                                    .unwrap_or(false);
+
+                                let mut channel_audio_data = Vec::with_capacity(planes);
+                                let mut channel_vus = Vec::with_capacity(planes);
+                                let eval_len = fresh_samples.max(update_interval).min(acc_len);
+
+                                for acc in accumulator.iter().take(planes) {
+                                    let mut peak = 0.0f32;
+                                    let start_idx = acc.len().saturating_sub(eval_len);
+                                    for &s in &acc[start_idx..] {
+                                        peak = peak.max(s.abs());
+                                    }
+                                    channel_vus.push(peak.clamp(0.0, 1.0));
+                                    if !skip_fft {
+                                        if acc.len() == window_size {
+                                            channel_audio_data.push(acc.clone());
+                                        } else {
+                                            let mut padded = vec![0.0f32; window_size];
+                                            let off = window_size.saturating_sub(acc.len());
+                                            padded[off..].copy_from_slice(acc);
+                                            channel_audio_data.push(padded);
+                                        }
+                                    }
+                                }
+
+                                let mono_audio_data = if skip_fft {
+                                    Vec::new()
+                                } else {
+                                    let mut mono = vec![0.0f32; window_size];
+                                    for acc in accumulator.iter().take(planes) {
+                                        let off = window_size.saturating_sub(acc.len());
+                                        for (i, &sample) in
+                                            acc.iter().take(window_size).enumerate()
+                                        {
+                                            mono[off + i] += sample;
+                                        }
+                                    }
+                                    let inv_planes = 1.0 / planes as f32;
+                                    for s in &mut mono {
+                                        *s *= inv_planes;
+                                    }
+                                    mono
+                                };
+
+                                pkt_dsp_messages.push(crate::audio::DspMessage {
+                                    audio_data: mono_audio_data,
+                                    channel_vus,
+                                    current_order: 0,
+                                    current_row: 0,
+                                    bpm: 0,
+                                    speed: 0,
+                                    current_seconds,
+                                    current_row_string: String::new(),
+                                    channel_audio_data,
+                                    seek_epoch: current_seek_epoch,
+                                });
+                            }
+                        }
+                    }
+                }
+
+                if !skip_spdif_packet {
+                    let mut pending_item = Some(SpdifItem {
+                        epoch: current_seek_epoch,
+                        packet,
+                        time_base: pkt_tb,
+                        dsp_messages: pkt_dsp_messages,
+                        is_eof: false,
+                    });
+                    while let Some(item) = pending_item.take() {
+                        if stop_token.load(std::sync::atomic::Ordering::Relaxed) {
+                            break 'stream_loop;
+                        }
+                        if let Ok(state) = shared_state.try_lock()
+                            && (state.seek_request.is_some() || state.seek_epoch > item.epoch)
+                        {
+                            break;
+                        }
+                        match spdif_tx.send_timeout(item, std::time::Duration::from_millis(15)) {
+                            Ok(()) => break,
+                            Err(crossbeam_channel::SendTimeoutError::Timeout(it)) => {
+                                pending_item = Some(it);
+                            }
+                            Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
+                                break 'stream_loop;
+                            }
+                        }
+                    }
+                }
+            }
         }
-        let _ = octx.write_trailer();
+        drop(spdif_tx);
         let _ = child.kill();
         let _ = child.wait();
+        let _ = spdif_pump_handle.join();
         let _ = std::fs::remove_file(&pipe_path_clone);
         println!("[bitstream] FFmpeg thread finished on Linux.");
     });
@@ -897,7 +1182,7 @@ mod wasapi_bitstream {
         let mut ictx = ffmpeg_next::format::input_with_dictionary(&file_path, dict)
             .context("Failed to open input file")?;
 
-        let (codec_id, best_audio_index, parameters, stream_time_base) = {
+        let (codec_id, best_audio_index, parameters, stream_time_base, mut audio_bitrate_kbps) = {
             let best_audio = ictx
                 .streams()
                 .best(ffmpeg_next::media::Type::Audio)
@@ -907,6 +1192,7 @@ mod wasapi_bitstream {
                 best_audio.index(),
                 best_audio.parameters(),
                 f64::from(best_audio.time_base()),
+                crate::audio::probe_stream_bitrate_kbps(&best_audio),
             )
         };
 
@@ -918,11 +1204,49 @@ mod wasapi_bitstream {
             .context("Failed to create probe decoder")?;
         let decoder_sample_rate = probe_decoder.rate();
         let src_channels = probe_decoder.channels();
+        if audio_bitrate_kbps.is_none() && probe_decoder.bit_rate() > 0 {
+            audio_bitrate_kbps = Some((probe_decoder.bit_rate() / 1000).max(1) as u32);
+        }
 
         let (codec_name, stream_type, profiles) =
             detect_codec_profile(codec_id, src_channels, decoder_sample_rate)?;
         let video_setup = crate::audio::probe_video_stream(&ictx);
         let has_video = video_setup.is_some();
+        let video_fps = video_setup.as_ref().map(|vs| vs.fps).unwrap_or(0.0);
+        let mut video_bitrate_kbps = video_setup.as_ref().and_then(|vs| vs.bitrate_kbps);
+        let container_kbps = if ictx.bit_rate() > 0 {
+            Some((ictx.bit_rate() / 1000).max(1) as u32)
+        } else {
+            None
+        };
+        if video_bitrate_kbps.is_none()
+            && has_video
+            && let Some(c_kbps) = container_kbps
+        {
+            let a_kbps = audio_bitrate_kbps.unwrap_or(0);
+            video_bitrate_kbps = Some(if c_kbps > a_kbps {
+                c_kbps - a_kbps
+            } else {
+                c_kbps
+            });
+        }
+        if audio_bitrate_kbps.is_none()
+            && let Some(c_kbps) = container_kbps
+        {
+            if !has_video {
+                audio_bitrate_kbps = Some(c_kbps);
+            } else if let Some(v_kbps) = video_bitrate_kbps
+                && c_kbps > v_kbps
+            {
+                audio_bitrate_kbps = Some(c_kbps - v_kbps);
+            }
+        }
+        if let Ok(mut state) = shared_state.lock() {
+            state.bitrate = audio_bitrate_kbps;
+            state.stats.audio_bitrate_kbps = audio_bitrate_kbps;
+            state.stats.video_fps = video_fps;
+            state.stats.video_bitrate_kbps = video_bitrate_kbps;
+        }
         let meta_duration = if ictx.duration() > 0 {
             ictx.duration() as f64 / ffmpeg_next::ffi::AV_TIME_BASE as f64
         } else {
@@ -1196,7 +1520,7 @@ mod wasapi_bitstream {
                     is_eof: bool,
                 }
 
-                let (pcm_tx, pcm_rx) = crossbeam_channel::bounded::<AudioPacket>(64);
+                let (pcm_tx, pcm_rx) = crossbeam_channel::bounded::<AudioPacket>(1024);
                 let (vis_tx, vis_rx) = crossbeam_channel::bounded::<DspMessage>(1024);
 
                 let stop_token_ffmpeg = stop_token_pump.clone();
@@ -1333,7 +1657,10 @@ mod wasapi_bitstream {
                             let update_interval = ((decoder_rate / 60.0).round() as usize).max(256);
                             let mut accumulator: Vec<Vec<f32>> =
                                 vec![vec![0.0f32; window_size]; target_ch];
+                            let mut samples_since_last_send = 0usize;
                             let mut current_seconds = 0.0;
+                            let mut seek_in_progress = true;
+                            let mut target_seek_time: Option<f64> = None;
 
                             let mut resampler: Option<
                                 ffmpeg_next::software::resampling::context::Context,
@@ -1348,32 +1675,43 @@ mod wasapi_bitstream {
                                 .map(|s| s.seek_epoch)
                                 .unwrap_or(0);
                             let mut is_eof = false;
-                            let mut seek_sync_pending = false;
+                            let mut audio_pkt_bytes_accum: u64 = 0;
+                            let mut audio_pkt_window_start: Option<f64> = None;
 
                             loop {
                                 if stop_token_worker.load(std::sync::atomic::Ordering::Relaxed) {
                                     break;
                                 }
 
-                                let seek_req = {
+                                let (seek_req, playback_sec) = {
                                     if let Ok(mut state) = shared_state_worker.lock() {
                                         if let Some(target) = state.seek_request.take() {
                                             state.seek_epoch += 1;
                                             state.current_seconds = target;
                                             state.track_ended = false;
-                                            Some((target, state.seek_epoch))
+                                            state.lookahead_queue.clear();
+                                            state.lookahead_sample_buffer.clear();
+                                            state.lookahead_timeline.fill(0.0);
+                                            state.lookahead_buffer_start_time = target;
+                                            state.waveform_history.clear();
+                                            state.raw_waveform.fill(0.0);
+                                            (Some((target, state.seek_epoch)), target)
                                         } else {
-                                            None
+                                            (None, state.current_seconds)
                                         }
                                     } else {
-                                        None
+                                        (None, current_seconds)
                                     }
                                 };
 
                                 if let Some((pos, epoch)) = seek_req {
                                     current_seek_epoch = epoch;
                                     is_eof = false;
-                                    seek_sync_pending = true;
+                                    seek_in_progress = true;
+                                    target_seek_time = Some(pos);
+                                    samples_since_last_send = 0;
+                                    audio_pkt_bytes_accum = 0;
+                                    audio_pkt_window_start = None;
                                     if let Some(ref v_rx) = video_packet_rx {
                                         while v_rx.try_recv().is_ok() {}
                                     }
@@ -1427,8 +1765,12 @@ mod wasapi_bitstream {
                                     current_seconds = pos;
                                 }
 
-                                if is_eof {
-                                    std::thread::sleep(std::time::Duration::from_millis(20));
+                                if is_eof
+                                    || (target_seek_time.is_none()
+                                        && current_seconds > playback_sec + 7.5
+                                        && pcm_rx_worker.len() > 16)
+                                {
+                                    std::thread::sleep(std::time::Duration::from_millis(10));
                                     continue;
                                 }
 
@@ -1445,33 +1787,43 @@ mod wasapi_bitstream {
                                 }
                                 if stream.index() == best_audio_index {
                                     let vis_packet = packet.clone();
+                                    audio_pkt_bytes_accum =
+                                        audio_pkt_bytes_accum.saturating_add(packet.size() as u64);
 
                                     let pts = packet.pts().or_else(|| packet.dts());
                                     if let Some(p) = pts {
-                                        current_seconds = p as f64 * f64::from(stream.time_base());
-                                        if seek_sync_pending {
-                                            seek_sync_pending = false;
-                                            if let Ok(mut state) = shared_state_worker.lock()
-                                                && state.seek_epoch == current_seek_epoch
-                                            {
-                                                state.current_seconds = current_seconds;
+                                        let pkt_sec = p as f64 * f64::from(stream.time_base());
+                                        if seek_in_progress
+                                            || (pkt_sec - current_seconds).abs() > 0.25
+                                        {
+                                            current_seconds = pkt_sec;
+                                            seek_in_progress = false;
+                                        }
+                                        if let Some(start_t) = audio_pkt_window_start {
+                                            let win_dur = pkt_sec - start_t;
+                                            if win_dur >= 0.5 {
+                                                let kbps = ((audio_pkt_bytes_accum as f64 * 8.0)
+                                                    / (win_dur * 1000.0))
+                                                    .round()
+                                                    as u32;
+                                                if kbps > 0
+                                                    && let Ok(mut state) =
+                                                        shared_state_worker.try_lock()
+                                                    && state.stats.audio_bitrate_kbps.is_none()
+                                                {
+                                                    state.bitrate = Some(kbps);
+                                                    state.stats.audio_bitrate_kbps = Some(kbps);
+                                                }
+                                                audio_pkt_window_start = Some(pkt_sec);
+                                                audio_pkt_bytes_accum = 0;
                                             }
+                                        } else {
+                                            audio_pkt_window_start = Some(pkt_sec);
+                                            audio_pkt_bytes_accum = 0;
                                         }
                                     }
 
-                                    packet.set_pts(None);
-                                    packet.set_dts(None);
-                                    packet.set_position(-1);
-                                    packet.set_stream(ost_index);
-
-                                    if let Err(e) = packet.write(&mut octx) {
-                                        eprintln!(
-                                            "[bitstream] Failed to write packet to spdif: {}",
-                                            e
-                                        );
-                                        break;
-                                    }
-
+                                    let mut skip_spdif_packet = false;
                                     if decoder.send_packet(&vis_packet).is_ok() {
                                         let mut frame = ffmpeg_next::frame::Audio::empty();
                                         while decoder.receive_frame(&mut frame).is_ok() {
@@ -1515,8 +1867,49 @@ mod wasapi_bitstream {
                                                     let total_samples = vis_frame.samples();
                                                     let planes = (vis_frame.channels() as usize)
                                                         .min(target_ch);
-                                                    let mut sample_offset = 0;
+                                                    if total_samples == 0 || planes == 0 {
+                                                        continue;
+                                                    }
+                                                    let rate_u32 = decoder.rate().max(1);
+                                                    let frame_dur =
+                                                        total_samples as f64 / rate_u32 as f64;
+                                                    if let Some(target_pos) = target_seek_time {
+                                                        if current_seconds + frame_dur <= target_pos
+                                                        {
+                                                            current_seconds += frame_dur;
+                                                            skip_spdif_packet = true;
+                                                            continue;
+                                                        } else {
+                                                            if current_seconds < target_pos {
+                                                                current_seconds = target_pos;
+                                                            }
+                                                            target_seek_time = None;
+                                                            skip_spdif_packet = false;
+                                                        }
+                                                    }
 
+                                                    let mut fresh_planes =
+                                                        Vec::with_capacity(planes);
+                                                    for p in 0..planes {
+                                                        fresh_planes.push(
+                                                            vis_frame.plane::<f32>(p)
+                                                                [..total_samples]
+                                                                .to_vec(),
+                                                        );
+                                                    }
+                                                    if let Ok(mut state) =
+                                                        shared_state_worker.lock()
+                                                        && state.seek_epoch == current_seek_epoch
+                                                    {
+                                                        crate::audio::push_planar_lookahead_slices(
+                                                            &mut state,
+                                                            &fresh_planes,
+                                                            rate_u32,
+                                                            current_seconds,
+                                                        );
+                                                    }
+
+                                                    let mut sample_offset = 0;
                                                     while sample_offset < total_samples {
                                                         let step = (total_samples - sample_offset)
                                                             .min(update_interval);
@@ -1539,50 +1932,73 @@ mod wasapi_bitstream {
                                                             }
                                                         }
 
+                                                        sample_offset += step;
+                                                        samples_since_last_send += step;
+                                                        if samples_since_last_send
+                                                            < update_interval
+                                                        {
+                                                            continue;
+                                                        }
+                                                        samples_since_last_send = 0;
+
+                                                        let slice_time = current_seconds
+                                                            + (sample_offset as f64
+                                                                / rate_u32 as f64);
+                                                        let skip_fft = shared_state_worker
+                                                            .try_lock()
+                                                            .map(|s| {
+                                                                s.video_mode == 3
+                                                                    && (s.has_video_stream
+                                                                        || s.video_frame_rx
+                                                                            .is_some())
+                                                            })
+                                                            .unwrap_or(false);
+
                                                         let mut channel_audio_data =
                                                             Vec::with_capacity(target_ch);
                                                         let mut channel_vus =
                                                             Vec::with_capacity(target_ch);
+                                                        let eval_len = step.max(update_interval);
                                                         for acc in
                                                             accumulator.iter().take(target_ch)
                                                         {
-                                                            let window = acc.clone();
                                                             let mut peak = 0.0f32;
-                                                            let start_idx =
-                                                                window.len().saturating_sub(step);
-                                                            for &s in &window[start_idx..] {
+                                                            let start_idx = acc
+                                                                .len()
+                                                                .saturating_sub(eval_len);
+                                                            for &s in &acc[start_idx..] {
                                                                 peak = peak.max(s.abs());
                                                             }
                                                             channel_vus.push(peak.clamp(0.0, 1.0));
-                                                            channel_audio_data.push(window);
-                                                        }
-
-                                                        let mut mono_audio_data =
-                                                            vec![0.0f32; window_size];
-                                                        for acc in
-                                                            accumulator.iter().take(target_ch)
-                                                        {
-                                                            for (i, &sample) in acc
-                                                                .iter()
-                                                                .take(window_size)
-                                                                .enumerate()
-                                                            {
-                                                                mono_audio_data[i] += sample;
+                                                            if !skip_fft {
+                                                                channel_audio_data
+                                                                    .push(acc.clone());
                                                             }
                                                         }
-                                                        let inv_ch = 1.0 / target_ch.max(1) as f32;
-                                                        for s in &mut mono_audio_data {
-                                                            *s *= inv_ch;
-                                                        }
 
-                                                        let slice_time = current_seconds
-                                                            + (sample_offset as f64
-                                                                / decoder.rate() as f64);
-                                                        if let Ok(mut state) =
-                                                            shared_state_worker.try_lock()
-                                                        {
-                                                            crate::audio::push_planar_lookahead_slices(&mut state, &channel_audio_data, decoder.rate(), slice_time);
-                                                        }
+                                                        let mono_audio_data = if skip_fft {
+                                                            Vec::new()
+                                                        } else {
+                                                            let mut mono =
+                                                                vec![0.0f32; window_size];
+                                                            for acc in
+                                                                accumulator.iter().take(target_ch)
+                                                            {
+                                                                for (i, &sample) in acc
+                                                                    .iter()
+                                                                    .take(window_size)
+                                                                    .enumerate()
+                                                                {
+                                                                    mono[i] += sample;
+                                                                }
+                                                            }
+                                                            let inv_ch =
+                                                                1.0 / target_ch.max(1) as f32;
+                                                            for s in &mut mono {
+                                                                *s *= inv_ch;
+                                                            }
+                                                            mono
+                                                        };
                                                         let vis_msg = DspMessage {
                                                             audio_data: mono_audio_data,
                                                             channel_vus,
@@ -1593,12 +2009,28 @@ mod wasapi_bitstream {
                                                             current_seconds: slice_time,
                                                             current_row_string: String::new(),
                                                             channel_audio_data,
+                                                            seek_epoch: current_seek_epoch,
                                                         };
                                                         let _ = vis_tx_worker.try_send(vis_msg);
-                                                        sample_offset += step;
                                                     }
+                                                    current_seconds += frame_dur;
                                                 }
                                             }
+                                        }
+                                    }
+
+                                    if !skip_spdif_packet {
+                                        packet.set_pts(None);
+                                        packet.set_dts(None);
+                                        packet.set_position(-1);
+                                        packet.set_stream(ost_index);
+
+                                        if let Err(e) = packet.write(&mut octx) {
+                                            eprintln!(
+                                                "[bitstream] Failed to write packet to spdif: {}",
+                                                e
+                                            );
+                                            break;
                                         }
                                     }
                                 }
@@ -1730,6 +2162,7 @@ mod wasapi_bitstream {
                             let update_interval = ((out_rate / 60.0).round() as usize).max(256);
                             let mut accumulator: Vec<Vec<f32>> =
                                 vec![vec![0.0f32; window_size]; target_channels];
+                            let mut samples_since_last_send = 0usize;
                             let mut current_seconds = 0.0;
 
                             let mut pcm_resampler: Option<
@@ -1745,7 +2178,9 @@ mod wasapi_bitstream {
 
                             let mut process_frame =
                                 |frame: &ffmpeg_next::frame::Audio,
-                                 current_seconds: f64,
+                                 current_seconds: &mut f64,
+                                 target_seek_time: &mut Option<f64>,
+                                 samples_since_last_send: &mut usize,
                                  epoch: u64,
                                  accumulator: &mut [Vec<f32>]| {
                                     let frame_layout = if frame.channel_layout().channels() > 0 {
@@ -1782,6 +2217,22 @@ mod wasapi_bitstream {
                                         cur_in_rate = frame.rate();
                                     }
 
+                                    let rate_f64 = profile_clone.rate.max(1) as f64;
+                                    let est_samples = frame.samples();
+                                    let est_dur =
+                                        est_samples as f64 / frame.rate().max(1) as f64;
+                                    if let Some(target_pos) = *target_seek_time {
+                                        if *current_seconds + est_dur <= target_pos {
+                                            *current_seconds += est_dur;
+                                            return;
+                                        } else {
+                                            if *current_seconds < target_pos {
+                                                *current_seconds = target_pos;
+                                            }
+                                            *target_seek_time = None;
+                                        }
+                                    }
+
                                     if let Some(ref mut presamp) = pcm_resampler {
                                         let mut pcm_frame = ffmpeg_next::frame::Audio::empty();
                                         if presamp.run(&frame, &mut pcm_frame).is_ok() {
@@ -1803,7 +2254,8 @@ mod wasapi_bitstream {
                                                         return;
                                                     }
                                                     if let Ok(state) = shared_state_lpcm.try_lock()
-                                                        && state.seek_request.is_some()
+                                                        && (state.seek_request.is_some()
+                                                            || state.seek_epoch > chunk.epoch)
                                                     {
                                                         return;
                                                     }
@@ -1827,6 +2279,27 @@ mod wasapi_bitstream {
                                             let total_samples = vis_frame.samples();
                                             let planes = (vis_frame.channels() as usize)
                                                 .min(target_channels);
+                                            if total_samples == 0 || planes == 0 {
+                                                return;
+                                            }
+                                            let mut fresh_planes = Vec::with_capacity(planes);
+                                            for p in 0..planes {
+                                                fresh_planes.push(
+                                                    vis_frame.plane::<f32>(p)[..total_samples]
+                                                        .to_vec(),
+                                                );
+                                            }
+                                            if let Ok(mut state) = shared_state_lpcm.lock()
+                                                && state.seek_epoch == epoch
+                                            {
+                                                crate::audio::push_planar_lookahead_slices(
+                                                    &mut state,
+                                                    &fresh_planes,
+                                                    profile_clone.rate,
+                                                    *current_seconds,
+                                                );
+                                            }
+
                                             let mut sample_offset = 0;
 
                                             while sample_offset < total_samples {
@@ -1847,49 +2320,65 @@ mod wasapi_bitstream {
                                                     }
                                                 }
 
+                                                sample_offset += step;
+                                                *samples_since_last_send += step;
+                                                if *samples_since_last_send < update_interval {
+                                                    continue;
+                                                }
+                                                *samples_since_last_send = 0;
+
+                                                let slice_time = *current_seconds
+                                                    + (sample_offset as f64 / rate_f64);
+                                                let skip_fft = shared_state_lpcm
+                                                    .try_lock()
+                                                    .map(|s| {
+                                                        s.video_mode == 3
+                                                            && (s.has_video_stream
+                                                                || s.video_frame_rx.is_some())
+                                                    })
+                                                    .unwrap_or(false);
+
                                                 let mut channel_audio_data =
                                                     Vec::with_capacity(target_channels);
                                                 let mut channel_vus =
                                                     Vec::with_capacity(target_channels);
+                                                let eval_len = step.max(update_interval);
                                                 for acc in accumulator.iter().take(target_channels)
                                                 {
-                                                    let window = acc.clone();
                                                     let mut peak = 0.0f32;
                                                     let start_idx =
-                                                        window.len().saturating_sub(step);
-                                                    for &s in &window[start_idx..] {
+                                                        acc.len().saturating_sub(eval_len);
+                                                    for &s in &acc[start_idx..] {
                                                         peak = peak.max(s.abs());
                                                     }
                                                     channel_vus.push(peak.clamp(0.0, 1.0));
-                                                    channel_audio_data.push(window);
-                                                }
-
-                                                let mut mono_audio_data = vec![0.0f32; window_size];
-                                                for acc in accumulator.iter().take(target_channels)
-                                                {
-                                                    for (i, &sample) in
-                                                        acc.iter().take(window_size).enumerate()
-                                                    {
-                                                        mono_audio_data[i] += sample;
+                                                    if !skip_fft {
+                                                        channel_audio_data.push(acc.clone());
                                                     }
                                                 }
-                                                let inv_ch = 1.0 / target_channels.max(1) as f32;
-                                                for s in &mut mono_audio_data {
-                                                    *s *= inv_ch;
-                                                }
 
-                                                let slice_time = current_seconds
-                                                    + (sample_offset as f64
-                                                        / profile_clone.rate as f64);
-                                                if let Ok(mut state) = shared_state_lpcm.try_lock()
-                                                {
-                                                    crate::audio::push_planar_lookahead_slices(
-                                                        &mut state,
-                                                        &channel_audio_data,
-                                                        profile_clone.rate,
-                                                        slice_time,
-                                                    );
-                                                }
+                                                let mono_audio_data = if skip_fft {
+                                                    Vec::new()
+                                                } else {
+                                                    let mut mono = vec![0.0f32; window_size];
+                                                    for acc in
+                                                        accumulator.iter().take(target_channels)
+                                                    {
+                                                        for (i, &sample) in acc
+                                                            .iter()
+                                                            .take(window_size)
+                                                            .enumerate()
+                                                        {
+                                                            mono[i] += sample;
+                                                        }
+                                                    }
+                                                    let inv_ch =
+                                                        1.0 / target_channels.max(1) as f32;
+                                                    for s in &mut mono {
+                                                        *s *= inv_ch;
+                                                    }
+                                                    mono
+                                                };
                                                 let vis_msg = DspMessage {
                                                     audio_data: mono_audio_data,
                                                     channel_vus,
@@ -1900,42 +2389,59 @@ mod wasapi_bitstream {
                                                     current_seconds: slice_time,
                                                     current_row_string: String::new(),
                                                     channel_audio_data,
+                                                    seek_epoch: epoch,
                                                 };
                                                 let _ = vis_tx_lpcm.try_send(vis_msg);
-                                                sample_offset += step;
                                             }
+                                            *current_seconds += total_samples as f64 / rate_f64;
                                         }
                                     }
                                 };
 
-                            let mut current_seek_epoch = 0u64;
+                            let mut current_seek_epoch = shared_state_lpcm
+                                .lock()
+                                .map(|s| s.seek_epoch)
+                                .unwrap_or(0);
                             let mut is_eof = false;
-                            let mut seek_sync_pending = false;
+                            let mut seek_in_progress = true;
+                            let mut target_seek_time: Option<f64> = None;
+                            let mut audio_pkt_bytes_accum: u64 = 0;
+                            let mut audio_pkt_window_start: Option<f64> = None;
 
                             loop {
                                 if stop_token_lpcm.load(std::sync::atomic::Ordering::Relaxed) {
                                     break;
                                 }
 
-                                let seek_req = {
+                                let (seek_req, playback_sec) = {
                                     if let Ok(mut state) = shared_state_lpcm.lock() {
                                         if let Some(target) = state.seek_request.take() {
                                             state.seek_epoch += 1;
                                             state.current_seconds = target;
                                             state.track_ended = false;
-                                            Some((target, state.seek_epoch))
+                                            state.lookahead_queue.clear();
+                                            state.lookahead_sample_buffer.clear();
+                                            state.lookahead_timeline.fill(0.0);
+                                            state.lookahead_buffer_start_time = target;
+                                            state.waveform_history.clear();
+                                            state.raw_waveform.fill(0.0);
+                                            (Some((target, state.seek_epoch)), target)
                                         } else {
-                                            None
+                                            (None, state.current_seconds)
                                         }
                                     } else {
-                                        None
+                                        (None, current_seconds)
                                     }
                                 };
 
                                 if let Some((pos, epoch)) = seek_req {
                                     current_seek_epoch = epoch;
                                     is_eof = false;
-                                    seek_sync_pending = true;
+                                    seek_in_progress = true;
+                                    target_seek_time = Some(pos);
+                                    samples_since_last_send = 0;
+                                    audio_pkt_bytes_accum = 0;
+                                    audio_pkt_window_start = None;
                                     if let Some(ref v_rx) = video_packet_rx {
                                         while v_rx.try_recv().is_ok() {}
                                     }
@@ -1989,8 +2495,12 @@ mod wasapi_bitstream {
                                     current_seconds = pos;
                                 }
 
-                                if is_eof {
-                                    std::thread::sleep(std::time::Duration::from_millis(20));
+                                if is_eof
+                                    || (target_seek_time.is_none()
+                                        && current_seconds > playback_sec + 7.5
+                                        && pcm_rx_lpcm.len() > 16)
+                                {
+                                    std::thread::sleep(std::time::Duration::from_millis(10));
                                     continue;
                                 }
 
@@ -2006,16 +2516,43 @@ mod wasapi_bitstream {
                                                     .try_send((current_seek_epoch, packet.clone()));
                                             }
                                         } else if stream.index() == best_audio_index {
+                                            audio_pkt_bytes_accum = audio_pkt_bytes_accum
+                                                .saturating_add(packet.size() as u64);
                                             let pts = packet.pts().or_else(|| packet.dts());
                                             if let Some(p) = pts {
-                                                current_seconds = p as f64 * stream_time_base;
-                                                if seek_sync_pending {
-                                                    seek_sync_pending = false;
-                                                    if let Ok(mut state) = shared_state_lpcm.lock()
-                                                        && state.seek_epoch == current_seek_epoch
-                                                    {
-                                                        state.current_seconds = current_seconds;
+                                                let pkt_sec = p as f64 * stream_time_base;
+                                                if seek_in_progress
+                                                    || (pkt_sec - current_seconds).abs() > 0.25
+                                                {
+                                                    current_seconds = pkt_sec;
+                                                    seek_in_progress = false;
+                                                }
+                                                if let Some(start_t) = audio_pkt_window_start {
+                                                    let win_dur = pkt_sec - start_t;
+                                                    if win_dur >= 0.5 {
+                                                        let kbps = ((audio_pkt_bytes_accum as f64
+                                                            * 8.0)
+                                                            / (win_dur * 1000.0))
+                                                            .round()
+                                                            as u32;
+                                                        if kbps > 0
+                                                            && let Ok(mut state) =
+                                                                shared_state_lpcm.try_lock()
+                                                            && state
+                                                                .stats
+                                                                .audio_bitrate_kbps
+                                                                .is_none()
+                                                        {
+                                                            state.bitrate = Some(kbps);
+                                                            state.stats.audio_bitrate_kbps =
+                                                                Some(kbps);
+                                                        }
+                                                        audio_pkt_window_start = Some(pkt_sec);
+                                                        audio_pkt_bytes_accum = 0;
                                                     }
+                                                } else {
+                                                    audio_pkt_window_start = Some(pkt_sec);
+                                                    audio_pkt_bytes_accum = 0;
                                                 }
                                             }
 
@@ -2034,7 +2571,9 @@ mod wasapi_bitstream {
                                                     }
                                                     process_frame(
                                                         &frame,
-                                                        current_seconds,
+                                                        &mut current_seconds,
+                                                        &mut target_seek_time,
+                                                        &mut samples_since_last_send,
                                                         current_seek_epoch,
                                                         &mut accumulator,
                                                     );
@@ -2053,7 +2592,9 @@ mod wasapi_bitstream {
                                             }
                                             process_frame(
                                                 &frame,
-                                                current_seconds,
+                                                &mut current_seconds,
+                                                &mut target_seek_time,
+                                                &mut samples_since_last_send,
                                                 current_seek_epoch,
                                                 &mut accumulator,
                                             );

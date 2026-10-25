@@ -887,6 +887,8 @@ async fn run_gui(
                                 let target = (state.current_seconds + delta)
                                     .clamp(0.0, state.duration_seconds);
                                 state.seek_request = Some(target);
+                                state.current_seconds = target;
+                                state.track_ended = false;
                                 state.spectrum_history.clear();
                                 for _ in 0..120 {
                                     state.spectrum_history.push_back(vec![0.0; 1024]);
@@ -1651,6 +1653,11 @@ async fn run_gui(
                                         state.video_mode = 0;
                                         state.stats.bitstream_active = false;
                                         state.stats.audio_buffer_fill_pct = 0.0;
+                                        state.stats.video_buffer_fill_pct = 0.0;
+                                        state.stats.video_hw_decoder.clear();
+                                        state.stats.video_fps = 0.0;
+                                        state.stats.video_bitrate_kbps = None;
+                                        state.stats.audio_bitrate_kbps = None;
                                         state.track_ended = false;
                                     }
 
@@ -1755,76 +1762,82 @@ async fn run_gui(
                                     }
                                 }
 
-                                if state.channel_vus.len() != state.raw_channel_vus.len() {
-                                    state.channel_vus = vec![0.0; state.raw_channel_vus.len()];
-                                }
-                                for i in 0..state.raw_channel_vus.len() {
-                                    if state.raw_channel_vus[i] > state.channel_vus[i] {
-                                        state.channel_vus[i] = state.raw_channel_vus[i];
-                                    } else {
-                                        state.channel_vus[i] = (state.channel_vus[i]
-                                            - (0.015 * time_scale))
-                                            .max(state.raw_channel_vus[i]);
-                                    }
-                                }
+                                let fullscreen_video_no_vis = state.video_mode == 3
+                                    && (state.has_video_stream || state.video_frame_rx.is_some());
 
-                                if state.peak_vus.len() != state.channel_vus.len() {
-                                    state.peak_vus = vec![0.0; state.channel_vus.len()];
-                                }
-                                for i in 0..state.channel_vus.len() {
-                                    state.peak_vus[i] =
-                                        (state.peak_vus[i] - (0.005 * time_scale)).max(0.0);
-                                    if state.channel_vus[i] > state.peak_vus[i] {
-                                        state.peak_vus[i] = state.channel_vus[i];
+                                if !fullscreen_video_no_vis {
+                                    if state.channel_vus.len() != state.raw_channel_vus.len() {
+                                        state.channel_vus = vec![0.0; state.raw_channel_vus.len()];
                                     }
-                                }
-
-                                if state.spectrum_data.len() != state.raw_spectrum_data.len() {
-                                    state.spectrum_data = vec![0.0; state.raw_spectrum_data.len()];
-                                }
-                                for i in 0..state.raw_spectrum_data.len() {
-                                    if state.raw_spectrum_data[i] > state.spectrum_data[i] {
-                                        state.spectrum_data[i] = state.raw_spectrum_data[i];
-                                    } else {
-                                        state.spectrum_data[i] = (state.spectrum_data[i]
-                                            - (1.5 * time_scale))
-                                            .max(state.raw_spectrum_data[i]);
+                                    for i in 0..state.raw_channel_vus.len() {
+                                        if state.raw_channel_vus[i] > state.channel_vus[i] {
+                                            state.channel_vus[i] = state.raw_channel_vus[i];
+                                        } else {
+                                            state.channel_vus[i] = (state.channel_vus[i]
+                                                - (0.015 * time_scale))
+                                                .max(state.raw_channel_vus[i]);
+                                        }
                                     }
 
-                                    // Smoothly decay fire heat using display refresh rate
-                                    if state.raw_spectrum_data[i] > state.fire_heat[i] {
-                                        state.fire_heat[i] = state.raw_spectrum_data[i];
-                                    } else {
-                                        state.fire_heat[i] =
-                                            (state.fire_heat[i] - (1.5 * time_scale)).max(0.0);
+                                    if state.peak_vus.len() != state.channel_vus.len() {
+                                        state.peak_vus = vec![0.0; state.channel_vus.len()];
                                     }
-                                }
-
-                                if state.spectrum_peaks.len() != state.spectrum_data.len() {
-                                    state.spectrum_peaks = vec![0.0; state.spectrum_data.len()];
-                                }
-                                for i in 0..state.spectrum_data.len() {
-                                    state.spectrum_peaks[i] =
-                                        (state.spectrum_peaks[i] - (0.5 * time_scale)).max(0.0);
-                                    if state.spectrum_data[i] > state.spectrum_peaks[i] {
-                                        state.spectrum_peaks[i] = state.spectrum_data[i];
+                                    for i in 0..state.channel_vus.len() {
+                                        state.peak_vus[i] =
+                                            (state.peak_vus[i] - (0.005 * time_scale)).max(0.0);
+                                        if state.channel_vus[i] > state.peak_vus[i] {
+                                            state.peak_vus[i] = state.channel_vus[i];
+                                        }
                                     }
-                                }
-                                // Scroll spectrum history
-                                if state.spectrum_history.len() > 120 {
-                                    state.spectrum_history.pop_front();
-                                }
-                                let cloned_data = state.spectrum_data.clone();
-                                state.spectrum_history.push_back(cloned_data);
 
-                                // Temporal smoothing for waveform history to prevent jerky oscilloscope motion.
-                                // Lerp the display waveform toward the raw DSP data each frame,
-                                // decoupling visual smoothness from the DSP callback rate.
-                                let raw_wave = state.raw_waveform.clone();
-                                if let Some(newest) = state.waveform_history.back_mut() {
-                                    let lerp_speed = (12.0 * dt).min(1.0); // fast attack, smooth motion
-                                    for i in 0..newest.len().min(1024) {
-                                        newest[i] += (raw_wave[i] - newest[i]) * lerp_speed;
+                                    if state.spectrum_data.len() != state.raw_spectrum_data.len() {
+                                        state.spectrum_data =
+                                            vec![0.0; state.raw_spectrum_data.len()];
+                                    }
+                                    for i in 0..state.raw_spectrum_data.len() {
+                                        if state.raw_spectrum_data[i] > state.spectrum_data[i] {
+                                            state.spectrum_data[i] = state.raw_spectrum_data[i];
+                                        } else {
+                                            state.spectrum_data[i] = (state.spectrum_data[i]
+                                                - (1.5 * time_scale))
+                                                .max(state.raw_spectrum_data[i]);
+                                        }
+
+                                        // Smoothly decay fire heat using display refresh rate
+                                        if state.raw_spectrum_data[i] > state.fire_heat[i] {
+                                            state.fire_heat[i] = state.raw_spectrum_data[i];
+                                        } else {
+                                            state.fire_heat[i] =
+                                                (state.fire_heat[i] - (1.5 * time_scale)).max(0.0);
+                                        }
+                                    }
+
+                                    if state.spectrum_peaks.len() != state.spectrum_data.len() {
+                                        state.spectrum_peaks = vec![0.0; state.spectrum_data.len()];
+                                    }
+                                    for i in 0..state.spectrum_data.len() {
+                                        state.spectrum_peaks[i] =
+                                            (state.spectrum_peaks[i] - (0.5 * time_scale)).max(0.0);
+                                        if state.spectrum_data[i] > state.spectrum_peaks[i] {
+                                            state.spectrum_peaks[i] = state.spectrum_data[i];
+                                        }
+                                    }
+                                    // Scroll spectrum history
+                                    if state.spectrum_history.len() > 120 {
+                                        state.spectrum_history.pop_front();
+                                    }
+                                    let cloned_data = state.spectrum_data.clone();
+                                    state.spectrum_history.push_back(cloned_data);
+
+                                    // Temporal smoothing for waveform history to prevent jerky oscilloscope motion.
+                                    // Lerp the display waveform toward the raw DSP data each frame,
+                                    // decoupling visual smoothness from the DSP callback rate.
+                                    let raw_wave = state.raw_waveform.clone();
+                                    if let Some(newest) = state.waveform_history.back_mut() {
+                                        let lerp_speed = (12.0 * dt).min(1.0); // fast attack, smooth motion
+                                        for i in 0..newest.len().min(1024) {
+                                            newest[i] += (raw_wave[i] - newest[i]) * lerp_speed;
+                                        }
                                     }
                                 }
 
@@ -1854,6 +1867,8 @@ async fn run_gui(
                                         let target = (state.current_seconds + scrub_amount)
                                             .clamp(0.0, state.duration_seconds);
                                         state.seek_request = Some(target);
+                                        state.current_seconds = target;
+                                        state.track_ended = false;
                                         state.spectrum_history.clear();
                                         for _ in 0..120 {
                                             state.spectrum_history.push_back(vec![0.0; 1024]);
@@ -2671,6 +2686,8 @@ async fn run_gui(
                                         let target = (state.current_seconds + 10.0)
                                             .clamp(0.0, state.duration_seconds);
                                         state.seek_request = Some(target);
+                                        state.current_seconds = target;
+                                        state.track_ended = false;
                                         state.spectrum_history.clear();
                                         for _ in 0..120 {
                                             state.spectrum_history.push_back(vec![0.0; 1024]);
@@ -2682,6 +2699,8 @@ async fn run_gui(
                                         let mut state = app_state.lock().unwrap();
                                         let target = (state.current_seconds - 10.0).max(0.0);
                                         state.seek_request = Some(target);
+                                        state.current_seconds = target;
+                                        state.track_ended = false;
                                         state.spectrum_history.clear();
                                         for _ in 0..120 {
                                             state.spectrum_history.push_back(vec![0.0; 1024]);
@@ -2916,6 +2935,8 @@ async fn run_gui(
                                     } else {
                                         let target = (state.current_seconds - 60.0).max(0.0);
                                         state.seek_request = Some(target);
+                                        state.current_seconds = target;
+                                        state.track_ended = false;
                                         state.spectrum_history.clear();
                                         for _ in 0..120 {
                                             state.spectrum_history.push_back(vec![0.0; 1024]);
@@ -2941,6 +2962,8 @@ async fn run_gui(
                                         let target = (state.current_seconds + 60.0)
                                             .clamp(0.0, state.duration_seconds);
                                         state.seek_request = Some(target);
+                                        state.current_seconds = target;
+                                        state.track_ended = false;
                                         state.spectrum_history.clear();
                                         for _ in 0..120 {
                                             state.spectrum_history.push_back(vec![0.0; 1024]);
@@ -2994,6 +3017,8 @@ async fn run_gui(
                                         let target = (state.current_seconds + 10.0)
                                             .clamp(0.0, state.duration_seconds);
                                         state.seek_request = Some(target);
+                                        state.current_seconds = target;
+                                        state.track_ended = false;
                                         state.spectrum_history.clear();
                                         for _ in 0..120 {
                                             state.spectrum_history.push_back(vec![0.0; 1024]);
@@ -3007,6 +3032,8 @@ async fn run_gui(
                                     if !state.show_vis_picker {
                                         let target = (state.current_seconds - 10.0).max(0.0);
                                         state.seek_request = Some(target);
+                                        state.current_seconds = target;
+                                        state.track_ended = false;
                                         state.spectrum_history.clear();
                                         for _ in 0..120 {
                                             state.spectrum_history.push_back(vec![0.0; 1024]);
@@ -3234,6 +3261,11 @@ where
                     let mut state = app_state.lock().unwrap();
                     state.stats.bitstream_active = false;
                     state.stats.audio_buffer_fill_pct = 0.0;
+                    state.stats.video_buffer_fill_pct = 0.0;
+                    state.stats.video_hw_decoder.clear();
+                    state.stats.video_fps = 0.0;
+                    state.stats.video_bitrate_kbps = None;
+                    state.stats.audio_bitrate_kbps = None;
                     state.track_ended = false;
                 }
 
@@ -3473,6 +3505,8 @@ where
                         let mut state = app_state.lock().unwrap();
                         let target = (state.current_seconds + 5.0).min(state.duration_seconds);
                         state.seek_request = Some(target);
+                        state.current_seconds = target;
+                        state.track_ended = false;
                         state.spectrum_history.clear();
                         for _ in 0..120 {
                             state.spectrum_history.push_back(vec![0.0; 1024]);
@@ -3482,6 +3516,8 @@ where
                         let mut state = app_state.lock().unwrap();
                         let target = (state.current_seconds - 5.0).max(0.0);
                         state.seek_request = Some(target);
+                        state.current_seconds = target;
+                        state.track_ended = false;
                         state.spectrum_history.clear();
                         for _ in 0..120 {
                             state.spectrum_history.push_back(vec![0.0; 1024]);

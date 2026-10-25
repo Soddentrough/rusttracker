@@ -68,6 +68,7 @@ pub struct DspMessage {
     pub current_seconds: f64,
     pub current_row_string: String,
     pub channel_audio_data: Vec<Vec<f32>>,
+    pub seek_epoch: u64,
 }
 
 fn is_relevant_audio_device(name: &str) -> bool {
@@ -227,67 +228,116 @@ pub fn spawn_dsp_thread(
 
         let n_sqrt = (window_size as f32).sqrt();
         let mut last_waveform_push = Instant::now();
-        let mut need_gpu_spectrum = {
-            if let Ok(state) = shared_state.lock() {
-                let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
-                vis_def.id == 6 || vis_def.requires_resynth
-            } else {
-                false
-            }
-        };
         let recycle_tx = &dsp_recycle_channel().0;
 
         while let Ok(msg) = rx.recv() {
-            let fft_start = Instant::now();
-
-            // 1. Apply Hann window and prepare complex input for mono channel
-            for i in 0..window_size {
-                let sample = *msg.audio_data.get(i).unwrap_or(&0.0);
-                complex_buf[i] = Complex {
-                    re: sample * hann_window[i],
-                    im: 0.0,
-                };
-            }
-
-            // Run FFT
-            fft.process(&mut complex_buf);
-
-            // Compute magnitudes (only first half — up to Nyquist)
-            for i in 0..nyquist {
-                magnitudes[i] = complex_buf[i].norm() / n_sqrt;
-            }
-
-            // Logarithmic binning into 1024 display bins (mono) using precomputed ranges
-            for (bin, range) in binned_data.iter_mut().zip(mono_bin_ranges.iter()) {
-                let mut max_val: f32 = 0.0;
-                if range.use_range {
-                    if range.start < range.safe_end {
-                        for &mag in &magnitudes[range.start..range.safe_end] {
-                            max_val = max_val.max(mag);
-                        }
-                    }
+            let (need_gpu_spectrum, skip_fft, stale_epoch) = if let Ok(state) = shared_state.lock() {
+                if msg.seek_epoch < state.seek_epoch {
+                    (false, true, true)
                 } else {
-                    max_val = magnitudes[range.nearest];
+                    let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
+                    let need_gpu = vis_def.id == 6 || vis_def.requires_resynth;
+                    let skip = state.video_mode == 3
+                        && (state.has_video_stream || state.video_frame_rx.is_some());
+                    (need_gpu, skip, false)
                 }
-                *bin = (max_val * 100.0).clamp(0.0, 100.0);
+            } else {
+                (false, false, false)
+            };
+
+            if stale_epoch {
+                let _ = recycle_tx.try_send(msg);
+                continue;
             }
 
-            // 2. Process multi-channel FFT ONLY when active visualizer requires GPU spectrum (ID 6 or requires_resynth)
             let num_channels = msg.channel_audio_data.len().min(32);
-            if need_gpu_spectrum {
-                gpu_spectrum.fill(0.0);
-                if num_channels > 0 {
-                    for c in 0..num_channels {
-                        let channel_data = &msg.channel_audio_data[c];
-                        for i in 0..window_size {
-                            let sample = *channel_data.get(i).unwrap_or(&0.0);
-                            complex_buf[i] = Complex {
-                                re: sample * hann_window[i],
-                                im: 0.0,
-                            };
-                        }
-                        fft.process(&mut complex_buf);
+            let fft_elapsed = if skip_fft || msg.audio_data.is_empty() {
+                0.0
+            } else {
+                let fft_start = Instant::now();
 
+                // 1. Apply Hann window and prepare complex input for mono channel
+                for i in 0..window_size {
+                    let sample = *msg.audio_data.get(i).unwrap_or(&0.0);
+                    complex_buf[i] = Complex {
+                        re: sample * hann_window[i],
+                        im: 0.0,
+                    };
+                }
+
+                // Run FFT
+                fft.process(&mut complex_buf);
+
+                // Compute magnitudes (only first half — up to Nyquist)
+                for i in 0..nyquist {
+                    magnitudes[i] = complex_buf[i].norm() / n_sqrt;
+                }
+
+                // Logarithmic binning into 1024 display bins (mono) using precomputed ranges
+                for (bin, range) in binned_data.iter_mut().zip(mono_bin_ranges.iter()) {
+                    let mut max_val: f32 = 0.0;
+                    if range.use_range {
+                        if range.start < range.safe_end {
+                            for &mag in &magnitudes[range.start..range.safe_end] {
+                                max_val = max_val.max(mag);
+                            }
+                        }
+                    } else {
+                        max_val = magnitudes[range.nearest];
+                    }
+                    *bin = (max_val * 100.0).clamp(0.0, 100.0);
+                }
+
+                // 2. Process multi-channel FFT ONLY when active visualizer requires GPU spectrum (ID 6 or requires_resynth)
+                if need_gpu_spectrum {
+                    gpu_spectrum.fill(0.0);
+                    if num_channels > 0 {
+                        for c in 0..num_channels {
+                            let channel_data = &msg.channel_audio_data[c];
+                            for i in 0..window_size {
+                                let sample = *channel_data.get(i).unwrap_or(&0.0);
+                                complex_buf[i] = Complex {
+                                    re: sample * hann_window[i],
+                                    im: 0.0,
+                                };
+                            }
+                            fft.process(&mut complex_buf);
+
+                            for (i, (mapping, range)) in log_bin_mappings
+                                .iter()
+                                .zip(mono_bin_ranges.iter())
+                                .enumerate()
+                            {
+                                let (re, im) = if range.use_range && range.start < range.safe_end {
+                                    let mut best = complex_buf[range.start];
+                                    let mut best_norm_sq = best.norm_sqr();
+                                    for &val in &complex_buf[range.start + 1..range.safe_end] {
+                                        let nsq = val.norm_sqr();
+                                        if nsq > best_norm_sq {
+                                            best_norm_sq = nsq;
+                                            best = val;
+                                        }
+                                    }
+                                    (best.re, best.im)
+                                } else {
+                                    let c0 = complex_buf[mapping.i0];
+                                    let c1 = complex_buf[mapping.i1];
+                                    (
+                                        c0.re * (1.0 - mapping.frac) + c1.re * mapping.frac,
+                                        c0.im * (1.0 - mapping.frac) + c1.im * mapping.frac,
+                                    )
+                                };
+
+                                let norm_re = re / n_sqrt;
+                                let norm_im = im / n_sqrt;
+
+                                let out_idx = c * 1024 * 2 + i * 2;
+                                gpu_spectrum[out_idx] = norm_re;
+                                gpu_spectrum[out_idx + 1] = norm_im;
+                            }
+                        }
+                    } else {
+                        // Fallback to mono channel FFT mapped to channel 0
                         for (i, (mapping, range)) in log_bin_mappings
                             .iter()
                             .zip(mono_bin_ranges.iter())
@@ -316,148 +366,124 @@ pub fn spawn_dsp_thread(
                             let norm_re = re / n_sqrt;
                             let norm_im = im / n_sqrt;
 
-                            let out_idx = c * 1024 * 2 + i * 2;
+                            let out_idx = i * 2;
                             gpu_spectrum[out_idx] = norm_re;
                             gpu_spectrum[out_idx + 1] = norm_im;
                         }
                     }
-                } else {
-                    // Fallback to mono channel FFT mapped to channel 0
-                    for (i, (mapping, range)) in log_bin_mappings
-                        .iter()
-                        .zip(mono_bin_ranges.iter())
-                        .enumerate()
-                    {
-                        let (re, im) = if range.use_range && range.start < range.safe_end {
-                            let mut best = complex_buf[range.start];
-                            let mut best_norm_sq = best.norm_sqr();
-                            for &val in &complex_buf[range.start + 1..range.safe_end] {
-                                let nsq = val.norm_sqr();
-                                if nsq > best_norm_sq {
-                                    best_norm_sq = nsq;
-                                    best = val;
-                                }
-                            }
-                            (best.re, best.im)
-                        } else {
-                            let c0 = complex_buf[mapping.i0];
-                            let c1 = complex_buf[mapping.i1];
-                            (
-                                c0.re * (1.0 - mapping.frac) + c1.re * mapping.frac,
-                                c0.im * (1.0 - mapping.frac) + c1.im * mapping.frac,
-                            )
-                        };
-
-                        let norm_re = re / n_sqrt;
-                        let norm_im = im / n_sqrt;
-
-                        let out_idx = i * 2;
-                        gpu_spectrum[out_idx] = norm_re;
-                        gpu_spectrum[out_idx + 1] = norm_im;
-                    }
                 }
-            }
 
-            let fft_elapsed = fft_start.elapsed().as_micros() as f32;
+                fft_start.elapsed().as_secs_f32() * 1_000_000.0
+            };
 
             // Sync to UI state
             if let Ok(mut state) = shared_state.lock() {
-                let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
-                need_gpu_spectrum = vis_def.id == 6 || vis_def.requires_resynth;
-
-                // Decay/smooth the execution stats for readability
-                state.stats.fft_us = state.stats.fft_us * 0.9 + fft_elapsed * 0.1;
-
-                if state.stats.bitstream_active
-                    && let Some(cap) = rx.capacity()
-                {
-                    state.stats.audio_buffer_fill_pct = (rx.len() as f32 / cap as f32) * 100.0;
+                if msg.seek_epoch < state.seek_epoch {
+                    drop(state);
+                    let _ = recycle_tx.try_send(msg);
+                    continue;
                 }
+                let skip_fft = state.video_mode == 3
+                    && (state.has_video_stream || state.video_frame_rx.is_some());
 
-                state.raw_channel_vus.clear();
-                state.raw_channel_vus.extend_from_slice(&msg.channel_vus);
-
-                state.raw_spectrum_data.copy_from_slice(&binned_data);
-                if need_gpu_spectrum {
-                    if state.gpu_spectrum_data.len() != gpu_spectrum.len() {
-                        state.gpu_spectrum_data.resize(gpu_spectrum.len(), 0.0);
+                if skip_fft {
+                    state.stats.fft_us = 0.0;
+                    while let Some(&(t, _)) = state.lookahead_queue.front() {
+                        if t < msg.current_seconds - 2.0 {
+                            state.lookahead_queue.pop_front();
+                        } else {
+                            break;
+                        }
                     }
-                    state.gpu_spectrum_data.copy_from_slice(&gpu_spectrum);
-                }
-                if state.raw_audio_channels.len() != num_channels {
-                    state.raw_audio_channels.resize_with(num_channels, Vec::new);
-                }
-                for (dst, src) in state
-                    .raw_audio_channels
-                    .iter_mut()
-                    .zip(msg.channel_audio_data.iter())
-                    .take(num_channels)
-                {
-                    dst.clear();
-                    dst.extend_from_slice(src);
-                }
+                } else {
+                    // Decay/smooth the execution stats for readability
+                    state.stats.fft_us = state.stats.fft_us * 0.9 + fft_elapsed * 0.1;
 
-                // --- Waveform extraction (Zero-Crossing Edge Trigger) ---
-                let visual_width = state.visual_width.clamp(128, 4096) as usize;
-                let target_fps = state.target_fps.clamp(30, 500);
-                let waveform_push_interval =
-                    std::time::Duration::from_secs_f64(1.0 / target_fps as f64);
+                    state.raw_channel_vus.clear();
+                    state.raw_channel_vus.extend_from_slice(&msg.channel_vus);
 
-                // Maintain a constant ~23ms time window regardless of sample rate
-                let target_window_samples = (sample_rate as f32 * 0.023).round() as usize;
-                let stride = (target_window_samples as f32 / visual_width as f32).max(1.0);
-                let actual_window_samples = (visual_width as f32 * stride).ceil() as usize;
+                    state.raw_spectrum_data.copy_from_slice(&binned_data);
+                    if need_gpu_spectrum {
+                        if state.gpu_spectrum_data.len() != gpu_spectrum.len() {
+                            state.gpu_spectrum_data.resize(gpu_spectrum.len(), 0.0);
+                        }
+                        state.gpu_spectrum_data.copy_from_slice(&gpu_spectrum);
+                    }
+                    if state.raw_audio_channels.len() != num_channels {
+                        state.raw_audio_channels.resize_with(num_channels, Vec::new);
+                    }
+                    for (dst, src) in state
+                        .raw_audio_channels
+                        .iter_mut()
+                        .zip(msg.channel_audio_data.iter())
+                        .take(num_channels)
+                    {
+                        dst.clear();
+                        dst.extend_from_slice(src);
+                    }
 
-                // Restrict search to the last ~33ms to ensure a fresh trigger at >= 30 FPS,
-                // avoiding the visual "freeze" caused by searching the entire history buffer.
-                let search_window = (sample_rate as f32 / 30.0) as usize;
-                let search_start = msg
-                    .audio_data
-                    .len()
-                    .saturating_sub(actual_window_samples + search_window);
-                // Ensure i+1 stays in bounds during zero-crossing search
-                let search_limit = msg
-                    .audio_data
-                    .len()
-                    .saturating_sub(actual_window_samples)
-                    .min(msg.audio_data.len().saturating_sub(1));
+                    // --- Waveform extraction (Zero-Crossing Edge Trigger) ---
+                    let visual_width = state.visual_width.clamp(128, 4096) as usize;
+                    let target_fps = state.target_fps.clamp(30, 500);
+                    let waveform_push_interval =
+                        std::time::Duration::from_secs_f64(1.0 / target_fps as f64);
 
-                let mut start_idx = search_start;
-                let mut best_slope = 0.0;
+                    // Maintain a constant ~23ms time window regardless of sample rate
+                    let target_window_samples = (sample_rate as f32 * 0.023).round() as usize;
+                    let stride = (target_window_samples as f32 / visual_width as f32).max(1.0);
+                    let actual_window_samples = (visual_width as f32 * stride).ceil() as usize;
 
-                if msg.audio_data.len() >= 2 {
-                    for i in search_start..search_limit {
-                        if msg.audio_data[i] <= 0.0 && msg.audio_data[i + 1] > 0.0 {
-                            let slope = msg.audio_data[i + 1] - msg.audio_data[i];
-                            if slope > best_slope {
-                                best_slope = slope;
-                                start_idx = i;
+                    // Restrict search to the last ~33ms to ensure a fresh trigger at >= 30 FPS,
+                    // avoiding the visual "freeze" caused by searching the entire history buffer.
+                    let search_window = (sample_rate as f32 / 30.0) as usize;
+                    let search_start = msg
+                        .audio_data
+                        .len()
+                        .saturating_sub(actual_window_samples + search_window);
+                    // Ensure i+1 stays in bounds during zero-crossing search
+                    let search_limit = msg
+                        .audio_data
+                        .len()
+                        .saturating_sub(actual_window_samples)
+                        .min(msg.audio_data.len().saturating_sub(1));
+
+                    let mut start_idx = search_start;
+                    let mut best_slope = 0.0;
+
+                    if msg.audio_data.len() >= 2 {
+                        for i in search_start..search_limit {
+                            if msg.audio_data[i] <= 0.0 && msg.audio_data[i + 1] > 0.0 {
+                                let slope = msg.audio_data[i + 1] - msg.audio_data[i];
+                                if slope > best_slope {
+                                    best_slope = slope;
+                                    start_idx = i;
+                                }
                             }
                         }
                     }
-                }
 
-                if state.raw_waveform.len() != visual_width {
-                    state.raw_waveform.resize(visual_width, 0.0);
-                }
-
-                if !msg.audio_data.is_empty() {
-                    for i in 0..visual_width {
-                        let sample_idx = start_idx + (i as f32 * stride) as usize;
-                        state.raw_waveform[i] =
-                            msg.audio_data[sample_idx.min(msg.audio_data.len() - 1)];
+                    if state.raw_waveform.len() != visual_width {
+                        state.raw_waveform.resize(visual_width, 0.0);
                     }
-                }
 
-                let now = Instant::now();
-                if now.duration_since(last_waveform_push) >= waveform_push_interval {
-                    while state.waveform_history.len() >= 144 {
-                        state.waveform_history.pop_front();
+                    if !msg.audio_data.is_empty() {
+                        for i in 0..visual_width {
+                            let sample_idx = start_idx + (i as f32 * stride) as usize;
+                            state.raw_waveform[i] =
+                                msg.audio_data[sample_idx.min(msg.audio_data.len() - 1)];
+                        }
                     }
-                    let wave_clone = state.raw_waveform.clone();
-                    state.waveform_history.push_back(wave_clone);
-                    state.waveform_history_push_count += 1;
-                    last_waveform_push = now;
+
+                    let now = Instant::now();
+                    if now.duration_since(last_waveform_push) >= waveform_push_interval {
+                        while state.waveform_history.len() >= 144 {
+                            state.waveform_history.pop_front();
+                        }
+                        let wave_clone = state.raw_waveform.clone();
+                        state.waveform_history.push_back(wave_clone);
+                        state.waveform_history_push_count += 1;
+                        last_waveform_push = now;
+                    }
                 }
 
                 if msg.bpm != 0 {
@@ -477,104 +503,28 @@ pub fn spawn_dsp_thread(
                     .push_str(&msg.current_row_string);
 
                 // --- Lookahead Timeline Extraction (600 slices: -1.0s past to +5.0s future) ---
-                if state.lookahead_timeline.len() != 600 * 8 {
-                    state.lookahead_timeline = vec![0.0; 600 * 8];
-                }
-                while let Some(&(t, _)) = state.lookahead_queue.front() {
-                    if t < msg.current_seconds - 2.0 {
-                        state.lookahead_queue.pop_front();
-                    } else {
-                        break;
-                    }
-                }
-                if !state.lookahead_queue.is_empty() {
-                    let cur_t = msg.current_seconds;
-                    let q_len = state.lookahead_queue.len();
-                    let (t_first, d_first) = state.lookahead_queue[0];
-                    let (t_last, d_last) = state.lookahead_queue[q_len - 1];
-
-                    for k in 0..600 {
-                        let target_t = cur_t + (k as f64 - 100.0) * 0.01;
-                        let off = k * 8;
-
-                        if target_t < t_first {
-                            // Prior to available history buffer: smooth fade out to first slice
-                            let fade = (1.0 - ((t_first - target_t) / 0.5)).max(0.0) as f32;
-                            for (c, val) in d_first.iter().enumerate() {
-                                state.lookahead_timeline[off + c] = *val * fade;
-                            }
-                        } else if target_t > t_last {
-                            // Beyond decoded lookahead horizon (e.g. at end of track or initial buffering):
-                            // Smooth fade out to silence - NEVER wrap or repeat to avoid banding/seam artifacts!
-                            let fade = (1.0 - ((target_t - t_last) / 0.5)).max(0.0) as f32;
-                            for (c, val) in d_last.iter().enumerate() {
-                                state.lookahead_timeline[off + c] = *val * fade;
-                            }
+                if !skip_fft {
+                    while let Some(&(t, _)) = state.lookahead_queue.front() {
+                        if t < msg.current_seconds - 2.0 {
+                            state.lookahead_queue.pop_front();
                         } else {
-                            let idx = match state.lookahead_queue.binary_search_by(|(t, _)| {
-                                t.partial_cmp(&target_t)
-                                    .unwrap_or(std::cmp::Ordering::Equal)
-                            }) {
-                                Ok(i) => i,
-                                Err(i) => i,
-                            };
-
-                            if idx == 0 {
-                                state.lookahead_timeline[off..off + 8].copy_from_slice(&d_first);
-                            } else if idx >= q_len {
-                                state.lookahead_timeline[off..off + 8].copy_from_slice(&d_last);
-                            } else {
-                                let (t0, d0) = state.lookahead_queue[idx - 1];
-                                let (t1, d1) = state.lookahead_queue[idx];
-                                let dt = t1 - t0;
-                                if dt > 0.0001 && dt < 1.0 && target_t >= t0 && target_t <= t1 {
-                                    let frac = ((target_t - t0) / dt).clamp(0.0, 1.0) as f32;
-                                    for c in 0..8 {
-                                        state.lookahead_timeline[off + c] =
-                                            d0[c] * (1.0 - frac) + d1[c] * frac;
-                                    }
-                                } else {
-                                    state.lookahead_timeline[off..off + 8].copy_from_slice(&d0);
-                                }
-                            }
+                            break;
                         }
                     }
-                } else if !state.raw_waveform.is_empty() {
-                    // Fallback synthesis when lookahead_queue is empty (e.g. initial playback or live mic)
-                    // Synthesize continuous timeline envelope from raw waveform and channel VUs so tape head is never dead
-                    let wave_len = state.raw_waveform.len();
-                    let vu_l = state
-                        .raw_channel_vus
-                        .first()
-                        .copied()
-                        .unwrap_or(0.2)
-                        .clamp(0.05, 1.0);
-                    let vu_r = state
-                        .raw_channel_vus
-                        .get(1)
-                        .copied()
-                        .unwrap_or(vu_l)
-                        .clamp(0.05, 1.0);
-                    for k in 0..600 {
-                        let off = k * 8;
-                        let wave_idx = (k * 13) % wave_len;
-                        let sample = state.raw_waveform[wave_idx].clamp(-1.0, 1.0);
-                        let sample_next =
-                            state.raw_waveform[(wave_idx + 1) % wave_len].clamp(-1.0, 1.0);
-                        let min_s = sample.min(sample_next).min(0.0) * vu_l;
-                        let max_s = sample.max(sample_next).max(0.0) * vu_l;
-                        let min_r = sample.min(sample_next).min(0.0) * vu_r;
-                        let max_r = sample.max(sample_next).max(0.0) * vu_r;
-                        let rms = (sample.abs() * 0.7 + 0.3 * (vu_l + vu_r) * 0.5).min(1.0);
-                        state.lookahead_timeline[off] = min_s;
-                        state.lookahead_timeline[off + 1] = max_s;
-                        state.lookahead_timeline[off + 2] = min_r;
-                        state.lookahead_timeline[off + 3] = max_r;
-                        state.lookahead_timeline[off + 4] = rms;
-                        state.lookahead_timeline[off + 5] = rms;
-                        state.lookahead_timeline[off + 6] = vu_l;
-                        state.lookahead_timeline[off + 7] = vu_r;
-                    }
+                    let AppState {
+                        ref lookahead_queue,
+                        ref raw_waveform,
+                        ref raw_channel_vus,
+                        ref mut lookahead_timeline,
+                        ..
+                    } = *state;
+                    update_lookahead_timeline_from_queue(
+                        lookahead_queue,
+                        raw_waveform,
+                        raw_channel_vus,
+                        msg.current_seconds,
+                        lookahead_timeline,
+                    );
                 }
 
                 if state.current_tracker_order != msg.current_order
@@ -600,6 +550,99 @@ pub fn spawn_dsp_thread(
             let _ = recycle_tx.try_send(msg);
         }
     });
+}
+
+pub fn update_lookahead_timeline_from_queue(
+    lookahead_queue: &std::collections::VecDeque<(f64, [f32; 8])>,
+    raw_waveform: &[f32],
+    raw_channel_vus: &[f32],
+    cur_t: f64,
+    lookahead_timeline: &mut Vec<f32>,
+) {
+    if lookahead_timeline.len() != 600 * 8 {
+        lookahead_timeline.resize(600 * 8, 0.0);
+    }
+    if !lookahead_queue.is_empty() {
+        let q_len = lookahead_queue.len();
+        let (t_first, d_first) = lookahead_queue[0];
+        let (t_last, d_last) = lookahead_queue[q_len - 1];
+
+        for k in 0..600 {
+            let target_t = cur_t + (k as f64 - 100.0) * 0.01;
+            let off = k * 8;
+
+            if target_t < t_first {
+                let fade = (1.0 - ((t_first - target_t) / 0.5)).max(0.0) as f32;
+                for (c, val) in d_first.iter().enumerate() {
+                    lookahead_timeline[off + c] = *val * fade;
+                }
+            } else if target_t > t_last {
+                let fade = (1.0 - ((target_t - t_last) / 0.5)).max(0.0) as f32;
+                for (c, val) in d_last.iter().enumerate() {
+                    lookahead_timeline[off + c] = *val * fade;
+                }
+            } else {
+                let idx = match lookahead_queue.binary_search_by(|(t, _)| {
+                    t.partial_cmp(&target_t)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                }) {
+                    Ok(i) => i,
+                    Err(i) => i,
+                };
+
+                if idx == 0 {
+                    lookahead_timeline[off..off + 8].copy_from_slice(&d_first);
+                } else if idx >= q_len {
+                    lookahead_timeline[off..off + 8].copy_from_slice(&d_last);
+                } else {
+                    let (t0, d0) = lookahead_queue[idx - 1];
+                    let (t1, d1) = lookahead_queue[idx];
+                    let dt = t1 - t0;
+                    if dt > 0.0001 && dt < 1.0 && target_t >= t0 && target_t <= t1 {
+                        let frac = ((target_t - t0) / dt).clamp(0.0, 1.0) as f32;
+                        for c in 0..8 {
+                            lookahead_timeline[off + c] = d0[c] * (1.0 - frac) + d1[c] * frac;
+                        }
+                    } else {
+                        lookahead_timeline[off..off + 8].copy_from_slice(&d0);
+                    }
+                }
+            }
+        }
+    } else if !raw_waveform.is_empty() {
+        let wave_len = raw_waveform.len();
+        let vu_l = raw_channel_vus
+            .first()
+            .copied()
+            .unwrap_or(0.2)
+            .clamp(0.05, 1.0);
+        let vu_r = raw_channel_vus
+            .get(1)
+            .copied()
+            .unwrap_or(vu_l)
+            .clamp(0.05, 1.0);
+        for k in 0..600 {
+            let off = k * 8;
+            let wave_idx = (k * 13) % wave_len;
+            let sample = raw_waveform[wave_idx].clamp(-1.0, 1.0);
+            let sample_next = raw_waveform[(wave_idx + 1) % wave_len].clamp(-1.0, 1.0);
+            let min_s = sample.min(sample_next).min(0.0) * vu_l;
+            let max_s = sample.max(sample_next).max(0.0) * vu_l;
+            let min_r = sample.min(sample_next).min(0.0) * vu_r;
+            let max_r = sample.max(sample_next).max(0.0) * vu_r;
+            let rms = (sample.abs() * 0.7 + 0.3 * (vu_l + vu_r) * 0.5).min(1.0);
+            lookahead_timeline[off] = min_s;
+            lookahead_timeline[off + 1] = max_s;
+            lookahead_timeline[off + 2] = min_r;
+            lookahead_timeline[off + 3] = max_r;
+            lookahead_timeline[off + 4] = rms;
+            lookahead_timeline[off + 5] = rms;
+            lookahead_timeline[off + 6] = vu_l;
+            lookahead_timeline[off + 7] = vu_r;
+        }
+    } else {
+        lookahead_timeline.fill(0.0);
+    }
 }
 
 pub trait AudioSource: Send {
@@ -645,6 +688,12 @@ pub trait AudioSource: Send {
         None
     }
     fn get_bitrate(&mut self) -> Option<u32> {
+        None
+    }
+    fn get_video_fps(&self) -> f32 {
+        0.0
+    }
+    fn get_video_bitrate(&self) -> Option<u32> {
         None
     }
     fn get_audio_tracks(&self) -> Vec<crate::state::AudioTrackInfo> {
@@ -2101,8 +2150,11 @@ struct FfmpegSource {
     video_params: Option<ffmpeg_next::codec::Parameters>,
     video_time_base: Option<ffmpeg_next::Rational>,
     video_rotation: u32,
+    video_fps: f32,
+    video_bitrate_kbps: Option<u32>,
 
     audio_tracks: Vec<crate::state::AudioTrackInfo>,
+    audio_track_bitrates: Vec<Option<u32>>,
     selected_track_idx: usize,
     output_sample_rate: u32,
     is_eof: bool,
@@ -2191,13 +2243,10 @@ impl FfmpegSource {
                             track
                                 .sample_buf
                                 .extend_from_slice(&actual_data[skip_samples..]);
-                            track.current_time = target_pos
-                                + (actual_frames - skip_frames) as f64
-                                    / self.output_sample_rate as f64;
+                            track.current_time = target_pos;
                             progress = true;
                         } else {
                             track.sample_buf.extend_from_slice(actual_data);
-                            track.current_time += frame_dur;
                             progress = true;
                         }
                     } else {
@@ -2226,7 +2275,12 @@ impl FfmpegSource {
         }
 
         if need_packets && !self.is_eof {
-            for _ in 0..512 {
+            let max_packets = if self.target_seek_time.is_some() {
+                4096
+            } else {
+                512
+            };
+            for _ in 0..max_packets {
                 let all_satisfied = self
                     .active_tracks
                     .values()
@@ -2272,6 +2326,25 @@ impl FfmpegSource {
                             } else {
                                 self.output_sample_rate
                             };
+                            if let Some(slot) = self.audio_track_bitrates.get_mut(track.track_idx)
+                                && slot.is_none()
+                            {
+                                if track.decoder.bit_rate() > 0 {
+                                    *slot = Some((track.decoder.bit_rate() / 1000).max(1) as u32);
+                                } else if decoded.samples() > 0 && dec_rate > 0 && packet.size() > 0
+                                {
+                                    let frame_dur = decoded.samples() as f64 / dec_rate as f64;
+                                    if frame_dur > 0.0005 {
+                                        let kbps = ((packet.size() as f64 * 8.0)
+                                            / (frame_dur * 1000.0))
+                                            .round()
+                                            as u32;
+                                        if kbps > 0 {
+                                            *slot = Some(kbps);
+                                        }
+                                    }
+                                }
+                            }
                             let dec_layout =
                                 safe_ffmpeg_channel_layout(decoded.channel_layout(), dec_ch);
                             if (track.channels != dec_ch
@@ -2322,13 +2395,10 @@ impl FfmpegSource {
                                         track
                                             .sample_buf
                                             .extend_from_slice(&actual_data[skip_samples..]);
-                                        track.current_time = target_pos
-                                            + (actual_frames - skip_frames) as f64
-                                                / self.output_sample_rate as f64;
+                                        track.current_time = target_pos;
                                         progress = true;
                                     } else {
                                         track.sample_buf.extend_from_slice(actual_data);
-                                        track.current_time += frame_dur;
                                         progress = true;
                                     }
                                 } else {
@@ -2474,8 +2544,16 @@ impl AudioSource for FfmpegSource {
                             if self.is_eof {
                                 break;
                             }
-                            // Try filling one more batch before giving up
-                            if !self.fill_buffers() {
+                            // Try filling additional batches (especially if skipping video packets during seek)
+                            let extra_batches = if self.target_seek_time.is_some() { 4 } else { 1 };
+                            let mut filled = false;
+                            for _ in 0..extra_batches {
+                                if self.fill_buffers() || self.is_eof {
+                                    filled = !self.is_eof;
+                                    break;
+                                }
+                            }
+                            if !filled {
                                 break;
                             }
                             continue;
@@ -2670,11 +2748,7 @@ impl AudioSource for FfmpegSource {
                 );
             }
         }
-        self.target_seek_time = if self.video_stream_index.is_some() {
-            None
-        } else {
-            Some(pos)
-        };
+        self.target_seek_time = Some(pos);
         for track in self.active_tracks.values_mut() {
             track.decoder.flush();
             track.sample_buf.clear();
@@ -2745,12 +2819,34 @@ impl AudioSource for FfmpegSource {
             return Some(br);
         }
 
+        if let Some(Some(track_br)) = self.audio_track_bitrates.get(self.selected_track_idx)
+            && *track_br > 0
+        {
+            return Some(*track_br);
+        }
+
         let br = self.ictx.bit_rate();
         if br > 0 {
-            return Some((br / 1000) as u32);
+            let total_kbps = ((br as f64) / 1000.0).round() as u32;
+            if let Some(v_br) = self.video_bitrate_kbps {
+                let rem = total_kbps.saturating_sub(v_br);
+                if rem > 0 {
+                    return Some(rem);
+                }
+            } else if self.video_stream_index.is_none() {
+                return Some(total_kbps);
+            }
         }
 
         None
+    }
+
+    fn get_video_fps(&self) -> f32 {
+        self.video_fps
+    }
+
+    fn get_video_bitrate(&self) -> Option<u32> {
+        self.video_bitrate_kbps
     }
 
     fn attach_video_queue(&mut self, tx: crossbeam_channel::Sender<(u64, ffmpeg_next::Packet)>) {
@@ -2854,6 +2950,8 @@ struct VideoOnlySource {
     last_video_pts: f64,
     duration: f64,
     video_info: Option<String>,
+    video_fps: f32,
+    video_bitrate_kbps: Option<u32>,
     ext_type: String,
 }
 
@@ -3039,6 +3137,12 @@ impl AudioSource for VideoOnlySource {
     fn get_video_info(&mut self) -> Option<String> {
         self.video_info.clone()
     }
+    fn get_video_fps(&self) -> f32 {
+        self.video_fps
+    }
+    fn get_video_bitrate(&self) -> Option<u32> {
+        self.video_bitrate_kbps
+    }
 
     fn attach_video_queue(&mut self, tx: crossbeam_channel::Sender<(u64, ffmpeg_next::Packet)>) {
         self.video_tx = Some(tx);
@@ -3067,6 +3171,27 @@ pub struct VideoStreamSetup {
     pub time_base: ffmpeg_next::Rational,
     pub rotation: u32,
     pub info: String,
+    pub fps: f32,
+    pub bitrate_kbps: Option<u32>,
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn probe_stream_bitrate_kbps(stream: &ffmpeg_next::format::stream::Stream) -> Option<u32> {
+    let raw_br = unsafe { (*stream.parameters().as_ptr()).bit_rate };
+    if raw_br > 0 {
+        return Some((raw_br / 1000).max(1) as u32);
+    }
+    let meta = stream.metadata();
+    for (k, v) in meta.iter() {
+        let ku = k.to_uppercase();
+        if (ku == "BPS" || ku.starts_with("BPS-") || ku == "BIT_RATE" || ku == "VARIANT_BITRATE")
+            && let Ok(bps) = v.trim().parse::<u64>()
+            && bps > 0
+        {
+            return Some((bps / 1000).max(1) as u32);
+        }
+    }
+    None
 }
 
 #[cfg(not(target_os = "android"))]
@@ -3076,6 +3201,25 @@ pub fn probe_video_stream(ictx: &ffmpeg_next::format::context::Input) -> Option<
     let params = v_stream.parameters();
     let time_base = v_stream.time_base();
     let mut rotation = 0u32;
+
+    let avg_fr = v_stream.avg_frame_rate();
+    let r_fr = v_stream.rate();
+    let fps = if avg_fr.denominator() > 0 && avg_fr.numerator() > 0 {
+        let f = avg_fr.numerator() as f32 / avg_fr.denominator() as f32;
+        if (1.0..=1000.0).contains(&f) {
+            f
+        } else if r_fr.denominator() > 0 && r_fr.numerator() > 0 {
+            (r_fr.numerator() as f32 / r_fr.denominator() as f32).clamp(0.0, 1000.0)
+        } else {
+            0.0
+        }
+    } else if r_fr.denominator() > 0 && r_fr.numerator() > 0 {
+        (r_fr.numerator() as f32 / r_fr.denominator() as f32).clamp(0.0, 1000.0)
+    } else {
+        0.0
+    };
+
+    let bitrate_kbps = probe_stream_bitrate_kbps(&v_stream);
 
     // 1. Check metadata dictionary for "rotate" tag
     if let Some(rot_str) = v_stream.metadata().get("rotate")
@@ -3137,6 +3281,8 @@ pub fn probe_video_stream(ictx: &ffmpeg_next::format::context::Input) -> Option<
         time_base,
         rotation,
         info,
+        fps,
+        bitrate_kbps,
     })
 }
 
@@ -3179,15 +3325,20 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
     let mut video_params = None;
     let mut video_tb = None;
     let mut video_rotation = 0u32;
+    let mut video_fps = 0.0f32;
+    let mut video_bitrate_kbps = None;
     if let Some(vs) = probe_video_stream(&ictx) {
         video_stream_index = Some(vs.stream_index);
         video_params = Some(vs.params);
         video_tb = Some(vs.time_base);
         video_rotation = vs.rotation;
         video_info = Some(vs.info);
+        video_fps = vs.fps;
+        video_bitrate_kbps = vs.bitrate_kbps;
     }
 
     let mut audio_tracks = Vec::new();
+    let mut audio_track_bitrates: Vec<Option<u32>> = Vec::new();
     let mut selected_track_idx = 0;
 
     let mp4_track_names = if file_path.to_lowercase().ends_with(".mp4")
@@ -3221,10 +3372,14 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
                 _ => format!("{:?}", codec_id).to_uppercase(),
             };
 
+            let mut track_br = probe_stream_bitrate_kbps(&stream);
             let (channels, rate) = if let Ok(ctx) =
                 ffmpeg_next::codec::context::Context::from_parameters(p.clone())
                 && let Ok(dec) = ctx.decoder().audio()
             {
+                if track_br.is_none() && dec.bit_rate() > 0 {
+                    track_br = Some((dec.bit_rate() / 1000).max(1) as u32);
+                }
                 (
                     dec.channels().max(1),
                     if dec.rate() > 0 { dec.rate() } else { 48000 },
@@ -3289,6 +3444,37 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
                 sample_rate: rate,
                 language: lang,
             });
+            audio_track_bitrates.push(track_br);
+        }
+    }
+
+    let container_kbps = if ictx.bit_rate() > 0 {
+        Some((ictx.bit_rate() / 1000).max(1) as u32)
+    } else {
+        None
+    };
+
+    if video_bitrate_kbps.is_none()
+        && video_stream_index.is_some()
+        && let Some(c_kbps) = container_kbps
+    {
+        let audio_sum: u32 = audio_track_bitrates.iter().flatten().copied().sum();
+        if c_kbps > audio_sum {
+            video_bitrate_kbps = Some(c_kbps - audio_sum);
+        } else {
+            video_bitrate_kbps = Some(c_kbps);
+        }
+    }
+
+    if let Some(c_kbps) = container_kbps {
+        if video_stream_index.is_none() && audio_track_bitrates.len() == 1 && audio_track_bitrates[0].is_none() {
+            audio_track_bitrates[0] = Some(c_kbps);
+        } else if let Some(v_kbps) = video_bitrate_kbps
+            && audio_track_bitrates.len() == 1
+            && audio_track_bitrates[0].is_none()
+            && c_kbps > v_kbps
+        {
+            audio_track_bitrates[0] = Some(c_kbps - v_kbps);
         }
     }
 
@@ -3306,6 +3492,8 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
                 last_video_pts: 0.0,
                 duration,
                 video_info,
+                video_fps,
+                video_bitrate_kbps,
                 ext_type: ext,
             }));
         } else {
@@ -3394,7 +3582,7 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
                         channels: ch,
                         time_base: track_tb_f64,
                         current_time: 0.0,
-                        seek_in_progress: false,
+                        seek_in_progress: video_stream_index.is_some(),
                     },
                 );
             }
@@ -3423,6 +3611,9 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
             .unwrap_or(ext),
         intrinsic_sample_rate: sample_rate,
         video_info,
+        video_fps,
+        video_bitrate_kbps,
+        audio_track_bitrates,
         channel_vus: vec![0.0; channels as usize],
         video_stream_index,
         video_tx: None,
@@ -4097,6 +4288,17 @@ pub fn start_audio_thread(
         );
         let passthrough = shared_state.lock().unwrap().passthrough_enabled;
         if passthrough && can_bitstream {
+            {
+                let mut state = shared_state.lock().unwrap();
+                state.current_seconds = 0.0;
+                state.lookahead_queue.clear();
+                state.lookahead_sample_buffer.clear();
+                state.lookahead_buffer_start_time = 0.0;
+                state.lookahead_timeline = vec![0.0; 600 * 8];
+                state.waveform_history.clear();
+                state.raw_waveform.fill(0.0);
+                state.track_ended = false;
+            }
             let (tx, rx) = bounded::<DspMessage>(32);
             let stop_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
             if let Ok((handle, decoder_rate, channels, codec_name, has_video, artist, duration)) =
@@ -4147,14 +4349,6 @@ pub fn start_audio_thread(
 
                 {
                     let mut state = shared_state.lock().unwrap();
-                    state.current_seconds = 0.0;
-                    state.lookahead_queue.clear();
-                    state.lookahead_sample_buffer.clear();
-                    state.lookahead_buffer_start_time = 0.0;
-                    state.lookahead_timeline = vec![0.0; 600 * 8];
-                    state.waveform_history.clear();
-                    state.raw_waveform.fill(0.0);
-                    state.track_ended = false;
                     state.artist = meta_artist;
                     state.module_type = if is_lpcm {
                         "Multi-Channel LPCM".to_string()
@@ -4603,6 +4797,9 @@ fn populate_state_from_audio_source(
     state.num_instruments = audio_source.get_num_instruments();
     state.num_patterns = audio_source.get_num_patterns();
     state.bitrate = audio_source.get_bitrate();
+    state.stats.audio_bitrate_kbps = state.bitrate;
+    state.stats.video_fps = audio_source.get_video_fps();
+    state.stats.video_bitrate_kbps = audio_source.get_video_bitrate();
     state.audio_tracks = audio_source.get_audio_tracks();
     state.selected_audio_track = audio_source.get_selected_audio_track();
     state.active_audio_tracks = audio_source.get_active_audio_tracks();
@@ -4750,18 +4947,45 @@ pub fn push_planar_lookahead_slices(
     };
 
     let slice_frames = ((sample_rate as f64 * 0.01).round() as usize).max(16);
-    let total_samples = left.len();
-    let full_slices = total_samples / slice_frames;
+    let total_samples = left.len().min(right.len());
+    if total_samples == 0 {
+        return;
+    }
+
+    let existing_end_time = state.lookahead_buffer_start_time
+        + (state.lookahead_sample_buffer.len() / 2) as f64 / sample_rate as f64;
+    if state.lookahead_sample_buffer.is_empty()
+        || (current_seconds - existing_end_time).abs() > 0.05
+    {
+        state.lookahead_sample_buffer.clear();
+        state.lookahead_buffer_start_time = current_seconds;
+    }
+
+    state.lookahead_sample_buffer.reserve(total_samples * 2);
+    for i in 0..total_samples {
+        let mut l = left[i];
+        let mut r = right[i];
+        if let Some(c_plane) = center
+            && i < c_plane.len()
+        {
+            let c_val = c_plane[i] * std::f32::consts::FRAC_1_SQRT_2;
+            l += c_val;
+            r += c_val;
+        }
+        state.lookahead_sample_buffer.push(l);
+        state.lookahead_sample_buffer.push(r);
+    }
+
+    let buffer_frames = state.lookahead_sample_buffer.len() / 2;
+    let full_slices = buffer_frames / slice_frames;
     if full_slices == 0 {
         return;
     }
 
-    let window_start_time = current_seconds;
-
     for s in 0..full_slices {
         let start_f = s * slice_frames;
         let end_f = start_f + slice_frames;
-        let slice_time = window_start_time + (start_f as f64 / sample_rate as f64);
+        let slice_time = state.lookahead_buffer_start_time + (start_f as f64 / sample_rate as f64);
 
         let mut min_l = 0.0f32;
         let mut max_l = 0.0f32;
@@ -4774,13 +4998,8 @@ pub fn push_planar_lookahead_slices(
 
         let cnt = slice_frames as f32;
         for i in start_f..end_f {
-            let mut l = left[i];
-            let mut r = right[i];
-            if let Some(c_plane) = center {
-                let c_val = c_plane[i] * std::f32::consts::FRAC_1_SQRT_2;
-                l += c_val;
-                r += c_val;
-            }
+            let l = state.lookahead_sample_buffer[i * 2];
+            let r = state.lookahead_sample_buffer[i * 2 + 1];
 
             min_l = min_l.min(l);
             max_l = max_l.max(l);
@@ -4791,7 +5010,7 @@ pub fn push_planar_lookahead_slices(
 
             let mono = (l + r) * 0.5;
             let diff = if i > start_f {
-                let prev_l = left[i - 1];
+                let prev_l = state.lookahead_sample_buffer[(i - 1) * 2];
                 (l - prev_l).abs()
             } else {
                 0.0
@@ -4827,6 +5046,13 @@ pub fn push_planar_lookahead_slices(
                 treble,
             ],
         ));
+    }
+
+    let consumed_samples = full_slices * slice_frames * 2;
+    if consumed_samples > 0 {
+        state.lookahead_sample_buffer.drain(0..consumed_samples);
+        state.lookahead_buffer_start_time +=
+            (full_slices * slice_frames) as f64 / sample_rate as f64;
     }
 
     while state.lookahead_queue.len() > 1800 {
@@ -4866,6 +5092,7 @@ fn process_decoder_state_requests(
             state.peak_vus.resize(ch_count, 0.0);
             state.module_type = audio_source.get_type();
             state.bitrate = audio_source.get_bitrate();
+            state.stats.audio_bitrate_kbps = state.bitrate;
             state.multi_track_mix_mode = state.active_audio_tracks.len() > 1;
 
             if state.audio_track_volumes.len() != state.audio_tracks.len() {
@@ -4931,6 +5158,7 @@ fn process_decoder_state_requests(
             state.peak_vus.resize(ch_count, 0.0);
             state.module_type = audio_source.get_type();
             state.bitrate = audio_source.get_bitrate();
+            state.stats.audio_bitrate_kbps = state.bitrate;
             let track_title = state
                 .audio_tracks
                 .get(track_idx)
@@ -5228,6 +5456,9 @@ pub fn spawn_video_decoder_thread(
             // Deliver the very first decoded frame immediately (even while paused at startup)
             let mut is_first_frame_after_seek = true;
             let mut decoded_any_frame = false;
+            let mut pkt_bytes_accum: u64 = 0;
+            let mut pkt_window_start_pts: Option<f64> = None;
+            let mut prev_frame_pts: Option<f64> = None;
             let mut scaler: Option<(
                 ffmpeg_next::format::Pixel,
                 u32,
@@ -5244,12 +5475,17 @@ pub fn spawn_video_decoder_thread(
                                 decoder.flush();
                                 local_epoch = state.seek_epoch;
                                 is_first_frame_after_seek = true;
+                                pkt_bytes_accum = 0;
+                                pkt_window_start_pts = None;
+                                prev_frame_pts = None;
                             }
                         }
 
                         if packet_epoch < local_epoch {
                             continue;
                         }
+
+                        pkt_bytes_accum = pkt_bytes_accum.saturating_add(packet.size() as u64);
 
                         let decode_start = std::time::Instant::now();
                         let mut send_ok = decoder.send_packet(&packet).is_ok();
@@ -5319,12 +5555,30 @@ pub fn spawn_video_decoder_thread(
 
                                 let mut skip_push = false;
                                 if is_first_frame_after_seek {
-                                    is_first_frame_after_seek = false;
-                                    if pts >= 0.0
-                                        && let Ok(mut state) = state_for_video.lock()
-                                        && state.seek_epoch == local_epoch
-                                    {
-                                        state.current_seconds = pts;
+                                    let (cached_seconds, current_epoch, duration) = {
+                                        let state = state_for_video.lock().unwrap();
+                                        (
+                                            state.current_seconds,
+                                            state.seek_epoch,
+                                            state.duration_seconds,
+                                        )
+                                    };
+                                    if current_epoch > local_epoch {
+                                        skip_push = true;
+                                    } else {
+                                        let target_t = if duration > 0.25 {
+                                            cached_seconds.min((duration - 0.25).max(0.0))
+                                        } else {
+                                            cached_seconds
+                                        };
+                                        if pts >= 0.0 && pts < target_t - 0.15 {
+                                            // Fast-forward through intermediate GOP reference frames
+                                            // between the keyframe and the seek target without GPU transfer
+                                            // or snapping `state.current_seconds` backwards.
+                                            skip_push = true;
+                                        } else {
+                                            is_first_frame_after_seek = false;
+                                        }
                                     }
                                 } else {
                                     loop {
@@ -5650,8 +5904,40 @@ pub fn spawn_video_decoder_thread(
                                         let pkt_pct = (video_packet_rx_for_video.len() as f32
                                             / 128.0)
                                             * 100.0;
+                                        let frame_pct =
+                                            (video_frame_tx.len() as f32 / 16.0) * 100.0;
                                         state.stats.video_buffer_fill_pct =
-                                            pkt_pct.clamp(0.0, 100.0);
+                                            pkt_pct.max(frame_pct).clamp(0.0, 100.0);
+                                        if state.stats.video_fps <= 0.0
+                                            && let Some(p_pts) = prev_frame_pts
+                                        {
+                                            let dt = pts - p_pts;
+                                            if (0.001..0.5).contains(&dt) {
+                                                state.stats.video_fps = (1.0 / dt) as f32;
+                                            }
+                                        }
+                                        if pts >= 0.0 {
+                                            prev_frame_pts = Some(pts);
+                                            if let Some(start_pts) = pkt_window_start_pts {
+                                                let win_dur = pts - start_pts;
+                                                if win_dur >= 0.5 {
+                                                    let kbps = ((pkt_bytes_accum as f64 * 8.0)
+                                                        / (win_dur * 1000.0))
+                                                        .round()
+                                                        as u32;
+                                                    if kbps > 0
+                                                        && state.stats.video_bitrate_kbps.is_none()
+                                                    {
+                                                        state.stats.video_bitrate_kbps = Some(kbps);
+                                                    }
+                                                    pkt_window_start_pts = Some(pts);
+                                                    pkt_bytes_accum = 0;
+                                                }
+                                            } else {
+                                                pkt_window_start_pts = Some(pts);
+                                                pkt_bytes_accum = 0;
+                                            }
+                                        }
                                         if state.stats.bitstream_active {
                                             state.stats.decode_us =
                                                 state.stats.decode_us * 0.9 + frame_work_us * 0.1;
@@ -5733,6 +6019,7 @@ fn spawn_media_decoder_threads(
             tracker_channels: None,
             spatial_channels: 0,
             track_ended: false,
+            seek_epoch: 0,
         });
     }
 
@@ -5746,7 +6033,12 @@ fn spawn_media_decoder_threads(
                 chunk_frames,
             );
             if frames_read > 0 {
-                if let Ok(mut state) = shared_state.try_lock() {
+                if let Ok(mut state) = shared_state.lock() {
+                    if state.bitrate.is_none() {
+                        state.bitrate = audio_source.get_bitrate();
+                        state.stats.audio_bitrate_kbps = state.bitrate;
+                    }
+                    chunk.seek_epoch = state.seek_epoch;
                     push_chunk_lookahead_slices(
                         &mut state,
                         &chunk,
@@ -5806,10 +6098,20 @@ fn spawn_media_decoder_threads(
             );
 
             let current_artist = audio_source.get_artist();
-            if let Ok(mut state) = state_for_decoder.try_lock() {
-                if just_seeked && frames_read > 0 {
-                    state.current_seconds = chunk.current_seconds;
+            let current_bitrate = audio_source.get_bitrate();
+            if let Ok(mut state) = state_for_decoder.lock() {
+                if just_seeked {
+                    if frames_read > 0
+                        && (state.current_seconds - chunk.current_seconds).abs() < 0.5
+                    {
+                        state.current_seconds = chunk.current_seconds;
+                    }
                     just_seeked = false;
+                }
+                chunk.seek_epoch = state.seek_epoch;
+                if state.bitrate.is_none() && current_bitrate.is_some() {
+                    state.bitrate = current_bitrate;
+                    state.stats.audio_bitrate_kbps = current_bitrate;
                 }
                 if current_artist != "Unknown" && !current_artist.is_empty() {
                     if let Some((artist_part, title_part)) = current_artist.split_once(" - ") {
@@ -5824,9 +6126,13 @@ fn spawn_media_decoder_threads(
                 state.stats.decode_us = state.stats.decode_us * 0.9 + decode_elapsed * 0.1;
                 let fill_pct = (ready_rx_for_decoder.len() as f32 / pool_size as f32) * 100.0;
                 state.stats.audio_buffer_fill_pct = fill_pct;
-                let video_pct =
-                    ((video_rx_for_decoder.len() as f32 / 128.0) * 100.0).clamp(0.0, 100.0);
-                state.stats.video_buffer_fill_pct = video_pct;
+                let pkt_pct = (video_rx_for_decoder.len() as f32 / 128.0) * 100.0;
+                let frame_pct = state
+                    .video_frame_rx
+                    .as_ref()
+                    .map(|rx| (rx.len() as f32 / 16.0) * 100.0)
+                    .unwrap_or(0.0);
+                state.stats.video_buffer_fill_pct = pkt_pct.max(frame_pct).clamp(0.0, 100.0);
                 state.stats.clipping_events += clips;
                 push_chunk_lookahead_slices(
                     &mut state,
@@ -5920,10 +6226,12 @@ fn run_dummy(
         let recycle_rx = dsp_recycle_channel().1.clone();
 
         let mut was_paused = false;
+        let mut latest_seek_epoch = 0u64;
 
         while !stop_token_clone.load(std::sync::atomic::Ordering::Relaxed) {
             if let Ok(state) = shared_state_dummy.try_lock() {
                 was_paused = state.is_paused;
+                latest_seek_epoch = state.seek_epoch;
             }
 
             if was_paused {
@@ -5937,6 +6245,10 @@ fn run_dummy(
 
             match ready_rx.recv_timeout(std::time::Duration::from_millis(50)) {
                 Ok(chunk) => {
+                    if chunk.seek_epoch < latest_seek_epoch {
+                        let _ = free_tx.try_send(chunk);
+                        continue;
+                    }
                     if chunk.track_ended
                         && let Ok(mut state) = shared_state_dummy.try_lock()
                     {
@@ -5975,11 +6287,15 @@ fn run_dummy(
                         chunk.speed,
                         chunk.current_seconds,
                         &chunk.current_row_string,
+                        chunk.seek_epoch,
+                        true,
                     );
 
                     let _ = tx.try_send(msg);
 
-                    if let Ok(mut state) = shared_state_dummy.try_lock() {
+                    if let Ok(mut state) = shared_state_dummy.try_lock()
+                        && chunk.seek_epoch == state.seek_epoch
+                    {
                         state.current_seconds = chunk.current_seconds;
                     }
 
@@ -6026,6 +6342,8 @@ fn build_recycled_dsp_message(
     speed: i32,
     current_seconds: f64,
     current_row_string: &str,
+    seek_epoch: u64,
+    copy_audio: bool,
 ) -> DspMessage {
     let mut msg = recycle_rx.try_recv().unwrap_or_else(|_| DspMessage {
         audio_data: vec![0.0; window_size],
@@ -6037,27 +6355,30 @@ fn build_recycled_dsp_message(
         current_seconds: 0.0,
         current_row_string: String::with_capacity(256),
         channel_audio_data: vec![vec![0.0; window_size]; hardware_channels],
+        seek_epoch: 0,
     });
 
-    if msg.audio_data.len() != window_size {
-        msg.audio_data.resize(window_size, 0.0);
-    }
-    copy_ring_buffer(&mut msg.audio_data, fft_buffer, fft_index);
-
-    if msg.channel_audio_data.len() != hardware_channels {
-        msg.channel_audio_data
-            .resize_with(hardware_channels, || vec![0.0; window_size]);
-    }
-    for (dst_ch, src_ch) in msg
-        .channel_audio_data
-        .iter_mut()
-        .zip(channel_fft_buffers.iter())
-        .take(hardware_channels)
-    {
-        if dst_ch.len() != window_size {
-            dst_ch.resize(window_size, 0.0);
+    if copy_audio {
+        if msg.audio_data.len() != window_size {
+            msg.audio_data.resize(window_size, 0.0);
         }
-        copy_ring_buffer(dst_ch, src_ch, fft_index);
+        copy_ring_buffer(&mut msg.audio_data, fft_buffer, fft_index);
+
+        if msg.channel_audio_data.len() != hardware_channels {
+            msg.channel_audio_data
+                .resize_with(hardware_channels, || vec![0.0; window_size]);
+        }
+        for (dst_ch, src_ch) in msg
+            .channel_audio_data
+            .iter_mut()
+            .zip(channel_fft_buffers.iter())
+            .take(hardware_channels)
+        {
+            if dst_ch.len() != window_size {
+                dst_ch.resize(window_size, 0.0);
+            }
+            copy_ring_buffer(dst_ch, src_ch, fft_index);
+        }
     }
 
     msg.channel_vus.clear();
@@ -6069,6 +6390,7 @@ fn build_recycled_dsp_message(
     msg.current_seconds = current_seconds;
     msg.current_row_string.clear();
     msg.current_row_string.push_str(current_row_string);
+    msg.seek_epoch = seek_epoch;
     msg
 }
 
@@ -6087,6 +6409,7 @@ struct AudioChunk {
     tracker_channels: Option<i32>,
     spatial_channels: i32,
     track_ended: bool,
+    seek_epoch: u64,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6130,7 +6453,10 @@ where
     let mut last_speed = 0;
     let mut last_current_seconds = 0.0;
     let mut last_current_row_string = String::new();
+    let mut last_seek_epoch = 0u64;
+    let mut latest_seek_epoch = 0u64;
     let mut was_paused = false;
+    let mut skip_fft_cached = false;
 
     let shared_state_err = shared_state.clone();
     let shared_state_cb = shared_state.clone();
@@ -6143,6 +6469,17 @@ where
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
             if let Ok(state) = shared_state_cb.try_lock() {
                 was_paused = state.is_paused;
+                latest_seek_epoch = state.seek_epoch;
+                skip_fft_cached = state.video_mode == 3
+                    && (state.has_video_stream || state.video_frame_rx.is_some());
+            }
+
+            if let Some(ref c) = current_chunk
+                && c.seek_epoch < latest_seek_epoch
+            {
+                let stale = current_chunk.take().unwrap();
+                let _ = free_tx_cb.try_send(stale);
+                chunk_frame_pos = 0;
             }
 
             if was_paused {
@@ -6163,6 +6500,10 @@ where
                 if current_chunk.is_none() {
                     match ready_rx_cb.try_recv() {
                         Ok(chunk) => {
+                            if chunk.seek_epoch < latest_seek_epoch {
+                                let _ = free_tx_cb.try_send(chunk);
+                                continue;
+                            }
                             last_channel_vus.clear();
                             last_channel_vus.extend_from_slice(&chunk.channel_vus);
                             last_current_order = chunk.current_order;
@@ -6172,6 +6513,10 @@ where
                             last_current_seconds = chunk.current_seconds;
                             last_current_row_string.clear();
                             last_current_row_string.push_str(&chunk.current_row_string);
+                            last_seek_epoch = chunk.seek_epoch;
+                            if chunk.seek_epoch > latest_seek_epoch {
+                                latest_seek_epoch = chunk.seek_epoch;
+                            }
 
                             if chunk.track_ended
                                 && let Ok(mut state) = shared_state_cb.try_lock()
@@ -6207,27 +6552,41 @@ where
 
                     let to_copy = std::cmp::min(frames_available, frames_needed);
 
-                    let mono_norm = if hardware_channels > 2 {
-                        1.0 / (hardware_channels as f32).sqrt()
-                    } else {
-                        1.0 / (hardware_channels.max(1) as f32)
-                    };
-                    for i in 0..to_copy {
-                        let src_frame_idx = chunk_frame_pos + i;
-                        let dst_frame_idx = frames_written + i;
-
-                        let mut mono = 0.0;
-                        for c in 0..hardware_channels {
-                            let sample = chunk.samples[src_frame_idx * hardware_channels + c]
-                                .clamp(-1.0, 1.0);
-                            data[dst_frame_idx * hardware_channels + c] = T::from_sample(sample);
-                            mono += sample;
-                            channel_fft_buffers[c][fft_index] = sample;
+                    if skip_fft_cached {
+                        for i in 0..to_copy {
+                            let src_frame_idx = chunk_frame_pos + i;
+                            let dst_frame_idx = frames_written + i;
+                            for c in 0..hardware_channels {
+                                let sample = chunk.samples[src_frame_idx * hardware_channels + c]
+                                    .clamp(-1.0, 1.0);
+                                data[dst_frame_idx * hardware_channels + c] =
+                                    T::from_sample(sample);
+                            }
                         }
-                        mono *= mono_norm;
+                    } else {
+                        let mono_norm = if hardware_channels > 2 {
+                            1.0 / (hardware_channels as f32).sqrt()
+                        } else {
+                            1.0 / (hardware_channels.max(1) as f32)
+                        };
+                        for i in 0..to_copy {
+                            let src_frame_idx = chunk_frame_pos + i;
+                            let dst_frame_idx = frames_written + i;
 
-                        fft_buffer[fft_index] = mono;
-                        fft_index = (fft_index + 1) % window_size;
+                            let mut mono = 0.0;
+                            for c in 0..hardware_channels {
+                                let sample = chunk.samples[src_frame_idx * hardware_channels + c]
+                                    .clamp(-1.0, 1.0);
+                                data[dst_frame_idx * hardware_channels + c] =
+                                    T::from_sample(sample);
+                                mono += sample;
+                                channel_fft_buffers[c][fft_index] = sample;
+                            }
+                            mono *= mono_norm;
+
+                            fft_buffer[fft_index] = mono;
+                            fft_index = (fft_index + 1) % window_size;
+                        }
                     }
 
                     chunk_frame_pos += to_copy;
@@ -6236,7 +6595,10 @@ where
             }
 
             frames_since_last_dsp_send += frames_written;
-            if frames_since_last_dsp_send >= dsp_send_interval {
+            if frames_since_last_dsp_send >= dsp_send_interval
+                && frames_written > 0
+                && last_seek_epoch >= latest_seek_epoch
+            {
                 frames_since_last_dsp_send = 0;
                 let play_time =
                     last_current_seconds + (chunk_frame_pos as f64 / sample_rate as f64);
@@ -6254,6 +6616,8 @@ where
                     last_speed,
                     play_time,
                     &last_current_row_string,
+                    last_seek_epoch,
+                    !skip_fft_cached,
                 );
                 let _ = tx_cb.try_send(msg);
             }
@@ -6397,6 +6761,8 @@ where
                     0,
                     0.0,
                     "",
+                    0,
+                    true,
                 );
 
                 let _ = tx.try_send(msg);
@@ -6587,5 +6953,203 @@ mod tests {
         assert!(!(single_track.len() > 1));
         assert!(multi_track.len() > 1);
         assert!(!(empty_track.len() > 1));
+    }
+
+    #[test]
+    fn test_dsp_thread_skips_fft_in_fullscreen_video_and_preserves_bitstream_buffer_pct() {
+        let state = Arc::new(Mutex::new(AppState::new("Test".to_string())));
+        {
+            let mut s = state.lock().unwrap();
+            s.has_video_stream = true;
+            s.video_mode = 3; // Fullscreen video mode (no visualization)
+            s.stats.bitstream_active = true;
+            s.stats.audio_buffer_fill_pct = 82.5;
+            s.stats.fft_us = 999.0;
+        }
+
+        let (tx, rx) = bounded(4);
+        let window_size = 2048;
+        spawn_dsp_thread(rx, Arc::clone(&state), 48000, 20000.0, window_size);
+
+        // Send a DSP message while in fullscreen video mode
+        tx.send(DspMessage {
+            audio_data: Vec::new(),
+            channel_audio_data: Vec::new(),
+            channel_vus: vec![0.4, 0.5],
+            current_order: 1,
+            current_row: 2,
+            bpm: 120,
+            speed: 6,
+            current_seconds: 42.5,
+            current_row_string: String::new(),
+            seek_epoch: 0,
+        })
+        .unwrap();
+
+        // Wait briefly for DSP thread to process
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let s = state.lock().unwrap();
+            if (s.current_seconds - 42.5).abs() < 1e-6 {
+                break;
+            }
+        }
+
+        {
+            let mut s = state.lock().unwrap();
+            assert!((s.current_seconds - 42.5).abs() < 1e-6);
+            assert_eq!(
+                s.stats.fft_us, 0.0,
+                "CPU FFT time must be 0.0 when skipped in Fullscreen Video mode"
+            );
+            assert_eq!(
+                s.stats.audio_buffer_fill_pct, 82.5,
+                "DSP thread must not overwrite bitstream audio_buffer_fill_pct with 0.0%"
+            );
+            // Switch to normal visualization mode (video_mode = 2 = Split View)
+            s.video_mode = 2;
+        }
+
+        // Send a DSP message with a 440Hz tone in Split View mode
+        let samples: Vec<f32> = (0..window_size)
+            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 48000.0).sin())
+            .collect();
+        tx.send(DspMessage {
+            audio_data: samples.clone(),
+            channel_audio_data: vec![samples.clone(), samples],
+            channel_vus: vec![0.8, 0.8],
+            current_order: 1,
+            current_row: 3,
+            bpm: 120,
+            speed: 6,
+            current_seconds: 43.0,
+            current_row_string: String::new(),
+            seek_epoch: 0,
+        })
+        .unwrap();
+
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let s = state.lock().unwrap();
+            if (s.current_seconds - 43.0).abs() < 1e-6 {
+                break;
+            }
+        }
+
+        {
+            let s = state.lock().unwrap();
+            assert!((s.current_seconds - 43.0).abs() < 1e-6);
+            assert!(
+                s.stats.fft_us > 0.0,
+                "CPU FFT must run when not in Fullscreen Video mode"
+            );
+            assert_eq!(
+                s.stats.audio_buffer_fill_pct, 82.5,
+                "DSP thread must preserve bitstream audio_buffer_fill_pct across frames"
+            );
+        }
+    }
+
+    #[test]
+    fn test_dsp_thread_discards_stale_seek_epoch_and_preserves_post_seek_lookahead_queue() {
+        let state = Arc::new(Mutex::new(AppState::new("Test".to_string())));
+        {
+            let mut s = state.lock().unwrap();
+            s.seek_epoch = 5;
+            s.current_seconds = 100.0;
+            // Populate post-seek lookahead queue around 100.0s .. 103.0s
+            for i in 0..300 {
+                s.lookahead_queue.push_back((
+                    100.0 + (i as f64) * 0.01,
+                    [0.75, 0.5, 0.75, 0.5, 0.0, 0.0, 0.0, 0.0],
+                ));
+            }
+        }
+
+        let (tx, rx) = bounded(4);
+        let window_size = 2048;
+        spawn_dsp_thread(rx, Arc::clone(&state), 48000, 20000.0, window_size);
+
+        // Send a stale pre-seek message from epoch 4 at timestamp 250.0s (which previously
+        // would have overwritten current_seconds = 250.0 and pruned all 100.0..103.0s slices!)
+        tx.send(DspMessage {
+            audio_data: vec![0.25; window_size],
+            channel_audio_data: vec![vec![0.25; window_size], vec![0.25; window_size]],
+            channel_vus: vec![0.25, 0.25],
+            current_order: 0,
+            current_row: 0,
+            bpm: 120,
+            speed: 6,
+            current_seconds: 250.0,
+            current_row_string: String::new(),
+            seek_epoch: 4,
+        })
+        .unwrap();
+
+        // Follow with a fresh post-seek message from epoch 5 at timestamp 100.05s
+        tx.send(DspMessage {
+            audio_data: vec![0.25; window_size],
+            channel_audio_data: vec![vec![0.25; window_size], vec![0.25; window_size]],
+            channel_vus: vec![0.25, 0.25],
+            current_order: 0,
+            current_row: 0,
+            bpm: 120,
+            speed: 6,
+            current_seconds: 100.05,
+            current_row_string: String::new(),
+            seek_epoch: 5,
+        })
+        .unwrap();
+
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let s = state.lock().unwrap();
+            if (s.current_seconds - 100.05).abs() < 1e-6 {
+                break;
+            }
+        }
+
+        let s = state.lock().unwrap();
+        assert!(
+            (s.current_seconds - 100.05).abs() < 1e-6,
+            "Stale seek_epoch message must not overwrite current_seconds"
+        );
+        assert!(
+            s.lookahead_queue.len() >= 295,
+            "Post-seek lookahead_queue slices must not be pruned by stale pre-seek DspMessage (len={})",
+            s.lookahead_queue.len()
+        );
+    }
+
+    #[test]
+    fn test_push_planar_lookahead_slices_accumulates_sub_slice_frames_and_remainders() {
+        let mut s = AppState::new("Test".to_string());
+        s.current_seconds = 10.0;
+
+        // Simulate TrueHD-style 40-sample frames at 48kHz (12 frames = 480 samples = 1 slice of 10ms)
+        let channels = vec![vec![0.6f32; 40], vec![0.4f32; 40]];
+        for i in 0..24 {
+            let pts = 10.0 + (i as f64) * (40.0 / 48_000.0);
+            push_planar_lookahead_slices(&mut s, &channels, 48_000, pts);
+        }
+
+        assert_eq!(
+            s.lookahead_queue.len(),
+            2,
+            "24 frames of 40 samples @ 48kHz (960 samples) must produce exactly 2 10ms lookahead slices"
+        );
+        assert_eq!(s.lookahead_sample_buffer.len(), 0);
+        assert!((s.lookahead_queue[0].0 - 10.0).abs() < 1e-4);
+        assert!((s.lookahead_queue[1].0 - 10.01).abs() < 1e-4);
+        assert!((s.lookahead_queue[0].1[1] - 0.6).abs() < 1e-4);
+        assert!((s.lookahead_queue[0].1[3] - 0.4).abs() < 1e-4);
+        assert!((s.lookahead_queue[0].1[4] - 0.6).abs() < 1e-4);
+        assert!((s.lookahead_queue[0].1[5] - 0.4).abs() < 1e-4);
+
+        // Also verify update_lookahead_timeline_from_queue populates the tape timeline at +0.0s (slice 100)
+        let mut timeline = vec![0.0f32; 600 * 8];
+        update_lookahead_timeline_from_queue(&s.lookahead_queue, &[], &[], 10.0, &mut timeline);
+        assert!((timeline[100 * 8 + 1] - 0.6).abs() < 1e-4);
+        assert!((timeline[100 * 8 + 3] - 0.4).abs() < 1e-4);
     }
 }

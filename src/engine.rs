@@ -296,6 +296,7 @@ pub struct VulkanEngine {
 
     // Pre-allocated buffers to avoid per-frame heap allocations
     waveform_history_flat: Vec<f32>,
+    tape_timeline_scratch: Vec<f32>,
 
     // Video
     video_bind_group_layout: wgpu::BindGroupLayout,
@@ -321,6 +322,8 @@ pub struct VulkanEngine {
     last_history_cam_z: f64,
     smooth_time: f64,
     play_time: f64,
+    smooth_audio_seconds: f64,
+    last_raw_state_seconds: f64,
     smooth_dt: f64,
     last_history_push_count: u64,
     time_since_last_push: f64,
@@ -5467,6 +5470,7 @@ impl VulkanEngine {
             depth_texture_view,
 
             waveform_history_flat: vec![0.0; 2048 * 144],
+            tape_timeline_scratch: vec![0.0; 600 * 8],
             video_bind_group_layout,
             video_pipeline,
             video_state: None,
@@ -5489,6 +5493,8 @@ impl VulkanEngine {
             last_history_cam_z: 0.0f64,
             smooth_time: 0.0f64,
             play_time: 0.0f64,
+            smooth_audio_seconds: 0.0f64,
+            last_raw_state_seconds: 0.0f64,
             smooth_dt: 1.0f64 / 60.0f64,
             last_history_push_count: 0,
             time_since_last_push: 0.0,
@@ -5886,6 +5892,35 @@ impl VulkanEngine {
             self.play_time = (self.play_time + self.smooth_dt * 2.88) % 86400.0;
         }
 
+        // Smooth display-rate audio playhead clock for visualizers (such as Retro Tape Head)
+        if let Some(scrub_t) = state.scrub_target_seconds {
+            self.smooth_audio_seconds = scrub_t;
+            self.last_raw_state_seconds = state.current_seconds;
+        } else if !state.file_loaded {
+            self.smooth_audio_seconds = 0.0;
+            self.last_raw_state_seconds = 0.0;
+        } else if state.is_paused
+            || state.track_ended
+            || state.seek_request.is_some()
+            || (state.current_seconds - self.last_raw_state_seconds).abs() > 0.20
+        {
+            self.smooth_audio_seconds = state.current_seconds;
+            self.last_raw_state_seconds = state.current_seconds;
+        } else {
+            self.smooth_audio_seconds += (dt as f64).clamp(0.0, 0.1);
+            let drift = state.current_seconds - self.smooth_audio_seconds;
+            if drift.abs() > 0.12 {
+                self.smooth_audio_seconds = state.current_seconds;
+            } else if (state.current_seconds - self.last_raw_state_seconds).abs() > 1e-6 {
+                self.smooth_audio_seconds += drift * 0.25;
+            }
+            if state.duration_seconds > 0.0 {
+                self.smooth_audio_seconds =
+                    self.smooth_audio_seconds.clamp(0.0, state.duration_seconds);
+            }
+            self.last_raw_state_seconds = state.current_seconds;
+        }
+
         // Progress bar fire dies off when playback stops / pauses / ends / reaches end of song
         let is_at_end =
             state.duration_seconds > 0.0 && state.current_seconds >= state.duration_seconds - 0.05;
@@ -5917,7 +5952,7 @@ impl VulkanEngine {
             channel_phases: self.channel_phases,
             num_channels: state.channel_vus.len().min(32) as u32,
             mode: state.visualizer_mode,
-            time: state.scrub_target_seconds.unwrap_or(state.current_seconds) as f32,
+            time: self.smooth_audio_seconds as f32,
             duration: state.duration_seconds as f32,
             smooth_time: self.play_time as f32,
             heatmap_row: self.heatmap_row,
@@ -6219,17 +6254,22 @@ impl VulkanEngine {
         let history_dirty = state.waveform_history_push_count != self.last_uploaded_push_count
             || vis_width != self.last_uploaded_vis_width
             || vis_def.id != self.last_uploaded_vis_id;
-        if vis_def.id == 24 && history_dirty {
-            if !state.lookahead_timeline.is_empty() {
-                self.last_uploaded_push_count = state.waveform_history_push_count;
-                self.last_uploaded_vis_width = vis_width;
-                self.last_uploaded_vis_id = vis_def.id;
-                self.queue.write_buffer(
-                    &self.waveform_storage_buffer,
-                    0,
-                    bytemuck::cast_slice(&state.lookahead_timeline),
-                );
-            }
+        if vis_def.id == 24 {
+            crate::audio::update_lookahead_timeline_from_queue(
+                &state.lookahead_queue,
+                &state.raw_waveform,
+                &state.raw_channel_vus,
+                self.smooth_audio_seconds,
+                &mut self.tape_timeline_scratch,
+            );
+            self.last_uploaded_push_count = state.waveform_history_push_count;
+            self.last_uploaded_vis_width = vis_width;
+            self.last_uploaded_vis_id = vis_def.id;
+            self.queue.write_buffer(
+                &self.waveform_storage_buffer,
+                0,
+                bytemuck::cast_slice(&self.tape_timeline_scratch),
+            );
         } else if vis_def.requires_history && history_dirty {
             self.last_uploaded_push_count = state.waveform_history_push_count;
             self.last_uploaded_vis_width = vis_width;
@@ -6772,14 +6812,23 @@ impl VulkanEngine {
                 (vs.width, vs.height)
             };
             let disp_bits = if vs.bit_depth == 16 { 10 } else { vs.bit_depth };
+            let fps_suffix = if state.stats.video_fps > 0.0 {
+                if (state.stats.video_fps - state.stats.video_fps.round()).abs() < 0.05 {
+                    format!(" @ {:.0} fps", state.stats.video_fps.round())
+                } else {
+                    format!(" @ {:.2} fps", state.stats.video_fps)
+                }
+            } else {
+                String::new()
+            };
             let hw_suffix = if !state.stats.video_hw_decoder.is_empty() {
                 format!(" | {}", state.stats.video_hw_decoder)
             } else {
                 String::new()
             };
             video_info_str = Some(format!(
-                "{}x{} | {} {}-bit {}{}",
-                disp_w, disp_h, cs, disp_bits, cr, hw_suffix
+                "{}x{}{} | {} {}-bit {}{}",
+                disp_w, disp_h, fps_suffix, cs, disp_bits, cr, hw_suffix
             ));
         }
 
@@ -6899,8 +6948,15 @@ impl VulkanEngine {
                             egui::RichText::new(format!("CPU UI: {:.2} ms | CPU Render: {:.2} ms", state.stats.ui_us / 1000.0, state.stats.render_us / 1000.0))
                                 .color(egui::Color32::WHITE)
                         );
+                        let fft_text = if state.video_mode == 3
+                            && (state.has_video_stream || state.video_frame_rx.is_some())
+                        {
+                            "CPU FFT: Off (Fullscreen Video)".to_string()
+                        } else {
+                            format!("CPU FFT: {:.2} ms", state.stats.fft_us / 1000.0)
+                        };
                         ui.label(
-                            egui::RichText::new(format!("CPU FFT: {:.2} ms", state.stats.fft_us / 1000.0))
+                            egui::RichText::new(fft_text)
                                 .color(egui::Color32::WHITE)
                         );
                         if state.gpu_fft && state.stats.gpu_fft_us > 0.0 {
@@ -6975,6 +7031,19 @@ impl VulkanEngine {
                             egui::RichText::new(format!("Hardware Channels: {} | Source: {}", state.hardware_channels, state.num_channels))
                                 .color(if state.hardware_channels != state.num_channels { egui::Color32::YELLOW } else { egui::Color32::GRAY })
                         );
+                        if video_info_str.is_none()
+                            && let Some(abr) = state.stats.audio_bitrate_kbps.or(state.bitrate)
+                        {
+                            let abr_str = if abr >= 1000 {
+                                format!("Audio Bitrate: {} kbps ({:.2} Mbps)", abr, abr as f32 / 1000.0)
+                            } else {
+                                format!("Audio Bitrate: {} kbps", abr)
+                            };
+                            ui.label(
+                                egui::RichText::new(abr_str)
+                                    .color(egui::Color32::LIGHT_GREEN)
+                            );
+                        }
                         ui.label(
                             egui::RichText::new(format!("Clipping Events: {}", state.stats.clipping_events))
                                 .color(if state.stats.clipping_events > 0 { egui::Color32::RED } else { egui::Color32::GRAY })
@@ -6989,6 +7058,39 @@ impl VulkanEngine {
                                 egui::RichText::new(vi)
                                     .color(egui::Color32::YELLOW)
                             );
+                            if state.stats.video_fps > 0.0 {
+                                let fps_str = if (state.stats.video_fps - state.stats.video_fps.round()).abs() < 0.05 {
+                                    format!("Video Frame Rate: {:.0} fps", state.stats.video_fps.round())
+                                } else {
+                                    format!("Video Frame Rate: {:.2} fps", state.stats.video_fps)
+                                };
+                                ui.label(
+                                    egui::RichText::new(fps_str)
+                                        .color(egui::Color32::LIGHT_GREEN)
+                                );
+                            }
+                            if let Some(vbr) = state.stats.video_bitrate_kbps {
+                                let vbr_str = if vbr >= 1000 {
+                                    format!("Video Bitrate: {} kbps ({:.2} Mbps)", vbr, vbr as f32 / 1000.0)
+                                } else {
+                                    format!("Video Bitrate: {} kbps", vbr)
+                                };
+                                ui.label(
+                                    egui::RichText::new(vbr_str)
+                                        .color(egui::Color32::LIGHT_GREEN)
+                                );
+                            }
+                            if let Some(abr) = state.stats.audio_bitrate_kbps.or(state.bitrate) {
+                                let abr_str = if abr >= 1000 {
+                                    format!("Audio Bitrate: {} kbps ({:.2} Mbps)", abr, abr as f32 / 1000.0)
+                                } else {
+                                    format!("Audio Bitrate: {} kbps", abr)
+                                };
+                                ui.label(
+                                    egui::RichText::new(abr_str)
+                                        .color(egui::Color32::LIGHT_GREEN)
+                                );
+                            }
                         }
                     });
             }
@@ -10839,9 +10941,16 @@ mod tests {
         // Simulate bitstream playback active
         state.stats.bitstream_active = true;
         state.stats.audio_buffer_fill_pct = 78.5;
+        state.stats.video_buffer_fill_pct = 62.0;
+        state.stats.video_fps = 59.94;
+        state.stats.video_bitrate_kbps = Some(15000);
+        state.stats.audio_bitrate_kbps = Some(768);
         state.track_ended = false;
         assert!(state.stats.bitstream_active);
         assert_eq!(state.stats.audio_buffer_fill_pct, 78.5);
+        assert_eq!(state.stats.video_fps, 59.94);
+        assert_eq!(state.stats.video_bitrate_kbps, Some(15000));
+        assert_eq!(state.stats.audio_bitrate_kbps, Some(768));
 
         // Simulate stream drop / transition logic from main.rs
         state.video_frame_rx = None;
@@ -10849,6 +10958,11 @@ mod tests {
         state.video_mode = 0;
         state.stats.bitstream_active = false;
         state.stats.audio_buffer_fill_pct = 0.0;
+        state.stats.video_buffer_fill_pct = 0.0;
+        state.stats.video_hw_decoder.clear();
+        state.stats.video_fps = 0.0;
+        state.stats.video_bitrate_kbps = None;
+        state.stats.audio_bitrate_kbps = None;
         state.track_ended = false;
 
         assert!(
@@ -10858,6 +10972,22 @@ mod tests {
         assert_eq!(
             state.stats.audio_buffer_fill_pct, 0.0,
             "audio_buffer_fill_pct must be 0 after dropping stream"
+        );
+        assert_eq!(
+            state.stats.video_buffer_fill_pct, 0.0,
+            "video_buffer_fill_pct must be 0 after dropping stream"
+        );
+        assert_eq!(
+            state.stats.video_fps, 0.0,
+            "video_fps must be 0 after dropping stream"
+        );
+        assert!(
+            state.stats.video_bitrate_kbps.is_none(),
+            "video_bitrate_kbps must be None after dropping stream"
+        );
+        assert!(
+            state.stats.audio_bitrate_kbps.is_none(),
+            "audio_bitrate_kbps must be None after dropping stream"
         );
     }
 

@@ -71,6 +71,9 @@ pub struct PerformanceStats {
     pub bitstream_active: bool,
     pub bitstream_format: String,
     pub video_hw_decoder: String,
+    pub video_fps: f32,
+    pub video_bitrate_kbps: Option<u32>,
+    pub audio_bitrate_kbps: Option<u32>,
 
     // Fine-grained frame phase timings (microseconds)
     pub phase_lock_update_us: f32, // Main loop: lock + smoothing + engine.update()
