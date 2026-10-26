@@ -2050,9 +2050,7 @@ mod wasapi_bitstream {
                             use std::os::windows::io::FromRawHandle;
                             let raw_ptr = pipe_handle_raw as *mut std::ffi::c_void;
                             let pipe_h = windows::Win32::Foundation::HANDLE(raw_ptr);
-                            let mut file = unsafe {
-                                std::fs::File::from_raw_handle(raw_ptr)
-                            };
+                            let mut file = unsafe { std::fs::File::from_raw_handle(raw_ptr) };
                             let mut buf = vec![0u8; 16384];
                             while !stop_token_feeder.load(Ordering::Relaxed) {
                                 let mut avail: u32 = 0;
