@@ -11366,7 +11366,7 @@ mod tests {
                 e.emit_to_string(&glass_src)
             );
         }
-        assert!(glass_src.contains("eval_cylinder_wall_glass"));
+        assert!(!glass_src.contains("eval_cylinder_wall_glass"));
         assert!(glass_src.contains("eval_studio_reflection"));
         assert!(glass_src.contains("sample_macro_flip_energy"));
     }

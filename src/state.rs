@@ -410,7 +410,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         id: 28,
         name: "Acoustic Glass Water Chamber",
         filename: "vis_glass_water.wgsl",
-        description: "Optical crystal chamber with FLIP acoustic water geysers, Faraday ripples & caustics",
+        description: "Expansive FLIP acoustic ocean with swells, Faraday ripples & seabed caustics",
         pipeline_type: PipelineType::FullscreenQuad,
         requires_history: false,
         requires_fire: false,
