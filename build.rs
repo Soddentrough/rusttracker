@@ -15,6 +15,23 @@ fn main() {
         if let Err(e) = res.compile() {
             panic!("Failed to compile Windows resource: {}", e);
         }
+        // Because Cargo.toml defines both [lib] and [[bin]], `cargo:rustc-link-lib=static=resource`
+        // emitted by `winres` attaches `libresource.a` to `librusttracker.rlib`. Since `resource.o`
+        // contains only a `.rsrc` section and zero exported symbols, the linker discards it when
+        // linking `rusttracker.exe` unless passed directly as a binary linker argument.
+        let out_dir = env::var("OUT_DIR").expect("OUT_DIR must be set");
+        let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+        if target_env == "gnu" {
+            println!(
+                "cargo:rustc-link-arg-bin=rusttracker={}/resource.o",
+                out_dir
+            );
+        } else if target_env == "msvc" {
+            println!(
+                "cargo:rustc-link-arg-bin=rusttracker={}/resource.lib",
+                out_dir
+            );
+        }
     } else if target_os == "android" {
         println!("cargo:rustc-link-lib=mediandk");
     }

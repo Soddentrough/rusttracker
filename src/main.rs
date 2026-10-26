@@ -2505,22 +2505,19 @@ async fn run_gui(
                                 file_dialog.pick_multiple();
                             }
 
-                            // VSync and Frame Rate pacing:
-                            // When --uncapped or --bench is specified, allow maximum unconstrained framerates.
-                            // Otherwise, pace to display refresh rate to eliminate runaway GPU power draw.
-                            let fps_limit =
-                                if let Ok(limit_str) = std::env::var("RUSTTRACKER_FPS_LIMIT") {
-                                    limit_str.parse::<f32>().ok().filter(|&fps| fps > 0.0)
-                                } else if !is_uncapped && bench.is_none() {
-                                    let target_fps = window
-                                        .current_monitor()
-                                        .and_then(|m| m.refresh_rate_millihertz())
-                                        .map(|mhz| mhz as f32 / 1000.0)
-                                        .unwrap_or(60.0);
-                                    Some(target_fps)
-                                } else {
-                                    None
-                                };
+                            // Hardware VSync (PresentMode::Fifo) paces frames natively to VBlank.
+                            // Only apply software sleep throttling when RUSTTRACKER_FPS_LIMIT is
+                            // explicitly requested (and not running --uncapped or --bench), as
+                            // unconditional post-present CPU sleeping fights swapchain VSync and
+                            // Windows DWM composition in windowed mode.
+                            let fps_limit = if !is_uncapped && bench.is_none() {
+                                std::env::var("RUSTTRACKER_FPS_LIMIT")
+                                    .ok()
+                                    .and_then(|s| s.parse::<f32>().ok())
+                                    .filter(|&fps| fps > 0.0)
+                            } else {
+                                None
+                            };
 
                             if let Some(target_fps) = fps_limit {
                                 let target_frame_time = Duration::from_secs_f32(1.0 / target_fps);

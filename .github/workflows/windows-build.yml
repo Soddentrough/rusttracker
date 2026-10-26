@@ -48,6 +48,7 @@ jobs:
       run: |
         python3 scripts/patch_msys2_headers.py "$MINGW_PREFIX/include"
         cargo build --release
+        objdump -h target/release/rusttracker.exe | grep -q '\.rsrc'
         
     - name: Package Release
       run: |

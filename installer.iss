@@ -35,7 +35,13 @@ Name: "{autodesktop}\RustTracker"; Filename: "{app}\rusttracker.exe"; IconFilena
 Root: HKA; Subkey: "Software\Classes\Applications\rusttracker.exe"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "RustTracker"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\Applications\rusttracker.exe"; ValueType: string; ValueName: "ApplicationIcon"; ValueData: """{app}\rusttracker.exe"",0"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\Applications\rusttracker.exe\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: """{app}\rusttracker.exe"",0"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\Applications\rusttracker.exe\shell\open"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "RustTracker"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\Applications\rusttracker.exe\shell\open"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\rusttracker.exe"",0"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\Applications\rusttracker.exe\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\rusttracker.exe"" ""%1"""; Flags: uninsdeletekey
+
+; App Paths Registration (used by Windows 11 Open With / AssocQueryString to resolve rusttracker.exe)
+Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\App Paths\rusttracker.exe"; ValueType: string; ValueName: ""; ValueData: "{app}\rusttracker.exe"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\App Paths\rusttracker.exe"; ValueType: string; ValueName: "Path"; ValueData: "{app}"; Flags: uninsdeletekey
 
 ; SupportedTypes entries
 Root: HKA; Subkey: "Software\Classes\Applications\rusttracker.exe\SupportedTypes"; ValueType: string; ValueName: ".mod"; ValueData: ""; Flags: uninsdeletevalue
@@ -74,19 +80,39 @@ Root: HKA; Subkey: "Software\Classes\Applications\rusttracker.exe\SupportedTypes
 
 ; ProgIDs Definitions
 Root: HKA; Subkey: "Software\Classes\RustTracker.TrackerModule"; ValueType: string; ValueName: ""; ValueData: "Tracker Module"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\RustTracker.TrackerModule"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "RustTracker"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\RustTracker.TrackerModule\Application"; ValueType: string; ValueName: "ApplicationName"; ValueData: "RustTracker"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\RustTracker.TrackerModule\Application"; ValueType: string; ValueName: "ApplicationIcon"; ValueData: """{app}\rusttracker.exe"",0"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\RustTracker.TrackerModule\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: """{app}\rusttracker.exe"",0"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\RustTracker.TrackerModule\shell\open"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "RustTracker"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\RustTracker.TrackerModule\shell\open"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\rusttracker.exe"",0"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\RustTracker.TrackerModule\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\rusttracker.exe"" ""%1"""; Flags: uninsdeletekey
 
 Root: HKA; Subkey: "Software\Classes\RustTracker.AudioFile"; ValueType: string; ValueName: ""; ValueData: "Audio File"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\RustTracker.AudioFile"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "RustTracker"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\RustTracker.AudioFile\Application"; ValueType: string; ValueName: "ApplicationName"; ValueData: "RustTracker"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\RustTracker.AudioFile\Application"; ValueType: string; ValueName: "ApplicationIcon"; ValueData: """{app}\rusttracker.exe"",0"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\RustTracker.AudioFile\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: """{app}\rusttracker.exe"",0"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\RustTracker.AudioFile\shell\open"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "RustTracker"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\RustTracker.AudioFile\shell\open"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\rusttracker.exe"",0"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\RustTracker.AudioFile\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\rusttracker.exe"" ""%1"""; Flags: uninsdeletekey
 
 Root: HKA; Subkey: "Software\Classes\RustTracker.VideoFile"; ValueType: string; ValueName: ""; ValueData: "Video File"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\RustTracker.VideoFile"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "RustTracker"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\RustTracker.VideoFile\Application"; ValueType: string; ValueName: "ApplicationName"; ValueData: "RustTracker"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\RustTracker.VideoFile\Application"; ValueType: string; ValueName: "ApplicationIcon"; ValueData: """{app}\rusttracker.exe"",0"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\RustTracker.VideoFile\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: """{app}\rusttracker.exe"",0"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\RustTracker.VideoFile\shell\open"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "RustTracker"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\RustTracker.VideoFile\shell\open"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\rusttracker.exe"",0"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\RustTracker.VideoFile\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\rusttracker.exe"" ""%1"""; Flags: uninsdeletekey
 
 Root: HKA; Subkey: "Software\Classes\RustTracker.PlaylistFile"; ValueType: string; ValueName: ""; ValueData: "Playlist / Project File"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\RustTracker.PlaylistFile"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "RustTracker"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\RustTracker.PlaylistFile\Application"; ValueType: string; ValueName: "ApplicationName"; ValueData: "RustTracker"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\RustTracker.PlaylistFile\Application"; ValueType: string; ValueName: "ApplicationIcon"; ValueData: """{app}\rusttracker.exe"",0"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\RustTracker.PlaylistFile\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: """{app}\rusttracker.exe"",0"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\RustTracker.PlaylistFile\shell\open"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "RustTracker"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\RustTracker.PlaylistFile\shell\open"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\rusttracker.exe"",0"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\RustTracker.PlaylistFile\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\rusttracker.exe"" ""%1"""; Flags: uninsdeletekey
 
 ; File Association Mappings - Tracker Modules

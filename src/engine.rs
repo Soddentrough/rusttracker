@@ -2739,7 +2739,10 @@ impl VulkanEngine {
             .find(|f| f.is_srgb())
             .unwrap_or(surface_caps.formats[0]);
 
-        // Enable dynamic display refresh & VRR (Adaptive Sync / FreeSync / G-Sync)
+        // Default to strict hardware VSync (PresentMode::Fifo / VK_PRESENT_MODE_FIFO_KHR)
+        // unless uncapped mode or an explicit override is requested.
+        // Avoid defaulting to FifoRelaxed on desktop: in Windows windowed mode under DWM/MPO,
+        // FifoRelaxed tears/flickers whenever a frame arrives slightly after VBlank.
         let present_mode = if crate::state::UNCAPPED_PRESENT_MODE.load(Ordering::Relaxed) {
             wgpu::PresentMode::AutoNoVsync
         } else if let Ok(mode_str) = std::env::var("RUSTTRACKER_PRESENT_MODE") {
@@ -2760,21 +2763,18 @@ impl VulkanEngine {
                     wgpu::PresentMode::FifoRelaxed
                 }
                 "fifo" => wgpu::PresentMode::Fifo,
-                _ => wgpu::PresentMode::AutoVsync,
+                _ => wgpu::PresentMode::Fifo,
             }
-        } else if surface_caps
-            .present_modes
-            .contains(&wgpu::PresentMode::AutoVsync)
-        {
-            wgpu::PresentMode::AutoVsync
-        } else if surface_caps
-            .present_modes
-            .contains(&wgpu::PresentMode::FifoRelaxed)
-        {
-            wgpu::PresentMode::FifoRelaxed
         } else {
             wgpu::PresentMode::Fifo
         };
+
+        let alpha_mode = surface_caps
+            .alpha_modes
+            .iter()
+            .copied()
+            .find(|&m| m == wgpu::CompositeAlphaMode::Opaque)
+            .unwrap_or(surface_caps.alpha_modes[0]);
 
         let config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
@@ -2782,7 +2782,7 @@ impl VulkanEngine {
             width: size.width.max(1),
             height: size.height.max(1),
             present_mode,
-            alpha_mode: surface_caps.alpha_modes[0],
+            alpha_mode,
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
@@ -10082,6 +10082,7 @@ impl VulkanEngine {
             }
         }
 
+        window.pre_present_notify();
         surface_texture.present();
 
         for id in &full_output.textures_delta.free {
@@ -10937,6 +10938,18 @@ mod tests {
     fn test_windows_installer_icon_registration() {
         let iss_content =
             std::fs::read_to_string("installer.iss").expect("installer.iss must exist");
+        let build_rs = std::fs::read_to_string("build.rs").expect("build.rs must exist");
+
+        // Ensure build.rs explicitly links resource.o / resource.lib into the rusttracker binary
+        // so that [lib] in Cargo.toml does not cause the linker to discard the .rsrc section.
+        assert!(
+            build_rs.contains("cargo:rustc-link-arg-bin=rusttracker={}/resource.o"),
+            "build.rs must link resource.o directly into rusttracker.exe on GNU targets"
+        );
+        assert!(
+            build_rs.contains("cargo:rustc-link-arg-bin=rusttracker={}/resource.lib"),
+            "build.rs must link resource.lib directly into rusttracker.exe on MSVC targets"
+        );
 
         // Ensure no unquoted or raw .ico,0 references exist (Windows ExtractIconEx fails with .ico,0)
         assert!(
@@ -10956,10 +10969,20 @@ mod tests {
             "installer.iss must register DefaultIcon under Software\\Classes\\Applications\\rusttracker.exe\\DefaultIcon"
         );
 
-        // Ensure file association ProgIDs have correct quoted executable icon references
+        // Ensure App Paths is registered so Windows 11 Open With / AssocQueryString resolves rusttracker.exe
+        assert!(
+            iss_content.contains(r#"Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\App Paths\rusttracker.exe"; ValueType: string; ValueName: ""; ValueData: "{app}\rusttracker.exe""#),
+            "installer.iss must register App Paths\\rusttracker.exe"
+        );
+
+        // Ensure file association ProgIDs have correct quoted executable icon references and Application\ApplicationIcon for Windows 11 OpenWithProgids
         assert!(
             iss_content.contains(r#"Root: HKA; Subkey: "Software\Classes\RustTracker.AudioFile\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: """{app}\rusttracker.exe"",0""#),
-            "RustTracker.AudioFile must use quoted rusttracker.exe,0 icon"
+            "RustTracker.AudioFile must use quoted rusttracker.exe,0 DefaultIcon"
+        );
+        assert!(
+            iss_content.contains(r#"Root: HKA; Subkey: "Software\Classes\RustTracker.AudioFile\Application"; ValueType: string; ValueName: "ApplicationIcon"; ValueData: """{app}\rusttracker.exe"",0""#),
+            "RustTracker.AudioFile must register Application\\ApplicationIcon for Windows 11 Open With menu"
         );
     }
 

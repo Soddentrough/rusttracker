@@ -12,8 +12,8 @@ android {
         applicationId = "com.rusttracker.app"
         minSdk = 29
         targetSdk = 35
-        versionCode = 30
-        versionName = "0.9.30"
+        versionCode = 31
+        versionName = "0.9.31"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk {
