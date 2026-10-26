@@ -11336,4 +11336,38 @@ mod tests {
             "Main Render Pass must not override APP_DEFAULT_BG_CLEAR_COLOR with an inline wgpu::Color"
         );
     }
+
+    #[test]
+    fn test_visualizer_curation_and_glass_water_overhaul() {
+        // 1. Verify retired visualizers 8 (Spatial Vectors), 9 (Chrome Ferrofluid), and 10 (Ferrofluid Particle Sim) are removed
+        for retired_id in [8u32, 9, 10] {
+            assert!(
+                crate::state::VISUALIZERS.iter().all(|v| v.id != retired_id),
+                "Visualizer ID {} must be removed from VISUALIZERS",
+                retired_id
+            );
+        }
+
+        // 2. Verify Acoustic Glass Water Chamber (ID 28) remains registered and active
+        let glass_water = crate::state::VISUALIZERS
+            .iter()
+            .find(|v| v.id == 28)
+            .expect("Visualizer ID 28 (Acoustic Glass Water Chamber) must be registered");
+        assert_eq!(glass_water.filename, "vis_glass_water.wgsl");
+        assert!(glass_water.requires_flip_water);
+
+        // 3. Validate WGSL compilation and key optical/hydrodynamic features of vis_glass_water.wgsl
+        const SHADER_COMMON: &str = include_str!("shaders/_common.wgsl");
+        let glass_src = include_str!("shaders/vis_glass_water.wgsl")
+            .replace("// INCLUDE: common", SHADER_COMMON);
+        if let Err(e) = wgpu::naga::front::wgsl::parse_str(&glass_src) {
+            panic!(
+                "vis_glass_water.wgsl WGSL parse error:\n{}",
+                e.emit_to_string(&glass_src)
+            );
+        }
+        assert!(glass_src.contains("eval_cylinder_wall_glass"));
+        assert!(glass_src.contains("eval_studio_reflection"));
+        assert!(glass_src.contains("sample_macro_flip_energy"));
+    }
 }

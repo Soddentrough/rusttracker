@@ -163,8 +163,8 @@ fn cs_p2g(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let r3 = fract(sin(fi * 39.421 + 0.789) * 43758.5453);
 
             let angle = r1 * 6.2831853;
-            let radius = sqrt(r2) * 2.55;
-            let y_pos = 0.05 + r3 * 0.28; // Resting water level ~30cm
+            let radius = sqrt(r2) * 2.58;
+            let y_pos = 0.12 + r3 * 0.30; // Resting water level ~42cm
 
             p.pos = vec4<f32>(cos(angle) * radius, y_pos, sin(angle) * radius, 1.333);
             p.vel = vec4<f32>(0.0);
@@ -311,7 +311,7 @@ fn cs_grid_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let r_xz = length(world_p.xz);
 
         // Boundary classification: glass cylinder walls and transducer basin floor (ID 28)
-        if (r_xz > CHAMBER_RADIUS || world_p.y < 0.02) {
+        if (r_xz > CHAMBER_RADIUS || world_p.y < 0.08) {
             cell_type = 2.0; // SOLID
             grid_vel_new[idx] = vec4<f32>(0.0, 0.0, 0.0, cell_type);
             grid_vel_old[idx] = vec4<f32>(0.0, 0.0, 0.0, cell_type);
@@ -327,41 +327,44 @@ fn cs_grid_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
             var force = vec3<f32>(0.0, -9.8, 0.0);
 
-            // Acoustic Sub-bass Geyser Fountain Impulses (normalized from [0, 100] scale)
-            let sub_bass = clamp(audio.spectrum[0].x / 55.0 + audio.channels[0].x * 0.9, 0.0, 2.5);
-            let jet_falloff = exp(-r_xz * r_xz * 2.2);
-            let geyser_impulse = sub_bass * 260.0 * jet_falloff * smoothstep(0.75, 0.02, world_p.y);
+            // Cohesive Acoustic Sub-bass Fountain Swell & Toroidal Roll (supports both [0..100] and [0..2] scales)
+            let spec0 = select(audio.spectrum[0].x / 55.0, audio.spectrum[0].x, audio.spectrum[0].x > 0.0 && audio.spectrum[0].x <= 3.0);
+            let sub_bass = clamp(spec0 + audio.channels[0].x * 0.85, 0.0, 2.2);
+            let jet_falloff = exp(-r_xz * r_xz * 1.45);
+            let geyser_impulse = sub_bass * 54.0 * jet_falloff * smoothstep(0.72, 0.10, world_p.y);
             force.y += geyser_impulse;
 
-            let spread_factor = smoothstep(0.4, 1.2, world_p.y) * sub_bass * 35.0;
+            let spread_factor = smoothstep(0.36, 0.78, world_p.y) * sub_bass * 18.0 * exp(-r_xz * 0.6);
             if (r_xz > 0.01) {
                 force.x += (world_p.x / r_xz) * spread_factor;
                 force.z += (world_p.z / r_xz) * spread_factor;
             }
 
-            // Faraday Acoustic Surface Waves (normalized from [0, 100] scale)
+            // Faraday Acoustic Surface Waves & Perimeter Ring Excitation
             let azimuth = atan2(world_p.z, world_p.x);
-            let mids = clamp((audio.spectrum[8].x + audio.spectrum[16].x) / 110.0, 0.0, 1.6);
-            let highs = clamp((audio.spectrum[32].x + audio.spectrum[48].x) / 110.0, 0.0, 1.4);
+            let raw_m = audio.spectrum[8].x + audio.spectrum[16].x;
+            let raw_h = audio.spectrum[32].x + audio.spectrum[48].x;
+            let mids = clamp(select(raw_m / 110.0, raw_m * 0.5, raw_m > 0.0 && raw_m <= 4.0) + audio.channels[0].y * 0.4, 0.0, 1.6);
+            let highs = clamp(select(raw_h / 110.0, raw_h * 0.5, raw_h > 0.0 && raw_h <= 4.0) + audio.channels[0].x * 0.3, 0.0, 1.4);
 
-            let wave_k = 7.5;
-            let mode_m = 4.0;
-            let standing_wave = cos(r_xz * wave_k - audio.time * 3.5) * cos(azimuth * mode_m);
-            let ripple_force = standing_wave * (mids * 24.0 + highs * 18.0) * smoothstep(0.08, 0.40, world_p.y);
+            let standing_wave = cos(r_xz * 5.8 - audio.time * 3.8) * cos(azimuth * 4.0)
+                              + 0.5 * sin(r_xz * 9.2 + audio.time * 2.9) * cos(azimuth * 6.0);
+            let ripple_force = standing_wave * (mids * 14.0 + highs * 10.0) * smoothstep(0.14, 0.45, world_p.y);
             force.y += ripple_force;
 
-            let excess_h = max(0.0, world_p.y - 0.38);
-            force.y -= excess_h * 16.0;
+            // Smooth hydrostatic equilibrium restoring force around resting level (0.42m)
+            let excess_h = world_p.y - 0.42;
+            force.y -= excess_h * 26.0;
 
             let wall_dist = CHAMBER_RADIUS - r_xz;
-            if (wall_dist < 0.35 && world_p.y < 0.5) {
-                let meniscus_pull = smoothstep(0.35, 0.0, wall_dist) * 10.0;
+            if (wall_dist < 0.35 && world_p.y < 0.52) {
+                let meniscus_pull = smoothstep(0.35, 0.0, wall_dist) * 8.0;
                 force.y += meniscus_pull;
             }
 
             vel += force * dt;
             let dt_scale = dt / 0.016;
-            vel *= pow(0.985, dt_scale);
+            vel *= pow(0.975, dt_scale);
         }
     }
 
@@ -708,40 +711,43 @@ fn cs_g2p_advect_splat(@builtin(global_invocation_id) global_id: vec3<u32>) {
         // Visualizer ID 28: Cylindrical Optical Glass Water Chamber
         let r_p = length(p.pos.xz);
 
-        // Acoustic Sub-bass Geyser Fountain Impulses (normalized from [0, 100] scale)
-        let sub_bass = clamp(audio.spectrum[0].x / 55.0 + audio.channels[0].x * 0.9, 0.0, 2.5);
-        let jet_falloff = exp(-r_p * r_p * 3.5);
-        let geyser_kick = sub_bass * 9.5 * jet_falloff * smoothstep(0.70, 0.05, p.pos.y);
+        // Cohesive Acoustic Sub-bass Fountain Swell (normalized from [0, 100] or [0, 2] scale)
+        let spec0 = select(audio.spectrum[0].x / 55.0, audio.spectrum[0].x, audio.spectrum[0].x > 0.0 && audio.spectrum[0].x <= 3.0);
+        let sub_bass = clamp(spec0 + audio.channels[0].x * 0.85, 0.0, 2.2);
+        let jet_falloff = exp(-r_p * r_p * 1.8);
+        let geyser_kick = sub_bass * 2.4 * jet_falloff * smoothstep(0.68, 0.12, p.pos.y);
         v_cur.y += geyser_kick * (dt / 0.016);
 
-        if (r_p > 0.01 && p.pos.y > 0.45) {
-            let spread = smoothstep(0.45, 1.4, p.pos.y) * sub_bass * 4.5 * (dt / 0.016);
+        if (r_p > 0.01 && p.pos.y > 0.38) {
+            let spread = smoothstep(0.38, 0.85, p.pos.y) * sub_bass * 1.8 * exp(-r_p * 0.5) * (dt / 0.016);
             v_cur.x += (p.pos.x / r_p) * spread;
             v_cur.z += (p.pos.z / r_p) * spread;
         }
 
-        // Faraday standing waves ripple impulse (normalized from [0, 100] scale)
+        // Faraday standing waves ripple impulse
         let azimuth = atan2(p.pos.z, p.pos.x);
-        let mids = clamp((audio.spectrum[8].x + audio.spectrum[16].x) / 110.0, 0.0, 1.6);
-        let highs = clamp((audio.spectrum[32].x + audio.spectrum[48].x) / 110.0, 0.0, 1.4);
-        let standing_wave = cos(r_p * 8.0 - audio.time * 4.0) * cos(azimuth * 4.0);
-        v_cur.y += standing_wave * (mids * 1.2 + highs * 0.9) * smoothstep(0.1, 0.45, p.pos.y) * (dt / 0.016);
+        let raw_m = audio.spectrum[8].x + audio.spectrum[16].x;
+        let raw_h = audio.spectrum[32].x + audio.spectrum[48].x;
+        let mids = clamp(select(raw_m / 110.0, raw_m * 0.5, raw_m > 0.0 && raw_m <= 4.0) + audio.channels[0].y * 0.4, 0.0, 1.6);
+        let highs = clamp(select(raw_h / 110.0, raw_h * 0.5, raw_h > 0.0 && raw_h <= 4.0) + audio.channels[0].x * 0.3, 0.0, 1.4);
+        let standing_wave = cos(r_p * 5.8 - audio.time * 3.8) * cos(azimuth * 4.0);
+        v_cur.y += standing_wave * (mids * 0.65 + highs * 0.45) * smoothstep(0.15, 0.48, p.pos.y) * (dt / 0.016);
 
-        // Ballistic gravity & restoring buoyancy for airborne/surface droplets
+        // Restoring gravity & equilibrium surface tension around resting level (0.42m)
         v_cur.y -= 9.8 * dt * ballistic_mask;
-        let excess_h = max(0.0, p.pos.y - 0.35);
-        v_cur.y -= excess_h * 9.0 * dt * ballistic_mask;
+        let excess_h = p.pos.y - 0.42;
+        v_cur.y -= excess_h * 14.0 * dt;
 
         p.vel = vec4<f32>(v_cur, p.vel.w);
         p.pos = vec4<f32>(p.pos.xyz + p.vel.xyz * dt, p.pos.w);
 
         let r_xz = length(p.pos.xz);
-        let floor_y = 0.025;
+        let floor_y = 0.09;
 
         if (p.pos.y < floor_y) {
             p.pos.y = floor_y;
             if (p.vel.y < 0.0) {
-                p.vel.y = -p.vel.y * 0.30;
+                p.vel.y = -p.vel.y * 0.25;
             }
         }
 
@@ -756,15 +762,15 @@ fn cs_g2p_advect_splat(@builtin(global_invocation_id) global_id: vec3<u32>) {
             }
         }
 
-        if (p.pos.y > dom_max.y - 0.05) {
-            p.pos.y = dom_max.y - 0.05;
-            p.vel.y = -abs(p.vel.y) * 0.4;
+        if (p.pos.y > 0.92) {
+            p.pos.y = 0.92;
+            p.vel.y = -abs(p.vel.y) * 0.35;
         }
 
         particles[p_idx] = p;
 
-        // Skip 5x5 atomicMax splat for submerged bottom-layer particles below resting meniscus (0.32m)
-        if (p.pos.y <= 0.28) {
+        // Skip 5x5 atomicMax splat for deeply submerged bottom-layer particles
+        if (p.pos.y <= 0.36) {
             return;
         }
 
@@ -775,7 +781,12 @@ fn cs_g2p_advect_splat(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let ix = i32(round(rx));
         let iz = i32(round(rz));
 
-        let height_val = clamp(p.pos.y, 0.0, 3.0);
+        // Splat only excess elevation above resting level with a C1-continuous zero-boundary kernel
+        // so individual particles never create 5x5 square step plateaus in the heightfield
+        let excess = clamp(p.pos.y - 0.38, 0.0, 0.45);
+        if (excess <= 0.002) {
+            return;
+        }
 
         for (var dz = -2; dz <= 2; dz++) {
             let gz = iz + dz;
@@ -786,11 +797,14 @@ fn cs_g2p_advect_splat(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 if (gx < 0 || gx >= i32(RENDER_GRID_SIZE)) { continue; }
 
                 let d2 = f32(dx * dx + dz * dz);
-                let falloff = max(0.0, 1.0 - d2 * 0.18);
-                let splat_u = u32((height_val * falloff) * 1000.0);
+                let w = max(0.0, 1.0 - d2 / 9.0);
+                let falloff = w * w;
+                let splat_u = u32((excess * falloff) * 1000.0);
 
-                let cell = u32(gz) * RENDER_GRID_SIZE + u32(gx);
-                atomicMax(&render_grid[cell], splat_u);
+                if (splat_u > 0u) {
+                    let cell = u32(gz) * RENDER_GRID_SIZE + u32(gx);
+                    atomicMax(&render_grid[cell], splat_u);
+                }
             }
         }
     }
