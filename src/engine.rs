@@ -109,6 +109,18 @@ pub struct AudioUniforms {
     pub _pad3: f32,
 }
 
+/// Default linear-space clear color for the application window and transparent top HUD panel.
+/// In sRGB surface formats, `(0.1, 0.1, 0.1)` encodes to the standard `#595959` dark grey UI background.
+///
+/// IMPORTANT: Do NOT change this to black/dark-blue for 3D visualizers or startup; visualizer viewports
+/// are cleared independently via `clear_black_pipeline` (or custom sky pipelines) within their scissor rect.
+pub const APP_DEFAULT_BG_CLEAR_COLOR: wgpu::Color = wgpu::Color {
+    r: 0.1,
+    g: 0.1,
+    b: 0.1,
+    a: 1.0,
+};
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct FireParams {
@@ -9553,12 +9565,9 @@ impl VulkanEngine {
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.012,
-                            g: 0.012,
-                            b: 0.014,
-                            a: 1.0,
-                        }),
+                        // Must always clear to APP_DEFAULT_BG_CLEAR_COLOR (0.1, 0.1, 0.1) so the
+                        // transparent top HUD panel preserves its default grey background.
+                        load: wgpu::LoadOp::Clear(APP_DEFAULT_BG_CLEAR_COLOR),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -9716,15 +9725,7 @@ impl VulkanEngine {
                 .min(self.render_pipelines.len() - 1);
             let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
 
-            if vis_def.id == 12
-                || vis_def.id == 3
-                || vis_def.id == 4
-                || vis_def.id == 23
-                || vis_def.id == 29
-            {
-                render_pass.set_pipeline(&self.clear_black_pipeline);
-                render_pass.draw(0..3, 0..1);
-            } else if vis_def.id == 20 {
+            if vis_def.id == 20 {
                 render_pass.set_pipeline(&self.biolum_bg_pipeline);
                 render_pass.draw(0..3, 0..1);
             } else if vis_def.id == 18 {
@@ -9751,6 +9752,18 @@ impl VulkanEngine {
                 render_pass.set_pipeline(&self.storm_sky_pipeline);
                 render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
                 render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
+                render_pass.draw(0..3, 0..1);
+            } else if vis_def.id != 13
+                && vis_def.id != 22
+                && matches!(
+                    vis_def.pipeline_type,
+                    crate::state::PipelineType::Mesh3D { .. }
+                )
+            {
+                // Automatically clear the 3D visualizer viewport to black for any Mesh3D visualizer
+                // that does not use one of the dedicated sky pipelines above, while preserving
+                // APP_DEFAULT_BG_CLEAR_COLOR in the surrounding application/HUD panels.
+                render_pass.set_pipeline(&self.clear_black_pipeline);
                 render_pass.draw(0..3, 0..1);
             }
 
@@ -11290,5 +11303,37 @@ mod tests {
                 ext
             );
         }
+    }
+
+    #[test]
+    fn test_app_default_grey_background_invariants() {
+        // 1. Verify the canonical application default grey clear color constant
+        assert_eq!(
+            APP_DEFAULT_BG_CLEAR_COLOR,
+            wgpu::Color {
+                r: 0.1,
+                g: 0.1,
+                b: 0.1,
+                a: 1.0,
+            },
+            "APP_DEFAULT_BG_CLEAR_COLOR must remain (0.1, 0.1, 0.1, 1.0) so the HUD/UI panel background stays default grey"
+        );
+
+        let engine_code =
+            std::fs::read_to_string("src/engine.rs").expect("src/engine.rs must exist");
+        let prod_code = engine_code
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or(&engine_code);
+
+        // 2. Main Render Pass must clear to APP_DEFAULT_BG_CLEAR_COLOR and never inline a custom wgpu::Color
+        assert!(
+            prod_code.contains("load: wgpu::LoadOp::Clear(APP_DEFAULT_BG_CLEAR_COLOR)"),
+            "Main Render Pass must clear using APP_DEFAULT_BG_CLEAR_COLOR"
+        );
+        assert!(
+            !prod_code.contains("LoadOp::Clear(wgpu::Color"),
+            "Main Render Pass must not override APP_DEFAULT_BG_CLEAR_COLOR with an inline wgpu::Color"
+        );
     }
 }

@@ -211,7 +211,11 @@ if [[ "$DO_INSTALL" = true ]]; then
     
     for dev in "${TARGET_DEVICES[@]}"; do
         echo "Installing $APK_PATH to device $dev..."
-        adb -s "$dev" install -r -d "$APK_PATH"
+        if ! adb -s "$dev" install -r -d "$APK_PATH"; then
+            echo "Install failed (likely signature mismatch); uninstalling existing com.rusttracker.app and retrying..."
+            adb -s "$dev" uninstall com.rusttracker.app || true
+            adb -s "$dev" install -r -d "$APK_PATH"
+        fi
         echo "Successfully installed on device $dev!"
     done
 fi

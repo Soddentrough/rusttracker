@@ -66,15 +66,22 @@ fn sample_canyon_audio(mirror_col: u32, row_idx: u32, col_t: f32) -> f32 {
     let col_f = f32(mirror_col);
     let row_f = f32(row_idx);
     let t = audio.smooth_time;
-    let jag1 = sin(col_f * 1.65 + row_f * 2.35 - t * 3.2) * 0.5 + 0.5;
-    let jag2 = cos(col_f * 3.10 - row_f * 2.80 + t * 2.1) * 0.5 + 0.5;
-    let jag3 = sin(col_f * 0.62 + row_f * 1.25 + t * 1.4) * 0.5 + 0.5;
-    let col_hash = hash11_common(col_f * 19.7 + row_f * 13.3);
+    let center_weight = 1.0 - smoothstep(0.0, 0.18, curved_t);
+    // Keep depth rows phase-coherent in the center so all rows in a red column rise and fall together
+    let eff_row = mix(row_f, row_f * 0.05, center_weight);
+    let jag1 = sin(col_f * 1.65 + eff_row * 2.35 - t * 3.8) * 0.5 + 0.5;
+    let jag2 = cos(col_f * 3.10 - eff_row * 2.80 + t * 2.6) * 0.5 + 0.5;
+    let jag3 = sin(col_f * 0.62 + eff_row * 1.25 + t * 1.7) * 0.5 + 0.5;
+    let col_hash = hash11_common(col_f * 19.7 + eff_row * 13.3);
     let raw_jag = jag1 * 0.42 + jag2 * 0.33 + jag3 * 0.15 + col_hash * 0.10;
     let sharp_jag = pow(clamp(raw_jag, 0.0, 1.0), 1.60);
 
     let base_activity = 0.46 + 0.54 * norm_db;
-    return clamp(base_activity * (0.14 + 0.86 * sharp_jag) + norm_db * 0.18, 0.05, 1.0);
+    let wing_amp = clamp(base_activity * (0.14 + 0.86 * sharp_jag) + norm_db * 0.18, 0.05, 1.0);
+    // In the center, return the un-attenuated audio envelope so vs_main_3d can drive full [0, 1] excursions
+    // without double-multiplying two independent wave envelopes
+    let center_amp = clamp(0.42 + 0.58 * norm_db, 0.15, 1.0);
+    return mix(wing_amp, center_amp, center_weight);
 }
 
 // Prismatic rainbow palette mapped from hue_t in [0, 1]:
@@ -210,10 +217,22 @@ fn vs_main_3d(in: VertexInput, @builtin(instance_index) inst_idx: u32) -> Vertex
 
     // High-contrast per-column spike envelope so adjacent columns have tall dramatic peaks and deep dark valleys
     let col_f = f32(mirror_col);
-    let spike_wave1 = sin(col_f * 1.15 + row_f * 0.85) * 0.5 + 0.5;
-    let spike_wave2 = cos(col_f * 2.45 - row_f * 1.35 + 0.8) * 0.5 + 0.5;
+    let t = audio.smooth_time;
+    let spike_wave1 = sin(col_f * 1.15 + row_f * 0.85 - t * 2.8) * 0.5 + 0.5;
+    let spike_wave2 = cos(col_f * 2.45 - row_f * 1.35 + t * 1.9 + 0.8) * 0.5 + 0.5;
     let col_spike = pow(clamp(spike_wave1 * 0.58 + spike_wave2 * 0.42, 0.0, 1.0), 1.50);
     let jagged_amp = clamp(amp * (0.30 + 0.95 * col_spike), 0.04, 1.0);
+
+    // Wide-range dynamic oscillator for the central red/orange spire:
+    // Combine traveling column waves with a macro center pulse, mapped through a full-swing S-curve
+    // so every red column regularly plunges down to 0.0 (deep valley) and surges up to 1.0 (horizon peak).
+    let center_x_phase = screen_x_abs * 44.0 + col_f * 0.65;
+    let center_wave_a = sin(center_x_phase + row_t * 0.55 - t * 4.2);
+    let center_wave_b = cos(center_x_phase * 1.65 - row_t * 0.40 + t * 2.9);
+    let center_macro  = sin(t * 2.1 - screen_x_abs * 12.0);
+    let raw_center_wave = center_wave_a * 0.48 + center_wave_b * 0.32 + center_macro * 0.20;
+    let center_osc = smoothstep(-0.62, 0.62, raw_center_wave);
+    let center_drive = clamp(center_osc * amp, 0.0, 1.0);
 
     // Front-to-back multi-tier canyon architecture across 32 depth rows:
     // - Foreground rows (row_t ~ 0.0..0.22): Green at top/bottom corners (reach ~ 0.15..0.34),
@@ -224,15 +243,15 @@ fn vs_main_3d(in: VertexInput, @builtin(instance_index) inst_idx: u32) -> Vertex
     //   far into the background chasm (reaching 0.56..0.76 on the wings and 0.80..0.97 toward the center!)
     var reach_norm = 0.12;
     if row_idx == 0u {
-        // Frontmost row: tall in the red/yellow center, medium-short jagged green comb on the outer edges
-        let front_wing = 0.06 + 0.16 * jagged_amp;
-        let front_inner = center_spire * 0.68 + yellow_lobe * (0.20 + 0.38 * jagged_amp) + green_lobe * (0.10 + 0.22 * jagged_amp);
-        reach_norm = clamp(front_wing + front_inner, 0.06, 0.86);
+        // Frontmost row: wide-swinging red/yellow center, medium-short jagged green comb on the outer edges
+        let front_wing = (0.06 + 0.16 * jagged_amp) * (1.0 - center_spire * 0.65);
+        let front_inner = center_spire * (0.14 + 0.78 * center_drive) + yellow_lobe * (0.20 + 0.38 * jagged_amp) + green_lobe * (0.10 + 0.22 * jagged_amp);
+        reach_norm = clamp(front_wing + front_inner, 0.06, 0.94);
     } else {
         // Foreground envelope (row_t near 0.03):
         let front_envelope =
             0.14 +
-            center_spire * 0.64 +
+            center_spire * 0.28 +
             yellow_lobe  * 0.38 +
             green_lobe   * 0.24 +
             outer_lobe   * 0.12;
@@ -240,7 +259,7 @@ fn vs_main_3d(in: VertexInput, @builtin(instance_index) inst_idx: u32) -> Vertex
         // Deep background envelope (row_t -> 1.0): stretches MUCH further into the chasm across the entire width!
         let deep_envelope =
             0.54 +
-            center_spire * 0.44 +
+            center_spire * 0.24 +
             yellow_lobe  * 0.30 +
             green_lobe   * 0.24 +
             outer_lobe   * 0.16;
@@ -249,21 +268,25 @@ fn vs_main_3d(in: VertexInput, @builtin(instance_index) inst_idx: u32) -> Vertex
         let base_reach = mix(front_envelope, deep_envelope, prog);
 
         // Dramatic foreground/midground equalizer spikes: tall yellow & green bars jutting out in front of
-        // the darker cyan/blue/violet layers, plus isolate hero spikes at x ~ 0.18 and x ~ 0.34
+        // the darker cyan/blue/violet layers
         let fg_weight = 1.0 - smoothstep(0.02, 0.50, row_t);
         let bg_mod = mix(0.76, 1.06, jagged_amp);
         let fg_spike = fg_weight * (jagged_amp - 0.32) * (yellow_lobe * 0.56 + green_lobe * 0.44 + outer_lobe * 0.28);
+        let wing_reach = base_reach * bg_mod + fg_spike;
 
-        // Central red/orange twin spire reaches almost all the way to the center horizon (y = 0)
-        let spire_reach = center_spire * (0.74 + 0.23 * smoothstep(0.0, 0.40, row_t) + 0.05 * amp);
-        reach_norm = max(base_reach * bg_mod + fg_spike, spire_reach);
+        // Central red/orange twin spire swings across a wide vertical range from retracted valleys (0.14..0.26)
+        // all the way up to horizon-kissing peaks (0.90..0.99) without being floored by deep_envelope!
+        let spire_floor = 0.14 + 0.12 * smoothstep(0.0, 0.80, row_t);
+        let spire_peak  = 0.90 + 0.09 * smoothstep(0.0, 0.35, row_t);
+        let spire_reach = mix(spire_floor, spire_peak, center_drive);
+        reach_norm = mix(wing_reach, spire_reach, center_spire);
     }
 
     // Organic, staggered base recession (no flat straight black line across the top/bottom!):
     // Each row's base steps down smoothly with depth AND undulates with per-column wave variation,
     // creating natural jagged dark pockets between the green foreground, cyan/blue midground, and violet deep rows.
-    let flank_mask = smoothstep(0.07, 0.26, screen_x_abs);
-    let col_base_wave = (sin(col_f * 0.95 + row_f * 1.7) * 0.5 + 0.5) * 0.12 + (1.0 - jagged_amp) * 0.10;
+    let flank_mask = 0.32 + 0.68 * smoothstep(0.04, 0.24, screen_x_abs);
+    let col_base_wave = (sin(col_f * 0.95 + row_f * 1.7 - t * 1.6) * 0.5 + 0.5) * 0.12 + (1.0 - jagged_amp) * 0.10;
     let row_step_in = pow(row_t, 0.72) * (0.28 + 0.30 * smoothstep(0.22, 1.0, screen_x_abs));
     let y_base_norm = clamp(1.03 - (row_step_in + col_base_wave * smoothstep(0.0, 0.25, row_t)) * flank_mask, 0.26, 1.03);
 
@@ -302,7 +325,8 @@ fn vs_main_3d(in: VertexInput, @builtin(instance_index) inst_idx: u32) -> Vertex
     let tip_frac = select(0.5 - in.position.y, in.position.y + 0.5, is_top);
     let dist_from_tip_screen = tip_frac * bar_len_norm;
 
-    out.bar_params = vec4<f32>(screen_x_abs, row_t, jagged_amp, hue_t);
+    let vis_amp = mix(jagged_amp, center_drive, center_spire);
+    out.bar_params = vec4<f32>(screen_x_abs, row_t, vis_amp, hue_t);
     out.seg_params = vec4<f32>(dist_from_tip_screen, 0.0, tip_frac, row_f);
     return out;
 }
@@ -326,11 +350,11 @@ fn render_chasm_backdrop(ndc: vec2<f32>) -> vec3<f32> {
         smoothstep(0.22, 0.85, cloud) * (0.30 + 0.70 * center_band)
     );
 
-    // Very tight, subtle crimson glow strictly at the tip of the central red spire (no wide orange blob!)
-    let spire_glow_x = exp(-(ax / 0.028) * (ax / 0.028));
-    let spire_glow_y = exp(-(ay / 0.22) * (ay / 0.22));
+    // Faint atmospheric crimson haze in the central chasm (pulsing with bass)
+    let spire_glow_x = exp(-(ax / 0.032) * (ax / 0.032));
+    let spire_glow_y = exp(-(ay / 0.16) * (ay / 0.16));
     let bass_bin = get_live_spectrum(2u) / 100.0;
-    let core_bloom = spire_glow_x * spire_glow_y * (0.06 + 0.06 * clamp(bass_bin, 0.0, 1.0));
+    let core_bloom = spire_glow_x * spire_glow_y * (0.0015 + 0.0035 * clamp(bass_bin, 0.0, 1.0));
     bg += vec3<f32>(0.95, 0.12, 0.02) * core_bloom;
 
     // Subtle perspective light streaks on the outer chasm flanks
@@ -390,16 +414,16 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     let spire_core_mask = exp(-(screen_x_abs / 0.075) * (screen_x_abs / 0.075));
     let edge_x = abs(in.local_uv.x - 0.5) * 2.0;
     let raw_bevel_x = smoothstep_r(1.0, 0.56, edge_x);
-    let bar_bevel_x = mix(raw_bevel_x, 0.90 + 0.10 * raw_bevel_x, spire_core_mask * smoothstep(0.04, 0.28, row_t));
+    let bar_bevel_x = mix(raw_bevel_x, 0.45 + 0.55 * raw_bevel_x, spire_core_mask * smoothstep(0.08, 0.40, row_t));
 
     // 3D face shading
     let is_side_wall = abs(in.normal.x) > 0.5;
     let is_tip_cap = abs(in.normal.y) > 0.5;
     var face_shade = 1.0;
     if is_side_wall {
-        face_shade = mix(0.08, 0.55, spire_core_mask);
+        face_shade = mix(0.08, 0.35, spire_core_mask);
     } else if is_tip_cap {
-        face_shade = mix(0.12, 0.75, spire_core_mask);
+        face_shade = mix(0.12, 0.50, spire_core_mask);
     }
 
     // Incandescent peach/orange-gold core highlight on the flanking pillars of the central Red spire
@@ -407,7 +431,7 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     let dx_core = (screen_x_abs - 0.046) / 0.028;
     let center_heat = exp(-dx_core * dx_core) * smoothstep(0.02, 0.35, row_t) * (1.0 - smoothstep(0.45, 0.92, row_t));
     let tip_glow = exp(-dist_from_tip * 9.0);
-    let hot_core = center_heat * (0.45 + 0.55 * tip_glow) * (0.75 + 0.25 * amp);
+    let hot_core = center_heat * (0.45 + 0.55 * tip_glow) * (0.55 + 0.45 * amp);
     base_col = mix(base_col, vec3<f32>(1.05, 0.76, 0.38), clamp(hot_core * 0.58, 0.0, 0.62));
 
     // Darken the innermost centerline cleft (x < 0.018) so the twin red spires have a dramatic central split
@@ -419,11 +443,11 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     var tier_cutout_shadow = 1.0;
     if row_id > 0.5 {
         let shadow_fade = smoothstep_r(0.84, 0.22, tip_frac);
-        tier_cutout_shadow = mix(shadow_fade, 1.0, spire_core_mask * 0.65);
+        tier_cutout_shadow = mix(shadow_fade, 1.0, spire_core_mask * 0.28);
     }
 
     let raw_tip_rim = smoothstep(0.004, 0.014, dist_from_tip);
-    let tip_rim_shadow = mix(raw_tip_rim, 0.88 + 0.12 * raw_tip_rim, spire_core_mask * smoothstep(0.06, 0.35, row_t));
+    let tip_rim_shadow = mix(raw_tip_rim, 0.42 + 0.58 * raw_tip_rim, spire_core_mask * smoothstep(0.10, 0.45, row_t));
 
     // Progressive front-to-back depth attenuation:
     // Foreground rows (row_t ~ 0..0.30) are blazing bright (1.5x), Midground Cyan/Blue rows (row_t ~ 0.35..0.65)

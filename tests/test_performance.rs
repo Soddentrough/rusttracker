@@ -5503,4 +5503,98 @@ fn test_vis_spectrum_canyon_snapshot() {
     let out_path = std::path::PathBuf::from("target/vis_spectrum_canyon.png");
     img.save(&out_path).unwrap();
     println!("Saved Prismatic Spectrum Canyon snapshot to {:?}", out_path);
+
+    // Verify that the central red region (around x = 600..680) has a wide range of movement across time
+    uniforms.smooth_time = 31.75;
+    uniforms.time = 31.75;
+    queue.write_buffer(&uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+
+    let mut encoder2 = device.create_command_encoder(&CommandEncoderDescriptor::default());
+    {
+        let mut rp = encoder2.begin_render_pass(&RenderPassDescriptor {
+            label: Some("Spectrum Canyon Render Pass t2"),
+            color_attachments: &[Some(RenderPassColorAttachment {
+                view: &color_view,
+                resolve_target: None,
+                ops: Operations {
+                    load: LoadOp::Clear(Color::BLACK),
+                    store: StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                view: &depth_view,
+                depth_ops: Some(Operations {
+                    load: LoadOp::Clear(1.0),
+                    store: StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        rp.set_pipeline(&pipeline);
+        rp.set_bind_group(0, &uniform_bind_group, &[]);
+        rp.set_bind_group(1, &smoke_bind_group, &[]);
+        rp.set_bind_group(2, &camera_bind_group, &[]);
+        rp.set_vertex_buffer(0, box_vertex_buffer.slice(..));
+        rp.set_index_buffer(box_index_buffer.slice(..), IndexFormat::Uint32);
+        rp.draw_indexed(0..box_index_count, 0, 0..8193);
+    }
+    encoder2.copy_texture_to_buffer(
+        TexelCopyTextureInfo {
+            texture: &render_target,
+            mip_level: 0,
+            origin: Origin3d::ZERO,
+            aspect: TextureAspect::All,
+        },
+        TexelCopyBufferInfo {
+            buffer: &out_buf,
+            layout: TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(height),
+            },
+        },
+        Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(Some(encoder2.finish()));
+
+    let slice2 = out_buf.slice(..);
+    let (tx2, rx2) = std::sync::mpsc::channel();
+    slice2.map_async(MapMode::Read, move |res| {
+        tx2.send(res).unwrap();
+    });
+    let _ = device.poll(PollType::Wait {
+        submission_index: None,
+        timeout: None,
+    });
+    rx2.recv().unwrap().unwrap();
+
+    let data2 = slice2.get_mapped_range();
+    let mut center_diff_pixels = 0usize;
+    for y in 120..600 {
+        let row_start = (y * bytes_per_row) as usize;
+        for x in 590..690 {
+            let px_start = row_start + (x * bytes_per_pixel) as usize;
+            let r2 = data2[px_start];
+            let r1 = img.get_pixel(x, y)[0];
+            if r1.abs_diff(r2) > 40 {
+                center_diff_pixels += 1;
+            }
+        }
+    }
+    drop(data2);
+    out_buf.unmap();
+
+    assert!(
+        center_diff_pixels > 8000,
+        "Expected wide range of movement in the central red spire across time, got only {} changed pixels",
+        center_diff_pixels
+    );
 }

@@ -66,6 +66,7 @@ android/local.properties
 android/app/src/main/jniLibs/
 android/.cxx/
 android/.idea/
+android/.kotlin/
 *.apk
 *.aab
 dist/
