@@ -234,6 +234,7 @@ pub struct VulkanEngine {
     pub meters_uv_rect: [f32; 4],
     pub heatmap_uv_rect: [f32; 4],
     pub fire_uv_rect: [f32; 4],
+    pub track_info_rect: Option<[f32; 4]>,
 
     // GPU compute fire simulation
     _fire_compute_pipeline: wgpu::ComputePipeline,
@@ -5426,6 +5427,7 @@ impl VulkanEngine {
             meters_uv_rect: [0.0; 4],
             heatmap_uv_rect: [0.0; 4],
             fire_uv_rect: [0.0; 4],
+            track_info_rect: None,
             _fire_compute_pipeline: fire_compute_pipeline,
             firesim_compute_pipeline,
             fire_buffer_a,
@@ -6814,6 +6816,13 @@ impl VulkanEngine {
         // Process egui UI
         let ui_start = std::time::Instant::now();
         let mut raw_input = egui_state.take_egui_input(window);
+        if (state.hovered_file.is_some() || !raw_input.hovered_files.is_empty())
+            && let Some([x, y]) = state.drag_cursor_pos
+        {
+            raw_input
+                .events
+                .push(egui::Event::PointerMoved(egui::pos2(x, y)));
+        }
         raw_input.events.extend(gamepad_events);
         let mut central_rect = egui::Rect::from_min_max(
             Default::default(),
@@ -7927,16 +7936,6 @@ impl VulkanEngine {
                         });
                     });
                 });
-
-                let dropped_files: Vec<String> = ctx.input(|i| {
-                    i.raw.dropped_files
-                        .iter()
-                        .filter_map(|df| df.path.as_ref().map(|p| p.to_string_lossy().into_owned()))
-                        .collect()
-                });
-                if !dropped_files.is_empty() {
-                    engine_action = EngineAction::LoadFiles(dropped_files, false);
-                }
 
                 return;
             }
@@ -9148,31 +9147,19 @@ impl VulkanEngine {
                 }
             });
 
-            let dropped_files: Vec<String> = ctx.input(|i| {
-                i.raw.dropped_files
-                    .iter()
-                    .filter_map(|df| df.path.as_ref().map(|p| p.to_string_lossy().into_owned()))
-                    .collect()
-            });
-
-            let pointer_pos = ctx.input(|i| i.pointer.hover_pos().or(i.pointer.latest_pos()));
+            let pointer_pos = state
+                .drag_cursor_pos
+                .map(|[x, y]| egui::pos2(x, y))
+                .or_else(|| ctx.input(|i| i.pointer.hover_pos().or(i.pointer.latest_pos())));
             let is_over_track_info = if let (Some(pos), Some(ti_rect)) = (pointer_pos, out_track_info_rect) {
                 ti_rect.contains(pos)
             } else {
                 false
             };
 
-            if !dropped_files.is_empty() {
-                if !state.file_loaded {
-                    engine_action = EngineAction::LoadFiles(dropped_files, false);
-                } else if is_over_track_info {
-                    engine_action = EngineAction::LoadFiles(dropped_files, true);
-                } else {
-                    engine_action = EngineAction::LoadFiles(dropped_files, false);
-                }
-            } else if (!ctx.input(|i| i.raw.hovered_files.is_empty()) || state.hovered_file.is_some()) && state.file_loaded {
+            if (!ctx.input(|i| i.raw.hovered_files.is_empty()) || state.hovered_file.is_some()) && state.file_loaded {
                 let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drag_overlay")));
-                if is_over_track_info {
+                if is_over_track_info && state.has_active_playback() {
                     if let Some(ti_rect) = out_track_info_rect {
                         painter.rect(
                             ti_rect.expand(2.0),
@@ -9223,6 +9210,8 @@ impl VulkanEngine {
             }
 
         });
+
+        self.track_info_rect = out_track_info_rect.map(|r| [r.min.x, r.min.y, r.max.x, r.max.y]);
 
         let scale = egui_ctx.pixels_per_point();
         let w = self.config.width as f32;
@@ -10253,60 +10242,73 @@ mod tests {
 
     #[test]
     fn test_drag_and_drop_use_cases() {
-        let mut state = crate::state::AppState::new("Test App".to_string());
+        let mut state = crate::state::AppState::new(String::new());
         let track_info_rect = [800.0f32, 0.0, 1200.0, 300.0];
         state.track_info_rect = Some(track_info_rect);
 
-        let dropped_file = "song1.flac".to_string();
+        let cursor_inside = Some([950.0f32, 100.0]);
+        let cursor_outside = Some([400.0f32, 150.0]);
 
-        // Use Case 1: Splash screen drop (file_loaded == false)
+        // Use Case 1: Nothing is playing (file_loaded == false), even if dropped on Track Info -> play immediately
         assert!(!state.file_loaded);
-        state.playlist = vec![dropped_file.clone()];
-        state.playlist_index = 0;
-        state.load_request = Some(dropped_file.clone());
-        state.file_loaded = true;
-
+        state.handle_dropped_files(vec!["song1.flac".to_string()], cursor_inside);
         assert!(state.file_loaded);
-        assert_eq!(state.playlist.len(), 1);
-        assert_eq!(state.load_request, Some("song1.flac".to_string()));
+        assert!(!state.is_paused);
+        assert!(!state.track_ended);
+        assert_eq!(state.playlist, vec!["song1.flac".to_string()]);
+        assert_eq!(state.playlist_index, 0);
+        assert_eq!(state.load_request.take(), Some("song1.flac".to_string()));
+        state.song_title = "song1.flac".to_string();
 
-        // Use Case 2: Drop on main view outside Track Info (e.g. cursor at (400, 150))
-        let cursor_outside = [400.0f32, 150.0];
-        let is_over_ti = cursor_outside[0] >= track_info_rect[0]
-            && cursor_outside[0] <= track_info_rect[2]
-            && cursor_outside[1] >= track_info_rect[1]
-            && cursor_outside[1] <= track_info_rect[3];
-        assert!(!is_over_ti);
-
-        let new_file = "song2.mp3".to_string();
-        if !is_over_ti {
-            state.playlist = vec![new_file.clone()];
-            state.playlist_index = 0;
-            state.load_request = Some(new_file.clone());
-        }
-        assert_eq!(state.playlist, vec!["song2.mp3".to_string()]);
-        assert_eq!(state.load_request, Some("song2.mp3".to_string()));
-
-        // Use Case 3: Drop on Track Info pane (e.g. cursor at (950, 100))
-        let cursor_inside = [950.0f32, 100.0];
-        let is_over_ti_inside = cursor_inside[0] >= track_info_rect[0]
-            && cursor_inside[0] <= track_info_rect[2]
-            && cursor_inside[1] >= track_info_rect[1]
-            && cursor_inside[1] <= track_info_rect[3];
-        assert!(is_over_ti_inside);
-
-        let append_file = "song3.wav".to_string();
-        if is_over_ti_inside {
-            state.playlist.push(append_file.clone());
-            state.osd_text = Some(format!("Added to Playlist: {}", append_file));
-            state.osd_timer = 3.0;
-        }
-        assert_eq!(state.playlist.len(), 2);
-        assert_eq!(state.playlist[1], "song3.wav");
+        // Use Case 2: Single track is playing, drop onto Track Info -> creates playlist with dropped track as next track
+        state.handle_dropped_files(vec!["song2.mp3".to_string()], cursor_inside);
+        assert_eq!(
+            state.playlist,
+            vec!["song1.flac".to_string(), "song2.mp3".to_string()]
+        );
+        assert_eq!(state.playlist_index, 0);
+        assert_eq!(state.playlist[state.playlist_index + 1], "song2.mp3");
+        assert_eq!(state.load_request, None);
         assert_eq!(
             state.osd_text,
-            Some("Added to Playlist: song3.wav".to_string())
+            Some("Added to Playlist: song2.mp3".to_string())
         );
+
+        // Use Case 3: Playlist is playing track 0 ("song1.flac"), drop "song_next.wav" onto Track Info
+        // -> inserts "song_next.wav" as the next track (index 1) before "song2.mp3"
+        state.handle_dropped_files(vec!["song_next.wav".to_string()], cursor_inside);
+        assert_eq!(
+            state.playlist,
+            vec![
+                "song1.flac".to_string(),
+                "song_next.wav".to_string(),
+                "song2.mp3".to_string()
+            ]
+        );
+        assert_eq!(state.playlist_index, 0);
+        assert_eq!(state.playlist[state.playlist_index + 1], "song_next.wav");
+        assert_eq!(state.load_request, None);
+        assert_eq!(
+            state.osd_text,
+            Some("Added to Playlist: song_next.wav".to_string())
+        );
+
+        // Use Case 4: Drop outside Track Info while playing -> replaces playlist and plays immediately
+        state.handle_dropped_files(vec!["song3.ogg".to_string()], cursor_outside);
+        assert_eq!(state.playlist, vec!["song3.ogg".to_string()]);
+        assert_eq!(state.playlist_index, 0);
+        assert_eq!(state.load_request.take(), Some("song3.ogg".to_string()));
+        state.song_title = "song3.ogg".to_string();
+
+        // Use Case 5: Playback has ended (track_ended == true), drop onto Track Info -> plays immediately
+        state.track_ended = true;
+        state.is_paused = true;
+        state.handle_dropped_files(vec!["song4.flac".to_string()], cursor_inside);
+        assert!(!state.track_ended);
+        assert!(!state.is_paused);
+        assert_eq!(state.playlist, vec!["song4.flac".to_string()]);
+        assert_eq!(state.playlist_index, 0);
+        assert_eq!(state.load_request.take(), Some("song4.flac".to_string()));
     }
 
     #[test]

@@ -548,6 +548,7 @@ pub struct AppState {
     pub tui_device_picker_cursor: usize,
     pub lyrics: Option<std::sync::Arc<crate::lyrics::Lyrics>>,
     pub hovered_file: Option<String>,
+    pub drag_cursor_pos: Option<[f32; 2]>,
     pub track_info_rect: Option<[f32; 4]>,
     pub mobile_hud_tab: MobileHudTab,
 }
@@ -753,6 +754,7 @@ impl AppState {
             tui_device_picker_cursor: 0,
             lyrics: None,
             hovered_file: None,
+            drag_cursor_pos: None,
             track_info_rect: None,
             mobile_hud_tab: MobileHudTab::default(),
         }
@@ -861,8 +863,76 @@ impl AppState {
             tui_device_picker_cursor: self.tui_device_picker_cursor,
             lyrics: self.lyrics.clone(),
             hovered_file: self.hovered_file.clone(),
+            drag_cursor_pos: self.drag_cursor_pos,
             track_info_rect: self.track_info_rect,
             mobile_hud_tab: self.mobile_hud_tab,
+        }
+    }
+
+    /// Returns true if a media track is currently active/playing (not on the splash screen,
+    /// not microphone-only mode, and playback has not ended).
+    pub fn has_active_playback(&self) -> bool {
+        self.file_loaded
+            && !self.track_ended
+            && (!self.playlist.is_empty()
+                || (!self.song_title.is_empty() && self.song_title != "Microphone Input"))
+    }
+
+    /// Returns true if the given cursor position (or `self.drag_cursor_pos`) lies within
+    /// the last rendered Track Info section rectangle.
+    pub fn is_over_track_info(&self, cursor_pos: Option<[f32; 2]>) -> bool {
+        if let (Some(c_pos), Some(ti_rect)) =
+            (cursor_pos.or(self.drag_cursor_pos), self.track_info_rect)
+        {
+            c_pos[0] >= ti_rect[0]
+                && c_pos[0] <= ti_rect[2]
+                && c_pos[1] >= ti_rect[1]
+                && c_pos[1] <= ti_rect[3]
+        } else {
+            false
+        }
+    }
+
+    /// Handles media file(s) dropped onto the window:
+    /// - When dropped onto the Track Info section while a track is currently playing,
+    ///   creates/updates the playlist with the dropped track(s) queued next (immediately
+    ///   after the current track) without interrupting current playback.
+    /// - When dropped anywhere else, or when nothing is playing, replaces the playlist
+    ///   and plays the dropped file immediately as normal.
+    pub fn handle_dropped_files(&mut self, expanded: Vec<String>, cursor_pos: Option<[f32; 2]>) {
+        self.hovered_file = None;
+        self.drag_cursor_pos = None;
+        if expanded.is_empty() {
+            return;
+        }
+
+        let is_over_ti = self.is_over_track_info(cursor_pos);
+        if self.has_active_playback() && is_over_ti {
+            if self.playlist.is_empty() && !self.song_title.is_empty() {
+                self.playlist.push(self.song_title.clone());
+                self.playlist_index = 0;
+            }
+            let insert_idx = (self.playlist_index + 1).min(self.playlist.len());
+            let count = expanded.len();
+            let file_name = std::path::Path::new(&expanded[0])
+                .file_name()
+                .unwrap_or_default()
+                .to_string_lossy()
+                .into_owned();
+            self.playlist.splice(insert_idx..insert_idx, expanded);
+            if count == 1 {
+                self.osd_text = Some(format!("Added to Playlist: {}", file_name));
+            } else {
+                self.osd_text = Some(format!("Added {} tracks to Playlist", count));
+            }
+            self.osd_timer = 3.0;
+        } else {
+            self.playlist = expanded;
+            self.playlist_index = 0;
+            self.load_request = Some(self.playlist[0].clone());
+            self.file_loaded = true;
+            self.is_paused = false;
+            self.track_ended = false;
         }
     }
 }

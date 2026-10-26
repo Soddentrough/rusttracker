@@ -594,6 +594,150 @@ fn constrain_window_to_monitor(
     }
 }
 
+/// Queries the live cursor position in logical points relative to the window's client area.
+/// During external OS file drag-and-drop, winit 0.30 does not emit `WindowEvent::CursorMoved`
+/// (and `CursorLeft` clears egui's pointer state when leaving the window to grab a file),
+/// so we query the windowing system directly during `HoveredFile` / `DroppedFile`.
+fn query_window_cursor_pos(window: &winit::window::Window) -> Option<egui::Pos2> {
+    #[cfg(target_os = "linux")]
+    {
+        use winit::raw_window_handle::{
+            HasDisplayHandle, HasWindowHandle, RawDisplayHandle, RawWindowHandle,
+        };
+        let dh = window.display_handle().ok()?.as_raw();
+        let wh = window.window_handle().ok()?.as_raw();
+        let (display_ptr, xwindow) = match (dh, wh) {
+            (RawDisplayHandle::Xlib(d), RawWindowHandle::Xlib(w)) => {
+                (d.display?.as_ptr(), w.window)
+            }
+            _ => return None,
+        };
+        type XQueryPointerFn = unsafe extern "C" fn(
+            display: *mut std::ffi::c_void,
+            w: std::ffi::c_ulong,
+            root_return: *mut std::ffi::c_ulong,
+            child_return: *mut std::ffi::c_ulong,
+            root_x_return: *mut std::ffi::c_int,
+            root_y_return: *mut std::ffi::c_int,
+            win_x_return: *mut std::ffi::c_int,
+            win_y_return: *mut std::ffi::c_int,
+            mask_return: *mut std::ffi::c_uint,
+        ) -> std::ffi::c_int;
+
+        static XQUERY_POINTER: std::sync::OnceLock<Option<XQueryPointerFn>> =
+            std::sync::OnceLock::new();
+        let func = (*XQUERY_POINTER.get_or_init(|| unsafe {
+            unsafe extern "C" {
+                fn dlopen(
+                    filename: *const std::ffi::c_char,
+                    flags: std::ffi::c_int,
+                ) -> *mut std::ffi::c_void;
+                fn dlsym(
+                    handle: *mut std::ffi::c_void,
+                    symbol: *const std::ffi::c_char,
+                ) -> *mut std::ffi::c_void;
+            }
+            // RTLD_LAZY = 1
+            let lib = dlopen(c"libX11.so.6".as_ptr(), 1);
+            if lib.is_null() {
+                return None;
+            }
+            let sym = dlsym(lib, c"XQueryPointer".as_ptr());
+            if sym.is_null() {
+                None
+            } else {
+                Some(std::mem::transmute::<*mut std::ffi::c_void, XQueryPointerFn>(sym))
+            }
+        }))?;
+
+        let mut root_ret: std::ffi::c_ulong = 0;
+        let mut child_ret: std::ffi::c_ulong = 0;
+        let mut root_x: std::ffi::c_int = 0;
+        let mut root_y: std::ffi::c_int = 0;
+        let mut win_x: std::ffi::c_int = 0;
+        let mut win_y: std::ffi::c_int = 0;
+        let mut mask_ret: std::ffi::c_uint = 0;
+        let ok = unsafe {
+            func(
+                display_ptr,
+                xwindow,
+                &mut root_ret,
+                &mut child_ret,
+                &mut root_x,
+                &mut root_y,
+                &mut win_x,
+                &mut win_y,
+                &mut mask_ret,
+            )
+        };
+        if ok != 0 {
+            let sf = window.scale_factor().max(1.0) as f32;
+            Some(egui::pos2(win_x as f32 / sf, win_y as f32 / sf))
+        } else {
+            None
+        }
+    }
+    #[cfg(windows)]
+    {
+        #[link(name = "user32")]
+        unsafe extern "system" {
+            fn GetCursorPos(lpPoint: *mut [i32; 2]) -> i32;
+        }
+        let mut pt = [0i32; 2];
+        if unsafe { GetCursorPos(&mut pt) } != 0
+            && let Ok(inner_pos) = window.inner_position()
+        {
+            let sf = window.scale_factor().max(1.0) as f32;
+            Some(egui::pos2(
+                (pt[0] - inner_pos.x) as f32 / sf,
+                (pt[1] - inner_pos.y) as f32 / sf,
+            ))
+        } else {
+            None
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use objc2::encode::{Encode, Encoding};
+        use objc2::msg_send;
+        use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+
+        #[repr(C)]
+        #[derive(Copy, Clone)]
+        struct NSPoint {
+            x: f64,
+            y: f64,
+        }
+        unsafe impl Encode for NSPoint {
+            const ENCODING: Encoding = Encoding::Struct("CGPoint", &[f64::ENCODING, f64::ENCODING]);
+        }
+
+        let wh = window.window_handle().ok()?.as_raw();
+        if let RawWindowHandle::AppKit(handle) = wh {
+            let ns_view = handle.ns_view.as_ptr() as *mut objc2::runtime::AnyObject;
+            if !ns_view.is_null() {
+                unsafe {
+                    let ns_window: *mut objc2::runtime::AnyObject = msg_send![ns_view, window];
+                    if !ns_window.is_null() {
+                        let win_pt: NSPoint =
+                            msg_send![ns_window, mouseLocationOutsideOfEventStream];
+                        let null_view: *const objc2::runtime::AnyObject = std::ptr::null();
+                        let view_pt: NSPoint =
+                            msg_send![ns_view, convertPoint: win_pt, fromView: null_view];
+                        return Some(egui::pos2(view_pt.x as f32, view_pt.y as f32));
+                    }
+                }
+            }
+        }
+        None
+    }
+    #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
+    {
+        let _ = window;
+        None
+    }
+}
+
 async fn run_gui(
     args: Args,
     app_state: Arc<Mutex<AppState>>,
@@ -617,7 +761,13 @@ async fn run_gui(
     let mut event_loop_builder = EventLoop::builder();
     #[cfg(target_os = "linux")]
     {
-        if std::env::var("RUSTTRACKER_X11").is_ok() {
+        // winit 0.30's native Wayland backend does not implement wl_data_device
+        // file drag-and-drop (HoveredFile / DroppedFile). Prefer X11/XWayland when
+        // DISPLAY is available (unless RUSTTRACKER_WAYLAND is explicitly set), with
+        // automatic fallback to the default Wayland backend below if X11 init fails.
+        if std::env::var("RUSTTRACKER_WAYLAND").is_err()
+            && (std::env::var("DISPLAY").is_ok() || std::env::var("RUSTTRACKER_X11").is_ok())
+        {
             event_loop_builder.with_x11();
         }
     }
@@ -788,6 +938,7 @@ async fn run_gui(
                     &mut init_dialog,
                     Vec::new(),
                 );
+                app_state_for_init.lock().unwrap().track_info_rect = engine.track_info_rect;
             }
             window.set_visible(true);
             window.request_redraw();
@@ -842,6 +993,8 @@ async fn run_gui(
 
     let mut modifiers = winit::keyboard::ModifiersState::empty();
     let mut last_cursor_pos: Option<egui::Pos2> = None;
+    let mut pending_dropped_files: Vec<String> = Vec::new();
+    let mut drop_cursor_pos: Option<[f32; 2]> = None;
     let mut bench_frame_count = 0u32;
 
     let mut app = DesktopApp {
@@ -866,8 +1019,14 @@ async fn run_gui(
                     if let WindowEvent::CursorMoved { position, .. } = event {
                         last_mouse_move = Instant::now();
                         let sf = window.scale_factor() as f32;
-                        last_cursor_pos =
-                            Some(egui::pos2(position.x as f32 / sf, position.y as f32 / sf));
+                        let pos = egui::pos2(position.x as f32 / sf, position.y as f32 / sf);
+                        last_cursor_pos = Some(pos);
+                        {
+                            let mut state = app_state.lock().unwrap();
+                            if state.hovered_file.is_some() {
+                                state.drag_cursor_pos = Some([pos.x, pos.y]);
+                            }
+                        }
                         if !is_cursor_visible {
                             window.set_cursor_visible(true);
                             is_cursor_visible = true;
@@ -875,12 +1034,20 @@ async fn run_gui(
                     }
 
                     if let WindowEvent::HoveredFile(path) = event {
+                        if let Some(live_pos) = query_window_cursor_pos(window) {
+                            last_cursor_pos = Some(live_pos);
+                        }
                         let mut state = app_state.lock().unwrap();
                         state.hovered_file = Some(path.to_string_lossy().into_owned());
+                        state.drag_cursor_pos = last_cursor_pos.map(|p| [p.x, p.y]);
+                        if engine.track_info_rect.is_some() {
+                            state.track_info_rect = engine.track_info_rect;
+                        }
                         window.request_redraw();
                     } else if let WindowEvent::HoveredFileCancelled = event {
                         let mut state = app_state.lock().unwrap();
                         state.hovered_file = None;
+                        state.drag_cursor_pos = None;
                         window.request_redraw();
                     }
 
@@ -1483,53 +1650,21 @@ async fn run_gui(
                     }
 
                     if let WindowEvent::DroppedFile(path) = &event {
+                        if let Some(live_pos) = query_window_cursor_pos(window) {
+                            last_cursor_pos = Some(live_pos);
+                        }
+                        if drop_cursor_pos.is_none() {
+                            drop_cursor_pos = last_cursor_pos.map(|p| [p.x, p.y]);
+                        }
+                        let path_str = crate::lyrics::normalize_path_str(&path.to_string_lossy());
+                        if !path_str.is_empty() {
+                            pending_dropped_files.push(path_str);
+                        }
                         let mut state = app_state.lock().unwrap();
                         state.hovered_file = None;
-                        let path_str = crate::lyrics::normalize_path_str(&path.to_string_lossy());
-                        let expanded = crate::playlist::expand_input_paths(&[path_str]);
-                        if !expanded.is_empty() {
-                            let is_over_ti = if let (Some(c_pos), Some(ti_rect)) =
-                                (last_cursor_pos, state.track_info_rect)
-                            {
-                                c_pos.x >= ti_rect[0]
-                                    && c_pos.x <= ti_rect[2]
-                                    && c_pos.y >= ti_rect[1]
-                                    && c_pos.y <= ti_rect[3]
-                            } else {
-                                false
-                            };
-
-                            if !state.file_loaded || state.playlist.is_empty() {
-                                // Use case 1: Splash screen -> Play immediately
-                                state.playlist = expanded.clone();
-                                state.playlist_index = 0;
-                                state.load_request = Some(state.playlist[0].clone());
-                                state.file_loaded = true;
-                            } else if is_over_ti {
-                                // Use case 3: Track Info pane -> Add to playlist
-                                state.playlist.extend(expanded.clone());
-                                let file_name = std::path::Path::new(&expanded[0])
-                                    .file_name()
-                                    .unwrap_or_default()
-                                    .to_string_lossy()
-                                    .into_owned();
-                                if expanded.len() == 1 {
-                                    state.osd_text =
-                                        Some(format!("Added to Playlist: {}", file_name));
-                                } else {
-                                    state.osd_text = Some(format!(
-                                        "Added {} tracks to Playlist",
-                                        expanded.len()
-                                    ));
-                                }
-                                state.osd_timer = 3.0;
-                            } else {
-                                // Use case 2: Main player view (outside Track Info) -> Play immediately
-                                state.playlist = expanded.clone();
-                                state.playlist_index = 0;
-                                state.load_request = Some(state.playlist[0].clone());
-                                state.file_loaded = true;
-                            }
+                        state.drag_cursor_pos = None;
+                        if engine.track_info_rect.is_some() {
+                            state.track_info_rect = engine.track_info_rect;
                         }
                         window.request_redraw();
                     }
@@ -1552,6 +1687,18 @@ async fn run_gui(
                             if is_first_frame {
                                 is_first_frame = false;
                                 app_state.lock().unwrap().is_paused = false;
+                            }
+                            if !pending_dropped_files.is_empty() {
+                                let raw_files = std::mem::take(&mut pending_dropped_files);
+                                let expanded = crate::playlist::expand_input_paths(&raw_files);
+                                let c_pos = drop_cursor_pos
+                                    .take()
+                                    .or_else(|| last_cursor_pos.map(|p| [p.x, p.y]));
+                                let mut state = app_state.lock().unwrap();
+                                if engine.track_info_rect.is_some() {
+                                    state.track_info_rect = engine.track_info_rect;
+                                }
+                                state.handle_dropped_files(expanded, c_pos);
                             }
                             let load_path = {
                                 let mut state = app_state.lock().unwrap();
@@ -1902,7 +2049,18 @@ async fn run_gui(
                             // and drain gamepad events in the same lock acquisition
                             let snapshot_timer = Instant::now();
                             let (state_copy, gamepad_events) = {
+                                let is_hovering_file =
+                                    app_state.lock().unwrap().hovered_file.is_some();
+                                if is_hovering_file
+                                    && let Some(live_pos) = query_window_cursor_pos(window)
+                                {
+                                    last_cursor_pos = Some(live_pos);
+                                }
                                 let mut state = app_state.lock().unwrap();
+                                if state.hovered_file.is_some() {
+                                    state.drag_cursor_pos = last_cursor_pos.map(|p| [p.x, p.y]);
+                                }
+                                state.track_info_rect = engine.track_info_rect;
                                 let events = state.egui_gamepad_events.clone();
                                 state.egui_gamepad_events.clear();
                                 (state.render_snapshot(), events)
@@ -1982,6 +2140,7 @@ async fn run_gui(
                             {
                                 let mut state = app_state.lock().unwrap();
                                 state.vis_picker_scroll_to_cursor = false;
+                                state.track_info_rect = engine.track_info_rect;
 
                                 // Write back timing stats
                                 if ui_time > 0.0 || render_time > 0.0 {
@@ -2138,32 +2297,37 @@ async fn run_gui(
                                         }
                                     }
                                     EngineAction::LoadFiles(paths, append) => {
+                                        let expanded = crate::playlist::expand_input_paths(&paths);
                                         if append && !state.playlist.is_empty() && state.file_loaded
                                         {
-                                            let count = paths.len();
-                                            let first_name = std::path::Path::new(&paths[0])
-                                                .file_name()
-                                                .unwrap_or_default()
-                                                .to_string_lossy()
-                                                .into_owned();
-                                            if count == 1 {
-                                                state.osd_text = Some(format!(
-                                                    "Added to Playlist: {}",
-                                                    first_name
-                                                ));
-                                            } else {
-                                                state.osd_text = Some(format!(
-                                                    "Added {} tracks to Playlist",
-                                                    count
-                                                ));
+                                            if !expanded.is_empty() {
+                                                let count = expanded.len();
+                                                let first_name = std::path::Path::new(&expanded[0])
+                                                    .file_name()
+                                                    .unwrap_or_default()
+                                                    .to_string_lossy()
+                                                    .into_owned();
+                                                if count == 1 {
+                                                    state.osd_text = Some(format!(
+                                                        "Added to Playlist: {}",
+                                                        first_name
+                                                    ));
+                                                } else {
+                                                    state.osd_text = Some(format!(
+                                                        "Added {} tracks to Playlist",
+                                                        count
+                                                    ));
+                                                }
+                                                state.osd_timer = 3.0;
+                                                state.playlist.extend(expanded);
                                             }
-                                            state.osd_timer = 3.0;
-                                            state.playlist.extend(paths);
-                                        } else if !paths.is_empty() {
-                                            state.playlist = paths;
+                                        } else if !expanded.is_empty() {
+                                            state.playlist = expanded;
                                             state.playlist_index = 0;
                                             state.load_request = Some(state.playlist[0].clone());
                                             state.file_loaded = true;
+                                            state.is_paused = false;
+                                            state.track_ended = false;
                                         }
                                         state.is_file_picker_open = false;
                                     }
@@ -2539,6 +2703,20 @@ async fn run_gui(
                     }
                 }
                 Event::AboutToWait => {
+                    if !pending_dropped_files.is_empty() {
+                        let raw_files = std::mem::take(&mut pending_dropped_files);
+                        let expanded = crate::playlist::expand_input_paths(&raw_files);
+                        let c_pos = drop_cursor_pos
+                            .take()
+                            .or_else(|| last_cursor_pos.map(|p| [p.x, p.y]));
+                        let mut state = app_state.lock().unwrap();
+                        if engine.track_info_rect.is_some() {
+                            state.track_info_rect = engine.track_info_rect;
+                        }
+                        state.handle_dropped_files(expanded, c_pos);
+                        window.request_redraw();
+                    }
+
                     // Poll native file picker results immediately to eliminate UI latency
                     if let Ok(paths) = rfd_rx.try_recv() {
                         rfd_pending = false;
