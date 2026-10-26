@@ -4411,12 +4411,10 @@ pub fn start_audio_thread(
     let host = cpal::default_host();
     let mut audio_source_opt = if mic {
         None
+    } else if let Some(src) = preloaded_source.take() {
+        Some(src)
     } else {
-        if let Some(src) = preloaded_source.take() {
-            Some(src)
-        } else {
-            Some(load_audio_source(file_path)?)
-        }
+        Some(load_audio_source(file_path)?)
     };
     let rate = audio_source_opt
         .as_mut()
@@ -4594,12 +4592,10 @@ pub fn start_audio_thread(
                 None
             } else if let Some(src) = audio_source_opt.take() {
                 Some(src)
+            } else if let Some(src) = preloaded_source.take() {
+                Some(src)
             } else {
-                if let Some(src) = preloaded_source.take() {
-            Some(src)
-        } else {
-            Some(load_audio_source(file_path)?)
-        }
+                Some(load_audio_source(file_path)?)
             };
 
             let result = (|| -> Result<(cpal::Stream, Arc<std::sync::atomic::AtomicBool>)> {

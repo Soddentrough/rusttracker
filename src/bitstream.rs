@@ -748,7 +748,7 @@ mod wasapi_bitstream {
     use std::io::Read;
     use std::ptr;
     use std::sync::{Arc, Mutex, atomic::AtomicBool};
-    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
     use windows::Win32::Media::Audio::*;
     use windows::Win32::System::Com::*;
     use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
@@ -892,8 +892,7 @@ mod wasapi_bitstream {
             {
                 let aligned_frames = unsafe { audio_client.GetBufferSize().unwrap_or(0) };
                 if aligned_frames > 0 {
-                    buffer_duration =
-                        (aligned_frames as i64 * 10_000_000) / profile.rate as i64;
+                    buffer_duration = (aligned_frames as i64 * 10_000_000) / profile.rate as i64;
                     let audio_client_new: IAudioClient =
                         unsafe { device.Activate(CLSCTX_ALL, None)? };
                     hr = unsafe {
@@ -2847,7 +2846,6 @@ mod wasapi_bitstream {
                                     let _ = ac.Stop();
                                     let _ = ac.Reset();
                                 }
-
                             }
                             playback_time = None;
                             pending_vis_msg = None;
@@ -2868,8 +2866,7 @@ mod wasapi_bitstream {
                                 }
                             }
                             if started
-                                || prebuffer_start.elapsed()
-                                    > std::time::Duration::from_millis(500)
+                                || prebuffer_start.elapsed() > std::time::Duration::from_millis(500)
                             {
                                 if let Some((ac, rc, ev)) = active_client.take() {
                                     unsafe {
@@ -2972,10 +2969,9 @@ mod wasapi_bitstream {
                                         while vis_rx.try_recv().is_ok() {}
                                         unsafe {
                                             if let Some((ref ac, _, _)) = active_client {
-                                    let _ = ac.Stop();
-                                    let _ = ac.Reset();
-                                }
-            
+                                                let _ = ac.Stop();
+                                                let _ = ac.Reset();
+                                            }
                                         }
                                         playback_time = None;
                                         pending_vis_msg = None;
@@ -3114,19 +3110,18 @@ mod wasapi_bitstream {
                     // Strict Teardown:
                     // 1. Stop audio hardware and reset (if not already released while paused)
                     if let Some((audio_client, render_client, event)) = active_client.take() {
-                    unsafe {
-                        let _ = audio_client.Stop();
-                        let _ = audio_client.Reset();
-                    }
-                    // 2. Drop render and audio client COM interfaces BEFORE CoUninitialize!
-                    drop(render_client);
-                    drop(audio_client);
+                        unsafe {
+                            let _ = audio_client.Stop();
+                            let _ = audio_client.Reset();
+                        }
+                        // 2. Drop render and audio client COM interfaces BEFORE CoUninitialize!
+                        drop(render_client);
+                        drop(audio_client);
 
-                    // 3. Close event handle
-                    unsafe {
-                        let _ = CloseHandle(event);
-                    }
-
+                        // 3. Close event handle
+                        unsafe {
+                            let _ = CloseHandle(event);
+                        }
                     }
                     drop(device);
 

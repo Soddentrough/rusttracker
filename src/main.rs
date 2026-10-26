@@ -1712,9 +1712,7 @@ async fn run_gui(
                                 state.handle_dropped_files(expanded, c_pos);
                             }
 
-
                             let (load_path, resume_pos_on_reload) = {
-
                                 let mut state = app_state.lock().unwrap();
 
                                 if state.audio_device_lost {
@@ -1764,7 +1762,9 @@ async fn run_gui(
                                         state.song_title.clone()
                                     };
 
-                                    if (!reload_path.is_empty() && state.file_loaded) || is_mic_launch {
+                                    if (!reload_path.is_empty() && state.file_loaded)
+                                        || is_mic_launch
+                                    {
                                         state.load_request = Some(reload_path);
                                         resume_pos_on_reload = Some(state.current_seconds);
                                         state.osd_text = Some(if pt_enabled {
@@ -2381,7 +2381,8 @@ async fn run_gui(
                                     EngineAction::SetForceStereo(val) => {
                                         state.force_stereo_downmix = val;
                                         if state.file_loaded {
-                                            state.passthrough_change_request = Some(state.passthrough_enabled);
+                                            state.passthrough_change_request =
+                                                Some(state.passthrough_enabled);
                                         }
                                     }
                                     EngineAction::SetPassthrough(val) => {
