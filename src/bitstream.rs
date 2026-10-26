@@ -1540,9 +1540,10 @@ mod wasapi_bitstream {
 
                 let ffmpeg_thread = match stream_type {
                     WasapiStreamType::CompressedBitstream => {
+                        use std::sync::atomic::Ordering;
                         use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
                         use windows::Win32::System::Pipes::{
-                            ConnectNamedPipe, CreateNamedPipeA, NAMED_PIPE_MODE,
+                            ConnectNamedPipe, CreateNamedPipeA, NAMED_PIPE_MODE, PeekNamedPipe,
                         };
 
                         let pipe_id =
@@ -1580,9 +1581,11 @@ mod wasapi_bitstream {
                         let pipe_name_clone = pipe_name.clone();
                         let stop_token_worker = stop_token_pump.clone();
                         let vis_tx_worker = vis_tx.clone();
-                        let vis_rx_worker = vis_rx.clone();
-                        let pcm_rx_worker = pcm_rx.clone();
+                        let pcm_tx_worker = pcm_tx.clone();
                         let shared_state_worker = shared_state_pump.clone();
+                        let eof_flag = Arc::new(AtomicBool::new(false));
+                        let eof_flag_worker = eof_flag.clone();
+                        let eof_flag_feeder = eof_flag.clone();
 
                         let ffmpeg_worker = std::thread::spawn(move || {
                             println!(
@@ -1704,6 +1707,7 @@ mod wasapi_bitstream {
                                 if let Some((pos, epoch)) = seek_req {
                                     current_seek_epoch = epoch;
                                     is_eof = false;
+                                    eof_flag_worker.store(false, Ordering::SeqCst);
                                     seek_in_progress = true;
                                     target_seek_time = Some(pos);
                                     samples_since_last_send = 0;
@@ -1712,8 +1716,6 @@ mod wasapi_bitstream {
                                     if let Some(ref v_rx) = video_packet_rx {
                                         while v_rx.try_recv().is_ok() {}
                                     }
-                                    while pcm_rx_worker.try_recv().is_ok() {}
-                                    while vis_rx_worker.try_recv().is_ok() {}
 
                                     let (seek_stream_idx, target_pts) =
                                         if let (Some(v_idx), Some(tb)) =
@@ -1764,8 +1766,9 @@ mod wasapi_bitstream {
 
                                 if is_eof
                                     || (target_seek_time.is_none()
-                                        && current_seconds > playback_sec + 7.5
-                                        && pcm_rx_worker.len() > 16)
+                                        && (pcm_tx_worker.len() > 256
+                                            || (current_seconds > playback_sec + 7.5
+                                                && pcm_tx_worker.len() > 16)))
                                 {
                                     std::thread::sleep(std::time::Duration::from_millis(10));
                                     continue;
@@ -1773,6 +1776,7 @@ mod wasapi_bitstream {
 
                                 let Some((stream, mut packet)) = ictx.packets().next() else {
                                     is_eof = true;
+                                    eof_flag_worker.store(true, Ordering::SeqCst);
                                     continue;
                                 };
 
@@ -2027,7 +2031,9 @@ mod wasapi_bitstream {
                                     }
                                 }
                             }
-                            let _ = octx.write_trailer();
+                            if !stop_token_worker.load(std::sync::atomic::Ordering::Relaxed) {
+                                let _ = octx.write_trailer();
+                            }
                         });
 
                         println!("[bitstream] Connecting named pipe for bitstream...");
@@ -2042,14 +2048,37 @@ mod wasapi_bitstream {
                         let shared_state_feeder = shared_state_pump.clone();
                         let feeder_thread = std::thread::spawn(move || {
                             use std::os::windows::io::FromRawHandle;
+                            let raw_ptr = pipe_handle_raw as *mut std::ffi::c_void;
+                            let pipe_h = windows::Win32::Foundation::HANDLE(raw_ptr);
                             let mut file = unsafe {
-                                std::fs::File::from_raw_handle(
-                                    pipe_handle_raw as *mut std::ffi::c_void,
-                                )
+                                std::fs::File::from_raw_handle(raw_ptr)
                             };
                             let mut buf = vec![0u8; 16384];
-                            while !stop_token_feeder.load(std::sync::atomic::Ordering::Relaxed) {
-                                match file.read(&mut buf) {
+                            while !stop_token_feeder.load(Ordering::Relaxed) {
+                                let mut avail: u32 = 0;
+                                let peek_ok = unsafe {
+                                    PeekNamedPipe(pipe_h, None, 0, None, Some(&mut avail), None)
+                                };
+                                if peek_ok.is_err() {
+                                    break;
+                                }
+                                if avail == 0 {
+                                    if eof_flag_feeder.swap(false, Ordering::SeqCst) {
+                                        let cur_epoch = shared_state_feeder
+                                            .lock()
+                                            .map(|s| s.seek_epoch)
+                                            .unwrap_or(0);
+                                        let _ = pcm_tx_feeder.try_send(AudioPacket {
+                                            pcm_bytes: Vec::new(),
+                                            epoch: cur_epoch,
+                                            is_eof: true,
+                                        });
+                                    }
+                                    std::thread::sleep(std::time::Duration::from_millis(2));
+                                    continue;
+                                }
+                                let to_read = (avail as usize).min(buf.len());
+                                match file.read(&mut buf[..to_read]) {
                                     Ok(0) => break,
                                     Ok(n) => {
                                         let cur_epoch = shared_state_feeder
@@ -2066,6 +2095,7 @@ mod wasapi_bitstream {
                                             if stop_token_feeder
                                                 .load(std::sync::atomic::Ordering::Relaxed)
                                             {
+                                                drop(file);
                                                 return;
                                             }
                                             if let Ok(state) = shared_state_feeder.try_lock()
@@ -2080,6 +2110,7 @@ mod wasapi_bitstream {
                                                     pending = Some(c);
                                                 }
                                                 Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
+                                                    drop(file);
                                                     return;
                                                 }
                                             }
@@ -2088,27 +2119,28 @@ mod wasapi_bitstream {
                                     Err(_) => break,
                                 }
                             }
-                            let final_epoch = shared_state_feeder
-                                .lock()
-                                .map(|s| s.seek_epoch)
-                                .unwrap_or(0);
-                            let _ = pcm_tx_feeder.send(AudioPacket {
-                                pcm_bytes: Vec::new(),
-                                epoch: final_epoch,
-                                is_eof: true,
-                            });
+                            drop(file);
+                            if !stop_token_feeder.load(std::sync::atomic::Ordering::Relaxed) {
+                                let final_epoch = shared_state_feeder
+                                    .lock()
+                                    .map(|s| s.seek_epoch)
+                                    .unwrap_or(0);
+                                let _ = pcm_tx_feeder.try_send(AudioPacket {
+                                    pcm_bytes: Vec::new(),
+                                    epoch: final_epoch,
+                                    is_eof: true,
+                                });
+                            }
                         });
 
                         std::thread::spawn(move || {
-                            let _ = ffmpeg_worker.join();
                             let _ = feeder_thread.join();
+                            let _ = ffmpeg_worker.join();
                         })
                     }
                     WasapiStreamType::Lpcm => {
                         let pcm_tx_lpcm = pcm_tx.clone();
-                        let pcm_rx_lpcm = pcm_rx.clone();
                         let vis_tx_lpcm = vis_tx.clone();
-                        let vis_rx_lpcm = vis_rx.clone();
                         let stop_token_lpcm = stop_token_ffmpeg.clone();
                         let shared_state_lpcm = shared_state_pump.clone();
 
@@ -2431,8 +2463,6 @@ mod wasapi_bitstream {
                                     if let Some(ref v_rx) = video_packet_rx {
                                         while v_rx.try_recv().is_ok() {}
                                     }
-                                    while pcm_rx_lpcm.try_recv().is_ok() {}
-                                    while vis_rx_lpcm.try_recv().is_ok() {}
 
                                     let (seek_stream_idx, target_pts) =
                                         if let (Some(v_idx), Some(tb)) =
@@ -2483,8 +2513,9 @@ mod wasapi_bitstream {
 
                                 if is_eof
                                     || (target_seek_time.is_none()
-                                        && current_seconds > playback_sec + 7.5
-                                        && pcm_rx_lpcm.len() > 16)
+                                        && (pcm_tx_lpcm.len() > 256
+                                            || (current_seconds > playback_sec + 7.5
+                                                && pcm_tx_lpcm.len() > 16)))
                                 {
                                     std::thread::sleep(std::time::Duration::from_millis(10));
                                     continue;
@@ -2585,7 +2616,7 @@ mod wasapi_bitstream {
                                                 &mut accumulator,
                                             );
                                         }
-                                        let _ = pcm_tx_lpcm.send(AudioPacket {
+                                        let _ = pcm_tx_lpcm.try_send(AudioPacket {
                                             pcm_bytes: Vec::new(),
                                             epoch: current_seek_epoch,
                                             is_eof: true,
@@ -2718,6 +2749,16 @@ mod wasapi_bitstream {
 
                         if seek_from_state.is_some() {
                             buffer_queue.clear();
+                            eof = false;
+                            while let Ok(pkt) = pcm_rx.try_recv() {
+                                if pkt.epoch >= local_epoch {
+                                    if pkt.is_eof {
+                                        eof = true;
+                                        break;
+                                    }
+                                    buffer_queue.extend(pkt.pcm_bytes);
+                                }
+                            }
                             while vis_rx.try_recv().is_ok() {}
                             unsafe {
                                 let _ = audio_client.Stop();
@@ -2726,7 +2767,6 @@ mod wasapi_bitstream {
                             playback_time = None;
                             pending_vis_msg = None;
                             started = false;
-                            eof = false;
                         }
 
                         if started {
