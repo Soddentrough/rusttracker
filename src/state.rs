@@ -544,6 +544,7 @@ pub struct AppState {
     pub selected_audio_device: Option<String>,
     pub available_audio_devices: Vec<String>,
     pub audio_device_change_request: Option<String>,
+    pub passthrough_change_request: Option<bool>,
     pub show_tui_device_picker: bool,
     pub tui_device_picker_cursor: usize,
     pub lyrics: Option<std::sync::Arc<crate::lyrics::Lyrics>>,
@@ -651,7 +652,7 @@ impl AppState {
         }
 
         AppState {
-            passthrough_enabled: cfg!(any(target_os = "windows", target_os = "linux")),
+            passthrough_enabled: false,
             file_loaded: false,
             song_title: title,
             artist: "Unknown".to_string(),
@@ -750,6 +751,7 @@ impl AppState {
             selected_audio_device: default_audio_device,
             available_audio_devices,
             audio_device_change_request: None,
+            passthrough_change_request: None,
             show_tui_device_picker: false,
             tui_device_picker_cursor: 0,
             lyrics: None,
@@ -859,6 +861,7 @@ impl AppState {
             selected_audio_device: self.selected_audio_device.clone(),
             available_audio_devices: self.available_audio_devices.clone(),
             audio_device_change_request: self.audio_device_change_request.clone(),
+            passthrough_change_request: self.passthrough_change_request,
             show_tui_device_picker: self.show_tui_device_picker,
             tui_device_picker_cursor: self.tui_device_picker_cursor,
             lyrics: self.lyrics.clone(),

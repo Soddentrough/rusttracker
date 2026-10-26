@@ -66,6 +66,13 @@ struct Args {
         help = "Disable VSync / display sync and unlock uncapped frame rates"
     )]
     uncapped: bool,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Enable hardware bitstream passthrough (WASAPI Exclusive / PipeWire) for compressed surround formats"
+    )]
+    passthrough: bool,
 }
 
 struct Tui {
@@ -187,6 +194,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     {
         let mut state = app_state.lock().unwrap();
         state.playlist = args.file.clone();
+        if args.passthrough {
+            state.passthrough_enabled = true;
+        }
         state.playlist_index = 0;
 
         let mut history_changed = false;
@@ -1688,6 +1698,7 @@ async fn run_gui(
                                 is_first_frame = false;
                                 app_state.lock().unwrap().is_paused = false;
                             }
+
                             if !pending_dropped_files.is_empty() {
                                 let raw_files = std::mem::take(&mut pending_dropped_files);
                                 let expanded = crate::playlist::expand_input_paths(&raw_files);
@@ -1700,7 +1711,10 @@ async fn run_gui(
                                 }
                                 state.handle_dropped_files(expanded, c_pos);
                             }
-                            let load_path = {
+
+
+                            let (load_path, resume_pos_on_reload) = {
+
                                 let mut state = app_state.lock().unwrap();
 
                                 if state.audio_device_lost {
@@ -1721,6 +1735,7 @@ async fn run_gui(
                                     }
                                 }
 
+                                let mut resume_pos_on_reload: Option<f64> = None;
                                 let device_change = state.audio_device_change_request.take();
                                 if let Some(new_device) = device_change {
                                     let reload_path = if is_mic_launch {
@@ -1735,6 +1750,28 @@ async fn run_gui(
                                         state.load_request = Some(reload_path);
                                         state.osd_text =
                                             Some(format!("Audio Output: {}", new_device));
+                                        resume_pos_on_reload = Some(state.current_seconds);
+                                        state.osd_timer = 3.0;
+                                    }
+                                }
+
+                                if let Some(pt_enabled) = state.passthrough_change_request.take() {
+                                    let reload_path = if is_mic_launch {
+                                        "".to_string()
+                                    } else if state.playlist_index < state.playlist.len() {
+                                        state.playlist[state.playlist_index].clone()
+                                    } else {
+                                        state.song_title.clone()
+                                    };
+
+                                    if (!reload_path.is_empty() && state.file_loaded) || is_mic_launch {
+                                        state.load_request = Some(reload_path);
+                                        resume_pos_on_reload = Some(state.current_seconds);
+                                        state.osd_text = Some(if pt_enabled {
+                                            "Bitstream Passthrough: ON (Exclusive)".to_string()
+                                        } else {
+                                            "Bitstream Passthrough: OFF (Shared Mode)".to_string()
+                                        });
                                         state.osd_timer = 3.0;
                                     }
                                 }
@@ -1750,7 +1787,7 @@ async fn run_gui(
                                     }
                                 }
 
-                                state.load_request.take()
+                                (state.load_request.take(), resume_pos_on_reload)
                             };
 
                             if let Some(path) = load_path {
@@ -1851,6 +1888,13 @@ async fn run_gui(
                                                 .map(std::sync::Arc::new)
                                         };
                                         state.track_ended = false;
+                                        if let Some(pos) = resume_pos_on_reload
+                                            && pos > 0.1
+                                        {
+                                            state.current_seconds = pos;
+                                            state.seek_request = Some(pos);
+                                            state.seek_epoch += 1;
+                                        }
                                         active_stream = Some(stream);
                                     } else {
                                         let mut state = app_state.lock().unwrap();
@@ -2336,9 +2380,13 @@ async fn run_gui(
                                     }
                                     EngineAction::SetForceStereo(val) => {
                                         state.force_stereo_downmix = val;
+                                        if state.file_loaded {
+                                            state.passthrough_change_request = Some(state.passthrough_enabled);
+                                        }
                                     }
                                     EngineAction::SetPassthrough(val) => {
                                         state.passthrough_enabled = val;
+                                        state.passthrough_change_request = Some(val);
                                     }
                                     EngineAction::SetSplitRatio(val) => {
                                         state.panel_split_ratio = val;

@@ -860,6 +860,84 @@ mod wasapi_bitstream {
         }
     }
 
+    fn initialize_exclusive_client(
+        device: &IMMDevice,
+        profile: &AudioProfile,
+        format: &[u8],
+    ) -> anyhow::Result<(IAudioClient, IAudioRenderClient, HANDLE, u32)> {
+        let mut audio_client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
+        let mut default_period = 0;
+        let mut min_period = 0;
+        unsafe {
+            audio_client.GetDevicePeriod(Some(&mut default_period), Some(&mut min_period))?;
+        }
+        let mut buffer_duration = if min_period > 0 {
+            min_period
+        } else {
+            default_period.max(100_000)
+        };
+        let mut hr = unsafe {
+            audio_client.Initialize(
+                AUDCLNT_SHAREMODE_EXCLUSIVE,
+                AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                buffer_duration,
+                buffer_duration,
+                format.as_ptr() as *const _,
+                None,
+            )
+        };
+        if let Err(e) = &hr {
+            if e.code() == windows::core::HRESULT(0x88890019u32 as i32)
+                || e.code() == windows::core::HRESULT(0x80070057u32 as i32)
+            {
+                let aligned_frames = unsafe { audio_client.GetBufferSize().unwrap_or(0) };
+                if aligned_frames > 0 {
+                    buffer_duration =
+                        (aligned_frames as i64 * 10_000_000) / profile.rate as i64;
+                    let audio_client_new: IAudioClient =
+                        unsafe { device.Activate(CLSCTX_ALL, None)? };
+                    hr = unsafe {
+                        audio_client_new.Initialize(
+                            AUDCLNT_SHAREMODE_EXCLUSIVE,
+                            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                            buffer_duration,
+                            buffer_duration,
+                            format.as_ptr() as *const _,
+                            None,
+                        )
+                    };
+                    if hr.is_ok() {
+                        audio_client = audio_client_new;
+                    } else {
+                        hr.map_err(|e| anyhow::anyhow!(e))?;
+                    }
+                } else {
+                    hr.map_err(|e| anyhow::anyhow!(e))?;
+                }
+            } else {
+                hr.map_err(|e| anyhow::anyhow!(e))?;
+            }
+        }
+        let event = unsafe { CreateEventW(None, false, false, None)? };
+        if let Err(e) = unsafe { audio_client.SetEventHandle(event) } {
+            unsafe {
+                let _ = CloseHandle(event);
+            }
+            return Err(anyhow::anyhow!(e));
+        }
+        let buffer_frames = unsafe { audio_client.GetBufferSize()? };
+        let render_client: IAudioRenderClient = match unsafe { audio_client.GetService() } {
+            Ok(rc) => rc,
+            Err(e) => {
+                unsafe {
+                    let _ = CloseHandle(event);
+                }
+                return Err(anyhow::anyhow!(e));
+            }
+        };
+        Ok((audio_client, render_client, event, buffer_frames))
+    }
+
     fn detect_codec_profile(
         codec_id: ffmpeg_next::codec::Id,
         src_channels: u16,
@@ -953,7 +1031,8 @@ mod wasapi_bitstream {
                 }],
             )),
             // Uncompressed Multi-Channel LPCM (only when >2 channels; stereo uses shared mode)
-            id if src_channels > 2 => {
+            // Uncompressed Multi-Channel LPCM now uses WASAPI Shared Mode via cpal; Exclusive Mode is restricted to compressed bitstreams
+            id if false && src_channels > 2 => {
                 let codec_name = match id {
                     ffmpeg_next::codec::Id::FLAC => "flac",
                     ffmpeg_next::codec::Id::ALAC => "alac",
@@ -1373,7 +1452,7 @@ mod wasapi_bitstream {
                 };
 
                 // If target/default endpoint rejected the formats, probe other active endpoints
-                if negotiated.is_none() {
+                if false && negotiated.is_none() {
                     println!(
                         "[bitstream] Default/selected endpoint rejected formats; probing other active endpoints for AVR/HDMI..."
                     );
@@ -1482,7 +1561,7 @@ mod wasapi_bitstream {
                     }
                 }
 
-                drop(device);
+                // Keep `device` alive so Exclusive Mode can release on pause and re-acquire on resume
 
                 let event = unsafe { CreateEventW(None, false, false, None)? };
                 if let Err(e) = unsafe { audio_client.SetEventHandle(event) } {
@@ -2631,6 +2710,8 @@ mod wasapi_bitstream {
                 drop(vis_tx);
 
                 Ok((
+                    device,
+                    format,
                     audio_client,
                     render_client,
                     event,
@@ -2645,6 +2726,8 @@ mod wasapi_bitstream {
 
             match setup_result {
                 Ok((
+                    device,
+                    format,
                     audio_client,
                     render_client,
                     event,
@@ -2680,10 +2763,11 @@ mod wasapi_bitstream {
                         profile.name, profile.channels, profile.rate
                     );
 
-                    let available = buffer_frames;
+                    let mut active_client = Some((audio_client, render_client, event));
+                    let mut available = buffer_frames;
                     let frame_size = frame_bytes as usize;
-                    let bytes_needed = (available * frame_bytes) as usize;
-                    let target_prebuffer = bytes_needed.max(4096);
+                    let mut bytes_needed = (available * frame_bytes) as usize;
+                    let mut target_prebuffer = bytes_needed.max(4096);
                     let mut buffer_queue: std::collections::VecDeque<u8> =
                         std::collections::VecDeque::with_capacity(bytes_needed * 4);
                     let mut started = false;
@@ -2717,7 +2801,7 @@ mod wasapi_bitstream {
                         }
                     }
 
-                    let buffer_duration = available as f64 / profile.rate as f64;
+                    let mut buffer_duration = available as f64 / profile.rate as f64;
                     let mut playback_time: Option<f64> = None;
                     let mut pending_vis_msg: Option<DspMessage> = None;
 
@@ -2759,13 +2843,81 @@ mod wasapi_bitstream {
                             }
                             while vis_rx.try_recv().is_ok() {}
                             unsafe {
-                                let _ = audio_client.Stop();
-                                let _ = audio_client.Reset();
+                                if let Some((ref ac, _, _)) = active_client {
+                                    let _ = ac.Stop();
+                                    let _ = ac.Reset();
+                                }
+
                             }
                             playback_time = None;
                             pending_vis_msg = None;
                             started = false;
                         }
+
+                        if is_paused {
+                            if playback_time.is_none() {
+                                let first_msg = if let Some(msg) = pending_vis_msg.take() {
+                                    Some(msg)
+                                } else {
+                                    vis_rx.try_recv().ok()
+                                };
+                                if let Some(msg) = first_msg {
+                                    let t = msg.current_seconds;
+                                    let _ = tx.try_send(msg);
+                                    playback_time = Some(t);
+                                }
+                            }
+                            if started
+                                || prebuffer_start.elapsed()
+                                    > std::time::Duration::from_millis(500)
+                            {
+                                if let Some((ac, rc, ev)) = active_client.take() {
+                                    unsafe {
+                                        let _ = ac.Stop();
+                                        let _ = ac.Reset();
+                                    }
+                                    drop(rc);
+                                    drop(ac);
+                                    unsafe {
+                                        let _ = CloseHandle(ev);
+                                    }
+                                    started = false;
+                                    println!(
+                                        "[bitstream] Paused: released WASAPI Exclusive audio device lock."
+                                    );
+                                }
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(15));
+                            continue;
+                        }
+
+                        if active_client.is_none() {
+                            match initialize_exclusive_client(&device, &profile, &format) {
+                                Ok((ac, rc, ev, bf)) => {
+                                    available = bf;
+                                    bytes_needed = (available * frame_bytes) as usize;
+                                    target_prebuffer = bytes_needed.max(4096);
+                                    buffer_duration = available as f64 / profile.rate as f64;
+                                    active_client = Some((ac, rc, ev));
+                                    started = false;
+                                    println!(
+                                        "[bitstream] Resumed: re-acquired WASAPI Exclusive audio device lock."
+                                    );
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "[bitstream] Waiting to re-acquire WASAPI Exclusive device: {:?}",
+                                        e
+                                    );
+                                    std::thread::sleep(std::time::Duration::from_millis(100));
+                                    continue;
+                                }
+                            }
+                        }
+                        let (audio_client, render_client, event) = active_client
+                            .as_ref()
+                            .map(|(ac, rc, ev)| (ac, rc, *ev))
+                            .unwrap();
 
                         if started {
                             let wait_result = unsafe { WaitForSingleObject(event, 50) };
@@ -2779,7 +2931,7 @@ mod wasapi_bitstream {
                             }
                         }
 
-                        if is_paused {
+                        if false && is_paused {
                             if playback_time.is_none() {
                                 let first_msg = if let Some(msg) = pending_vis_msg.take() {
                                     Some(msg)
@@ -2819,8 +2971,11 @@ mod wasapi_bitstream {
                                         buffer_queue.clear();
                                         while vis_rx.try_recv().is_ok() {}
                                         unsafe {
-                                            let _ = audio_client.Stop();
-                                            let _ = audio_client.Reset();
+                                            if let Some((ref ac, _, _)) = active_client {
+                                    let _ = ac.Stop();
+                                    let _ = ac.Reset();
+                                }
+            
                                         }
                                         playback_time = None;
                                         pending_vis_msg = None;
@@ -2957,7 +3112,8 @@ mod wasapi_bitstream {
                     }
 
                     // Strict Teardown:
-                    // 1. Stop audio hardware and reset
+                    // 1. Stop audio hardware and reset (if not already released while paused)
+                    if let Some((audio_client, render_client, event)) = active_client.take() {
                     unsafe {
                         let _ = audio_client.Stop();
                         let _ = audio_client.Reset();
@@ -2970,6 +3126,9 @@ mod wasapi_bitstream {
                     unsafe {
                         let _ = CloseHandle(event);
                     }
+
+                    }
+                    drop(device);
 
                     // 4. Signal stop and drop receivers so worker thread exits promptly
                     stop_token_pump.store(true, std::sync::atomic::Ordering::SeqCst);

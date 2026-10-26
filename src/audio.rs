@@ -4263,6 +4263,8 @@ pub fn start_audio_thread(
     mic: bool,
     shared_state: Arc<Mutex<AppState>>,
 ) -> Result<PlaybackHandle> {
+    #[allow(unused_mut)]
+    let mut preloaded_source: Option<Box<dyn AudioSource>> = None;
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     if !mic {
         let ext = std::path::Path::new(file_path)
@@ -4289,7 +4291,26 @@ pub fn start_audio_thread(
                 | "mlp"
         );
         let passthrough = shared_state.lock().unwrap().passthrough_enabled;
-        if passthrough && can_bitstream {
+        let should_try_bitstream = if passthrough && can_bitstream {
+            true
+        } else if can_bitstream {
+            match load_audio_source(file_path) {
+                Ok(src) => {
+                    preloaded_source = Some(src);
+                    false
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[audio] Shared-mode software decode failed ({}), falling back to exclusive bitstream passthrough...",
+                        e
+                    );
+                    true
+                }
+            }
+        } else {
+            false
+        };
+        if should_try_bitstream {
             {
                 let mut state = shared_state.lock().unwrap();
                 state.current_seconds = 0.0;
@@ -4391,7 +4412,11 @@ pub fn start_audio_thread(
     let mut audio_source_opt = if mic {
         None
     } else {
-        Some(load_audio_source(file_path)?)
+        if let Some(src) = preloaded_source.take() {
+            Some(src)
+        } else {
+            Some(load_audio_source(file_path)?)
+        }
     };
     let rate = audio_source_opt
         .as_mut()
@@ -4570,7 +4595,11 @@ pub fn start_audio_thread(
             } else if let Some(src) = audio_source_opt.take() {
                 Some(src)
             } else {
-                Some(load_audio_source(file_path)?)
+                if let Some(src) = preloaded_source.take() {
+            Some(src)
+        } else {
+            Some(load_audio_source(file_path)?)
+        }
             };
 
             let result = (|| -> Result<(cpal::Stream, Arc<std::sync::atomic::AtomicBool>)> {

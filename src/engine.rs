@@ -8939,6 +8939,27 @@ impl VulkanEngine {
                                                 }
                                             });
 
+                                            ui.horizontal(|ui| {
+                                                let mut passthrough = state.passthrough_enabled;
+                                                let label = if cfg!(target_os = "windows") {
+                                                    "Bitstream Passthrough (WASAPI Exclusive)"
+                                                } else {
+                                                    "Bitstream Passthrough (PipeWire)"
+                                                };
+                                                if ui
+                                                    .checkbox(
+                                                        &mut passthrough,
+                                                        egui::RichText::new(label)
+                                                            .size(12.0)
+                                                            .color(egui::Color32::from_rgb(160, 180, 200)),
+                                                    )
+                                                    .on_hover_text("Enable raw IEC 61937 hardware bitstreaming (TrueHD/Atmos, E-AC3, DTS, AC3) to an external HDMI AVR. Unchecked (default) decodes in software using Shared Mode so other apps can play audio simultaneously.")
+                                                    .changed()
+                                                {
+                                                    *engine_action = EngineAction::SetPassthrough(passthrough);
+                                                }
+                                            });
+
                                             // 8. Next Song (placed at the bottom, smooth marquee if long)
                                             if state.playlist_index + 1 < state.playlist.len() {
                                                 let next_path = std::path::Path::new(&state.playlist[state.playlist_index + 1]);
