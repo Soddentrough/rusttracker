@@ -65,19 +65,21 @@ RustTracker features a specialized dual-pane interface optimized for mobile and 
 | Action | Desktop Key | Gamepad (Xbox / Steam Deck) |
 | :--- | :--- | :--- |
 | **Play / Pause** | `Space` | `A` (`South`) or `Start` |
-| **Seek Backward / Forward** | `Left` / `Right` Arrow | `Left Trigger (LT)` / `Right Trigger (RT)` (analog scrub) |
-| **Prev / Next Track (or Tracker Order)** | `Up` / `Down` Arrow (`[` / `]` for Order) | `D-Pad Left` / `D-Pad Right` |
-| **Prev / Next Visualizer** | `Page Up` / `Page Down` or `,` / `.` | `D-Pad Up` / `D-Pad Down` |
-| **Visualizer Picker Popup** | `V` | `Y` (`North Button`) |
-| **Cycle Display Mode (`Both` ➔ `HUD` ➔ `Vis`)** | `Tab` | `B` (`East Button`) |
-| **Cycle Audio Track** | `A` | `Right Stick Click (R3)` |
+| **Seek Backward / Forward** | `Left` / `Right` Arrow (`Shift` ±30s, `Ctrl`/`⌘` ±60s) | `Left Trigger (LT)` / `Right Trigger (RT)` (analog scrub) |
+| **Step Frame Backward / Forward** | `,` / `.` | — |
+| **Prev / Next Track** | `P` / `N` | `D-Pad Left` / `D-Pad Right` |
+| **Prev / Next Visualizer** | `Up` / `Down` Arrow | `D-Pad Up` / `D-Pad Down` |
+| **Visualizer Picker Popup** | `M` | `Y` (`North Button`) |
+| **Toggle Video / Cycle View Mode** | `V` | `Right Bumper (RB)` |
+| **Toggle HUD Visibility** | `Tab` | `B` (`East Button`) |
+| **Resize HUD / Visualizer Split** | `[` / `]` | — |
+| **Select Audio Track (1–9)** | `1` – `9` | `Right Stick Click (R3)` (cycles track) |
 | **Toggle Performance Stats** | `S` | `Select / Back Button` |
+| **Toggle Keyboard / Gamepad Help** | `H` | `Left Bumper (LB)` |
 | **Open File Dialog** | `O` | `X` (`West Button`) |
-| **Open Stream / URL Dialog** | `U` | `Left Stick Click (L3)` |
-| **Toggle Playlist Drawer** | `P` | `Left Bumper (LB)` |
-| **Cycle Repeat Mode** | `R` | `Right Bumper (RB)` |
-| **Fullscreen Toggle** | `F` or `F11` | — |
-| **Quit** | `Q` or `Escape` | — |
+| **Toggle GPU Compute FFT** | `G` | `Left Stick Click (L3)` |
+| **Fullscreen Toggle** | `F` | — |
+| **Quit** | `Ctrl+Q` / `⌘Q` or `Escape` | — |
 
 ---
 
@@ -105,7 +107,7 @@ Pre-compiled packages for all platforms are available on the [GitHub Releases](h
 
 * **Android:** Download and install `app-release.apk` (or `RustTracker-Android-*.apk`).
 * **Windows:** Download and run `RustTracker-Setup.exe` installer.
-* **macOS:** Download and open `RustTracker-MacOS-Installer.dmg`.
+* **macOS (Apple Silicon, macOS 11.0+):** Download and open `RustTracker-MacOS-Installer.dmg`, then drag `RustTracker.app` to `/Applications`. *(If macOS Gatekeeper warns that the app is unverified on first launch, run `xattr -cr /Applications/RustTracker.app` or Right-Click ➔ **Open**).*
 * **Fedora / RHEL:** `sudo dnf install ./rusttracker-*.x86_64.rpm`
 * **Ubuntu / Debian:** `sudo dpkg -i ./rusttracker_*_amd64.deb`
 * **Steam Deck:** Download `RustTracker-SteamDeck-*.AppImage`, mark executable, and add as Non-Steam Game in Steam Gaming Mode.
@@ -116,12 +118,23 @@ Pre-compiled packages for all platforms are available on the [GitHub Releases](h
 
 ### Prerequisites
 * Rust 1.85+ (Edition 2024)
-* Vulkan SDK / Drivers (`vulkan-loader`, `mesa-vulkan-drivers`)
+* GPU Drivers: Vulkan SDK / Drivers (`vulkan-loader`, `mesa-vulkan-drivers`) on Linux/Windows, or Metal on macOS
 * FFmpeg 6.0+ libraries & `libopenmpt`
 
 ### Linux (Fedora)
 ```bash
 sudo dnf install -y gcc gcc-c++ binutils pkgconfig alsa-lib-devel wayland-devel libX11-devel libxkbcommon-devel systemd-devel ffmpeg-devel libopenmpt-devel clang clang-devel
+cargo build --release
+```
+
+### macOS (Homebrew)
+```bash
+brew install ffmpeg@7 libopenmpt
+brew link --overwrite --force ffmpeg@7
+export PKG_CONFIG_PATH="/opt/homebrew/opt/ffmpeg@7/lib/pkgconfig:/opt/homebrew/lib/pkgconfig"
+export LIBRARY_PATH="/opt/homebrew/opt/ffmpeg@7/lib:/opt/homebrew/lib"
+export CPATH="/opt/homebrew/opt/ffmpeg@7/include:/opt/homebrew/include"
+export BINDGEN_EXTRA_CLANG_ARGS="-I/opt/homebrew/opt/ffmpeg@7/include -I/opt/homebrew/include"
 cargo build --release
 ```
 

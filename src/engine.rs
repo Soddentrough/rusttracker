@@ -2639,7 +2639,13 @@ impl VulkanEngine {
             .await
             .unwrap();
 
-        let mut required_features = wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
+        let mut required_features = wgpu::Features::empty();
+        if adapter
+            .features()
+            .contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES)
+        {
+            required_features |= wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES;
+        }
         let supports_timestamps = if cfg!(target_os = "android") {
             false
         } else {
@@ -6239,9 +6245,14 @@ impl VulkanEngine {
             }
         }
 
+        let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
         let vis_width = state.visual_width.clamp(128, 2048);
         uniforms.waveform_resolution = vis_width;
-        uniforms.waveform_history_size = state.waveform_history.len().min(144) as u32;
+        uniforms.waveform_history_size = if vis_def.id == 3 {
+            144
+        } else {
+            state.waveform_history.len().min(144) as u32
+        };
         uniforms.step_fraction = step_fraction;
 
         self.queue
@@ -6250,7 +6261,6 @@ impl VulkanEngine {
         // Only upload waveform history when the active visualizer requires it,
         // and only when new rows were pushed or the width changed (saves a
         // 1.2MB buffer write + CPU flatten/smooth pass every frame while paused)
-        let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
         let history_dirty = state.waveform_history_push_count != self.last_uploaded_push_count
             || vis_width != self.last_uploaded_vis_width
             || vis_def.id != self.last_uploaded_vis_id;
@@ -6274,26 +6284,42 @@ impl VulkanEngine {
             self.last_uploaded_push_count = state.waveform_history_push_count;
             self.last_uploaded_vis_width = vis_width;
             self.last_uploaded_vis_id = vis_def.id;
-            // Upload up to 144 most recent frames
+            // Upload up to 144 most recent frames (right-aligned for 3D Oscilloscope so
+            // newest row is always slot 143 even right after seek/load)
             let hist_len = state.waveform_history.len();
             let start = hist_len.saturating_sub(144);
+            let count = hist_len.min(144);
+            let pad_slots = if vis_def.id == 3 {
+                144usize.saturating_sub(count)
+            } else {
+                0
+            };
+            if pad_slots > 0 {
+                self.waveform_history_flat[..pad_slots * 2048].fill(0.0);
+            }
             let visual_width_usize = vis_width as usize;
 
-            for (slot, wave) in state
+            for (i, wave) in state
                 .waveform_history
                 .iter()
                 .skip(start)
                 .enumerate()
                 .take(144)
             {
+                let slot = pad_slots + i;
                 let wave_len = wave.len().min(visual_width_usize);
                 if wave_len > 0 {
                     let offset = slot * 2048; // Max width is 2048
                     self.waveform_history_flat[offset..offset + wave_len]
                         .copy_from_slice(&wave[..wave_len]);
+                    if wave_len < visual_width_usize {
+                        self.waveform_history_flat[offset + wave_len..offset + visual_width_usize]
+                            .fill(0.0);
+                    }
 
-                    // Simple pre-smoothing inline
-                    if wave_len > 2 {
+                    // Simple pre-smoothing inline for 2D CRT trace (skip for 3D Oscilloscope
+                    // so 3D ridges retain crisp transient height)
+                    if vis_def.id != 3 && wave_len > 2 {
                         let mut prev = self.waveform_history_flat[offset];
                         for j in 1..wave_len - 1 {
                             let curr = self.waveform_history_flat[offset + j];
@@ -6928,7 +6954,9 @@ impl VulkanEngine {
                                 );
                             }
                             ui.separator();
-                        } else if state.passthrough_enabled {
+                        } else if state.passthrough_enabled
+                            && cfg!(any(target_os = "windows", target_os = "linux"))
+                        {
                             ui.label(
                                 egui::RichText::new("Bitstream Passthrough: Inactive")
                                     .color(egui::Color32::GRAY)
@@ -7602,8 +7630,9 @@ impl VulkanEngine {
                                                             kb_shortcut("f", "Fullscreen");
                                                             kb_shortcut("g", "GPU FFT");
                                                             kb_shortcut("1-9", "Audio Track");
+                                                            kb_shortcut("n / p", "Prev/Next");
                                                             let ctrl_mod = if std::env::consts::OS == "macos" { "⌘" } else { "ctrl+" };
-                                                            kb_shortcut(&format!("{}L/R", ctrl_mod), "Prev/Next");
+                                                            kb_shortcut(&format!("{}L/R", ctrl_mod), "Seek ±60s");
                                                             kb_shortcut("[ / ]", "Scale Panels");
                                                             kb_shortcut("h", "Toggle Help");
                                                         });
@@ -11189,5 +11218,54 @@ mod tests {
             prod_code.contains("Color32::from_rgb(255, 145, 30)"),
             "Button must use theme orange stroke color"
         );
+    }
+
+    #[test]
+    fn test_macos_bundle_and_entitlements_config() {
+        let macos_yml = std::fs::read_to_string(".github/workflows/macos.yml")
+            .expect(".github/workflows/macos.yml must exist");
+        let entitlements =
+            std::fs::read_to_string("entitlements.plist").expect("entitlements.plist must exist");
+
+        // Verify required microphone & library entitlements are present
+        assert!(
+            entitlements.contains("com.apple.security.device.audio-input"),
+            "entitlements.plist must request audio-input for --mic support"
+        );
+        assert!(
+            entitlements.contains("com.apple.security.cs.disable-library-validation"),
+            "entitlements.plist must allow loading bundled Homebrew dylibs"
+        );
+
+        // Verify both Developer ID and ad-hoc signing pass --entitlements entitlements.plist
+        assert!(
+            macos_yml.contains(
+                "codesign --force --entitlements entitlements.plist --sign - RustTracker.app/Contents/MacOS/rusttracker"
+            ),
+            "Ad-hoc signing must embed entitlements.plist on the main executable"
+        );
+        assert!(
+            macos_yml.contains(
+                "codesign --force --entitlements entitlements.plist --sign - RustTracker.app"
+            ),
+            "Ad-hoc signing must embed entitlements.plist on the app bundle"
+        );
+
+        // Verify minimum macOS version matches Apple Silicon baseline (11.0)
+        assert!(
+            macos_yml
+                .contains("<key>LSMinimumSystemVersion</key>\n              <string>11.0</string>"),
+            "Info.plist LSMinimumSystemVersion must be 11.0 for Apple Silicon builds"
+        );
+
+        // Verify every extension in FILE_DIALOG_EXTENSIONS is registered in Info.plist CFBundleDocumentTypes
+        for ext in crate::playlist::FILE_DIALOG_EXTENSIONS {
+            let tag = format!("<string>{}</string>", ext);
+            assert!(
+                macos_yml.contains(&tag),
+                "macOS Info.plist CFBundleDocumentTypes is missing extension: {}",
+                ext
+            );
+        }
     }
 }

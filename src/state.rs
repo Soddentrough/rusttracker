@@ -689,7 +689,7 @@ impl AppState {
         }
 
         AppState {
-            passthrough_enabled: true,
+            passthrough_enabled: cfg!(any(target_os = "windows", target_os = "linux")),
             file_loaded: false,
             song_title: title,
             artist: "Unknown".to_string(),

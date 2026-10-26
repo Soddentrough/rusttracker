@@ -587,13 +587,6 @@ pub fn start_bitstream_thread(
 
                             if acc_len > 0 && samples_since_last_send >= update_interval {
                                 samples_since_last_send = 0;
-                                let skip_fft = shared_state
-                                    .try_lock()
-                                    .map(|s| {
-                                        s.video_mode == 3
-                                            && (s.has_video_stream || s.video_frame_rx.is_some())
-                                    })
-                                    .unwrap_or(false);
 
                                 let mut channel_audio_data = Vec::with_capacity(planes);
                                 let mut channel_vus = Vec::with_capacity(planes);
@@ -606,32 +599,39 @@ pub fn start_bitstream_thread(
                                         peak = peak.max(s.abs());
                                     }
                                     channel_vus.push(peak.clamp(0.0, 1.0));
-                                    if !skip_fft {
-                                        if acc.len() == window_size {
-                                            channel_audio_data.push(acc.clone());
-                                        } else {
-                                            let mut padded = vec![0.0f32; window_size];
-                                            let off = window_size.saturating_sub(acc.len());
-                                            padded[off..].copy_from_slice(acc);
-                                            channel_audio_data.push(padded);
-                                        }
+                                    if acc.len() == window_size {
+                                        channel_audio_data.push(acc.clone());
+                                    } else {
+                                        let mut padded = vec![0.0f32; window_size];
+                                        let off = window_size.saturating_sub(acc.len());
+                                        padded[off..].copy_from_slice(acc);
+                                        channel_audio_data.push(padded);
                                     }
                                 }
 
-                                let mono_audio_data = if skip_fft {
-                                    Vec::new()
-                                } else {
+                                let mono_audio_data = {
                                     let mut mono = vec![0.0f32; window_size];
-                                    for acc in accumulator.iter().take(planes) {
+                                    for (ch_idx, acc) in accumulator.iter().take(planes).enumerate()
+                                    {
+                                        let ch_weight = match ch_idx {
+                                            0 | 1 => {
+                                                if planes == 1 {
+                                                    1.0
+                                                } else {
+                                                    0.5
+                                                }
+                                            }
+                                            2 => std::f32::consts::FRAC_1_SQRT_2,
+                                            _ => 0.25,
+                                        };
                                         let off = window_size.saturating_sub(acc.len());
                                         for (i, &sample) in acc.iter().take(window_size).enumerate()
                                         {
-                                            mono[off + i] += sample;
+                                            mono[off + i] += sample * ch_weight;
                                         }
                                     }
-                                    let inv_planes = 1.0 / planes as f32;
                                     for s in &mut mono {
-                                        *s *= inv_planes;
+                                        *s = s.clamp(-1.0, 1.0);
                                     }
                                     mono
                                 };
@@ -1940,15 +1940,6 @@ mod wasapi_bitstream {
                                                         let slice_time = current_seconds
                                                             + (sample_offset as f64
                                                                 / rate_u32 as f64);
-                                                        let skip_fft = shared_state_worker
-                                                            .try_lock()
-                                                            .map(|s| {
-                                                                s.video_mode == 3
-                                                                    && (s.has_video_stream
-                                                                        || s.video_frame_rx
-                                                                            .is_some())
-                                                            })
-                                                            .unwrap_or(false);
 
                                                         let mut channel_audio_data =
                                                             Vec::with_capacity(target_ch);
@@ -1965,32 +1956,38 @@ mod wasapi_bitstream {
                                                                 peak = peak.max(s.abs());
                                                             }
                                                             channel_vus.push(peak.clamp(0.0, 1.0));
-                                                            if !skip_fft {
-                                                                channel_audio_data
-                                                                    .push(acc.clone());
-                                                            }
+                                                            channel_audio_data.push(acc.clone());
                                                         }
 
-                                                        let mono_audio_data = if skip_fft {
-                                                            Vec::new()
-                                                        } else {
+                                                        let mono_audio_data = {
                                                             let mut mono =
                                                                 vec![0.0f32; window_size];
-                                                            for acc in
-                                                                accumulator.iter().take(target_ch)
+                                                            for (ch_idx, acc) in accumulator
+                                                                .iter()
+                                                                .take(target_ch)
+                                                                .enumerate()
                                                             {
+                                                                let ch_weight = match ch_idx {
+                                                                    0 | 1 => {
+                                                                        if target_ch == 1 {
+                                                                            1.0
+                                                                        } else {
+                                                                            0.5
+                                                                        }
+                                                                    }
+                                                                    2 => std::f32::consts::FRAC_1_SQRT_2,
+                                                                    _ => 0.25,
+                                                                };
                                                                 for (i, &sample) in acc
                                                                     .iter()
                                                                     .take(window_size)
                                                                     .enumerate()
                                                                 {
-                                                                    mono[i] += sample;
+                                                                    mono[i] += sample * ch_weight;
                                                                 }
                                                             }
-                                                            let inv_ch =
-                                                                1.0 / target_ch.max(1) as f32;
                                                             for s in &mut mono {
-                                                                *s *= inv_ch;
+                                                                *s = s.clamp(-1.0, 1.0);
                                                             }
                                                             mono
                                                         };
@@ -2323,14 +2320,6 @@ mod wasapi_bitstream {
 
                                                 let slice_time = *current_seconds
                                                     + (sample_offset as f64 / rate_f64);
-                                                let skip_fft = shared_state_lpcm
-                                                    .try_lock()
-                                                    .map(|s| {
-                                                        s.video_mode == 3
-                                                            && (s.has_video_stream
-                                                                || s.video_frame_rx.is_some())
-                                                    })
-                                                    .unwrap_or(false);
 
                                                 let mut channel_audio_data =
                                                     Vec::with_capacity(target_channels);
@@ -2346,28 +2335,35 @@ mod wasapi_bitstream {
                                                         peak = peak.max(s.abs());
                                                     }
                                                     channel_vus.push(peak.clamp(0.0, 1.0));
-                                                    if !skip_fft {
-                                                        channel_audio_data.push(acc.clone());
-                                                    }
+                                                    channel_audio_data.push(acc.clone());
                                                 }
 
-                                                let mono_audio_data = if skip_fft {
-                                                    Vec::new()
-                                                } else {
+                                                let mono_audio_data = {
                                                     let mut mono = vec![0.0f32; window_size];
-                                                    for acc in
-                                                        accumulator.iter().take(target_channels)
+                                                    for (ch_idx, acc) in accumulator
+                                                        .iter()
+                                                        .take(target_channels)
+                                                        .enumerate()
                                                     {
+                                                        let ch_weight = match ch_idx {
+                                                            0 | 1 => {
+                                                                if target_channels == 1 {
+                                                                    1.0
+                                                                } else {
+                                                                    0.5
+                                                                }
+                                                            }
+                                                            2 => std::f32::consts::FRAC_1_SQRT_2,
+                                                            _ => 0.25,
+                                                        };
                                                         for (i, &sample) in
                                                             acc.iter().take(window_size).enumerate()
                                                         {
-                                                            mono[i] += sample;
+                                                            mono[i] += sample * ch_weight;
                                                         }
                                                     }
-                                                    let inv_ch =
-                                                        1.0 / target_channels.max(1) as f32;
                                                     for s in &mut mono {
-                                                        *s *= inv_ch;
+                                                        *s = s.clamp(-1.0, 1.0);
                                                     }
                                                     mono
                                                 };

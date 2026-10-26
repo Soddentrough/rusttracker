@@ -110,16 +110,25 @@ fn main() -> Result<(), Box<dyn Error>> {
             .location()
             .map(|l| format!("{}", l))
             .unwrap_or_else(|| "unknown".to_string());
-        let _ = std::fs::write(
-            "rusttracker_crash.log",
-            format!(
-                "RustTracker Panic at {}:\n{}\n\nBacktrace:\n{}",
-                location, msg, backtrace
-            ),
+        let crash_report = format!(
+            "RustTracker Panic at {}:\n{}\n\nBacktrace:\n{}",
+            location, msg, backtrace
         );
+        if std::fs::write("rusttracker_crash.log", &crash_report).is_err() {
+            let fallback_path = directories::ProjectDirs::from("com", "RustTracker", "RustTracker")
+                .map(|proj| {
+                    let dir = proj.data_local_dir();
+                    let _ = std::fs::create_dir_all(dir);
+                    dir.join("rusttracker_crash.log")
+                })
+                .unwrap_or_else(|| std::env::temp_dir().join("rusttracker_crash.log"));
+            let _ = std::fs::write(fallback_path, &crash_report);
+        }
     }));
 
-    let mut args = Args::parse();
+    let filtered_args =
+        std::env::args_os().filter(|arg| !arg.to_str().is_some_and(|s| s.starts_with("-psn_")));
+    let mut args = Args::parse_from(filtered_args);
     if args.uncapped {
         crate::state::UNCAPPED_PRESENT_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
@@ -163,6 +172,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (ipc_tx, ipc_rx) = crossbeam_channel::unbounded::<Vec<String>>();
     if !args.tui {
         crate::ipc::start_ipc_server(ipc_tx.clone());
+        #[cfg(target_os = "macos")]
+        let _ = MACOS_OPEN_FILES_TX.set(ipc_tx.clone());
     }
 
     let title = if args.mic {
@@ -299,6 +310,74 @@ struct DesktopRuntime {
     egui_state: egui_winit::State,
     engine: VulkanEngine,
     window: Arc<winit::window::Window>,
+}
+
+#[cfg(target_os = "macos")]
+static MACOS_OPEN_FILES_TX: std::sync::OnceLock<crossbeam_channel::Sender<Vec<String>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(target_os = "macos")]
+unsafe extern "C-unwind" fn macos_application_open_files(
+    _this: *mut objc2::runtime::AnyObject,
+    _cmd: objc2::runtime::Sel,
+    sender: *mut objc2::runtime::AnyObject,
+    filenames: *mut objc2::runtime::AnyObject,
+) {
+    use objc2::msg_send;
+    unsafe {
+        if !filenames.is_null() {
+            let count: usize = msg_send![filenames, count];
+            let mut paths = Vec::with_capacity(count);
+            for i in 0..count {
+                let ns_str: *mut objc2::runtime::AnyObject = msg_send![filenames, objectAtIndex: i];
+                if !ns_str.is_null() {
+                    let utf8: *const std::ffi::c_char = msg_send![ns_str, UTF8String];
+                    if !utf8.is_null() {
+                        let path = std::ffi::CStr::from_ptr(utf8)
+                            .to_string_lossy()
+                            .into_owned();
+                        if !path.is_empty() {
+                            paths.push(path);
+                        }
+                    }
+                }
+            }
+            if !paths.is_empty()
+                && let Some(tx) = MACOS_OPEN_FILES_TX.get()
+            {
+                let _ = tx.send(paths);
+            }
+        }
+        if !sender.is_null() {
+            // NSApplicationDelegateReplySuccess = 0
+            let _: () = msg_send![sender, replyToOpenOrPrint: 0usize];
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn register_macos_open_files_handler() {
+    use objc2::runtime::{AnyClass, Imp};
+    use objc2::sel;
+    if let Some(cls) = AnyClass::get(c"WinitApplicationDelegate") {
+        unsafe {
+            let imp: Imp = std::mem::transmute(
+                macos_application_open_files
+                    as unsafe extern "C-unwind" fn(
+                        *mut objc2::runtime::AnyObject,
+                        objc2::runtime::Sel,
+                        *mut objc2::runtime::AnyObject,
+                        *mut objc2::runtime::AnyObject,
+                    ),
+            );
+            let _ = objc2::ffi::class_addMethod(
+                cls as *const AnyClass as *mut AnyClass,
+                sel!(application:openFiles:),
+                imp,
+                c"v@:@@".as_ptr(),
+            );
+        }
+    }
 }
 
 struct DesktopApp<InitFn, EventFn> {
@@ -564,6 +643,9 @@ async fn run_gui(
         }
     };
 
+    #[cfg(target_os = "macos")]
+    register_macos_open_files_handler();
+
     let (icon_rgba, icon_width, icon_height) = {
         let image = image::load_from_memory(include_bytes!("../icon.png"))
             .expect("Failed to load icon")
@@ -748,44 +830,7 @@ async fn run_gui(
         .initial_directory(initial_dir.clone())
         .add_file_filter_extensions(
             "Audio/Video Files",
-            vec![
-                "flac",
-                "wav",
-                "mp3",
-                "ogg",
-                "aac",
-                "m4a",
-                "mp4",
-                "m4v",
-                "mov",
-                "mkv",
-                "avi",
-                "webm",
-                "ts",
-                "m2ts",
-                "mts",
-                "flv",
-                "wmv",
-                "mpg",
-                "mpeg",
-                "ogv",
-                "3gp",
-                "opus",
-                "mod",
-                "s3m",
-                "xm",
-                "it",
-                "stm",
-                "669",
-                "mtm",
-                "med",
-                "okt",
-                "psm",
-                "dawproject",
-                "aaf",
-                "mid",
-                "midi",
-            ],
+            crate::playlist::FILE_DIALOG_EXTENSIONS.to_vec(),
         )
         .show_all_files_filter(true)
         .default_file_filter("Audio/Video Files");
@@ -1153,44 +1198,7 @@ async fn run_gui(
                                                         .set_directory(&dir)
                                                         .add_filter(
                                                             "Audio/Video Files",
-                                                            &[
-                                                                "flac",
-                                                                "wav",
-                                                                "mp3",
-                                                                "ogg",
-                                                                "aac",
-                                                                "m4a",
-                                                                "mp4",
-                                                                "m4v",
-                                                                "mov",
-                                                                "mkv",
-                                                                "avi",
-                                                                "webm",
-                                                                "ts",
-                                                                "m2ts",
-                                                                "mts",
-                                                                "flv",
-                                                                "wmv",
-                                                                "mpg",
-                                                                "mpeg",
-                                                                "ogv",
-                                                                "3gp",
-                                                                "opus",
-                                                                "mod",
-                                                                "s3m",
-                                                                "xm",
-                                                                "it",
-                                                                "stm",
-                                                                "669",
-                                                                "mtm",
-                                                                "med",
-                                                                "okt",
-                                                                "psm",
-                                                                "dawproject",
-                                                                "aaf",
-                                                                "mid",
-                                                                "midi",
-                                                            ],
+                                                            crate::playlist::FILE_DIALOG_EXTENSIONS,
                                                         )
                                                         .add_filter("All Files", &["*"])
                                                         .pick_files();
@@ -1762,84 +1770,67 @@ async fn run_gui(
                                     }
                                 }
 
-                                let fullscreen_video_no_vis = state.video_mode == 3
-                                    && (state.has_video_stream || state.video_frame_rx.is_some());
-
-                                if !fullscreen_video_no_vis {
-                                    if state.channel_vus.len() != state.raw_channel_vus.len() {
-                                        state.channel_vus = vec![0.0; state.raw_channel_vus.len()];
-                                    }
-                                    for i in 0..state.raw_channel_vus.len() {
-                                        if state.raw_channel_vus[i] > state.channel_vus[i] {
-                                            state.channel_vus[i] = state.raw_channel_vus[i];
-                                        } else {
-                                            state.channel_vus[i] = (state.channel_vus[i]
-                                                - (0.015 * time_scale))
-                                                .max(state.raw_channel_vus[i]);
-                                        }
-                                    }
-
-                                    if state.peak_vus.len() != state.channel_vus.len() {
-                                        state.peak_vus = vec![0.0; state.channel_vus.len()];
-                                    }
-                                    for i in 0..state.channel_vus.len() {
-                                        state.peak_vus[i] =
-                                            (state.peak_vus[i] - (0.005 * time_scale)).max(0.0);
-                                        if state.channel_vus[i] > state.peak_vus[i] {
-                                            state.peak_vus[i] = state.channel_vus[i];
-                                        }
-                                    }
-
-                                    if state.spectrum_data.len() != state.raw_spectrum_data.len() {
-                                        state.spectrum_data =
-                                            vec![0.0; state.raw_spectrum_data.len()];
-                                    }
-                                    for i in 0..state.raw_spectrum_data.len() {
-                                        if state.raw_spectrum_data[i] > state.spectrum_data[i] {
-                                            state.spectrum_data[i] = state.raw_spectrum_data[i];
-                                        } else {
-                                            state.spectrum_data[i] = (state.spectrum_data[i]
-                                                - (1.5 * time_scale))
-                                                .max(state.raw_spectrum_data[i]);
-                                        }
-
-                                        // Smoothly decay fire heat using display refresh rate
-                                        if state.raw_spectrum_data[i] > state.fire_heat[i] {
-                                            state.fire_heat[i] = state.raw_spectrum_data[i];
-                                        } else {
-                                            state.fire_heat[i] =
-                                                (state.fire_heat[i] - (1.5 * time_scale)).max(0.0);
-                                        }
-                                    }
-
-                                    if state.spectrum_peaks.len() != state.spectrum_data.len() {
-                                        state.spectrum_peaks = vec![0.0; state.spectrum_data.len()];
-                                    }
-                                    for i in 0..state.spectrum_data.len() {
-                                        state.spectrum_peaks[i] =
-                                            (state.spectrum_peaks[i] - (0.5 * time_scale)).max(0.0);
-                                        if state.spectrum_data[i] > state.spectrum_peaks[i] {
-                                            state.spectrum_peaks[i] = state.spectrum_data[i];
-                                        }
-                                    }
-                                    // Scroll spectrum history
-                                    if state.spectrum_history.len() > 120 {
-                                        state.spectrum_history.pop_front();
-                                    }
-                                    let cloned_data = state.spectrum_data.clone();
-                                    state.spectrum_history.push_back(cloned_data);
-
-                                    // Temporal smoothing for waveform history to prevent jerky oscilloscope motion.
-                                    // Lerp the display waveform toward the raw DSP data each frame,
-                                    // decoupling visual smoothness from the DSP callback rate.
-                                    let raw_wave = state.raw_waveform.clone();
-                                    if let Some(newest) = state.waveform_history.back_mut() {
-                                        let lerp_speed = (12.0 * dt).min(1.0); // fast attack, smooth motion
-                                        for i in 0..newest.len().min(1024) {
-                                            newest[i] += (raw_wave[i] - newest[i]) * lerp_speed;
-                                        }
+                                if state.channel_vus.len() != state.raw_channel_vus.len() {
+                                    state.channel_vus = vec![0.0; state.raw_channel_vus.len()];
+                                }
+                                for i in 0..state.raw_channel_vus.len() {
+                                    if state.raw_channel_vus[i] > state.channel_vus[i] {
+                                        state.channel_vus[i] = state.raw_channel_vus[i];
+                                    } else {
+                                        state.channel_vus[i] = (state.channel_vus[i]
+                                            - (0.015 * time_scale))
+                                            .max(state.raw_channel_vus[i]);
                                     }
                                 }
+
+                                if state.peak_vus.len() != state.channel_vus.len() {
+                                    state.peak_vus = vec![0.0; state.channel_vus.len()];
+                                }
+                                for i in 0..state.channel_vus.len() {
+                                    state.peak_vus[i] =
+                                        (state.peak_vus[i] - (0.005 * time_scale)).max(0.0);
+                                    if state.channel_vus[i] > state.peak_vus[i] {
+                                        state.peak_vus[i] = state.channel_vus[i];
+                                    }
+                                }
+
+                                if state.spectrum_data.len() != state.raw_spectrum_data.len() {
+                                    state.spectrum_data = vec![0.0; state.raw_spectrum_data.len()];
+                                }
+                                for i in 0..state.raw_spectrum_data.len() {
+                                    if state.raw_spectrum_data[i] > state.spectrum_data[i] {
+                                        state.spectrum_data[i] = state.raw_spectrum_data[i];
+                                    } else {
+                                        state.spectrum_data[i] = (state.spectrum_data[i]
+                                            - (1.5 * time_scale))
+                                            .max(state.raw_spectrum_data[i]);
+                                    }
+
+                                    // Smoothly decay fire heat using display refresh rate
+                                    if state.raw_spectrum_data[i] > state.fire_heat[i] {
+                                        state.fire_heat[i] = state.raw_spectrum_data[i];
+                                    } else {
+                                        state.fire_heat[i] =
+                                            (state.fire_heat[i] - (1.5 * time_scale)).max(0.0);
+                                    }
+                                }
+
+                                if state.spectrum_peaks.len() != state.spectrum_data.len() {
+                                    state.spectrum_peaks = vec![0.0; state.spectrum_data.len()];
+                                }
+                                for i in 0..state.spectrum_data.len() {
+                                    state.spectrum_peaks[i] =
+                                        (state.spectrum_peaks[i] - (0.5 * time_scale)).max(0.0);
+                                    if state.spectrum_data[i] > state.spectrum_peaks[i] {
+                                        state.spectrum_peaks[i] = state.spectrum_data[i];
+                                    }
+                                }
+                                // Scroll spectrum history
+                                if state.spectrum_history.len() > 120 {
+                                    state.spectrum_history.pop_front();
+                                }
+                                let cloned_data = state.spectrum_data.clone();
+                                state.spectrum_history.push_back(cloned_data);
 
                                 // Gamepad analog panel scaling and scrubbing
                                 for (_id, gamepad) in gilrs.gamepads() {
@@ -2130,33 +2121,7 @@ async fn run_gui(
                                                     .set_directory(&dir)
                                                     .add_filter(
                                                         "Audio/Video Files",
-                                                        &[
-                                                            "flac",
-                                                            "wav",
-                                                            "mp3",
-                                                            "ogg",
-                                                            "aac",
-                                                            "m4a",
-                                                            "mp4",
-                                                            "mkv",
-                                                            "avi",
-                                                            "webm",
-                                                            "opus",
-                                                            "mod",
-                                                            "s3m",
-                                                            "xm",
-                                                            "it",
-                                                            "stm",
-                                                            "669",
-                                                            "mtm",
-                                                            "med",
-                                                            "okt",
-                                                            "psm",
-                                                            "dawproject",
-                                                            "aaf",
-                                                            "mid",
-                                                            "midi",
-                                                        ],
+                                                        crate::playlist::FILE_DIALOG_EXTENSIONS,
                                                     )
                                                     .add_filter("All Files", &["*"])
                                                     .pick_files();
@@ -2437,33 +2402,7 @@ async fn run_gui(
                                         .initial_directory(initial_dir.clone())
                                         .add_file_filter_extensions(
                                             "Audio/Video Files",
-                                            vec![
-                                                "flac",
-                                                "wav",
-                                                "mp3",
-                                                "ogg",
-                                                "aac",
-                                                "m4a",
-                                                "mp4",
-                                                "mkv",
-                                                "avi",
-                                                "webm",
-                                                "opus",
-                                                "mod",
-                                                "s3m",
-                                                "xm",
-                                                "it",
-                                                "stm",
-                                                "669",
-                                                "mtm",
-                                                "med",
-                                                "okt",
-                                                "psm",
-                                                "dawproject",
-                                                "aaf",
-                                                "mid",
-                                                "midi",
-                                            ],
+                                            crate::playlist::FILE_DIALOG_EXTENSIONS.to_vec(),
                                         )
                                         .show_all_files_filter(true)
                                         .default_file_filter("Audio/Video Files");
@@ -2622,6 +2561,52 @@ async fn run_gui(
                                 state.file_loaded = true;
                             }
                             state.is_file_picker_open = false;
+                            window.request_redraw();
+                        }
+                    }
+
+                    // Poll IPC / macOS Finder openFiles results immediately
+                    if let Ok(raw_paths) = ipc_rx.try_recv() {
+                        if !raw_paths.is_empty() {
+                            let expanded = crate::playlist::expand_input_paths(&raw_paths);
+                            if !expanded.is_empty() {
+                                let mut state = app_state.lock().unwrap();
+                                if !state.file_loaded || state.playlist.is_empty() {
+                                    state.playlist = expanded.clone();
+                                    state.playlist_index = 0;
+                                    state.load_request = Some(state.playlist[0].clone());
+                                    state.file_loaded = true;
+                                } else {
+                                    let first_new_idx = state.playlist.len();
+                                    state.playlist.extend(expanded.clone());
+                                    state.playlist_index = first_new_idx;
+                                    state.load_request =
+                                        Some(state.playlist[first_new_idx].clone());
+                                    state.is_paused = false;
+                                    let file_name = std::path::Path::new(&expanded[0])
+                                        .file_name()
+                                        .unwrap_or_default()
+                                        .to_string_lossy()
+                                        .into_owned();
+                                    if expanded.len() == 1 {
+                                        state.osd_text =
+                                            Some(format!("Now Playing: {}", file_name));
+                                    } else {
+                                        state.osd_text = Some(format!(
+                                            "Added {} tracks (Playing {})",
+                                            expanded.len(),
+                                            file_name
+                                        ));
+                                    }
+                                    state.osd_timer = 3.0;
+                                }
+                                window.set_minimized(false);
+                                window.focus_window();
+                                window.request_redraw();
+                            }
+                        } else {
+                            window.set_minimized(false);
+                            window.focus_window();
                             window.request_redraw();
                         }
                     }

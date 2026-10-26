@@ -40,24 +40,39 @@ fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
 
     // Integer history index locked to its buffer row while scrolling smoothly in Z via step_fraction
     let hist_idx = u32(round(clamp(v_coord * max_hist_f, 0.0, max_hist_f)));
-    let sample_idx = u32(round(u_coord * f32(res - 1u)));
-
-    let wave_val = waveform_history[hist_idx * 2048u + sample_idx];
+    let row_offset = hist_idx * 2048u;
+    let max_sample = i32(min(res, 2048u)) - 1i;
+    let center_idx = clamp(i32(round(u_coord * f32(res - 1u))), 0i, max_sample);
+    let half_span = clamp(i32(res / 512u), 1i, 3i);
+    let center_val = waveform_history[row_offset + u32(center_idx)];
+    var peak_val = center_val;
+    for (var k = -half_span; k <= half_span; k = k + 1i) {
+        let s_idx = u32(clamp(center_idx + k, 0i, max_sample));
+        let s_val = waveform_history[row_offset + s_idx];
+        if abs(s_val) > abs(peak_val) {
+            peak_val = s_val;
+        }
+    }
+    let wave_val = mix(center_val, peak_val, 0.65);
 
     // Sub-row fractional Z glide eliminates stepped waterfall jumps between history pushes
     let v_scrolled = clamp(v_coord - audio.step_fraction / max_hist_f, 0.0, 1.0);
 
-    // Smoothly taper spike height to 0 at the leading/outer edges (squared so height drops
-    // faster than brightness, preventing dimmed front rows from ever standing up in front of bright rows)
-    let front_taper = smoothstep_r(0.99, 0.78, v_coord);
-    let back_taper = smoothstep(0.0, 0.14, v_scrolled);
-    let side_taper = smoothstep_r(0.5, 0.42, abs(u_coord - 0.5));
-    let edge_env = front_taper * back_taper * side_taper;
-    let height_taper = edge_env * edge_env;
+    // Taper spike height only at the very outer perimeter so the entire foreground
+    // focal zone (v_coord in 0.75..0.96) displays full, undamped 3D wave amplitude
+    let front_taper = smoothstep_r(0.998, 0.960, v_coord);
+    let back_taper = smoothstep(0.0, 0.08, v_scrolled);
+    let side_taper = smoothstep_r(0.5, 0.46, abs(u_coord - 0.5));
+    let height_taper = front_taper * back_taper * side_taper;
+
+    // Perceptual soft-knee gain so moderate musical/dialogue waves produce prominent 3D ridges
+    // while full-scale 0 dBFS peaks saturate cleanly inside the CRT frame
+    let abs_w = abs(wave_val);
+    let boosted_w = sign(wave_val) * (abs_w * 1.65 / (1.0 + abs_w * 0.65));
 
     // Scale coordinates into 3D world coordinates
     let x = (u_coord - 0.5) * 19.2;
-    let y = wave_val * 1.25 * height_taper;
+    let y = boosted_w * 2.25 * height_taper;
     let z = mix(9.48, -2.6, v_scrolled);
 
     let p3 = vec3<f32>(x, y, z);
@@ -103,7 +118,7 @@ fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
     out.ndc_pos = vec3<f32>(distorted_ndc, clip_pos.z / max(clip_pos.w, 0.0001));
     out.uv = vec2<f32>(u_coord, v_scrolled);
     out.local_z = v_coord;
-    out.hit_val = wave_val * height_taper;
+    out.hit_val = boosted_w * height_taper;
     out.cam_dist = length(p3 - ro);
 
     return out;
@@ -132,13 +147,14 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
 
     // Match depth wireframe lines to the actual history row count so horizontal lines sit on vertex ridges
     let hist_lines = f32(max(audio.waveform_history_size, 72u) - 1u);
-    let grid_res = vec2<f32>(128.0, hist_lines * 0.5);
+    let grid_res = vec2<f32>(128.0, hist_lines);
 
-    // Lock wireframe grid lines to vertex UVs (in.tex_coords equivalent viascrolled Z)
-    let uv_g = in.uv;
+    // Lock horizontal wireframe lines to physical vertex rows (in.local_z = v_coord) so lines sit
+    // directly on the 3D wave ridges and glide smoothly backward in Z with the mesh
+    let uv_g = vec2<f32>(in.uv.x, in.local_z);
 
-    let wave_height = clamp(abs(in.hit_val) * 2.0, 0.0, 1.0);
-    let bloom_boost = 1.0 + wave_height * 0.95;
+    let wave_height = clamp(abs(in.hit_val) * 1.85, 0.0, 1.0);
+    let bloom_boost = 1.0 + wave_height * 1.15;
 
     let fwidth_uv = max(fwidth(uv_g * grid_res), vec2<f32>(0.0005, 0.0005));
 
@@ -153,20 +169,25 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     // Use physical mesh coordinate in.local_z (v_coord in 0..1) so the leading edge always hits exact 0.0 at v = 1.0
     let v_mesh = max(in.uv.y, in.local_z);
     let age_fade = mix(0.08, 1.0, in.uv.y);
-    let edge_fade = smoothstep_r(0.5, 0.42, abs(in.uv.x - 0.5));
-    let depth_fade = smoothstep(0.0, 0.18, in.uv.y);
-    let front_fade = smoothstep_r(0.995, 0.78, v_mesh);
+    let edge_fade = smoothstep_r(0.5, 0.46, abs(in.uv.x - 0.5));
+    let depth_fade = smoothstep(0.0, 0.12, in.uv.y);
+    let front_fade = smoothstep_r(0.998, 0.955, v_mesh);
     let boundary_fade = edge_fade * depth_fade * front_fade;
     let fade_sq = boundary_fade * boundary_fade;
 
     // Warm amber-to-incandescent cream phosphor palette (fades through warm copper at boundaries, never gray)
     let amber_ember = vec3<f32>(0.38, 0.07, 0.004);
     let amber_lo = mix(amber_ember, vec3<f32>(0.58, 0.17, 0.02), boundary_fade);
-    let amber_hi = vec3<f32>(1.05, 0.58, 0.10);
-    let amber_peak = vec3<f32>(1.35, 0.92, 0.38);
-    let line_amber = mix(mix(amber_lo, amber_hi, wave_height), amber_peak, wave_height * wave_height * 0.65);
+    let amber_hi = vec3<f32>(1.08, 0.62, 0.12);
+    let amber_peak = vec3<f32>(1.45, 0.98, 0.42);
+    let front_glow = smoothstep(0.76, 0.95, in.uv.y) * front_fade;
+    let line_amber = mix(
+        mix(amber_lo, amber_hi, wave_height),
+        amber_peak,
+        wave_height * wave_height * 0.72 + front_glow * 0.22
+    );
 
-    var color = line_amber * wire * age_fade * fade_sq * 1.65;
+    var color = line_amber * wire * age_fade * boundary_fade * 1.75;
 
     // Ambient CRT screen glow
     let ambient_glow = vec3<f32>(0.02, 0.01, 0.003) * bezel * fade_sq;

@@ -513,15 +513,6 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                     let cloned_spectrum = state.spectrum_data.clone();
                     state.spectrum_history.push_back(cloned_spectrum);
 
-                    // Waveform temporal smoothing
-                    let raw_wave = state.raw_waveform.clone();
-                    if let Some(newest) = state.waveform_history.back_mut() {
-                        let lerp_speed = (12.0 * dt).min(1.0);
-                        for i in 0..newest.len().min(1024) {
-                            newest[i] += (raw_wave[i] - newest[i]) * lerp_speed;
-                        }
-                    }
-
                     // OSD timer
                     if state.osd_timer > 0.0 {
                         state.osd_timer = (state.osd_timer - dt).max(0.0);

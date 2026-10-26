@@ -20,8 +20,9 @@ jobs:
       - name: Install dependencies
         run: brew install ffmpeg@7 libopenmpt dylibbundler create-dmg && brew link --overwrite --force ffmpeg@7
         
-      - name: Build executable
+      - name: Build and verify executable
         env:
+          MACOSX_DEPLOYMENT_TARGET: "11.0"
           LIBRARY_PATH: /opt/homebrew/opt/ffmpeg@7/lib:/opt/homebrew/lib
           CPATH: /opt/homebrew/opt/ffmpeg@7/include:/opt/homebrew/include
           PKG_CONFIG_PATH: /opt/homebrew/opt/ffmpeg@7/lib/pkgconfig:/opt/homebrew/lib/pkgconfig:/opt/homebrew/share/pkgconfig
@@ -29,7 +30,11 @@ jobs:
           CARGO_PROFILE_RELEASE_LTO: "true"
           CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
           CARGO_PROFILE_RELEASE_STRIP: "true"
-        run: cargo build --release
+          CARGO_PROFILE_RELEASE_DEBUG: "0"
+        run: |
+          cargo run --bin validate_wgsl
+          cargo test --lib
+          cargo build --release --bin rusttracker
 
       - name: Import Apple Certificate
         env:
@@ -96,7 +101,7 @@ jobs:
               <key>CFBundlePackageType</key>
               <string>APPL</string>
               <key>LSMinimumSystemVersion</key>
-              <string>10.15</string>
+              <string>11.0</string>
               <key>NSHighResolutionCapable</key>
               <true/>
               <key>NSSupportsAutomaticGraphicsSwitching</key>
@@ -149,11 +154,19 @@ jobs:
                           <string>opus</string>
                           <string>aac</string>
                           <string>m4a</string>
+                          <string>mka</string>
                           <string>mid</string>
                           <string>midi</string>
                           <string>aif</string>
                           <string>aiff</string>
                           <string>wma</string>
+                          <string>ac3</string>
+                          <string>eac3</string>
+                          <string>dts</string>
+                          <string>dtshd</string>
+                          <string>thd</string>
+                          <string>truehd</string>
+                          <string>mlp</string>
                       </array>
                   </dict>
                   <dict>
@@ -168,10 +181,20 @@ jobs:
                       <key>CFBundleTypeExtensions</key>
                       <array>
                           <string>mp4</string>
+                          <string>m4v</string>
                           <string>mkv</string>
                           <string>webm</string>
                           <string>avi</string>
                           <string>mov</string>
+                          <string>ts</string>
+                          <string>m2ts</string>
+                          <string>mts</string>
+                          <string>flv</string>
+                          <string>wmv</string>
+                          <string>mpg</string>
+                          <string>mpeg</string>
+                          <string>ogv</string>
+                          <string>3gp</string>
                       </array>
                   </dict>
                   <dict>
@@ -202,16 +225,26 @@ jobs:
           cp assets/soundfont.sf2 RustTracker.app/Contents/Resources/
           dylibbundler -od -b -x RustTracker.app/Contents/MacOS/rusttracker -d RustTracker.app/Contents/Frameworks/ -p @executable_path/../Frameworks/ -s /opt/homebrew/opt/ffmpeg@7/lib -s /opt/homebrew/lib
           
-          # Codesign the application
+          # Codesign the application (sign inner Frameworks first, then main executable and bundle with entitlements)
           if [ -n "${{ secrets.MACOS_CERTIFICATE }}" ]; then
             echo "Signing with Developer ID Certificate..."
             find RustTracker.app/Contents/Frameworks -type f \( -name "*.dylib" -or -name "*.so" \) -exec codesign --force --options runtime --sign "Developer ID Application" {} \;
             codesign --force --options runtime --entitlements entitlements.plist --sign "Developer ID Application" RustTracker.app/Contents/MacOS/rusttracker
             codesign --force --options runtime --entitlements entitlements.plist --sign "Developer ID Application" RustTracker.app
           else
-            echo "No Developer ID Certificate found. Performing ad-hoc signing..."
-            codesign --force --deep --sign - RustTracker.app
+            echo "No Developer ID Certificate found. Performing ad-hoc signing with entitlements..."
+            find RustTracker.app/Contents/Frameworks -type f \( -name "*.dylib" -or -name "*.so" \) -exec codesign --force --sign - {} \;
+            codesign --force --entitlements entitlements.plist --sign - RustTracker.app/Contents/MacOS/rusttracker
+            codesign --force --entitlements entitlements.plist --sign - RustTracker.app
           fi
+
+          # Verify dylib self-containment and code signature integrity
+          if otool -L RustTracker.app/Contents/MacOS/rusttracker RustTracker.app/Contents/Frameworks/*.dylib | grep -E '/opt/homebrew|/usr/local'; then
+            echo "ERROR: Unbundled Homebrew dylib paths detected in RustTracker.app!"
+            exit 1
+          fi
+          codesign --verify --deep --strict --verbose=2 RustTracker.app
+          codesign -d --entitlements - RustTracker.app/Contents/MacOS/rusttracker
           
       - name: Create DMG
         run: |
