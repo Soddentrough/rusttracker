@@ -749,7 +749,7 @@ impl SplashCache {
             let mut glyph_quads = Vec::with_capacity(16);
             for placed_row in &galley.rows {
                 let row_pos = snapped_pos + placed_row.pos.to_vec2();
-                for q in placed_row.row.visuals.mesh.vertices.chunks_exact(4) {
+                for q in placed_row.row.visuals.mesh.vertices.as_chunks::<4>().0 {
                     let x_min =
                         q[0].pos.x.min(q[1].pos.x).min(q[2].pos.x).min(q[3].pos.x) + row_pos.x;
                     let x_max =
@@ -897,7 +897,10 @@ impl SplashCache {
             let next_t = (i + 1) as f32 / steps as f32;
             let color_top = chrome_palette(t);
             let color_bot = chrome_palette((t + next_t) * 0.5);
-            for quad in self.title_base_mesh.vertices[v_start..v_end].chunks_exact_mut(4) {
+            for quad in self.title_base_mesh.vertices[v_start..v_end]
+                .as_chunks_mut::<4>()
+                .0
+            {
                 quad[0].color = color_top;
                 quad[1].color = color_top;
                 quad[2].color = color_bot;
