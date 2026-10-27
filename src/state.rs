@@ -136,6 +136,103 @@ pub enum PipelineType {
     Mesh3D { geometry: Geometry, instances: u32 },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum GpuCapabilityTier {
+    #[default]
+    High,
+    Constrained,
+}
+
+/// Evaluates GPU hardware capability and display pixel load in an OS-agnostic manner.
+///
+/// Rather than disabling visualizations based on the operating system (e.g. Android runs
+/// on everything from entry-level tablets to flagship Snapdragon 8 Elite / Immortalis phones
+/// that outperform many laptops), this inspects the Vulkan/Metal/DX12 adapter architecture
+/// and physical viewport resolution to determine whether heavy per-pixel raymarching / 3D FLIP
+/// hydrodynamic shaders should be enabled by default in rotation.
+pub fn classify_gpu_capability(
+    info: &wgpu::AdapterInfo,
+    viewport_pixels: u32,
+) -> GpuCapabilityTier {
+    match info.device_type {
+        wgpu::DeviceType::DiscreteGpu => GpuCapabilityTier::High,
+        wgpu::DeviceType::Cpu | wgpu::DeviceType::VirtualGpu => GpuCapabilityTier::Constrained,
+        wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::Other => {
+            let name = info.name.to_lowercase();
+
+            // Software / fallback renderers reporting as Integrated/Other
+            if name.contains("llvmpipe")
+                || name.contains("lavapipe")
+                || name.contains("swiftshader")
+                || name.contains(" microsoft basic render")
+            {
+                return GpuCapabilityTier::Constrained;
+            }
+
+            // Steam Deck custom Van Gogh APU (15W TDP shared budget)
+            if name.contains("custom gpu 0405")
+                || name.contains("custom gpu 0932")
+                || name.contains("vangogh")
+            {
+                return GpuCapabilityTier::Constrained;
+            }
+
+            // Standard ARM Mali-G / Mali-T series (non-Immortalis, e.g. Mali-G710 on Tensor G2)
+            if (name.contains("mali-g") || name.contains("mali-t")) && !name.contains("immortalis")
+            {
+                return GpuCapabilityTier::Constrained;
+            }
+
+            // Qualcomm Adreno: Adreno 8xx and Adreno 730/740/750+ are flagship High tier;
+            // older Adreno 4xx/5xx/6xx and mid-range Adreno 702/710/720/725 are Constrained.
+            if name.contains("adreno") {
+                if name.contains("adreno (tm) 8")
+                    || name.contains("adreno 8")
+                    || name.contains("adreno (tm) 73")
+                    || name.contains("adreno 73")
+                    || name.contains("adreno (tm) 74")
+                    || name.contains("adreno 74")
+                    || name.contains("adreno (tm) 75")
+                    || name.contains("adreno 75")
+                    || name.contains("adreno (tm) x")
+                    || name.contains("adreno x")
+                {
+                    return GpuCapabilityTier::High;
+                }
+                return GpuCapabilityTier::Constrained;
+            }
+
+            // Legacy Intel HD / UHD integrated graphics
+            if name.contains("hd graphics") || name.contains("uhd graphics") {
+                return GpuCapabilityTier::Constrained;
+            }
+
+            // Known high-tier integrated/SoC architectures (Apple Silicon, ARM Immortalis,
+            // Samsung Xclipse 9xx, AMD RDNA2/3/3.5 680M/780M/880M/890M/80xxS, Intel Arc/Iris Xe)
+            if name.contains("apple")
+                || name.contains("immortalis")
+                || name.contains("xclipse 9")
+                || name.contains("radeon 680m")
+                || name.contains("radeon 780m")
+                || name.contains("radeon 880m")
+                || name.contains("radeon 890m")
+                || name.contains("radeon 80")
+                || name.contains("intel(r) arc")
+                || name.contains("iris(r) xe")
+            {
+                return GpuCapabilityTier::High;
+            }
+
+            // Unknown integrated GPU driving a high-DPI (> 3.6 MP, e.g. 2560x1600 QHD+) panel
+            if viewport_pixels >= 3_600_000 {
+                return GpuCapabilityTier::Constrained;
+            }
+
+            GpuCapabilityTier::High
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct VisualizerDef {
     pub id: u32,
@@ -149,6 +246,10 @@ pub struct VisualizerDef {
     pub requires_ferrofluidsim: bool,
     pub requires_flip_ferrofluid: bool,
     pub requires_flip_water: bool,
+    /// True for compute/fillrate-heavy shaders (per-pixel raymarching, multi-octave FBM,
+    /// or 3D FLIP hydrodynamic compute + heightfield raymarching) that require a High-tier
+    /// GPU to sustain 60+ FPS at high resolutions.
+    pub heavy_shader: bool,
 }
 
 pub const VISUALIZERS: &[VisualizerDef] = &[
@@ -164,6 +265,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_ferrofluidsim: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: false,
+        heavy_shader: false,
     },
     VisualizerDef {
         id: 25,
@@ -177,6 +279,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_ferrofluidsim: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: false,
+        heavy_shader: false,
     },
     VisualizerDef {
         id: 24,
@@ -190,6 +293,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_ferrofluidsim: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: false,
+        heavy_shader: false,
     },
     VisualizerDef {
         id: 1,
@@ -203,6 +307,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_ferrofluidsim: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: false,
+        heavy_shader: true,
     },
     VisualizerDef {
         id: 3,
@@ -211,8 +316,8 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         description: "Rasterized 3D waterfall grid of waveform history",
         pipeline_type: PipelineType::Mesh3D {
             geometry: Geometry::Grid {
-                width: 256,
-                depth: 143,
+                width: 160,
+                depth: 95,
             },
             instances: 1,
         },
@@ -222,6 +327,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_ferrofluidsim: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: false,
+        heavy_shader: false,
     },
     VisualizerDef {
         id: 4,
@@ -241,6 +347,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_ferrofluidsim: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: false,
+        heavy_shader: false,
     },
     VisualizerDef {
         id: 5,
@@ -254,6 +361,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_ferrofluidsim: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: false,
+        heavy_shader: false,
     },
     VisualizerDef {
         id: 6,
@@ -267,6 +375,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_ferrofluidsim: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: false,
+        heavy_shader: true,
     },
     VisualizerDef {
         id: 7,
@@ -280,6 +389,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_ferrofluidsim: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: false,
+        heavy_shader: true,
     },
     VisualizerDef {
         id: 13,
@@ -288,8 +398,8 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         description: "Retro 80s wireframe landscape",
         pipeline_type: PipelineType::Mesh3D {
             geometry: Geometry::Grid {
-                width: 200,
-                depth: 200,
+                width: 120,
+                depth: 120,
             },
             instances: 1,
         },
@@ -299,6 +409,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_ferrofluidsim: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: false,
+        heavy_shader: true,
     },
     VisualizerDef {
         id: 14,
@@ -315,6 +426,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_ferrofluidsim: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: false,
+        heavy_shader: false,
     },
     VisualizerDef {
         id: 16,
@@ -328,6 +440,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_ferrofluidsim: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: false,
+        heavy_shader: true,
     },
     VisualizerDef {
         id: 19,
@@ -344,6 +457,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_ferrofluidsim: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: false,
+        heavy_shader: false,
     },
     VisualizerDef {
         id: 20,
@@ -352,7 +466,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         description: "GPU compute-driven bioluminescent particle waves",
         pipeline_type: PipelineType::Mesh3D {
             geometry: Geometry::UnitQuad,
-            instances: 65536,
+            instances: 36864,
         },
         requires_history: false,
         requires_fire: false,
@@ -360,6 +474,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_ferrofluidsim: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: false,
+        heavy_shader: false,
     },
     VisualizerDef {
         id: 22,
@@ -376,6 +491,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_ferrofluidsim: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: false,
+        heavy_shader: false,
     },
     VisualizerDef {
         id: 23,
@@ -392,6 +508,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_ferrofluidsim: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: true,
+        heavy_shader: true,
     },
     VisualizerDef {
         id: 27,
@@ -405,6 +522,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_ferrofluidsim: false,
         requires_flip_ferrofluid: true,
         requires_flip_water: false,
+        heavy_shader: true,
     },
     VisualizerDef {
         id: 28,
@@ -418,6 +536,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_ferrofluidsim: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: true,
+        heavy_shader: true,
     },
     VisualizerDef {
         id: 29,
@@ -434,6 +553,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_ferrofluidsim: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: false,
+        heavy_shader: false,
     },
 ];
 
@@ -531,11 +651,17 @@ pub struct AppState {
     pub panel_split_ratio: f32,
     pub gamepad_type: GamepadType,
     pub has_gamepad: bool,
-    // Visualizer Picker
+    // Visualizer Picker & Hardware Capability / Runtime Frame-Budget Watchdog
     pub show_vis_picker: bool,
     pub vis_picker_cursor: usize,
     pub vis_picker_scroll_to_cursor: bool,
     pub vis_enabled: Vec<bool>,
+    pub vis_user_overridden: Vec<bool>,
+    pub gpu_capability_tier: GpuCapabilityTier,
+    pub gpu_adapter_name: String,
+    pub vis_perf_watch_idx: usize,
+    pub vis_active_frames: u32,
+    pub vis_low_fps_frames: u32,
     pub osd_text: Option<String>,
     pub osd_timer: f32,
     pub cumulative_scrub: f64,
@@ -587,6 +713,7 @@ impl AppState {
             .unwrap_or(false);
 
         let mut vis_enabled = vec![true; VISUALIZERS.len()];
+        let vis_user_overridden = vec![false; VISUALIZERS.len()];
 
         // Solar Flare (ID 7): disabled on all systems due to computational cost and visual quality
         if let Some(idx) = VISUALIZERS.iter().position(|v| v.id == 7) {
@@ -603,42 +730,10 @@ impl AppState {
             vis_enabled[idx] = false;
         }
 
-        // Lissajous Laser is now working and fully optimized, so it remains enabled by default.
-
-        #[cfg(target_os = "android")]
-        {
-            // Disable heavy pixel-loop raymarched oscilloscopes and problematic/redundant shaders on mobile
-            let mobile_disabled_ids = [
-                1,  // CRT Oscilloscope (23.8ms on mobile)
-                2, // 3D CRT Oscilloscope (38.2ms on mobile -> replaced by 3D Oscilloscope Raster at 178 FPS)
-                9, // Chrome Ferrofluid (raymarched liquid metal is too heavy for mobile GPUs and drains battery)
-                10, // Ferrofluid Particle Sim
-                11, // Neon Corridor
-                12, // Lissajous Laser
-                17, // 3D Midnight Storm (redundant with Midnight Storm ID 16)
-            ];
-            for id in mobile_disabled_ids {
-                if let Some(idx) = VISUALIZERS.iter().position(|v| v.id == id) {
-                    vis_enabled[idx] = false;
-                }
-            }
-        }
-
-        if is_steam_deck {
-            // Disabled heavy shaders on Steam Deck to ensure smooth performance
-            let steam_deck_disabled_ids = [
-                1,  // CRT Oscilloscope
-                2,  // 3D CRT Oscilloscope
-                9,  // Chrome Ferrofluid
-                10, // Ferrofluid Particle Sim
-                11, // Neon Corridor
-            ];
-            for id in steam_deck_disabled_ids {
-                if let Some(idx) = VISUALIZERS.iter().position(|v| v.id == id) {
-                    vis_enabled[idx] = false;
-                }
-            }
-        }
+        // Note: Heavy shader visualizers are no longer disabled based on target_os or DMI vendor.
+        // Instead, `apply_gpu_capability_profile()` inspects the actual wgpu::AdapterInfo and
+        // viewport pixel count upon Vulkan/GPU initialization, paired with `update_visualizer_perf_guard()`
+        // at runtime.
 
         let mut url_history = Vec::new();
         if let Ok(data) = std::fs::read_to_string(get_history_file_path()) {
@@ -743,6 +838,12 @@ impl AppState {
             vis_picker_cursor: 0,
             vis_picker_scroll_to_cursor: false,
             vis_enabled,
+            vis_user_overridden,
+            gpu_capability_tier: GpuCapabilityTier::High,
+            gpu_adapter_name: String::new(),
+            vis_perf_watch_idx: 0,
+            vis_active_frames: 0,
+            vis_low_fps_frames: 0,
             osd_text: None,
             osd_timer: 0.0,
             cumulative_scrub: 0.0,
@@ -789,13 +890,21 @@ impl AppState {
             speed: self.speed,
             num_channels: self.num_channels,
             hardware_channels: self.hardware_channels,
-            raw_channel_vus: Vec::new(),           // Skipped in snapshot
-            channel_vus: self.channel_vus.clone(), // 8-16 elements, cheap
-            peak_vus: self.peak_vus.clone(),       // 8-16 elements, cheap
+            raw_channel_vus: Vec::new(), // Skipped in snapshot
+            channel_vus: if self.file_loaded {
+                self.channel_vus.clone()
+            } else {
+                Vec::new()
+            },
+            peak_vus: if self.file_loaded {
+                self.peak_vus.clone()
+            } else {
+                Vec::new()
+            },
             raw_spectrum_data: Vec::new(),
-            spectrum_data: self.spectrum_data.clone(),
-            spectrum_peaks: self.spectrum_peaks.clone(),
-            spectrum_history: VecDeque::new(), // Skipped in snapshot (only used for HUD background heatmap)
+            spectrum_data: Vec::new(), // Only used in engine.update() (under lock)
+            spectrum_peaks: Vec::new(), // Only used in TUI / engine.update()
+            spectrum_history: VecDeque::new(), // Skipped in snapshot
             waveform_history: VecDeque::new(), // Skipped in snapshot
             waveform_history_push_count: 0,
             raw_waveform: Vec::new(),
@@ -814,9 +923,21 @@ impl AppState {
             num_patterns: self.num_patterns,
             current_tracker_order: self.current_tracker_order,
             current_tracker_row: self.current_tracker_row,
-            tracker_row_history: self.tracker_row_history.clone(),
-            current_tracker_row_string: self.current_tracker_row_string.clone(),
-            tracker_patterns_by_order: self.tracker_patterns_by_order.clone(),
+            tracker_row_history: if self.file_loaded {
+                self.tracker_row_history.clone()
+            } else {
+                VecDeque::new()
+            },
+            current_tracker_row_string: if self.file_loaded {
+                self.current_tracker_row_string.clone()
+            } else {
+                String::new()
+            },
+            tracker_patterns_by_order: if self.file_loaded {
+                self.tracker_patterns_by_order.clone()
+            } else {
+                Vec::new()
+            },
             tracker_channels: self.tracker_channels,
             load_request: None,
             video_mode: self.video_mode,
@@ -847,6 +968,12 @@ impl AppState {
             force_stereo_downmix: self.force_stereo_downmix,
             append_to_playlist: self.append_to_playlist,
             vis_enabled: self.vis_enabled.clone(),
+            vis_user_overridden: self.vis_user_overridden.clone(),
+            gpu_capability_tier: self.gpu_capability_tier,
+            gpu_adapter_name: self.gpu_adapter_name.clone(),
+            vis_perf_watch_idx: self.vis_perf_watch_idx,
+            vis_active_frames: self.vis_active_frames,
+            vis_low_fps_frames: self.vis_low_fps_frames,
             gamepad_type: self.gamepad_type,
             has_gamepad: self.has_gamepad,
             panel_split_ratio: self.panel_split_ratio,
@@ -936,6 +1063,106 @@ impl AppState {
             self.file_loaded = true;
             self.is_paused = false;
             self.track_ended = false;
+        }
+    }
+
+    /// Applies the hardware-based GPU capability tier once the Vulkan/Metal/DX12 adapter
+    /// and viewport dimensions are known.
+    ///
+    /// On `GpuCapabilityTier::High` (discrete GPUs and flagship mobile/integrated GPUs such as
+    /// Snapdragon 8 Gen 2/3/Elite Adreno 740/750/8xx, Immortalis-G720/G925, Apple Silicon,
+    /// Radeon 680M/780M/890M, Intel Arc), all production visualizers remain enabled in rotation.
+    /// On `GpuCapabilityTier::Constrained` (fillrate/power-constrained GPUs such as Mali-G710
+    /// driving a 2560x1600 QHD+ panel, older integrated GPUs, or Steam Deck's 15W APU),
+    /// visualizers marked `heavy_shader: true` start unchecked in auto-rotation unless the
+    /// user explicitly selected or enabled them.
+    pub fn apply_gpu_capability_profile(
+        &mut self,
+        info: &wgpu::AdapterInfo,
+        width: u32,
+        height: u32,
+    ) {
+        let viewport_pixels = width.saturating_mul(height);
+        let tier = classify_gpu_capability(info, viewport_pixels);
+        self.gpu_capability_tier = tier;
+        self.gpu_adapter_name = info.name.clone();
+
+        if tier == GpuCapabilityTier::Constrained {
+            for (idx, v) in VISUALIZERS.iter().enumerate() {
+                if v.heavy_shader && !self.vis_user_overridden[idx] {
+                    self.vis_enabled[idx] = false;
+                }
+            }
+            if !self.vis_enabled[self.current_visualizer_idx]
+                && !self.vis_user_overridden[self.current_visualizer_idx]
+                && let Some(first_enabled) = self.vis_enabled.iter().position(|&e| e)
+            {
+                self.current_visualizer_idx = first_enabled;
+                self.visualizer_mode = VISUALIZERS[first_enabled].id;
+            }
+        }
+    }
+
+    /// Runtime frame-budget watchdog: monitors frame times while a heavy shader visualizer is
+    /// actively rendering. If a non-user-overridden `heavy_shader` visualizer cannot sustain
+    /// at least 85% of the target display refresh rate (e.g., < 51 FPS on a 60Hz panel) over a
+    /// sustained window after warm-up, it is automatically unchecked from auto-rotation and
+    /// advances to the next enabled visualizer.
+    pub fn update_visualizer_perf_guard(&mut self, dt: f32, target_refresh_hz: f32) {
+        let idx = self.current_visualizer_idx.min(VISUALIZERS.len() - 1);
+        if self.vis_perf_watch_idx != idx {
+            self.vis_perf_watch_idx = idx;
+            self.vis_active_frames = 0;
+            self.vis_low_fps_frames = 0;
+        }
+
+        // Only evaluate during active visualizer playback (not on Welcome screen, paused, or fullscreen video)
+        if !self.file_loaded || self.is_paused || self.track_ended || self.video_mode == 3 {
+            return;
+        }
+
+        // Respect explicit user selection or manual enable in the Visualizer Picker
+        if self.vis_user_overridden[idx] || !VISUALIZERS[idx].heavy_shader {
+            return;
+        }
+
+        self.vis_active_frames = self.vis_active_frames.saturating_add(1);
+        // Allow 45 frames (~0.75s) for pipeline/shader warm-up after switching visualizers
+        if self.vis_active_frames <= 45 {
+            return;
+        }
+
+        let effective_hz = target_refresh_hz.clamp(30.0, 240.0);
+        // 85% of target refresh rate (e.g. > 19.6ms frame time on a 60Hz display = < 51 FPS)
+        let budget_dt = 1.0 / (effective_hz * 0.85);
+        if dt > budget_dt && dt < 0.5 {
+            self.vis_low_fps_frames = self.vis_low_fps_frames.saturating_add(1);
+        } else {
+            self.vis_low_fps_frames = self.vis_low_fps_frames.saturating_sub(1);
+        }
+
+        if self.vis_low_fps_frames >= 90 {
+            let dropped_name = VISUALIZERS[idx].name;
+            self.vis_enabled[idx] = false;
+            self.vis_low_fps_frames = 0;
+            self.vis_active_frames = 0;
+
+            let len = VISUALIZERS.len();
+            for offset in 1..=len {
+                let next = (idx + offset) % len;
+                if self.vis_enabled[next] {
+                    self.current_visualizer_idx = next;
+                    self.visualizer_mode = VISUALIZERS[next].id;
+                    self.osd_text = Some(format!(
+                        "Auto-disabled {} (< {:.0} FPS) -> {}",
+                        dropped_name,
+                        effective_hz * 0.85,
+                        VISUALIZERS[next].name
+                    ));
+                    self.osd_timer = 3.0;
+                    break;
+                }
+            }
         }
     }
 }

@@ -136,14 +136,14 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
 
     let v = normalize(vec3<f32>(0.0, 2.0, -4.6) - in.world_pos);
     let n = normalize(in.normal);
-    let sun_dir = normalize(vec3<f32>(0.0, 0.25, 0.96)); // Low horizon synthwave sun
-    let curve_x = road_curve_offset(in.world_pos.z, audio.smooth_time);
-    let road_x = in.world_pos.x - curve_x;
-    let dx = abs(road_x);
+    let sun_dir = vec3<f32>(0.0, 0.25198, 0.96773); // Low horizon synthwave sun
 
     var color = vec3<f32>(0.0);
 
     if (mat_id < 0.2) {
+        let curve_x = road_curve_offset(in.world_pos.z, audio.smooth_time);
+        let road_x = in.world_pos.x - curve_x;
+        let dx = abs(road_x);
         // =========================================================================
         // 0.0: WET SPECULAR ASPHALT HIGHWAY (Forward Motion + Dynamic Lights)
         // =========================================================================
@@ -357,10 +357,12 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     }
 
     // Distance Atmospheric Vaporwave Fog (Blending cleanly into warm golden-crimson sunset horizon)
-    let fog_f = smoothstep(90.0, 380.0, in.world_pos.z);
-    let sun_align = exp(-abs(in.world_pos.x) * 0.016);
-    let fog_c = mix(vec3<f32>(0.26, 0.03, 0.32), vec3<f32>(0.72, 0.18, 0.28), sun_align * 0.65);
-    color = mix(color, fog_c, fog_f);
+    if (in.world_pos.z > 90.0) {
+        let fog_f = smoothstep(90.0, 380.0, in.world_pos.z);
+        let sun_align = exp(-abs(in.world_pos.x) * 0.016);
+        let fog_c = mix(vec3<f32>(0.26, 0.03, 0.32), vec3<f32>(0.72, 0.18, 0.28), sun_align * 0.65);
+        color = mix(color, fog_c, fog_f);
+    }
 
     let tonemapped = aces_tonemap(color);
     return vec4<f32>(tonemapped, 1.0);

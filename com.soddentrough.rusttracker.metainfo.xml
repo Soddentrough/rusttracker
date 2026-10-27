@@ -65,6 +65,11 @@
   <content_rating type="oars-1.1" />
   
   <releases>
+    <release version="0.9.31" date="2026-10-27">
+      <description>
+        <p>Hardware GPU capability tier classification, runtime frame-budget watchdog, hardware VSync pacing and status indicator, and 3D FLIP hydrodynamic Ferrofluid and Acoustic Glass Water Chamber visualizers.</p>
+      </description>
+    </release>
     <release version="0.9.24" date="2026-09-11">
       <description>
         <p>Mobile viewport layout enhancements for Track Info quick mix presets, 3D Vintage VU meter rack and 3D Glass Water lyrics responsive aspect framing, restored reactive lightning in Midnight Storm, 3D Oscilloscope phase stability, and automated Android release deployment.</p>

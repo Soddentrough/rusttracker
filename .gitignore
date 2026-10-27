@@ -9,6 +9,7 @@ dist/
 *.AppImage
 linux_rpm/
 linux_deb/
+linux_appimage/
 windows_release/
 AppDir/
 target_appimage/

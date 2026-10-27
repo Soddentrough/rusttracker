@@ -18,11 +18,17 @@ struct VertexInput {
 struct VertexOutput3D {
     @builtin(position) clip_position: vec4<f32>,
     @location(0) uv: vec2<f32>,
-    @location(1) world_pos: vec3<f32>,
-    @location(2) hit_val: f32,
-    @location(3) ndc_pos: vec3<f32>,
+    @location(1) line_amber_scaled: vec3<f32>,
+    @location(2) glass_and_ambient: vec3<f32>,
+    @location(3) coc_inv: vec4<f32>, // x: inv_coc_10, y: inv_coc_05, z: inv_coc_02, w: inv_coc_01 * bloom_boost
     @location(4) local_z: f32,
-    @location(5) cam_dist: f32,
+    @location(5) fade_params: vec3<f32>, // x: alpha, y: bezel * fade_sq, z: bloom_boost / inv_coc_01 ratio
+}
+
+fn hash21_fast_crt(p: vec2<f32>) -> f32 {
+    var p3 = fract(vec3<f32>(p.x, p.y, p.x) * 0.1031);
+    p3 += dot(p3, p3.yzx + vec3<f32>(33.33));
+    return fract((p3.x + p3.y) * p3.z);
 }
 
 @vertex
@@ -43,16 +49,11 @@ fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
     let row_offset = hist_idx * 2048u;
     let max_sample = i32(min(res, 2048u)) - 1i;
     let center_idx = clamp(i32(round(u_coord * f32(res - 1u))), 0i, max_sample);
-    let half_span = clamp(i32(res / 512u), 1i, 3i);
     let center_val = waveform_history[row_offset + u32(center_idx)];
-    var peak_val = center_val;
-    for (var k = -half_span; k <= half_span; k = k + 1i) {
-        let s_idx = u32(clamp(center_idx + k, 0i, max_sample));
-        let s_val = waveform_history[row_offset + s_idx];
-        if abs(s_val) > abs(peak_val) {
-            peak_val = s_val;
-        }
-    }
+    let prev_val = waveform_history[row_offset + u32(max(center_idx - 1i, 0i))];
+    let next_val = waveform_history[row_offset + u32(min(center_idx + 1i, max_sample))];
+    var peak_val = select(prev_val, center_val, abs(center_val) >= abs(prev_val));
+    peak_val = select(peak_val, next_val, abs(next_val) > abs(peak_val));
     let wave_val = mix(center_val, peak_val, 0.65);
 
     // Sub-row fractional Z glide eliminates stepped waterfall jumps between history pushes
@@ -113,38 +114,76 @@ fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
     let distorted_ndc = ndc * (1.0 + r2 * 0.035);
     let final_clip_pos = vec4<f32>(distorted_ndc * clip_pos.w, clip_pos.z, clip_pos.w);
 
-    out.world_pos = p3;
     out.clip_position = final_clip_pos;
-    out.ndc_pos = vec3<f32>(distorted_ndc, clip_pos.z / max(clip_pos.w, 0.0001));
     out.uv = vec2<f32>(u_coord, v_scrolled);
     out.local_z = v_coord;
-    out.hit_val = boosted_w * height_taper;
-    out.cam_dist = length(p3 - ro);
+
+    // Precompute smooth per-vertex optical/CRT lighting & DOF reciprocals to save 9 SFU ops per pixel
+    let r = sqrt(dot(distorted_ndc, distorted_ndc));
+    let bezel = smoothstep_r(1.3, 0.9, r);
+    let cam_dist = length(p3 - ro);
+    let coc = abs(cam_dist - 3.6) * 0.35;
+    let total_coc = coc + r * r * 0.75;
+
+    let hit_val = boosted_w * height_taper;
+    let wave_height = clamp(abs(hit_val) * 1.85, 0.0, 1.0);
+    let bloom_boost = 1.0 + wave_height * 1.15;
+
+    out.coc_inv = vec4<f32>(
+        1.0 / (1.0 + total_coc),
+        1.0 / (1.0 + total_coc * 0.5),
+        (1.0 / (1.0 + total_coc * 0.2)) * bloom_boost,
+        (1.0 / (1.0 + total_coc * 0.1)) * bloom_boost
+    );
+
+    let v_mesh = max(v_scrolled, v_coord);
+    let age_fade = mix(0.08, 1.0, v_scrolled);
+    let edge_fade = side_taper;
+    let depth_fade = smoothstep(0.0, 0.12, v_scrolled);
+    let front_fade = smoothstep_r(0.998, 0.955, v_mesh);
+    let boundary_fade = edge_fade * depth_fade * front_fade;
+    let fade_sq = boundary_fade * boundary_fade;
+    let bezel_fade_sq = bezel * fade_sq;
+
+    let amber_ember = vec3<f32>(0.38, 0.07, 0.004);
+    let amber_lo = mix(amber_ember, vec3<f32>(0.58, 0.17, 0.02), boundary_fade);
+    let amber_hi = vec3<f32>(1.08, 0.62, 0.12);
+    let amber_peak = vec3<f32>(1.45, 0.98, 0.42);
+    let front_glow = smoothstep(0.76, 0.95, v_scrolled) * front_fade;
+    let line_amber = mix(
+        mix(amber_lo, amber_hi, wave_height),
+        amber_peak,
+        wave_height * wave_height * 0.72 + front_glow * 0.22
+    );
+    out.line_amber_scaled = line_amber * (age_fade * boundary_fade * bezel * 1.75);
+
+    let norm = normalize(vec3<f32>(distorted_ndc * 0.18, 1.0));
+    let light_source = vec3<f32>(-0.40406, 0.70711, -0.60609);
+    let ndotl = max(dot(norm, light_source), 0.0);
+    let nl2 = ndotl * ndotl;
+    let nl4 = nl2 * nl2;
+    let nl8 = nl4 * nl4;
+    let nl16 = nl8 * nl8;
+    let reflection_spec = (nl16 * nl16) * 0.08;
+    let reflection_ambient = (1.0 - r * 0.4) * 0.015;
+    let glass_reflection = vec3<f32>(0.85, 0.92, 1.0) * (reflection_spec + reflection_ambient);
+    let phosphor_warmth = vec3<f32>(0.8, 0.35, 0.05) * (0.004 * bezel_fade_sq);
+    out.glass_and_ambient = (vec3<f32>(0.02, 0.01, 0.003) + glass_reflection) * (bezel_fade_sq * bezel) + phosphor_warmth;
+    out.fade_params = vec3<f32>(clamp(boundary_fade * bezel, 0.0, 1.0), bezel_fade_sq, 0.0);
 
     return out;
 }
 
 // Fast wireframe bloom function
-fn get_wire(line_val: f32, inv_coc_05: f32, inv_coc_02: f32, inv_coc_01: f32, bloom_boost: f32) -> f32 {
+fn get_wire(line_val: f32, inv_coc_05: f32, inv_coc_02_b: f32, inv_coc_01_b: f32) -> f32 {
     let core = 1.0 / (1.0 + line_val * line_val * 3.24);
-    let glow1 = 0.45 / (1.0 + line_val * 0.15) * bloom_boost;
-    let glow2 = 0.2 / (1.0 + line_val * 0.04) * bloom_boost;
-    return (core * inv_coc_05) + (glow1 * inv_coc_02) + (glow2 * inv_coc_01);
+    let glow1 = 0.45 / (1.0 + line_val * 0.15);
+    let glow2 = 0.2 / (1.0 + line_val * 0.04);
+    return (core * inv_coc_05) + (glow1 * inv_coc_02_b) + (glow2 * inv_coc_01_b);
 }
 
 @fragment
 fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
-    let crt_uv = in.ndc_pos.xy;
-    let r = length(crt_uv);
-    let bezel = smoothstep_r(1.3, 0.9, r);
-
-    // Depth of field (DOF) and edge-based electron beam defocusing
-    let dist = in.cam_dist;
-    let focus_dist = 3.6;
-    let coc = abs(dist - focus_dist) * 0.35;
-    let edge_defocus = r * r * 0.75;
-    let total_coc = coc + edge_defocus;
-
     // Match depth wireframe lines to the actual history row count so horizontal lines sit on vertex ridges
     let hist_lines = f32(max(audio.waveform_history_size, 72u) - 1u);
     let grid_res = vec2<f32>(128.0, hist_lines);
@@ -152,62 +191,15 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     // Lock horizontal wireframe lines to physical vertex rows (in.local_z = v_coord) so lines sit
     // directly on the 3D wave ridges and glide smoothly backward in Z with the mesh
     let uv_g = vec2<f32>(in.uv.x, in.local_z);
+    let scaled_uv = uv_g * grid_res;
+    let fwidth_uv = max(fwidth(scaled_uv), vec2<f32>(0.0005, 0.0005));
 
-    let wave_height = clamp(abs(in.hit_val) * 1.85, 0.0, 1.0);
-    let bloom_boost = 1.0 + wave_height * 1.15;
+    let grid = abs(fract(scaled_uv - 0.5) - 0.5) / fwidth_uv;
+    let line_dist = min(grid.x, grid.y) * in.coc_inv.x;
+    let wire = get_wire(line_dist, in.coc_inv.y, in.coc_inv.z, in.coc_inv.w);
 
-    let fwidth_uv = max(fwidth(uv_g * grid_res), vec2<f32>(0.0005, 0.0005));
-
-    let inv_coc_05 = 1.0 / (1.0 + total_coc * 0.5);
-    let inv_coc_02 = 1.0 / (1.0 + total_coc * 0.2);
-    let inv_coc_01 = 1.0 / (1.0 + total_coc * 0.1);
-
-    let grid = abs(fract(uv_g * grid_res - 0.5) - 0.5) / fwidth_uv;
-    let line_dist = min(grid.x, grid.y) / (1.0 + total_coc);
-    let wire = get_wire(line_dist, inv_coc_05, inv_coc_02, inv_coc_01, bloom_boost);
-
-    // Use physical mesh coordinate in.local_z (v_coord in 0..1) so the leading edge always hits exact 0.0 at v = 1.0
-    let v_mesh = max(in.uv.y, in.local_z);
-    let age_fade = mix(0.08, 1.0, in.uv.y);
-    let edge_fade = smoothstep_r(0.5, 0.46, abs(in.uv.x - 0.5));
-    let depth_fade = smoothstep(0.0, 0.12, in.uv.y);
-    let front_fade = smoothstep_r(0.998, 0.955, v_mesh);
-    let boundary_fade = edge_fade * depth_fade * front_fade;
-    let fade_sq = boundary_fade * boundary_fade;
-
-    // Warm amber-to-incandescent cream phosphor palette (fades through warm copper at boundaries, never gray)
-    let amber_ember = vec3<f32>(0.38, 0.07, 0.004);
-    let amber_lo = mix(amber_ember, vec3<f32>(0.58, 0.17, 0.02), boundary_fade);
-    let amber_hi = vec3<f32>(1.08, 0.62, 0.12);
-    let amber_peak = vec3<f32>(1.45, 0.98, 0.42);
-    let front_glow = smoothstep(0.76, 0.95, in.uv.y) * front_fade;
-    let line_amber = mix(
-        mix(amber_lo, amber_hi, wave_height),
-        amber_peak,
-        wave_height * wave_height * 0.72 + front_glow * 0.22
-    );
-
-    var color = line_amber * wire * age_fade * boundary_fade * 1.75;
-
-    // Ambient CRT screen glow
-    let ambient_glow = vec3<f32>(0.02, 0.01, 0.003) * bezel * fade_sq;
-    color += ambient_glow;
-
-    // Realistic CRT glass reflection overlay (masked by fade_sq so mesh edges never leave a gray step)
-    let norm = normalize(vec3<f32>(crt_uv * 0.18, 1.0));
-    let light_source = normalize(vec3<f32>(-0.4, 0.7, -0.6));
-    let reflection_spec = pow(max(dot(norm, light_source), 0.0), 32.0) * 0.08;
-    let reflection_ambient = (1.0 - r * 0.4) * 0.015;
-    let glass_reflection = vec3<f32>(0.85, 0.92, 1.0) * (reflection_spec + reflection_ambient) * bezel * fade_sq;
-    color += glass_reflection;
-
-    color *= bezel;
-
-    let noise_val = hash21_crt(in.clip_position.xy + fract(audio.smooth_time) * 113.0);
-    let noise_color = vec3<f32>(0.8, 0.35, 0.05) * noise_val * 0.008 * bezel * fade_sq;
-    color += noise_color;
-
-    let alpha = clamp(boundary_fade * bezel, 0.0, 1.0);
-    let final_color = aces_tonemap(color) * alpha;
+    let color = in.line_amber_scaled * wire + in.glass_and_ambient;
+    let alpha = in.fade_params.x;
+    let final_color = (color * (1.0 + color * 0.18) / (1.0 + color * 0.85)) * alpha;
     return vec4<f32>(final_color, alpha);
 }

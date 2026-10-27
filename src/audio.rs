@@ -1,10 +1,8 @@
 use anyhow::{Context, Result};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-#[cfg(not(target_os = "android"))]
 use openmpt::module::{Logger, Module};
 use rustfft::{FftPlanner, num_complex::Complex};
 use std::fs::File;
-#[cfg(not(target_os = "android"))]
 use std::io::Cursor;
 use std::io::Read;
 use std::sync::{Arc, Mutex};
@@ -496,7 +494,7 @@ pub fn spawn_dsp_thread(
                     .current_tracker_row_string
                     .push_str(&msg.current_row_string);
 
-                // --- Lookahead Timeline Extraction (600 slices: -1.0s past to +5.0s future) ---
+                // --- Lookahead Timeline Queue Pruning ---
                 while let Some(&(t, _)) = state.lookahead_queue.front() {
                     if t < msg.current_seconds - 2.0 {
                         state.lookahead_queue.pop_front();
@@ -504,20 +502,6 @@ pub fn spawn_dsp_thread(
                         break;
                     }
                 }
-                let AppState {
-                    ref lookahead_queue,
-                    ref raw_waveform,
-                    ref raw_channel_vus,
-                    ref mut lookahead_timeline,
-                    ..
-                } = *state;
-                update_lookahead_timeline_from_queue(
-                    lookahead_queue,
-                    raw_waveform,
-                    raw_channel_vus,
-                    msg.current_seconds,
-                    lookahead_timeline,
-                );
 
                 if state.current_tracker_order != msg.current_order
                     || state.current_tracker_row != msg.current_row
@@ -559,6 +543,7 @@ pub fn update_lookahead_timeline_from_queue(
         let (t_first, d_first) = lookahead_queue[0];
         let (t_last, d_last) = lookahead_queue[q_len - 1];
 
+        let mut idx = 0usize;
         for k in 0..600 {
             let target_t = cur_t + (k as f64 - 100.0) * 0.01;
             let off = k * 8;
@@ -574,13 +559,9 @@ pub fn update_lookahead_timeline_from_queue(
                     lookahead_timeline[off + c] = *val * fade;
                 }
             } else {
-                let idx = match lookahead_queue.binary_search_by(|(t, _)| {
-                    t.partial_cmp(&target_t)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                }) {
-                    Ok(i) => i,
-                    Err(i) => i,
-                };
+                while idx < q_len && lookahead_queue[idx].0 < target_t {
+                    idx += 1;
+                }
 
                 if idx == 0 {
                     lookahead_timeline[off..off + 8].copy_from_slice(&d_first);
@@ -715,19 +696,15 @@ pub trait AudioSource: Send {
 // ---------------------------------------------------------
 // OpenMPT Tracker Decoder
 // ---------------------------------------------------------
-#[cfg(not(target_os = "android"))]
 pub struct SafeModule(pub Module);
-#[cfg(not(target_os = "android"))]
 unsafe impl Send for SafeModule {}
 
-#[cfg(not(target_os = "android"))]
 struct OpenMptSource {
     module: SafeModule,
     left_buf: Vec<f32>,
     right_buf: Vec<f32>,
 }
 
-#[cfg(not(target_os = "android"))]
 impl AudioSource for OpenMptSource {
     fn read_frames(
         &mut self,
@@ -4089,24 +4066,44 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
         }
     }
 
-    // 2. Try OpenMPT Tracker module FIRST for tracker module files on desktop
-    #[cfg(not(target_os = "android"))]
-    if (ext == "mod"
-        || ext == "s3m"
-        || ext == "xm"
-        || ext == "it"
-        || ext == "mptm"
-        || ext == "stm"
-        || ext == "med"
-        || ext == "okt"
-        || ext == "669"
-        || ext == "mtm"
-        || ext == "far"
-        || ext == "ult"
-        || ext == "amf"
-        || ext == "dsm")
-        && let Ok(mut file) = File::open(file_path)
-    {
+    // 2. Try OpenMPT Tracker module FIRST for tracker module files
+    let is_tracker_ext = matches!(
+        ext.as_str(),
+        "mod"
+            | "s3m"
+            | "xm"
+            | "it"
+            | "mptm"
+            | "stm"
+            | "med"
+            | "okt"
+            | "669"
+            | "mtm"
+            | "far"
+            | "ult"
+            | "amf"
+            | "dsm"
+            | "psm"
+            | "umx"
+            | "mo3"
+            | "ptm"
+            | "mdl"
+            | "ams"
+            | "dbm"
+            | "digi"
+            | "dmf"
+            | "dtm"
+            | "gdm"
+            | "imf"
+            | "j2b"
+            | "m15"
+            | "nst"
+            | "plm"
+            | "sfx"
+            | "stk"
+            | "wow"
+    );
+    if is_tracker_ext && let Ok(mut file) = File::open(file_path) {
         let mut data = Vec::new();
         if file.read_to_end(&mut data).is_ok() {
             let mut module_cursor = Cursor::new(data);
@@ -4196,6 +4193,26 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
                     file_path, e
                 );
                 symphonia_error = Some(e);
+            }
+        }
+    }
+
+    // 4b. Fallback: Try OpenMPT if extension was missing or non-standard (e.g. Amiga prefix "mod.song" or cloud URI without extension)
+    if !is_tracker_ext
+        && let Ok(mut file) = File::open(file_path)
+        && let Ok(meta) = file.metadata()
+        && meta.len() > 0
+        && meta.len() <= 64 * 1024 * 1024
+    {
+        let mut data = Vec::new();
+        if file.read_to_end(&mut data).is_ok() {
+            let mut module_cursor = Cursor::new(data);
+            if let Ok(module) = Module::create(&mut module_cursor, Logger::None, &[]) {
+                return Ok(Box::new(OpenMptSource {
+                    module: SafeModule(module),
+                    left_buf: Vec::with_capacity(8192),
+                    right_buf: Vec::with_capacity(8192),
+                }));
             }
         }
     }

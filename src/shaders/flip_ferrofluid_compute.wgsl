@@ -19,7 +19,7 @@ struct CellAccum {
 };
 
 // --- Constants ---
-const NUM_PARTICLES: u32 = 65536u;
+const NUM_PARTICLES: u32 = 24576u;
 const GRID_X: u32 = 64u;
 const GRID_Y: u32 = 32u;
 const GRID_Z: u32 = 64u;
@@ -78,7 +78,8 @@ fn cs_clear(@builtin(global_invocation_id) global_id: vec3<u32>) {
     atomicStore(&grid_accum[idx].w_mom, 0);
     atomicStore(&grid_accum[idx].weight, 0u);
 
-    pressure_0[idx] = 0.0;
+    // Warm-start pressure from previous frame for 2x faster Jacobi convergence
+    pressure_0[idx] = pressure_0[idx] * 0.85;
     pressure_1[idx] = 0.0;
 }
 
@@ -325,6 +326,8 @@ fn cs_pressure_0_to_1(@builtin(global_invocation_id) global_id: vec3<u32>) {
     p_sum += cz * (sample_p_0(gx, gy, gz + 1, idx) + sample_p_0(gx, gy, gz - 1, idx));
 
     let p_rhs = (FLUID_DENSITY / dt) * div;
+    // Cache p_rhs in grid_vel_old.w so subsequent Jacobi passes skip 6-neighbor velocity divergence reads
+    grid_vel_old[idx].w = p_rhs;
     let p_jacobi = (p_sum - p_rhs) / c_diag;
     pressure_1[idx] = mix(pressure_0[idx], p_jacobi, JACOBI_OMEGA);
 }
@@ -344,9 +347,6 @@ fn cs_pressure_1_to_0(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let gy = i32((idx / GRID_X) % GRID_Y);
     let gz = i32(idx / (GRID_X * GRID_Y));
 
-    let div = compute_divergence(gx, gy, gz);
-    let dt = clamp(audio.frame_dt, 0.001, 0.033);
-
     let cx = INV_CELL_SIZE.x * INV_CELL_SIZE.x;
     let cy = INV_CELL_SIZE.y * INV_CELL_SIZE.y;
     let cz = INV_CELL_SIZE.z * INV_CELL_SIZE.z;
@@ -357,7 +357,7 @@ fn cs_pressure_1_to_0(@builtin(global_invocation_id) global_id: vec3<u32>) {
     p_sum += cy * (sample_p_1(gx, gy + 1, gz, idx) + sample_p_1(gx, gy - 1, gz, idx));
     p_sum += cz * (sample_p_1(gx, gy, gz + 1, idx) + sample_p_1(gx, gy, gz - 1, idx));
 
-    let p_rhs = (FLUID_DENSITY / dt) * div;
+    let p_rhs = grid_vel_old[idx].w;
     let p_jacobi = (p_sum - p_rhs) / c_diag;
     pressure_0[idx] = mix(pressure_1[idx], p_jacobi, JACOBI_OMEGA);
 }
@@ -394,12 +394,13 @@ fn cs_grid_project(@builtin(global_invocation_id) global_id: vec3<u32>) {
 // ----------------------------------------------------------------------------
 // PASS 6: Grid-to-Particle (G2P), Particle Advection & Heightfield Splat
 // ----------------------------------------------------------------------------
-fn sample_grid_vel(p: vec3<f32>, use_old: bool) -> vec3<f32> {
+fn sample_grid_vel_both(p: vec3<f32>) -> mat2x3<f32> {
     let cell_pos = world_to_cell(p) - vec3<f32>(0.5);
     let base_i = vec3<i32>(floor(cell_pos));
     let frac = fract(cell_pos);
 
-    var vel = vec3<f32>(0.0);
+    var vel_new = vec3<f32>(0.0);
+    var vel_old = vec3<f32>(0.0);
     var total_w = 0.0;
 
     for (var dz = 0; dz <= 1; dz++) {
@@ -417,8 +418,8 @@ fn sample_grid_vel(p: vec3<f32>, use_old: bool) -> vec3<f32> {
                 if (cell_in_bounds(cx, cy, cz)) {
                     let w = wx * wy * wz;
                     let c_idx = get_cell_idx(u32(cx), u32(cy), u32(cz));
-                    let sample_v = select(grid_vel_new[c_idx].xyz, grid_vel_old[c_idx].xyz, use_old);
-                    vel += sample_v * w;
+                    vel_new += grid_vel_new[c_idx].xyz * w;
+                    vel_old += grid_vel_old[c_idx].xyz * w;
                     total_w += w;
                 }
             }
@@ -426,9 +427,10 @@ fn sample_grid_vel(p: vec3<f32>, use_old: bool) -> vec3<f32> {
     }
 
     if (total_w > 0.0001) {
-        return vel / total_w;
+        let inv_w = 1.0 / total_w;
+        return mat2x3<f32>(vel_new * inv_w, vel_old * inv_w);
     }
-    return vec3<f32>(0.0);
+    return mat2x3<f32>(vec3<f32>(0.0), vec3<f32>(0.0));
 }
 
 @compute @workgroup_size(256)
@@ -439,9 +441,10 @@ fn cs_g2p_advect_splat(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var p = particles[p_idx];
     let dt = clamp(audio.frame_dt, 0.001, 0.033);
 
-    // 1. G2P Interpolation
-    let v_new = sample_grid_vel(p.pos.xyz, false);
-    let v_old = sample_grid_vel(p.pos.xyz, true);
+    // 1. G2P Interpolation (single fused 8-cell trilinear lookup for both new & old grid velocities)
+    let both_v = sample_grid_vel_both(p.pos.xyz);
+    let v_new = both_v[0];
+    let v_old = both_v[1];
 
     let v_flip = p.vel.xyz + (v_new - v_old);
     let v_pic = v_new;
@@ -482,9 +485,9 @@ fn cs_g2p_advect_splat(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     particles[p_idx] = p;
 
-    // Skip 5x5 atomicMax splat for deeply submerged bottom-layer particles that lie below
+    // Skip atomicMax splat for submerged bottom-layer particles that lie at or below
     // the resting meniscus puddle (eliminates massive atomic contention on render_grid).
-    if (p.pos.y <= floor_y + 0.042) {
+    if (p.pos.y <= floor_y + 0.055) {
         return;
     }
 
@@ -497,18 +500,21 @@ fn cs_g2p_advect_splat(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let iz = i32(round(rz));
 
     let height_val = clamp(p.pos.y, 0.0, 3.0);
+    let max_rad = select(1, 2, height_val > 0.30);
+    let max_d2 = select(2, 5, height_val > 0.30);
 
-    // 5x5 splat with smooth bell-shaped falloff to produce a continuous, organic liquid cone
-    for (var dz = -2; dz <= 2; dz++) {
+    // Splat with smooth bell-shaped falloff to produce a continuous, organic liquid cone
+    for (var dz = -max_rad; dz <= max_rad; dz++) {
         let gz = iz + dz;
         if (gz < 0 || gz >= i32(RENDER_GRID_SIZE)) { continue; }
 
-        for (var dx = -2; dx <= 2; dx++) {
+        for (var dx = -max_rad; dx <= max_rad; dx++) {
+            let d2_i = dx * dx + dz * dz;
+            if (d2_i > max_d2) { continue; }
             let gx = ix + dx;
             if (gx < 0 || gx >= i32(RENDER_GRID_SIZE)) { continue; }
 
-            let d2 = f32(dx * dx + dz * dz);
-            let falloff = max(0.0, 1.0 - d2 * 0.18);
+            let falloff = 1.0 - f32(d2_i) * 0.17;
             let splat_u = u32((height_val * falloff) * 1000.0);
 
             let cell = u32(gz) * RENDER_GRID_SIZE + u32(gx);

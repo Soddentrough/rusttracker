@@ -21,10 +21,28 @@ struct VertexOutput3D {
     @location(2) uv: vec2<f32>,
     @location(3) @interpolate(flat) mat: f32,
     @location(4) local_pos: vec3<f32>,
+    @location(5) @interpolate(flat) levels: vec4<f32>,
 };
 
 const PHI_MIN: f32 = -0.68;
 const PHI_MAX: f32 = 0.68;
+
+fn hash21_vu_fast(p: vec2<f32>) -> f32 {
+    var p3 = fract(vec3<f32>(p.x, p.y, p.x) * 0.1031);
+    p3 += dot(p3, p3.yzx + vec3<f32>(33.33));
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+fn paper_noise_fast(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    let a = hash21_vu_fast(i);
+    let b = hash21_vu_fast(i + vec2<f32>(1.0, 0.0));
+    let c = hash21_vu_fast(i + vec2<f32>(0.0, 1.0));
+    let d = hash21_vu_fast(i + vec2<f32>(1.0, 1.0));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
 
 // Compute responsive Left/Right VU and Peak levels across stereo or multi-channel tracker audio
 fn get_stereo_vu_peak() -> vec4<f32> {
@@ -254,48 +272,54 @@ fn draw_vector_char(ch: u32, p: vec2<f32>, origin: vec2<f32>, scale: f32, local_
 }
 
 fn draw_v_string_2(s: array<u32, 2>, p: vec2<f32>, origin: vec2<f32>, scale: f32, spacing: f32, lps: f32) -> f32 {
-    var intensity = 0.0;
-    for (var j = 0u; j < 2u; j++) {
-        let char_origin = origin + vec2<f32>(f32(j) * (scale + spacing), 0.0);
-        intensity = max(intensity, draw_vector_char(s[j], p, char_origin, scale, lps));
-    }
-    return intensity;
+    if (p.y < origin.y - 0.15 * scale || p.y > origin.y + 2.15 * scale) { return 0.0; }
+    let step_x = scale + spacing;
+    let rel_x = p.x - origin.x;
+    if (rel_x < -0.15 * scale || rel_x > 2.0 * step_x + 0.15 * scale) { return 0.0; }
+    let j = u32(clamp(floor((rel_x + 0.15 * scale) / step_x), 0.0, 1.0));
+    let char_origin = origin + vec2<f32>(f32(j) * step_x, 0.0);
+    return draw_vector_char(s[j], p, char_origin, scale, lps);
 }
 
 fn draw_v_string_3(s: array<u32, 3>, p: vec2<f32>, origin: vec2<f32>, scale: f32, spacing: f32, lps: f32) -> f32 {
-    var intensity = 0.0;
-    for (var j = 0u; j < 3u; j++) {
-        let char_origin = origin + vec2<f32>(f32(j) * (scale + spacing), 0.0);
-        intensity = max(intensity, draw_vector_char(s[j], p, char_origin, scale, lps));
-    }
-    return intensity;
+    if (p.y < origin.y - 0.15 * scale || p.y > origin.y + 2.15 * scale) { return 0.0; }
+    let step_x = scale + spacing;
+    let rel_x = p.x - origin.x;
+    if (rel_x < -0.15 * scale || rel_x > 3.0 * step_x + 0.15 * scale) { return 0.0; }
+    let j = u32(clamp(floor((rel_x + 0.15 * scale) / step_x), 0.0, 2.0));
+    let char_origin = origin + vec2<f32>(f32(j) * step_x, 0.0);
+    return draw_vector_char(s[j], p, char_origin, scale, lps);
 }
 
 fn draw_v_string_5(s: array<u32, 5>, p: vec2<f32>, origin: vec2<f32>, scale: f32, spacing: f32, lps: f32) -> f32 {
-    var intensity = 0.0;
-    for (var j = 0u; j < 5u; j++) {
-        let char_origin = origin + vec2<f32>(f32(j) * (scale + spacing), 0.0);
-        intensity = max(intensity, draw_vector_char(s[j], p, char_origin, scale, lps));
-    }
-    return intensity;
+    if (p.y < origin.y - 0.15 * scale || p.y > origin.y + 2.15 * scale) { return 0.0; }
+    let step_x = scale + spacing;
+    let rel_x = p.x - origin.x;
+    if (rel_x < -0.15 * scale || rel_x > 5.0 * step_x + 0.15 * scale) { return 0.0; }
+    let j = u32(clamp(floor((rel_x + 0.15 * scale) / step_x), 0.0, 4.0));
+    let char_origin = origin + vec2<f32>(f32(j) * step_x, 0.0);
+    return draw_vector_char(s[j], p, char_origin, scale, lps);
 }
 
 fn draw_v_string_6(s: array<u32, 6>, p: vec2<f32>, origin: vec2<f32>, scale: f32, spacing: f32, lps: f32) -> f32 {
-    var intensity = 0.0;
-    for (var j = 0u; j < 6u; j++) {
-        let char_origin = origin + vec2<f32>(f32(j) * (scale + spacing), 0.0);
-        intensity = max(intensity, draw_vector_char(s[j], p, char_origin, scale, lps));
-    }
-    return intensity;
+    if (p.y < origin.y - 0.15 * scale || p.y > origin.y + 2.15 * scale) { return 0.0; }
+    let step_x = scale + spacing;
+    let rel_x = p.x - origin.x;
+    if (rel_x < -0.15 * scale || rel_x > 6.0 * step_x + 0.15 * scale) { return 0.0; }
+    let j = u32(clamp(floor((rel_x + 0.15 * scale) / step_x), 0.0, 5.0));
+    let char_origin = origin + vec2<f32>(f32(j) * step_x, 0.0);
+    return draw_vector_char(s[j], p, char_origin, scale, lps);
 }
 
-fn draw_arc_label_1(ch: u32, p: vec2<f32>, pivot: vec2<f32>, theta: f32, radius: f32, scale: f32, lps: f32) -> f32 {
+fn draw_arc_label_1(ch: u32, p: vec2<f32>, pivot: vec2<f32>, p_theta: f32, theta: f32, radius: f32, scale: f32, lps: f32) -> f32 {
+    if (abs(p_theta - theta) > 0.065) { return 0.0; }
     let center = pivot + vec2<f32>(sin(theta), cos(theta)) * radius;
     let origin = center - vec2<f32>(0.4 * scale, 1.0 * scale);
     return draw_vector_char(ch, p, origin, scale, lps);
 }
 
-fn draw_arc_label_2(chars: array<u32, 2>, p: vec2<f32>, pivot: vec2<f32>, theta: f32, radius: f32, scale: f32, lps: f32) -> f32 {
+fn draw_arc_label_2(chars: array<u32, 2>, p: vec2<f32>, pivot: vec2<f32>, p_theta: f32, theta: f32, radius: f32, scale: f32, lps: f32) -> f32 {
+    if (abs(p_theta - theta) > 0.095) { return 0.0; }
     let center = pivot + vec2<f32>(sin(theta), cos(theta)) * radius;
     let spacing = scale * 0.25;
     let total_w = 2.0 * scale + spacing;
@@ -303,7 +327,8 @@ fn draw_arc_label_2(chars: array<u32, 2>, p: vec2<f32>, pivot: vec2<f32>, theta:
     return draw_v_string_2(chars, p, origin, scale, spacing, lps);
 }
 
-fn draw_arc_label_3(chars: array<u32, 3>, p: vec2<f32>, pivot: vec2<f32>, theta: f32, radius: f32, scale: f32, lps: f32) -> f32 {
+fn draw_arc_label_3(chars: array<u32, 3>, p: vec2<f32>, pivot: vec2<f32>, p_theta: f32, theta: f32, radius: f32, scale: f32, lps: f32) -> f32 {
+    if (abs(p_theta - theta) > 0.125) { return 0.0; }
     let center = pivot + vec2<f32>(sin(theta), cos(theta)) * radius;
     let spacing = scale * 0.22;
     let total_w = 3.0 * scale + 2.0 * spacing;
@@ -352,6 +377,7 @@ fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
     out.uv = in.tex_coords;
     out.mat = mat_id;
     out.local_pos = in.position;
+    out.levels = levels;
 
     out.clip_position = camera.proj_matrix * camera.view_matrix * vec4<f32>(pos, 1.0);
     return out;
@@ -362,7 +388,7 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     let mat_id = in.mat;
     let n = normalize(in.normal);
     let v = normalize(vec3<f32>(0.0, 0.0, 7.5) - in.world_pos);
-    let levels = get_stereo_vu_peak();
+    let levels = in.levels;
 
     // Studio ambient & key lighting
     let key_light_dir = normalize(vec3<f32>(0.3, 0.8, 1.0));
@@ -419,7 +445,7 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
         faceplate *= (0.85 + 0.65 * lamp_falloff) * (0.94 + 0.18 * vu_val);
 
         // Subtle ivory/paper grain so the dial reads as printed card
-        faceplate *= 0.97 + 0.05 * value_noise2d(q * 200.0);
+        faceplate *= 0.97 + 0.05 * paper_noise_fast(q * 200.0);
 
         // Soft cavity edge vignette
         let edge_vignette = smoothstep_r(1.08, 0.60, max(abs(q.x) / 1.05, abs(q.y - 0.10) / 0.68));
@@ -436,21 +462,24 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
         let tick_w = 0.0035;
         let outer_r = 1.10;
 
-        for (var ti = 0u; ti < 11u; ti++) {
-            let theta_tick = PHI_MIN + db_vals[ti] * (PHI_MAX - PHI_MIN);
-            let diff_t = abs(theta - theta_tick);
-            let tick_len = select(0.06, 0.105, db_is_major[ti]);
-            let inner_r = outer_r - tick_len;
+        if (d_scale >= outer_r - 0.105 - local_pixel_size && d_scale <= outer_r + local_pixel_size) {
+            for (var ti = 0u; ti < 11u; ti++) {
+                let theta_tick = PHI_MIN + db_vals[ti] * (PHI_MAX - PHI_MIN);
+                let diff_t = abs(theta - theta_tick);
+                if (diff_t > tick_w + angular_pixel_size) { continue; }
+                let tick_len = select(0.06, 0.105, db_is_major[ti]);
+                let inner_r = outer_r - tick_len;
 
-            if (d_scale >= inner_r - local_pixel_size && d_scale <= outer_r + local_pixel_size) {
-                let w_mask = smoothstep_r(tick_w + angular_pixel_size, tick_w - angular_pixel_size, diff_t);
-                let r_mask = smoothstep_r(outer_r + local_pixel_size, outer_r - local_pixel_size, d_scale) *
-                             smoothstep(inner_r - local_pixel_size, inner_r + local_pixel_size, d_scale);
-                let current_tick_mask = w_mask * r_mask;
-                if (current_tick_mask > 0.0) {
-                    let current_tick_color = select(vec3<f32>(0.03, 0.02, 0.01), vec3<f32>(0.78, 0.05, 0.02), db_is_red[ti]);
-                    tick_color = mix(tick_color, current_tick_color, current_tick_mask);
-                    tick_mask = max(tick_mask, current_tick_mask);
+                if (d_scale >= inner_r - local_pixel_size) {
+                    let w_mask = smoothstep_r(tick_w + angular_pixel_size, tick_w - angular_pixel_size, diff_t);
+                    let r_mask = smoothstep_r(outer_r + local_pixel_size, outer_r - local_pixel_size, d_scale) *
+                                 smoothstep(inner_r - local_pixel_size, inner_r + local_pixel_size, d_scale);
+                    let current_tick_mask = w_mask * r_mask;
+                    if (current_tick_mask > 0.0) {
+                        let current_tick_color = select(vec3<f32>(0.03, 0.02, 0.01), vec3<f32>(0.78, 0.05, 0.02), db_is_red[ti]);
+                        tick_color = mix(tick_color, current_tick_color, current_tick_mask);
+                        tick_mask = max(tick_mask, current_tick_mask);
+                    }
                 }
             }
         }
@@ -478,10 +507,11 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
         var pct_tick_mask = 0.0;
         let pct_tick_color = vec3<f32>(0.03, 0.02, 0.01);
 
-        for (var pi = 0u; pi < 6u; pi++) {
-            let theta_pct = PHI_MIN + pct_vals[pi] * (PHI_MAX - PHI_MIN);
-            let diff_p = abs(theta - theta_pct);
-            if (d_scale >= pct_inner - local_pixel_size && d_scale <= pct_outer + local_pixel_size) {
+        if (d_scale >= pct_inner - local_pixel_size && d_scale <= pct_outer + local_pixel_size) {
+            for (var pi = 0u; pi < 6u; pi++) {
+                let theta_pct = PHI_MIN + pct_vals[pi] * (PHI_MAX - PHI_MIN);
+                let diff_p = abs(theta - theta_pct);
+                if (diff_p > 0.003 + angular_pixel_size) { continue; }
                 let w_m = smoothstep_r(0.003 + angular_pixel_size, 0.003 - angular_pixel_size, diff_p);
                 let r_m = smoothstep_r(pct_outer + local_pixel_size, pct_outer - local_pixel_size, d_scale) *
                           smoothstep(pct_inner - local_pixel_size, pct_inner + local_pixel_size, d_scale);
@@ -503,18 +533,18 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
         let lbl_scale = 0.032;
         let lps = local_pixel_size;
         var db_num_ink = 0.0;
-        if (d_scale > 1.08 && d_scale < 1.30) {
-            db_num_ink = max(db_num_ink, draw_arc_label_2(array<u32, 2>(2u, 0u), q, pivot, PHI_MIN + 0.00 * (PHI_MAX - PHI_MIN), label_r, lbl_scale, lps));
-            db_num_ink = max(db_num_ink, draw_arc_label_2(array<u32, 2>(1u, 0u), q, pivot, PHI_MIN + 0.20 * (PHI_MAX - PHI_MIN), label_r, lbl_scale, lps));
-            db_num_ink = max(db_num_ink, draw_arc_label_1(7u, q, pivot, PHI_MIN + 0.32 * (PHI_MAX - PHI_MIN), label_r, lbl_scale, lps));
-            db_num_ink = max(db_num_ink, draw_arc_label_1(5u, q, pivot, PHI_MIN + 0.42 * (PHI_MAX - PHI_MIN), label_r, lbl_scale, lps));
-            db_num_ink = max(db_num_ink, draw_arc_label_1(3u, q, pivot, PHI_MIN + 0.54 * (PHI_MAX - PHI_MIN), label_r, lbl_scale, lps));
-            db_num_ink = max(db_num_ink, draw_arc_label_1(2u, q, pivot, PHI_MIN + 0.62 * (PHI_MAX - PHI_MIN), label_r, lbl_scale, lps));
-            db_num_ink = max(db_num_ink, draw_arc_label_1(1u, q, pivot, PHI_MIN + 0.70 * (PHI_MAX - PHI_MIN), label_r, lbl_scale, lps));
-            db_num_ink = max(db_num_ink, draw_arc_label_1(0u, q, pivot, PHI_MIN + 0.77 * (PHI_MAX - PHI_MIN), label_r, lbl_scale, lps));
-            db_num_ink = max(db_num_ink, draw_arc_label_1(1u, q, pivot, PHI_MIN + 0.84 * (PHI_MAX - PHI_MIN), label_r, lbl_scale, lps));
-            db_num_ink = max(db_num_ink, draw_arc_label_1(2u, q, pivot, PHI_MIN + 0.91 * (PHI_MAX - PHI_MIN), label_r, lbl_scale, lps));
-            db_num_ink = max(db_num_ink, draw_arc_label_1(3u, q, pivot, PHI_MIN + 1.00 * (PHI_MAX - PHI_MIN), label_r, lbl_scale, lps));
+        if (d_scale > 1.12 && d_scale < 1.26) {
+            db_num_ink = max(db_num_ink, draw_arc_label_2(array<u32, 2>(2u, 0u), q, pivot, theta, PHI_MIN + 0.00 * (PHI_MAX - PHI_MIN), label_r, lbl_scale, lps));
+            db_num_ink = max(db_num_ink, draw_arc_label_2(array<u32, 2>(1u, 0u), q, pivot, theta, PHI_MIN + 0.20 * (PHI_MAX - PHI_MIN), label_r, lbl_scale, lps));
+            db_num_ink = max(db_num_ink, draw_arc_label_1(7u, q, pivot, theta, PHI_MIN + 0.32 * (PHI_MAX - PHI_MIN), label_r, lbl_scale, lps));
+            db_num_ink = max(db_num_ink, draw_arc_label_1(5u, q, pivot, theta, PHI_MIN + 0.42 * (PHI_MAX - PHI_MIN), label_r, lbl_scale, lps));
+            db_num_ink = max(db_num_ink, draw_arc_label_1(3u, q, pivot, theta, PHI_MIN + 0.54 * (PHI_MAX - PHI_MIN), label_r, lbl_scale, lps));
+            db_num_ink = max(db_num_ink, draw_arc_label_1(2u, q, pivot, theta, PHI_MIN + 0.62 * (PHI_MAX - PHI_MIN), label_r, lbl_scale, lps));
+            db_num_ink = max(db_num_ink, draw_arc_label_1(1u, q, pivot, theta, PHI_MIN + 0.70 * (PHI_MAX - PHI_MIN), label_r, lbl_scale, lps));
+            db_num_ink = max(db_num_ink, draw_arc_label_1(0u, q, pivot, theta, PHI_MIN + 0.77 * (PHI_MAX - PHI_MIN), label_r, lbl_scale, lps));
+            db_num_ink = max(db_num_ink, draw_arc_label_1(1u, q, pivot, theta, PHI_MIN + 0.84 * (PHI_MAX - PHI_MIN), label_r, lbl_scale, lps));
+            db_num_ink = max(db_num_ink, draw_arc_label_1(2u, q, pivot, theta, PHI_MIN + 0.91 * (PHI_MAX - PHI_MIN), label_r, lbl_scale, lps));
+            db_num_ink = max(db_num_ink, draw_arc_label_1(3u, q, pivot, theta, PHI_MIN + 1.00 * (PHI_MAX - PHI_MIN), label_r, lbl_scale, lps));
         }
 
         let pixel_theta_norm = (theta - PHI_MIN) / (PHI_MAX - PHI_MIN);
@@ -524,14 +554,14 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
         let pct_label_r = 0.83;
         let pct_lbl_scale = 0.025;
         var pct_num_ink = 0.0;
-        if (d_scale > 0.74 && d_scale < 0.92) {
-            pct_num_ink = max(pct_num_ink, draw_arc_label_1(0u, q, pivot, PHI_MIN, pct_label_r, pct_lbl_scale, lps));
-            pct_num_ink = max(pct_num_ink, draw_arc_label_2(array<u32, 2>(2u, 0u), q, pivot, PHI_MIN + 0.20 * (PHI_MAX - PHI_MIN), pct_label_r, pct_lbl_scale, lps));
-            pct_num_ink = max(pct_num_ink, draw_arc_label_2(array<u32, 2>(4u, 0u), q, pivot, PHI_MIN + 0.42 * (PHI_MAX - PHI_MIN), pct_label_r, pct_lbl_scale, lps));
-            pct_num_ink = max(pct_num_ink, draw_arc_label_2(array<u32, 2>(6u, 0u), q, pivot, PHI_MIN + 0.62 * (PHI_MAX - PHI_MIN), pct_label_r, pct_lbl_scale, lps));
-            pct_num_ink = max(pct_num_ink, draw_arc_label_2(array<u32, 2>(8u, 0u), q, pivot, PHI_MIN + 0.77 * (PHI_MAX - PHI_MIN), pct_label_r, pct_lbl_scale, lps));
-            pct_num_ink = max(pct_num_ink, draw_arc_label_3(array<u32, 3>(1u, 0u, 0u), q, pivot, PHI_MIN + 0.91 * (PHI_MAX - PHI_MIN), pct_label_r, pct_lbl_scale, lps));
-            pct_num_ink = max(pct_num_ink, draw_arc_label_1(25u, q, pivot, PHI_MAX, pct_label_r - 0.04, pct_lbl_scale, lps));
+        if (d_scale > 0.75 && d_scale < 0.89) {
+            pct_num_ink = max(pct_num_ink, draw_arc_label_1(0u, q, pivot, theta, PHI_MIN, pct_label_r, pct_lbl_scale, lps));
+            pct_num_ink = max(pct_num_ink, draw_arc_label_2(array<u32, 2>(2u, 0u), q, pivot, theta, PHI_MIN + 0.20 * (PHI_MAX - PHI_MIN), pct_label_r, pct_lbl_scale, lps));
+            pct_num_ink = max(pct_num_ink, draw_arc_label_2(array<u32, 2>(4u, 0u), q, pivot, theta, PHI_MIN + 0.42 * (PHI_MAX - PHI_MIN), pct_label_r, pct_lbl_scale, lps));
+            pct_num_ink = max(pct_num_ink, draw_arc_label_2(array<u32, 2>(6u, 0u), q, pivot, theta, PHI_MIN + 0.62 * (PHI_MAX - PHI_MIN), pct_label_r, pct_lbl_scale, lps));
+            pct_num_ink = max(pct_num_ink, draw_arc_label_2(array<u32, 2>(8u, 0u), q, pivot, theta, PHI_MIN + 0.77 * (PHI_MAX - PHI_MIN), pct_label_r, pct_lbl_scale, lps));
+            pct_num_ink = max(pct_num_ink, draw_arc_label_3(array<u32, 3>(1u, 0u, 0u), q, pivot, theta, PHI_MIN + 0.91 * (PHI_MAX - PHI_MIN), pct_label_r, pct_lbl_scale, lps));
+            pct_num_ink = max(pct_num_ink, draw_arc_label_1(25u, q, pivot, theta, PHI_MAX, pct_label_r - 0.04, pct_lbl_scale, lps));
         }
 
         // === Dial Face Typography ("AUDIO", "VU", "SIGNAL", "L/R - LEVEL dB") ===

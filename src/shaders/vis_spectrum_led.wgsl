@@ -14,29 +14,34 @@ fn get_peak_bin(bin_idx: u32) -> f32 {
 }
 
 // Pool across the full 1024 logarithmically-binned spectrum (20Hz..10kHz)
-// and map with a studio logarithmic dB curve that uses the full [0..100] range without early clipping.
+// using aligned vec4 uniform reads to avoid per-bin scalar uniform indexing overhead.
 fn sample_column_energy(col_idx: u32, num_cols: u32) -> vec2<f32> {
     let b0 = (col_idx * 1024u) / num_cols;
     let b1 = max(b0 + 1u, ((col_idx + 1u) * 1024u) / num_cols);
 
+    let v0 = min(b0 >> 2u, 255u);
+    let v1 = min((b1 - 1u) >> 2u, 255u);
+    let vec_count = min(v1 - v0 + 1u, 6u);
+
     var max_amp = 0.0;
-    var avg_amp = 0.0;
+    var sum_amp = 0.0;
     var max_pk = 0.0;
-    let count = min(b1 - b0, 24u);
-    for (var i = 0u; i < count; i = i + 1u) {
-        let b = b0 + i;
-        let a = get_spectrum_bin(b);
-        let p = get_peak_bin(b);
-        max_amp = max(max_amp, a);
-        avg_amp += a;
-        max_pk = max(max_pk, p);
+    for (var i = 0u; i < vec_count; i = i + 1u) {
+        let vi = v0 + i;
+        let sv = audio.spectrum[vi];
+        let pv = audio.fire_heat[vi];
+        let sm = max(max(sv.x, sv.y), max(sv.z, sv.w));
+        let pm = max(max(pv.x, pv.y), max(pv.z, pv.w));
+        max_amp = max(max_amp, sm);
+        sum_amp += (sv.x + sv.y + sv.z + sv.w) * 0.25;
+        max_pk = max(max_pk, pm);
     }
-    let amp = mix(max_amp, avg_amp / f32(max(count, 1u)), 0.30);
+    let amp = mix(max_amp, sum_amp / f32(max(vec_count, 1u)), 0.30);
 
     // Studio logarithmic dB compression across [0..100]: sensitive at low levels, never clips at 22%
-    let log_denom = log2(1.0 + 36.0);
-    let norm_amp = clamp(log2(1.0 + amp * 0.36) / log_denom, 0.0, 1.0);
-    let norm_peak = clamp(log2(1.0 + max_pk * 0.36) / log_denom, 0.0, 1.0);
+    let inv_log_denom = 1.0 / 5.20945336;
+    let norm_amp = clamp(log2(1.0 + amp * 0.36) * inv_log_denom, 0.0, 1.0);
+    let norm_peak = clamp(log2(1.0 + max_pk * 0.36) * inv_log_denom, 0.0, 1.0);
     return vec2<f32>(norm_amp, max(norm_peak, norm_amp));
 }
 
@@ -105,12 +110,6 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     // Bevel & VFD fine anode mesh / tungsten filament wire texture
     let center_dx = abs(col_frac - 0.5) / (0.5 - pad_x);
     let center_dy = abs(row_frac - 0.5) / (0.5 - pad_y);
-    let bevel = 1.0 - 0.24 * max(center_dx, center_dy);
-
-    // Subtle VFD cathode filament wire shadow & phosphor grain inside each segment
-    let filament_wire = 0.92 + 0.08 * cos(inner_uv.y * num_leds * 18.84955);
-    let mesh_pattern = 0.94 + 0.06 * sin(col_frac * 37.7) * sin(row_frac * 25.1);
-    let vfd_texture = bevel * filament_wire * mesh_pattern;
 
     // Subtle studio dB calibration scale lines every 4 rows in background
     let is_db_line = (u32(row_i) % 4u == 0u) && (abs(row_frac - 0.06) < 0.04);
@@ -120,6 +119,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     }
 
     if is_led_body {
+        let bevel = 1.0 - 0.24 * max(center_dx, center_dy);
+        let filament_wire = 0.92 + 0.08 * cos(inner_uv.y * num_leds * 18.84955);
+        let mesh_pattern = 0.94 + 0.06 * sin(col_frac * 37.7) * sin(row_frac * 25.1);
+        let vfd_texture = bevel * filament_wire * mesh_pattern;
+
         if is_peak_cap {
             // Crisp white-cyan VFD peak hold segment
             let cap_tint = mix(vec3<f32>(1.65, 1.90, 2.00), vec3<f32>(2.00, 1.40, 1.25), step(0.84, led_norm_y));
@@ -136,12 +140,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             }
             color = base_led_col * (0.042 + afterglow) + vec3<f32>(0.012, 0.015, 0.019) * vfd_texture;
         }
-    } else {
+    } else if is_lit || is_peak_cap {
         // Inter-segment glass bloom bleed from lit segments
-        if is_lit || is_peak_cap {
-            let gap_glow = exp(-max(center_dx - 1.0, 0.0) * 3.0) * exp(-max(center_dy - 1.0, 0.0) * 3.0);
-            color += base_led_col * 0.16 * gap_glow;
-        }
+        let gap_sum = max(center_dx - 1.0, 0.0) + max(center_dy - 1.0, 0.0);
+        let gap_glow = exp(-gap_sum * 3.0);
+        color += base_led_col * 0.16 * gap_glow;
     }
 
     // Subtle smoked-glass diagonal reflection sheen across the VFD faceplate

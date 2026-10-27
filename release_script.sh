@@ -37,23 +37,29 @@ if [ "$SUCCESS_RUNS" -eq "$TOTAL_RUNS" ] && [ "$TOTAL_RUNS" -gt 0 ]; then
   echo "CI pipeline completed successfully."
    
   echo "Cleaning old artifact directories..."
-  rm -rf ./linux_rpm ./linux_deb ./windows_release ./macos_release
+  rm -rf ./linux_rpm ./linux_deb ./linux_appimage ./windows_release ./macos_release
   
   echo "Downloading artifacts..."
   gh run download -n RustTracker-Linux-RPM --dir ./linux_rpm || true
   gh run download -n RustTracker-Linux-DEB --dir ./linux_deb || true
+  gh run download -n RustTracker-Linux-AppImage --dir ./linux_appimage || true
   gh run download -n RustTracker-Windows --dir ./windows_release || true
   gh run download -n RustTracker-MacOS --dir ./macos_release || true
   
+  EXTRA_FILES=()
+  if compgen -G "./linux_appimage/RustTracker-SteamDeck-*.AppImage" >/dev/null; then
+    cp -f ./linux_appimage/RustTracker-SteamDeck-*.AppImage ./
+    chmod +x ./RustTracker-SteamDeck-*.AppImage
+  fi
+  if [ -f "./RustTracker-SteamDeck-$TAG.AppImage" ]; then
+    EXTRA_FILES+=("./RustTracker-SteamDeck-$TAG.AppImage")
+  fi
+
   if gh release view "$TAG" >/dev/null 2>&1; then
     echo "GitHub Release $TAG exists. Uploading/clobbering desktop artifacts..."
-    gh release upload "$TAG" ./windows_release/*.exe ./linux_rpm/*.rpm ./linux_deb/*.deb ./macos_release/*.dmg --clobber || true
+    gh release upload "$TAG" ./windows_release/*.exe ./linux_rpm/*.rpm ./linux_deb/*.deb ./macos_release/*.dmg "${EXTRA_FILES[@]}" --clobber || true
   else
     echo "Creating GitHub Release $TAG..."
-    EXTRA_FILES=()
-    if [ -f "./RustTracker-SteamDeck-$TAG.AppImage" ]; then
-      EXTRA_FILES+=("./RustTracker-SteamDeck-$TAG.AppImage")
-    fi
     gh release create "$TAG" ./windows_release/*.exe ./linux_rpm/*.rpm ./linux_deb/*.deb ./macos_release/*.dmg "${EXTRA_FILES[@]}" --title "RustTracker $TAG" --notes "Release $TAG"
   fi
 

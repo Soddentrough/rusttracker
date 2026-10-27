@@ -17,23 +17,40 @@ use crate::engine::{EngineAction, VulkanEngine};
 use crate::state::{AppState, VISUALIZERS};
 use crate::touch::{TouchGesture, TouchGestureController};
 
-static FILE_PICKER_CHANNEL: OnceLock<(Sender<String>, Mutex<Receiver<String>>)> = OnceLock::new();
+#[derive(Debug, Clone)]
+pub enum FilePickerEvent {
+    LoadingStarted(String),
+    Selected(String),
+}
+
+static FILE_PICKER_CHANNEL: OnceLock<(Sender<FilePickerEvent>, Mutex<Receiver<FilePickerEvent>>)> =
+    OnceLock::new();
 static GLOBAL_APP_STATE: OnceLock<Arc<Mutex<AppState>>> = OnceLock::new();
 
 #[derive(Debug)]
 pub enum AppCustomEvent {
     Destroy,
+    Wake,
 }
 
 static EVENT_LOOP_PROXY: OnceLock<
     Mutex<Option<winit::event_loop::EventLoopProxy<AppCustomEvent>>>,
 > = OnceLock::new();
 
-fn get_file_channel() -> &'static (Sender<String>, Mutex<Receiver<String>>) {
+fn get_file_channel() -> &'static (Sender<FilePickerEvent>, Mutex<Receiver<FilePickerEvent>>) {
     FILE_PICKER_CHANNEL.get_or_init(|| {
         let (tx, rx) = channel();
         (tx, Mutex::new(rx))
     })
+}
+
+fn wake_event_loop() {
+    if let Some(lock) = EVENT_LOOP_PROXY.get()
+        && let Ok(guard) = lock.lock()
+        && let Some(proxy) = guard.as_ref()
+    {
+        let _ = proxy.send_event(AppCustomEvent::Wake);
+    }
 }
 
 fn handle_back_navigation(app_state: &Arc<Mutex<AppState>>) -> bool {
@@ -94,6 +111,29 @@ pub extern "C" fn Java_com_rusttracker_app_MainActivity_nativeOnDestroy<'local>(
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn Java_com_rusttracker_app_MainActivity_nativeOnFileLoadingStarted<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    display_name: JString<'local>,
+) {
+    if let Ok(name) = env.get_string(&display_name) {
+        let name_str: String = name.into();
+        eprintln!("[RustTracker] JNI: File loading started: {}", name_str);
+        if let Some(app_state) = GLOBAL_APP_STATE.get()
+            && let Ok(mut state) = app_state.lock()
+        {
+            state.is_paused = true;
+            state.song_title = format!("Loading {}...", name_str);
+            state.osd_text = Some(format!("Loading {}...", name_str));
+            state.osd_timer = 15.0;
+        }
+        let (tx, _) = get_file_channel();
+        let _ = tx.send(FilePickerEvent::LoadingStarted(name_str));
+        wake_event_loop();
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn Java_com_rusttracker_app_MainActivity_nativeOnFileSelected<'local>(
     mut env: JNIEnv<'local>,
     _class: JClass<'local>,
@@ -103,7 +143,27 @@ pub extern "C" fn Java_com_rusttracker_app_MainActivity_nativeOnFileSelected<'lo
         let path_str: String = path.into();
         eprintln!("[RustTracker] JNI: Selected file path: {}", path_str);
         let (tx, _) = get_file_channel();
-        let _ = tx.send(path_str);
+        let _ = tx.send(FilePickerEvent::Selected(path_str));
+        wake_event_loop();
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_rusttracker_app_MainActivity_nativeOnFileStatus<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    status_msg: JString<'local>,
+) {
+    if let Ok(msg) = env.get_string(&status_msg) {
+        let msg_str: String = msg.into();
+        eprintln!("[RustTracker] JNI: File status: {}", msg_str);
+        if let Some(app_state) = GLOBAL_APP_STATE.get()
+            && let Ok(mut state) = app_state.lock()
+        {
+            state.osd_text = Some(msg_str);
+            state.osd_timer = 8.0;
+        }
+        wake_event_loop();
     }
 }
 
@@ -128,6 +188,23 @@ pub fn trigger_android_file_picker(app: &AndroidApp) {
     }
 }
 
+pub fn query_android_display_refresh_rate(app: &AndroidApp) -> f32 {
+    let vm = unsafe { jni::JavaVM::from_raw(app.vm_as_ptr() as *mut _) };
+    if let Ok(vm) = vm
+        && let Ok(mut env) = vm.attach_current_thread()
+    {
+        let activity_obj =
+            unsafe { jni::objects::JObject::from_raw(app.activity_as_ptr() as *mut _) };
+        if let Ok(val) = env.call_method(&activity_obj, "getDisplayRefreshRate", "()F", &[])
+            && let Ok(hz) = val.f()
+            && (30.0..=240.0).contains(&hz)
+        {
+            return hz;
+        }
+    }
+    60.0
+}
+
 struct AndroidRustTrackerApp {
     android_app: AndroidApp,
     app_state: Arc<Mutex<AppState>>,
@@ -138,8 +215,10 @@ struct AndroidRustTrackerApp {
     file_dialog: egui_file_dialog::FileDialog,
     touch_controller: TouchGestureController,
     active_stream: Option<crate::audio::PlaybackHandle>,
-    start_time: Instant,
     last_frame_time: Instant,
+    frame_dt_ring: [f32; 60],
+    frame_dt_idx: usize,
+    display_refresh_hz: f32,
     is_suspended: bool,
     frame_count: u64,
 }
@@ -177,6 +256,13 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                 );
                 event_loop.exit();
             }
+            AppCustomEvent::Wake => {
+                if !self.is_suspended
+                    && let Some(ref win) = self.window
+                {
+                    win.request_redraw();
+                }
+            }
         }
     }
 
@@ -194,7 +280,18 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         eprintln!("[RustTracker] Android Lifecycle: Resumed");
         self.is_suspended = false;
+        self.touch_controller.reset();
         self.last_frame_time = Instant::now();
+        self.display_refresh_hz = query_android_display_refresh_rate(&self.android_app);
+        let vsync_dt = 1.0 / self.display_refresh_hz.max(30.0);
+        self.frame_dt_ring = [vsync_dt; 60];
+        self.frame_dt_idx = 0;
+        self.frame_count = 0;
+        eprintln!(
+            "[RustTracker] Display VSync refresh rate: {:.2} Hz ({:.2} ms)",
+            self.display_refresh_hz,
+            vsync_dt * 1000.0
+        );
 
         if self.window.is_none() {
             let win_attrs = Window::default_attributes().with_title("RustTracker");
@@ -224,6 +321,22 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                     } else {
                         eprintln!("[RustTracker] Initializing VulkanEngine for the first time...");
                         let eng = pollster::block_on(VulkanEngine::new(win.clone()));
+                        {
+                            let mut app_state = self.app_state.lock().unwrap();
+                            app_state.apply_gpu_capability_profile(
+                                &eng.adapter_info,
+                                eng.config.width,
+                                eng.config.height,
+                            );
+                            eprintln!(
+                                "[RustTracker] GPU Adapter: '{}' ({:?}) @ {}x{} -> Tier: {:?}",
+                                eng.adapter_info.name,
+                                eng.adapter_info.device_type,
+                                eng.config.width,
+                                eng.config.height,
+                                app_state.gpu_capability_tier
+                            );
+                        }
                         self.engine = Some(eng);
                     }
 
@@ -244,6 +357,7 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
     fn suspended(&mut self, _event_loop: &ActiveEventLoop) {
         eprintln!("[RustTracker] Android Lifecycle: Suspended");
         self.is_suspended = true;
+        self.touch_controller.reset();
         if let Some(ref mut eng) = self.engine {
             eng.suspend_surface();
         }
@@ -287,6 +401,26 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                     event_loop.exit();
                 }
             }
+            WindowEvent::KeyboardInput {
+                event:
+                    KeyEvent {
+                        logical_key: Key::Character(ref c),
+                        state: ElementState::Pressed,
+                        ..
+                    },
+                ..
+            } if c.eq_ignore_ascii_case("s") => {
+                let mut state = self.app_state.lock().unwrap();
+                if !state.is_url_dialog_open {
+                    state.show_stats = !state.show_stats;
+                    state.osd_text = Some(if state.show_stats {
+                        "Engine Stats: Visible".to_string()
+                    } else {
+                        "Engine Stats: Hidden".to_string()
+                    });
+                    state.osd_timer = 1.5;
+                }
+            }
             WindowEvent::Resized(physical_size) => {
                 eprintln!("[RustTracker] Android Window Resized: {:?}", physical_size);
                 if physical_size.width > 0
@@ -327,17 +461,16 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                         size.height as f32,
                         scale_factor,
                     ) {
+                        self.touch_controller.reset();
                         trigger_android_file_picker(&self.android_app);
                     }
                 }
             }
             WindowEvent::RedrawRequested if !self.is_suspended => {
-                let dt = self
-                    .last_frame_time
-                    .elapsed()
-                    .as_secs_f32()
-                    .clamp(0.001, 0.1);
-                self.last_frame_time = Instant::now();
+                let now = Instant::now();
+                let raw_dt = now.duration_since(self.last_frame_time).as_secs_f32();
+                self.last_frame_time = now;
+                let dt = raw_dt.clamp(0.001, 0.1);
 
                 let size = win.inner_size();
                 let scale_factor = (win.scale_factor() as f32).max(1.0);
@@ -353,11 +486,14 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                 if let Some(gesture) = self.touch_controller.update_pending_tap() {
                     let is_track_info_open_btn = if let TouchGesture::SingleTap { x, y } = gesture {
                         let is_portrait = size.width < size.height;
-                        is_portrait
-                            && self.app_state.lock().unwrap().mobile_hud_tab
-                                == crate::state::MobileHudTab::Info
-                            && y < (115.0 * scale_factor)
-                            && x > (size.width as f32 * 0.65)
+                        let st = self.app_state.lock().unwrap();
+                        let in_info_hdr = if is_portrait {
+                            st.mobile_hud_tab == crate::state::MobileHudTab::Info
+                                && x > (size.width as f32 * 0.65)
+                        } else {
+                            st.show_hud && st.video_mode == 0 && x > (size.width as f32 * 0.82)
+                        };
+                        in_info_hdr && y < (115.0 * scale_factor)
                     } else {
                         false
                     };
@@ -374,14 +510,45 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                             scale_factor,
                         )
                     {
+                        self.touch_controller.reset();
                         trigger_android_file_picker(&self.android_app);
                     }
                 }
 
-                // Check for SAF file picker result
+                // Check for SAF file picker events
                 let (_, rx_lock) = get_file_channel();
                 if let Ok(rx) = rx_lock.try_lock() {
-                    while let Ok(path) = rx.try_recv() {
+                    let mut latest_selected_path = None;
+                    while let Ok(evt) = rx.try_recv() {
+                        match evt {
+                            FilePickerEvent::LoadingStarted(display_name) => {
+                                eprintln!(
+                                    "[RustTracker] Stopping active stream while cloud/storage file loads: {}",
+                                    display_name
+                                );
+                                self.active_stream = None;
+                                latest_selected_path = None;
+                                if let Some(engine) = self.engine.as_mut() {
+                                    engine.clear_video_state();
+                                }
+                                let mut state = self.app_state.lock().unwrap();
+                                state.is_paused = true;
+                                state.current_seconds = 0.0;
+                                state.duration_seconds = 0.0;
+                                state.song_title = format!("Loading {}...", display_name);
+                                state.raw_channel_vus.fill(0.0);
+                                state.channel_vus.fill(0.0);
+                                state.peak_vus.fill(0.0);
+                                state.raw_spectrum_data.fill(0.0);
+                                state.spectrum_data.fill(0.0);
+                                state.fire_heat.fill(0.0);
+                            }
+                            FilePickerEvent::Selected(path) => {
+                                latest_selected_path = Some(path);
+                            }
+                        }
+                    }
+                    if let Some(path) = latest_selected_path {
                         eprintln!(
                             "[RustTracker] Starting playback of SAF selected file: {}",
                             path
@@ -436,82 +603,80 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                 };
 
                 self.frame_count += 1;
-                let fps = 1.0 / dt;
-                {
-                    let mut state = self.app_state.lock().unwrap();
-                    state.current_fps = if state.current_fps == 0.0 {
-                        fps
-                    } else {
-                        state.current_fps * 0.9 + fps * 0.1
-                    };
+                if self.frame_count > 2 && raw_dt > 0.0 && raw_dt < 0.25 {
+                    self.frame_dt_ring[self.frame_dt_idx] = raw_dt;
+                    self.frame_dt_idx = (self.frame_dt_idx + 1) % self.frame_dt_ring.len();
                 }
+                let min_vsync_dt = 1.0 / self.display_refresh_hz.max(30.0);
+                let avg_dt = (self.frame_dt_ring.iter().sum::<f32>()
+                    / (self.frame_dt_ring.len() as f32))
+                    .max(min_vsync_dt);
+                let fps = 1.0 / avg_dt;
 
                 // Per-frame state update, decay & smoothing (mirrors desktop pipeline)
-                let state_copy = {
+                let phase_timer = Instant::now();
+                let (state_copy, phase_lock_update_us, phase_snapshot_us) = {
                     let mut state = self.app_state.lock().unwrap();
+                    state.current_fps = fps;
+                    state.update_visualizer_perf_guard(dt, self.display_refresh_hz);
                     let time_scale = (dt * 60.0).clamp(0.2, 5.0);
 
-                    if !state.file_loaded {
-                        let t = self.start_time.elapsed().as_secs_f32();
-                        for i in 0..1024 {
-                            let pct = i as f32 / 1024.0;
-                            let wave1 = (t * 2.0 + pct * 10.0).sin();
-                            let wave2 = (t * 1.5 - pct * 15.0).cos();
-                            let wave3 = (t * 0.5 + pct * 5.0).sin();
-                            let combined = (wave1 + wave2 + wave3) / 3.0;
-                            let val = (combined * 0.5 + 0.5).powf(2.0) * 0.5;
-                            state.raw_spectrum_data[i] = val;
+                    if state.file_loaded {
+                        // VU decay
+                        if state.channel_vus.len() != state.raw_channel_vus.len() {
+                            state.channel_vus = vec![0.0; state.raw_channel_vus.len()];
                         }
-                    }
+                        for i in 0..state.raw_channel_vus.len() {
+                            if state.raw_channel_vus[i] > state.channel_vus[i] {
+                                state.channel_vus[i] = state.raw_channel_vus[i];
+                            } else {
+                                state.channel_vus[i] = (state.channel_vus[i]
+                                    - (0.015 * time_scale))
+                                    .max(state.raw_channel_vus[i]);
+                            }
+                        }
 
-                    // VU decay
-                    if state.channel_vus.len() != state.raw_channel_vus.len() {
-                        state.channel_vus = vec![0.0; state.raw_channel_vus.len()];
-                    }
-                    for i in 0..state.raw_channel_vus.len() {
-                        if state.raw_channel_vus[i] > state.channel_vus[i] {
-                            state.channel_vus[i] = state.raw_channel_vus[i];
+                        if state.peak_vus.len() != state.channel_vus.len() {
+                            state.peak_vus = vec![0.0; state.channel_vus.len()];
+                        }
+                        for i in 0..state.channel_vus.len() {
+                            state.peak_vus[i] = (state.peak_vus[i] - (0.005 * time_scale)).max(0.0);
+                            if state.channel_vus[i] > state.peak_vus[i] {
+                                state.peak_vus[i] = state.channel_vus[i];
+                            }
+                        }
+
+                        // Spectrum & Fire Heat decay
+                        if state.spectrum_data.len() != state.raw_spectrum_data.len() {
+                            state.spectrum_data = vec![0.0; state.raw_spectrum_data.len()];
+                        }
+                        for i in 0..state.raw_spectrum_data.len() {
+                            if state.raw_spectrum_data[i] > state.spectrum_data[i] {
+                                state.spectrum_data[i] = state.raw_spectrum_data[i];
+                            } else {
+                                state.spectrum_data[i] = (state.spectrum_data[i]
+                                    - (1.5 * time_scale))
+                                    .max(state.raw_spectrum_data[i]);
+                            }
+
+                            if state.raw_spectrum_data[i] > state.fire_heat[i] {
+                                state.fire_heat[i] = state.raw_spectrum_data[i];
+                            } else {
+                                state.fire_heat[i] =
+                                    (state.fire_heat[i] - (1.5 * time_scale)).max(0.0);
+                            }
+                        }
+
+                        // Spectrum History (reuse front allocation instead of cloning a new Vec every frame)
+                        let mut recycled = if state.spectrum_history.len() > 120 {
+                            state.spectrum_history.pop_front().unwrap_or_default()
                         } else {
-                            state.channel_vus[i] = (state.channel_vus[i] - (0.015 * time_scale))
-                                .max(state.raw_channel_vus[i]);
-                        }
+                            Vec::with_capacity(state.spectrum_data.len())
+                        };
+                        recycled.clear();
+                        recycled.extend_from_slice(&state.spectrum_data);
+                        state.spectrum_history.push_back(recycled);
                     }
-
-                    if state.peak_vus.len() != state.channel_vus.len() {
-                        state.peak_vus = vec![0.0; state.channel_vus.len()];
-                    }
-                    for i in 0..state.channel_vus.len() {
-                        state.peak_vus[i] = (state.peak_vus[i] - (0.005 * time_scale)).max(0.0);
-                        if state.channel_vus[i] > state.peak_vus[i] {
-                            state.peak_vus[i] = state.channel_vus[i];
-                        }
-                    }
-
-                    // Spectrum & Fire Heat decay
-                    if state.spectrum_data.len() != state.raw_spectrum_data.len() {
-                        state.spectrum_data = vec![0.0; state.raw_spectrum_data.len()];
-                    }
-                    for i in 0..state.raw_spectrum_data.len() {
-                        if state.raw_spectrum_data[i] > state.spectrum_data[i] {
-                            state.spectrum_data[i] = state.raw_spectrum_data[i];
-                        } else {
-                            state.spectrum_data[i] = (state.spectrum_data[i] - (1.5 * time_scale))
-                                .max(state.raw_spectrum_data[i]);
-                        }
-
-                        if state.raw_spectrum_data[i] > state.fire_heat[i] {
-                            state.fire_heat[i] = state.raw_spectrum_data[i];
-                        } else {
-                            state.fire_heat[i] = (state.fire_heat[i] - (1.5 * time_scale)).max(0.0);
-                        }
-                    }
-
-                    // Spectrum History
-                    if state.spectrum_history.len() > 120 {
-                        state.spectrum_history.pop_front();
-                    }
-                    let cloned_spectrum = state.spectrum_data.clone();
-                    state.spectrum_history.push_back(cloned_spectrum);
 
                     // OSD timer
                     if state.osd_timer > 0.0 {
@@ -523,8 +688,12 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
 
                     // Upload GPU uniforms
                     eng.update(&state, dt);
+                    let lock_update_us = phase_timer.elapsed().as_micros() as f32;
 
-                    state.render_snapshot()
+                    let snap_timer = Instant::now();
+                    let snap = state.render_snapshot();
+                    let snap_us = snap_timer.elapsed().as_micros() as f32;
+                    (snap, lock_update_us, snap_us)
                 };
 
                 match eng.render(
@@ -542,11 +711,12 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                         fire_time,
                         fft_time,
                         vis_shader_time,
-                        _smoke_time,
-                        _ferro_time,
-                        _biolum_time,
-                        _resynth_time,
+                        phase_surface_us,
+                        phase_egui_us,
+                        phase_encode_us,
+                        phase_submit_us,
                     )) => {
+                        let post_timer = Instant::now();
                         {
                             let mut state = self.app_state.lock().unwrap();
                             state.vis_picker_scroll_to_cursor = false;
@@ -561,26 +731,26 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                             if let Some(ft) = fft_time {
                                 state.stats.gpu_fft_us = state.stats.gpu_fft_us * 0.9 + ft * 0.1;
                             }
-
-                            if self.frame_count.is_multiple_of(60) {
-                                let vis_name = crate::state::VISUALIZERS
-                                    .get(state.current_visualizer_idx)
-                                    .map(|v| v.name)
-                                    .unwrap_or("Unknown");
-                                eprintln!(
-                                    "[RustTracker Vis Perf] Vis {} ({}): FPS={:.1} | Shader={:.1}us | Render={:.1}us | UI={:.1}us",
-                                    state.visualizer_mode,
-                                    vis_name,
-                                    state.current_fps,
-                                    state.stats.shader_us,
-                                    state.stats.render_us,
-                                    state.stats.ui_us
-                                );
-                            }
+                            let post_us = post_timer.elapsed().as_micros() as f32;
+                            state.stats.phase_lock_update_us =
+                                state.stats.phase_lock_update_us * 0.9 + phase_lock_update_us * 0.1;
+                            state.stats.phase_snapshot_us =
+                                state.stats.phase_snapshot_us * 0.9 + phase_snapshot_us * 0.1;
+                            state.stats.phase_surface_us =
+                                state.stats.phase_surface_us * 0.9 + phase_surface_us * 0.1;
+                            state.stats.phase_egui_layout_us =
+                                state.stats.phase_egui_layout_us * 0.9 + phase_egui_us * 0.1;
+                            state.stats.phase_encode_us =
+                                state.stats.phase_encode_us * 0.9 + phase_encode_us * 0.1;
+                            state.stats.phase_submit_us =
+                                state.stats.phase_submit_us * 0.9 + phase_submit_us * 0.1;
+                            state.stats.phase_post_us =
+                                state.stats.phase_post_us * 0.9 + post_us * 0.1;
                         }
 
                         match action {
                             EngineAction::OpenFile => {
+                                self.touch_controller.reset();
                                 trigger_android_file_picker(&self.android_app);
                             }
                             EngineAction::LoadFiles(files, append) => {
@@ -774,6 +944,7 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                             EngineAction::VisPickerSelect(idx) => {
                                 let mut state = self.app_state.lock().unwrap();
                                 if idx < VISUALIZERS.len() {
+                                    state.vis_user_overridden[idx] = true;
                                     state.current_visualizer_idx = idx;
                                     state.visualizer_mode = VISUALIZERS[idx].id;
                                     state.osd_text = Some(VISUALIZERS[idx].name.to_string());
@@ -793,6 +964,7 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                                 let mut state = self.app_state.lock().unwrap();
                                 if idx != 0 && idx < state.vis_enabled.len() {
                                     state.vis_enabled[idx] = !state.vis_enabled[idx];
+                                    state.vis_user_overridden[idx] = true;
                                 }
                             }
                             EngineAction::VisPickerSetCursor(idx) => {
@@ -802,6 +974,9 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                                 let mut state = self.app_state.lock().unwrap();
                                 for enabled in &mut state.vis_enabled {
                                     *enabled = true;
+                                }
+                                for overridden in &mut state.vis_user_overridden {
+                                    *overridden = true;
                                 }
                             }
                             EngineAction::VisPickerEnableNone => {
@@ -885,8 +1060,6 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                         eprintln!("[RustTracker] Android Render error: {:?}", err);
                     }
                 }
-
-                win.request_redraw();
             }
             _ => {}
         }
@@ -1064,11 +1237,13 @@ impl AndroidRustTrackerApp {
                 let is_portrait = window_width < window_height;
 
                 // Check if top right [📂 OPEN FILE] button was tapped in Track Info pane
-                if is_portrait
-                    && state.mobile_hud_tab == crate::state::MobileHudTab::Info
-                    && y < (115.0 * sf)
-                    && x > window_width * 0.65
-                {
+                let in_info_hdr = if is_portrait {
+                    state.mobile_hud_tab == crate::state::MobileHudTab::Info
+                        && x > window_width * 0.65
+                } else {
+                    state.show_hud && state.video_mode == 0 && x > window_width * 0.82
+                };
+                if in_info_hdr && y < (115.0 * sf) {
                     return Some(EngineAction::OpenFile);
                 }
 
@@ -1382,8 +1557,10 @@ fn android_main(app: AndroidApp) {
         file_dialog: egui_file_dialog::FileDialog::new(),
         touch_controller: TouchGestureController::new(),
         active_stream: None,
-        start_time: Instant::now(),
         last_frame_time: Instant::now(),
+        frame_dt_ring: [1.0 / 60.0; 60],
+        frame_dt_idx: 0,
+        display_refresh_hz: 60.0,
         is_suspended: false,
         frame_count: 0,
     };

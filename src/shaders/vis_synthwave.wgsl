@@ -55,6 +55,9 @@ fn ridge(p: vec2<f32>) -> f32 {
 fn terrain_h(wx: f32, wz: f32, dist_z: f32) -> f32 {
     let road_half = 9.0;
     let dx = max(abs(wx) - road_half, 0.0);
+    if (dx <= 0.0 || dist_z >= 240.0) {
+        return -1.0;
+    }
     let slope = dx * 0.6;
     
     // Evaluate noise directly on continuous world coordinates to avoid vertex popping
@@ -75,21 +78,21 @@ fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
     let raw_cam_z = audio.history_cam_z;
     let cam_z = raw_cam_z % 6000.0; // history-locked: 0.5 world units per history row
     
-    // Map grid vertex coordinates
-    let norm_x = in.position.x / 100.0;
+    // Map 120x120 grid vertex coordinates (in.position in [-60..60])
+    let norm_x = in.position.x / 60.0;
     let local_x = (norm_x * 400.0) + (norm_x * norm_x * norm_x * 1200.0);
     
     let grid_spacing = 2.0;
     let shift_z = cam_z % grid_spacing;
     
-    let is_backdrop = in.position.z > 99.5;
-    let is_backdrop_base = in.position.z > 98.5 && in.position.z <= 99.5;
+    let is_backdrop = in.position.z > 59.5;
+    let is_backdrop_base = in.position.z > 58.5 && in.position.z <= 59.5;
     
     var local_z = 0.0;
     if is_backdrop || is_backdrop_base {
         local_z = 398.0;
     } else {
-        local_z = (in.position.z + 100.0) * grid_spacing - shift_z;
+        local_z = (in.position.z + 60.0) * grid_spacing - shift_z;
     }
     
     let world_x = local_x;
@@ -97,7 +100,7 @@ fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
     if is_backdrop || is_backdrop_base {
         world_z_snapped = (local_z + cam_z) % 6000.0;
     } else {
-        world_z_snapped = ((in.position.z + 100.0) * grid_spacing + grid_spacing * floor(cam_z / grid_spacing)) % 6000.0;
+        world_z_snapped = ((in.position.z + 60.0) * grid_spacing + grid_spacing * floor(cam_z / grid_spacing)) % 6000.0;
     }
     
     let world_z_smooth = (local_z + cam_z) % 6000.0;
@@ -114,11 +117,11 @@ fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
         h = terrain_h(world_x, world_z_snapped, local_z);
         
         // Elevate the terrain into gentle reactive hills outside the road limits.
-        // Skip the 32 textureLoad(history_tex) calls completely on flat road vertices.
+        // Skip history_tex loads completely on flat road vertices or beyond the 220m fog horizon.
         let road_mask = smoothstep(12.0, 30.0, abs(world_x));
-        if (road_mask > 0.001) {
+        if (road_mask > 0.001 && local_z < 225.0) {
             // Use smooth continuous steps_ago to sample history_tex smoothly.
-            let steps_ago_float = (400.0 - local_z) / 0.5;
+            let steps_ago_float = (400.0 - local_z) * 2.0;
             let continuous_heatmap_row = f32(audio.heatmap_row) + audio.step_fraction;
             let center_row = ((continuous_heatmap_row - steps_ago_float) % 1024.0 + 1024.0) % 1024.0;
             
@@ -136,30 +139,20 @@ fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
             let bin2 = clamp(bin1 + 1, select(128, 0, is_left), select(255, 127, is_left));
             let fract_bin = fract(freq_bin_float);
             
-            // Average over 8 adjacent rows (a 4-world-unit window) to low-pass filter
-            // the temporal audio data and eliminate row-transition jitter.
+            // Average over 4 adjacent rows using telescoping weights so each row is loaded only once
             let base_row = i32(floor(center_row));
             let fract_row = fract(center_row);
             
             var acc = 0.0;
-            for (var r = 0; r < 8; r++) {
-                let row1 = u32((base_row - 3 + r + 1024) % 1024);
-                let row2 = (row1 + 1u) % 1024u;
-                
-                // Sample bin1 at row1 and row2
-                let s1_r1 = textureLoad(history_tex, vec2<i32>(bin1, i32(row1)), 0).x;
-                let s1_r2 = textureLoad(history_tex, vec2<i32>(bin1, i32(row2)), 0).x;
-                let sample_bin1 = mix(s1_r1, s1_r2, fract_row);
-                
-                // Sample bin2 at row1 and row2
-                let s2_r1 = textureLoad(history_tex, vec2<i32>(bin2, i32(row1)), 0).x;
-                let s2_r2 = textureLoad(history_tex, vec2<i32>(bin2, i32(row2)), 0).x;
-                let sample_bin2 = mix(s2_r1, s2_r2, fract_row);
-                
-                // Blend between the two adjacent frequency bins
-                acc += mix(sample_bin1, sample_bin2, fract_bin);
+            for (var r = 0; r <= 4; r++) {
+                let row_idx = i32((base_row - 1 + r + 1024) & 1023);
+                let s1 = textureLoad(history_tex, vec2<i32>(bin1, row_idx), 0).x;
+                let s2 = textureLoad(history_tex, vec2<i32>(bin2, row_idx), 0).x;
+                let sample_bin = mix(s1, s2, fract_bin);
+                let row_w = select(1.0, select(1.0 - fract_row, fract_row, r == 4), r == 0 || r == 4);
+                acc += sample_bin * row_w;
             }
-            let raw_hit = acc * 0.125;
+            let raw_hit = acc * 0.25;
             // Calm, smooth, subtle audio elevation (prevents jarring geometric shifts)
             hit_val = clamp(raw_hit * 0.01, 0.0, 1.0);
             h += hit_val * 8.0 * road_mask;
@@ -205,14 +198,37 @@ fn eval_single_lamp(
         return vec3<f32>(0.0);
     }
 
-    let terrain_y = terrain_h(pole_x, lamp_z, 100.0);
-    let light_pos = vec3<f32>(pole_x + arm_offset_x, 10.6 + terrain_y, lamp_z);
+    let light_x = pole_x + arm_offset_x;
+    let gx = world_pos.x - light_x;
+    let gz = world_pos.z - lamp_z;
+    let dist_xz_sq = gx * gx + gz * gz;
+    let ground_near = dist_xz_sq < 196.0 && world_pos.y < 10.6;
+
+    let dx = light_x - E.x;
+    let dz = lamp_z - E.z;
+    let t = (dx * V.x + dz * V.z) * inv_vy2;
+    var ray_near = false;
+    if (t > 0.0 && t < ray_len) {
+        let qx = (E.x + t * V.x) - light_x;
+        let qz = (E.z + t * V.z) - lamp_z;
+        let qy = E.y + t * V.y;
+        ray_near = (qx * qx + qz * qz) < 36.0 && qy > -1.2 && qy < 13.0;
+    }
+
+    // Fast bounding rejection: skip volumetric math if outside lamp bounds
+    if (!ground_near && !ray_near) {
+        return vec3<f32>(0.0);
+    }
+
+    // At pole_x = +/-10.2 (just 1.2m off road edge), terrain_h is always ~ -0.95
+    let terrain_y = -0.95;
+    let light_pos = vec3<f32>(light_x, 10.6 + terrain_y, lamp_z);
     var contrib = vec3<f32>(0.0);
 
     // Ground lighting cone (sodium light pool on ground)
-    let dist_xz = length(world_pos.xz - light_pos.xz);
-    let cone_radius = 14.0;
-    if (dist_xz < cone_radius && world_pos.y < light_pos.y) {
+    if (ground_near && world_pos.y < light_pos.y) {
+        let dist_xz = sqrt(dist_xz_sq);
+        let cone_radius = 14.0;
         let attenuation = smoothstep_r(cone_radius, 0.0, dist_xz);
         let diff_3d = world_pos - light_pos;
         let light_pool = attenuation * (10.0 / (dot(diff_3d, diff_3d) + 1.0));
@@ -220,25 +236,24 @@ fn eval_single_lamp(
     }
 
     // Volumetric lighting and post/bulb rendering
-    let dx = light_pos.x - E.x;
-    let dz = light_pos.z - E.z;
-    let t = (dx * V.x + dz * V.z) * inv_vy2;
-    if (t > 0.0 && t < ray_len) {
+    if (ray_near) {
         let Q = E + t * V;
 
         let clamped_y = clamp(Q.y, terrain_y, light_pos.y);
         let C = vec3<f32>(pole_x, clamped_y, light_pos.z);
-        let dist_to_post = length(Q - C);
+        let post_diff = Q - C;
+        let post_dist_sq = dot(post_diff, post_diff);
 
-        if (dist_to_post < 0.15) {
-            let post_intensity = smoothstep_r(0.15, 0.0, dist_to_post);
+        if (post_dist_sq < 0.0225) {
+            let post_intensity = smoothstep_r(0.15, 0.0, sqrt(post_dist_sq));
             contrib += vec3<f32>(0.05, 0.02, 0.01) * post_intensity * lamp_fog;
         }
 
-        let dist_to_bulb = length(Q - light_pos);
-        let max_bulb_dist = 3.0;
-        if (dist_to_bulb < max_bulb_dist) {
-            let fade = smoothstep_r(max_bulb_dist, 0.0, dist_to_bulb);
+        let bulb_diff = Q - light_pos;
+        let bulb_dist_sq = dot(bulb_diff, bulb_diff);
+        if (bulb_dist_sq < 9.0) {
+            let dist_to_bulb = sqrt(bulb_dist_sq);
+            let fade = smoothstep_r(3.0, 0.0, dist_to_bulb);
             var bulb_glow = (exp(-dist_to_bulb * 4.0) * 12.0 + exp(-dist_to_bulb * 1.8) * 1.2) * fade;
             if (Q.y > light_pos.y) {
                 bulb_glow *= smoothstep_r(0.02, 0.0, Q.y - light_pos.y);
@@ -249,8 +264,10 @@ fn eval_single_lamp(
         if (Q.y < light_pos.y && Q.y > terrain_y) {
             let height_t = (light_pos.y - Q.y) / (light_pos.y - terrain_y);
             let cone_r = height_t * 6.0;
-            let dist_from_center = length(Q.xz - light_pos.xz);
-            if (dist_from_center < cone_r) {
+            let q_xz_diff = Q.xz - light_pos.xz;
+            let q_xz_sq = dot(q_xz_diff, q_xz_diff);
+            if (q_xz_sq < cone_r * cone_r) {
+                let dist_from_center = sqrt(q_xz_sq);
                 let cone_glow = (1.0 - dist_from_center / cone_r) * smoothstep(0.0, 0.2, height_t) * (1.0 - height_t);
                 let volume_contrib = sodium_color * cone_glow * 0.18 * lamp_intensity / (1.0 + t * 0.005);
                 contrib += volume_contrib * lamp_fog;
@@ -271,33 +288,58 @@ fn get_street_lamps(world_pos: vec3<f32>, cam_z: f32, bass_pulse: f32) -> vec3<f
     let road_half = 9.0;
     let sodium_color = vec3<f32>(1.0, 0.42, 0.05); // Rich sodium amber color
     
-    // We loop through segments of length L = 60.0
     let L = 60.0;
-    let current_seg_float = cam_z / L;
-    let start_seg = i32(floor(current_seg_float)) - 1;
-    let end_seg = start_seg + 8;
+    let min_dist = 22.0;
     let lamp_intensity = 0.35 + bass_pulse * 1.65;
-    
     var color_acc = vec3<f32>(0.0);
-    
+
+    // Since E.x == 0.0, a ray ending at abs(world_pos.x) <= 2.2 stays within [-2.2, 2.2]
+    // for all t in (0, ray_len) and can never approach within 6.0m of light_x = +/-8.2.
+    if (abs(world_pos.x) <= 2.2) {
+        if (world_pos.y < 10.6) {
+            let seg_g = i32(floor((world_pos.z + 14.0) / L));
+            let z_left = f32(seg_g) * L + ihash2(seg_g, 7) * (L - min_dist);
+            let z_right = f32(seg_g) * L + ihash2(seg_g, 42) * (L - min_dist);
+            color_acc += eval_single_lamp(
+                world_pos, E, V, ray_len, inv_vy2,
+                -road_half - 1.2, 2.0, z_left, cam_z, lamp_intensity, sodium_color
+            );
+            color_acc += eval_single_lamp(
+                world_pos, E, V, ray_len, inv_vy2,
+                road_half + 1.2, -2.0, z_right, cam_z, lamp_intensity, sodium_color
+            );
+        }
+        return color_acc;
+    }
+
+    let start_seg = i32(floor(cam_z / L));
+    let end_seg = start_seg + 3;
+    let is_right = world_pos.x >= 0.0;
+    let same_pole_x = select(-road_half - 1.2, road_half + 1.2, is_right);
+    let same_arm_x = select(2.0, -2.0, is_right);
+    let same_seed = select(7, 42, is_right);
+
     for (var seg = start_seg; seg <= end_seg; seg++) {
-        let h_left = ihash2(seg, 7);
-        let h_right = ihash2(seg, 42);
-        
-        let min_dist = 22.0;
-        let z_left = f32(seg) * L + h_left * (L - min_dist);
-        let z_right = f32(seg) * L + h_right * (L - min_dist);
-        
+        let z_same = f32(seg) * L + ihash2(seg, same_seed) * (L - min_dist);
         color_acc += eval_single_lamp(
             world_pos, E, V, ray_len, inv_vy2,
-            -road_half - 1.2, 2.0, z_left, cam_z, lamp_intensity, sodium_color
-        );
-        color_acc += eval_single_lamp(
-            world_pos, E, V, ray_len, inv_vy2,
-            road_half + 1.2, -2.0, z_right, cam_z, lamp_intensity, sodium_color
+            same_pole_x, same_arm_x, z_same, cam_z, lamp_intensity, sodium_color
         );
     }
-    
+
+    // Opposite-side ground cone (radius 14m around light_x = -/+8.2) only reaches |x| < 5.8
+    if (abs(world_pos.x) < 5.8 && world_pos.y < 10.6) {
+        let seg_g = i32(floor((world_pos.z + 14.0) / L));
+        let opp_pole_x = -same_pole_x;
+        let opp_arm_x = -same_arm_x;
+        let opp_seed = select(42, 7, is_right);
+        let z_opp = f32(seg_g) * L + ihash2(seg_g, opp_seed) * (L - min_dist);
+        color_acc += eval_single_lamp(
+            world_pos, E, V, ray_len, inv_vy2,
+            opp_pole_x, opp_arm_x, z_opp, cam_z, lamp_intensity, sodium_color
+        );
+    }
+
     return color_acc;
 }
 
@@ -349,14 +391,18 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
             sky_color += vec3<f32>(0.22, 0.05, 0.12) * smoothstep_r(0.55, 0.4, cloud) * alt_mask * exp(-sun_dist * 1.5) * (0.5 + bass_pulse * 0.25);
         }
 
-        // Stars with individual phase twinkle and treble sparkle
-        let star_uv = p * 80.0;
-        let star_id = floor(star_uv);
-        let star_rnd = hash1(star_id.x * 127.1 + star_id.y * 311.7);
-        let star_twinkle = 0.65 + 0.35 * sin(audio.smooth_time * 3.2 + star_rnd * 50.0);
-        let star_b = step(0.97, star_rnd) * smoothstep_r(0.04, 0.0, length(fract(star_uv) - 0.5)) * clamp(p.y - 0.1, 0.0, 1.0);
-        let star_tint = mix(vec3<f32>(0.85, 0.92, 1.0), vec3<f32>(1.0, 0.70, 0.95), fract(star_rnd * 17.3));
-        sky_color += star_tint * star_b * star_twinkle * (0.75 + treble_pulse * 0.85);
+        // Stars with individual phase twinkle and treble sparkle (only evaluate trig/sqrt on the 3% star cells)
+        if (p.y > 0.1) {
+            let star_uv = p * 80.0;
+            let star_id = vec2<i32>(floor(star_uv));
+            let star_rnd = ihash2(star_id.x, star_id.y);
+            if (star_rnd > 0.97) {
+                let star_twinkle = 0.65 + 0.35 * sin(audio.smooth_time * 3.2 + star_rnd * 50.0);
+                let star_b = smoothstep_r(0.04, 0.0, length(fract(star_uv) - 0.5)) * clamp(p.y - 0.1, 0.0, 1.0);
+                let star_tint = mix(vec3<f32>(0.85, 0.92, 1.0), vec3<f32>(1.0, 0.70, 0.95), fract(star_rnd * 17.3));
+                sky_color += star_tint * star_b * star_twinkle * (0.75 + treble_pulse * 0.85);
+            }
+        }
         
         final_color = sky_color;
     } else {
@@ -423,10 +469,11 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
         final_color = mix(color, fog_c, fog_f);
     }
     
-    // Add street lamps (lighting + volumetric + posts + bulbs)
-    let cam_z = audio.history_cam_z % 6000.0; // history-locked: 0.5 world units per history row
-    let lamps_color = get_street_lamps(in.world_pos, cam_z, bass_pulse);
-    final_color += lamps_color;
+    // Add street lamps (lighting + volumetric + posts + bulbs) only within the highway corridor
+    if (abs(in.world_pos.x) < 38.0 && (in.local_z < 225.0 || (in.is_sky > 0.01 && in.world_pos.y < 38.0))) {
+        let cam_z = audio.history_cam_z % 6000.0; // history-locked: 0.5 world units per history row
+        final_color += get_street_lamps(in.world_pos, cam_z, bass_pulse);
+    }
     
     // ACES Film Tone Mapping to prevent HDR highlight blowout on bright streetlamps & grid lines
     let tonemapped = aces_tonemap(final_color);

@@ -1,16 +1,24 @@
 #!/bin/bash
-# Automatically discover the directory this script is in
+# Automatically discover the mounted AppDir directory
 APPDIR="$(dirname "$(readlink -f "$0")")"
 
-# Set library search paths so bundled libraries (FFmpeg, libopenmpt, etc.) can be located
+# Set library and data search paths so bundled libraries (FFmpeg, libopenmpt, etc.)
+# and the SoundFont / hicolor icons can be located while preserving system XDG paths.
 export LD_LIBRARY_PATH="$APPDIR/usr/lib:$APPDIR/usr/lib/x86_64-linux-gnu${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-export XDG_DATA_DIRS="$APPDIR/usr/share${XDG_DATA_DIRS:+:$XDG_DATA_DIRS}"
+export XDG_DATA_DIRS="$APPDIR/usr/share:${XDG_DATA_DIRS:-/usr/local/share:/usr/share}"
 
-# Detect if running under Gamescope (Steam Deck Gaming Mode) or native Wayland
-if [ "$XDG_CURRENT_DESKTOP" = "gamescope" ] || [ -n "$STEAM_DECK" ] || [ -n "$WAYLAND_DISPLAY" ]; then
-    # Force winit to use Wayland natively to bypass the SteamOS X11 xkbcommon bug
-    export WINIT_UNIX_BACKEND=wayland
-    export XKB_DEFAULT_LAYOUT=us
+# Ensure libxkbcommon always has a valid keyboard layout and config root on SteamOS / minimal WMs
+export XKB_DEFAULT_LAYOUT="${XKB_DEFAULT_LAYOUT:-us}"
+if [ -z "$XKB_CONFIG_ROOT" ] && [ -d "/usr/share/X11/xkb" ]; then
+    export XKB_CONFIG_ROOT="/usr/share/X11/xkb"
+fi
+
+# Detect if running under Gamescope (Steam Deck Gaming Mode)
+if [ "$XDG_CURRENT_DESKTOP" = "gamescope" ] || [ "$XDG_SESSION_DESKTOP" = "gamescope" ] || [ -n "$STEAM_DECK" ]; then
+    # Use native Wayland under Gamescope (on desktop Linux, RustTracker defaults to X11/XWayland
+    # when DISPLAY is available so OS file drag-and-drop works, with automatic Wayland fallback).
+    export RUSTTRACKER_WAYLAND="${RUSTTRACKER_WAYLAND:-1}"
+    export WINIT_UNIX_BACKEND="${WINIT_UNIX_BACKEND:-wayland}"
 fi
 
 # Execute the actual binary directly from the mounted AppDir

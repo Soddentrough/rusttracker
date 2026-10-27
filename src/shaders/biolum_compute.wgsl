@@ -36,13 +36,36 @@ fn hash31(p: f32) -> vec3<f32> {
     return fract((p3.xxy + p3.yzz) * p3.zyx);
 }
 
+fn hash21_fast(p: vec2<f32>) -> f32 {
+    var p3 = fract(vec3<f32>(p.x, p.y, p.x) * 0.1031);
+    p3 += dot(p3, p3.yzx + vec3<f32>(33.33));
+    return fract((p3.x + p3.y) * p3.z);
+}
+
+fn noise2d_fast(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    let a = hash21_fast(i);
+    let b = hash21_fast(i + vec2<f32>(1.0, 0.0));
+    let c = hash21_fast(i + vec2<f32>(0.0, 1.0));
+    let d = hash21_fast(i + vec2<f32>(1.0, 1.0));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
+fn fbm2d_foam_fast(p: vec2<f32>) -> f32 {
+    let n0 = noise2d_fast(p);
+    let n1 = noise2d_fast(p * 2.02 + vec2<f32>(1.7, 9.2));
+    return n0 * 0.65 + n1 * 0.35;
+}
+
 // Evaluates both 3D Gerstner wave displacement (col 0) and 3D orbital velocity (col 1)
 // in a single pass with pre-normalized directions and wavenumbers (halving trig & sqrt ops).
 fn eval_gerstner_waves(xz: vec2<f32>, time: f32) -> mat2x3<f32> {
     var disp = vec3<f32>(0.0);
     var vel = vec3<f32>(0.0);
 
-    for (var i = 0u; i < 5u; i = i + 1u) {
+    for (var i = 0u; i < 4u; i = i + 1u) {
         let kin = WAVE_KINEMATICS[i];
         let amp = WAVE_AMPS[i];
         let dir = kin.xy;
@@ -106,7 +129,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let target_vel = wave_vel + drift_vel;
         
         // High drag keeps particles flowing smoothly with currents rather than zipping around
-        vel = mix(vel, target_vel, 1.0 - pow(0.85, dt / 0.016));
+        vel = mix(vel, target_vel, clamp(dt * 9.3, 0.02, 0.35));
         
         // Multi-band audio reactivity (normalized from 0..100 spectrum range)
         let bass = clamp(max(audio.spectrum[0].x, max(audio.spectrum[1].x, audio.spectrum[2].x)) / 75.0, 0.0, 1.4);
@@ -136,19 +159,20 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
         pos.y = wave_h;
         vel.y = 0.0;
         
-        // Wave breaks and dinoflagellate foam structure simulation (active at crests)
+        // Wave breaks and dinoflagellate foam structure simulation (active at crests within camera frustum)
         let crest_factor = smoothstep(0.30, 1.15, wave_h);
-        if (crest_factor > 0.0) {
-            // High frequency fBm noise creates organic foam lines and breaks
+        if (crest_factor > 0.0 && abs(pos.x) < 18.0 && pos.z > -12.0 && pos.z < 36.0) {
+            // Fast 2-octave ALU fBm noise creates organic foam lines and breaks without SFU sin() stalls
             let noise_coord = pos.xz * 2.5 + vec2<f32>(time * 1.5, time * 1.0);
-            let foam_noise = fbm2d_4(noise_coord);
+            let foam_noise = fbm2d_foam_fast(noise_coord);
             
             // Horizontal micro-agitation/diffusion clusters particles into foam filaments
+            let rnd_foam = hash31(idx_f + time * 1.3);
             let foam_disp = vec3<f32>(
-                hash11_common(idx_f + time) - 0.5,
+                rnd_foam.x - 0.5,
                 0.0,
-                hash11_common(idx_f + time * 1.3) - 0.5
-            ) * 0.22 * crest_factor * foam_noise;
+                rnd_foam.z - 0.5
+            ) * (0.22 * crest_factor * foam_noise);
             pos += foam_disp;
             
             // Excite glow in the breaking foam zones, boosted by treble/mids

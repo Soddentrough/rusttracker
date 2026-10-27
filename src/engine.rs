@@ -121,6 +121,21 @@ pub const APP_DEFAULT_BG_CLEAR_COLOR: wgpu::Color = wgpu::Color {
     a: 1.0,
 };
 
+pub fn is_vsync_present_mode(present_mode: wgpu::PresentMode) -> bool {
+    matches!(
+        present_mode,
+        wgpu::PresentMode::Fifo | wgpu::PresentMode::FifoRelaxed | wgpu::PresentMode::AutoVsync
+    )
+}
+
+pub fn format_vsync_status(present_mode: wgpu::PresentMode) -> &'static str {
+    if is_vsync_present_mode(present_mode) {
+        "VSYNC: ON"
+    } else {
+        "VSYNC: OFF"
+    }
+}
+
 #[repr(C)]
 #[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
 pub struct FireParams {
@@ -206,11 +221,847 @@ struct MeshBuffers {
     index_count: u32,
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct SplashStar {
+    pub x: f32,
+    pub y: f32,
+    pub radius: f32,
+    pub speed: f32,
+    pub phase: f32,
+}
+
+pub(crate) struct SplashCache {
+    pub cached_rect: egui::Rect,
+    pub cached_ppp: f32,
+    pub static_bg_mesh: std::sync::Arc<egui::Mesh>,
+    pub stars: Vec<SplashStar>,
+    pub horizon_y: f32,
+    pub grid_color: egui::Color32,
+    pub star_base: egui::Color32,
+    pub cached_title_rect: egui::Rect,
+    pub cached_title_ppp: f32,
+    pub cached_font_tex_size: [usize; 2],
+    pub title_base_mesh: egui::Mesh,
+    pub title_slice_ranges: Vec<(usize, usize)>,
+}
+
+impl Default for SplashCache {
+    fn default() -> Self {
+        Self {
+            cached_rect: egui::Rect::NOTHING,
+            cached_ppp: 0.0,
+            static_bg_mesh: std::sync::Arc::new(egui::Mesh::default()),
+            stars: Vec::new(),
+            horizon_y: 0.0,
+            grid_color: egui::Color32::TRANSPARENT,
+            star_base: egui::Color32::WHITE,
+            cached_title_rect: egui::Rect::NOTHING,
+            cached_title_ppp: 0.0,
+            cached_font_tex_size: [0, 0],
+            title_base_mesh: egui::Mesh::default(),
+            title_slice_ranges: Vec::new(),
+        }
+    }
+}
+
+impl SplashCache {
+    #[inline]
+    pub fn tint_rgb(r: u8, g: u8, b: u8) -> egui::Color32 {
+        let nr = ((r as u32 * 75 + 10 * 180 + 127) / 255) as u8;
+        let ng = ((g as u32 * 75 + 10 * 180 + 127) / 255) as u8;
+        let nb = ((b as u32 * 75 + 15 * 180 + 127) / 255) as u8;
+        egui::Color32::from_rgb(nr, ng, nb)
+    }
+
+    #[inline]
+    fn pseudo_rand(seed: u32) -> f32 {
+        let mut x = seed.wrapping_mul(136453);
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        (x % 1000) as f32 / 1000.0
+    }
+
+    pub fn ensure_background(&mut self, ctx: &egui::Context, rect: egui::Rect) {
+        let ppp = ctx.pixels_per_point().max(0.5);
+        let rect_same = (rect.min.x - self.cached_rect.min.x).abs() < 0.5
+            && (rect.min.y - self.cached_rect.min.y).abs() < 0.5
+            && (rect.max.x - self.cached_rect.max.x).abs() < 0.5
+            && (rect.max.y - self.cached_rect.max.y).abs() < 0.5
+            && (ppp - self.cached_ppp).abs() < 0.01
+            && !self.static_bg_mesh.is_empty();
+        if rect_same {
+            return;
+        }
+
+        self.cached_rect = rect;
+        self.cached_ppp = ppp;
+        let horizon_y = rect.top() + rect.height() * 0.45;
+        self.horizon_y = horizon_y;
+        let center_x = rect.center().x;
+        let sky_height = (horizon_y - rect.top()).max(1.0);
+
+        self.star_base = Self::tint_rgb(255, 255, 255);
+        self.grid_color = Self::tint_rgb(212, 34, 161);
+
+        let mut static_shapes: Vec<egui::epaint::ClippedShape> = Vec::with_capacity(128);
+        let mut push_shape = |shape: egui::Shape| {
+            static_shapes.push(egui::epaint::ClippedShape {
+                clip_rect: rect,
+                shape,
+            });
+        };
+
+        // 1. Multi-stop Synthwave Sky Gradient + Horizon Bloom + Floor Base (single hardware-interpolated Mesh)
+        let c_sky_top = Self::tint_rgb(34, 12, 74);
+        let c_sky_upper = Self::tint_rgb(98, 16, 112);
+        let c_sky_mid = Self::tint_rgb(186, 30, 128);
+        let c_sky_bot = Self::tint_rgb(255, 126, 103);
+        let c_floor_top = Self::tint_rgb(24, 14, 60);
+        let c_floor_bot = Self::tint_rgb(40, 22, 92);
+
+        let mut base_mesh = egui::Mesh::default();
+        let white_uv = egui::pos2(0.0, 0.0);
+        let sky_stops = [
+            (rect.top(), c_sky_top),
+            (rect.top() + 0.45 * sky_height, c_sky_upper),
+            (rect.top() + 0.78 * sky_height, c_sky_mid),
+            (horizon_y, c_sky_bot),
+        ];
+        for &(y_pos, col) in &sky_stops {
+            base_mesh.vertices.push(egui::epaint::Vertex {
+                pos: egui::pos2(rect.left(), y_pos),
+                uv: white_uv,
+                color: col,
+            });
+            base_mesh.vertices.push(egui::epaint::Vertex {
+                pos: egui::pos2(rect.right(), y_pos),
+                uv: white_uv,
+                color: col,
+            });
+        }
+        base_mesh.indices.extend_from_slice(&[
+            0, 1, 2, 1, 3, 2, // top -> upper
+            2, 3, 4, 3, 5, 4, // upper -> mid
+            4, 5, 6, 5, 7, 6, // mid -> horizon
+        ]);
+        // Floor gradient quad (vertices 8..11)
+        let f_base = base_mesh.vertices.len() as u32;
+        for &(y_pos, col) in &[(horizon_y, c_floor_top), (rect.bottom(), c_floor_bot)] {
+            base_mesh.vertices.push(egui::epaint::Vertex {
+                pos: egui::pos2(rect.left(), y_pos),
+                uv: white_uv,
+                color: col,
+            });
+            base_mesh.vertices.push(egui::epaint::Vertex {
+                pos: egui::pos2(rect.right(), y_pos),
+                uv: white_uv,
+                color: col,
+            });
+        }
+        base_mesh.indices.extend_from_slice(&[
+            f_base,
+            f_base + 1,
+            f_base + 2,
+            f_base + 1,
+            f_base + 3,
+            f_base + 2,
+        ]);
+        push_shape(egui::Shape::mesh(base_mesh));
+
+        // 2. Precompute Starfield coordinates & twinkle parameters (confined to upper sky above sun/mountains)
+        self.stars.clear();
+        self.stars.reserve(56);
+        for i in 0..56 {
+            let rx = Self::pseudo_rand(i * 31);
+            let ry = Self::pseudo_rand(i * 31 + 1);
+            let rr = Self::pseudo_rand(i * 31 + 2);
+            let rt = Self::pseudo_rand(i * 31 + 3);
+            self.stars.push(SplashStar {
+                x: rect.left() + rx * rect.width(),
+                y: rect.top() + ry * sky_height * 0.52,
+                radius: rr * 1.4 + 0.6,
+                speed: 1.0 + rt * 2.2,
+                phase: rx * 100.0,
+            });
+        }
+
+        // 3. Retro Sliced Sun
+        let sun_radius = rect.width().min(rect.height()) * 0.19;
+        let sun_center = egui::pos2(center_x, horizon_y - sun_radius * 0.30);
+        let sun_steps = 40usize;
+        let is_sun_slice_drawn = |idx: usize| -> bool {
+            if idx >= sun_steps {
+                return false;
+            }
+            let st = idx as f32 / sun_steps as f32;
+            if st > 0.45 {
+                let slice_t = (st - 0.45) / 0.55;
+                let slice_val = (slice_t * 15.0).fract();
+                let gap_threshold = 0.2 + slice_t * 0.6;
+                if slice_val < gap_threshold {
+                    return false;
+                }
+            }
+            true
+        };
+
+        for i in 0..sun_steps {
+            if !is_sun_slice_drawn(i) {
+                continue;
+            }
+            let t = i as f32 / sun_steps as f32;
+            let next_t = (i + 1) as f32 / sun_steps as f32;
+
+            let y_min = sun_center.y - sun_radius + t * sun_radius * 2.0;
+            let mut y_max = sun_center.y - sun_radius + next_t * sun_radius * 2.0;
+            if is_sun_slice_drawn(i + 1) {
+                y_max = (y_max + 0.6).min(sun_center.y + sun_radius);
+            }
+            if y_min >= horizon_y {
+                continue;
+            }
+            y_max = y_max.min(horizon_y);
+            if y_max <= y_min {
+                continue;
+            }
+
+            let r = (225.0 * (1.0 - t) + 195.0 * t) as u8;
+            let g = (175.0 * (1.0 - t) + 42.0 * t) as u8;
+            let b = (32.0 * (1.0 - t) + 112.0 * t) as u8;
+            let color = egui::Color32::from_rgb(r, g, b);
+
+            let sub_steps = 2usize;
+            let mut pts = Vec::with_capacity((sub_steps + 1) * 2);
+            for k in 0..=sub_steps {
+                let frac = k as f32 / sub_steps as f32;
+                let yk = y_min + (y_max - y_min) * frac;
+                let dy = (yk - sun_center.y).clamp(-sun_radius, sun_radius);
+                let dx = (sun_radius * sun_radius - dy * dy).max(0.0).sqrt();
+                pts.push(egui::pos2(sun_center.x + dx, yk));
+            }
+            for k in (0..=sub_steps).rev() {
+                let frac = k as f32 / sub_steps as f32;
+                let yk = y_min + (y_max - y_min) * frac;
+                let dy = (yk - sun_center.y).clamp(-sun_radius, sun_radius);
+                let dx = (sun_radius * sun_radius - dy * dy).max(0.0).sqrt();
+                if dx > 0.5 {
+                    pts.push(egui::pos2(sun_center.x - dx, yk));
+                }
+            }
+            if pts.len() >= 3 {
+                push_shape(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
+            }
+        }
+
+        // 4. Layered Wireframe Mountains (sculpted lower across the central sun valley so the sun remains iconic)
+        let mtn_fill = Self::tint_rgb(24, 22, 54);
+        let mtn_stroke = egui::Stroke::new(1.1_f32, Self::tint_rgb(105, 58, 225));
+        for i in 0..25 {
+            let h1 = Self::pseudo_rand(i * 17);
+            let h2 = Self::pseudo_rand(i * 17 + 1);
+            let h3 = Self::pseudo_rand(i * 17 + 2);
+
+            let cx = rect.left() + h1 * rect.width();
+            let cy = horizon_y;
+            let center_dist = ((cx - center_x).abs() / (rect.width() * 0.5)).clamp(0.0, 1.0);
+            let valley_half_span = (sun_radius / (rect.width() * 0.5).max(1.0)).clamp(0.38, 0.72);
+            let valley_scale = (center_dist / valley_half_span).clamp(0.16, 1.0);
+            let width = rect.width() * (0.09 + h2 * 0.20);
+            let height = sky_height * (0.11 + h3 * 0.42) * valley_scale;
+
+            let p1 = egui::pos2(cx - width, cy);
+            let p2 = egui::pos2(cx + width, cy);
+            let p3 = egui::pos2(cx, cy - height);
+
+            push_shape(egui::Shape::convex_polygon(
+                vec![p1, p2, p3],
+                mtn_fill,
+                mtn_stroke,
+            ));
+
+            let ridge_offset = (Self::pseudo_rand(i * 17 + 3) - 0.5) * 0.4;
+            push_shape(egui::Shape::line_segment(
+                [p3, egui::pos2(cx + width * ridge_offset, cy)],
+                mtn_stroke,
+            ));
+        }
+
+        // 5. Vertical Radiating Perspective Grid Lines + Horizon Laser Line
+        let num_v_lines = 40;
+        for i in 0..=num_v_lines {
+            let t = i as f32 / num_v_lines as f32;
+            let bottom_x = rect.left() + (t - 0.5) * rect.width() * 8.0;
+            let dx = bottom_x - center_x;
+            let dy = rect.bottom() - horizon_y;
+            let end_pt = if bottom_x < rect.left() && dx.abs() > 1e-3 {
+                let clip_t = (rect.left() - center_x) / dx;
+                egui::pos2(rect.left(), horizon_y + clip_t * dy)
+            } else if bottom_x > rect.right() && dx.abs() > 1e-3 {
+                let clip_t = (rect.right() - center_x) / dx;
+                egui::pos2(rect.right(), horizon_y + clip_t * dy)
+            } else {
+                egui::pos2(bottom_x, rect.bottom())
+            };
+
+            push_shape(egui::Shape::line_segment(
+                [egui::pos2(center_x, horizon_y), end_pt],
+                egui::Stroke::new(1.0_f32, self.grid_color),
+            ));
+        }
+        push_shape(egui::Shape::line_segment(
+            [
+                egui::pos2(rect.left(), horizon_y),
+                egui::pos2(rect.right(), horizon_y),
+            ],
+            egui::Stroke::new(1.5_f32, Self::tint_rgb(255, 95, 205)),
+        ));
+
+        // Pre-tessellate all static background primitives once and merge into a single cached Mesh
+        let mut tessellator = egui::epaint::Tessellator::new(
+            ppp,
+            egui::epaint::TessellationOptions::default(),
+            [1, 1],
+            Vec::new(),
+        );
+        let primitives = tessellator.tessellate_shapes(static_shapes);
+        let mut merged = egui::Mesh::default();
+        for prim in primitives {
+            if let egui::epaint::Primitive::Mesh(m) = prim.primitive
+                && m.texture_id == egui::TextureId::default()
+            {
+                merged.append(m);
+            }
+        }
+        self.static_bg_mesh = std::sync::Arc::new(merged);
+    }
+
+    /// Appends the animated elements of the Splash background (twinkling starfield + scrolling
+    /// perspective horizontal grid lines) directly into `mesh`, bypassing `epaint::Tessellator`.
+    pub fn append_dynamic_bg(&self, mesh: &mut egui::Mesh, rect: egui::Rect, time: f32, ppp: f32) {
+        let num_h_lines = 30usize;
+        mesh.reserve_vertices(self.stars.len() * 8 + num_h_lines * 8);
+        mesh.reserve_triangles(self.stars.len() * 6 + num_h_lines * 6);
+        let white_uv = egui::pos2(0.0, 0.0);
+        let feather = (1.0 / ppp.max(1.0)).clamp(0.4, 1.0);
+
+        for star in &self.stars {
+            let twinkle = ((time * star.speed + star.phase).sin() * 0.5 + 0.5) * 205.0 + 50.0;
+            let core_col = egui::Color32::from_rgba_unmultiplied(
+                self.star_base.r(),
+                self.star_base.g(),
+                self.star_base.b(),
+                twinkle as u8,
+            );
+            let r = star.radius;
+            let rf = r + feather;
+            let base = mesh.vertices.len() as u32;
+            for &(dx, dy, col) in &[
+                (0.0, -r, core_col),
+                (r, 0.0, core_col),
+                (0.0, r, core_col),
+                (-r, 0.0, core_col),
+                (0.0, -rf, egui::Color32::TRANSPARENT),
+                (rf, 0.0, egui::Color32::TRANSPARENT),
+                (0.0, rf, egui::Color32::TRANSPARENT),
+                (-rf, 0.0, egui::Color32::TRANSPARENT),
+            ] {
+                mesh.vertices.push(egui::epaint::Vertex {
+                    pos: egui::pos2(star.x + dx, star.y + dy),
+                    uv: white_uv,
+                    color: col,
+                });
+            }
+            mesh.indices.extend_from_slice(&[
+                base,
+                base + 1,
+                base + 2,
+                base,
+                base + 2,
+                base + 3,
+                base,
+                base + 4,
+                base + 5,
+                base,
+                base + 5,
+                base + 1,
+                base + 1,
+                base + 5,
+                base + 6,
+                base + 1,
+                base + 6,
+                base + 2,
+                base + 2,
+                base + 6,
+                base + 7,
+                base + 2,
+                base + 7,
+                base + 3,
+                base + 3,
+                base + 7,
+                base + 4,
+                base + 3,
+                base + 4,
+                base,
+            ]);
+        }
+
+        let horizon_y = self.horizon_y;
+        let floor_h = (rect.bottom() - horizon_y).max(1.0);
+        let frac_t = (time * 1.5).fract();
+        for i in 0..num_h_lines {
+            let offset = (i as f32 - frac_t) / num_h_lines as f32;
+            if offset <= 0.0 {
+                continue;
+            }
+            let depth = offset.powf(3.0);
+            let y = horizon_y + floor_h * depth;
+            if y >= rect.bottom() {
+                continue;
+            }
+            let thickness = 1.0 + offset * 2.0;
+            let half_t = thickness * 0.5;
+            let alpha = (offset * 3.2).clamp(0.15, 1.0);
+            let col = egui::Color32::from_rgba_unmultiplied(
+                self.grid_color.r(),
+                self.grid_color.g(),
+                self.grid_color.b(),
+                (255.0 * alpha) as u8,
+            );
+
+            let y0_out = (y - half_t - feather).max(horizon_y);
+            let y0_in = (y - half_t).max(horizon_y);
+            let y1_in = (y + half_t).min(rect.bottom());
+            let y1_out = (y + half_t + feather).min(rect.bottom());
+
+            let base = mesh.vertices.len() as u32;
+            for &(yv, c) in &[
+                (y0_out, egui::Color32::TRANSPARENT),
+                (y0_in, col),
+                (y1_in, col),
+                (y1_out, egui::Color32::TRANSPARENT),
+            ] {
+                mesh.vertices.push(egui::epaint::Vertex {
+                    pos: egui::pos2(rect.left(), yv),
+                    uv: white_uv,
+                    color: c,
+                });
+                mesh.vertices.push(egui::epaint::Vertex {
+                    pos: egui::pos2(rect.right(), yv),
+                    uv: white_uv,
+                    color: c,
+                });
+            }
+            mesh.indices.extend_from_slice(&[
+                base,
+                base + 1,
+                base + 2,
+                base + 1,
+                base + 3,
+                base + 2,
+                base + 2,
+                base + 3,
+                base + 4,
+                base + 3,
+                base + 5,
+                base + 4,
+                base + 4,
+                base + 5,
+                base + 6,
+                base + 5,
+                base + 7,
+                base + 6,
+            ]);
+        }
+    }
+
+    #[allow(dead_code)]
+    pub fn build_dynamic_bg_mesh(&self, rect: egui::Rect, time: f32, ppp: f32) -> egui::Mesh {
+        let mut mesh = egui::Mesh::default();
+        self.append_dynamic_bg(&mut mesh, rect, time, ppp);
+        mesh
+    }
+
+    pub fn build_combined_bg_primitive(
+        &mut self,
+        ctx: &egui::Context,
+        rect: egui::Rect,
+        time: f32,
+    ) -> egui::ClippedPrimitive {
+        self.ensure_background(ctx, rect);
+        let mut mesh = (*self.static_bg_mesh).clone();
+        self.append_dynamic_bg(&mut mesh, rect, time, ctx.pixels_per_point());
+        if !self.title_base_mesh.is_empty() {
+            mesh.append_ref(&self.title_base_mesh);
+        }
+        egui::ClippedPrimitive {
+            clip_rect: rect,
+            primitive: egui::epaint::Primitive::Mesh(mesh),
+        }
+    }
+
+    /// Builds or updates the cached `RustTracker` chrome title mesh in-place.
+    /// Full font layout and bevel/slice geometry construction happen only when `title_rect` or
+    /// `pixels_per_point` changes; on all subsequent frames only the 20 interior slice colors
+    /// are updated in-place on `self.title_base_mesh` and appended directly into the combined
+    /// Splash primitive after `egui_ctx.tessellate()`.
+    pub fn update_title_mesh(
+        &mut self,
+        ui: &egui::Ui,
+        title_rect: egui::Rect,
+        gradient_extent: f32,
+        font_size: f32,
+        time: f32,
+    ) {
+        let ppp = ui.ctx().pixels_per_point().max(0.5);
+        let current_font_tex_size = ui.ctx().fonts_mut(|f| f.font_image_size());
+        let steps = 20usize;
+        let rect_same = (title_rect.min.x - self.cached_title_rect.min.x).abs() < 0.5
+            && (title_rect.min.y - self.cached_title_rect.min.y).abs() < 0.5
+            && (title_rect.max.x - self.cached_title_rect.max.x).abs() < 0.5
+            && (title_rect.max.y - self.cached_title_rect.max.y).abs() < 0.5
+            && (ppp - self.cached_title_ppp).abs() < 0.01
+            && self.cached_font_tex_size == current_font_tex_size
+            && !self.title_base_mesh.is_empty();
+
+        if !rect_same {
+            self.cached_title_rect = title_rect;
+            self.cached_title_ppp = ppp;
+
+            let painter = ui.painter();
+            let font_id = egui::FontId::new(font_size, egui::FontFamily::Name("Orbitron".into()));
+            let galley =
+                painter.layout_no_wrap("RustTracker".to_string(), font_id, egui::Color32::WHITE);
+            let base_pos = egui::Align2::CENTER_CENTER
+                .anchor_size(title_rect.center(), galley.size())
+                .min;
+            let snapped_pos = egui::pos2(
+                (base_pos.x * ppp).round() / ppp,
+                (base_pos.y * ppp).round() / ppp,
+            );
+            let font_tex_size = ui.ctx().fonts_mut(|f| f.font_image_size());
+            self.cached_font_tex_size = font_tex_size;
+            let uv_norm = egui::vec2(
+                1.0 / (font_tex_size[0].max(1) as f32),
+                1.0 / (font_tex_size[1].max(1) as f32),
+            );
+
+            let mut glyph_quads = Vec::with_capacity(16);
+            for placed_row in &galley.rows {
+                let row_pos = snapped_pos + placed_row.pos.to_vec2();
+                for q in placed_row.row.visuals.mesh.vertices.chunks_exact(4) {
+                    let x_min =
+                        q[0].pos.x.min(q[1].pos.x).min(q[2].pos.x).min(q[3].pos.x) + row_pos.x;
+                    let x_max =
+                        q[0].pos.x.max(q[1].pos.x).max(q[2].pos.x).max(q[3].pos.x) + row_pos.x;
+                    let y_min =
+                        q[0].pos.y.min(q[1].pos.y).min(q[2].pos.y).min(q[3].pos.y) + row_pos.y;
+                    let y_max =
+                        q[0].pos.y.max(q[1].pos.y).max(q[2].pos.y).max(q[3].pos.y) + row_pos.y;
+                    let u_min = q[0].uv.x.min(q[1].uv.x).min(q[2].uv.x).min(q[3].uv.x) * uv_norm.x;
+                    let u_max = q[0].uv.x.max(q[1].uv.x).max(q[2].uv.x).max(q[3].uv.x) * uv_norm.x;
+                    let v_min = q[0].uv.y.min(q[1].uv.y).min(q[2].uv.y).min(q[3].uv.y) * uv_norm.y;
+                    let v_max = q[0].uv.y.max(q[1].uv.y).max(q[2].uv.y).max(q[3].uv.y) * uv_norm.y;
+                    glyph_quads.push((x_min, y_min, x_max, y_max, u_min, v_min, u_max, v_max));
+                }
+            }
+
+            let mut title_mesh = egui::Mesh::with_texture(egui::TextureId::default());
+            title_mesh.reserve_vertices(glyph_quads.len() * (8 + steps) * 4);
+            title_mesh.reserve_triangles(glyph_quads.len() * (8 + steps) * 2);
+
+            // 1. Silver Outer Bevel (3px diagonal offsets)
+            let silver_color = egui::Color32::from_rgb(200, 220, 255);
+            for (dx, dy) in [(-3.0, -3.0), (3.0, -3.0), (-3.0, 3.0), (3.0, 3.0)] {
+                for &(x_min, y_min, x_max, y_max, u_min, v_min, u_max, v_max) in &glyph_quads {
+                    title_mesh.add_rect_with_uv(
+                        egui::Rect::from_min_max(
+                            egui::pos2(x_min + dx, y_min + dy),
+                            egui::pos2(x_max + dx, y_max + dy),
+                        ),
+                        egui::Rect::from_min_max(
+                            egui::pos2(u_min, v_min),
+                            egui::pos2(u_max, v_max),
+                        ),
+                        silver_color,
+                    );
+                }
+            }
+
+            // 2. Black Inner Outline (1px diagonal offsets)
+            for (dx, dy) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
+                for &(x_min, y_min, x_max, y_max, u_min, v_min, u_max, v_max) in &glyph_quads {
+                    title_mesh.add_rect_with_uv(
+                        egui::Rect::from_min_max(
+                            egui::pos2(x_min + dx, y_min + dy),
+                            egui::pos2(x_max + dx, y_max + dy),
+                        ),
+                        egui::Rect::from_min_max(
+                            egui::pos2(u_min, v_min),
+                            egui::pos2(u_max, v_max),
+                        ),
+                        egui::Color32::BLACK,
+                    );
+                }
+            }
+
+            // 3. Sliced Chrome Interior template
+            self.title_slice_ranges.clear();
+            self.title_slice_ranges.reserve(steps);
+            let top_y = title_rect.center().y - gradient_extent;
+            let bottom_y = title_rect.center().y + gradient_extent;
+            let height = bottom_y - top_y;
+
+            for i in 0..steps {
+                let t = i as f32 / steps as f32;
+                let next_t = (i + 1) as f32 / steps as f32;
+                let min_y = top_y + t * height;
+                let max_y = top_y + next_t * height;
+                let v_start = title_mesh.vertices.len();
+
+                for &(x_min, y_min, x_max, y_max, u_min, v_min, u_max, v_max) in &glyph_quads {
+                    let sy0 = min_y.max(y_min);
+                    let sy1 = max_y.min(y_max);
+                    let gh = y_max - y_min;
+                    if sy1 > sy0 && gh > 0.0 {
+                        let f0 = (sy0 - y_min) / gh;
+                        let f1 = (sy1 - y_min) / gh;
+                        let sv0 = v_min + (v_max - v_min) * f0;
+                        let sv1 = v_min + (v_max - v_min) * f1;
+                        let idx = title_mesh.vertices.len() as u32;
+                        title_mesh.vertices.extend_from_slice(&[
+                            egui::epaint::Vertex {
+                                pos: egui::pos2(x_min, sy0),
+                                uv: egui::pos2(u_min, sv0),
+                                color: egui::Color32::WHITE,
+                            },
+                            egui::epaint::Vertex {
+                                pos: egui::pos2(x_max, sy0),
+                                uv: egui::pos2(u_max, sv0),
+                                color: egui::Color32::WHITE,
+                            },
+                            egui::epaint::Vertex {
+                                pos: egui::pos2(x_max, sy1),
+                                uv: egui::pos2(u_max, sv1),
+                                color: egui::Color32::WHITE,
+                            },
+                            egui::epaint::Vertex {
+                                pos: egui::pos2(x_min, sy1),
+                                uv: egui::pos2(u_min, sv1),
+                                color: egui::Color32::WHITE,
+                            },
+                        ]);
+                        title_mesh.indices.extend_from_slice(&[
+                            idx,
+                            idx + 1,
+                            idx + 2,
+                            idx,
+                            idx + 2,
+                            idx + 3,
+                        ]);
+                    }
+                }
+                let v_end = title_mesh.vertices.len();
+                self.title_slice_ranges.push((v_start, v_end));
+            }
+
+            self.title_base_mesh = title_mesh;
+        }
+
+        // Fast per-frame color update across the 20 chrome slices (zero glyph layout or tessellation)
+        let chrome_palette = |t_pos: f32| -> egui::Color32 {
+            let scroll_speed = 0.1;
+            let mut color_t = (t_pos + time * scroll_speed).fract();
+            if color_t < 0.0 {
+                color_t += 1.0;
+            }
+            if color_t < 0.48 {
+                let sky_t = color_t / 0.48;
+                let r = (0.0 * (1.0 - sky_t) + 10.0 * sky_t) as u8;
+                let g = (220.0 * (1.0 - sky_t) + 30.0 * sky_t) as u8;
+                let b = (255.0 * (1.0 - sky_t) + 120.0 * sky_t) as u8;
+                egui::Color32::from_rgb(r, g, b)
+            } else if color_t < 0.52 {
+                egui::Color32::WHITE
+            } else {
+                let ground_t = (color_t - 0.52) / 0.48;
+                let r = (50.0 * (1.0 - ground_t) + 255.0 * ground_t) as u8;
+                let g = (15.0 * (1.0 - ground_t) + 160.0 * ground_t) as u8;
+                let b = (0.0 * (1.0 - ground_t) + 50.0 * ground_t) as u8;
+                egui::Color32::from_rgb(r, g, b)
+            }
+        };
+
+        for (i, &(v_start, v_end)) in self.title_slice_ranges.iter().enumerate() {
+            let t = i as f32 / steps as f32;
+            let next_t = (i + 1) as f32 / steps as f32;
+            let color_top = chrome_palette(t);
+            let color_bot = chrome_palette((t + next_t) * 0.5);
+            for quad in self.title_base_mesh.vertices[v_start..v_end].chunks_exact_mut(4) {
+                quad[0].color = color_top;
+                quad[1].color = color_top;
+                quad[2].color = color_bot;
+                quad[3].color = color_bot;
+            }
+        }
+    }
+}
+
+/// Throttles formatted telemetry strings in the Stats panel to ~10 Hz (every 100 ms)
+/// so `egui`'s `GalleyCache` achieves a >90% cache hit rate while making numbers
+/// steady and readable for human eyes.
+#[derive(Default)]
+pub(crate) struct StatsDisplayCache {
+    pub last_update_time: f64,
+    pub initialized: bool,
+    pub last_file_loaded: bool,
+    pub fps_line: String,
+    pub cpu_active_line: String,
+    pub cpu_fft_line: String,
+    pub gpu_compute_line: Option<String>,
+    pub cpu_decode_line: String,
+    pub vis_shader_line: Option<String>,
+    pub audio_buffer_line: String,
+    pub audio_buffer_color: egui::Color32,
+    pub video_buffer_line: Option<(String, egui::Color32)>,
+    pub phase_lines: [(String, egui::Color32); 7],
+    pub total_phases_line: String,
+}
+
+impl StatsDisplayCache {
+    pub fn update_if_needed(
+        &mut self,
+        state: &crate::state::AppState,
+        has_video_state: bool,
+        now_time: f64,
+    ) {
+        if self.initialized
+            && self.last_file_loaded == state.file_loaded
+            && (now_time - self.last_update_time).abs() < 0.10
+        {
+            return;
+        }
+        self.initialized = true;
+        self.last_file_loaded = state.file_loaded;
+        self.last_update_time = now_time;
+
+        self.fps_line = format!(
+            "FPS: {:.1} ({:.2} ms)",
+            state.current_fps,
+            1000.0 / state.current_fps.max(1.0)
+        );
+        let cpu_active_us = state.stats.phase_lock_update_us
+            + state.stats.phase_snapshot_us
+            + state.stats.phase_egui_layout_us
+            + state.stats.phase_encode_us
+            + state.stats.phase_post_us;
+        self.cpu_active_line = format!("CPU Active Total: {:.2} ms", cpu_active_us / 1000.0);
+        self.cpu_fft_line = if state.video_mode == 3
+            && (state.has_video_stream || state.video_frame_rx.is_some() || has_video_state)
+        {
+            "CPU FFT: Off (Fullscreen Video)".to_string()
+        } else {
+            format!("CPU FFT: {:.2} ms", state.stats.fft_us / 1000.0)
+        };
+        self.gpu_compute_line =
+            if state.file_loaded && state.gpu_fft && state.stats.gpu_fft_us > 0.0 {
+                Some(format!(
+                    "GPU Compute: {:.2} ms",
+                    state.stats.gpu_fft_us / 1000.0
+                ))
+            } else {
+                None
+            };
+        self.cpu_decode_line = format!("CPU Decode: {:.2} ms", state.stats.decode_us / 1000.0);
+
+        let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
+        let mut total_vis_us = state.stats.shader_us;
+        if vis_def.requires_fire {
+            total_vis_us += state.stats.fire_us;
+        }
+        self.vis_shader_line = if state.file_loaded && total_vis_us > 0.0 {
+            Some(format!(
+                "Visualization Shader (GPU): {:.2} ms",
+                total_vis_us / 1000.0
+            ))
+        } else {
+            None
+        };
+
+        if !state.file_loaded {
+            self.audio_buffer_line = "Audio Buffer: Idle".to_string();
+            self.audio_buffer_color = egui::Color32::GRAY;
+        } else {
+            let buffer_label = if state.duration_seconds <= 0.0 {
+                "Network Buffer"
+            } else {
+                "Audio Buffer"
+            };
+            self.audio_buffer_line = format!(
+                "{}: {:.1}%",
+                buffer_label, state.stats.audio_buffer_fill_pct
+            );
+            self.audio_buffer_color = if state.stats.audio_buffer_fill_pct < 5.0 {
+                egui::Color32::RED
+            } else if state.stats.audio_buffer_fill_pct > 95.0 {
+                egui::Color32::YELLOW
+            } else {
+                egui::Color32::GREEN
+            };
+        }
+
+        self.video_buffer_line = if state.file_loaded && state.video_frame_rx.is_some() {
+            let col = if state.stats.video_buffer_fill_pct < 1.0 {
+                egui::Color32::RED
+            } else {
+                egui::Color32::YELLOW
+            };
+            Some((
+                format!("Video Buffer: {:.1}%", state.stats.video_buffer_fill_pct),
+                col,
+            ))
+        } else {
+            None
+        };
+
+        let phases = [
+            ("  Lock+Update", state.stats.phase_lock_update_us),
+            ("  Snapshot", state.stats.phase_snapshot_us),
+            ("  Surface Acq (VSync Wait)", state.stats.phase_surface_us),
+            ("  UI Layout + Tess", state.stats.phase_egui_layout_us),
+            ("  Cmd Record (CPU)", state.stats.phase_encode_us),
+            ("  Submit + Present", state.stats.phase_submit_us),
+            ("  Post Write", state.stats.phase_post_us),
+        ];
+        let total_phases: f32 = phases.iter().map(|(_, v)| v).sum();
+        for (idx, (name, val)) in phases.iter().enumerate() {
+            let color = if *name == "  Surface Acq (VSync Wait)" {
+                egui::Color32::from_rgb(160, 160, 160)
+            } else if *name == "  Submit + Present" {
+                if *val > 4000.0 {
+                    egui::Color32::YELLOW
+                } else {
+                    egui::Color32::from_rgb(160, 160, 160)
+                }
+            } else if *val > 2500.0 {
+                egui::Color32::RED
+            } else if *val > 1500.0 {
+                egui::Color32::YELLOW
+            } else {
+                egui::Color32::from_rgb(160, 160, 160)
+            };
+            self.phase_lines[idx] = (format!("{}: {:.2} ms", name, val / 1000.0), color);
+        }
+        self.total_phases_line = format!("  Total Frame Loop: {:.2} ms", total_phases / 1000.0);
+    }
+}
+
 pub struct VulkanEngine {
     instance: wgpu::Instance,
     surface: Option<wgpu::Surface<'static>>,
     device: wgpu::Device,
     queue: wgpu::Queue,
+    pub adapter_info: wgpu::AdapterInfo,
     pub config: wgpu::SurfaceConfiguration,
     pub size: winit::dpi::PhysicalSize<u32>,
     render_pipelines: Vec<wgpu::RenderPipeline>,
@@ -352,6 +1203,10 @@ pub struct VulkanEngine {
     pub last_lyric_line_idx: Option<usize>,
     pub current_lyric_mesh_text: String,
     pub fire_intensity: f32,
+    pub(crate) splash_cache: SplashCache,
+    pub(crate) stats_cache: StatsDisplayCache,
+    pub(crate) is_game_mode: bool,
+    pub(crate) last_ui_rects_data: [[f32; 4]; 3],
 }
 
 pub fn generate_lamp_mesh() -> (Vec<Vertex>, Vec<u32>) {
@@ -939,19 +1794,8 @@ pub(crate) fn generate_neon_room_mesh() -> (Vec<Vertex>, Vec<u32>) {
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
 
-    // 1. FLOOR & STAGE (mat = 0.0)
-    room_add_quad(
-        &mut vertices,
-        &mut indices,
-        [-11.0, -1.6, 9.0],
-        [11.0, -1.6, 9.0],
-        [11.0, -1.6, -9.0],
-        [-11.0, -1.6, -9.0],
-        [0.0, 1.0, 0.0],
-        0.0,
-        0.0,
-    );
-
+    // Front-to-back draw order for Early-Z culling: draw interior stage riser, speakers,
+    // acoustic diffuser slats, and observation window BEFORE the enclosing room floor/walls/ceiling.
     // Front stage platform riser
     room_add_box(
         &mut vertices,
@@ -971,68 +1815,6 @@ pub(crate) fn generate_neon_room_mesh() -> (Vec<Vertex>, Vec<u32>) {
         0.0,
         3.0,
         5.0,
-    );
-
-    // 2. WALLS & CEILING (mat = 0.5)
-    // Back acoustic wall (+Z)
-    room_add_quad(
-        &mut vertices,
-        &mut indices,
-        [-11.0, -1.6, 9.0],
-        [-11.0, 5.0, 9.0],
-        [11.0, 5.0, 9.0],
-        [11.0, -1.6, 9.0],
-        [0.0, 0.0, -1.0],
-        0.0,
-        0.5,
-    );
-    // Rear studio wall (-Z)
-    room_add_quad(
-        &mut vertices,
-        &mut indices,
-        [11.0, -1.6, -9.0],
-        [11.0, 5.0, -9.0],
-        [-11.0, 5.0, -9.0],
-        [-11.0, -1.6, -9.0],
-        [0.0, 0.0, 1.0],
-        0.0,
-        0.5,
-    );
-    // Left wall (-X)
-    room_add_quad(
-        &mut vertices,
-        &mut indices,
-        [-11.0, -1.6, -9.0],
-        [-11.0, 5.0, -9.0],
-        [-11.0, 5.0, 9.0],
-        [-11.0, -1.6, 9.0],
-        [1.0, 0.0, 0.0],
-        0.0,
-        0.5,
-    );
-    // Right wall (+X)
-    room_add_quad(
-        &mut vertices,
-        &mut indices,
-        [11.0, -1.6, 9.0],
-        [11.0, 5.0, 9.0],
-        [11.0, 5.0, -9.0],
-        [11.0, -1.6, -9.0],
-        [-1.0, 0.0, 0.0],
-        0.0,
-        0.5,
-    );
-    // Ceiling (+Y)
-    room_add_quad(
-        &mut vertices,
-        &mut indices,
-        [-11.0, 5.0, -9.0],
-        [11.0, 5.0, -9.0],
-        [11.0, 5.0, 9.0],
-        [-11.0, 5.0, 9.0],
-        [0.0, -1.0, 0.0],
-        0.0,
-        0.5,
     );
 
     // 3. ACOUSTIC DIFFUSER SLATS (mat = 6.0) on back wall
@@ -1419,6 +2201,110 @@ pub(crate) fn generate_neon_room_mesh() -> (Vec<Vertex>, Vec<u32>) {
             2.0,
         );
     }
+
+    // 5. ENCLOSING ROOM SHELL (drawn last so foreground objects occlude via Early-Z,
+    // subdivided into 8x8 patches so per-vertex 12-speaker lighting captures smooth localized pools)
+    let mut room_add_subdivided_quad = |p0: [f32; 3],
+                                        p1: [f32; 3],
+                                        p2: [f32; 3],
+                                        p3: [f32; 3],
+                                        normal: [f32; 3],
+                                        ch: f32,
+                                        mat: f32| {
+        const SUB: usize = 8;
+        let lerp3 = |a: [f32; 3], b: [f32; 3], t: f32| -> [f32; 3] {
+            [
+                a[0] + (b[0] - a[0]) * t,
+                a[1] + (b[1] - a[1]) * t,
+                a[2] + (b[2] - a[2]) * t,
+            ]
+        };
+        let bilerp = |u: f32, v: f32| -> [f32; 3] {
+            let bot = lerp3(p0, p1, u);
+            let top = lerp3(p3, p2, u);
+            lerp3(bot, top, v)
+        };
+        for iv in 0..SUB {
+            let v0 = (iv as f32) / (SUB as f32);
+            let v1 = ((iv + 1) as f32) / (SUB as f32);
+            for iu in 0..SUB {
+                let u0 = (iu as f32) / (SUB as f32);
+                let u1 = ((iu + 1) as f32) / (SUB as f32);
+                room_add_quad(
+                    &mut vertices,
+                    &mut indices,
+                    bilerp(u0, v0),
+                    bilerp(u1, v0),
+                    bilerp(u1, v1),
+                    bilerp(u0, v1),
+                    normal,
+                    ch,
+                    mat,
+                );
+            }
+        }
+    };
+
+    // Floor (mat = 0.0)
+    room_add_subdivided_quad(
+        [-11.0, -1.6, 9.0],
+        [11.0, -1.6, 9.0],
+        [11.0, -1.6, -9.0],
+        [-11.0, -1.6, -9.0],
+        [0.0, 1.0, 0.0],
+        0.0,
+        0.0,
+    );
+    // Back acoustic wall (+Z, mat = 0.5)
+    room_add_subdivided_quad(
+        [-11.0, -1.6, 9.0],
+        [-11.0, 5.0, 9.0],
+        [11.0, 5.0, 9.0],
+        [11.0, -1.6, 9.0],
+        [0.0, 0.0, -1.0],
+        0.0,
+        0.5,
+    );
+    // Rear studio wall (-Z, mat = 0.5)
+    room_add_subdivided_quad(
+        [11.0, -1.6, -9.0],
+        [11.0, 5.0, -9.0],
+        [-11.0, 5.0, -9.0],
+        [-11.0, -1.6, -9.0],
+        [0.0, 0.0, 1.0],
+        0.0,
+        0.5,
+    );
+    // Left wall (-X, mat = 0.5)
+    room_add_subdivided_quad(
+        [-11.0, -1.6, -9.0],
+        [-11.0, 5.0, -9.0],
+        [-11.0, 5.0, 9.0],
+        [-11.0, -1.6, 9.0],
+        [1.0, 0.0, 0.0],
+        0.0,
+        0.5,
+    );
+    // Right wall (+X, mat = 0.5)
+    room_add_subdivided_quad(
+        [11.0, -1.6, 9.0],
+        [11.0, 5.0, 9.0],
+        [11.0, 5.0, -9.0],
+        [11.0, -1.6, -9.0],
+        [-1.0, 0.0, 0.0],
+        0.0,
+        0.5,
+    );
+    // Ceiling (+Y, mat = 0.5)
+    room_add_subdivided_quad(
+        [-11.0, 5.0, -9.0],
+        [11.0, 5.0, -9.0],
+        [11.0, 5.0, 9.0],
+        [-11.0, 5.0, 9.0],
+        [0.0, -1.0, 0.0],
+        0.0,
+        0.5,
+    );
 
     (vertices, indices)
 }
@@ -2651,6 +3537,7 @@ impl VulkanEngine {
             })
             .await
             .unwrap();
+        let adapter_info = adapter.get_info();
 
         let mut required_features = wgpu::Features::empty();
         if adapter
@@ -2753,7 +3640,7 @@ impl VulkanEngine {
             .unwrap_or(surface_caps.formats[0]);
 
         // Default to strict hardware VSync (PresentMode::Fifo / VK_PRESENT_MODE_FIFO_KHR)
-        // unless uncapped mode or an explicit override is requested.
+        // across all platforms unless uncapped mode or an explicit override is requested.
         // Avoid defaulting to FifoRelaxed on desktop: in Windows windowed mode under DWM/MPO,
         // FifoRelaxed tears/flickers whenever a frame arrives slightly after VBlank.
         let present_mode = if crate::state::UNCAPPED_PRESENT_MODE.load(Ordering::Relaxed) {
@@ -3506,6 +4393,11 @@ impl VulkanEngine {
             cache: pipeline_cache_ref,
         });
 
+        let hud_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("HUD Pipeline Layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
         let hud_source = resolve_shader_includes(include_str!("shaders/hud.wgsl"));
         let hud_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("HUD Shader"),
@@ -3513,7 +4405,7 @@ impl VulkanEngine {
         });
         let hud_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("HUD Pipeline"),
-            layout: Some(&render_pipeline_layout),
+            layout: Some(&hud_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &hud_shader,
                 entry_point: Some("vs_main"),
@@ -5234,89 +6126,25 @@ impl VulkanEngine {
                     (vertices, indices)
                 }
                 crate::state::Geometry::UnitBox => {
-                    let mut vertices = Vec::with_capacity(24);
-                    let mut indices = Vec::with_capacity(36);
-                    let faces: [([f32; 3], [[f32; 3]; 4]); 6] = [
-                        // Front (+Z) — normal.z > 0.5
-                        (
-                            [0.0, 0.0, 1.0],
-                            [
-                                [-0.5, -0.5, 0.5],
-                                [0.5, -0.5, 0.5],
-                                [0.5, 0.5, 0.5],
-                                [-0.5, 0.5, 0.5],
-                            ],
-                        ),
-                        // Back (-Z)
-                        (
-                            [0.0, 0.0, -1.0],
-                            [
-                                [0.5, -0.5, -0.5],
-                                [-0.5, -0.5, -0.5],
-                                [-0.5, 0.5, -0.5],
-                                [0.5, 0.5, -0.5],
-                            ],
-                        ),
-                        // Left (-X)
-                        (
-                            [-1.0, 0.0, 0.0],
-                            [
-                                [-0.5, -0.5, -0.5],
-                                [-0.5, -0.5, 0.5],
-                                [-0.5, 0.5, 0.5],
-                                [-0.5, 0.5, -0.5],
-                            ],
-                        ),
-                        // Right (+X)
-                        (
-                            [1.0, 0.0, 0.0],
-                            [
-                                [0.5, -0.5, 0.5],
-                                [0.5, -0.5, -0.5],
-                                [0.5, 0.5, -0.5],
-                                [0.5, 0.5, 0.5],
-                            ],
-                        ),
-                        // Top (+Y)
-                        (
-                            [0.0, 1.0, 0.0],
-                            [
-                                [-0.5, 0.5, 0.5],
-                                [0.5, 0.5, 0.5],
-                                [0.5, 0.5, -0.5],
-                                [-0.5, 0.5, -0.5],
-                            ],
-                        ),
-                        // Bottom (-Y)
-                        (
-                            [0.0, -1.0, 0.0],
-                            [
-                                [-0.5, -0.5, -0.5],
-                                [0.5, -0.5, -0.5],
-                                [0.5, -0.5, 0.5],
-                                [-0.5, -0.5, 0.5],
-                            ],
-                        ),
+                    let mut vertices = Vec::with_capacity(4);
+                    let mut indices = Vec::with_capacity(6);
+                    // Front-facing (-Z) quad for instanced 3D bars (eliminates 83% culled back/side faces)
+                    let normal = [0.0, 0.0, -1.0];
+                    let quad = [
+                        [0.5, -0.5, -0.5],
+                        [-0.5, -0.5, -0.5],
+                        [-0.5, 0.5, -0.5],
+                        [0.5, 0.5, -0.5],
                     ];
                     let uvs = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
-                    for (normal, quad) in faces {
-                        let base = vertices.len() as u32;
-                        for (i, pos) in quad.into_iter().enumerate() {
-                            vertices.push(Vertex {
-                                position: pos,
-                                normal,
-                                tex_coords: uvs[i],
-                            });
-                        }
-                        indices.extend_from_slice(&[
-                            base,
-                            base + 1,
-                            base + 2,
-                            base,
-                            base + 2,
-                            base + 3,
-                        ]);
+                    for (i, pos) in quad.into_iter().enumerate() {
+                        vertices.push(Vertex {
+                            position: pos,
+                            normal,
+                            tex_coords: uvs[i],
+                        });
                     }
+                    indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
                     (vertices, indices)
                 }
                 crate::state::Geometry::NeonRoom => generate_neon_room_mesh(),
@@ -5405,6 +6233,7 @@ impl VulkanEngine {
             surface: Some(surface),
             device,
             queue,
+            adapter_info,
             config,
             size,
             render_pipelines,
@@ -5529,6 +6358,16 @@ impl VulkanEngine {
             last_lyric_line_idx: None,
             current_lyric_mesh_text: "RUSTTRACKER".to_string(),
             fire_intensity: 0.0,
+            splash_cache: SplashCache::default(),
+            stats_cache: StatsDisplayCache::default(),
+            is_game_mode: std::env::var("XDG_CURRENT_DESKTOP")
+                .unwrap_or_default()
+                .eq_ignore_ascii_case("gamescope")
+                || std::env::var("XDG_SESSION_DESKTOP")
+                    .unwrap_or_default()
+                    .eq_ignore_ascii_case("gamescope")
+                || std::env::var("STEAM_DECK").is_ok(),
+            last_ui_rects_data: [[f32::NAN; 4]; 3],
         }
     }
 
@@ -5588,6 +6427,22 @@ impl VulkanEngine {
 
     pub fn clear_video_state(&mut self) {
         self.video_state = None;
+    }
+
+    pub fn step_fire_intensity(current: f32, state: &crate::state::AppState, dt: f32) -> f32 {
+        let is_at_end =
+            state.duration_seconds > 0.0 && state.current_seconds >= state.duration_seconds - 0.05;
+        let is_playing = !state.is_paused && state.file_loaded && !state.track_ended && !is_at_end;
+        let target_intensity = if is_playing { 1.0f32 } else { 0.0f32 };
+        let fire_rate = if is_playing { 5.0f32 } else { 3.5f32 };
+        let dt_clamped = dt.clamp(0.001, 0.1);
+        if current < target_intensity {
+            (current + fire_rate * dt_clamped).min(target_intensity)
+        } else if current > target_intensity {
+            (current - fire_rate * dt_clamped).max(target_intensity)
+        } else {
+            current
+        }
     }
 
     pub fn update_retro_fire_grid(
@@ -5860,6 +6715,13 @@ impl VulkanEngine {
         self.smooth_dt = self.smooth_dt * (1.0 - alpha) + (dt as f64).clamp(0.001, 0.1) * alpha;
         self.smooth_time += self.smooth_dt;
 
+        if !state.file_loaded {
+            self.smooth_audio_seconds = 0.0;
+            self.last_raw_state_seconds = 0.0;
+            self.fire_intensity = 0.0;
+            return;
+        }
+
         // Track pushes to synchronize scrolling phase with physical buffer updates
         if state.waveform_history_push_count < self.last_history_push_count {
             self.last_history_push_count = state.waveform_history_push_count;
@@ -5942,19 +6804,7 @@ impl VulkanEngine {
         }
 
         // Progress bar fire dies off when playback stops / pauses / ends / reaches end of song
-        let is_at_end =
-            state.duration_seconds > 0.0 && state.current_seconds >= state.duration_seconds - 0.05;
-        let is_playing = !state.is_paused && state.file_loaded && !state.track_ended && !is_at_end;
-        let target_intensity = if is_playing { 1.0f32 } else { 0.0f32 };
-        let fire_rate = if is_playing { 5.0f32 } else { 3.5f32 };
-        let dt_clamped = dt.clamp(0.001, 0.1);
-        if self.fire_intensity < target_intensity {
-            self.fire_intensity =
-                (self.fire_intensity + fire_rate * dt_clamped).min(target_intensity);
-        } else if self.fire_intensity > target_intensity {
-            self.fire_intensity =
-                (self.fire_intensity - fire_rate * dt_clamped).max(target_intensity);
-        }
+        self.fire_intensity = Self::step_fire_intensity(self.fire_intensity, state, dt);
 
         // World-Z camera position locked to history rows (0.5 units/row), used by
         // visualizers that scroll with the waveform/spectrum history ring buffer.
@@ -6262,8 +7112,9 @@ impl VulkanEngine {
         let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
         let vis_width = state.visual_width.clamp(128, 2048);
         uniforms.waveform_resolution = vis_width;
+        let max_hist_rows = if vis_def.id == 3 { 96usize } else { 144usize };
         uniforms.waveform_history_size = if vis_def.id == 3 {
-            144
+            96
         } else {
             state.waveform_history.len().min(144) as u32
         };
@@ -6295,60 +7146,95 @@ impl VulkanEngine {
                 bytemuck::cast_slice(&self.tape_timeline_scratch),
             );
         } else if vis_def.requires_history && history_dirty {
+            let new_rows = state
+                .waveform_history_push_count
+                .wrapping_sub(self.last_uploaded_push_count);
+            let can_shift_incremental = vis_def.id == 3
+                && vis_def.id == self.last_uploaded_vis_id
+                && vis_width == self.last_uploaded_vis_width
+                && state.waveform_history.len() >= max_hist_rows
+                && (1..=16).contains(&new_rows);
+
             self.last_uploaded_push_count = state.waveform_history_push_count;
             self.last_uploaded_vis_width = vis_width;
             self.last_uploaded_vis_id = vis_def.id;
-            // Upload up to 144 most recent frames (right-aligned for 3D Oscilloscope so
-            // newest row is always slot 143 even right after seek/load)
-            let hist_len = state.waveform_history.len();
-            let start = hist_len.saturating_sub(144);
-            let count = hist_len.min(144);
-            let pad_slots = if vis_def.id == 3 {
-                144usize.saturating_sub(count)
-            } else {
-                0
-            };
-            if pad_slots > 0 {
-                self.waveform_history_flat[..pad_slots * 2048].fill(0.0);
-            }
+
             let visual_width_usize = vis_width as usize;
+            let hist_len = state.waveform_history.len();
 
-            for (i, wave) in state
-                .waveform_history
-                .iter()
-                .skip(start)
-                .enumerate()
-                .take(144)
-            {
-                let slot = pad_slots + i;
-                let wave_len = wave.len().min(visual_width_usize);
-                if wave_len > 0 {
-                    let offset = slot * 2048; // Max width is 2048
-                    self.waveform_history_flat[offset..offset + wave_len]
-                        .copy_from_slice(&wave[..wave_len]);
-                    if wave_len < visual_width_usize {
-                        self.waveform_history_flat[offset + wave_len..offset + visual_width_usize]
-                            .fill(0.0);
+            if can_shift_incremental {
+                let shift = (new_rows as usize) * 2048;
+                let total_floats = max_hist_rows * 2048;
+                self.waveform_history_flat
+                    .copy_within(shift..total_floats, 0);
+                let first_new_slot = max_hist_rows - (new_rows as usize);
+                for i in 0..(new_rows as usize) {
+                    let wave = &state.waveform_history[hist_len - (new_rows as usize) + i];
+                    let slot = first_new_slot + i;
+                    let offset = slot * 2048;
+                    let wave_len = wave.len().min(visual_width_usize);
+                    if wave_len > 0 {
+                        self.waveform_history_flat[offset..offset + wave_len]
+                            .copy_from_slice(&wave[..wave_len]);
+                        if wave_len < visual_width_usize {
+                            self.waveform_history_flat
+                                [offset + wave_len..offset + visual_width_usize]
+                                .fill(0.0);
+                        }
                     }
+                }
+            } else {
+                // Upload up to max_hist_rows most recent frames (right-aligned for 3D Oscilloscope)
+                let start = hist_len.saturating_sub(max_hist_rows);
+                let count = hist_len.min(max_hist_rows);
+                let pad_slots = if vis_def.id == 3 {
+                    max_hist_rows.saturating_sub(count)
+                } else {
+                    0
+                };
+                if pad_slots > 0 {
+                    self.waveform_history_flat[..pad_slots * 2048].fill(0.0);
+                }
 
-                    // Simple pre-smoothing inline for 2D CRT trace (skip for 3D Oscilloscope
-                    // so 3D ridges retain crisp transient height)
-                    if vis_def.id != 3 && wave_len > 2 {
-                        let mut prev = self.waveform_history_flat[offset];
-                        for j in 1..wave_len - 1 {
-                            let curr = self.waveform_history_flat[offset + j];
-                            let next = self.waveform_history_flat[offset + j + 1];
-                            self.waveform_history_flat[offset + j] =
-                                (prev + curr * 2.0 + next) / 4.0;
-                            prev = curr;
+                for (i, wave) in state
+                    .waveform_history
+                    .iter()
+                    .skip(start)
+                    .enumerate()
+                    .take(max_hist_rows)
+                {
+                    let slot = pad_slots + i;
+                    let wave_len = wave.len().min(visual_width_usize);
+                    if wave_len > 0 {
+                        let offset = slot * 2048; // Max width is 2048
+                        self.waveform_history_flat[offset..offset + wave_len]
+                            .copy_from_slice(&wave[..wave_len]);
+                        if wave_len < visual_width_usize {
+                            self.waveform_history_flat
+                                [offset + wave_len..offset + visual_width_usize]
+                                .fill(0.0);
+                        }
+
+                        // Simple pre-smoothing inline for 2D CRT trace (skip for 3D Oscilloscope
+                        // so 3D ridges retain crisp transient height)
+                        if vis_def.id != 3 && wave_len > 2 {
+                            let mut prev = self.waveform_history_flat[offset];
+                            for j in 1..wave_len - 1 {
+                                let curr = self.waveform_history_flat[offset + j];
+                                let next = self.waveform_history_flat[offset + j + 1];
+                                self.waveform_history_flat[offset + j] =
+                                    (prev + curr * 2.0 + next) / 4.0;
+                                prev = curr;
+                            }
                         }
                     }
                 }
             }
+            let upload_floats = max_hist_rows * 2048;
             self.queue.write_buffer(
                 &self.waveform_storage_buffer,
                 0,
-                bytemuck::cast_slice(&self.waveform_history_flat),
+                bytemuck::cast_slice(&self.waveform_history_flat[..upload_floats]),
             );
         }
 
@@ -6751,21 +7637,9 @@ impl VulkanEngine {
         if physical_size.width > 0 && physical_size.height > 0 && physical_size != self.size {
             self.resize(physical_size);
         }
-        let surface_start = std::time::Instant::now();
-        let surface = self.surface.as_ref().ok_or(wgpu::SurfaceStatus::Lost)?;
-        let output = surface.get_current_texture();
-        let surface_texture = match output {
-            wgpu::CurrentSurfaceTexture::Success(tex)
-            | wgpu::CurrentSurfaceTexture::Suboptimal(tex) => tex,
-            wgpu::CurrentSurfaceTexture::Lost => return Err(wgpu::SurfaceStatus::Lost),
-            wgpu::CurrentSurfaceTexture::Outdated => return Err(wgpu::SurfaceStatus::Outdated),
-            wgpu::CurrentSurfaceTexture::Timeout => return Err(wgpu::SurfaceStatus::Timeout),
-            _ => return Err(wgpu::SurfaceStatus::Lost),
-        };
-        let view = surface_texture
-            .texture
-            .create_view(&wgpu::TextureViewDescriptor::default());
-        let phase_surface_us = surface_start.elapsed().as_micros() as f32;
+        if self.surface.is_none() {
+            return Err(wgpu::SurfaceStatus::Lost);
+        }
 
         let mut fft_shader_time_us = self.cached_fft_us;
         let mut fire_shader_time_us = self.cached_fire_us;
@@ -6939,7 +7813,14 @@ impl VulkanEngine {
 
 
             if state.show_stats {
-                let stats_top_y = if ctx.viewport_rect().width() < ctx.viewport_rect().height() {
+                self.stats_cache.update_if_needed(
+                    state,
+                    self.video_state.is_some(),
+                    self.smooth_time,
+                );
+                let stats_top_y = if ctx.viewport_rect().width() < ctx.viewport_rect().height()
+                    || cfg!(target_os = "android")
+                {
                     48.0
                 } else {
                     10.0
@@ -6956,10 +7837,12 @@ impl VulkanEngine {
                                 .color(egui::Color32::WHITE)
                                 .strong()
                         );
-                        ui.label(
-                            egui::RichText::new(format!("Visualizer: {}", vis_name))
-                                .color(egui::Color32::YELLOW)
-                        );
+                        if state.file_loaded {
+                            ui.label(
+                                egui::RichText::new(format!("Visualizer: {}", vis_name))
+                                    .color(egui::Color32::YELLOW)
+                            );
+                        }
                         ui.separator();
 
                         if state.stats.bitstream_active {
@@ -6985,60 +7868,55 @@ impl VulkanEngine {
                             ui.separator();
                         }
                         ui.label(
-                            egui::RichText::new(format!("FPS: {:.1}", state.current_fps))
+                            egui::RichText::new(&self.stats_cache.fps_line)
                                 .color(egui::Color32::GREEN)
-                                .strong()
+                                .strong(),
+                        );
+                        let vsync_on = is_vsync_present_mode(self.config.present_mode);
+                        ui.label(
+                            egui::RichText::new(format_vsync_status(self.config.present_mode))
+                                .color(if vsync_on {
+                                    egui::Color32::GREEN
+                                } else {
+                                    egui::Color32::YELLOW
+                                })
+                                .strong(),
                         );
                         ui.label(
-                            egui::RichText::new(format!("Frame Time: {:.2} ms", 1000.0 / state.current_fps.max(1.0)))
-                                .color(egui::Color32::LIGHT_GREEN)
-                        );
-                        ui.label(
-                            egui::RichText::new(format!("CPU UI: {:.2} ms | CPU Render: {:.2} ms", state.stats.ui_us / 1000.0, state.stats.render_us / 1000.0))
+                            egui::RichText::new(&self.stats_cache.cpu_active_line)
                                 .color(egui::Color32::WHITE)
                         );
-                        let fft_text = if state.video_mode == 3
-                            && (state.has_video_stream || state.video_frame_rx.is_some())
-                        {
-                            "CPU FFT: Off (Fullscreen Video)".to_string()
-                        } else {
-                            format!("CPU FFT: {:.2} ms", state.stats.fft_us / 1000.0)
-                        };
-                        ui.label(
-                            egui::RichText::new(fft_text)
-                                .color(egui::Color32::WHITE)
-                        );
-                        if state.gpu_fft && state.stats.gpu_fft_us > 0.0 {
+                        if state.file_loaded {
                             ui.label(
-                                egui::RichText::new(format!("GPU Compute: {:.2} ms", state.stats.gpu_fft_us / 1000.0))
-                                    .color(egui::Color32::LIGHT_BLUE)
+                                egui::RichText::new(&self.stats_cache.cpu_fft_line)
+                                    .color(egui::Color32::WHITE)
                             );
-                        }
-                        ui.label(
-                            egui::RichText::new(format!("CPU Decode: {:.2} ms", state.stats.decode_us / 1000.0))
-                                .color(egui::Color32::WHITE)
-                        );
-                        let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
-                        let mut total_vis_us = state.stats.shader_us;
-                        if vis_def.requires_fire {
-                            total_vis_us += state.stats.fire_us;
-                        }
-                        if total_vis_us > 0.0 {
+                            if let Some(ref gpu_comp) = self.stats_cache.gpu_compute_line {
+                                ui.label(
+                                    egui::RichText::new(gpu_comp)
+                                        .color(egui::Color32::LIGHT_BLUE)
+                                );
+                            }
                             ui.label(
-                                egui::RichText::new(format!("Visualization Shader (GPU): {:.2} ms", total_vis_us / 1000.0))
-                                    .color(egui::Color32::LIGHT_BLUE)
+                                egui::RichText::new(&self.stats_cache.cpu_decode_line)
+                                    .color(egui::Color32::WHITE)
                             );
-                        }
-                        let buffer_label = if state.duration_seconds <= 0.0 { "Network Buffer" } else { "Audio Buffer" };
-                        ui.label(
-                            egui::RichText::new(format!("{}: {:.1}%", buffer_label, state.stats.audio_buffer_fill_pct))
-                                .color(if state.stats.audio_buffer_fill_pct < 5.0 { egui::Color32::RED } else if state.stats.audio_buffer_fill_pct > 95.0 { egui::Color32::YELLOW } else { egui::Color32::GREEN })
-                        );
-                        if state.video_frame_rx.is_some() {
+                            if let Some(ref vis_line) = self.stats_cache.vis_shader_line {
+                                ui.label(
+                                    egui::RichText::new(vis_line)
+                                        .color(egui::Color32::LIGHT_BLUE)
+                                );
+                            }
                             ui.label(
-                                egui::RichText::new(format!("Video Buffer: {:.1}%", state.stats.video_buffer_fill_pct))
-                                    .color(if state.stats.video_buffer_fill_pct < 1.0 { egui::Color32::RED } else { egui::Color32::YELLOW })
+                                egui::RichText::new(&self.stats_cache.audio_buffer_line)
+                                    .color(self.stats_cache.audio_buffer_color)
                             );
+                            if let Some((ref vbuf_line, vbuf_col)) = self.stats_cache.video_buffer_line {
+                                ui.label(
+                                    egui::RichText::new(vbuf_line)
+                                        .color(vbuf_col)
+                                );
+                            }
                         }
                         ui.separator();
                         ui.label(
@@ -7046,57 +7924,39 @@ impl VulkanEngine {
                                 .color(egui::Color32::from_rgb(180, 180, 255))
                                 .strong()
                         );
-                        let phases = [
-                            ("  Lock+Update", state.stats.phase_lock_update_us),
-                            ("  Snapshot", state.stats.phase_snapshot_us),
-                            ("  Surface Acq", state.stats.phase_surface_us),
-                            ("  Egui Layout", state.stats.phase_egui_layout_us),
-                            ("  GPU Encode", state.stats.phase_encode_us),
-                            ("  Post Write", state.stats.phase_post_us),
-                        ];
-                        let total_phases: f32 = phases.iter().map(|(_, v)| v).sum();
-                        for (name, val) in &phases {
-                            let mut color = if *val > 2000.0 { egui::Color32::RED }
-                                       else if *val > 1000.0 { egui::Color32::YELLOW }
-                                       else { egui::Color32::from_rgb(160, 160, 160) };
-
-                            let display_name = if *name == "  Surface Acq" {
-                                color = egui::Color32::from_rgb(160, 160, 160);
-                                "  Surface Acq (VSync Wait)"
-                            } else {
-                                *name
-                            };
-
+                        for (phase_text, color) in &self.stats_cache.phase_lines {
                             ui.label(
-                                egui::RichText::new(format!("{}: {:.2} ms", display_name, val / 1000.0))
-                                    .color(color)
+                                egui::RichText::new(phase_text)
+                                    .color(*color)
                             );
                         }
                         ui.label(
-                            egui::RichText::new(format!("  Total Phases: {:.2} ms", total_phases / 1000.0))
+                            egui::RichText::new(&self.stats_cache.total_phases_line)
                                 .color(egui::Color32::from_rgb(180, 180, 255))
                         );
-                        ui.label(
-                            egui::RichText::new(format!("Hardware Channels: {} | Source: {}", state.hardware_channels, state.num_channels))
-                                .color(if state.hardware_channels != state.num_channels { egui::Color32::YELLOW } else { egui::Color32::GRAY })
-                        );
-                        if video_info_str.is_none()
-                            && let Some(abr) = state.stats.audio_bitrate_kbps.or(state.bitrate)
-                        {
-                            let abr_str = if abr >= 1000 {
-                                format!("Audio Bitrate: {} kbps ({:.2} Mbps)", abr, abr as f32 / 1000.0)
-                            } else {
-                                format!("Audio Bitrate: {} kbps", abr)
-                            };
+                        if state.file_loaded {
                             ui.label(
-                                egui::RichText::new(abr_str)
-                                    .color(egui::Color32::LIGHT_GREEN)
+                                egui::RichText::new(format!("Hardware Channels: {} | Source: {}", state.hardware_channels, state.num_channels))
+                                    .color(if state.hardware_channels != state.num_channels { egui::Color32::YELLOW } else { egui::Color32::GRAY })
+                            );
+                            if video_info_str.is_none()
+                                && let Some(abr) = state.stats.audio_bitrate_kbps.or(state.bitrate)
+                            {
+                                let abr_str = if abr >= 1000 {
+                                    format!("Audio Bitrate: {} kbps ({:.2} Mbps)", abr, abr as f32 / 1000.0)
+                                } else {
+                                    format!("Audio Bitrate: {} kbps", abr)
+                                };
+                                ui.label(
+                                    egui::RichText::new(abr_str)
+                                        .color(egui::Color32::LIGHT_GREEN)
+                                );
+                            }
+                            ui.label(
+                                egui::RichText::new(format!("Clipping Events: {}", state.stats.clipping_events))
+                                    .color(if state.stats.clipping_events > 0 { egui::Color32::RED } else { egui::Color32::GRAY })
                             );
                         }
-                        ui.label(
-                            egui::RichText::new(format!("Clipping Events: {}", state.stats.clipping_events))
-                                .color(if state.stats.clipping_events > 0 { egui::Color32::RED } else { egui::Color32::GRAY })
-                        );
                         if let Some(vi) = &video_info_str {
                             ui.separator();
                             ui.label(
@@ -7367,15 +8227,17 @@ impl VulkanEngine {
             }
 
             let mut append = state.append_to_playlist;
-            file_dialog.update_with_right_panel_ui(ctx, &mut |ui, _fd| {
-                ui.add_space(10.0);
-                ui.heading("Options");
-                ui.separator();
-                ui.checkbox(&mut append, "Add to Playlist instead of replacing");
-            });
+            if matches!(file_dialog.state(), egui_file_dialog::DialogState::Open) {
+                file_dialog.update_with_right_panel_ui(ctx, &mut |ui, _fd| {
+                    ui.add_space(10.0);
+                    ui.heading("Options");
+                    ui.separator();
+                    ui.checkbox(&mut append, "Add to Playlist instead of replacing");
+                });
 
-            if append != state.append_to_playlist {
-                engine_action = EngineAction::SetAppendToPlaylist(append);
+                if append != state.append_to_playlist {
+                    engine_action = EngineAction::SetAppendToPlaylist(append);
+                }
             }
 
             if let Some(paths) = file_dialog.take_picked_multiple() {
@@ -7388,262 +8250,156 @@ impl VulkanEngine {
             if !state.file_loaded {
                 central_rect = ctx.content_rect();
                 let time = self.smooth_time as f32;
-
-                // --- Background Retro Grid (Demoscene Vibe) ---
-                let bg_painter = ctx.layer_painter(egui::LayerId::background());
                 let rect = ctx.content_rect();
-                let horizon_y = rect.top() + rect.height() * 0.55;
-                let center_x = rect.center().x;
 
-                // 1. Sky gradient
-                let sky_steps = 40;
-                let sky_height = horizon_y - rect.top();
-                for i in 0..sky_steps {
-                    let t = i as f32 / sky_steps as f32;
-                    let next_t = (i + 1) as f32 / sky_steps as f32;
-                    let color = if t < 0.6 {
-                        let st = t / 0.6;
-                        egui::Color32::from_rgb(
-                            (43.0 * (1.0 - st) + 150.0 * st) as u8,
-                            (16.0 * (1.0 - st) + 20.0 * st) as u8,
-                            (85.0 * (1.0 - st) + 120.0 * st) as u8,
-                        )
-                    } else {
-                        let st = (t - 0.6) / 0.4;
-                        egui::Color32::from_rgb(
-                            (150.0 * (1.0 - st) + 255.0 * st) as u8,
-                            (20.0 * (1.0 - st) + 126.0 * st) as u8,
-                            (120.0 * (1.0 - st) + 103.0 * st) as u8,
-                        )
-                    };
-                    bg_painter.rect_filled(
-                        egui::Rect::from_min_max(
-                            egui::pos2(rect.left(), rect.top() + t * sky_height),
-                            egui::pos2(rect.right(), rect.top() + next_t * sky_height),
-                        ),
-                        0.0,
-                        color,
-                    );
-                }
-
-                // 2. Stars
-                let pseudo_rand = |seed: u32| -> f32 {
-                    let mut x = seed.wrapping_mul(136453);
-                    x ^= x << 13;
-                    x ^= x >> 17;
-                    x ^= x << 5;
-                    (x % 1000) as f32 / 1000.0
-                };
-
-                for i in 0..50 {
-                    let rx = pseudo_rand(i * 31);
-                    let ry = pseudo_rand(i * 31 + 1);
-                    let rr = pseudo_rand(i * 31 + 2);
-                    let rt = pseudo_rand(i * 31 + 3);
-
-                    let x = rect.left() + rx * rect.width();
-                    let y = rect.top() + ry * sky_height * 0.7; // Stars in upper 70%
-                    let radius = rr * 1.5 + 0.5;
-                    let twinkle = ((time * (1.0 + rt * 2.0) + rx * 100.0).sin() * 0.5 + 0.5) * 200.0 + 55.0;
-
-                    bg_painter.circle_filled(
-                        egui::pos2(x, y),
-                        radius,
-                        egui::Color32::from_white_alpha(twinkle as u8),
-                    );
-                }
-
-                // 3. Retro Sliced Sun
-                let sun_radius = rect.width().min(rect.height()) * 0.25;
-                let sun_center = egui::pos2(center_x, horizon_y - sun_radius * 0.3);
-
-                let sun_steps = 40;
-                for i in 0..sun_steps {
-                    let t = i as f32 / sun_steps as f32;
-                    let next_t = (i + 1) as f32 / sun_steps as f32;
-
-                    if t > 0.45 {
-                        let slice_t = (t - 0.45) / 0.55;
-                        let slice_val = (slice_t * 15.0).fract();
-                        let gap_threshold = 0.2 + slice_t * 0.6;
-                        if slice_val < gap_threshold {
-                            continue;
-                        }
-                    }
-
-                    let y_min = sun_center.y - sun_radius + t * sun_radius * 2.0;
-                    let y_max = sun_center.y - sun_radius + next_t * sun_radius * 2.0;
-
-                    let r = 255;
-                    let g = (204.0 * (1.0 - t) + 80.0 * t) as u8;
-                    let b = (0.0 * (1.0 - t) + 100.0 * t) as u8;
-                    let color = egui::Color32::from_rgb(r, g, b);
-
-                    bg_painter.with_clip_rect(egui::Rect::from_min_max(
-                        egui::pos2(rect.left(), y_min),
-                        egui::pos2(rect.right(), y_max),
-                    )).circle_filled(
-                        sun_center,
-                        sun_radius,
-                        color,
-                    );
-                }
-
-                // 4. Wireframe Mountains
-                for i in 0..25 {
-                    let h1 = pseudo_rand(i * 17);
-                    let h2 = pseudo_rand(i * 17 + 1);
-                    let h3 = pseudo_rand(i * 17 + 2);
-
-                    let cx = rect.left() + h1 * rect.width();
-                    let cy = horizon_y;
-                    let width = rect.width() * (0.1 + h2 * 0.25);
-                    let height = rect.height() * (0.05 + h3 * 0.25);
-
-                    let p1 = egui::pos2(cx - width, cy);
-                    let p2 = egui::pos2(cx + width, cy);
-                    let p3 = egui::pos2(cx, cy - height);
-
-                    bg_painter.add(egui::Shape::convex_polygon(
-                        vec![p1, p2, p3],
-                        egui::Color32::from_rgb(27, 27, 58),
-                        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(91, 50, 212)),
-                    ));
-
-                    // Center ridge
-                    let ridge_offset = (pseudo_rand(i * 17 + 3) - 0.5) * 0.4;
-                    bg_painter.line_segment(
-                        [p3, egui::pos2(cx + width * ridge_offset, cy)],
-                        egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(91, 50, 212))
-                    );
-                }
-
-                // 5. Floor Grid
-                bg_painter.rect_filled(
-                    egui::Rect::from_min_max(
-                        egui::pos2(rect.left(), horizon_y),
-                        egui::pos2(rect.right(), rect.bottom())
-                    ),
-                    0.0,
-                    egui::Color32::from_rgb(36, 21, 84)
-                );
-
-                let grid_color = egui::Color32::from_rgb(212, 34, 161);
-
-                // Vertical radiating lines
-                let num_v_lines = 40;
-                for i in 0..=num_v_lines {
-                    let t = i as f32 / num_v_lines as f32;
-                    let bottom_x = rect.left() + (t - 0.5) * rect.width() * 8.0;
-
-                    bg_painter.line_segment(
-                        [egui::pos2(center_x, horizon_y), egui::pos2(bottom_x, rect.bottom())],
-                        egui::Stroke::new(1.0_f32, grid_color)
-                    );
-                }
-
-                // Horizontal scrolling perspective lines
-                let num_h_lines = 30;
-                for i in 0..num_h_lines {
-                    let offset = (i as f32 - (time * 1.5).fract()) / num_h_lines as f32;
-                    if offset <= 0.0 { continue; }
-                    let y = horizon_y + (rect.bottom() - horizon_y) * offset.powf(3.0);
-                    let thickness = 1.0 + offset * 2.0;
-
-                    bg_painter.line_segment(
-                        [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
-                        egui::Stroke::new(thickness, grid_color)
-                    );
-                }
-                // --- End Retro Grid ---
+                // Ensure cached synthwave background geometry & horizon_y are up to date;
+                // the combined static+dynamic background primitive is prepended directly
+                // to `clipped_primitives` after `egui_ctx.tessellate` to avoid redundant
+                // per-frame `calc_bounds()` and `append_ref()` copies inside `Tessellator`.
+                self.splash_cache.ensure_background(ctx, rect);
 
                 let is_mobile = cfg!(target_os = "android");
-                let is_game_mode = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default().to_lowercase() == "gamescope" ||
-                                   std::env::var("XDG_SESSION_DESKTOP").unwrap_or_default().to_lowercase() == "gamescope" ||
-                                   std::env::var("STEAM_DECK").is_ok();
+                let is_game_mode = self.is_game_mode;
 
                 let show_kb = !is_game_mode && !is_mobile;
                 let show_gp = state.has_gamepad && !is_mobile;
                 let show_touch = is_mobile;
+                let is_wide_viewport = rect.width() >= 680.0;
+
+                let bottom_reserved_h = if show_touch {
+                    if is_wide_viewport { 96.0 } else { 132.0 }
+                } else if show_kb && show_gp {
+                    168.0
+                } else if show_kb || show_gp {
+                    136.0
+                } else {
+                    0.0
+                };
 
                 if show_kb || show_gp || show_touch {
                     egui::Panel::bottom("splash_bottom")
-                        .frame(egui::Frame::NONE.fill(egui::Color32::from_rgba_unmultiplied(10, 10, 15, 180)).inner_margin(if is_mobile { 12.0 } else { 40.0 }))
+                        .frame(
+                            egui::Frame::NONE
+                                .fill(egui::Color32::TRANSPARENT)
+                                .inner_margin(if is_mobile { 8.0 } else { 24.0 }),
+                        )
                         .show_inside(ctx, |ui| {
-                            let height = if is_mobile { 120.0 } else if show_kb && show_gp { 170.0 } else { 140.0 };
-                            ui.add_space(height);
+                            ui.add_space(bottom_reserved_h);
                         });
 
                     egui::Area::new(egui::Id::new("splash_shortcuts_area"))
-                        .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, if is_mobile { -12.0 } else { -40.0 }))
+                        .anchor(
+                            egui::Align2::CENTER_BOTTOM,
+                            egui::vec2(0.0, if is_mobile { -10.0 } else { -24.0 }),
+                        )
                         .show(ctx, |ui| {
                             egui::Frame::NONE
-                                .fill(egui::Color32::from_black_alpha(210))
-                                .corner_radius(10.0)
-                                .inner_margin(if is_mobile { 12.0 } else { 20.0 })
+                                .fill(egui::Color32::from_rgba_unmultiplied(10, 10, 20, 220))
+                                .stroke(egui::Stroke::new(
+                                    1.0_f32,
+                                    egui::Color32::from_rgba_unmultiplied(91, 50, 212, 140),
+                                ))
+                                .corner_radius(12.0)
+                                .inner_margin(egui::Margin::symmetric(
+                                    if is_mobile { 16 } else { 22 },
+                                    if is_mobile { 10 } else { 14 },
+                                ))
                                 .show(ui, |ui| {
                                     if show_touch {
+                                        let gestures: [(&str, &str); 6] = [
+                                            ("Swipe L / R", "Switch Visualizers"),
+                                            ("Swipe U / D", "Tabs / Fullscreen Video"),
+                                            ("Single Tap", "Play / Pause"),
+                                            ("Double Tap", "Toggle HUD Visibility"),
+                                            ("2-Finger Tap", "Cycle Audio Track"),
+                                            ("3-Finger Tap", "Toggle Engine Stats"),
+                                        ];
+                                        let pairs_per_row = if is_wide_viewport { 3 } else { 2 };
                                         ui.vertical_centered(|ui| {
-                                            ui.label(egui::RichText::new("Touch Gestures Guide").color(egui::Color32::LIGHT_GRAY).strong().size(14.0));
+                                            ui.label(
+                                                egui::RichText::new("Touch Gestures Guide")
+                                                    .color(egui::Color32::from_rgb(210, 220, 240))
+                                                    .strong()
+                                                    .size(13.0),
+                                            );
                                             ui.add_space(6.0);
                                             egui::Grid::new("touch_shortcuts")
-                                                .num_columns(2)
-                                                .spacing([18.0, 5.0])
+                                                .num_columns(pairs_per_row * 2)
+                                                .spacing([if is_wide_viewport { 16.0 } else { 12.0 }, 5.0])
                                                 .show(ui, |ui| {
-                                                    ui.label(egui::RichText::new("Swipe L / R").color(egui::Color32::from_rgb(0, 220, 255)).strong().size(12.5));
-                                                    let enabled_count = state.vis_enabled.iter().filter(|&&e| e).count();
-                                                    ui.label(egui::RichText::new(format!("Switch Visualizers ({})", enabled_count)).color(egui::Color32::LIGHT_GRAY).size(12.5));
-                                                    ui.end_row();
-
-                                                    ui.label(egui::RichText::new("Swipe U / D").color(egui::Color32::from_rgb(0, 220, 255)).strong().size(12.5));
-                                                    ui.label(egui::RichText::new("Tabs / Fullscreen Video").color(egui::Color32::LIGHT_GRAY).size(12.5));
-                                                    ui.end_row();
-
-                                                    ui.label(egui::RichText::new("Single Tap").color(egui::Color32::from_rgb(0, 220, 255)).strong().size(12.5));
-                                                    ui.label(egui::RichText::new("Play / Pause").color(egui::Color32::LIGHT_GRAY).size(12.5));
-                                                    ui.end_row();
-
-                                                    ui.label(egui::RichText::new("Double Tap").color(egui::Color32::from_rgb(0, 220, 255)).strong().size(12.5));
-                                                    ui.label(egui::RichText::new("Toggle HUD Visibility").color(egui::Color32::LIGHT_GRAY).size(12.5));
-                                                    ui.end_row();
-
-                                                    ui.label(egui::RichText::new("2-Finger Tap").color(egui::Color32::from_rgb(0, 220, 255)).strong().size(12.5));
-                                                    ui.label(egui::RichText::new("Cycle Audio Track").color(egui::Color32::LIGHT_GRAY).size(12.5));
-                                                    ui.end_row();
-
-                                                    ui.label(egui::RichText::new("3-Finger Tap").color(egui::Color32::from_rgb(0, 220, 255)).strong().size(12.5));
-                                                    ui.label(egui::RichText::new("Toggle Engine Stats").color(egui::Color32::LIGHT_GRAY).size(12.5));
-                                                    ui.end_row();
+                                                    for (idx, (gesture, desc)) in
+                                                        gestures.iter().enumerate()
+                                                    {
+                                                        ui.label(
+                                                            egui::RichText::new(*gesture)
+                                                                .color(egui::Color32::from_rgb(
+                                                                    0, 220, 255,
+                                                                ))
+                                                                .strong()
+                                                                .size(12.0),
+                                                        );
+                                                        ui.label(
+                                                            egui::RichText::new(*desc)
+                                                                .color(egui::Color32::LIGHT_GRAY)
+                                                                .size(12.0),
+                                                        );
+                                                        if (idx + 1) % pairs_per_row == 0 {
+                                                            ui.end_row();
+                                                        }
+                                                    }
                                                 });
                                         });
                                     } else {
                                         ui.horizontal_centered(|ui| {
-                                            let pairs_per_row = if show_kb && show_gp { 2 } else { 3 };
+                                            let pairs_per_row =
+                                                if show_kb && show_gp { 2 } else { 4 };
 
                                             if show_kb {
                                                 ui.vertical(|ui| {
-                                                    ui.label(egui::RichText::new("🖮 Keyboard Shortcuts").color(egui::Color32::LIGHT_GRAY).strong().size(18.0));
-                                                    ui.add_space(10.0);
+                                                    ui.label(
+                                                        egui::RichText::new(
+                                                            "🖮 Keyboard Shortcuts",
+                                                        )
+                                                        .color(egui::Color32::from_rgb(
+                                                            210, 220, 240,
+                                                        ))
+                                                        .strong()
+                                                        .size(15.0),
+                                                    );
+                                                    ui.add_space(6.0);
 
                                                     egui::Grid::new("kb_shortcuts")
                                                         .num_columns(pairs_per_row * 2)
-                                                        .spacing([25.0, 12.0])
+                                                        .spacing([20.0, 6.0])
                                                         .show(ui, |ui| {
                                                             let mut col = 0;
-                                                            let mut kb_shortcut = |key: &str, desc: &str| {
-                                                                ui.label(egui::RichText::new(key).color(egui::Color32::WHITE).strong());
-                                                                ui.label(egui::RichText::new(desc).color(egui::Color32::GRAY));
-                                                                col += 1;
-                                                                if col == pairs_per_row {
-                                                                    ui.end_row();
-                                                                    col = 0;
-                                                                }
-                                                            };
+                                                            let mut kb_shortcut =
+                                                                |key: &str, desc: &str| {
+                                                                    ui.label(
+                                                                        egui::RichText::new(key)
+                                                                            .color(egui::Color32::from_rgb(0, 220, 255))
+                                                                            .strong()
+                                                                            .size(12.5),
+                                                                    );
+                                                                    ui.label(
+                                                                        egui::RichText::new(desc)
+                                                                            .color(egui::Color32::LIGHT_GRAY)
+                                                                            .size(12.5),
+                                                                    );
+                                                                    col += 1;
+                                                                    if col == pairs_per_row {
+                                                                        ui.end_row();
+                                                                        col = 0;
+                                                                    }
+                                                                };
                                                             kb_shortcut("o", "Open File");
                                                             kb_shortcut("space", "Play / Pause");
                                                             kb_shortcut("v", "Toggle Video");
                                                             kb_shortcut("m", "Visualizer Modules");
-                                                            kb_shortcut("left/right", "Seek Timeline");
+                                                            kb_shortcut(
+                                                                "left/right",
+                                                                "Seek Timeline",
+                                                            );
                                                             kb_shortcut("tab", "Toggle HUD");
                                                             kb_shortcut("up/down", "Cycle Vis");
                                                             kb_shortcut("s", "Toggle Stats");
@@ -7652,8 +8408,16 @@ impl VulkanEngine {
                                                             kb_shortcut("g", "GPU FFT");
                                                             kb_shortcut("1-9", "Audio Track");
                                                             kb_shortcut("n / p", "Prev/Next");
-                                                            let ctrl_mod = if std::env::consts::OS == "macos" { "⌘" } else { "ctrl+" };
-                                                            kb_shortcut(&format!("{}L/R", ctrl_mod), "Seek ±60s");
+                                                            let ctrl_mod =
+                                                                if std::env::consts::OS == "macos" {
+                                                                    "⌘"
+                                                                } else {
+                                                                    "ctrl+"
+                                                                };
+                                                            kb_shortcut(
+                                                                &format!("{}L/R", ctrl_mod),
+                                                                "Seek ±60s",
+                                                            );
                                                             kb_shortcut("[ / ]", "Scale Panels");
                                                             kb_shortcut("h", "Toggle Help");
                                                         });
@@ -7661,39 +8425,72 @@ impl VulkanEngine {
                                             }
 
                                             if show_kb && show_gp {
-                                                ui.add_space(20.0);
-                                                let (rect, _) = ui.allocate_exact_size(egui::vec2(1.0, 180.0), egui::Sense::hover());
-                                                ui.painter().line_segment(
-                                                    [rect.center_top(), rect.center_bottom()],
-                                                    (1.0, egui::Color32::from_gray(60))
+                                                ui.add_space(16.0);
+                                                let (sep_rect, _) = ui.allocate_exact_size(
+                                                    egui::vec2(1.0, 130.0),
+                                                    egui::Sense::hover(),
                                                 );
-                                                ui.add_space(20.0);
+                                                ui.painter().line_segment(
+                                                    [
+                                                        sep_rect.center_top(),
+                                                        sep_rect.center_bottom(),
+                                                    ],
+                                                    (1.0, egui::Color32::from_gray(65)),
+                                                );
+                                                ui.add_space(16.0);
                                             }
 
                                             if show_gp {
                                                 ui.vertical(|ui| {
-                                                    ui.horizontal(|ui| {
-                                                        ui.label(egui::RichText::new("🎮 Gamepad Controls").color(egui::Color32::LIGHT_GRAY).strong().size(18.0));
-                                                    });
-                                                    ui.add_space(10.0);
+                                                    ui.label(
+                                                        egui::RichText::new("🎮 Gamepad Controls")
+                                                            .color(egui::Color32::from_rgb(
+                                                                210, 220, 240,
+                                                            ))
+                                                            .strong()
+                                                            .size(15.0),
+                                                    );
+                                                    ui.add_space(6.0);
                                                     egui::Grid::new("gp_shortcuts_wide")
                                                         .num_columns(pairs_per_row * 2)
-                                                        .spacing([25.0, 12.0])
+                                                        .spacing([20.0, 6.0])
                                                         .show(ui, |ui| {
                                                             let mut col = 0;
-                                                            let mut gp_shortcut = |gp: &str, desc: &str| {
-                                                                ui.label(egui::RichText::new(gamepad_icon(state.gamepad_type, gp)).color(egui::Color32::LIGHT_BLUE).size(16.0));
-                                                                ui.label(egui::RichText::new(desc).color(egui::Color32::GRAY));
-                                                                col += 1;
-                                                                if col == pairs_per_row {
-                                                                    ui.end_row();
-                                                                    col = 0;
-                                                                }
-                                                            };
+                                                            let mut gp_shortcut =
+                                                                |gp: &str, desc: &str| {
+                                                                    ui.label(
+                                                                        egui::RichText::new(
+                                                                            gamepad_icon(
+                                                                                state.gamepad_type,
+                                                                                gp,
+                                                                            ),
+                                                                        )
+                                                                        .color(
+                                                                            egui::Color32::LIGHT_BLUE,
+                                                                        )
+                                                                        .strong()
+                                                                        .size(13.0),
+                                                                    );
+                                                                    ui.label(
+                                                                        egui::RichText::new(desc)
+                                                                            .color(
+                                                                                egui::Color32::LIGHT_GRAY,
+                                                                            )
+                                                                            .size(12.5),
+                                                                    );
+                                                                    col += 1;
+                                                                    if col == pairs_per_row {
+                                                                        ui.end_row();
+                                                                        col = 0;
+                                                                    }
+                                                                };
                                                             gp_shortcut("Y", "Open File");
                                                             gp_shortcut("A", "Play / Pause");
                                                             gp_shortcut("X", "Toggle Video");
-                                                            gp_shortcut("D-Pad L/R", "Seek Timeline");
+                                                            gp_shortcut(
+                                                                "D-Pad L/R",
+                                                                "Seek Timeline",
+                                                            );
                                                             gp_shortcut("L2", "Toggle HUD");
                                                             gp_shortcut("D-Pad U/D", "Cycle Vis");
                                                             gp_shortcut("B", "Toggle Stats");
@@ -7711,231 +8508,385 @@ impl VulkanEngine {
                 }
 
                 let frame = egui::Frame::NONE
-                    .fill(egui::Color32::from_rgba_unmultiplied(10, 10, 15, 180)) // Translucent to show grid
-                    .inner_margin(if is_mobile { 16.0 } else { 40.0 });
+                    .fill(egui::Color32::TRANSPARENT)
+                    .inner_margin(if is_mobile { 12.0 } else { 28.0 });
 
-                egui::CentralPanel::default().frame(frame).show_inside(ctx, |ui| {
-                    let real_avail_height = ui.available_height();
-                    let real_avail_width = ui.available_width();
+                egui::CentralPanel::default()
+                    .frame(frame)
+                    .show_inside(ctx, |ui| {
+                        let real_avail_height = ui.available_height();
+                        let real_avail_width = ui.available_width();
 
-                    egui::ScrollArea::vertical().show(ui, |ui| {
-                        ui.vertical_centered(|ui| {
-                            let top_space = if is_mobile {
-                                (real_avail_height * 0.06).max(20.0)
-                            } else {
-                                real_avail_height * 0.15
-                            };
-                            if top_space > 0.0 {
-                                ui.add_space(top_space);
-                            }
-                            // Scale title dynamically to fit portrait phone (9:19.5), steam deck, or 4K monitors
-                            let target_w = (real_avail_width - 32.0).max(100.0);
-                            let width_scale = (target_w / 950.0).clamp(0.25, 1.0);
-                            let height_scale = (real_avail_height / 450.0).clamp(0.25, 1.0);
-                            let scale_factor = width_scale.min(height_scale);
-                            let title_width = 950.0 * scale_factor;
-                            let title_height = 140.0 * scale_factor;
-                            let font_size = 120.0 * scale_factor;
-                            let gradient_extent = 55.0 * scale_factor;
-
-                            // --- Glowing Animated Title ---
-                            let (title_rect, _) = ui.allocate_exact_size(egui::vec2(title_width, title_height), egui::Sense::hover());
-                            let painter = ui.painter();
-                            let text = "RustTracker";
-
-                            let font_id = egui::FontId::new(font_size, egui::FontFamily::Name("Orbitron".into()));
-
-                            // 1. Silver Outer Bevel (3px offset)
-                            let silver_color = egui::Color32::from_rgb(200, 220, 255);
-                            for dx in [-3.0, 0.0, 3.0] {
-                                for dy in [-3.0, 0.0, 3.0] {
-                                    if dx == 0.0 && dy == 0.0 { continue; }
-                                    painter.text(
-                                        title_rect.center() + egui::vec2(dx, dy),
-                                        egui::Align2::CENTER_CENTER,
-                                        text,
-                                        font_id.clone(),
-                                        silver_color,
-                                    );
-                                }
-                            }
-
-                            // 2. Black Inner Outline (1px offset)
-                            for dx in [-1.0, 0.0, 1.0] {
-                                for dy in [-1.0, 0.0, 1.0] {
-                                    if dx == 0.0 && dy == 0.0 { continue; }
-                                    painter.text(
-                                        title_rect.center() + egui::vec2(dx, dy),
-                                        egui::Align2::CENTER_CENTER,
-                                        text,
-                                        font_id.clone(),
-                                        egui::Color32::BLACK,
-                                    );
-                                }
-                            }
-
-                            // 3. Sliced Chrome Scrolling Palette Interior
-                            let steps = 40; // More steps for cooler copper bar effect
-                            let top_y = title_rect.center().y - gradient_extent;
-                            let bottom_y = title_rect.center().y + gradient_extent;
-                            let height = bottom_y - top_y;
-
-                            for i in 0..steps {
-                                let t = i as f32 / steps as f32;
-                                let next_t = (i + 1) as f32 / steps as f32;
-                                let min_y = top_y + t * height;
-                                let max_y = top_y + next_t * height;
-
-                                let clip_rect = egui::Rect::from_min_max(
-                                    egui::pos2(title_rect.left(), min_y),
-                                    egui::pos2(title_rect.right(), max_y),
-                                );
-
-                                // Palette cycling calculation
-                                let scroll_speed = 0.1;
-                                let mut color_t = (t + time * scroll_speed).fract();
-                                if color_t < 0.0 { color_t += 1.0; }
-
-                                let color = if color_t < 0.48 {
-                                    // Sky: Cyan to Dark Blue
-                                    let sky_t = color_t / 0.48;
-                                    let r = (0.0 * (1.0 - sky_t) + 10.0 * sky_t) as u8;
-                                    let g = (220.0 * (1.0 - sky_t) + 30.0 * sky_t) as u8;
-                                    let b = (255.0 * (1.0 - sky_t) + 120.0 * sky_t) as u8;
-                                    egui::Color32::from_rgb(r, g, b)
-                                } else if color_t < 0.52 {
-                                    // Chrome Horizon Reflection
-                                    egui::Color32::WHITE
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            ui.vertical_centered(|ui| {
+                                let is_portrait_splash = rect.width() < rect.height();
+                                let top_space = if is_portrait_splash {
+                                    40.0
+                                } else if is_mobile {
+                                    30.0
                                 } else {
-                                    // Ground Reflection: Dark Brown to Orange/Tan
-                                    let ground_t = (color_t - 0.52) / 0.48;
-                                    let r = (50.0 * (1.0 - ground_t) + 255.0 * ground_t) as u8;
-                                    let g = (15.0 * (1.0 - ground_t) + 160.0 * ground_t) as u8;
-                                    let b = (0.0 * (1.0 - ground_t) + 50.0 * ground_t) as u8;
-                                    egui::Color32::from_rgb(r, g, b)
-                                } ;
-
-                                painter.with_clip_rect(clip_rect).text(
-                                    title_rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    text,
-                                    font_id.clone(),
-                                    color,
-                                );
-                            }
-                            ui.add_space(20.0);
-
-                            let is_file_hovered = !ui.input(|i| i.raw.hovered_files.is_empty()) || state.hovered_file.is_some();
-                            if is_file_hovered {
-                                let badge_text = if let Some(hf) = &state.hovered_file {
-                                    let fn_only = std::path::Path::new(hf).file_name().unwrap_or_default().to_string_lossy();
-                                    format!("📥 Drop '{}' to start playing", fn_only)
-                                } else {
-                                    "📥 Drop audio file here to start playing".to_string()
+                                    (real_avail_height * 0.03).clamp(8.0, 28.0)
                                 };
-                                let font_id = egui::FontId::proportional(16.0);
-                                let galley = ui.painter().layout(
-                                    badge_text,
-                                    font_id,
-                                    egui::Color32::WHITE,
-                                    ui.available_width().min(600.0),
+                                ui.add_space(top_space);
+
+                                // Scale title dynamically so it sits cleanly in the upper sky without colliding with the top-right Stats panel
+                                let target_w = (real_avail_width - 24.0).max(120.0);
+                                let width_scale = (target_w / 950.0).clamp(0.25, 0.58);
+                                let height_scale = (real_avail_height / 500.0).clamp(0.25, 0.58);
+                                let scale_factor = width_scale.min(height_scale);
+                                let title_width = 950.0 * scale_factor;
+                                let title_height = 122.0 * scale_factor;
+                                let font_size = 114.0 * scale_factor;
+                                let gradient_extent = 50.0 * scale_factor;
+
+                                // --- Glowing Animated Chrome Title (Cached glyph quads, merged into background primitive) ---
+                                let (title_rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(title_width, title_height),
+                                    egui::Sense::hover(),
                                 );
-                                let (badge_rect, _) = ui.allocate_exact_size(galley.size() + egui::vec2(28.0, 14.0), egui::Sense::hover());
-                                ui.painter().rect(
-                                    badge_rect,
-                                    8.0,
-                                    egui::Color32::from_rgba_unmultiplied(215, 105, 0, 230),
-                                    egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 175, 40)),
-                                    egui::StrokeKind::Outside,
+                                self.splash_cache.update_title_mesh(
+                                    ui,
+                                    title_rect,
+                                    gradient_extent,
+                                    font_size,
+                                    time,
                                 );
-                                ui.painter().galley(badge_rect.min + egui::vec2(14.0, 7.0), galley, egui::Color32::WHITE);
-                                ui.add_space(10.0);
-                            }
 
-                                let is_narrow = real_avail_width < 640.0;
-                                let btn_text = if is_file_hovered { "📥 DROP TO PLAY" } else { "OPEN FILE" };
-                                let btn_fill = if is_file_hovered { egui::Color32::from_rgb(240, 125, 10) } else { egui::Color32::from_rgb(205, 95, 0) };
-                                let btn_stroke = if is_file_hovered { egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 195, 70)) } else { egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(255, 145, 30)) };
+                                // Format & Engine Subtitle Pill
+                                ui.add_space(2.0);
+                                ui.label(
+                                    egui::RichText::new(
+                                        "MOD • XM • S3M • IT • FLAC • WAV • MP3 • OPUS • MKV/MP4 • LIVE STREAM",
+                                    )
+                                    .size((12.0 * scale_factor.max(0.75)).clamp(9.5, 12.5))
+                                    .color(egui::Color32::from_rgb(235, 195, 250))
+                                    .strong(),
+                                );
 
-                                let btn_font_size = if is_narrow { 18.0 } else { 22.0 };
-                                let btn_h = if is_narrow { 52.0 } else { 60.0 };
-                                let btn_w = if is_narrow { (real_avail_width - 48.0).min(340.0) } else { 280.0 };
+                                // Position the Hero Action Card over the perspective neon grid just below the sunset horizon,
+                                // leaving the sliced synthwave sun and mountain peaks unobstructed in the sky above.
+                                let is_narrow = real_avail_width < 600.0;
+                                let after_subtitle_y = ui.cursor().min.y;
+                                let est_card_h = if is_narrow { 225.0 } else { 180.0 };
+                                let max_card_top_y = (rect.bottom() - bottom_reserved_h - est_card_h - 20.0)
+                                    .max(after_subtitle_y + 10.0);
+                                let target_card_top_y =
+                                    (self.splash_cache.horizon_y + 10.0).min(max_card_top_y);
+                                let scenic_gap =
+                                    (target_card_top_y - after_subtitle_y).max(10.0);
+                                ui.add_space(scenic_gap);
 
-                                let btn = egui::Button::new(
-                                    egui::RichText::new(btn_text)
-                                        .size(btn_font_size)
-                                        .color(egui::Color32::WHITE)
-                                        .strong()
-                                )
-                                .fill(btn_fill)
-                                .stroke(btn_stroke);
-
-                                let url_btn = egui::Button::new(
-                                    egui::RichText::new("OPEN URL / STREAM")
-                                        .size(btn_font_size)
-                                        .color(egui::Color32::WHITE)
-                                        .strong()
-                                )
-                                .fill(egui::Color32::from_rgb(100, 50, 150))
-                                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(180, 80, 255)));
+                                // --- Unified Translucent Hero Action Card ---
+                                let card_max_w = if is_narrow {
+                                    (real_avail_width - 16.0).clamp(260.0, 420.0)
+                                } else {
+                                    620.0
+                                };
 
                                 egui::Frame::NONE
-                                    .shadow(egui::Shadow { offset: [0, 4], blur: 12, spread: 0, color: egui::Color32::from_black_alpha(200) })
-                                    .corner_radius(8.0)
+                                    .fill(egui::Color32::from_rgba_unmultiplied(14, 12, 28, 215))
+                                    .stroke(egui::Stroke::new(
+                                        1.0_f32,
+                                        egui::Color32::from_rgba_unmultiplied(212, 34, 161, 135),
+                                    ))
+                                    .corner_radius(14.0)
+                                    .inner_margin(egui::Margin::symmetric(
+                                        if is_narrow { 16 } else { 24 },
+                                        if is_narrow { 14 } else { 18 },
+                                    ))
                                     .show(ui, |ui| {
-                                        if is_narrow {
-                                            ui.vertical_centered(|ui| {
+                                        ui.set_max_width(card_max_w);
+                                        ui.vertical_centered(|ui| {
+                                            let is_file_hovered =
+                                                !ui.input(|i| i.raw.hovered_files.is_empty())
+                                                    || state.hovered_file.is_some();
+                                            if is_file_hovered {
+                                                let badge_text =
+                                                    if let Some(hf) = &state.hovered_file {
+                                                        let fn_only = std::path::Path::new(hf)
+                                                            .file_name()
+                                                            .unwrap_or_default()
+                                                            .to_string_lossy();
+                                                        format!(
+                                                            "📥 Drop '{}' to start playing",
+                                                            fn_only
+                                                        )
+                                                    } else {
+                                                        "📥 Drop media file here to start playing"
+                                                            .to_string()
+                                                    };
+                                                egui::Frame::NONE
+                                                    .fill(egui::Color32::from_rgba_unmultiplied(
+                                                        215, 105, 0, 230,
+                                                    ))
+                                                    .stroke(egui::Stroke::new(
+                                                        1.5_f32,
+                                                        egui::Color32::from_rgb(255, 175, 40),
+                                                    ))
+                                                    .corner_radius(8.0)
+                                                    .inner_margin(egui::Margin::symmetric(14, 7))
+                                                    .show(ui, |ui| {
+                                                        ui.label(
+                                                            egui::RichText::new(badge_text)
+                                                                .size(15.0)
+                                                                .color(egui::Color32::WHITE)
+                                                                .strong(),
+                                                        );
+                                                    });
+                                                ui.add_space(10.0);
+                                            }
+
+                                            let btn_text = if is_file_hovered {
+                                                "📥 DROP TO PLAY"
+                                            } else {
+                                                "OPEN FILE"
+                                            };
+                                            let btn_fill = if is_file_hovered {
+                                                egui::Color32::from_rgb(240, 125, 10)
+                                            } else {
+                                                egui::Color32::from_rgb(205, 95, 0)
+                                            };
+                                            let btn_stroke = if is_file_hovered {
+                                                egui::Stroke::new(
+                                                    2.0_f32,
+                                                    egui::Color32::from_rgb(255, 195, 70),
+                                                )
+                                            } else {
+                                                egui::Stroke::new(
+                                                    1.0_f32,
+                                                    egui::Color32::from_rgb(255, 145, 30),
+                                                )
+                                            };
+
+                                            let btn_font_size = if is_narrow { 17.0 } else { 20.0 };
+                                            let btn_h = if is_narrow { 48.0 } else { 54.0 };
+                                            let btn_w = if is_narrow {
+                                                (card_max_w - 32.0).clamp(200.0, 340.0)
+                                            } else {
+                                                265.0
+                                            };
+
+                                            let btn = egui::Button::new(
+                                                egui::RichText::new(btn_text)
+                                                    .size(btn_font_size)
+                                                    .color(egui::Color32::WHITE)
+                                                    .strong(),
+                                            )
+                                            .fill(btn_fill)
+                                            .stroke(btn_stroke)
+                                            .corner_radius(8.0);
+
+                                            let url_btn = egui::Button::new(
+                                                egui::RichText::new("OPEN URL / STREAM")
+                                                    .size(btn_font_size)
+                                                    .color(egui::Color32::WHITE)
+                                                    .strong(),
+                                            )
+                                            .fill(egui::Color32::from_rgb(100, 50, 150))
+                                            .stroke(egui::Stroke::new(
+                                                1.0_f32,
+                                                egui::Color32::from_rgb(180, 80, 255),
+                                            ))
+                                            .corner_radius(8.0);
+
+                                            if is_narrow {
                                                 let resp1 = ui.add_sized([btn_w, btn_h], btn);
                                                 if resp1.clicked() {
                                                     engine_action = EngineAction::OpenFile;
                                                 }
-                                                ui.add_space(14.0);
+                                                ui.add_space(10.0);
                                                 let resp2 = ui.add_sized([btn_w, btn_h], url_btn);
                                                 if resp2.clicked() {
                                                     engine_action = EngineAction::OpenUrlDialog;
                                                 }
-                                            });
-                                        } else {
-                                            ui.horizontal(|ui| {
-                                                let total_width = btn_w * 2.0 + 20.0;
-                                                ui.add_space((ui.available_width() - total_width) / 2.0);
-                                                let resp1 = ui.add_sized([btn_w, btn_h], btn);
-                                                if resp1.clicked() {
-                                                    engine_action = EngineAction::OpenFile;
+                                            } else {
+                                                ui.horizontal(|ui| {
+                                                    let total_width = btn_w * 2.0 + 16.0;
+                                                    let pad = ((ui.available_width() - total_width)
+                                                        * 0.5)
+                                                        .max(0.0);
+                                                    ui.add_space(pad);
+                                                    let resp1 = ui.add_sized([btn_w, btn_h], btn);
+                                                    if resp1.clicked() {
+                                                        engine_action = EngineAction::OpenFile;
+                                                    }
+                                                    ui.add_space(16.0);
+                                                    let resp2 =
+                                                        ui.add_sized([btn_w, btn_h], url_btn);
+                                                    if resp2.clicked() {
+                                                        engine_action =
+                                                            EngineAction::OpenUrlDialog;
+                                                    }
+                                                });
+                                            }
+
+                                            ui.add_space(10.0);
+
+                                            // Quick-Access Utility Row: Visualizer Module Picker & Recent Stream
+                                            let vis_btn_label =
+                                                format!("🎨 Visualizer: {}", vis_name);
+                                            let vis_btn = egui::Button::new(
+                                                egui::RichText::new(vis_btn_label)
+                                                    .size(12.5)
+                                                    .color(egui::Color32::from_rgb(190, 225, 255)),
+                                            )
+                                            .fill(egui::Color32::from_rgba_unmultiplied(
+                                                30, 35, 65, 210,
+                                            ))
+                                            .stroke(egui::Stroke::new(
+                                                1.0_f32,
+                                                egui::Color32::from_rgba_unmultiplied(
+                                                    0, 190, 255, 130,
+                                                ),
+                                            ))
+                                            .corner_radius(6.0);
+
+                                            if let Some((recent_url, recent_title)) =
+                                                state.url_history.last()
+                                            {
+                                                let display_ref = if !recent_title.is_empty() {
+                                                    recent_title.as_str()
+                                                } else {
+                                                    recent_url.as_str()
+                                                };
+                                                let short_url = if display_ref.chars().count() > 28
+                                                {
+                                                    let truncated: String =
+                                                        display_ref.chars().take(26).collect();
+                                                    format!("📡 Recent: {}…", truncated)
+                                                } else {
+                                                    format!("📡 Recent: {}", display_ref)
+                                                };
+                                                let recent_btn = egui::Button::new(
+                                                    egui::RichText::new(short_url)
+                                                        .size(12.5)
+                                                        .color(egui::Color32::from_rgb(
+                                                            225, 195, 255,
+                                                        )),
+                                                )
+                                                .fill(egui::Color32::from_rgba_unmultiplied(
+                                                    50, 28, 78, 210,
+                                                ))
+                                                .stroke(egui::Stroke::new(
+                                                    1.0_f32,
+                                                    egui::Color32::from_rgba_unmultiplied(
+                                                        180, 90, 255, 130,
+                                                    ),
+                                                ))
+                                                .corner_radius(6.0);
+
+                                                if is_narrow {
+                                                    if ui
+                                                        .add_sized([btn_w, 30.0], vis_btn)
+                                                        .clicked()
+                                                    {
+                                                        engine_action =
+                                                            EngineAction::ToggleVisPicker;
+                                                    }
+                                                    ui.add_space(6.0);
+                                                    if ui
+                                                        .add_sized([btn_w, 30.0], recent_btn)
+                                                        .on_hover_text(recent_url.as_str())
+                                                        .clicked()
+                                                    {
+                                                        engine_action = EngineAction::LoadUrl(
+                                                            recent_url.clone(),
+                                                        );
+                                                    }
+                                                } else {
+                                                    ui.horizontal(|ui| {
+                                                        let sub_w =
+                                                            (btn_w * 2.0 + 16.0 - 12.0) * 0.5;
+                                                        let total_w = sub_w * 2.0 + 12.0;
+                                                        let pad = ((ui.available_width() - total_w)
+                                                            * 0.5)
+                                                            .max(0.0);
+                                                        ui.add_space(pad);
+                                                        if ui
+                                                            .add_sized([sub_w, 30.0], vis_btn)
+                                                            .clicked()
+                                                        {
+                                                            engine_action =
+                                                                EngineAction::ToggleVisPicker;
+                                                        }
+                                                        ui.add_space(12.0);
+                                                        if ui
+                                                            .add_sized([sub_w, 30.0], recent_btn)
+                                                            .on_hover_text(recent_url.as_str())
+                                                            .clicked()
+                                                        {
+                                                            engine_action = EngineAction::LoadUrl(
+                                                                recent_url.clone(),
+                                                            );
+                                                        }
+                                                    });
                                                 }
-                                                ui.add_space(20.0);
-                                                let resp2 = ui.add_sized([btn_w, btn_h], url_btn);
-                                                if resp2.clicked() {
-                                                    engine_action = EngineAction::OpenUrlDialog;
+                                            } else {
+                                                let pill_w = if is_narrow {
+                                                    btn_w
+                                                } else {
+                                                    btn_w * 2.0 + 16.0
+                                                };
+                                                if ui.add_sized([pill_w, 30.0], vis_btn).clicked()
+                                                {
+                                                    engine_action = EngineAction::ToggleVisPicker;
                                                 }
-                                            });
-                                        }
+                                            }
+
+                                            ui.add_space(8.0);
+                                            ui.separator();
+                                            ui.add_space(4.0);
+
+                                            // Audio output toggles inside the hero card for high legibility
+                                            let mut force_stereo = state.force_stereo_downmix;
+                                            if ui
+                                                .checkbox(
+                                                    &mut force_stereo,
+                                                    egui::RichText::new(
+                                                        "Force Stereo Downmix (Fixes crackling on some devices)",
+                                                    )
+                                                    .size(12.5)
+                                                    .color(egui::Color32::from_rgb(205, 210, 225)),
+                                                )
+                                                .changed()
+                                            {
+                                                engine_action =
+                                                    EngineAction::SetForceStereo(force_stereo);
+                                            }
+
+                                            #[cfg(any(
+                                                target_os = "windows",
+                                                target_os = "linux"
+                                            ))]
+                                            {
+                                                let mut passthrough = state.passthrough_enabled;
+
+                                                #[cfg(target_os = "windows")]
+                                                let label = "Enable Bitstream Passthrough (WASAPI Exclusive)";
+                                                #[cfg(target_os = "linux")]
+                                                let label =
+                                                    "Enable Bitstream Passthrough (PipeWire)";
+
+                                                if ui
+                                                    .checkbox(
+                                                        &mut passthrough,
+                                                        egui::RichText::new(label)
+                                                            .size(12.5)
+                                                            .color(egui::Color32::from_rgb(
+                                                                205, 210, 225,
+                                                            )),
+                                                    )
+                                                    .changed()
+                                                {
+                                                    engine_action =
+                                                        EngineAction::SetPassthrough(passthrough);
+                                                }
+                                            }
+                                        });
                                     });
-
-                                ui.add_space(20.0);
-
-                            let mut force_stereo = state.force_stereo_downmix;
-                            if ui.checkbox(&mut force_stereo, "Force Stereo Downmix (Fixes crackling on some devices)").changed() {
-                                engine_action = EngineAction::SetForceStereo(force_stereo);
-                            }
-
-                            #[cfg(any(target_os = "windows", target_os = "linux"))]
-                            {
-                                let mut passthrough = state.passthrough_enabled;
-
-                                #[cfg(target_os = "windows")]
-                                let label = "Enable Bitstream Passthrough (WASAPI Exclusive)";
-                                #[cfg(target_os = "linux")]
-                                let label = "Enable Bitstream Passthrough (PipeWire)";
-
-                                if ui.checkbox(&mut passthrough, label).changed() {
-                                    engine_action = EngineAction::SetPassthrough(passthrough);
-                                }
-                            }
-                            // The shortcuts are now rendered in the TopBottomPanel
+                            });
                         });
                     });
-                });
 
                 return;
             }
@@ -7945,7 +8896,14 @@ impl VulkanEngine {
                 let total_h = ctx.viewport_rect().height();
                 let min_h = 220.0f32;
                 let top_h = (total_h * state.panel_split_ratio).clamp(min_h, (total_h - min_h).max(min_h));
-                let top_margin = if is_portrait { 54 } else { 8 };
+                let top_margin = if is_portrait {
+                    54
+                } else if cfg!(target_os = "android") {
+                    42
+                } else {
+                    8
+                };
+                let bottom_margin = if is_portrait { 14 } else { 8 };
                 let panel_resp = egui::Panel::top("top_panel")
                     .resizable(false)
                     .frame(
@@ -7955,7 +8913,7 @@ impl VulkanEngine {
                                 left: 16,
                                 right: 16,
                                 top: top_margin,
-                                bottom: 8,
+                                bottom: bottom_margin,
                             })
                     )
                     .exact_size(top_h)
@@ -8014,11 +8972,27 @@ impl VulkanEngine {
                                 )
                             };
 
+                            let font_id = egui::FontId::proportional(11.0);
+                            let shadow_color = egui::Color32::from_black_alpha(210);
+                            for offset in [
+                                egui::vec2(-1.0, 0.0),
+                                egui::vec2(1.0, 0.0),
+                                egui::vec2(0.0, -1.0),
+                                egui::vec2(0.0, 1.0),
+                            ] {
+                                painter.text(
+                                    rect.center() + offset,
+                                    egui::Align2::CENTER_CENTER,
+                                    &time_text,
+                                    font_id.clone(),
+                                    shadow_color,
+                                );
+                            }
                             painter.text(
                                 rect.center(),
                                 egui::Align2::CENTER_CENTER,
                                 time_text,
-                                egui::FontId::proportional(11.0),
+                                font_id,
                                 egui::Color32::WHITE,
                             );
                         };
@@ -9271,28 +10245,61 @@ impl VulkanEngine {
             self.heatmap_uv_rect = [0.0; 4];
         }
 
-        // Write updated HUD rect uniforms immediately so Frame 1 (and any layout change)
-        // renders the HUD panels in-place without waiting for the next frame's update()
-        const UI_RECTS_OFFSET: wgpu::BufferAddress =
-            std::mem::offset_of!(AudioUniforms, ui_meters_rect) as wgpu::BufferAddress;
-        let ui_rects_data = [self.meters_uv_rect, self.heatmap_uv_rect, self.fire_uv_rect];
-        self.queue.write_buffer(
-            &self.uniform_buffer,
-            UI_RECTS_OFFSET,
-            bytemuck::cast_slice(&ui_rects_data),
-        );
-
         egui_state.handle_platform_output(window, full_output.platform_output);
-        let clipped_primitives =
+        let mut clipped_primitives =
             egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+        if !state.file_loaded {
+            clipped_primitives.insert(
+                0,
+                self.splash_cache.build_combined_bg_primitive(
+                    egui_ctx,
+                    central_rect,
+                    self.smooth_time as f32,
+                ),
+            );
+        }
 
         let ui_elapsed = ui_start.elapsed().as_micros() as f32;
         let phase_egui_layout_us = ui_elapsed; // Egui layout now accurately measures only UI logic and tessellation
+
+        // Write updated HUD rect uniforms only when playback is active and layout rects changed
+        if state.file_loaded {
+            const UI_RECTS_OFFSET: wgpu::BufferAddress =
+                std::mem::offset_of!(AudioUniforms, ui_meters_rect) as wgpu::BufferAddress;
+            let ui_rects_data = [self.meters_uv_rect, self.heatmap_uv_rect, self.fire_uv_rect];
+            if ui_rects_data != self.last_ui_rects_data {
+                self.last_ui_rects_data = ui_rects_data;
+                self.queue.write_buffer(
+                    &self.uniform_buffer,
+                    UI_RECTS_OFFSET,
+                    bytemuck::cast_slice(&ui_rects_data),
+                );
+            }
+        }
 
         for (id, image_delta) in &full_output.textures_delta.set {
             self.egui_renderer
                 .update_texture(&self.device, &self.queue, *id, image_delta);
         }
+
+        // Acquire swapchain image AFTER CPU UI layout & tessellation ("Late Swapchain Acquire")
+        // so Egui layout overlaps with the previous frame's GPU execution and VSync fence wait,
+        // and GPU command submission happens immediately after VSync unblocks.
+        let surface_start = std::time::Instant::now();
+        let surface = self.surface.as_ref().ok_or(wgpu::SurfaceStatus::Lost)?;
+        let output = surface.get_current_texture();
+        let surface_texture = match output {
+            wgpu::CurrentSurfaceTexture::Success(tex)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(tex) => tex,
+            wgpu::CurrentSurfaceTexture::Lost => return Err(wgpu::SurfaceStatus::Lost),
+            wgpu::CurrentSurfaceTexture::Outdated => return Err(wgpu::SurfaceStatus::Outdated),
+            wgpu::CurrentSurfaceTexture::Timeout => return Err(wgpu::SurfaceStatus::Timeout),
+            _ => return Err(wgpu::SurfaceStatus::Lost),
+        };
+        let view = surface_texture
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let phase_surface_us = surface_start.elapsed().as_micros() as f32;
 
         let screen_descriptor = egui_wgpu::ScreenDescriptor {
             size_in_pixels: [self.config.width, self.config.height],
@@ -9314,87 +10321,94 @@ impl VulkanEngine {
             &screen_descriptor,
         );
 
-        // GPU heatmap & resynth compute (timed via query indices 0..1)
-        {
-            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Heatmap & Resynth Compute Pass"),
-                timestamp_writes: self.query_set.as_ref().map(|qs| {
-                    wgpu::ComputePassTimestampWrites {
+        let should_start_mapping = state.file_loaded
+            && state.show_stats
+            && !self.timestamp_mapping_active
+            && self.query_set.is_some();
+        let active_query_set = if should_start_mapping {
+            self.query_set.as_ref()
+        } else {
+            None
+        };
+
+        // GPU heatmap & resynth compute (timed via query indices 0..1 when stats are visible)
+        if state.file_loaded {
+            {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Heatmap & Resynth Compute Pass"),
+                    timestamp_writes: active_query_set.map(|qs| wgpu::ComputePassTimestampWrites {
                         query_set: qs,
                         beginning_of_pass_write_index: Some(0),
                         end_of_pass_write_index: Some(1),
-                    }
-                }),
-            });
-            compute_pass.set_pipeline(&self.heatmap_compute_pipeline);
-            compute_pass.set_bind_group(0, Some(&self.heatmap_bind_group), &[]);
-            compute_pass.dispatch_workgroups(1, 1, 1); // 256x1x1 threads
+                    }),
+                });
+                compute_pass.set_pipeline(&self.heatmap_compute_pipeline);
+                compute_pass.set_bind_group(0, Some(&self.heatmap_bind_group), &[]);
+                compute_pass.dispatch_workgroups(1, 1, 1); // 256x1x1 threads
 
-            let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
-            if vis_def.requires_resynth {
-                compute_pass.set_pipeline(&self.resynth_compute_pipeline);
-                compute_pass.set_bind_group(0, Some(&self.resynth_bind_group), &[]);
-                compute_pass.dispatch_workgroups(32, 2, 1); // 512/16=32, 32/16=2
-            }
-        }
-
-        // GPU fire compute: dispatch simulation + copy result to texture
-        let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
-        if vis_def.requires_fire {
-            if vis_def.id == 6 {
-                {
-                    let mut compute_pass =
-                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                            label: Some("Fire Compute"),
-                            timestamp_writes: self.query_set.as_ref().map(|qs| {
-                                wgpu::ComputePassTimestampWrites {
-                                    query_set: qs,
-                                    beginning_of_pass_write_index: Some(2),
-                                    end_of_pass_write_index: Some(3),
-                                }
-                            }),
-                        });
-                    compute_pass.set_pipeline(&self.firesim_compute_pipeline);
-                    let bg = if self.fire_ping {
-                        &self.fire_bind_group_a
-                    } else {
-                        &self.fire_bind_group_b
-                    };
-                    compute_pass.set_bind_group(0, Some(bg), &[]);
-                    compute_pass.dispatch_workgroups(64, 36, 1); // 1024/16=64, 576/16=36
+                let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
+                if vis_def.requires_resynth {
+                    compute_pass.set_pipeline(&self.resynth_compute_pipeline);
+                    compute_pass.set_bind_group(0, Some(&self.resynth_bind_group), &[]);
+                    compute_pass.dispatch_workgroups(32, 2, 1); // 512/16=32, 32/16=2
                 }
-                // Copy output buffer to fire_grid_texture
-                let output_buffer = if self.fire_ping {
-                    &self.fire_buffer_b
-                } else {
-                    &self.fire_buffer_a
-                };
-                encoder.copy_buffer_to_texture(
-                    wgpu::TexelCopyBufferInfo {
-                        buffer: output_buffer,
-                        layout: wgpu::TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(1024 * 4),
-                            rows_per_image: Some(576),
+            }
+
+            // GPU fire compute: dispatch simulation + copy result to texture
+            let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
+            if vis_def.requires_fire {
+                if vis_def.id == 6 {
+                    {
+                        let mut compute_pass =
+                            encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                                label: Some("Fire Compute"),
+                                timestamp_writes: active_query_set.map(|qs| {
+                                    wgpu::ComputePassTimestampWrites {
+                                        query_set: qs,
+                                        beginning_of_pass_write_index: Some(2),
+                                        end_of_pass_write_index: Some(3),
+                                    }
+                                }),
+                            });
+                        compute_pass.set_pipeline(&self.firesim_compute_pipeline);
+                        let bg = if self.fire_ping {
+                            &self.fire_bind_group_a
+                        } else {
+                            &self.fire_bind_group_b
+                        };
+                        compute_pass.set_bind_group(0, Some(bg), &[]);
+                        compute_pass.dispatch_workgroups(64, 36, 1); // 1024/16=64, 576/16=36
+                    }
+                    // Copy output buffer to fire_grid_texture
+                    let output_buffer = if self.fire_ping {
+                        &self.fire_buffer_b
+                    } else {
+                        &self.fire_buffer_a
+                    };
+                    encoder.copy_buffer_to_texture(
+                        wgpu::TexelCopyBufferInfo {
+                            buffer: output_buffer,
+                            layout: wgpu::TexelCopyBufferLayout {
+                                offset: 0,
+                                bytes_per_row: Some(1024 * 4),
+                                rows_per_image: Some(576),
+                            },
                         },
-                    },
-                    wgpu::TexelCopyTextureInfo {
-                        texture: &self.fire_grid_texture,
-                        mip_level: 0,
-                        origin: wgpu::Origin3d::ZERO,
-                        aspect: wgpu::TextureAspect::All,
-                    },
-                    wgpu::Extent3d {
-                        width: 1024,
-                        height: 576,
-                        depth_or_array_layers: 1,
-                    },
-                );
-                self.fire_ping = !self.fire_ping;
-            } else {
-                // Retro Fire (ID 5) cellular automaton already ran on CPU and uploaded to fire_grid_texture.
-                // Run dummy timestamp compute pass to satisfy Vulkan validation timestamp queries:
-                if let Some(qs) = &self.query_set {
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &self.fire_grid_texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::Extent3d {
+                            width: 1024,
+                            height: 576,
+                            depth_or_array_layers: 1,
+                        },
+                    );
+                    self.fire_ping = !self.fire_ping;
+                } else if let Some(qs) = active_query_set {
+                    // Retro Fire (ID 5) cellular automaton already ran on CPU and uploaded to fire_grid_texture.
                     encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                         label: Some("Dummy Fire Pass"),
                         timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
@@ -9404,10 +10418,7 @@ impl VulkanEngine {
                         }),
                     });
                 }
-            }
-        } else {
-            // Write dummy timestamps to satisfy Vulkan validation
-            if let Some(qs) = &self.query_set {
+            } else if let Some(qs) = active_query_set {
                 encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("Dummy Fire Pass"),
                     timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
@@ -9417,537 +10428,546 @@ impl VulkanEngine {
                     }),
                 });
             }
-        }
 
-        if vis_def.id == 11 {
-            // Neon Corridor
-            // Update params
-            let mut act = 0.0;
-            let count = state.channel_vus.len().min(8);
-            for i in 0..count {
-                act += state.channel_vus[i];
+            if vis_def.id == 11 {
+                // Neon Corridor
+                // Update params
+                let mut act = 0.0;
+                let count = state.channel_vus.len().min(8);
+                for i in 0..count {
+                    act += state.channel_vus[i];
+                }
+                if count > 0 {
+                    act /= count as f32;
+                }
+                self.queue.write_buffer(
+                    &self.smoke_params_buffer,
+                    0,
+                    bytemuck::cast_slice(&[
+                        state.current_seconds as f32,
+                        act,
+                        0.0,
+                        0.0, // padding
+                    ]),
+                );
+
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Neon Smoke Compute Pass"),
+                    timestamp_writes: None,
+                });
+                compute_pass.set_pipeline(&self.smoke_compute_pipeline);
+                compute_pass.set_bind_group(0, Some(&self.smoke_compute_bind_group), &[]);
+                compute_pass.dispatch_workgroups(16, 16, 16); // 64 / 4
             }
-            if count > 0 {
-                act /= count as f32;
+
+            if vis_def.requires_ferrofluidsim {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Ferrofluid Sim Compute"),
+                    timestamp_writes: None,
+                });
+                compute_pass.set_pipeline(&self.ferrofluidsim_clear_pipeline);
+                compute_pass.set_bind_group(0, Some(&self.ferrofluidsim_bind_group), &[]);
+                compute_pass.dispatch_workgroups(1024, 1, 1);
+
+                compute_pass.set_pipeline(&self.ferrofluidsim_compute_pipeline);
+                compute_pass.dispatch_workgroups(391, 1, 1);
             }
-            self.queue.write_buffer(
-                &self.smoke_params_buffer,
-                0,
-                bytemuck::cast_slice(&[
-                    state.current_seconds as f32,
-                    act,
-                    0.0,
-                    0.0, // padding
-                ]),
-            );
 
-            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Neon Smoke Compute Pass"),
-                timestamp_writes: None,
-            });
-            compute_pass.set_pipeline(&self.smoke_compute_pipeline);
-            compute_pass.set_bind_group(0, Some(&self.smoke_compute_bind_group), &[]);
-            compute_pass.dispatch_workgroups(16, 16, 16); // 64 / 4
-        }
-
-        if vis_def.requires_ferrofluidsim {
-            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Ferrofluid Sim Compute"),
-                timestamp_writes: None,
-            });
-            compute_pass.set_pipeline(&self.ferrofluidsim_clear_pipeline);
-            compute_pass.set_bind_group(0, Some(&self.ferrofluidsim_bind_group), &[]);
-            compute_pass.dispatch_workgroups(1024, 1, 1);
-
-            compute_pass.set_pipeline(&self.ferrofluidsim_compute_pipeline);
-            compute_pass.dispatch_workgroups(391, 1, 1);
-        }
-
-        if vis_def.requires_flip_ferrofluid {
-            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Quantum FLIP Ferrofluid Compute"),
-                timestamp_writes: None,
-            });
-            // 1. Clear grid accum and pressure buffers
-            compute_pass.set_pipeline(&self.flip_clear_pipeline);
-            compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
-            compute_pass.dispatch_workgroups(512, 1, 1);
-
-            // 2. Clear render heightfield grid
-            compute_pass.set_pipeline(&self.flip_clear_render_pipeline);
-            compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
-            compute_pass.dispatch_workgroups(1024, 1, 1);
-
-            // 3. P2G (Transfer particle momentum to grid)
-            compute_pass.set_pipeline(&self.flip_p2g_pipeline);
-            compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
-            compute_pass.dispatch_workgroups(256, 1, 1);
-
-            // 4. Grid forces (normalize, gravity, magnetic body forces, boundary walls)
-            compute_pass.set_pipeline(&self.flip_forces_pipeline);
-            compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
-            compute_pass.dispatch_workgroups(512, 1, 1);
-
-            // 5. Pressure solve (16 Jacobi iterations ping-ponging 0 -> 1 -> 0 -> 1)
-            for _ in 0..8 {
-                compute_pass.set_pipeline(&self.flip_pressure_0_to_1_pipeline);
+            if vis_def.requires_flip_ferrofluid {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Quantum FLIP Ferrofluid Compute"),
+                    timestamp_writes: None,
+                });
+                // 1. Clear grid accum and pressure buffers
+                compute_pass.set_pipeline(&self.flip_clear_pipeline);
                 compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
                 compute_pass.dispatch_workgroups(512, 1, 1);
 
-                compute_pass.set_pipeline(&self.flip_pressure_1_to_0_pipeline);
+                // 2. Clear render heightfield grid
+                compute_pass.set_pipeline(&self.flip_clear_render_pipeline);
+                compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                compute_pass.dispatch_workgroups(1024, 1, 1);
+
+                // 3. P2G (Transfer particle momentum to grid)
+                compute_pass.set_pipeline(&self.flip_p2g_pipeline);
+                compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                compute_pass.dispatch_workgroups(96, 1, 1);
+
+                // 4. Grid forces (normalize, gravity, magnetic body forces, boundary walls)
+                compute_pass.set_pipeline(&self.flip_forces_pipeline);
                 compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
                 compute_pass.dispatch_workgroups(512, 1, 1);
+
+                // 5. Pressure solve (2 warm-started Jacobi iterations ping-ponging 0 -> 1 -> 0)
+                for _ in 0..1 {
+                    compute_pass.set_pipeline(&self.flip_pressure_0_to_1_pipeline);
+                    compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                    compute_pass.dispatch_workgroups(512, 1, 1);
+
+                    compute_pass.set_pipeline(&self.flip_pressure_1_to_0_pipeline);
+                    compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                    compute_pass.dispatch_workgroups(512, 1, 1);
+                }
+
+                // 6. Velocity projection (subtract pressure gradient)
+                compute_pass.set_pipeline(&self.flip_project_pipeline);
+                compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                compute_pass.dispatch_workgroups(512, 1, 1);
+
+                // 7. G2P & Advection & Splat to Render Grid
+                compute_pass.set_pipeline(&self.flip_g2p_advect_pipeline);
+                compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                compute_pass.dispatch_workgroups(96, 1, 1);
             }
 
-            // 6. Velocity projection (subtract pressure gradient)
-            compute_pass.set_pipeline(&self.flip_project_pipeline);
-            compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
-            compute_pass.dispatch_workgroups(512, 1, 1);
-
-            // 7. G2P & Advection & Splat to Render Grid
-            compute_pass.set_pipeline(&self.flip_g2p_advect_pipeline);
-            compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
-            compute_pass.dispatch_workgroups(256, 1, 1);
-        }
-
-        if vis_def.requires_flip_water {
-            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Acoustic FLIP Water Compute"),
-                timestamp_writes: None,
-            });
-            // 1. Clear grid accum and pressure buffers
-            compute_pass.set_pipeline(&self.flip_water_clear_pipeline);
-            compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
-            compute_pass.dispatch_workgroups(512, 1, 1);
-
-            // 2. Clear render heightfield grid
-            compute_pass.set_pipeline(&self.flip_water_clear_render_pipeline);
-            compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
-            compute_pass.dispatch_workgroups(1024, 1, 1);
-
-            // 3. P2G (Transfer particle momentum to grid)
-            compute_pass.set_pipeline(&self.flip_water_p2g_pipeline);
-            compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
-            compute_pass.dispatch_workgroups(256, 1, 1);
-
-            // 4. Grid forces (normalize, gravity, acoustic sub-bass geyser forces, Faraday ripples, walls)
-            compute_pass.set_pipeline(&self.flip_water_forces_pipeline);
-            compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
-            compute_pass.dispatch_workgroups(512, 1, 1);
-
-            // 5. Pressure solve (16 Jacobi iterations ping-ponging 0 -> 1 -> 0 -> 1)
-            for _ in 0..8 {
-                compute_pass.set_pipeline(&self.flip_water_pressure_0_to_1_pipeline);
+            if vis_def.requires_flip_water && vis_def.id != 28 {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Acoustic FLIP Water Compute"),
+                    timestamp_writes: None,
+                });
+                // 1. Clear grid accum and pressure buffers
+                compute_pass.set_pipeline(&self.flip_water_clear_pipeline);
                 compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
                 compute_pass.dispatch_workgroups(512, 1, 1);
 
-                compute_pass.set_pipeline(&self.flip_water_pressure_1_to_0_pipeline);
+                // 2. Clear render heightfield grid
+                compute_pass.set_pipeline(&self.flip_water_clear_render_pipeline);
+                compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                compute_pass.dispatch_workgroups(1024, 1, 1);
+
+                // 3. P2G (Transfer particle momentum to grid)
+                compute_pass.set_pipeline(&self.flip_water_p2g_pipeline);
+                compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                compute_pass.dispatch_workgroups(256, 1, 1);
+
+                // 4. Grid forces (normalize, gravity, acoustic sub-bass geyser forces, Faraday ripples, walls)
+                compute_pass.set_pipeline(&self.flip_water_forces_pipeline);
                 compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
                 compute_pass.dispatch_workgroups(512, 1, 1);
+
+                // 5. Pressure solve (16 Jacobi iterations ping-ponging 0 -> 1 -> 0 -> 1)
+                for _ in 0..8 {
+                    compute_pass.set_pipeline(&self.flip_water_pressure_0_to_1_pipeline);
+                    compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                    compute_pass.dispatch_workgroups(512, 1, 1);
+
+                    compute_pass.set_pipeline(&self.flip_water_pressure_1_to_0_pipeline);
+                    compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                    compute_pass.dispatch_workgroups(512, 1, 1);
+                }
+
+                // 6. Velocity projection (subtract pressure gradient)
+                compute_pass.set_pipeline(&self.flip_water_project_pipeline);
+                compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                compute_pass.dispatch_workgroups(512, 1, 1);
+
+                // 7. G2P & Advection & Splat to Render Grid
+                compute_pass.set_pipeline(&self.flip_water_g2p_advect_pipeline);
+                compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                compute_pass.dispatch_workgroups(256, 1, 1);
             }
 
-            // 6. Velocity projection (subtract pressure gradient)
-            compute_pass.set_pipeline(&self.flip_water_project_pipeline);
-            compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
-            compute_pass.dispatch_workgroups(512, 1, 1);
+            if vis_def.id == 20 {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Bioluminescence Waves Sim Compute"),
+                    timestamp_writes: None,
+                });
+                compute_pass.set_pipeline(&self.biolum_compute_pipeline);
+                compute_pass.set_bind_group(0, Some(&self.biolum_compute_bind_group), &[]);
+                compute_pass.dispatch_workgroups(144, 1, 1);
+            }
 
-            // 7. G2P & Advection & Splat to Render Grid
-            compute_pass.set_pipeline(&self.flip_water_g2p_advect_pipeline);
-            compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
-            compute_pass.dispatch_workgroups(256, 1, 1);
-        }
-
-        if vis_def.id == 20 {
-            let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("Bioluminescence Waves Sim Compute"),
-                timestamp_writes: None,
-            });
-            compute_pass.set_pipeline(&self.biolum_compute_pipeline);
-            compute_pass.set_bind_group(0, Some(&self.biolum_compute_bind_group), &[]);
-            compute_pass.dispatch_workgroups(256, 1, 1);
-        }
-
-        {
-            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("Main Render Pass"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    depth_slice: None,
-                    ops: wgpu::Operations {
-                        // Must always clear to APP_DEFAULT_BG_CLEAR_COLOR (0.1, 0.1, 0.1) so the
-                        // transparent top HUD panel preserves its default grey background.
-                        load: wgpu::LoadOp::Clear(APP_DEFAULT_BG_CLEAR_COLOR),
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                    view: &self.depth_texture_view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
-                        store: wgpu::StoreOp::Store,
+            {
+                let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Main Render Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            // Must always clear to APP_DEFAULT_BG_CLEAR_COLOR (0.1, 0.1, 0.1) so the
+                            // transparent top HUD panel preserves its default grey background.
+                            load: wgpu::LoadOp::Clear(APP_DEFAULT_BG_CLEAR_COLOR),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                        view: &self.depth_texture_view,
+                        depth_ops: Some(wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(1.0),
+                            store: wgpu::StoreOp::Discard,
+                        }),
+                        stencil_ops: None,
                     }),
-                    stencil_ops: None,
-                }),
-                timestamp_writes: self.query_set.as_ref().map(|qs| {
-                    wgpu::RenderPassTimestampWrites {
+                    timestamp_writes: active_query_set.map(|qs| wgpu::RenderPassTimestampWrites {
                         query_set: qs,
                         beginning_of_pass_write_index: Some(4),
                         end_of_pass_write_index: Some(5),
-                    }
-                }),
-                occlusion_query_set: None,
-                multiview_mask: None,
-            });
+                    }),
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
 
-            let scale_factor = egui_ctx.pixels_per_point();
-            let vp_x =
-                ((central_rect.min.x * scale_factor).clamp(0.0, self.config.width as f32)).round();
-            let vp_y =
-                ((central_rect.min.y * scale_factor).clamp(0.0, self.config.height as f32)).round();
-            let max_w = (self.config.width as f32 - vp_x).max(1.0);
-            let vp_w = ((central_rect.width() * scale_factor).clamp(1.0, max_w)).round();
-            let max_h = (self.config.height as f32 - vp_y).max(1.0);
-            let vp_h = ((central_rect.height() * scale_factor).clamp(1.0, max_h)).round();
+                let scale_factor = egui_ctx.pixels_per_point();
+                let vp_x = ((central_rect.min.x * scale_factor)
+                    .clamp(0.0, self.config.width as f32))
+                .round();
+                let vp_y = ((central_rect.min.y * scale_factor)
+                    .clamp(0.0, self.config.height as f32))
+                .round();
+                let max_w = (self.config.width as f32 - vp_x).max(1.0);
+                let vp_w = ((central_rect.width() * scale_factor).clamp(1.0, max_w)).round();
+                let max_h = (self.config.height as f32 - vp_y).max(1.0);
+                let vp_h = ((central_rect.height() * scale_factor).clamp(1.0, max_h)).round();
 
-            // --- 3D Engine Camera Math ---
-            let aspect = vp_w / vp_h.max(1.0);
+                // --- 3D Engine Camera Math ---
+                let aspect = vp_w / vp_h.max(1.0);
 
-            // Update aspect_ratio uniform dynamically based on current viewport
-            const ASPECT_RATIO_OFFSET: wgpu::BufferAddress =
-                std::mem::offset_of!(AudioUniforms, aspect_ratio) as wgpu::BufferAddress;
-            self.queue.write_buffer(
-                &self.uniform_buffer,
-                ASPECT_RATIO_OFFSET,
-                bytemuck::cast_slice(&[aspect as f32]),
-            );
+                // Update aspect_ratio uniform dynamically based on current viewport
+                const ASPECT_RATIO_OFFSET: wgpu::BufferAddress =
+                    std::mem::offset_of!(AudioUniforms, aspect_ratio) as wgpu::BufferAddress;
+                self.queue.write_buffer(
+                    &self.uniform_buffer,
+                    ASPECT_RATIO_OFFSET,
+                    bytemuck::cast_slice(&[aspect as f32]),
+                );
 
-            // Adapt FOV when aspect ratio is square or portrait (< 1.0) so 3D scenes fit without horizontal clipping
-            let base_fov = if state.visualizer_mode == 22 {
-                64.0_f32.to_radians()
-            } else {
-                48.0_f32.to_radians()
-            };
-            let fov_y = if state.visualizer_mode == 19
-                || state.visualizer_mode == 23
-                || state.visualizer_mode == 29
-            {
-                base_fov
-            } else if aspect < 1.0 {
-                (base_fov / aspect.clamp(0.65, 1.0)).min(if state.visualizer_mode == 22 {
-                    85.0_f32.to_radians()
+                // Adapt FOV when aspect ratio is square or portrait (< 1.0) so 3D scenes fit without horizontal clipping
+                let base_fov = if state.visualizer_mode == 22 {
+                    64.0_f32.to_radians()
                 } else {
-                    75.0_f32.to_radians()
-                })
-            } else {
-                base_fov
-            };
-            let proj = glam::Mat4::perspective_rh_gl(fov_y, aspect, 0.1, 1000.0);
-            let view = if state.visualizer_mode == 20 && state.biolum_top_down {
-                glam::Mat4::look_at_rh(
-                    glam::Vec3::new(0.0, 14.0, 0.0),
-                    glam::Vec3::new(0.0, 0.0, 0.0),
-                    glam::Vec3::new(0.0, 0.0, 1.0),
-                )
-            } else if state.visualizer_mode == 14 {
-                let cam_y = if aspect < 1.0 { 1.65 } else { 1.50 };
-                let cam_z = if aspect < 1.0 { 0.2 } else { 0.6 };
-                glam::Mat4::look_at_rh(
-                    glam::Vec3::new(0.0, cam_y, cam_z),
-                    glam::Vec3::new(0.0, 0.95, 14.0),
-                    glam::Vec3::new(0.0, 1.0, 0.0),
-                )
-            } else if state.visualizer_mode == 19 {
-                // 3D Vintage Hi-Fi Master Rack:
-                // Scale camera distance so 11.5-wide rack fits completely in square/portrait viewports without clipping
-                let cam_z = (13.5 / aspect).clamp(6.2, 22.0);
-                glam::Mat4::look_at_rh(
-                    glam::Vec3::new(0.0, 0.0, cam_z),
-                    glam::Vec3::new(0.0, 0.0, 0.0),
-                    glam::Vec3::new(0.0, 1.0, 0.0),
-                )
-            } else if state.visualizer_mode == 11 {
-                // 3D Concentric Neon Audio Portal Frames Corridor
-                glam::Mat4::look_at_rh(
-                    glam::Vec3::new(0.0, 2.1, -3.8),
-                    glam::Vec3::new(0.0, 1.8, 20.0),
-                    glam::Vec3::new(0.0, 1.0, 0.0),
-                )
-            } else if state.visualizer_mode == 17 {
-                // 3D Volumetric Falling Rain Storm
-                glam::Mat4::look_at_rh(
-                    glam::Vec3::new(0.0, 8.0, 0.0),
-                    glam::Vec3::new(0.0, 14.0, 50.0),
-                    glam::Vec3::new(0.0, 1.0, 0.0),
-                )
-            } else if state.visualizer_mode == 23 {
-                // 3D Glass Water Lyrics: Low-angle studio camera
-                // Scale camera distance and elevation so 7.5-wide text fits cleanly in square/portrait mobile viewport
-                let lyrics_scale = (2.2 / aspect).max(1.0);
-                let eye_y = 0.45 + 0.95 * lyrics_scale;
-                let eye_z = 4.2 * lyrics_scale;
-                glam::Mat4::look_at_rh(
-                    glam::Vec3::new(0.0, eye_y, eye_z),
-                    glam::Vec3::new(0.0, 0.45, 0.0),
-                    glam::Vec3::new(0.0, 1.0, 0.0),
-                )
-            } else if state.visualizer_mode == 22 {
-                // 3D Neon Spatial Listening Room: Orbiting camera focused on center stage
-                let t_cam = self.play_time as f32 * 0.18;
-                let cam_radius = 9.8f32;
-                let cam_h = 2.4f32 + (t_cam * 0.7).sin() * 0.6f32;
-                let cam_x = t_cam.sin() * cam_radius * 0.55f32;
-                let cam_z = -t_cam.cos() * cam_radius * 0.6f32 - 2.8f32;
-                glam::Mat4::look_at_rh(
-                    glam::Vec3::new(cam_x, cam_h, cam_z),
-                    glam::Vec3::new(0.0, 0.4, 2.5),
-                    glam::Vec3::new(0.0, 1.0, 0.0),
-                )
-            } else if state.visualizer_mode == 29 {
-                // 3D Prismatic Spectrum Canyon: Centered perspective camera looking down +Z canyon
-                glam::Mat4::look_at_rh(
-                    glam::Vec3::new(0.0, 0.0, -6.5),
-                    glam::Vec3::new(0.0, 0.0, 20.0),
-                    glam::Vec3::new(0.0, 1.0, 0.0),
-                )
-            } else {
-                glam::Mat4::look_at_rh(
-                    glam::Vec3::new(0.0, 1.5, -2.0),
-                    glam::Vec3::new(0.0, 1.5, 0.0),
-                    glam::Vec3::new(0.0, 1.0, 0.0),
-                )
-            };
-            let camera_uniforms = CameraUniforms {
-                view_matrix: view.to_cols_array_2d(),
-                proj_matrix: proj.to_cols_array_2d(),
-            };
-            self.queue.write_buffer(
-                &self.camera_uniform_buffer,
-                0,
-                bytemuck::cast_slice(&[camera_uniforms]),
-            );
-
-            render_pass.set_viewport(vp_x, vp_y, vp_w, vp_h, 0.0, 1.0);
-            render_pass.set_scissor_rect(vp_x as u32, vp_y as u32, vp_w as u32, vp_h as u32);
-
-            let mode_idx = state
-                .current_visualizer_idx
-                .min(self.render_pipelines.len() - 1);
-            let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
-
-            if vis_def.id == 20 {
-                render_pass.set_pipeline(&self.biolum_bg_pipeline);
-                render_pass.draw(0..3, 0..1);
-            } else if vis_def.id == 18 {
-                render_pass.set_pipeline(&self.crt_background_pipeline);
-                render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-                render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
-                render_pass.draw(0..3, 0..1);
-            } else if vis_def.id == 14 {
-                render_pass.set_pipeline(&self.synthwave_sky_pipeline);
-                render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-                render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
-                render_pass.draw(0..3, 0..1);
-            } else if vis_def.id == 19 {
-                render_pass.set_pipeline(&self.vumeters_bg_pipeline);
-                render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-                render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
-                render_pass.draw(0..3, 0..1);
-            } else if vis_def.id == 11 {
-                render_pass.set_pipeline(&self.neon_bg_pipeline);
-                render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-                render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
-                render_pass.draw(0..3, 0..1);
-            } else if vis_def.id == 17 {
-                render_pass.set_pipeline(&self.storm_sky_pipeline);
-                render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-                render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
-                render_pass.draw(0..3, 0..1);
-            } else if vis_def.id != 13
-                && vis_def.id != 22
-                && matches!(
-                    vis_def.pipeline_type,
-                    crate::state::PipelineType::Mesh3D { .. }
-                )
-            {
-                // Automatically clear the 3D visualizer viewport to black for any Mesh3D visualizer
-                // that does not use one of the dedicated sky pipelines above, while preserving
-                // APP_DEFAULT_BG_CLEAR_COLOR in the surrounding application/HUD panels.
-                render_pass.set_pipeline(&self.clear_black_pipeline);
-                render_pass.draw(0..3, 0..1);
-            }
-
-            render_pass.set_pipeline(&self.render_pipelines[mode_idx]);
-            render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-            if vis_def.id == 27 || vis_def.id == 28 || vis_def.id == 23 {
-                render_pass.set_bind_group(1, &self.flip_render_bind_group, &[]);
-            } else {
-                render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
-            }
-
-            match &vis_def.pipeline_type {
-                crate::state::PipelineType::FullscreenQuad => {
-                    render_pass.draw(0..3, 0..1);
-                }
-                crate::state::PipelineType::Mesh3D {
-                    geometry,
-                    instances,
-                } => {
-                    render_pass.set_bind_group(2, &self.camera_bind_group, &[]);
-                    if vis_def.id == 20 {
-                        render_pass.set_bind_group(3, &self.biolum_render_bind_group, &[]);
-                    }
-                    if let Some(mesh) = self.mesh_registry.get(geometry) {
-                        render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                        render_pass.set_index_buffer(
-                            mesh.index_buffer.slice(..),
-                            wgpu::IndexFormat::Uint32,
-                        );
-                        render_pass.draw_indexed(0..mesh.index_count, 0, 0..*instances);
-                    }
-
-                    if vis_def.id == 23 {
-                        render_pass.set_pipeline(&self.water_splash_pipeline);
-                        render_pass.set_vertex_buffer(0, self.splash_quad_vertex_buffer.slice(..));
-                        render_pass.set_index_buffer(
-                            self.splash_quad_index_buffer.slice(..),
-                            wgpu::IndexFormat::Uint32,
-                        );
-                        render_pass.draw_indexed(0..6, 0, 0..65536);
-                    }
-
-                    if vis_def.id == 13 {
-                        render_pass.set_pipeline(&self.lamp_pipeline);
-                        render_pass.set_vertex_buffer(0, self.lamp_vertex_buffer.slice(..));
-                        render_pass.set_index_buffer(
-                            self.lamp_index_buffer.slice(..),
-                            wgpu::IndexFormat::Uint32,
-                        );
-                        render_pass.draw_indexed(0..self.lamp_index_count, 0, 0..16);
-                    }
-                }
-            }
-
-            let is_portrait = self.config.width < self.config.height;
-            let is_video_active = self.video_state.is_some()
-                && (state.video_mode > 0
-                    || (is_portrait && state.mobile_hud_tab == crate::state::MobileHudTab::Video));
-
-            if is_video_active {
-                let mut v_vp_x = 0.0;
-                let mut v_vp_y = 0.0;
-                let mut v_vp_w = self.config.width as f32;
-                let mut v_vp_h = self.config.height as f32;
-
-                let target_rect = if state.video_mode == 3 {
-                    None // mode 3: full screen
-                } else if is_portrait && state.mobile_hud_tab == crate::state::MobileHudTab::Video {
-                    out_video_rect
-                } else if state.video_mode == 1 {
-                    out_track_info_rect
-                } else if state.video_mode == 2 {
-                    out_video_rect.or(out_top_panel_rect)
-                } else {
-                    None // mode 3: full screen
+                    48.0_f32.to_radians()
                 };
-
-                if let Some(r) = target_rect {
-                    v_vp_x =
-                        ((r.min.x * scale_factor).clamp(0.0, self.config.width as f32)).round();
-                    v_vp_y =
-                        ((r.min.y * scale_factor).clamp(0.0, self.config.height as f32)).round();
-                    let max_w = (self.config.width as f32 - v_vp_x).max(1.0);
-                    v_vp_w = ((r.width() * scale_factor).clamp(1.0, max_w)).round();
-                    let max_h = (self.config.height as f32 - v_vp_y).max(1.0);
-                    v_vp_h = ((r.height() * scale_factor).clamp(1.0, max_h)).round();
-                }
-
-                render_pass.set_viewport(v_vp_x, v_vp_y, v_vp_w, v_vp_h, 0.0, 1.0);
-                render_pass.set_scissor_rect(
-                    v_vp_x as u32,
-                    v_vp_y as u32,
-                    v_vp_w as u32,
-                    v_vp_h as u32,
+                let fov_y = if state.visualizer_mode == 19
+                    || state.visualizer_mode == 23
+                    || state.visualizer_mode == 29
+                {
+                    base_fov
+                } else if aspect < 1.0 {
+                    (base_fov / aspect.clamp(0.65, 1.0)).min(if state.visualizer_mode == 22 {
+                        85.0_f32.to_radians()
+                    } else {
+                        75.0_f32.to_radians()
+                    })
+                } else {
+                    base_fov
+                };
+                let proj = glam::Mat4::perspective_rh_gl(fov_y, aspect, 0.1, 1000.0);
+                let view = if state.visualizer_mode == 20 && state.biolum_top_down {
+                    glam::Mat4::look_at_rh(
+                        glam::Vec3::new(0.0, 14.0, 0.0),
+                        glam::Vec3::new(0.0, 0.0, 0.0),
+                        glam::Vec3::new(0.0, 0.0, 1.0),
+                    )
+                } else if state.visualizer_mode == 14 {
+                    let cam_y = if aspect < 1.0 { 1.65 } else { 1.50 };
+                    let cam_z = if aspect < 1.0 { 0.2 } else { 0.6 };
+                    glam::Mat4::look_at_rh(
+                        glam::Vec3::new(0.0, cam_y, cam_z),
+                        glam::Vec3::new(0.0, 0.95, 14.0),
+                        glam::Vec3::new(0.0, 1.0, 0.0),
+                    )
+                } else if state.visualizer_mode == 19 {
+                    // 3D Vintage Hi-Fi Master Rack:
+                    // Scale camera distance so 11.5-wide rack fits completely in square/portrait viewports without clipping
+                    let cam_z = (13.5 / aspect).clamp(6.2, 22.0);
+                    glam::Mat4::look_at_rh(
+                        glam::Vec3::new(0.0, 0.0, cam_z),
+                        glam::Vec3::new(0.0, 0.0, 0.0),
+                        glam::Vec3::new(0.0, 1.0, 0.0),
+                    )
+                } else if state.visualizer_mode == 11 {
+                    // 3D Concentric Neon Audio Portal Frames Corridor
+                    glam::Mat4::look_at_rh(
+                        glam::Vec3::new(0.0, 2.1, -3.8),
+                        glam::Vec3::new(0.0, 1.8, 20.0),
+                        glam::Vec3::new(0.0, 1.0, 0.0),
+                    )
+                } else if state.visualizer_mode == 17 {
+                    // 3D Volumetric Falling Rain Storm
+                    glam::Mat4::look_at_rh(
+                        glam::Vec3::new(0.0, 8.0, 0.0),
+                        glam::Vec3::new(0.0, 14.0, 50.0),
+                        glam::Vec3::new(0.0, 1.0, 0.0),
+                    )
+                } else if state.visualizer_mode == 23 {
+                    // 3D Glass Water Lyrics: Low-angle studio camera
+                    // Scale camera distance and elevation so 7.5-wide text fits cleanly in square/portrait mobile viewport
+                    let lyrics_scale = (2.2 / aspect).max(1.0);
+                    let eye_y = 0.45 + 0.95 * lyrics_scale;
+                    let eye_z = 4.2 * lyrics_scale;
+                    glam::Mat4::look_at_rh(
+                        glam::Vec3::new(0.0, eye_y, eye_z),
+                        glam::Vec3::new(0.0, 0.45, 0.0),
+                        glam::Vec3::new(0.0, 1.0, 0.0),
+                    )
+                } else if state.visualizer_mode == 22 {
+                    // 3D Neon Spatial Listening Room: Orbiting camera focused on center stage
+                    let t_cam = self.play_time as f32 * 0.18;
+                    let cam_radius = 9.8f32;
+                    let cam_h = 2.4f32 + (t_cam * 0.7).sin() * 0.6f32;
+                    let cam_x = t_cam.sin() * cam_radius * 0.55f32;
+                    let cam_z = -t_cam.cos() * cam_radius * 0.6f32 - 2.8f32;
+                    glam::Mat4::look_at_rh(
+                        glam::Vec3::new(cam_x, cam_h, cam_z),
+                        glam::Vec3::new(0.0, 0.4, 2.5),
+                        glam::Vec3::new(0.0, 1.0, 0.0),
+                    )
+                } else if state.visualizer_mode == 29 {
+                    // 3D Prismatic Spectrum Canyon: Centered perspective camera looking down +Z canyon
+                    glam::Mat4::look_at_rh(
+                        glam::Vec3::new(0.0, 0.0, -6.5),
+                        glam::Vec3::new(0.0, 0.0, 20.0),
+                        glam::Vec3::new(0.0, 1.0, 0.0),
+                    )
+                } else {
+                    glam::Mat4::look_at_rh(
+                        glam::Vec3::new(0.0, 1.5, -2.0),
+                        glam::Vec3::new(0.0, 1.5, 0.0),
+                        glam::Vec3::new(0.0, 1.0, 0.0),
+                    )
+                };
+                let camera_uniforms = CameraUniforms {
+                    view_matrix: view.to_cols_array_2d(),
+                    proj_matrix: proj.to_cols_array_2d(),
+                };
+                self.queue.write_buffer(
+                    &self.camera_uniform_buffer,
+                    0,
+                    bytemuck::cast_slice(&[camera_uniforms]),
                 );
 
-                if let Some(vs) = &self.video_state {
-                    let params = VideoParams {
-                        color_space: vs.color_space,
-                        color_range: vs.color_range,
-                        bit_depth: vs.bit_depth,
-                        color_trc: vs.color_trc,
-                        viewport_width: v_vp_w,
-                        viewport_height: v_vp_h,
-                        video_width: vs.width as f32,
-                        video_height: vs.height as f32,
-                        rotation: vs.rotation,
-                        _pad1: 0.0,
-                        _pad2: 0.0,
-                        _pad3: 0.0,
-                    };
-                    self.queue
-                        .write_buffer(&vs.params_buffer, 0, bytemuck::cast_slice(&[params]));
-                    render_pass.set_pipeline(&self.video_pipeline);
-                    render_pass.set_bind_group(0, &vs.bind_group, &[]);
-                    render_pass.draw(0..3, 0..1);
-                }
-            }
+                render_pass.set_viewport(vp_x, vp_y, vp_w, vp_h, 0.0, 1.0);
+                render_pass.set_scissor_rect(vp_x as u32, vp_y as u32, vp_w as u32, vp_h as u32);
 
-            if state.show_hud && state.video_mode != 3 {
-                render_pass.set_viewport(
-                    0.0,
-                    0.0,
-                    self.config.width as f32,
-                    self.config.height as f32,
-                    0.0,
-                    1.0,
-                );
-                render_pass.set_pipeline(&self.hud_pipeline);
-                render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-                render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
+                if state.file_loaded {
+                    let mode_idx = state
+                        .current_visualizer_idx
+                        .min(self.render_pipelines.len() - 1);
+                    let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
 
-                let mut drawn = false;
-                let mut draw_rect = |r: Option<egui::Rect>| {
-                    if let Some(rect) = r {
-                        let x = ((rect.min.x * scale_factor).clamp(0.0, self.config.width as f32))
-                            .round() as u32;
-                        let y = ((rect.min.y * scale_factor).clamp(0.0, self.config.height as f32))
-                            .round() as u32;
+                    if vis_def.id == 20 {
+                        render_pass.set_pipeline(&self.biolum_bg_pipeline);
+                        render_pass.draw(0..3, 0..1);
+                    } else if vis_def.id == 18 {
+                        render_pass.set_pipeline(&self.crt_background_pipeline);
+                        render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                        render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
+                        render_pass.draw(0..3, 0..1);
+                    } else if vis_def.id == 14 {
+                        render_pass.set_pipeline(&self.synthwave_sky_pipeline);
+                        render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                        render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
+                        render_pass.draw(0..3, 0..1);
+                    } else if vis_def.id == 19 {
+                        render_pass.set_pipeline(&self.vumeters_bg_pipeline);
+                        render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                        render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
+                        render_pass.draw(0..3, 0..1);
+                    } else if vis_def.id == 11 {
+                        render_pass.set_pipeline(&self.neon_bg_pipeline);
+                        render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                        render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
+                        render_pass.draw(0..3, 0..1);
+                    } else if vis_def.id == 17 {
+                        render_pass.set_pipeline(&self.storm_sky_pipeline);
+                        render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                        render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
+                        render_pass.draw(0..3, 0..1);
+                    } else if vis_def.id != 13
+                        && vis_def.id != 22
+                        && vis_def.id != 29
+                        && matches!(
+                            vis_def.pipeline_type,
+                            crate::state::PipelineType::Mesh3D { .. }
+                        )
+                    {
+                        // Automatically clear the 3D visualizer viewport to black for any Mesh3D visualizer
+                        // that does not use one of the dedicated sky pipelines above, while preserving
+                        // APP_DEFAULT_BG_CLEAR_COLOR in the surrounding application/HUD panels.
+                        render_pass.set_pipeline(&self.clear_black_pipeline);
+                        render_pass.draw(0..3, 0..1);
+                    }
 
-                        let w = if x < self.config.width {
-                            let max_w = self.config.width - x;
-                            ((rect.width() * scale_factor).round() as u32).clamp(1, max_w)
-                        } else {
-                            0
-                        };
+                    render_pass.set_pipeline(&self.render_pipelines[mode_idx]);
+                    render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                    if vis_def.id == 27 || vis_def.id == 28 || vis_def.id == 23 {
+                        render_pass.set_bind_group(1, &self.flip_render_bind_group, &[]);
+                    } else {
+                        render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
+                    }
 
-                        let h = if y < self.config.height {
-                            let max_h = self.config.height - y;
-                            ((rect.height() * scale_factor).round() as u32).clamp(1, max_h)
-                        } else {
-                            0
-                        };
-
-                        if w > 0 && h > 0 {
-                            render_pass.set_scissor_rect(x, y, w, h);
+                    match &vis_def.pipeline_type {
+                        crate::state::PipelineType::FullscreenQuad => {
                             render_pass.draw(0..3, 0..1);
-                            drawn = true;
+                        }
+                        crate::state::PipelineType::Mesh3D {
+                            geometry,
+                            instances,
+                        } => {
+                            render_pass.set_bind_group(2, &self.camera_bind_group, &[]);
+                            if vis_def.id == 20 {
+                                render_pass.set_bind_group(3, &self.biolum_render_bind_group, &[]);
+                            }
+                            if let Some(mesh) = self.mesh_registry.get(geometry) {
+                                render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                                render_pass.set_index_buffer(
+                                    mesh.index_buffer.slice(..),
+                                    wgpu::IndexFormat::Uint32,
+                                );
+                                render_pass.draw_indexed(0..mesh.index_count, 0, 0..*instances);
+                            }
+
+                            if vis_def.id == 23 {
+                                render_pass.set_pipeline(&self.water_splash_pipeline);
+                                render_pass
+                                    .set_vertex_buffer(0, self.splash_quad_vertex_buffer.slice(..));
+                                render_pass.set_index_buffer(
+                                    self.splash_quad_index_buffer.slice(..),
+                                    wgpu::IndexFormat::Uint32,
+                                );
+                                render_pass.draw_indexed(0..6, 0, 0..65536);
+                            }
+
+                            if vis_def.id == 13 {
+                                render_pass.set_pipeline(&self.lamp_pipeline);
+                                render_pass.set_vertex_buffer(0, self.lamp_vertex_buffer.slice(..));
+                                render_pass.set_index_buffer(
+                                    self.lamp_index_buffer.slice(..),
+                                    wgpu::IndexFormat::Uint32,
+                                );
+                                render_pass.draw_indexed(0..self.lamp_index_count, 0, 0..16);
+                            }
                         }
                     }
-                };
+                }
 
-                draw_rect(out_meters_rect);
-                draw_rect(out_heatmap_rect);
-                draw_rect(out_fire_rect);
+                let is_portrait = self.config.width < self.config.height;
+                let is_video_active = self.video_state.is_some()
+                    && (state.video_mode > 0
+                        || (is_portrait
+                            && state.mobile_hud_tab == crate::state::MobileHudTab::Video));
 
-                if !drawn && !is_portrait {
-                    render_pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
-                    render_pass.draw(0..3, 0..1);
+                if is_video_active {
+                    let mut v_vp_x = 0.0;
+                    let mut v_vp_y = 0.0;
+                    let mut v_vp_w = self.config.width as f32;
+                    let mut v_vp_h = self.config.height as f32;
+
+                    let target_rect = if state.video_mode == 3 {
+                        None // mode 3: full screen
+                    } else if is_portrait
+                        && state.mobile_hud_tab == crate::state::MobileHudTab::Video
+                    {
+                        out_video_rect
+                    } else if state.video_mode == 1 {
+                        out_track_info_rect
+                    } else if state.video_mode == 2 {
+                        out_video_rect.or(out_top_panel_rect)
+                    } else {
+                        None // mode 3: full screen
+                    };
+
+                    if let Some(r) = target_rect {
+                        v_vp_x =
+                            ((r.min.x * scale_factor).clamp(0.0, self.config.width as f32)).round();
+                        v_vp_y = ((r.min.y * scale_factor).clamp(0.0, self.config.height as f32))
+                            .round();
+                        let max_w = (self.config.width as f32 - v_vp_x).max(1.0);
+                        v_vp_w = ((r.width() * scale_factor).clamp(1.0, max_w)).round();
+                        let max_h = (self.config.height as f32 - v_vp_y).max(1.0);
+                        v_vp_h = ((r.height() * scale_factor).clamp(1.0, max_h)).round();
+                    }
+
+                    render_pass.set_viewport(v_vp_x, v_vp_y, v_vp_w, v_vp_h, 0.0, 1.0);
+                    render_pass.set_scissor_rect(
+                        v_vp_x as u32,
+                        v_vp_y as u32,
+                        v_vp_w as u32,
+                        v_vp_h as u32,
+                    );
+
+                    if let Some(vs) = &self.video_state {
+                        let params = VideoParams {
+                            color_space: vs.color_space,
+                            color_range: vs.color_range,
+                            bit_depth: vs.bit_depth,
+                            color_trc: vs.color_trc,
+                            viewport_width: v_vp_w,
+                            viewport_height: v_vp_h,
+                            video_width: vs.width as f32,
+                            video_height: vs.height as f32,
+                            rotation: vs.rotation,
+                            _pad1: 0.0,
+                            _pad2: 0.0,
+                            _pad3: 0.0,
+                        };
+                        self.queue.write_buffer(
+                            &vs.params_buffer,
+                            0,
+                            bytemuck::cast_slice(&[params]),
+                        );
+                        render_pass.set_pipeline(&self.video_pipeline);
+                        render_pass.set_bind_group(0, &vs.bind_group, &[]);
+                        render_pass.draw(0..3, 0..1);
+                    }
+                }
+
+                if state.show_hud
+                    && state.video_mode != 3
+                    && (out_meters_rect.is_some()
+                        || out_heatmap_rect.is_some()
+                        || out_fire_rect.is_some())
+                {
+                    render_pass.set_viewport(
+                        0.0,
+                        0.0,
+                        self.config.width as f32,
+                        self.config.height as f32,
+                        0.0,
+                        1.0,
+                    );
+                    render_pass.set_pipeline(&self.hud_pipeline);
+                    render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+
+                    let mut draw_rect = |r: Option<egui::Rect>| {
+                        if let Some(rect) = r {
+                            let x = ((rect.min.x * scale_factor)
+                                .clamp(0.0, self.config.width as f32))
+                            .round() as u32;
+                            let y = ((rect.min.y * scale_factor)
+                                .clamp(0.0, self.config.height as f32))
+                            .round() as u32;
+
+                            let w = if x < self.config.width {
+                                let max_w = self.config.width - x;
+                                ((rect.width() * scale_factor).round() as u32).clamp(1, max_w)
+                            } else {
+                                0
+                            };
+
+                            let h = if y < self.config.height {
+                                let max_h = self.config.height - y;
+                                ((rect.height() * scale_factor).round() as u32).clamp(1, max_h)
+                            } else {
+                                0
+                            };
+
+                            if w > 0 && h > 0 {
+                                render_pass.set_scissor_rect(x, y, w, h);
+                                render_pass.draw(0..3, 0..1);
+                            }
+                        }
+                    };
+
+                    draw_rect(out_meters_rect);
+                    draw_rect(out_heatmap_rect);
+                    draw_rect(out_fire_rect);
                 }
             }
         }
 
-        {
+        if !clipped_primitives.is_empty() {
             let mut render_pass = encoder
                 .begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Egui Render Pass"),
@@ -9956,7 +10976,11 @@ impl VulkanEngine {
                         resolve_target: None,
                         depth_slice: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
+                            load: if state.file_loaded {
+                                wgpu::LoadOp::Load
+                            } else {
+                                wgpu::LoadOp::Clear(APP_DEFAULT_BG_CLEAR_COLOR)
+                            },
                             store: wgpu::StoreOp::Store,
                         },
                     })],
@@ -9971,9 +10995,7 @@ impl VulkanEngine {
         }
 
         // Resolve timestamp queries into the resolve buffer, then copy to the read buffer.
-        // ONLY do this when no mapping is pending — wgpu will panic if we copy to a buffer
-        // that has an active or pending map operation.
-        let should_start_mapping = !self.timestamp_mapping_active && self.query_set.is_some();
+        // ONLY do this when stats are visible and no mapping is pending.
         if should_start_mapping
             && let (Some(qs), Some(res_buf), Some(read_buf)) = (
                 &self.query_set,
@@ -9985,24 +11007,35 @@ impl VulkanEngine {
             encoder.copy_buffer_to_buffer(res_buf, 0, read_buf, 0, 48);
         }
 
+        static CAPTURE_ENV: std::sync::OnceLock<(Option<u32>, u32, bool)> =
+            std::sync::OnceLock::new();
+        let &(env_bench_frames, capture_count, env_capture_enabled) =
+            CAPTURE_ENV.get_or_init(|| {
+                let bf = std::env::var("BENCH_FRAMES")
+                    .ok()
+                    .and_then(|s| s.parse::<u32>().ok());
+                let cc = std::env::var("CAPTURE_FRAMES_COUNT")
+                    .ok()
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(1);
+                let cap = std::env::var("CAPTURE_FRAME").is_ok();
+                (bf, cc, cap)
+            });
+
         let bench_override = crate::state::BENCH_FRAMES_OVERRIDE.load(Ordering::Relaxed);
         let capture_frame = if bench_override > 0 {
             bench_override.saturating_sub(1)
-        } else if let Ok(bf_str) = std::env::var("BENCH_FRAMES") {
-            bf_str.parse::<u32>().unwrap_or(180).saturating_sub(1)
+        } else if let Some(bf) = env_bench_frames {
+            bf.saturating_sub(1)
         } else {
             180
         };
-        let capture_count = std::env::var("CAPTURE_FRAMES_COUNT")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .unwrap_or(1);
         let capture_start = if capture_count > 1 {
             capture_frame.saturating_sub(capture_count.saturating_sub(1))
         } else {
             capture_frame
         };
-        let do_capture = std::env::var("CAPTURE_FRAME").is_ok()
+        let do_capture = env_capture_enabled
             && self.frame_count >= capture_start
             && self.frame_count <= capture_frame;
 
@@ -10039,7 +11072,11 @@ impl VulkanEngine {
             readback_buffer = Some(rb);
         }
 
-        self.queue.submit(std::iter::once(encoder.finish()));
+        let command_buffer = encoder.finish();
+        let phase_encode_us = render_start.elapsed().as_micros() as f32;
+        let submit_start = std::time::Instant::now();
+
+        self.queue.submit(std::iter::once(command_buffer));
 
         // Start async timestamp mapping AFTER submit (non-blocking)
         if should_start_mapping && let Some(read_buf) = &self.query_read_buffer {
@@ -10098,7 +11135,7 @@ impl VulkanEngine {
                 println!("Screenshot saved to {}", capture_path);
             }
             if bench_override == 0
-                && std::env::var("BENCH_FRAMES").is_err()
+                && env_bench_frames.is_none()
                 && self.frame_count == capture_frame
             {
                 std::process::exit(0);
@@ -10112,8 +11149,8 @@ impl VulkanEngine {
             self.egui_renderer.free_texture(id);
         }
 
-        let submit_elapsed = render_start.elapsed().as_micros() as f32;
-        let phase_encode_us = submit_elapsed; // entire encode+submit block
+        let phase_submit_us = submit_start.elapsed().as_micros() as f32;
+        let submit_elapsed = phase_encode_us + phase_submit_us;
 
         Ok((
             engine_action,
@@ -10125,7 +11162,7 @@ impl VulkanEngine {
             phase_surface_us,
             phase_egui_layout_us,
             phase_encode_us,
-            0.0,
+            phase_submit_us,
         ))
     }
 }
@@ -10720,14 +11757,7 @@ mod tests {
 
         // 1. When playing, fire should ramp up to 1.0
         for _ in 0..60 {
-            let is_playing = !state.is_paused && state.file_loaded && !state.track_ended;
-            let target_intensity = if is_playing { 1.0f32 } else { 0.0f32 };
-            let fire_rate = if is_playing { 5.0f32 } else { 2.5f32 };
-            if fire_intensity < target_intensity {
-                fire_intensity = (fire_intensity + fire_rate * dt).min(target_intensity);
-            } else if fire_intensity > target_intensity {
-                fire_intensity = (fire_intensity - fire_rate * dt).max(target_intensity);
-            }
+            fire_intensity = VulkanEngine::step_fire_intensity(fire_intensity, &state, dt);
         }
         assert!(
             (fire_intensity - 1.0).abs() < 1e-4,
@@ -10737,14 +11767,7 @@ mod tests {
         // 2. Pause playback -> fire intensity should decay down to 0.0
         state.is_paused = true;
         for _ in 0..60 {
-            let is_playing = !state.is_paused && state.file_loaded && !state.track_ended;
-            let target_intensity = if is_playing { 1.0f32 } else { 0.0f32 };
-            let fire_rate = if is_playing { 5.0f32 } else { 2.5f32 };
-            if fire_intensity < target_intensity {
-                fire_intensity = (fire_intensity + fire_rate * dt).min(target_intensity);
-            } else if fire_intensity > target_intensity {
-                fire_intensity = (fire_intensity - fire_rate * dt).max(target_intensity);
-            }
+            fire_intensity = VulkanEngine::step_fire_intensity(fire_intensity, &state, dt);
         }
         assert_eq!(
             fire_intensity, 0.0,
@@ -10756,17 +11779,7 @@ mod tests {
         state.track_ended = true;
         fire_intensity = 0.8;
         for _ in 0..60 {
-            let is_at_end = state.duration_seconds > 0.0
-                && state.current_seconds >= state.duration_seconds - 0.05;
-            let is_playing =
-                !state.is_paused && state.file_loaded && !state.track_ended && !is_at_end;
-            let target_intensity = if is_playing { 1.0f32 } else { 0.0f32 };
-            let fire_rate = if is_playing { 5.0f32 } else { 3.5f32 };
-            if fire_intensity < target_intensity {
-                fire_intensity = (fire_intensity + fire_rate * dt).min(target_intensity);
-            } else if fire_intensity > target_intensity {
-                fire_intensity = (fire_intensity - fire_rate * dt).max(target_intensity);
-            }
+            fire_intensity = VulkanEngine::step_fire_intensity(fire_intensity, &state, dt);
         }
         assert_eq!(
             fire_intensity, 0.0,
@@ -10779,17 +11792,7 @@ mod tests {
         state.current_seconds = 180.0;
         fire_intensity = 0.9;
         for _ in 0..60 {
-            let is_at_end = state.duration_seconds > 0.0
-                && state.current_seconds >= state.duration_seconds - 0.05;
-            let is_playing =
-                !state.is_paused && state.file_loaded && !state.track_ended && !is_at_end;
-            let target_intensity = if is_playing { 1.0f32 } else { 0.0f32 };
-            let fire_rate = if is_playing { 5.0f32 } else { 3.5f32 };
-            if fire_intensity < target_intensity {
-                fire_intensity = (fire_intensity + fire_rate * dt).min(target_intensity);
-            } else if fire_intensity > target_intensity {
-                fire_intensity = (fire_intensity - fire_rate * dt).max(target_intensity);
-            }
+            fire_intensity = VulkanEngine::step_fire_intensity(fire_intensity, &state, dt);
         }
         assert_eq!(
             fire_intensity, 0.0,
@@ -11392,5 +12395,407 @@ mod tests {
         assert!(!glass_src.contains("eval_cylinder_wall_glass"));
         assert!(glass_src.contains("eval_studio_reflection"));
         assert!(glass_src.contains("sample_macro_flip_energy"));
+
+        // 4. Validate WGSL parsing for all optimized visualizers (Tape Head, LED Spectrum, Canyon, Neon Room, Synthwave, Biolum, Ferrofluid)
+        const SHADER_GLYPH_FONT: &str = include_str!("shaders/_glyph_font.wgsl");
+        for (name, raw_src) in [
+            (
+                "vis_tape_head.wgsl",
+                include_str!("shaders/vis_tape_head.wgsl"),
+            ),
+            (
+                "vis_spectrum_led.wgsl",
+                include_str!("shaders/vis_spectrum_led.wgsl"),
+            ),
+            (
+                "vis_spectrum_canyon.wgsl",
+                include_str!("shaders/vis_spectrum_canyon.wgsl"),
+            ),
+            (
+                "vis_neon_room.wgsl",
+                include_str!("shaders/vis_neon_room.wgsl"),
+            ),
+            (
+                "vis_synthwave.wgsl",
+                include_str!("shaders/vis_synthwave.wgsl"),
+            ),
+            (
+                "vis_synthwave_racer_3d.wgsl",
+                include_str!("shaders/vis_synthwave_racer_3d.wgsl"),
+            ),
+            (
+                "vis_synthwave_racer_sky.wgsl",
+                include_str!("shaders/vis_synthwave_racer_sky.wgsl"),
+            ),
+            (
+                "vis_bioluminescence.wgsl",
+                include_str!("shaders/vis_bioluminescence.wgsl"),
+            ),
+            (
+                "biolum_compute.wgsl",
+                include_str!("shaders/biolum_compute.wgsl"),
+            ),
+            (
+                "vis_flip_ferrofluid.wgsl",
+                include_str!("shaders/vis_flip_ferrofluid.wgsl"),
+            ),
+            (
+                "flip_ferrofluid_compute.wgsl",
+                include_str!("shaders/flip_ferrofluid_compute.wgsl"),
+            ),
+            (
+                "vis_vumeters_bg.wgsl",
+                include_str!("shaders/vis_vumeters_bg.wgsl"),
+            ),
+        ] {
+            let resolved = raw_src
+                .replace("// INCLUDE: common", SHADER_COMMON)
+                .replace("// INCLUDE: glyph_font", SHADER_GLYPH_FONT);
+            if let Err(e) = wgpu::naga::front::wgsl::parse_str(&resolved) {
+                panic!(
+                    "{} WGSL parse error:\n{}",
+                    name,
+                    e.emit_to_string(&resolved)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_hardware_capability_tier_and_vsync_stats_panel() {
+        use crate::state::{GpuCapabilityTier, VISUALIZERS, classify_gpu_capability};
+
+        // 1. Verify src/state.rs contains zero OS-based (`target_os = "android"`) visualizer exclusions
+        let state_code = std::fs::read_to_string("src/state.rs").expect("src/state.rs must exist");
+        assert!(
+            !state_code.contains("target_os = \"android\""),
+            "Visualizers must never be disabled based on target_os = \"android\""
+        );
+        assert_eq!(
+            VISUALIZERS.len(),
+            19,
+            "All 19 visualizers must be compiled on every platform"
+        );
+
+        let make_adapter = |name: &str, device_type: wgpu::DeviceType| wgpu::AdapterInfo {
+            name: name.to_string(),
+            vendor: 0,
+            device: 0,
+            device_type,
+            device_pci_bus_id: String::new(),
+            driver: String::new(),
+            driver_info: String::new(),
+            backend: wgpu::Backend::Vulkan,
+            subgroup_min_size: 32,
+            subgroup_max_size: 64,
+            transient_saves_memory: false,
+        };
+
+        // 2. Flagship Android phone GPUs and discrete desktop GPUs -> GpuCapabilityTier::High
+        for (gpu_name, dev_type, w, h) in [
+            (
+                "Adreno (TM) 740",
+                wgpu::DeviceType::IntegratedGpu,
+                3088,
+                1440,
+            ),
+            (
+                "Adreno (TM) 750",
+                wgpu::DeviceType::IntegratedGpu,
+                3120,
+                1440,
+            ),
+            (
+                "Adreno (TM) 830",
+                wgpu::DeviceType::IntegratedGpu,
+                3200,
+                1440,
+            ),
+            (
+                "Immortalis-G720 MC12",
+                wgpu::DeviceType::IntegratedGpu,
+                2800,
+                1260,
+            ),
+            (
+                "Samsung Xclipse 940",
+                wgpu::DeviceType::IntegratedGpu,
+                3120,
+                1440,
+            ),
+            ("Apple M3 Max", wgpu::DeviceType::IntegratedGpu, 3456, 2234),
+            (
+                "AMD Radeon AI PRO R9700",
+                wgpu::DeviceType::DiscreteGpu,
+                3840,
+                2160,
+            ),
+        ] {
+            let info = make_adapter(gpu_name, dev_type);
+            assert_eq!(
+                classify_gpu_capability(&info, w * h),
+                GpuCapabilityTier::High,
+                "{} should classify as High capability tier",
+                gpu_name
+            );
+            let mut state = AppState::new("Test".to_string());
+            state.apply_gpu_capability_profile(&info, w, h);
+            assert_eq!(state.gpu_capability_tier, GpuCapabilityTier::High);
+            for (idx, v) in VISUALIZERS.iter().enumerate() {
+                if !matches!(v.id, 6 | 7 | 23) {
+                    assert!(
+                        state.vis_enabled[idx],
+                        "Visualizer {} ({}) must remain enabled on High-tier GPU {}",
+                        v.id, v.name, gpu_name
+                    );
+                }
+            }
+        }
+
+        // 3. Constrained GPUs (Pixel Tablet Mali-G710 @ 2560x1600, mid-range Adreno 640, Steam Deck APU) -> Constrained
+        for (gpu_name, dev_type, w, h) in [
+            ("Mali-G710", wgpu::DeviceType::IntegratedGpu, 2560, 1600),
+            (
+                "Adreno (TM) 640",
+                wgpu::DeviceType::IntegratedGpu,
+                2400,
+                1080,
+            ),
+            (
+                "AMD Custom GPU 0405 (RADV VANGOGH)",
+                wgpu::DeviceType::IntegratedGpu,
+                1280,
+                800,
+            ),
+            (
+                "llvmpipe (LLVM 19.1.0, 256 bits)",
+                wgpu::DeviceType::Cpu,
+                1920,
+                1080,
+            ),
+        ] {
+            let info = make_adapter(gpu_name, dev_type);
+            assert_eq!(
+                classify_gpu_capability(&info, w * h),
+                GpuCapabilityTier::Constrained,
+                "{} should classify as Constrained capability tier",
+                gpu_name
+            );
+            let mut state = AppState::new("Test".to_string());
+            state.apply_gpu_capability_profile(&info, w, h);
+            assert_eq!(state.gpu_capability_tier, GpuCapabilityTier::Constrained);
+            for (idx, v) in VISUALIZERS.iter().enumerate() {
+                if v.heavy_shader {
+                    assert!(
+                        !state.vis_enabled[idx],
+                        "Heavy shader visualizer {} ({}) should default to unchecked on Constrained GPU {}",
+                        v.id, v.name, gpu_name
+                    );
+                } else {
+                    assert!(
+                        state.vis_enabled[idx],
+                        "Standard visualizer {} ({}) must remain enabled on Constrained GPU {}",
+                        v.id, v.name, gpu_name
+                    );
+                }
+            }
+        }
+
+        // 4. Runtime Frame-Budget Watchdog auto-disables non-overridden heavy shader if < 85% VSync FPS
+        let mut state = AppState::new("Watchdog Test".to_string());
+        state.file_loaded = true;
+        state.is_paused = false;
+        let heavy_idx = VISUALIZERS
+            .iter()
+            .position(|v| v.id == 28)
+            .expect("ID 28 must exist");
+        state.current_visualizer_idx = heavy_idx;
+        state.visualizer_mode = 28;
+        for _ in 0..140 {
+            // Simulate 33.3ms frame time (30 FPS on a 60Hz display)
+            state.update_visualizer_perf_guard(1.0 / 30.0, 60.0);
+        }
+        assert!(
+            !state.vis_enabled[heavy_idx],
+            "Watchdog must uncheck heavy visualizer when it drops to 30 FPS on 60Hz display"
+        );
+        assert_ne!(
+            state.current_visualizer_idx, heavy_idx,
+            "Watchdog must advance to the next enabled visualizer"
+        );
+
+        // 5. Explicit user selection (`vis_user_overridden`) bypasses the watchdog
+        let mut user_state = AppState::new("User Override Test".to_string());
+        user_state.file_loaded = true;
+        user_state.is_paused = false;
+        user_state.current_visualizer_idx = heavy_idx;
+        user_state.visualizer_mode = 28;
+        user_state.vis_user_overridden[heavy_idx] = true;
+        for _ in 0..200 {
+            user_state.update_visualizer_perf_guard(1.0 / 25.0, 60.0);
+        }
+        assert!(
+            user_state.vis_enabled[heavy_idx],
+            "User-overridden visualizer must never be auto-disabled by the watchdog"
+        );
+        assert_eq!(user_state.current_visualizer_idx, heavy_idx);
+
+        // 6. Verify VSYNC status formatting and Stats panel integration
+        assert_eq!(format_vsync_status(wgpu::PresentMode::Fifo), "VSYNC: ON");
+        assert_eq!(
+            format_vsync_status(wgpu::PresentMode::FifoRelaxed),
+            "VSYNC: ON"
+        );
+        assert_eq!(
+            format_vsync_status(wgpu::PresentMode::AutoVsync),
+            "VSYNC: ON"
+        );
+        assert_eq!(
+            format_vsync_status(wgpu::PresentMode::AutoNoVsync),
+            "VSYNC: OFF"
+        );
+        assert_eq!(
+            format_vsync_status(wgpu::PresentMode::Immediate),
+            "VSYNC: OFF"
+        );
+        assert_eq!(
+            format_vsync_status(wgpu::PresentMode::Mailbox),
+            "VSYNC: OFF"
+        );
+
+        let engine_code =
+            std::fs::read_to_string("src/engine.rs").expect("src/engine.rs must exist");
+        let prod_code = engine_code
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or(&engine_code);
+        assert!(
+            prod_code.contains("format_vsync_status(self.config.present_mode)"),
+            "Stats panel must display VSYNC: ON / VSYNC: OFF status"
+        );
+    }
+
+    #[test]
+    fn test_appimage_packaging_and_apprun_config() {
+        let repackage = std::fs::read_to_string("repackage_appimage.sh")
+            .expect("repackage_appimage.sh must exist");
+        let apprun =
+            std::fs::read_to_string("AppRun.template").expect("AppRun.template must exist");
+        let linux_yml = std::fs::read_to_string(".github/workflows/linux-build.yml")
+            .expect(".github/workflows/linux-build.yml must exist");
+
+        // 1. Verify modern AppImage/appimagetool repository URL (not deprecated AppImage/AppImageKit)
+        assert!(
+            repackage.contains("https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"),
+            "repackage_appimage.sh must fetch appimagetool from AppImage/appimagetool"
+        );
+        assert!(
+            !repackage.contains("AppImage/AppImageKit"),
+            "repackage_appimage.sh must not reference deprecated AppImage/AppImageKit URL"
+        );
+
+        // 2. Verify rDNS AppStream metadata alignment for zero-warning appstreamcli validation
+        assert!(
+            repackage.contains("com.soddentrough.rusttracker.appdata.xml"),
+            "repackage_appimage.sh must install com.soddentrough.rusttracker.appdata.xml"
+        );
+        assert!(
+            repackage.contains("com.soddentrough.rusttracker.desktop"),
+            "repackage_appimage.sh must align desktop entry filename to rDNS ID"
+        );
+
+        // 3. Verify AppRun.template preserves XDG_DATA_DIRS fallback and configures Gamescope Wayland
+        assert!(
+            apprun.contains("/usr/local/share:/usr/share"),
+            "AppRun.template must preserve standard XDG_DATA_DIRS fallback paths"
+        );
+        assert!(
+            apprun.contains("RUSTTRACKER_WAYLAND"),
+            "AppRun.template must export RUSTTRACKER_WAYLAND under Gamescope / Steam Deck"
+        );
+
+        // 4. Verify Linux CI workflow packages and uploads the AppImage
+        assert!(
+            linux_yml.contains("RustTracker-Linux-AppImage"),
+            "linux-build.yml must upload the RustTracker-Linux-AppImage artifact"
+        );
+        assert!(
+            linux_yml.contains("RustTracker-SteamDeck-*.AppImage"),
+            "linux-build.yml must publish RustTracker-SteamDeck-*.AppImage on release tags"
+        );
+    }
+
+    #[test]
+    fn test_splash_screen_cache_and_holistic_ux() {
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1280.0, 800.0));
+        let mut splash_cache = SplashCache::default();
+
+        // 1. Static background mesh should build once and remain cached for identical viewport geometry
+        splash_cache.ensure_background(&ctx, rect);
+        assert!(
+            !splash_cache.static_bg_mesh.vertices.is_empty(),
+            "Static splash background mesh must contain tessellated sky, sun, mountains, and perspective grid"
+        );
+        assert_eq!(
+            splash_cache.stars.len(),
+            56,
+            "SplashCache must precompute 56 stars"
+        );
+        let first_arc_ptr = std::sync::Arc::as_ptr(&splash_cache.static_bg_mesh);
+
+        splash_cache.ensure_background(&ctx, rect);
+        assert_eq!(
+            std::sync::Arc::as_ptr(&splash_cache.static_bg_mesh),
+            first_arc_ptr,
+            "SplashCache must reuse the cached Arc<Mesh> when viewport dimensions and ppp do not change"
+        );
+
+        // 2. Dynamic background mesh builds twinkling stars + scrolling horizontal grid lines in a single Mesh
+        let dyn_mesh = splash_cache.build_dynamic_bg_mesh(rect, 1.25, 2.0);
+        assert!(
+            dyn_mesh.vertices.len() >= 50 * 4,
+            "Dynamic splash mesh must contain at least 50 star quads plus scrolling grid lines"
+        );
+
+        // 3. StatsDisplayCache throttles string formatting to 10 Hz (100ms) and separates CPU command recording from driver submit+present
+        let mut stats_cache = StatsDisplayCache::default();
+        let mut state = AppState::new("Stats Cache Test".to_string());
+        state.current_fps = 60.0;
+        state.stats.phase_lock_update_us = 100.0;
+        state.stats.phase_snapshot_us = 20.0;
+        state.stats.phase_surface_us = 13500.0;
+        state.stats.phase_egui_layout_us = 1200.0;
+        state.stats.phase_encode_us = 200.0;
+        state.stats.phase_submit_us = 1400.0;
+        state.stats.phase_post_us = 10.0;
+        stats_cache.update_if_needed(&state, false, 1.0);
+        assert_eq!(stats_cache.fps_line, "FPS: 60.0 (16.67 ms)");
+        assert_eq!(
+            stats_cache.cpu_active_line, "CPU Active Total: 1.53 ms",
+            "CPU Active Total must sum only active CPU phases (excluding VSync wait and Submit+Present)"
+        );
+        assert_eq!(stats_cache.phase_lines[3].0, "  UI Layout + Tess: 1.20 ms");
+        assert_eq!(stats_cache.phase_lines[4].0, "  Cmd Record (CPU): 0.20 ms");
+        assert_eq!(stats_cache.phase_lines[5].0, "  Submit + Present: 1.40 ms");
+        assert_eq!(
+            stats_cache.total_phases_line,
+            "  Total Frame Loop: 16.43 ms"
+        );
+
+        // Within 100ms window (t = 1.03s), cached strings must remain stable even if raw telemetry fluctuates
+        state.current_fps = 50.0;
+        stats_cache.update_if_needed(&state, false, 1.03);
+        assert_eq!(
+            stats_cache.fps_line, "FPS: 60.0 (16.67 ms)",
+            "StatsDisplayCache must throttle updates within the 100ms window"
+        );
+
+        // After >= 100ms (t = 1.12s), cached strings must refresh
+        stats_cache.update_if_needed(&state, false, 1.12);
+        assert_eq!(
+            stats_cache.fps_line, "FPS: 50.0 (20.00 ms)",
+            "StatsDisplayCache must refresh after 100ms"
+        );
     }
 }

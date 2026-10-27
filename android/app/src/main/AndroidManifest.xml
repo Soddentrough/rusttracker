@@ -87,6 +87,23 @@
                 <data android:pathPattern=".*\\.m3u8" />
                 <data android:pathPattern=".*\\.dawproject" />
                 <data android:pathPattern=".*\\.aaf" />
+                <data android:pathPattern=".*\\.mod" />
+                <data android:pathPattern=".*\\.s3m" />
+                <data android:pathPattern=".*\\.xm" />
+                <data android:pathPattern=".*\\.it" />
+                <data android:pathPattern=".*\\.mptm" />
+                <data android:pathPattern=".*\\.stm" />
+                <data android:pathPattern=".*\\.med" />
+                <data android:pathPattern=".*\\.okt" />
+                <data android:pathPattern=".*\\.669" />
+                <data android:pathPattern=".*\\.mtm" />
+                <data android:pathPattern=".*\\.far" />
+                <data android:pathPattern=".*\\.ult" />
+                <data android:pathPattern=".*\\.amf" />
+                <data android:pathPattern=".*\\.dsm" />
+                <data android:pathPattern=".*\\.psm" />
+                <data android:pathPattern=".*\\.umx" />
+                <data android:pathPattern=".*\\.mo3" />
             </intent-filter>
         </activity>
     </application>

@@ -14,9 +14,9 @@ const DISH_RADIUS: f32 = 3.35;
 const DOMAIN_HALF: f32 = 3.6;
 
 // Raymarch tuning
-const MAX_STEPS: i32 = 96;
-const HIT_EPS: f32 = 0.0035;
-const STEP_SCALE: f32 = 0.42;
+const MAX_STEPS: i32 = 16;
+const HIT_EPS: f32 = 0.0045;
+const STEP_SCALE: f32 = 0.72;
 
 fn get_grid_height(gx: i32, gz: i32) -> f32 {
     if (gx < 0 || gx >= RENDER_GRID_SIZE || gz < 0 || gz >= RENDER_GRID_SIZE) {
@@ -26,22 +26,22 @@ fn get_grid_height(gx: i32, gz: i32) -> f32 {
     return f32(render_grid[cell]) * 0.001; // Scaled by 1000 in compute shader
 }
 
-// Bilinear heightfield lookup with continuous meniscus puddle
-fn sample_height(p: vec2<f32>) -> f32 {
-    let r_xz = length(p);
-    let floor_y = 0.025 + 0.022 * (r_xz * r_xz);
+// Bilinear heightfield lookup with precomputed radius squared
+fn sample_height_r2(p: vec2<f32>, r2: f32) -> f32 {
+    let floor_y = 0.025 + 0.022 * r2;
 
-    if (r_xz > DISH_RADIUS + 0.2) {
+    if (r2 > (DISH_RADIUS + 0.2) * (DISH_RADIUS + 0.2)) {
         return floor_y;
     }
 
     // Base meniscus puddle: resting liquid depth that smoothly tapers at the dish rim
-    let dish_mask = smoothstep(DISH_RADIUS, DISH_RADIUS - 0.45, r_xz);
+    // DISH_RADIUS^2 = 11.2225, (DISH_RADIUS - 0.45)^2 = 8.41
+    let dish_mask = smoothstep_r(11.2225, 8.41, r2);
     let base_puddle = floor_y + 0.055 * dish_mask;
 
     // World [-3.6, 3.6] -> [0, 512]
-    let gx_f = ((p.x + DOMAIN_HALF) / (DOMAIN_HALF * 2.0)) * f32(RENDER_GRID_SIZE);
-    let gz_f = ((p.y + DOMAIN_HALF) / (DOMAIN_HALF * 2.0)) * f32(RENDER_GRID_SIZE);
+    let gx_f = (p.x + DOMAIN_HALF) * (512.0 / 7.2);
+    let gz_f = (p.y + DOMAIN_HALF) * (512.0 / 7.2);
 
     let ix = i32(floor(gx_f));
     let iz = i32(floor(gz_f));
@@ -60,10 +60,16 @@ fn sample_height(p: vec2<f32>) -> f32 {
     return max(base_puddle, h_fluid);
 }
 
+// Bilinear heightfield lookup with continuous meniscus puddle
+fn sample_height(p: vec2<f32>) -> f32 {
+    return sample_height_r2(p, dot(p, p));
+}
+
 fn calc_normal(p: vec2<f32>, eps: f32) -> vec3<f32> {
     let e = vec2<f32>(eps, 0.0);
-    let dx = (sample_height(p + e.xy) - sample_height(p - e.xy)) / (2.0 * eps);
-    let dz = (sample_height(p + e.yx) - sample_height(p - e.yx)) / (2.0 * eps);
+    let h0 = sample_height(p);
+    let dx = (sample_height(p + e.xy) - h0) / eps;
+    let dz = (sample_height(p + e.yx) - h0) / eps;
     return normalize(vec3<f32>(-dx, 1.0, -dz));
 }
 
@@ -111,49 +117,70 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let floor_glow = exp(-length(screen_p - vec2<f32>(0.0, -0.4)) * 1.8) * (0.04 + sub_bass * 0.08);
     col += vec3<f32>(0.1, 0.06, 0.18) * floor_glow;
 
-    // Ray-AABB intersection test for early-out
-    let box_min = vec3<f32>(-3.55, 0.0, -3.55);
-    let box_max = vec3<f32>(3.55, 2.5, 3.55);
-    let box_hit = intersect_aabb(ro, rd, box_min, box_max);
+    // Exact Ray-Cylinder + Vertical Slab intersection for circular dish (eliminates corner AABB waste)
+    let max_r2 = (DISH_RADIUS + 0.12) * (DISH_RADIUS + 0.12);
+    let a_cyl = dot(rd.xz, rd.xz);
+    let b_cyl = dot(ro.xz, rd.xz);
+    let c_cyl = dot(ro.xz, ro.xz) - max_r2;
+    let disc = b_cyl * b_cyl - a_cyl * c_cyl;
+    if (disc <= 0.0) {
+        return vec4<f32>(aces_tonemap(col), 1.0);
+    }
+    let sqrt_disc = sqrt(disc);
+    let inv_a_cyl = 1.0 / max(a_cyl, 1e-6);
+    let t_cyl0 = (-b_cyl - sqrt_disc) * inv_a_cyl;
+    let t_cyl1 = (-b_cyl + sqrt_disc) * inv_a_cyl;
 
-    if (box_hit.x > box_hit.y || box_hit.y < 0.0) {
-        // Ray missed fluid domain completely — return background immediately
+    let inv_rdy = 1.0 / rd.y;
+    let ty0 = (0.0 - ro.y) * inv_rdy;
+    let ty1 = (1.32 - ro.y) * inv_rdy;
+    let t_near = max(max(0.0, t_cyl0), min(ty0, ty1));
+    let t_far  = min(t_cyl1, max(ty0, ty1));
+
+    if (t_near >= t_far || t_far <= 0.0) {
+        // Ray missed circular fluid dish completely — return background immediately
         return vec4<f32>(aces_tonemap(col), 1.0);
     }
 
-    let t_start = max(0.0, box_hit.x);
-    let t_end = box_hit.y;
+    var t_start = t_near;
+    // Outside central spike zone (r2 > 7.5), fluid is only the resting meniscus puddle (y <= 0.30)
+    let p_entry = ro + rd * t_start;
+    if (rd.y < -0.01 && dot(p_entry.xz, p_entry.xz) > 7.5 && dot(p_entry.xz, rd.xz) >= -0.2) {
+        t_start = max(t_start, (0.32 - ro.y) * inv_rdy);
+    }
+
+    let t_end = t_far;
     var t = t_start;
+    var t_prev = t_start;
+    var dist_prev = 1.0;
     var hit = false;
     var hit_p = vec3<f32>(0.0);
+    let inv_slant = 1.0 / (max(-rd.y, 0.02) + 0.92);
 
-    // March heightfield
+    // March heightfield inside circular cylinder
     for (var i = 0; i < MAX_STEPS; i++) {
         let p = ro + rd * t;
-        let r = length(p.xz);
-
-        // Outside dish bounds
-        if (r > DISH_RADIUS + 0.15) {
-            t += 0.06;
-            if (t >= t_end) { break; }
-            continue;
-        }
-
-        let h = sample_height(p.xz);
+        let r2 = dot(p.xz, p.xz);
+        let h = sample_height_r2(p.xz, r2);
         let dist = p.y - h;
 
         if (dist < HIT_EPS) {
+            let denom = max(dist_prev - dist, 0.0001);
+            let frac_t = clamp(dist_prev / denom, 0.0, 1.0);
+            t = mix(t_prev, t, frac_t);
             hit = true;
-            hit_p = p;
+            hit_p = ro + rd * t;
             break;
         }
 
         // Sky early-out: ray is pointing up and is already above max possible fluid height
-        if (rd.y > 0.0 && p.y > 2.4) {
+        if (rd.y > 0.0 && p.y > 1.30) {
             break;
         }
 
-        t += max(dist * STEP_SCALE, 0.012);
+        t_prev = t;
+        dist_prev = dist;
+        t += max(dist * inv_slant, 0.032);
         if (t >= t_end) { break; }
     }
 
@@ -161,8 +188,9 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let normal = calc_normal(hit_p.xz, 0.025);
         let view_dir = -rd;
         let NdotV = max(0.0, dot(normal, view_dir));
-        let r_xz = length(hit_p.xz);
-        let floor_y = 0.025 + 0.022 * (r_xz * r_xz);
+        let r2_hit = dot(hit_p.xz, hit_p.xz);
+        let r_xz = sqrt(r2_hit);
+        let floor_y = 0.025 + 0.022 * r2_hit;
         let dish_mask = smoothstep(DISH_RADIUS, DISH_RADIUS - 0.45, r_xz);
         let base_puddle = floor_y + 0.055 * dish_mask;
         let spike_h = max(0.0, hit_p.y - base_puddle);
@@ -171,17 +199,27 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Obsidian base color: pitch black with faint graphite undertone
         let albedo = vec3<f32>(0.012, 0.014, 0.018);
 
-        // Fresnel reflection (Schlick approximation)
+        // Fresnel reflection (Schlick approximation via fast squaring)
         let F0 = 0.62; // High metallic chrome reflectivity
-        let fresnel = F0 + (1.0 - F0) * pow(1.0 - NdotV, 5.0);
+        let om_nv = 1.0 - NdotV;
+        let om_nv2 = om_nv * om_nv;
+        let om_nv3 = om_nv2 * om_nv;
+        let fresnel = F0 + (1.0 - F0) * (om_nv2 * om_nv3);
 
         // Primary Overhead Softbox Area Light (Warm Studio Amber)
         let light1_pos = vec3<f32>(2.2, 5.2, 2.5);
         let l1_dir = normalize(light1_pos - hit_p);
         let h1 = normalize(l1_dir + view_dir);
         let NdotL1 = max(0.0, dot(normal, l1_dir));
-        let spec1_tight = pow(max(0.0, dot(normal, h1)), 220.0) * 5.2;
-        let spec1_soft = pow(max(0.0, dot(normal, h1)), 28.0) * 0.85;
+        let ndh1_2 = max(0.0, dot(normal, h1)) * max(0.0, dot(normal, h1));
+        let ndh1_4 = ndh1_2 * ndh1_2;
+        let ndh1_8 = ndh1_4 * ndh1_4;
+        let ndh1_16 = ndh1_8 * ndh1_8;
+        let ndh1_28 = ndh1_16 * ndh1_8 * ndh1_4;
+        let ndh1_64 = ndh1_16 * ndh1_16 * ndh1_16 * ndh1_16;
+        let ndh1_220 = ndh1_64 * ndh1_64 * ndh1_64 * ndh1_28;
+        let spec1_tight = ndh1_220 * 5.2;
+        let spec1_soft = ndh1_28 * 0.85;
         let light1_col = vec3<f32>(1.12, 0.98, 0.82) * (spec1_tight + spec1_soft) * NdotL1;
 
         // Secondary Kicker Light (Cool Blue-Cyan Rim Light)
@@ -189,12 +227,20 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let l2_dir = normalize(light2_pos - hit_p);
         let h2 = normalize(l2_dir + view_dir);
         let NdotL2 = max(0.0, dot(normal, l2_dir));
-        let spec2 = pow(max(0.0, dot(normal, h2)), 110.0) * 2.6;
+        let ndh2_2 = max(0.0, dot(normal, h2)) * max(0.0, dot(normal, h2));
+        let ndh2_4 = ndh2_2 * ndh2_2;
+        let ndh2_8 = ndh2_4 * ndh2_4;
+        let ndh2_16 = ndh2_8 * ndh2_8;
+        let ndh2_32 = ndh2_16 * ndh2_16;
+        let ndh2_64 = ndh2_32 * ndh2_32;
+        let spec2 = (ndh2_64 * ndh2_32 * ndh2_16) * 2.6;
         let light2_col = vec3<f32>(0.45, 0.85, 1.25) * spec2 * NdotL2;
 
         // Electromagnetic Under-Basin Coil Radiance
         // Concentric neon filament coils visible in the glass dish rim and around erupting spike roots
-        let coil_freq = pow(max(0.0, sin(r_xz * 28.0 - time * 1.5)), 6.0);
+        let cf_1 = max(0.0, sin(r_xz * 28.0 - time * 1.5));
+        let cf_2 = cf_1 * cf_1;
+        let coil_freq = cf_2 * cf_2 * cf_2;
         let coil_col = mix(vec3<f32>(1.0, 0.40, 0.06), vec3<f32>(0.10, 0.75, 1.0), sin(r_xz * 6.0) * 0.5 + 0.5);
         
         // Dish glass rim glow: visible where fluid thins out towards container edge
@@ -217,7 +263,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         var fluid_col = albedo + underglow;
         fluid_col += (light1_col + light2_col) * fresnel;
         fluid_col += (env_sky + env_floor) * fresnel;
-        fluid_col += irid_col * pow(1.0 - NdotV, 3.0);
+        fluid_col += irid_col * om_nv3;
 
         // Dish rim & 16-pole azimuthal electromagnetic coil segments
         if (r_xz > DISH_RADIUS - 0.14) {

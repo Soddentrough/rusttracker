@@ -33,6 +33,24 @@ fn main() {
             );
         }
     } else if target_os == "android" {
+        let manifest_dir = env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set");
+        let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+        let abi_dir = match target_arch.as_str() {
+            "aarch64" => "arm64-v8a",
+            "x86_64" => "x86_64",
+            "arm" => "armeabi-v7a",
+            _ => "arm64-v8a",
+        };
+        println!(
+            "cargo:rustc-link-search=native={}/local_lib/android/{}",
+            manifest_dir, abi_dir
+        );
+        println!("cargo:rustc-link-lib=static=openmpt");
+        println!("cargo:rustc-link-lib=z");
         println!("cargo:rustc-link-lib=mediandk");
+        println!("cargo:rustc-link-arg=-lopenmpt");
+        println!("cargo:rustc-link-arg=-lz");
+        println!("cargo:rustc-link-arg=-lc++_static");
+        println!("cargo:rustc-link-arg=-lc++abi");
     }
 }

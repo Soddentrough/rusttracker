@@ -261,6 +261,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 state.current_visualizer_idx = idx;
                 state.visualizer_mode = crate::state::VISUALIZERS[idx].id;
                 state.vis_enabled[idx] = true;
+                state.vis_user_overridden[idx] = true;
             } else {
                 eprintln!(
                     "Warning: Visualizer '{}' not found. Launching with default visualizer.",
@@ -862,7 +863,6 @@ async fn run_gui(
         attrs = WindowAttributesExtX11::with_name(attrs, "rusttracker", "rusttracker");
     }
 
-    let start_time = Instant::now();
     let mut last_update = Instant::now();
 
     let egui_ctx = egui::Context::default();
@@ -922,6 +922,14 @@ async fn run_gui(
             }
             let window = Arc::new(window);
             let mut engine = pollster::block_on(VulkanEngine::new(window.clone()));
+            app_state_for_init
+                .lock()
+                .unwrap()
+                .apply_gpu_capability_profile(
+                    &engine.adapter_info,
+                    engine.config.width,
+                    engine.config.height,
+                );
             let mut egui_state = egui_winit::State::new(
                 egui_ctx_for_init.clone(),
                 egui::ViewportId::ROOT,
@@ -1006,6 +1014,9 @@ async fn run_gui(
     let mut pending_dropped_files: Vec<String> = Vec::new();
     let mut drop_cursor_pos: Option<[f32; 2]> = None;
     let mut bench_frame_count = 0u32;
+    let mut frame_dt_ring = [1.0f32 / 60.0; 60];
+    let mut frame_dt_idx = 0usize;
+    let mut desktop_frame_count = 0u64;
 
     let mut app = DesktopApp {
         runtime: None,
@@ -1436,6 +1447,7 @@ async fn run_gui(
                                                 if idx != 0 {
                                                     state.vis_enabled[idx] =
                                                         !state.vis_enabled[idx];
+                                                    state.vis_user_overridden[idx] = true;
                                                 }
                                             } else if state.track_ended
                                                 || (state.current_seconds
@@ -1498,14 +1510,13 @@ async fn run_gui(
                                         WinitKeyCode::Enter => {
                                             let mut state = app_state.lock().unwrap();
                                             if state.show_vis_picker {
-                                                state.current_visualizer_idx =
-                                                    state.vis_picker_cursor;
-                                                state.visualizer_mode = crate::state::VISUALIZERS
-                                                    [state.vis_picker_cursor]
-                                                    .id;
+                                                let cursor = state.vis_picker_cursor;
+                                                state.vis_user_overridden[cursor] = true;
+                                                state.current_visualizer_idx = cursor;
+                                                state.visualizer_mode =
+                                                    crate::state::VISUALIZERS[cursor].id;
                                                 state.osd_text = Some(
-                                                    crate::state::VISUALIZERS
-                                                        [state.vis_picker_cursor]
+                                                    crate::state::VISUALIZERS[cursor]
                                                         .name
                                                         .to_string(),
                                                 );
@@ -1940,88 +1951,91 @@ async fn run_gui(
                             let dt = raw_dt.min(0.1);
                             last_update = now;
                             let time_scale = dt * 60.0; // Decay logic built for 60fps
-                            let fps = if raw_dt > 0.0 { 1.0 / raw_dt } else { 0.0 };
+                            desktop_frame_count += 1;
+                            if desktop_frame_count > 2 && raw_dt > 0.0 && raw_dt < 0.25 {
+                                frame_dt_ring[frame_dt_idx] = raw_dt;
+                                frame_dt_idx = (frame_dt_idx + 1) % frame_dt_ring.len();
+                            }
+                            let avg_dt =
+                                frame_dt_ring.iter().sum::<f32>() / (frame_dt_ring.len() as f32);
+                            let fps = if avg_dt > 0.0 { 1.0 / avg_dt } else { 60.0 };
 
                             let phase_timer = Instant::now();
                             {
                                 let mut state = app_state.lock().unwrap();
-                                state.current_fps = state.current_fps * 0.9 + fps * 0.1;
+                                state.current_fps = fps;
+                                if bench.is_none() {
+                                    state.update_visualizer_perf_guard(dt, 60.0);
+                                }
                                 state.visual_width = engine.config.width / 2;
 
-                                if !state.file_loaded {
-                                    let t = start_time.elapsed().as_secs_f32();
-                                    for i in 0..1024 {
-                                        let pct = i as f32 / 1024.0;
-                                        let wave1 = (t * 2.0 + pct * 10.0).sin();
-                                        let wave2 = (t * 1.5 - pct * 15.0).cos();
-                                        let wave3 = (t * 0.5 + pct * 5.0).sin();
-                                        let combined = (wave1 + wave2 + wave3) / 3.0; // -1 to 1
-                                        let val = (combined * 0.5 + 0.5).powf(2.0) * 0.5; // 0 to 0.5, biased low
-                                        state.raw_spectrum_data[i] = val;
+                                if state.file_loaded {
+                                    if state.channel_vus.len() != state.raw_channel_vus.len() {
+                                        state.channel_vus = vec![0.0; state.raw_channel_vus.len()];
                                     }
-                                }
+                                    for i in 0..state.raw_channel_vus.len() {
+                                        if state.raw_channel_vus[i] > state.channel_vus[i] {
+                                            state.channel_vus[i] = state.raw_channel_vus[i];
+                                        } else {
+                                            state.channel_vus[i] = (state.channel_vus[i]
+                                                - (0.015 * time_scale))
+                                                .max(state.raw_channel_vus[i]);
+                                        }
+                                    }
 
-                                if state.channel_vus.len() != state.raw_channel_vus.len() {
-                                    state.channel_vus = vec![0.0; state.raw_channel_vus.len()];
-                                }
-                                for i in 0..state.raw_channel_vus.len() {
-                                    if state.raw_channel_vus[i] > state.channel_vus[i] {
-                                        state.channel_vus[i] = state.raw_channel_vus[i];
+                                    if state.peak_vus.len() != state.channel_vus.len() {
+                                        state.peak_vus = vec![0.0; state.channel_vus.len()];
+                                    }
+                                    for i in 0..state.channel_vus.len() {
+                                        state.peak_vus[i] =
+                                            (state.peak_vus[i] - (0.005 * time_scale)).max(0.0);
+                                        if state.channel_vus[i] > state.peak_vus[i] {
+                                            state.peak_vus[i] = state.channel_vus[i];
+                                        }
+                                    }
+
+                                    if state.spectrum_data.len() != state.raw_spectrum_data.len() {
+                                        state.spectrum_data =
+                                            vec![0.0; state.raw_spectrum_data.len()];
+                                    }
+                                    for i in 0..state.raw_spectrum_data.len() {
+                                        if state.raw_spectrum_data[i] > state.spectrum_data[i] {
+                                            state.spectrum_data[i] = state.raw_spectrum_data[i];
+                                        } else {
+                                            state.spectrum_data[i] = (state.spectrum_data[i]
+                                                - (1.5 * time_scale))
+                                                .max(state.raw_spectrum_data[i]);
+                                        }
+
+                                        // Smoothly decay fire heat using display refresh rate
+                                        if state.raw_spectrum_data[i] > state.fire_heat[i] {
+                                            state.fire_heat[i] = state.raw_spectrum_data[i];
+                                        } else {
+                                            state.fire_heat[i] =
+                                                (state.fire_heat[i] - (1.5 * time_scale)).max(0.0);
+                                        }
+                                    }
+
+                                    if state.spectrum_peaks.len() != state.spectrum_data.len() {
+                                        state.spectrum_peaks = vec![0.0; state.spectrum_data.len()];
+                                    }
+                                    for i in 0..state.spectrum_data.len() {
+                                        state.spectrum_peaks[i] =
+                                            (state.spectrum_peaks[i] - (0.5 * time_scale)).max(0.0);
+                                        if state.spectrum_data[i] > state.spectrum_peaks[i] {
+                                            state.spectrum_peaks[i] = state.spectrum_data[i];
+                                        }
+                                    }
+                                    // Scroll spectrum history (reuse front allocation)
+                                    let mut recycled = if state.spectrum_history.len() > 120 {
+                                        state.spectrum_history.pop_front().unwrap_or_default()
                                     } else {
-                                        state.channel_vus[i] = (state.channel_vus[i]
-                                            - (0.015 * time_scale))
-                                            .max(state.raw_channel_vus[i]);
-                                    }
+                                        Vec::with_capacity(state.spectrum_data.len())
+                                    };
+                                    recycled.clear();
+                                    recycled.extend_from_slice(&state.spectrum_data);
+                                    state.spectrum_history.push_back(recycled);
                                 }
-
-                                if state.peak_vus.len() != state.channel_vus.len() {
-                                    state.peak_vus = vec![0.0; state.channel_vus.len()];
-                                }
-                                for i in 0..state.channel_vus.len() {
-                                    state.peak_vus[i] =
-                                        (state.peak_vus[i] - (0.005 * time_scale)).max(0.0);
-                                    if state.channel_vus[i] > state.peak_vus[i] {
-                                        state.peak_vus[i] = state.channel_vus[i];
-                                    }
-                                }
-
-                                if state.spectrum_data.len() != state.raw_spectrum_data.len() {
-                                    state.spectrum_data = vec![0.0; state.raw_spectrum_data.len()];
-                                }
-                                for i in 0..state.raw_spectrum_data.len() {
-                                    if state.raw_spectrum_data[i] > state.spectrum_data[i] {
-                                        state.spectrum_data[i] = state.raw_spectrum_data[i];
-                                    } else {
-                                        state.spectrum_data[i] = (state.spectrum_data[i]
-                                            - (1.5 * time_scale))
-                                            .max(state.raw_spectrum_data[i]);
-                                    }
-
-                                    // Smoothly decay fire heat using display refresh rate
-                                    if state.raw_spectrum_data[i] > state.fire_heat[i] {
-                                        state.fire_heat[i] = state.raw_spectrum_data[i];
-                                    } else {
-                                        state.fire_heat[i] =
-                                            (state.fire_heat[i] - (1.5 * time_scale)).max(0.0);
-                                    }
-                                }
-
-                                if state.spectrum_peaks.len() != state.spectrum_data.len() {
-                                    state.spectrum_peaks = vec![0.0; state.spectrum_data.len()];
-                                }
-                                for i in 0..state.spectrum_data.len() {
-                                    state.spectrum_peaks[i] =
-                                        (state.spectrum_peaks[i] - (0.5 * time_scale)).max(0.0);
-                                    if state.spectrum_data[i] > state.spectrum_peaks[i] {
-                                        state.spectrum_peaks[i] = state.spectrum_data[i];
-                                    }
-                                }
-                                // Scroll spectrum history
-                                if state.spectrum_history.len() > 120 {
-                                    state.spectrum_history.pop_front();
-                                }
-                                let cloned_data = state.spectrum_data.clone();
-                                state.spectrum_history.push_back(cloned_data);
 
                                 // Gamepad analog panel scaling and scrubbing
                                 for (_id, gamepad) in gilrs.gamepads() {
@@ -2510,6 +2524,7 @@ async fn run_gui(
                                         state.audio_mix_request = Some(tracks);
                                     }
                                     EngineAction::VisPickerSelect(idx) => {
+                                        state.vis_user_overridden[idx] = true;
                                         state.current_visualizer_idx = idx;
                                         state.visualizer_mode = crate::state::VISUALIZERS[idx].id;
                                         state.osd_text =
@@ -2528,6 +2543,7 @@ async fn run_gui(
                                         if idx != 0 {
                                             // Frequency Spectrum always enabled
                                             state.vis_enabled[idx] = !state.vis_enabled[idx];
+                                            state.vis_user_overridden[idx] = true;
                                         }
                                     }
                                     EngineAction::VisPickerSetCursor(idx) => {
@@ -2536,6 +2552,7 @@ async fn run_gui(
                                     EngineAction::VisPickerEnableAll => {
                                         for i in 0..state.vis_enabled.len() {
                                             state.vis_enabled[i] = true;
+                                            state.vis_user_overridden[i] = true;
                                         }
                                     }
                                     EngineAction::VisPickerEnableNone => {

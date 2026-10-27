@@ -12,13 +12,14 @@
 
 const RENDER_GRID_SIZE: i32 = 512;
 const BASIN_FLOOR_Y: f32 = -0.35;
+const MIN_WATER_Y: f32 = 0.22;
 const BASE_WATER_Y: f32 = 0.42;
-const MAX_WATER_Y: f32 = 1.25;
+const MAX_WATER_Y: f32 = 0.92;
 
 // Raymarch tuning
-const MAX_STEPS: i32 = 80;
-const HIT_EPS: f32 = 0.0020;
-const STEP_SCALE: f32 = 0.62;
+const MAX_STEPS: i32 = 10;
+const HIT_EPS: f32 = 0.0038;
+const STEP_SCALE: f32 = 0.92;
 
 var<private> g_time: f32 = 0.0;
 var<private> g_sub_bass: f32 = 0.0;
@@ -26,6 +27,8 @@ var<private> g_lowmids: f32 = 0.0;
 var<private> g_mids: f32 = 0.0;
 var<private> g_highs: f32 = 0.0;
 var<private> g_flip_energy: f32 = 0.0;
+var<private> g_plume_pulse: f32 = 1.0;
+var<private> g_collar1_r: f32 = 0.85;
 
 fn get_grid_height(gx: i32, gz: i32) -> f32 {
     if (gx < 0 || gx >= RENDER_GRID_SIZE || gz < 0 || gz >= RENDER_GRID_SIZE) {
@@ -44,27 +47,66 @@ fn sample_macro_flip_energy() -> f32 {
            + get_grid_height(c, c + 12) + get_grid_height(c, c - 12);
     let h2 = get_grid_height(c + 28, c + 28) + get_grid_height(c - 28, c + 28)
            + get_grid_height(c + 28, c - 28) + get_grid_height(c - 28, c - 28);
-    return clamp((h0 * 2.0 + h1 + h2 * 0.5) * 0.35, 0.0, 0.45);
+    let grid_e = clamp((h0 * 2.0 + h1 + h2 * 0.5) * 0.35, 0.0, 0.45);
+    return max(grid_e, clamp(g_sub_bass * 0.28 + g_lowmids * 0.12, 0.0, 0.45));
 }
 
-// Continuous C-infinity smooth 3D open-ocean + acoustic cymatic water surface heightfield
-fn sample_water_height(p: vec2<f32>) -> f32 {
-    let r = length(p);
+// Fast macro heightfield used during coarse raymarch stepping (pure ALU rational attenuation + 3 primary swells)
+fn sample_water_height_march(p: vec2<f32>) -> f32 {
     let r2 = dot(p, p);
-    let theta = atan2(p.y, p.x);
 
     let flip_boost = g_flip_energy * 0.28;
     let bass_drive = g_sub_bass + flip_boost;
 
-    // 1. Central Sub-Bass Acoustic Fountain Plume & Concentric Rayleigh Collars
-    let plume_pulse = 0.90 + 0.10 * sin(g_time * 6.4);
-    let plume_core = exp(-r2 * 2.4) * (0.06 + bass_drive * 0.34) * plume_pulse;
-    let collar1_r = 0.85 + 0.08 * sin(g_time * 3.0);
-    let collar1 = exp(-pow(r - collar1_r, 2.0) * 8.5) * (0.025 + bass_drive * 0.105);
-    let trough1 = -exp(-pow(r - 0.52, 2.0) * 14.0) * (0.015 + bass_drive * 0.042);
+    var central_plume = 0.0;
+    if (r2 < 2.8) {
+        let plume_core = (1.0 / (1.0 + r2 * 2.4 + r2 * r2 * 2.8)) * (0.06 + bass_drive * 0.34) * g_plume_pulse;
+        let r_approx = r2 * inverseSqrt(max(r2, 1e-6));
+        let dc = r_approx - g_collar1_r;
+        let dt_r = r_approx - 0.52;
+        let collar1 = (1.0 / (1.0 + (dc * dc) * 9.5)) * (0.025 + bass_drive * 0.105);
+        let trough1 = -(1.0 / (1.0 + (dt_r * dt_r) * 15.0)) * (0.015 + bass_drive * 0.042);
+        central_plume = plume_core + collar1 + trough1;
+    }
+
+    let far_fade = 1.0 / (1.0 + r2 * 0.0022);
+    let d1 = vec2<f32>(0.866, 0.500);
+    let d2 = vec2<f32>(-0.643, 0.766);
+    let d3 = vec2<f32>(0.342, -0.940);
+    let swell1 = sin(dot(p, d1) * 1.45 + g_time * 2.1);
+    let swell2 = sin(dot(p, d2) * 2.15 - g_time * 2.6 + swell1 * 0.35);
+    let swell3 = cos(dot(p, d3) * 3.30 + g_time * 3.2);
+
+    let ocean_swell = (swell1 * 0.042 + swell2 * 0.030) * (1.0 + bass_drive * 0.55 + g_lowmids * 0.45)
+                    + (swell3 * 0.018) * (1.0 + g_mids * 0.75 + g_highs * 0.65);
+
+    return BASE_WATER_Y + central_plume + ocean_swell * far_fade;
+}
+
+// Continuous C-infinity smooth 3D open-ocean + acoustic cymatic water surface heightfield
+fn sample_water_height(p: vec2<f32>) -> f32 {
+    let r2 = dot(p, p);
+    let inv_r = inverseSqrt(max(r2, 1e-6));
+    let r = r2 * inv_r;
+    let u = p * inv_r;
+
+    let flip_boost = g_flip_energy * 0.28;
+    let bass_drive = g_sub_bass + flip_boost;
+
+    // 1. Central Sub-Bass Acoustic Fountain Plume & Concentric Rayleigh Collars (pure ALU rational Gaussian)
+    var central_plume = 0.0;
+    if (r2 < 2.8) {
+        let plume_core = (1.0 / (1.0 + r2 * 2.4 + r2 * r2 * 2.8)) * (0.06 + bass_drive * 0.34) * g_plume_pulse;
+        let dc = r - g_collar1_r;
+        let dt_r = r - 0.52;
+        let collar1 = (1.0 / (1.0 + (dc * dc) * 9.5)) * (0.025 + bass_drive * 0.105);
+        let trough1 = -(1.0 / (1.0 + (dt_r * dt_r) * 15.0)) * (0.015 + bass_drive * 0.042);
+        central_plume = plume_core + collar1 + trough1;
+    }
 
     // 2. Expansive Radially Propagating Gravity Wave Rings (unbounded across the viewport)
-    let dist_atten = exp(-r * 0.085);
+    let far_fade = 1.0 / (1.0 + r * 0.035 + r2 * 0.0006);
+    let dist_atten = far_fade * far_fade * far_fade;
     let wave_out1 = sin(r * 3.8 - g_time * 4.6) * smoothstep(0.15, 0.65, r);
     let wave_out2 = sin(r * 6.4 - g_time * 5.8 + 1.2) * 0.55 * smoothstep(0.25, 0.95, r);
     let radial_waves = (wave_out1 + wave_out2) * dist_atten * (0.028 + bass_drive * 0.068 + g_lowmids * 0.042);
@@ -83,26 +125,46 @@ fn sample_water_height(p: vec2<f32>) -> f32 {
     let ocean_swell = (swell1 * 0.040 + swell2 * 0.028) * (1.0 + bass_drive * 0.55 + g_lowmids * 0.45)
                     + (swell3 * 0.016 + swell4 * 0.009) * (1.0 + g_mids * 0.75 + g_highs * 0.65);
 
-    // 4. Multi-Pole Azimuthal Faraday / Cymatic Standing Wave Harmonics
-    let cymatic_atten = exp(-r * 0.11);
-    let mode4 = cos(r * 5.2 - g_time * 3.2) * cos(theta * 4.0 + g_time * 0.30) * smoothstep(0.30, 1.15, r);
-    let mode6 = sin(r * 8.4 + g_time * 3.8) * cos(theta * 6.0 - g_time * 0.40) * smoothstep(0.55, 1.70, r);
-    let mode8 = cos(r * 11.8 - g_time * 4.5) * sin(theta * 8.0 + g_time * 0.25) * smoothstep(0.85, 2.20, r);
+    // 4. Multi-Pole Azimuthal Faraday / Cymatic Standing Wave Harmonics (using Chebyshev polynomial identities on u)
+    let c2 = 2.0 * u.x * u.x - 1.0;
+    let s2 = 2.0 * u.x * u.y;
+    let c4 = 2.0 * c2 * c2 - 1.0;
+    let s4 = 2.0 * s2 * c2;
+    let c6 = c4 * c2 - s4 * s2;
+    let s8 = 2.0 * s4 * c4;
+
+    let cymatic_atten = dist_atten;
+    let mode4 = cos(r * 5.2 - g_time * 3.2) * c4 * smoothstep(0.30, 1.15, r);
+    let mode6 = sin(r * 8.4 + g_time * 3.8) * c6 * smoothstep(0.55, 1.70, r);
+    let mode8 = cos(r * 11.8 - g_time * 4.5) * s8 * smoothstep(0.85, 2.20, r);
     let cymatic_ripples = (mode4 * (0.015 + g_mids * 0.032)
                         + mode6 * (0.009 + g_highs * 0.022)
                         + mode8 * (0.005 + g_highs * 0.014)) * cymatic_atten;
 
-    let far_fade = exp(-r * 0.035);
-    let dynamic_waves = plume_core + collar1 + trough1 + radial_waves + cymatic_ripples + ocean_swell * far_fade;
+    let dynamic_waves = central_plume + radial_waves + cymatic_ripples + ocean_swell * far_fade;
 
     return BASE_WATER_Y + dynamic_waves;
 }
 
 fn calc_water_normal(p: vec2<f32>, eps: f32) -> vec3<f32> {
     let e = vec2<f32>(eps, 0.0);
-    let dx = (sample_water_height(p + e.xy) - sample_water_height(p - e.xy)) / (2.0 * eps);
-    let dz = (sample_water_height(p + e.yx) - sample_water_height(p - e.yx)) / (2.0 * eps);
+    let h0 = sample_water_height(p);
+    let dx = (sample_water_height(p + e.xy) - h0) / eps;
+    let dz = (sample_water_height(p + e.yx) - h0) / eps;
     return normalize(vec3<f32>(-dx, 1.0, -dz));
+}
+
+// Fast polynomial power helpers to avoid expensive SFU log2/exp2 pow() calls
+fn pow7_f32(x: f32) -> f32 {
+    let x2 = x * x;
+    let x4 = x2 * x2;
+    return x4 * x2 * x;
+}
+
+fn pow8_f32(x: f32) -> f32 {
+    let x2 = x * x;
+    let x4 = x2 * x2;
+    return x4 * x4;
 }
 
 // True Ridged Cellular / Voronoi Caustic Filament Network (continuous intersecting photon webs)
@@ -118,35 +180,83 @@ fn calculate_caustics(pos: vec2<f32>, time: f32, bass: f32) -> f32 {
     let w2 = p_rot + vec2<f32>(cos(p_rot.y * 2.1 - time * 1.7), sin(p_rot.x * 2.1 + time * 1.4)) * 0.26;
 
     // 1.0 - abs(sin(...)) produces sharp continuous 1D zero-crossing caustic filaments
-    let f1 = 1.0 - abs(sin(w1.x * 3.4 + sin(w1.y * 2.8 + time * 1.1)));
-    let f2 = 1.0 - abs(sin(w2.y * 3.6 + cos(w2.x * 3.0 - time * 1.2)));
-    let f3 = 1.0 - abs(sin((w1.x + w2.y) * 2.5 - time * 0.9));
+    let f1 = clamp(1.0 - abs(sin(w1.x * 3.4 + sin(w1.y * 2.8 + time * 1.1))), 0.0, 1.0);
+    let f2 = clamp(1.0 - abs(sin(w2.y * 3.6 + cos(w2.x * 3.0 - time * 1.2))), 0.0, 1.0);
+    let f3 = clamp(1.0 - abs(sin((w1.x + w2.y) * 2.5 - time * 0.9)), 0.0, 1.0);
 
-    let filament1 = pow(clamp(f1, 0.0, 1.0), 7.0);
-    let filament2 = pow(clamp(f2, 0.0, 1.0), 7.0);
-    let filament3 = pow(clamp(f3, 0.0, 1.0), 8.0) * 0.75;
+    let filament1 = pow7_f32(f1);
+    let filament2 = pow7_f32(f2);
+    let filament3 = pow8_f32(f3) * 0.75;
     // Bright caustic cusps where filaments intersect
-    let cusp_nodes = pow(clamp(f1 * f2, 0.0, 1.0), 3.5) * 2.4;
+    let f12 = f1 * f2;
+    let f12_2 = f12 * f12;
+    let cusp_nodes = f12_2 * f12 * sqrt(f12) * 2.4;
 
     return (filament1 + filament2 + filament3 + cusp_nodes) * (0.95 + bass * 0.85);
 }
 
+// Single-pass chromatic caustics (reuses domain warps across R/G/B dispersion offsets)
+fn calculate_caustics_chromatic(pos: vec2<f32>, disp: vec2<f32>, time: f32, bass: f32) -> vec3<f32> {
+    let p = pos * 1.05;
+    let c = 0.8660254;
+    let s = 0.5000000;
+
+    let w1 = p + vec2<f32>(sin(p.y * 1.8 + time * 1.5), cos(p.x * 1.8 - time * 1.3)) * 0.32;
+    let p_rot = vec2<f32>(p.x * c - p.y * s, p.x * s + p.y * c) * 1.28;
+    let w2 = p_rot + vec2<f32>(cos(p_rot.y * 2.1 - time * 1.7), sin(p_rot.x * 2.1 + time * 1.4)) * 0.26;
+
+    let phase1 = w1.x * 3.4 + sin(w1.y * 2.8 + time * 1.1);
+    let phase2 = w2.y * 3.6 + cos(w2.x * 3.0 - time * 1.2);
+    let phase3 = (w1.x + w2.y) * 2.5 - time * 0.9;
+    let shift = (disp.x + disp.y) * 3.5;
+
+    let f1 = clamp(1.0 - abs(sin(phase1)), 0.0, 1.0);
+    let f2 = clamp(1.0 - abs(sin(phase2)), 0.0, 1.0);
+    let f3 = clamp(1.0 - abs(sin(phase3)), 0.0, 1.0);
+
+    let fil1 = pow7_f32(f1);
+    let fil2 = pow7_f32(f2);
+    let fil3 = pow8_f32(f3) * 0.75;
+    let f12 = f1 * f2;
+    let cusp_g = (f12 * f12 * f12 * sqrt(f12)) * 2.4;
+
+    let boost = 0.95 + bass * 0.85;
+    let c_g = (fil1 + fil2 + fil3 + cusp_g) * boost;
+    let d_chroma = clamp(shift * (fil1 - fil2) * 3.2, -0.35, 0.35);
+    let c_r = c_g * (1.0 + d_chroma);
+    let c_b = c_g * (1.0 - d_chroma);
+
+    return vec3<f32>(c_r * 0.18, c_g * 0.68, (c_g * 0.5 + c_b * 0.5) * 1.15);
+}
+
 fn eval_cymatic_floor_grid(floor_p: vec2<f32>, time: f32, sub_bass: f32, mids: f32, highs: f32) -> vec3<f32> {
-    let r = length(floor_p);
-    let theta = atan2(floor_p.y, floor_p.x);
-    let dist_fade = exp(-r * 0.09);
+    let r2 = dot(floor_p, floor_p);
+    let inv_r = inverseSqrt(max(r2, 1e-6));
+    let r = r2 * inv_r;
+    let u = floor_p * inv_r;
+    let dist_fade = 1.0 / (1.0 + r * 0.09 + r2 * 0.005);
+
+    let c2 = 2.0 * u.x * u.x - 1.0;
+    let s2 = 2.0 * u.x * u.y;
+    let c4 = 2.0 * c2 * c2 - 1.0;
+    let s4 = 2.0 * s2 * c2;
+    let s6 = s4 * c2 + c4 * s2;
 
     // Chladni radial + azimuthal standing-wave laser nodal filaments across the seabed
-    let nodal1 = cos(r * 4.8 - time * 1.8) * cos(theta * 4.0) + 0.55 * sin(r * 7.6 + time * 1.3) * sin(theta * 6.0);
-    let chladni_line = exp(-abs(nodal1) * 16.0) * dist_fade;
+    let nodal1 = cos(r * 4.8 - time * 1.8) * c4 + 0.55 * sin(r * 7.6 + time * 1.3) * s6;
+    let n1_16 = abs(nodal1) * 16.0;
+    let chladni_line = (1.0 / (1.0 + n1_16 + n1_16 * n1_16 * 0.5)) * dist_fade;
 
     // Concentric harmonic resonator rings
-    let ring_grid = exp(-abs(fract(r * 0.95) - 0.5) * 32.0) * 0.38 * dist_fade;
+    let rg_32 = abs(fract(r * 0.95) - 0.5) * 32.0;
+    let ring_grid = (1.0 / (1.0 + rg_32 + rg_32 * rg_32 * 0.5)) * 0.38 * dist_fade;
     // 12 radial acoustic waveguide spokes
-    let spoke_line = exp(-abs(sin(theta * 6.0)) * 28.0) * smoothstep(0.35, 1.10, r) * dist_fade * 0.24;
+    let sp_28 = abs(s6) * 28.0;
+    let spoke_line = (1.0 / (1.0 + sp_28 + sp_28 * sp_28 * 0.5)) * smoothstep(0.35, 1.10, r) * dist_fade * 0.24;
 
     let cymatic_col = mix(vec3<f32>(0.06, 0.72, 1.20), vec3<f32>(0.55, 0.35, 1.30), clamp(highs * 0.65, 0.0, 1.0));
-    let gold_accent = vec3<f32>(1.10, 0.78, 0.32) * exp(-abs(r - 1.45) * 20.0) * (0.25 + sub_bass * 0.45);
+    let ga_20 = abs(r - 1.45) * 20.0;
+    let gold_accent = vec3<f32>(1.10, 0.78, 0.32) * (1.0 / (1.0 + ga_20 + ga_20 * ga_20 * 0.5)) * (0.25 + sub_bass * 0.45);
 
     return cymatic_col * (chladni_line * (0.22 + mids * 0.55 + highs * 0.40) + (ring_grid + spoke_line) * (0.18 + sub_bass * 0.28)) + gold_accent;
 }
@@ -168,18 +278,31 @@ fn eval_studio_reflection(pos: vec3<f32>, ref_dir: vec3<f32>, sub_bass: f32) -> 
     // 2. Left Horizon Rim Glow (Electric Cyan-Sapphire)
     let strip1_dir = normalize(vec3<f32>(-6.5, 2.6, 2.2) - pos);
     let align1 = max(0.0, dot(ref_dir, strip1_dir));
-    let strip1 = pow(align1, 18.0) * 1.25 + pow(align1, 120.0) * 2.8;
+    let a2 = align1 * align1;
+    let a4 = a2 * a2;
+    let a8 = a4 * a4;
+    let a16 = a8 * a8;
+    let a32 = a16 * a16;
+    let a64 = a32 * a32;
+    let strip1 = (a16 * a2) * 1.25 + (a64 * a32 * a16 * a8) * 2.8;
     refl += vec3<f32>(0.22, 0.82, 1.45) * strip1;
 
     // 3. Right Horizon Kicker Glow (Warm Champagne Gold & Violet)
     let strip2_dir = normalize(vec3<f32>(6.5, 3.0, -2.0) - pos);
     let align2 = max(0.0, dot(ref_dir, strip2_dir));
-    let strip2 = pow(align2, 22.0) * 1.1 + pow(align2, 140.0) * 2.4;
+    let b2 = align2 * align2;
+    let b4 = b2 * b2;
+    let b8 = b4 * b4;
+    let b16 = b8 * b8;
+    let b32 = b16 * b16;
+    let b64 = b32 * b32;
+    let strip2 = (b16 * b4 * b2) * 1.1 + (b64 * b64 * b8 * b4) * 2.4;
     refl += vec3<f32>(1.30, 0.92, 0.58) * strip2;
 
     // 4. Ambient Ocean Sky Dome Gradient
     let sky_grad = smoothstep(-0.15, 0.85, ref_dir.y);
-    let horizon_band = exp(-abs(ref_dir.y) * 9.0) * (0.14 + sub_bass * 0.08);
+    let hb_9 = abs(ref_dir.y) * 9.0;
+    let horizon_band = (1.0 / (1.0 + hb_9 + hb_9 * hb_9 * 0.48)) * (0.14 + sub_bass * 0.08);
     refl += mix(vec3<f32>(0.015, 0.032, 0.065), vec3<f32>(0.09, 0.19, 0.34), sky_grad)
           + vec3<f32>(0.10, 0.45, 0.85) * horizon_band;
 
@@ -216,6 +339,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     g_mids = mids;
     g_highs = highs;
     g_flip_energy = sample_macro_flip_energy();
+    g_plume_pulse = 0.90 + 0.10 * sin(time * 6.4);
+    g_collar1_r = 0.85 + 0.08 * sin(time * 3.0);
 
     // Panoramic camera framing looking out across the expansive water surface
     let portrait_scale = max(1.0, 1.25 / aspect);
@@ -232,7 +357,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     // Atmospheric night-ocean sky & horizon glow
     let sky_elev = max(0.0, rd.y);
-    let horizon_glow = exp(-abs(rd.y + 0.02) * 8.5) * (0.08 + sub_bass * 0.04);
+    let hg_arg = abs(rd.y + 0.02) * 8.5;
+    let horizon_glow = (1.0 / (1.0 + hg_arg + hg_arg * hg_arg * 0.48)) * (0.08 + sub_bass * 0.04);
     let bg_col = mix(
         vec3<f32>(0.016, 0.038, 0.078),
         vec3<f32>(0.005, 0.012, 0.026),
@@ -250,18 +376,25 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var t_water = 0.0;
 
     if (rd.y < -0.0005) {
-        let t_start = max(0.0, (MAX_WATER_Y - ro.y) / rd.y);
-        let t_max = min(60.0, (BASIN_FLOOR_Y - ro.y) / rd.y);
+        let inv_rdy = 1.0 / rd.y;
+        var t_start = max(0.0, (MAX_WATER_Y - ro.y) * inv_rdy);
+        let p_top = ro + rd * t_start;
+        // Outside central plume cylinder, waves never exceed y = 0.55
+        if (dot(p_top.xz, p_top.xz) > 2.3 && dot(p_top.xz, rd.xz) >= -0.05) {
+            t_start = max(t_start, (0.55 - ro.y) * inv_rdy);
+        }
+        let t_max = min(56.0, (MIN_WATER_Y - ro.y) * inv_rdy);
+        let inv_slant = 1.0 / (max(-rd.y, 0.02) + 0.28);
 
         if (t_start < t_max) {
             var t = t_start;
             var t_prev = t_start;
             let p_start = ro + rd * t_start;
-            var dist_prev = p_start.y - sample_water_height(p_start.xz);
+            var dist_prev = p_start.y - sample_water_height_march(p_start.xz);
 
             for (var i = 0; i < MAX_STEPS; i++) {
                 let p = ro + rd * t;
-                let h = sample_water_height(p.xz);
+                let h = sample_water_height_march(p.xz);
                 let dist = p.y - h;
 
                 if (dist < HIT_EPS) {
@@ -280,8 +413,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
                 t_prev = t;
                 dist_prev = dist;
-                // Adaptive step size that scales smoothly with distance to reach the horizon
-                t += max(dist * STEP_SCALE, 0.014 + t * 0.008);
+                // True Lipschitz slant step along ray direction rd
+                t += max(dist * inv_slant, 0.032 + t * 0.022);
                 if (t >= t_max) {
                     break;
                 }
@@ -289,7 +422,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
             // Analytic distant plane fallback so water extends seamlessly to the horizon
             if (!water_hit && ro.y > BASE_WATER_Y) {
-                let t_plane = (BASE_WATER_Y - ro.y) / rd.y;
+                let t_plane = (BASE_WATER_Y - ro.y) * inv_rdy;
                 if (t_plane > 0.0 && t_plane < 85.0) {
                     water_hit = true;
                     t_water = t_plane;
@@ -308,24 +441,41 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let NdotV = max(0.0, dot(normal, view_dir));
 
         // Dielectric Fresnel reflection for water (F0 = 0.028)
-        let fresnel_water = 0.028 + 0.972 * pow(1.0 - NdotV, 4.5);
+        let nv1 = 1.0 - NdotV;
+        let nv2 = nv1 * nv1;
+        let fresnel_water = 0.028 + 0.972 * (nv2 * nv2 * sqrt(nv1));
 
         // Sky & Dual Rim Reflections on 3D Wave Slopes
         let ref_dir = reflect(rd, normal);
         let env_reflection = eval_studio_reflection(hit_p, ref_dir, sub_bass);
 
-        // Pinpoint specular glints on steep wave crests
+        // Pinpoint specular glints on steep wave crests (pure squaring chains, 0 pow())
         let l1_dir = normalize(softbox_pos - hit_p);
         let h1 = normalize(l1_dir + view_dir);
         let NdotL1 = max(0.0, dot(normal, l1_dir));
-        let spec1_tight = pow(max(0.0, dot(normal, h1)), 220.0) * 4.5;
-        let spec1_soft = pow(max(0.0, dot(normal, h1)), 26.0) * 0.72;
+        let nh1 = max(0.0, dot(normal, h1));
+        let n2 = nh1 * nh1;
+        let n4 = n2 * n2;
+        let n8 = n4 * n4;
+        let n16 = n8 * n8;
+        let n32 = n16 * n16;
+        let n64 = n32 * n32;
+        let n128 = n64 * n64;
+        let spec1_tight = (n128 * n64 * n16 * n8 * n4) * 4.5;
+        let spec1_soft = (n16 * n8 * n2) * 0.72;
         let water_specular1 = vec3<f32>(1.15, 1.22, 1.35) * (spec1_tight + spec1_soft) * NdotL1;
 
         let l2_dir = normalize(kicker_pos - hit_p);
         let h2 = normalize(l2_dir + view_dir);
         let NdotL2 = max(0.0, dot(normal, l2_dir));
-        let spec2 = pow(max(0.0, dot(normal, h2)), 92.0) * 2.2;
+        let nh2 = max(0.0, dot(normal, h2));
+        let m2 = nh2 * nh2;
+        let m4 = m2 * m2;
+        let m8 = m4 * m4;
+        let m16 = m8 * m8;
+        let m32 = m16 * m16;
+        let m64 = m32 * m32;
+        let spec2 = (m64 * m16 * m8 * m4) * 2.2;
         let water_specular2 = vec3<f32>(0.25, 0.88, 1.45) * spec2 * NdotL2;
 
         // Snell's Law Refraction (IOR 1.0 -> 1.333) & Beer-Lambert Optical Absorption
@@ -335,31 +485,28 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let floor_p = hit_p.xz + refr_dir.xz * min(t_refr_floor, 2.2);
 
         // Rich emerald-sapphire Beer-Lambert depth absorption
-        let absorption_coeff = vec3<f32>(0.38, 0.068, 0.012);
-        let transmission = exp(-absorption_coeff * (t_refr_floor * 2.2));
+        let abs_arg = vec3<f32>(0.38, 0.068, 0.012) * (t_refr_floor * 2.2);
+        let transmission = 1.0 / (vec3<f32>(1.0) + abs_arg + abs_arg * abs_arg * 0.48);
 
         // Wave-slope Jacobian focusing: steeper wave crests concentrate brighter caustic filaments
         let wave_slope = length(normal.xz);
         let jacobian_focus = clamp(1.0 + wave_slope * 3.8, 1.0, 2.8);
-        let caustic_dist_fade = exp(-length(hit_p.xz) * 0.045);
-        let caustics = calculate_caustics(floor_p, time, sub_bass) * jacobian_focus * caustic_dist_fade;
+        let caustic_dist_fade = 1.0 / (1.0 + dot(hit_p.xz, hit_p.xz) * 0.0045);
         let cymatic_grid = eval_cymatic_floor_grid(floor_p, time, sub_bass, mids, highs);
 
-        // Subtle chromatic dispersion on refracted caustics
-        let caustics_r = calculate_caustics(floor_p + normal.xz * 0.025, time, sub_bass);
-        let caustics_b = calculate_caustics(floor_p - normal.xz * 0.025, time, sub_bass);
-        let caustic_rgb = vec3<f32>(
-            caustics_r * 0.18,
-            caustics * 0.68,
-            (caustics * 0.5 + caustics_b * 0.5) * 1.15
-        ) * jacobian_focus * caustic_dist_fade;
+        // Chromatic dispersion on refracted caustics in a single domain-warped pass
+        let caustic_rgb = calculate_caustics_chromatic(floor_p, normal.xz * 0.025, time, sub_bass) * (jacobian_focus * caustic_dist_fade);
 
         let seabed_plate = vec3<f32>(0.010, 0.022, 0.042) + caustic_rgb * 0.28 + cymatic_grid;
 
         // Acoustic Center Core & Expanding Resonator Ring Luminescence
-        let center_dist = length(floor_p);
-        let ring_pulse = exp(-pow(center_dist - 0.85, 2.0) * 6.0) * (0.30 + sub_bass * 0.65);
-        let bass_core = exp(-center_dist * center_dist * 1.8) * (0.25 + sub_bass * 0.60);
+        let center_dist2 = dot(floor_p, floor_p);
+        let center_dist = sqrt(center_dist2);
+        let d_ring = center_dist - 0.85;
+        let dr6 = (d_ring * d_ring) * 6.0;
+        let ring_pulse = (1.0 / (1.0 + dr6 + dr6 * dr6 * 0.48)) * (0.30 + sub_bass * 0.65);
+        let bc_arg = center_dist2 * 1.8;
+        let bass_core = (1.0 / (1.0 + bc_arg + bc_arg * bc_arg * 0.48)) * (0.25 + sub_bass * 0.60);
         let transducer_emission = ring_pulse * vec3<f32>(0.12, 0.82, 1.35) + bass_core * vec3<f32>(0.18, 0.68, 1.25);
 
         // Volumetric subsurface scattering inside elevated wave crests & central acoustic plume

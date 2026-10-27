@@ -263,6 +263,20 @@ impl TouchGestureController {
         }
         None
     }
+
+    /// Clear all in-flight touch state and pending delayed taps (e.g. when launching external picker or suspending)
+    pub fn reset(&mut self) {
+        self.touch_start_pos = None;
+        self.touch_start_time = None;
+        self.current_pos = None;
+        self.is_scrubbing = false;
+        self.last_tap_time = None;
+        self.last_tap_pos = None;
+        self.pending_single_tap = None;
+        self.active_touches.clear();
+        self.max_touch_count = 0;
+        self.multi_finger_start_time = None;
+    }
 }
 
 #[cfg(test)]
