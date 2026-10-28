@@ -103,9 +103,11 @@ rm -f AppDir/AppRun
 cp AppRun.template AppDir/AppRun
 chmod +x AppDir/AppRun
 
-echo "Injecting SoundFont asset and AppStream metadata into AppDir..."
+echo "Injecting SoundFont asset, SteamGrid artwork, and AppStream metadata into AppDir..."
 mkdir -p AppDir/usr/share/rusttracker/assets
 cp assets/soundfont.sf2 AppDir/usr/share/rusttracker/assets/
+mkdir -p AppDir/usr/share/rusttracker/steamgrid
+cp assets/steamgrid/* AppDir/usr/share/rusttracker/steamgrid/
 
 # Align desktop and AppStream metadata filenames to rDNS ID (com.soddentrough.rusttracker)
 # so appstreamcli and appimagetool validate cleanly with zero warnings.

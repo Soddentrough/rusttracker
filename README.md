@@ -64,22 +64,22 @@ RustTracker features a specialized dual-pane interface optimized for mobile and 
 
 | Action | Desktop Key | Gamepad (Xbox / Steam Deck) |
 | :--- | :--- | :--- |
-| **Play / Pause** | `Space` | `A` (`South`) or `Start` |
-| **Seek Backward / Forward** | `Left` / `Right` Arrow (`Shift` ±30s, `Ctrl`/`⌘` ±60s) | `Left Trigger (LT)` / `Right Trigger (RT)` (analog scrub) |
+| **Play / Pause** *(or Open File on Splash)* | `Space` | `A` (`South`) |
+| **Open File Dialog** | `O` | `Y` (`North`) *(or `A` on Splash Screen)* |
+| **Toggle Performance Stats** | `S` | `B` (`East`) *(also closes modals)* |
+| **Toggle Video / Cycle View Mode** | `V` | `X` (`West`) |
+| **Prev / Next Track** *(or ±60s seek)* | `P` / `N` | `L1` / `R1` (`Left / Right Bumper`) |
+| **Seek Backward / Forward** | `Left` / `Right` Arrow (`Shift` ±30s, `Ctrl`/`⌘` ±60s) | `D-Pad Left` / `D-Pad Right` (±10s) or `L2` / `R2` (analog scrub) |
 | **Step Frame Backward / Forward** | `,` / `.` | — |
-| **Prev / Next Track** | `P` / `N` | `D-Pad Left` / `D-Pad Right` |
 | **Prev / Next Visualizer** | `Up` / `Down` Arrow | `D-Pad Up` / `D-Pad Down` |
-| **Visualizer Picker Popup** | `M` | `Y` (`North Button`) |
-| **Toggle Video / Cycle View Mode** | `V` | `Right Bumper (RB)` |
-| **Toggle HUD Visibility** | `Tab` | `B` (`East Button`) |
-| **Resize HUD / Visualizer Split** | `[` / `]` | — |
-| **Select Audio Track (1–9)** | `1` – `9` | `Right Stick Click (R3)` (cycles track) |
-| **Toggle Performance Stats** | `S` | `Select / Back Button` |
-| **Toggle Keyboard / Gamepad Help** | `H` | `Left Bumper (LB)` |
-| **Open File Dialog** | `O` | `X` (`West Button`) |
-| **Toggle GPU Compute FFT** | `G` | `Left Stick Click (L3)` |
-| **Fullscreen Toggle** | `F` | — |
-| **Quit** | `Ctrl+Q` / `⌘Q` or `Escape` | — |
+| **Visualizer Picker Popup** | `M` | — |
+| **Toggle HUD Visibility** | `Tab` | `L2` (`Left Trigger`) |
+| **Toggle GPU Compute FFT** | `G` | `R2` (`Right Trigger`) |
+| **Resize HUD / Visualizer Split** | `[` / `]` | `Left Stick` or `Right Stick` (Up / Down) |
+| **Select Audio Track (1–9)** | `1` – `9` | — |
+| **Toggle Keyboard / Gamepad Help** | `H` | — |
+| **Fullscreen Toggle** | `F` | `Start` |
+| **Quit** | `Ctrl+Q` / `⌘Q` or `Escape` | `Select / View` |
 
 ---
 
@@ -92,6 +92,7 @@ RustTracker features a specialized dual-pane interface optimized for mobile and 
 * **`--uncapped`**: Disable VSync/refresh-rate pacing and run at uncapped hardware frame rates (`Immediate` present mode).
 * **`--bench [frames]`**: Run automated benchmark loop for a given frame count (default `300`) with GPU timestamp profiling enabled.
 * **`--fullscreen` / `--windowed`**: Force fullscreen or windowed startup mode.
+* **`--register-steam`**: Headlessly register or update **RustTracker** in Steam's `shortcuts.vdf`, provision all SteamOS Home Screen & Library artwork (`config/grid/` and `appcache/librarycache/`), restart `steam-launcher.service` if active, and exit (ideal for one-step SSH deployment).
 
 ### Environment Variables
 * **`RUSTTRACKER_FPS_LIMIT=<fps>`**: Set an explicit software framerate cap (e.g. `RUSTTRACKER_FPS_LIMIT=120`). By default, RustTracker paces to the active display refresh rate (or VSync).
@@ -110,7 +111,33 @@ Pre-compiled packages for all platforms are available on the [GitHub Releases](h
 * **macOS (Apple Silicon, macOS 11.0+):** Download and open `RustTracker-MacOS-Installer.dmg`, then drag `RustTracker.app` to `/Applications`. *(If macOS Gatekeeper warns that the app is unverified on first launch, run `xattr -cr /Applications/RustTracker.app` or Right-Click ➔ **Open**).*
 * **Fedora / RHEL:** `sudo dnf install ./rusttracker-*.x86_64.rpm`
 * **Ubuntu / Debian:** `sudo dpkg -i ./rusttracker_*_amd64.deb`
-* **Steam Deck:** Download `RustTracker-SteamDeck-*.AppImage`, mark executable, and add as Non-Steam Game in Steam Gaming Mode.
+* **Steam Deck / SteamOS:** Download `RustTracker-SteamDeck-*.AppImage` and follow the steps below.
+
+### 🕹️ Steam Deck / SteamOS Installation Procedure
+
+You can install RustTracker on a Steam Deck either **remotely over SSH** (without leaving Gaming Mode) or **directly on the device in Desktop Mode**.
+
+#### Option A: Remote Deployment via SSH (No Desktop Mode Required)
+If `sshd` is enabled on your Steam Deck (`passwd` set and `sudo systemctl enable --now sshd`), you can copy the AppImage from your PC and headlessly register it in Steam Gaming Mode with two commands:
+```bash
+# 1. Copy the AppImage to the Steam Deck
+scp RustTracker-SteamDeck-*.AppImage deck@<steamdeck-ip>:~/Downloads/RustTracker-SteamDeck.AppImage
+
+# 2. Mark executable and headlessly register the Non-Steam shortcut + Home Screen artwork
+ssh deck@<steamdeck-ip> "chmod +x ~/Downloads/RustTracker-SteamDeck.AppImage && ~/Downloads/RustTracker-SteamDeck.AppImage --register-steam"
+```
+`--register-steam` automatically stops `steam-launcher.service` cleanly, creates or updates the **`RustTracker`** entry in `~/.local/share/Steam/userdata/*/config/shortcuts.vdf`, installs the 512×512 icon, provisions all Steam Grid & LibraryCache artwork (`config/grid/` and `appcache/librarycache/`), and restarts `steam-launcher.service` so **RustTracker** immediately appears on the SteamOS Home Screen.
+
+#### Option B: On-Device Setup (Desktop Mode)
+1. **Switch to Desktop Mode:** Press the `STEAM` button ➔ **Power** ➔ **Switch to Desktop**.
+2. **Download & Mark Executable:** Download `RustTracker-SteamDeck-*.AppImage` (e.g., into `~/Downloads` or `~/Applications`) and mark it executable:
+   ```bash
+   chmod +x ~/Downloads/RustTracker-SteamDeck-*.AppImage
+   ```
+3. **Register Shortcut & Artwork Automatically (or via Steam UI):**
+   * **Fastest (Terminal / Konsole):** Run `./RustTracker-SteamDeck-*.AppImage --register-steam` to automatically add **`RustTracker`** to Steam with all Home Screen artwork and icons pre-configured.
+   * **Via Steam UI:** Launch the AppImage once (which provisions `~/.local/share/icons/hicolor/512x512/apps/rusttracker.png` and `~/.local/share/applications/com.soddentrough.rusttracker.desktop`), then open **Steam** ➔ **Games** ➔ **Add a Non-Steam Game to My Library...**, select **`RustTracker`**, and click **Add Selected Programs**. *(Even if you add the `.AppImage` file directly via **Browse...**, launching RustTracker automatically normalizes the shortcut's `AppName` to **`RustTracker`** and provisions the bundled Steam Grid & LibraryCache artwork).*
+4. **Return to Gaming Mode:** Switch back to **Gaming Mode**. **RustTracker** will appear on your SteamOS Home Screen and Library with full artwork, native `1280×800` Gamescope scaling, and full gamepad controls.
 
 ---
 
@@ -121,10 +148,13 @@ Pre-compiled packages for all platforms are available on the [GitHub Releases](h
 * GPU Drivers: Vulkan SDK / Drivers (`vulkan-loader`, `mesa-vulkan-drivers`) on Linux/Windows, or Metal on macOS
 * FFmpeg 6.0+ libraries & `libopenmpt`
 
-### Linux (Fedora)
+### Linux (Fedora) & Steam Deck AppImage
 ```bash
 sudo dnf install -y gcc gcc-c++ binutils pkgconfig alsa-lib-devel wayland-devel libX11-devel libxkbcommon-devel systemd-devel ffmpeg-devel libopenmpt-devel clang clang-devel
 cargo build --release
+
+# Optional: Package standalone Steam Deck / Linux AppImage (bundles FFmpeg, libopenmpt, SoundFont, and SteamGrid assets)
+./repackage_appimage.sh
 ```
 
 ### macOS (Homebrew)

@@ -26,14 +26,18 @@ fn gamepad_icon(g_type: crate::state::GamepadType, action: &str) -> String {
             _ => "\u{e996}",
         },
         "L1" => match g_type {
-            crate::state::GamepadType::PlayStation => "\u{e99d}",
             crate::state::GamepadType::Nintendo => "\u{e99c}",
-            _ => "\u{e99f}",
+            _ => "\u{e99d}",
         },
         "R1" => match g_type {
-            crate::state::GamepadType::PlayStation => "\u{e9a4}",
             crate::state::GamepadType::Nintendo => "\u{e9a5}",
-            _ => "\u{e9a2}",
+            _ => "\u{e9a4}",
+        },
+        "L2" => "\u{e99e}",
+        "R2" => "\u{e9a3}",
+        "L1 / R1" => match g_type {
+            crate::state::GamepadType::Nintendo => "\u{e99c} \u{e9a5}",
+            _ => "\u{e99d} \u{e9a4}",
         },
         "Select" => "\u{e9a9}",
         "Start" => "\u{e9a8}",
@@ -6369,7 +6373,12 @@ impl VulkanEngine {
                 || std::env::var("XDG_SESSION_DESKTOP")
                     .unwrap_or_default()
                     .eq_ignore_ascii_case("gamescope")
-                || std::env::var("STEAM_DECK").is_ok(),
+                || std::env::var("STEAM_DECK").is_ok()
+                || std::env::var("SteamDeck").is_ok()
+                || std::env::var("SteamOS").is_ok()
+                || std::fs::read_to_string("/sys/class/dmi/id/sys_vendor")
+                    .map(|v| v.trim().eq_ignore_ascii_case("valve"))
+                    .unwrap_or(false),
             last_ui_rects_data: [[f32::NAN; 4]; 3],
         }
     }
@@ -7821,189 +7830,326 @@ impl VulkanEngine {
                     self.video_state.is_some(),
                     self.smooth_time,
                 );
-                let stats_top_y = if ctx.viewport_rect().width() < ctx.viewport_rect().height()
+                let viewport_rect = ctx.viewport_rect();
+                let stats_top_y = if viewport_rect.width() < viewport_rect.height()
                     || cfg!(target_os = "android")
                 {
                     48.0
+                } else if state.file_loaded && state.show_hud && state.video_mode != 3 {
+                    let total_h = viewport_rect.height();
+                    let min_h = 120.0f32;
+                    let top_h = (total_h * state.panel_split_ratio)
+                        .clamp(min_h, (total_h - min_h).max(min_h));
+                    if total_h - top_h >= 240.0 {
+                        top_h + 10.0
+                    } else {
+                        10.0
+                    }
                 } else {
                     10.0
                 };
+                let max_stats_h = (viewport_rect.height() - stats_top_y - 16.0).max(160.0);
+                let max_stats_w = (viewport_rect.width() - 20.0).clamp(240.0, 440.0);
                 egui::Window::new("Stats")
                     .anchor(egui::Align2::RIGHT_TOP, [-10.0, stats_top_y])
                     .title_bar(false)
                     .resizable(false)
                     .collapsible(false)
-                    .frame(egui::Frame::window(&ctx.global_style()).fill(egui::Color32::from_black_alpha(200)))
+                    .max_width(max_stats_w)
+                    .max_height(max_stats_h)
+                    .frame(
+                        egui::Frame::window(&ctx.global_style())
+                            .fill(egui::Color32::from_black_alpha(210))
+                            .inner_margin(egui::Margin::symmetric(10, 8)),
+                    )
                     .show(ctx, |ui| {
-                        ui.label(
-                            egui::RichText::new(format!("RustTracker v{}", env!("CARGO_PKG_VERSION")))
-                                .color(egui::Color32::WHITE)
-                                .strong()
-                        );
-                        if state.file_loaded {
-                            ui.label(
-                                egui::RichText::new(format!("Visualizer: {}", vis_name))
-                                    .color(egui::Color32::YELLOW)
-                            );
-                        }
-                        ui.separator();
+                        ui.spacing_mut().item_spacing.y = 2.5;
+                        egui::ScrollArea::vertical()
+                            .max_height(max_stats_h - 16.0)
+                            .show(ui, |ui| {
+                                let vsync_on = is_vsync_present_mode(self.config.present_mode);
+                                let vsync_str = format_vsync_status(self.config.present_mode);
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "RustTracker v{}",
+                                            env!("CARGO_PKG_VERSION")
+                                        ))
+                                        .color(egui::Color32::WHITE)
+                                        .strong(),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new("•")
+                                            .color(egui::Color32::from_gray(100)),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(vsync_str)
+                                        .color(if vsync_on {
+                                            egui::Color32::GREEN
+                                        } else {
+                                            egui::Color32::YELLOW
+                                        })
+                                        .strong(),
+                                    );
+                                });
+                                if state.file_loaded {
+                                    ui.label(
+                                        egui::RichText::new(format!("Visualizer: {}", vis_name))
+                                            .color(egui::Color32::YELLOW),
+                                    );
+                                }
+                                ui.separator();
 
-                        if state.stats.bitstream_active {
-                            ui.label(
-                                egui::RichText::new("Bitstream Passthrough: ACTIVE")
-                                    .color(egui::Color32::from_rgb(0, 255, 128))
-                                    .strong()
-                            );
-                            if let Some(info) = &state.video_info {
+                                if state.stats.bitstream_active {
+                                    ui.label(
+                                        egui::RichText::new("Bitstream Passthrough: ACTIVE")
+                                            .color(egui::Color32::from_rgb(0, 255, 128))
+                                            .strong(),
+                                    );
+                                    if let Some(info) = &state.video_info {
+                                        ui.label(
+                                            egui::RichText::new(format!("Format: {}", info))
+                                                .color(egui::Color32::LIGHT_GREEN),
+                                        );
+                                    }
+                                    ui.separator();
+                                } else if state.passthrough_enabled
+                                    && cfg!(any(target_os = "windows", target_os = "linux"))
+                                {
+                                    ui.label(
+                                        egui::RichText::new("Bitstream Passthrough: Inactive")
+                                            .color(egui::Color32::GRAY),
+                                    );
+                                    ui.separator();
+                                }
+
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(&self.stats_cache.fps_line)
+                                            .color(egui::Color32::GREEN)
+                                            .strong(),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new("•")
+                                            .color(egui::Color32::from_gray(100)),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(&self.stats_cache.cpu_active_line)
+                                            .color(egui::Color32::WHITE),
+                                    );
+                                });
+
+                                if state.file_loaded {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(&self.stats_cache.cpu_fft_line)
+                                                .color(egui::Color32::WHITE),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new("•")
+                                                .color(egui::Color32::from_gray(100)),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(&self.stats_cache.cpu_decode_line)
+                                                .color(egui::Color32::WHITE),
+                                        );
+                                    });
+                                    if self.stats_cache.gpu_compute_line.is_some()
+                                        || self.stats_cache.vis_shader_line.is_some()
+                                    {
+                                        ui.horizontal_wrapped(|ui| {
+                                            if let Some(ref gpu_comp) =
+                                                self.stats_cache.gpu_compute_line
+                                            {
+                                                ui.label(
+                                                    egui::RichText::new(gpu_comp)
+                                                        .color(egui::Color32::LIGHT_BLUE),
+                                                );
+                                            }
+                                            if let Some(ref vis_line) =
+                                                self.stats_cache.vis_shader_line
+                                            {
+                                                ui.label(
+                                                    egui::RichText::new(vis_line)
+                                                        .color(egui::Color32::LIGHT_BLUE),
+                                                );
+                                            }
+                                        });
+                                    }
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                &self.stats_cache.audio_buffer_line,
+                                            )
+                                            .color(self.stats_cache.audio_buffer_color),
+                                        );
+                                        if let Some((ref vbuf_line, vbuf_col)) =
+                                            self.stats_cache.video_buffer_line
+                                        {
+                                            ui.label(
+                                                egui::RichText::new("•")
+                                                    .color(egui::Color32::from_gray(100)),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(vbuf_line).color(vbuf_col),
+                                            );
+                                        }
+                                    });
+                                }
+                                ui.separator();
                                 ui.label(
-                                    egui::RichText::new(format!("Format: {}", info))
-                                        .color(egui::Color32::LIGHT_GREEN)
+                                    egui::RichText::new("⏱ Frame Phase Breakdown:")
+                                        .color(egui::Color32::from_rgb(180, 180, 255))
+                                        .strong()
+                                        .size(12.0),
                                 );
-                            }
-                            ui.separator();
-                        } else if state.passthrough_enabled
-                            && cfg!(any(target_os = "windows", target_os = "linux"))
-                        {
-                            ui.label(
-                                egui::RichText::new("Bitstream Passthrough: Inactive")
-                                    .color(egui::Color32::GRAY)
-                            );
-                            ui.separator();
-                        }
-                        ui.label(
-                            egui::RichText::new(&self.stats_cache.fps_line)
-                                .color(egui::Color32::GREEN)
-                                .strong(),
-                        );
-                        let vsync_on = is_vsync_present_mode(self.config.present_mode);
-                        ui.label(
-                            egui::RichText::new(format_vsync_status(self.config.present_mode))
-                                .color(if vsync_on {
-                                    egui::Color32::GREEN
-                                } else {
-                                    egui::Color32::YELLOW
-                                })
-                                .strong(),
-                        );
-                        ui.label(
-                            egui::RichText::new(&self.stats_cache.cpu_active_line)
-                                .color(egui::Color32::WHITE)
-                        );
-                        if state.file_loaded {
-                            ui.label(
-                                egui::RichText::new(&self.stats_cache.cpu_fft_line)
-                                    .color(egui::Color32::WHITE)
-                            );
-                            if let Some(ref gpu_comp) = self.stats_cache.gpu_compute_line {
+                                egui::Grid::new("stats_phases_grid")
+                                    .num_columns(2)
+                                    .spacing([12.0, 2.0])
+                                    .show(ui, |ui| {
+                                        for (idx, (phase_text, color)) in
+                                            self.stats_cache.phase_lines.iter().enumerate()
+                                        {
+                                            ui.label(
+                                                egui::RichText::new(phase_text.trim_start())
+                                                    .color(*color)
+                                                    .size(11.5),
+                                            );
+                                            if idx % 2 == 1 {
+                                                ui.end_row();
+                                            }
+                                        }
+                                        if self.stats_cache.phase_lines.len() % 2 == 1 {
+                                            ui.end_row();
+                                        }
+                                    });
                                 ui.label(
-                                    egui::RichText::new(gpu_comp)
-                                        .color(egui::Color32::LIGHT_BLUE)
+                                    egui::RichText::new(&self.stats_cache.total_phases_line)
+                                        .color(egui::Color32::from_rgb(180, 180, 255))
+                                        .size(12.0),
                                 );
-                            }
-                            ui.label(
-                                egui::RichText::new(&self.stats_cache.cpu_decode_line)
-                                    .color(egui::Color32::WHITE)
-                            );
-                            if let Some(ref vis_line) = self.stats_cache.vis_shader_line {
-                                ui.label(
-                                    egui::RichText::new(vis_line)
-                                        .color(egui::Color32::LIGHT_BLUE)
-                                );
-                            }
-                            ui.label(
-                                egui::RichText::new(&self.stats_cache.audio_buffer_line)
-                                    .color(self.stats_cache.audio_buffer_color)
-                            );
-                            if let Some((ref vbuf_line, vbuf_col)) = self.stats_cache.video_buffer_line {
-                                ui.label(
-                                    egui::RichText::new(vbuf_line)
-                                        .color(vbuf_col)
-                                );
-                            }
-                        }
-                        ui.separator();
-                        ui.label(
-                            egui::RichText::new("⏱ Frame Phase Breakdown:")
-                                .color(egui::Color32::from_rgb(180, 180, 255))
-                                .strong()
-                        );
-                        for (phase_text, color) in &self.stats_cache.phase_lines {
-                            ui.label(
-                                egui::RichText::new(phase_text)
-                                    .color(*color)
-                            );
-                        }
-                        ui.label(
-                            egui::RichText::new(&self.stats_cache.total_phases_line)
-                                .color(egui::Color32::from_rgb(180, 180, 255))
-                        );
-                        if state.file_loaded {
-                            ui.label(
-                                egui::RichText::new(format!("Hardware Channels: {} | Source: {}", state.hardware_channels, state.num_channels))
-                                    .color(if state.hardware_channels != state.num_channels { egui::Color32::YELLOW } else { egui::Color32::GRAY })
-                            );
-                            if video_info_str.is_none()
-                                && let Some(abr) = state.stats.audio_bitrate_kbps.or(state.bitrate)
-                            {
-                                let abr_str = if abr >= 1000 {
-                                    format!("Audio Bitrate: {} kbps ({:.2} Mbps)", abr, abr as f32 / 1000.0)
-                                } else {
-                                    format!("Audio Bitrate: {} kbps", abr)
-                                };
-                                ui.label(
-                                    egui::RichText::new(abr_str)
-                                        .color(egui::Color32::LIGHT_GREEN)
-                                );
-                            }
-                            ui.label(
-                                egui::RichText::new(format!("Clipping Events: {}", state.stats.clipping_events))
-                                    .color(if state.stats.clipping_events > 0 { egui::Color32::RED } else { egui::Color32::GRAY })
-                            );
-                        }
-                        if let Some(vi) = &video_info_str {
-                            ui.separator();
-                            ui.label(
-                                egui::RichText::new("Video Stream:")
-                                    .color(egui::Color32::GRAY)
-                            );
-                            ui.label(
-                                egui::RichText::new(vi)
-                                    .color(egui::Color32::YELLOW)
-                            );
-                            if state.stats.video_fps > 0.0 {
-                                let fps_str = if (state.stats.video_fps - state.stats.video_fps.round()).abs() < 0.05 {
-                                    format!("Video Frame Rate: {:.0} fps", state.stats.video_fps.round())
-                                } else {
-                                    format!("Video Frame Rate: {:.2} fps", state.stats.video_fps)
-                                };
-                                ui.label(
-                                    egui::RichText::new(fps_str)
-                                        .color(egui::Color32::LIGHT_GREEN)
-                                );
-                            }
-                            if let Some(vbr) = state.stats.video_bitrate_kbps {
-                                let vbr_str = if vbr >= 1000 {
-                                    format!("Video Bitrate: {} kbps ({:.2} Mbps)", vbr, vbr as f32 / 1000.0)
-                                } else {
-                                    format!("Video Bitrate: {} kbps", vbr)
-                                };
-                                ui.label(
-                                    egui::RichText::new(vbr_str)
-                                        .color(egui::Color32::LIGHT_GREEN)
-                                );
-                            }
-                            if let Some(abr) = state.stats.audio_bitrate_kbps.or(state.bitrate) {
-                                let abr_str = if abr >= 1000 {
-                                    format!("Audio Bitrate: {} kbps ({:.2} Mbps)", abr, abr as f32 / 1000.0)
-                                } else {
-                                    format!("Audio Bitrate: {} kbps", abr)
-                                };
-                                ui.label(
-                                    egui::RichText::new(abr_str)
-                                        .color(egui::Color32::LIGHT_GREEN)
-                                );
-                            }
-                        }
+                                if state.file_loaded {
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "Channels: {} hw / {} src",
+                                                state.hardware_channels, state.num_channels
+                                            ))
+                                            .color(
+                                                if state.hardware_channels != state.num_channels {
+                                                    egui::Color32::YELLOW
+                                                } else {
+                                                    egui::Color32::GRAY
+                                                },
+                                            )
+                                            .size(12.0),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new("•")
+                                                .color(egui::Color32::from_gray(100)),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "Clips: {}",
+                                                state.stats.clipping_events
+                                            ))
+                                            .color(if state.stats.clipping_events > 0 {
+                                                egui::Color32::RED
+                                            } else {
+                                                egui::Color32::GRAY
+                                            })
+                                            .size(12.0),
+                                        );
+                                    });
+                                    if video_info_str.is_none()
+                                        && let Some(abr) =
+                                            state.stats.audio_bitrate_kbps.or(state.bitrate)
+                                    {
+                                        let abr_str = if abr >= 1000 {
+                                            format!(
+                                                "Audio Bitrate: {} kbps ({:.2} Mbps)",
+                                                abr,
+                                                abr as f32 / 1000.0
+                                            )
+                                        } else {
+                                            format!("Audio Bitrate: {} kbps", abr)
+                                        };
+                                        ui.label(
+                                            egui::RichText::new(abr_str)
+                                                .color(egui::Color32::LIGHT_GREEN)
+                                                .size(12.0),
+                                        );
+                                    }
+                                }
+                                if let Some(vi) = &video_info_str {
+                                    ui.separator();
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(
+                                            egui::RichText::new("Video:")
+                                                .color(egui::Color32::GRAY)
+                                                .size(12.0),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(vi)
+                                                .color(egui::Color32::YELLOW)
+                                                .size(12.0),
+                                        );
+                                    });
+                                    ui.horizontal_wrapped(|ui| {
+                                        if state.stats.video_fps > 0.0 {
+                                            let fps_str = if (state.stats.video_fps
+                                                - state.stats.video_fps.round())
+                                            .abs()
+                                                < 0.05
+                                            {
+                                                format!(
+                                                    "FPS: {:.0}",
+                                                    state.stats.video_fps.round()
+                                                )
+                                            } else {
+                                                format!("FPS: {:.2}", state.stats.video_fps)
+                                            };
+                                            ui.label(
+                                                egui::RichText::new(fps_str)
+                                                    .color(egui::Color32::LIGHT_GREEN)
+                                                    .size(12.0),
+                                            );
+                                        }
+                                        if let Some(vbr) = state.stats.video_bitrate_kbps {
+                                            let vbr_str = if vbr >= 1000 {
+                                                format!(
+                                                    "• Video: {:.2} Mbps",
+                                                    vbr as f32 / 1000.0
+                                                )
+                                            } else {
+                                                format!("• Video: {} kbps", vbr)
+                                            };
+                                            ui.label(
+                                                egui::RichText::new(vbr_str)
+                                                    .color(egui::Color32::LIGHT_GREEN)
+                                                    .size(12.0),
+                                            );
+                                        }
+                                        if let Some(abr) =
+                                            state.stats.audio_bitrate_kbps.or(state.bitrate)
+                                        {
+                                            let abr_str = if abr >= 1000 {
+                                                format!(
+                                                    "• Audio: {:.2} Mbps",
+                                                    abr as f32 / 1000.0
+                                                )
+                                            } else {
+                                                format!("• Audio: {} kbps", abr)
+                                            };
+                                            ui.label(
+                                                egui::RichText::new(abr_str)
+                                                    .color(egui::Color32::LIGHT_GREEN)
+                                                    .size(12.0),
+                                            );
+                                        }
+                                    });
+                                }
+                            });
                     });
             }
 
@@ -8041,15 +8187,16 @@ impl VulkanEngine {
                                 shortcut(ui, "v", Some("X"), "Toggle Video");
                                 shortcut(ui, "m", None, "Visualizer Modules");
                                 shortcut(ui, "left/right", Some("D-Pad L/R"), "Seek Timeline");
-                                shortcut(ui, "tab", Some("L1"), "Toggle HUD");
+                                shortcut(ui, "tab", Some("L2"), "Toggle HUD");
                                 shortcut(ui, "up/down", Some("D-Pad U/D"), "Cycle Visualizer");
                                 shortcut(ui, "s", Some("B"), "Toggle Stats");
                                 shortcut(ui, "h", None, "Toggle Help");
                                 shortcut(ui, "q / esc", Some("Select"), "Quit");
                                 shortcut(ui, "f", Some("Start"), "Toggle Fullscreen");
-                                shortcut(ui, "g", Some("R1"), "Toggle GPU FFT");
+                                shortcut(ui, "g", Some("R2"), "Toggle GPU FFT");
+                                shortcut(ui, "n / p", Some("L1 / R1"), "Prev / Next Track");
                                 shortcut(ui, "1-9", None, "Select Audio Track");
-                                shortcut(ui, "[ / ]", None, "Scale Panels");
+                                shortcut(ui, "[ / ]", Some("L/R Stick"), "Scale Panels");
                                 if state.visualizer_mode == 20 {
                                     shortcut(ui, "c", None, "Toggle Camera Mode");
                                 }
@@ -8103,6 +8250,8 @@ impl VulkanEngine {
                         ui.add_space(2.0);
                         let hint_str = if cfg!(target_os = "android") || is_narrow_modal {
                             "Tap row to select  •  Tap ✅ to toggle rotation  •  ✕ to close"
+                        } else if state.has_gamepad {
+                            "A / Enter to select  •  X / Space to toggle rotation  •  B / Esc to close"
                         } else {
                             "Enter to select  •  Space to toggle rotation  •  Esc to close"
                         };
@@ -8274,23 +8423,14 @@ impl VulkanEngine {
                 } else if show_kb && show_gp {
                     168.0
                 } else if show_kb || show_gp {
-                    136.0
+                    144.0
                 } else {
                     0.0
                 };
 
                 if show_kb || show_gp || show_touch {
-                    egui::Panel::bottom("splash_bottom")
-                        .frame(
-                            egui::Frame::NONE
-                                .fill(egui::Color32::TRANSPARENT)
-                                .inner_margin(if is_mobile { 8.0 } else { 24.0 }),
-                        )
-                        .show_inside(ctx, |ui| {
-                            ui.add_space(bottom_reserved_h);
-                        });
-
                     egui::Area::new(egui::Id::new("splash_shortcuts_area"))
+                        .order(egui::Order::Foreground)
                         .anchor(
                             egui::Align2::CENTER_BOTTOM,
                             egui::vec2(0.0, if is_mobile { -10.0 } else { -24.0 }),
@@ -8354,8 +8494,11 @@ impl VulkanEngine {
                                         });
                                     } else {
                                         ui.horizontal_centered(|ui| {
-                                            let pairs_per_row =
-                                                if show_kb && show_gp { 2 } else { 4 };
+                                            let pairs_per_row = if show_kb && show_gp {
+                                                if rect.width() >= 1100.0 { 3 } else { 2 }
+                                            } else {
+                                                4
+                                            };
 
                                             if show_kb {
                                                 ui.vertical(|ui| {
@@ -8372,23 +8515,26 @@ impl VulkanEngine {
                                                     ui.add_space(6.0);
 
                                                     egui::Grid::new("kb_shortcuts")
-                                                        .num_columns(pairs_per_row * 2)
-                                                        .spacing([20.0, 6.0])
+                                                        .num_columns(pairs_per_row)
+                                                        .spacing([28.0, 6.0])
                                                         .show(ui, |ui| {
                                                             let mut col = 0;
                                                             let mut kb_shortcut =
                                                                 |key: &str, desc: &str| {
-                                                                    ui.label(
-                                                                        egui::RichText::new(key)
-                                                                            .color(egui::Color32::from_rgb(0, 220, 255))
-                                                                            .strong()
-                                                                            .size(12.5),
-                                                                    );
-                                                                    ui.label(
-                                                                        egui::RichText::new(desc)
-                                                                            .color(egui::Color32::LIGHT_GRAY)
-                                                                            .size(12.5),
-                                                                    );
+                                                                    ui.horizontal(|ui| {
+                                                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                                                        ui.label(
+                                                                            egui::RichText::new(key)
+                                                                                .color(egui::Color32::from_rgb(0, 220, 255))
+                                                                                .strong()
+                                                                                .size(12.5),
+                                                                        );
+                                                                        ui.label(
+                                                                            egui::RichText::new(desc)
+                                                                                .color(egui::Color32::LIGHT_GRAY)
+                                                                                .size(12.5),
+                                                                        );
+                                                                    });
                                                                     col += 1;
                                                                     if col == pairs_per_row {
                                                                         ui.end_row();
@@ -8455,32 +8601,35 @@ impl VulkanEngine {
                                                     );
                                                     ui.add_space(6.0);
                                                     egui::Grid::new("gp_shortcuts_wide")
-                                                        .num_columns(pairs_per_row * 2)
-                                                        .spacing([20.0, 6.0])
+                                                        .num_columns(pairs_per_row)
+                                                        .spacing([28.0, 6.0])
                                                         .show(ui, |ui| {
                                                             let mut col = 0;
                                                             let mut gp_shortcut =
                                                                 |gp: &str, desc: &str| {
-                                                                    ui.label(
-                                                                        egui::RichText::new(
-                                                                            gamepad_icon(
-                                                                                state.gamepad_type,
-                                                                                gp,
-                                                                            ),
-                                                                        )
-                                                                        .color(
-                                                                            egui::Color32::LIGHT_BLUE,
-                                                                        )
-                                                                        .strong()
-                                                                        .size(13.0),
-                                                                    );
-                                                                    ui.label(
-                                                                        egui::RichText::new(desc)
-                                                                            .color(
-                                                                                egui::Color32::LIGHT_GRAY,
+                                                                    ui.horizontal(|ui| {
+                                                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                                                        ui.label(
+                                                                            egui::RichText::new(
+                                                                                gamepad_icon(
+                                                                                    state.gamepad_type,
+                                                                                    gp,
+                                                                                ),
                                                                             )
-                                                                            .size(12.5),
-                                                                    );
+                                                                            .color(
+                                                                                egui::Color32::LIGHT_BLUE,
+                                                                            )
+                                                                            .strong()
+                                                                            .size(13.0),
+                                                                        );
+                                                                        ui.label(
+                                                                            egui::RichText::new(desc)
+                                                                                .color(
+                                                                                    egui::Color32::LIGHT_GRAY,
+                                                                                )
+                                                                                .size(12.5),
+                                                                        );
+                                                                    });
                                                                     col += 1;
                                                                     if col == pairs_per_row {
                                                                         ui.end_row();
@@ -8570,11 +8719,11 @@ impl VulkanEngine {
                                 // leaving the sliced synthwave sun and mountain peaks unobstructed in the sky above.
                                 let is_narrow = real_avail_width < 600.0;
                                 let after_subtitle_y = ui.cursor().min.y;
-                                let est_card_h = if is_narrow { 225.0 } else { 180.0 };
-                                let max_card_top_y = (rect.bottom() - bottom_reserved_h - est_card_h - 20.0)
+                                let est_card_h = if is_narrow { 255.0 } else { 222.0 };
+                                let max_card_top_y = (rect.bottom() - bottom_reserved_h - est_card_h - 18.0)
                                     .max(after_subtitle_y + 10.0);
                                 let target_card_top_y =
-                                    (self.splash_cache.horizon_y + 10.0).min(max_card_top_y);
+                                    (self.splash_cache.horizon_y + 8.0).min(max_card_top_y);
                                 let scenic_gap =
                                     (target_card_top_y - after_subtitle_y).max(10.0);
                                 ui.add_space(scenic_gap);
@@ -8692,8 +8841,18 @@ impl VulkanEngine {
                                             ))
                                             .corner_radius(8.0);
 
+                                            let no_modal_open = !state.is_file_picker_open
+                                                && !state.is_url_dialog_open
+                                                && !state.show_vis_picker;
+
                                             if is_narrow {
                                                 let resp1 = ui.add_sized([btn_w, btn_h], btn);
+                                                if state.has_gamepad
+                                                    && no_modal_open
+                                                    && ui.ctx().memory(|m| m.focused().is_none())
+                                                {
+                                                    resp1.request_focus();
+                                                }
                                                 if resp1.clicked() {
                                                     engine_action = EngineAction::OpenFile;
                                                 }
@@ -8710,6 +8869,12 @@ impl VulkanEngine {
                                                         .max(0.0);
                                                     ui.add_space(pad);
                                                     let resp1 = ui.add_sized([btn_w, btn_h], btn);
+                                                    if state.has_gamepad
+                                                        && no_modal_open
+                                                        && ui.ctx().memory(|m| m.focused().is_none())
+                                                    {
+                                                        resp1.request_focus();
+                                                    }
                                                     if resp1.clicked() {
                                                         engine_action = EngineAction::OpenFile;
                                                     }
@@ -8897,7 +9062,7 @@ impl VulkanEngine {
             let is_portrait = ctx.viewport_rect().width() < ctx.viewport_rect().height();
             if state.show_hud && state.video_mode != 3 {
                 let total_h = ctx.viewport_rect().height();
-                let min_h = 220.0f32;
+                let min_h = 120.0f32;
                 let top_h = (total_h * state.panel_split_ratio).clamp(min_h, (total_h - min_h).max(min_h));
                 let top_margin = if is_portrait {
                     54
@@ -9222,8 +9387,8 @@ impl VulkanEngine {
                                     let num_rows_to_draw = (hm_rect.height() / row_height) as i32;
 
                                     let font_id = egui::FontId::monospace(12.0);
-                                    let char_width = 7.0; // Approx monospace char width at 12pt
-                                    let max_chars = ((hm_rect.width() - 20.0) / char_width).max(10.0) as usize;
+                                    let char_width = 7.5; // Monospace char width at 12pt with safety margin
+                                    let max_chars = ((hm_rect.width() - 24.0) / char_width).max(10.0) as usize;
                                     let max_text_chars = max_chars.saturating_sub(4);
 
                                     let mut formatted = String::with_capacity(max_text_chars + 16);
@@ -9318,7 +9483,10 @@ impl VulkanEngine {
                                                         egui::Color32::WHITE,
                                                     );
 
-                                                    let rect = egui::Rect::from_center_size(pos, galley.size());
+                                                    let rect = egui::Rect::from_min_size(
+                                                        pos + egui::vec2(0.0, -galley.size().y / 2.0),
+                                                        galley.size(),
+                                                    );
                                                     painter.galley(rect.min, galley, color);
                                                 }
 
@@ -9462,8 +9630,11 @@ impl VulkanEngine {
                                         }
                                     };
 
+                                    let avail_info_h = col.available_height().max(32.0);
                                     egui::ScrollArea::vertical()
                                         .auto_shrink([false, false])
+                                        .max_height(avail_info_h)
+                                        .min_scrolled_height(32.0)
                                         .show(col, |ui| {
                                             egui::Grid::new("track_info_meta_grid")
                                                 .num_columns(2)
@@ -10038,7 +10209,7 @@ impl VulkanEngine {
                     }
                     if response.dragged()
                         && let Some(mouse_pos) = response.interact_pointer_pos() {
-                        let min_h = 220.0f32;
+                        let min_h = 120.0f32;
                         let min_r = min_h / total_height;
                         let max_r = (total_height - min_h) / total_height;
                         let new_ratio = mouse_pos.y / total_height;

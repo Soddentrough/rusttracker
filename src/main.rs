@@ -73,6 +73,13 @@ struct Args {
         help = "Enable hardware bitstream passthrough (WASAPI Exclusive / PipeWire) for compressed surround formats"
     )]
     passthrough: bool,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Headlessly register RustTracker as a Non-Steam shortcut with SteamOS Home Screen artwork and exit (ideal for SSH deployment)"
+    )]
+    register_steam: bool,
 }
 
 struct Tui {
@@ -161,6 +168,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                 v.id, short_name, v.name, v.description
             );
         }
+        return Ok(());
+    }
+
+    if args.register_steam {
+        register_steam_shortcut_cli()?;
         return Ok(());
     }
 
@@ -458,6 +470,16 @@ fn clamp_window_geometry_to_monitor(
     let mon_logical_w = mon_phys_w as f64 / scale;
     let mon_logical_h = mon_phys_h as f64 / scale;
 
+    // On Steam Deck / Gamescope (1280x800 monitor with 1280x800 desired geometry),
+    // occupy the full 1280x800 display rather than subtracting desktop window frame/taskbar margins.
+    if (mon_logical_w - desired_logical_w).abs() < 1.0
+        && (mon_logical_h - desired_logical_h).abs() < 1.0
+        && desired_logical_w == 1280.0
+        && desired_logical_h == 800.0
+    {
+        return ((1280.0, 800.0), (1024.0, 600.0), (mon_pos_x, mon_pos_y));
+    }
+
     // Reserve logical margin for window decorations (borders + titlebar) and OS taskbar/dock
     let max_inner_w = (mon_logical_w - 48.0).min(mon_logical_w * 0.94).max(320.0);
     let max_inner_h = (mon_logical_h - 96.0).min(mon_logical_h * 0.88).max(240.0);
@@ -477,6 +499,713 @@ fn clamp_window_geometry_to_monitor(
     let pos_y = mon_pos_y + ((usable_phys_h - est_outer_h).max(0) / 2);
 
     ((target_w, target_h), (min_w, min_h), (pos_x, pos_y))
+}
+
+pub(crate) const MIN_PANEL_SPLIT_RATIO: f32 = 0.15;
+pub(crate) const MAX_PANEL_SPLIT_RATIO: f32 = 0.85;
+pub(crate) const MIN_PANEL_HEIGHT_PX: f32 = 120.0;
+
+pub(crate) fn clamp_panel_split_ratio(ratio: f32, total_h: f32) -> f32 {
+    let clamped = ratio.clamp(MIN_PANEL_SPLIT_RATIO, MAX_PANEL_SPLIT_RATIO);
+    if total_h > 0.0 {
+        let min_r = (MIN_PANEL_HEIGHT_PX / total_h).clamp(0.0, 1.0);
+        let max_r = ((total_h - MIN_PANEL_HEIGHT_PX) / total_h).clamp(0.0, 1.0);
+        clamped.clamp(min_r.min(max_r), min_r.max(max_r))
+    } else {
+        clamped
+    }
+}
+
+pub(crate) fn apply_gamepad_stick_panel_resize(
+    state: &mut AppState,
+    left_stick_y: f32,
+    right_stick_y: f32,
+    dt: f32,
+) -> bool {
+    if state.show_vis_picker || state.is_file_picker_open || state.is_url_dialog_open {
+        return false;
+    }
+    let stick_y = if left_stick_y.abs() >= right_stick_y.abs() {
+        left_stick_y
+    } else {
+        right_stick_y
+    };
+    if stick_y.abs() > 0.1 {
+        let scaled_delta = stick_y * dt * 1.0; // Subtract moving UP (positive Y stick)
+        state.panel_split_ratio = (state.panel_split_ratio - scaled_delta)
+            .clamp(MIN_PANEL_SPLIT_RATIO, MAX_PANEL_SPLIT_RATIO);
+        if state.file_loaded {
+            if !state.show_hud {
+                state.show_hud = true;
+            }
+            if state.video_mode == 3 {
+                state.video_mode = 0;
+            }
+        }
+        true
+    } else {
+        false
+    }
+}
+
+/// Parses a binary Steam `shortcuts.vdf` buffer and returns all unsigned 32-bit `appid`s
+/// for shortcut entries whose `AppName` or `Exe` references `rusttracker` (case-insensitive).
+pub(crate) fn extract_rusttracker_shortcut_appids(vdf_bytes: &[u8]) -> Vec<u32> {
+    let mut appids = Vec::new();
+    let mut i = 0usize;
+    let mut depth = 0usize;
+    let mut current_appid: Option<u32> = None;
+    let mut is_rusttracker = false;
+
+    let read_cstr = |buf: &[u8], pos: &mut usize| -> Option<String> {
+        let start = *pos;
+        let rel_end = buf.get(start..)?.iter().position(|&b| b == 0)?;
+        *pos = start + rel_end + 1;
+        Some(String::from_utf8_lossy(&buf[start..start + rel_end]).into_owned())
+    };
+
+    while i < vdf_bytes.len() {
+        let tag = vdf_bytes[i];
+        i += 1;
+        match tag {
+            0x00 => {
+                // Start of nested object
+                if read_cstr(vdf_bytes, &mut i).is_none() {
+                    break;
+                }
+                depth += 1;
+                if depth == 2 {
+                    current_appid = None;
+                    is_rusttracker = false;
+                }
+            }
+            0x01 => {
+                // String property
+                let Some(key) = read_cstr(vdf_bytes, &mut i) else {
+                    break;
+                };
+                let Some(val) = read_cstr(vdf_bytes, &mut i) else {
+                    break;
+                };
+                if depth == 2
+                    && (key.eq_ignore_ascii_case("AppName") || key.eq_ignore_ascii_case("Exe"))
+                    && val.to_ascii_lowercase().contains("rusttracker")
+                {
+                    is_rusttracker = true;
+                }
+            }
+            0x02 => {
+                // 32-bit integer property
+                let Some(key) = read_cstr(vdf_bytes, &mut i) else {
+                    break;
+                };
+                let Some(raw) = vdf_bytes.get(i..i + 4) else {
+                    break;
+                };
+                i += 4;
+                if depth == 2 && key.eq_ignore_ascii_case("appid") {
+                    current_appid = Some(u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]));
+                }
+            }
+            0x08 => {
+                // End of nested object
+                if depth == 2 {
+                    if is_rusttracker
+                        && let Some(id) = current_appid
+                        && !appids.contains(&id)
+                    {
+                        appids.push(id);
+                    }
+                    current_appid = None;
+                    is_rusttracker = false;
+                }
+                depth = depth.saturating_sub(1);
+            }
+            _ => break,
+        }
+    }
+    appids
+}
+
+/// Normalizes any RustTracker shortcut entry in a binary `shortcuts.vdf` buffer so that
+/// filename-based `AppName` values (e.g. `"RustTracker-SteamDeck-GamePad.AppImage"`) become
+/// `"RustTracker"` and an empty `icon` field is populated with `default_icon_path`.
+pub(crate) fn normalize_rusttracker_shortcuts_vdf(
+    vdf_bytes: &[u8],
+    default_icon_path: Option<&str>,
+) -> Option<Vec<u8>> {
+    let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+    let mut i = 0usize;
+    let mut depth = 0usize;
+    let mut is_rusttracker = false;
+    let mut app_name_span: Option<(usize, usize, String)> = None;
+    let mut icon_span: Option<(usize, usize, String)> = None;
+
+    let read_cstr_span = |buf: &[u8], pos: &mut usize| -> Option<(usize, usize, String)> {
+        let start = *pos;
+        let rel_end = buf.get(start..)?.iter().position(|&b| b == 0)?;
+        let end = start + rel_end;
+        *pos = end + 1;
+        Some((
+            start,
+            end,
+            String::from_utf8_lossy(&buf[start..end]).into_owned(),
+        ))
+    };
+
+    while i < vdf_bytes.len() {
+        let tag = vdf_bytes[i];
+        i += 1;
+        match tag {
+            0x00 => {
+                if read_cstr_span(vdf_bytes, &mut i).is_none() {
+                    break;
+                }
+                depth += 1;
+                if depth == 2 {
+                    is_rusttracker = false;
+                    app_name_span = None;
+                    icon_span = None;
+                }
+            }
+            0x01 => {
+                let Some((_, _, key)) = read_cstr_span(vdf_bytes, &mut i) else {
+                    break;
+                };
+                let Some((val_start, val_end, val)) = read_cstr_span(vdf_bytes, &mut i) else {
+                    break;
+                };
+                if depth == 2 {
+                    if (key.eq_ignore_ascii_case("AppName") || key.eq_ignore_ascii_case("Exe"))
+                        && val.to_ascii_lowercase().contains("rusttracker")
+                    {
+                        is_rusttracker = true;
+                    }
+                    if key.eq_ignore_ascii_case("AppName") {
+                        app_name_span = Some((val_start, val_end, val));
+                    } else if key.eq_ignore_ascii_case("icon") {
+                        icon_span = Some((val_start, val_end, val));
+                    }
+                }
+            }
+            0x02 => {
+                if read_cstr_span(vdf_bytes, &mut i).is_none() {
+                    break;
+                };
+                if vdf_bytes.get(i..i + 4).is_none() {
+                    break;
+                }
+                i += 4;
+            }
+            0x08 => {
+                if depth == 2 {
+                    if is_rusttracker {
+                        if let Some((start, end, name)) = app_name_span.take() {
+                            let lower = name.to_ascii_lowercase();
+                            if name != "RustTracker"
+                                && (lower.ends_with(".appimage")
+                                    || lower.starts_with("rusttracker-")
+                                    || lower.starts_with("rusttracker_")
+                                    || lower == "rusttracker")
+                            {
+                                replacements.push((start, end, "RustTracker".to_string()));
+                            }
+                        }
+                        if let Some((start, end, icon)) = icon_span.take()
+                            && icon.is_empty()
+                            && let Some(icon_path) = default_icon_path
+                            && !icon_path.is_empty()
+                        {
+                            replacements.push((start, end, icon_path.to_string()));
+                        }
+                    }
+                    is_rusttracker = false;
+                    app_name_span = None;
+                    icon_span = None;
+                }
+                depth = depth.saturating_sub(1);
+            }
+            _ => break,
+        }
+    }
+
+    if replacements.is_empty() {
+        return None;
+    }
+
+    replacements.sort_by_key(|a| std::cmp::Reverse(a.0));
+    let mut out = vdf_bytes.to_vec();
+    for (start, end, new_val) in replacements {
+        out.splice(start..end, new_val.into_bytes());
+    }
+    Some(out)
+}
+
+/// Inserts or updates a RustTracker shortcut entry in a binary `shortcuts.vdf` buffer,
+/// returning the updated buffer and the shortcut's unsigned 32-bit `appid`.
+pub(crate) fn upsert_rusttracker_shortcut_in_vdf(
+    vdf_bytes: &[u8],
+    exe_path: &str,
+    start_dir: &str,
+    icon_path: &str,
+) -> (Vec<u8>, u32) {
+    let existing_ids = extract_rusttracker_shortcut_appids(vdf_bytes);
+    if let Some(&appid) = existing_ids.first() {
+        let mut replacements: Vec<(usize, usize, String)> = Vec::new();
+        let mut i = 0usize;
+        let mut depth = 0usize;
+        let mut is_rusttracker = false;
+        let mut app_name_span: Option<(usize, usize)> = None;
+        let mut exe_span: Option<(usize, usize)> = None;
+        let mut start_dir_span: Option<(usize, usize)> = None;
+        let mut icon_span: Option<(usize, usize)> = None;
+
+        let read_cstr_span = |buf: &[u8], pos: &mut usize| -> Option<(usize, usize, String)> {
+            let start = *pos;
+            let rel_end = buf.get(start..)?.iter().position(|&b| b == 0)?;
+            let end = start + rel_end;
+            *pos = end + 1;
+            Some((
+                start,
+                end,
+                String::from_utf8_lossy(&buf[start..end]).into_owned(),
+            ))
+        };
+
+        while i < vdf_bytes.len() {
+            let tag = vdf_bytes[i];
+            i += 1;
+            match tag {
+                0x00 => {
+                    if read_cstr_span(vdf_bytes, &mut i).is_none() {
+                        break;
+                    }
+                    depth += 1;
+                    if depth == 2 {
+                        is_rusttracker = false;
+                        app_name_span = None;
+                        exe_span = None;
+                        start_dir_span = None;
+                        icon_span = None;
+                    }
+                }
+                0x01 => {
+                    let Some((_, _, key)) = read_cstr_span(vdf_bytes, &mut i) else {
+                        break;
+                    };
+                    let Some((val_start, val_end, val)) = read_cstr_span(vdf_bytes, &mut i) else {
+                        break;
+                    };
+                    if depth == 2 {
+                        if (key.eq_ignore_ascii_case("AppName") || key.eq_ignore_ascii_case("Exe"))
+                            && val.to_ascii_lowercase().contains("rusttracker")
+                        {
+                            is_rusttracker = true;
+                        }
+                        if key.eq_ignore_ascii_case("AppName") {
+                            app_name_span = Some((val_start, val_end));
+                        } else if key.eq_ignore_ascii_case("Exe") {
+                            exe_span = Some((val_start, val_end));
+                        } else if key.eq_ignore_ascii_case("StartDir") {
+                            start_dir_span = Some((val_start, val_end));
+                        } else if key.eq_ignore_ascii_case("icon") {
+                            icon_span = Some((val_start, val_end));
+                        }
+                    }
+                }
+                0x02 => {
+                    if read_cstr_span(vdf_bytes, &mut i).is_none() {
+                        break;
+                    }
+                    if vdf_bytes.get(i..i + 4).is_none() {
+                        break;
+                    }
+                    i += 4;
+                }
+                0x08 => {
+                    if depth == 2 {
+                        if is_rusttracker {
+                            if let Some((s, e)) = app_name_span.take() {
+                                replacements.push((s, e, "RustTracker".to_string()));
+                            }
+                            if !exe_path.is_empty()
+                                && let Some((s, e)) = exe_span.take()
+                            {
+                                replacements.push((s, e, format!("\"{exe_path}\"")));
+                            }
+                            if !start_dir.is_empty()
+                                && let Some((s, e)) = start_dir_span.take()
+                            {
+                                replacements.push((s, e, start_dir.to_string()));
+                            }
+                            if !icon_path.is_empty()
+                                && let Some((s, e)) = icon_span.take()
+                            {
+                                replacements.push((s, e, icon_path.to_string()));
+                            }
+                        }
+                        is_rusttracker = false;
+                    }
+                    depth = depth.saturating_sub(1);
+                }
+                _ => break,
+            }
+        }
+        replacements.sort_by_key(|a| std::cmp::Reverse(a.0));
+        let mut out = vdf_bytes.to_vec();
+        for (start, end, new_val) in replacements {
+            out.splice(start..end, new_val.into_bytes());
+        }
+        return (out, appid);
+    }
+
+    // Create a new shortcut entry
+    let appid: u32 = 3929032336; // 0xEA304690
+    let mut next_idx = 0usize;
+    let mut i = 0usize;
+    let mut depth = 0usize;
+    let read_cstr = |buf: &[u8], pos: &mut usize| -> Option<String> {
+        let start = *pos;
+        let rel_end = buf.get(start..)?.iter().position(|&b| b == 0)?;
+        *pos = start + rel_end + 1;
+        Some(String::from_utf8_lossy(&buf[start..start + rel_end]).into_owned())
+    };
+    while i < vdf_bytes.len() {
+        let tag = vdf_bytes[i];
+        i += 1;
+        match tag {
+            0x00 => {
+                let Some(key) = read_cstr(vdf_bytes, &mut i) else {
+                    break;
+                };
+                depth += 1;
+                if depth == 2
+                    && let Ok(n) = key.parse::<usize>()
+                {
+                    next_idx = next_idx.max(n + 1);
+                }
+            }
+            0x01 => {
+                if read_cstr(vdf_bytes, &mut i).is_none() || read_cstr(vdf_bytes, &mut i).is_none()
+                {
+                    break;
+                }
+            }
+            0x02 => {
+                if read_cstr(vdf_bytes, &mut i).is_none() || vdf_bytes.get(i..i + 4).is_none() {
+                    break;
+                }
+                i += 4;
+            }
+            0x08 => {
+                depth = depth.saturating_sub(1);
+            }
+            _ => break,
+        }
+    }
+
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as u32)
+        .unwrap_or(0);
+
+    let mut entry = Vec::new();
+    entry.push(0x00);
+    entry.extend_from_slice(next_idx.to_string().as_bytes());
+    entry.push(0x00);
+    entry.extend_from_slice(b"\x02appid\x00");
+    entry.extend_from_slice(&appid.to_le_bytes());
+    entry.extend_from_slice(b"\x01AppName\x00RustTracker\x00");
+    entry.extend_from_slice(b"\x01Exe\x00\"");
+    entry.extend_from_slice(exe_path.as_bytes());
+    entry.extend_from_slice(b"\"\x00");
+    entry.extend_from_slice(b"\x01StartDir\x00");
+    entry.extend_from_slice(start_dir.as_bytes());
+    entry.push(0x00);
+    entry.extend_from_slice(b"\x01icon\x00");
+    entry.extend_from_slice(icon_path.as_bytes());
+    entry.push(0x00);
+    entry.extend_from_slice(b"\x01ShortcutPath\x00\x00");
+    entry.extend_from_slice(b"\x01LaunchOptions\x00\x00");
+    entry.extend_from_slice(b"\x02IsHidden\x00\x00\x00\x00\x00");
+    entry.extend_from_slice(b"\x02AllowDesktopConfig\x00\x01\x00\x00\x00");
+    entry.extend_from_slice(b"\x02AllowOverlay\x00\x01\x00\x00\x00");
+    entry.extend_from_slice(b"\x02OpenVR\x00\x00\x00\x00\x00");
+    entry.extend_from_slice(b"\x02Devkit\x00\x00\x00\x00\x00");
+    entry.extend_from_slice(b"\x01DevkitGameID\x00\x00");
+    entry.extend_from_slice(b"\x02DevkitOverrideAppID\x00\x00\x00\x00\x00");
+    entry.extend_from_slice(b"\x02LastPlayTime\x00");
+    entry.extend_from_slice(&now_epoch.to_le_bytes());
+    entry.extend_from_slice(b"\x01FlatpakAppID\x00\x00");
+    entry.extend_from_slice(b"\x01sortas\x00\x00");
+    entry.extend_from_slice(b"\x00tags\x00\x08\x08");
+
+    let mut out = if vdf_bytes.starts_with(b"\x00shortcuts\x00") && vdf_bytes.len() >= 13 {
+        let mut trimmed = vdf_bytes.to_vec();
+        while trimmed.last() == Some(&0x08) {
+            trimmed.pop();
+        }
+        trimmed
+    } else {
+        b"\x00shortcuts\x00".to_vec()
+    };
+    out.extend_from_slice(&entry);
+    out.extend_from_slice(b"\x08\x08");
+    (out, appid)
+}
+
+fn register_steam_shortcut_cli() -> Result<(), Box<dyn Error>> {
+    let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+        return Err("HOME environment variable is not set".into());
+    };
+    let exe_path = std::env::var("APPIMAGE")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            std::env::current_exe()
+                .ok()
+                .and_then(|p| p.to_str().map(|s| s.to_string()))
+        })
+        .unwrap_or_else(|| "/home/deck/Downloads/RustTracker-SteamDeck.AppImage".to_string());
+    let start_dir = std::path::Path::new(&exe_path)
+        .parent()
+        .and_then(|p| p.to_str())
+        .map(|s| format!("{}/", s.trim_end_matches('/')))
+        .unwrap_or_else(|| "/home/deck/Downloads/".to_string());
+    let icon_path = home.join(".local/share/icons/hicolor/512x512/apps/rusttracker.png");
+    let icon_path_str = icon_path.to_string_lossy().into_owned();
+
+    // Stop steam-launcher.service if running on SteamOS so Steam flushes shortcuts.vdf first
+    let steam_service_was_active = std::process::Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", "steam-launcher.service"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if steam_service_was_active {
+        println!("[steam] Stopping steam-launcher.service to safely update shortcuts.vdf...");
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "stop", "steam-launcher.service"])
+            .status();
+    }
+
+    let mut total_registered = 0usize;
+    for rel in [".local/share/Steam", ".steam/steam"] {
+        let root = home.join(rel);
+        let userdata = root.join("userdata");
+        if !userdata.is_dir() {
+            continue;
+        }
+        if let Ok(entries) = std::fs::read_dir(&userdata) {
+            for entry in entries.flatten() {
+                let user_dir = entry.path();
+                if !user_dir.is_dir() {
+                    continue;
+                }
+                let config_dir = user_dir.join("config");
+                let _ = std::fs::create_dir_all(&config_dir);
+                let vdf_path = config_dir.join("shortcuts.vdf");
+                let existing = std::fs::read(&vdf_path).unwrap_or_default();
+                let (updated, appid) = upsert_rusttracker_shortcut_in_vdf(
+                    &existing,
+                    &exe_path,
+                    &start_dir,
+                    &icon_path_str,
+                );
+                std::fs::write(&vdf_path, updated)?;
+                println!(
+                    "[steam] Registered 'RustTracker' (AppID {}) in {}",
+                    appid,
+                    vdf_path.display()
+                );
+                total_registered += 1;
+            }
+        }
+        if total_registered > 0 {
+            break;
+        }
+    }
+
+    auto_provision_steam_artwork();
+
+    if steam_service_was_active {
+        println!("[steam] Restarting steam-launcher.service...");
+        let _ = std::process::Command::new("systemctl")
+            .args(["--user", "start", "steam-launcher.service"])
+            .status();
+    }
+
+    println!(
+        "[steam] Successfully registered RustTracker and provisioned SteamOS Home Screen artwork ({} user profile(s)).",
+        total_registered
+    );
+    Ok(())
+}
+
+/// Copies Steam Grid (`userdata/<id>/config/grid/`) and LibraryCache (`appcache/librarycache/`)
+/// artwork for all discovered RustTracker non-Steam shortcuts under `steam_root`.
+pub(crate) fn provision_steam_shortcut_artwork_in_root(
+    steam_root: &std::path::Path,
+    steamgrid_dir: &std::path::Path,
+    icon_png: Option<&std::path::Path>,
+) -> usize {
+    let userdata_dir = steam_root.join("userdata");
+    let Ok(entries) = std::fs::read_dir(&userdata_dir) else {
+        return 0;
+    };
+    let copy_if_missing = |src: &std::path::Path, dst: &std::path::Path| -> bool {
+        if !dst.exists() && src.exists() {
+            std::fs::copy(src, dst).is_ok()
+        } else {
+            false
+        }
+    };
+
+    let header_src = steamgrid_dir.join("header.jpg");
+    let capsule_src = steamgrid_dir.join("library_600x900.jpg");
+    let hero_src = steamgrid_dir.join("library_hero.jpg");
+    let hero_blur_src = steamgrid_dir.join("library_hero_blur.jpg");
+    let logo_src = steamgrid_dir.join("logo.png");
+    let icon_jpg_src = steamgrid_dir.join("icon.jpg");
+
+    let libcache_dir = steam_root.join("appcache").join("librarycache");
+    let mut provisioned_shortcuts = 0usize;
+
+    for entry in entries.flatten() {
+        let user_dir = entry.path();
+        if !user_dir.is_dir() {
+            continue;
+        }
+        let vdf_path = user_dir.join("config").join("shortcuts.vdf");
+        let Ok(vdf_bytes) = std::fs::read(&vdf_path) else {
+            continue;
+        };
+        let appids = extract_rusttracker_shortcut_appids(&vdf_bytes);
+        if appids.is_empty() {
+            continue;
+        }
+        let icon_path_str = icon_png.and_then(|p| p.to_str());
+        if let Some(updated_vdf) = normalize_rusttracker_shortcuts_vdf(&vdf_bytes, icon_path_str) {
+            let _ = std::fs::write(&vdf_path, updated_vdf);
+        }
+        let grid_dir = user_dir.join("config").join("grid");
+        let _ = std::fs::create_dir_all(&grid_dir);
+        let _ = std::fs::create_dir_all(&libcache_dir);
+
+        for appid in appids {
+            provisioned_shortcuts += 1;
+            let _ = copy_if_missing(&header_src, &grid_dir.join(format!("{appid}.jpg")));
+            let _ = copy_if_missing(&capsule_src, &grid_dir.join(format!("{appid}p.jpg")));
+            let _ = copy_if_missing(&hero_src, &grid_dir.join(format!("{appid}_hero.jpg")));
+            let _ = copy_if_missing(&logo_src, &grid_dir.join(format!("{appid}_logo.png")));
+            let _ = copy_if_missing(&icon_jpg_src, &grid_dir.join(format!("{appid}_icon.jpg")));
+            if let Some(png) = icon_png {
+                let _ = copy_if_missing(png, &grid_dir.join(format!("{appid}_icon.png")));
+            }
+
+            let app_cache_sub = libcache_dir.join(appid.to_string());
+            let _ = std::fs::create_dir_all(&app_cache_sub);
+            let _ = copy_if_missing(&header_src, &app_cache_sub.join("header.jpg"));
+            let _ = copy_if_missing(&header_src, &app_cache_sub.join("library_header.jpg"));
+            let _ = copy_if_missing(&capsule_src, &app_cache_sub.join("library_600x900.jpg"));
+            let _ = copy_if_missing(&hero_src, &app_cache_sub.join("library_hero.jpg"));
+            let _ = copy_if_missing(&hero_blur_src, &app_cache_sub.join("library_hero_blur.jpg"));
+            let _ = copy_if_missing(&logo_src, &app_cache_sub.join("logo.png"));
+            let _ = copy_if_missing(&icon_jpg_src, &app_cache_sub.join("icon.jpg"));
+
+            let _ = copy_if_missing(
+                &header_src,
+                &libcache_dir.join(format!("{appid}_header.jpg")),
+            );
+            let _ = copy_if_missing(
+                &header_src,
+                &libcache_dir.join(format!("{appid}_library_header.jpg")),
+            );
+            let _ = copy_if_missing(
+                &capsule_src,
+                &libcache_dir.join(format!("{appid}_library_600x900.jpg")),
+            );
+            let _ = copy_if_missing(
+                &hero_src,
+                &libcache_dir.join(format!("{appid}_library_hero.jpg")),
+            );
+            let _ = copy_if_missing(
+                &hero_blur_src,
+                &libcache_dir.join(format!("{appid}_library_hero_blur.jpg")),
+            );
+            let _ = copy_if_missing(&logo_src, &libcache_dir.join(format!("{appid}_logo.png")));
+            let _ = copy_if_missing(
+                &icon_jpg_src,
+                &libcache_dir.join(format!("{appid}_icon.jpg")),
+            );
+        }
+    }
+    provisioned_shortcuts
+}
+
+fn auto_provision_steam_artwork() {
+    #[cfg(target_os = "linux")]
+    {
+        let Some(home) = std::env::var_os("HOME").map(std::path::PathBuf::from) else {
+            return;
+        };
+        let mut steamgrid_candidates = Vec::new();
+        let mut icon_candidates = Vec::new();
+        if let Some(appdir) = std::env::var_os("RUSTTRACKER_APPDIR")
+            .or_else(|| std::env::var_os("APPDIR"))
+            .map(std::path::PathBuf::from)
+        {
+            steamgrid_candidates.push(appdir.join("usr/share/rusttracker/steamgrid"));
+            icon_candidates
+                .push(appdir.join("usr/share/icons/hicolor/512x512/apps/rusttracker.png"));
+        }
+        if let Ok(exe) = std::env::current_exe()
+            && let Some(exe_dir) = exe.parent()
+        {
+            steamgrid_candidates.push(exe_dir.join("../share/rusttracker/steamgrid"));
+            steamgrid_candidates.push(exe_dir.join("assets/steamgrid"));
+            icon_candidates
+                .push(exe_dir.join("../share/icons/hicolor/512x512/apps/rusttracker.png"));
+            icon_candidates.push(exe_dir.join("assets/icons/hicolor/512x512/apps/rusttracker.png"));
+        }
+        steamgrid_candidates.push(std::path::PathBuf::from("assets/steamgrid"));
+        icon_candidates.push(std::path::PathBuf::from(
+            "assets/icons/hicolor/512x512/apps/rusttracker.png",
+        ));
+
+        let Some(steamgrid_dir) = steamgrid_candidates
+            .into_iter()
+            .find(|p| p.join("header.jpg").exists())
+        else {
+            return;
+        };
+        let bundled_icon_png = icon_candidates.into_iter().find(|p| p.exists());
+        let persistent_icon_path =
+            home.join(".local/share/icons/hicolor/512x512/apps/rusttracker.png");
+        if !persistent_icon_path.exists()
+            && let Some(ref src_icon) = bundled_icon_png
+        {
+            if let Some(parent) = persistent_icon_path.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::copy(src_icon, &persistent_icon_path);
+        }
+        let icon_png = if persistent_icon_path.exists() {
+            Some(persistent_icon_path)
+        } else {
+            bundled_icon_png
+        };
+
+        for rel in [".local/share/Steam", ".steam/steam"] {
+            let root = home.join(rel);
+            if root.join("userdata").is_dir() {
+                let _ = provision_steam_shortcut_artwork_in_root(
+                    &root,
+                    &steamgrid_dir,
+                    icon_png.as_deref(),
+                );
+            }
+        }
+    }
 }
 
 fn compute_initial_window_geometry(
@@ -547,6 +1276,18 @@ fn constrain_window_to_monitor(
 
     let mon_logical_w = mon_phys.width as f64 / scale;
     let mon_logical_h = mon_phys.height as f64 / scale;
+    let is_deck_full_display = desired_logical_w == Some(1280.0)
+        && desired_logical_h == Some(800.0)
+        && (mon_logical_w - 1280.0).abs() < 1.0
+        && (mon_logical_h - 800.0).abs() < 1.0;
+    if is_deck_full_display {
+        let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(
+            mon_phys.width,
+            mon_phys.height,
+        ));
+        window.set_outer_position(winit::dpi::PhysicalPosition::new(mon_pos.x, mon_pos.y));
+        return;
+    }
     let safe_max_logical_w = (mon_logical_w - 48.0).min(mon_logical_w * 0.94).max(320.0);
     let safe_max_logical_h = (mon_logical_h - 96.0).min(mon_logical_h * 0.88).max(240.0);
 
@@ -755,7 +1496,32 @@ async fn run_gui(
     mut active_stream: Option<audio::PlaybackHandle>,
     ipc_rx: crossbeam_channel::Receiver<Vec<String>>,
 ) -> Result<(), Box<dyn Error>> {
-    let is_fullscreen = args.fullscreen;
+    auto_provision_steam_artwork();
+    let is_steam_deck = std::fs::read_to_string("/sys/class/dmi/id/sys_vendor")
+        .map(|s| s.trim().to_lowercase().contains("valve"))
+        .unwrap_or(false)
+        || std::env::var("SteamDeck").is_ok()
+        || std::env::var("SteamOS").is_ok();
+    let is_gamescope = std::env::var("XDG_CURRENT_DESKTOP")
+        .unwrap_or_default()
+        .eq_ignore_ascii_case("gamescope")
+        || std::env::var("XDG_SESSION_DESKTOP")
+            .unwrap_or_default()
+            .eq_ignore_ascii_case("gamescope");
+    let is_game_mode = is_gamescope || std::env::var("STEAM_DECK").is_ok() || is_steam_deck;
+
+    // Gamescope's XWayland server advertises a 1280x800 display with 100mm x 150mm physical
+    // dimensions (~212 DPI), which causes winit's X11 backend to compute a 2.208x scale factor.
+    // Force a 1.0 scale factor before initializing the EventLoop on Steam Deck / Gamescope.
+    #[cfg(target_os = "linux")]
+    if is_game_mode && std::env::var("WINIT_X11_SCALE_FACTOR").is_err() {
+        unsafe {
+            std::env::set_var("WINIT_X11_SCALE_FACTOR", "1");
+        }
+    }
+
+    let is_fullscreen =
+        args.fullscreen || (is_gamescope && std::env::var("CAPTURE_FRAME").is_err());
     let use_gpu_fft = args.gpu_fft;
     let bench = args.bench;
     let is_mic_launch = args.mic;
@@ -774,9 +1540,11 @@ async fn run_gui(
     {
         // winit 0.30's native Wayland backend does not implement wl_data_device
         // file drag-and-drop (HoveredFile / DroppedFile). Prefer X11/XWayland when
-        // DISPLAY is available (unless RUSTTRACKER_WAYLAND is explicitly set), with
-        // automatic fallback to the default Wayland backend below if X11 init fails.
-        if std::env::var("RUSTTRACKER_WAYLAND").is_err()
+        // DISPLAY is available (unless RUSTTRACKER_WAYLAND is explicitly set and
+        // WAYLAND_DISPLAY is active), with automatic fallback below.
+        let use_wayland = std::env::var("RUSTTRACKER_WAYLAND").is_ok()
+            && std::env::var("WAYLAND_DISPLAY").is_ok();
+        if !use_wayland
             && (std::env::var("DISPLAY").is_ok() || std::env::var("RUSTTRACKER_X11").is_ok())
         {
             event_loop_builder.with_x11();
@@ -823,20 +1591,6 @@ async fn run_gui(
         use windows::core::w;
         let _ = SetCurrentProcessExplicitAppUserModelID(w!("Soddentrough.RustTracker"));
     }
-
-    let is_steam_deck = std::fs::read_to_string("/sys/class/dmi/id/sys_vendor")
-        .map(|s| s.trim().to_lowercase().contains("valve"))
-        .unwrap_or(false);
-    let is_game_mode = std::env::var("XDG_CURRENT_DESKTOP")
-        .unwrap_or_default()
-        .to_lowercase()
-        == "gamescope"
-        || std::env::var("XDG_SESSION_DESKTOP")
-            .unwrap_or_default()
-            .to_lowercase()
-            == "gamescope"
-        || std::env::var("STEAM_DECK").is_ok()
-        || is_steam_deck;
 
     let (desired_logical_w, desired_logical_h) = if is_game_mode {
         (1280.0, 800.0)
@@ -995,6 +1749,7 @@ async fn run_gui(
         std::path::PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/".to_string()));
 
     let mut file_dialog = egui_file_dialog::FileDialog::new()
+        .default_size([920.0, 560.0])
         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
         .initial_directory(initial_dir.clone())
         .add_file_filter_extensions(
@@ -1017,6 +1772,8 @@ async fn run_gui(
     let mut frame_dt_ring = [1.0f32 / 60.0; 60];
     let mut frame_dt_idx = 0usize;
     let mut desktop_frame_count = 0u64;
+    let mut frame_left_stick_y = 0.0f32;
+    let mut frame_right_stick_y = 0.0f32;
 
     let mut app = DesktopApp {
         runtime: None,
@@ -1306,12 +2063,30 @@ async fn run_gui(
                                         WinitKeyCode::BracketLeft => {
                                             let mut state = app_state.lock().unwrap();
                                             state.panel_split_ratio =
-                                                (state.panel_split_ratio - 0.05).clamp(0.15, 0.85);
+                                                (state.panel_split_ratio - 0.05).clamp(
+                                                    MIN_PANEL_SPLIT_RATIO,
+                                                    MAX_PANEL_SPLIT_RATIO,
+                                                );
+                                            if state.file_loaded {
+                                                state.show_hud = true;
+                                                if state.video_mode == 3 {
+                                                    state.video_mode = 0;
+                                                }
+                                            }
                                         }
                                         WinitKeyCode::BracketRight => {
                                             let mut state = app_state.lock().unwrap();
                                             state.panel_split_ratio =
-                                                (state.panel_split_ratio + 0.05).clamp(0.15, 0.85);
+                                                (state.panel_split_ratio + 0.05).clamp(
+                                                    MIN_PANEL_SPLIT_RATIO,
+                                                    MAX_PANEL_SPLIT_RATIO,
+                                                );
+                                            if state.file_loaded {
+                                                state.show_hud = true;
+                                                if state.video_mode == 3 {
+                                                    state.video_mode = 0;
+                                                }
+                                            }
                                         }
                                         WinitKeyCode::Tab => {
                                             let mut state = app_state.lock().unwrap();
@@ -2037,14 +2812,17 @@ async fn run_gui(
                                     state.spectrum_history.push_back(recycled);
                                 }
 
-                                // Gamepad analog panel scaling and scrubbing
+                                // Gamepad analog panel scaling (Left Stick Y or Right Stick Y) and trigger scrubbing
+                                let mut max_left_y = std::mem::take(&mut frame_left_stick_y);
+                                let mut max_right_y = std::mem::take(&mut frame_right_stick_y);
                                 for (_id, gamepad) in gilrs.gamepads() {
+                                    let left_y = gamepad.value(gilrs::Axis::LeftStickY);
+                                    if left_y.abs() > max_left_y.abs() {
+                                        max_left_y = left_y;
+                                    }
                                     let right_y = gamepad.value(gilrs::Axis::RightStickY);
-                                    if right_y.abs() > 0.1 {
-                                        let scaled_delta = right_y * dt * 1.0; // Subtract moving UP (positive Y stick)
-                                        state.panel_split_ratio = (state.panel_split_ratio
-                                            - scaled_delta)
-                                            .clamp(0.15, 0.85);
+                                    if right_y.abs() > max_right_y.abs() {
+                                        max_right_y = right_y;
                                     }
 
                                     // Analog trigger scrubbing
@@ -2079,6 +2857,12 @@ async fn run_gui(
                                         state.osd_timer = 0.5;
                                     }
                                 }
+                                apply_gamepad_stick_panel_resize(
+                                    &mut state,
+                                    max_left_y,
+                                    max_right_y,
+                                    dt,
+                                );
 
                                 if state.osd_timer > 0.0 {
                                     state.osd_timer = (state.osd_timer - dt).max(0.0);
@@ -2087,17 +2871,11 @@ async fn run_gui(
                                     }
                                 }
 
-                                // Clamp panel split ratio to ensure both top and bottom panels have at least 220px height
+                                // Clamp panel split ratio to ensure both top and bottom panels have at least MIN_PANEL_HEIGHT_PX height
                                 let total_h =
                                     engine.config.height as f32 / window.scale_factor() as f32;
-                                if total_h > 0.0 {
-                                    let min_h = 220.0f32;
-                                    let min_r = (min_h / total_h).clamp(0.0, 1.0);
-                                    let max_r = ((total_h - min_h) / total_h).clamp(0.0, 1.0);
-                                    state.panel_split_ratio = state
-                                        .panel_split_ratio
-                                        .clamp(min_r.min(max_r), min_r.max(max_r));
-                                }
+                                state.panel_split_ratio =
+                                    clamp_panel_split_ratio(state.panel_split_ratio, total_h);
 
                                 engine.update(&state, dt);
                             }
@@ -2628,6 +3406,7 @@ async fn run_gui(
                                     *fd_state == egui_file_dialog::DialogState::Open;
                                 if *fd_state == egui_file_dialog::DialogState::Cancelled {
                                     file_dialog = egui_file_dialog::FileDialog::new()
+                                        .default_size([920.0, 560.0])
                                         .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                                         .initial_directory(initial_dir.clone())
                                         .add_file_filter_extensions(
@@ -2732,7 +3511,27 @@ async fn run_gui(
                             }
 
                             if trigger_picker {
+                                egui_ctx.memory_mut(|m| {
+                                    if let Some(id) = m.focused() {
+                                        m.surrender_focus(id);
+                                    }
+                                });
                                 file_dialog.pick_multiple();
+                                let mut state = app_state.lock().unwrap();
+                                state.egui_gamepad_events.push(egui::Event::Key {
+                                    key: egui::Key::ArrowDown,
+                                    physical_key: None,
+                                    pressed: true,
+                                    repeat: false,
+                                    modifiers: egui::Modifiers::NONE,
+                                });
+                                state.egui_gamepad_events.push(egui::Event::Key {
+                                    key: egui::Key::ArrowDown,
+                                    physical_key: None,
+                                    pressed: false,
+                                    repeat: false,
+                                    modifiers: egui::Modifiers::NONE,
+                                });
                             }
 
                             // Hardware VSync (PresentMode::Fifo) paces frames natively to VBlank.
@@ -2896,6 +3695,19 @@ async fn run_gui(
                     }
 
                     while let Some(gilrs::Event { event: g_event, .. }) = gilrs.next_event() {
+                        if let gilrs::EventType::AxisChanged(axis, val, _) = g_event {
+                            match axis {
+                                gilrs::Axis::LeftStickY if val.abs() > frame_left_stick_y.abs() => {
+                                    frame_left_stick_y = val;
+                                }
+                                gilrs::Axis::RightStickY
+                                    if val.abs() > frame_right_stick_y.abs() =>
+                                {
+                                    frame_right_stick_y = val;
+                                }
+                                _ => {}
+                            }
+                        }
                         let is_pressed = matches!(g_event, gilrs::EventType::ButtonPressed(_, _));
                         let is_repeated = matches!(g_event, gilrs::EventType::ButtonRepeated(_, _));
                         if is_pressed || is_repeated {
@@ -3034,18 +3846,63 @@ async fn run_gui(
                                         continue;
                                     }
                                     gilrs::Button::DPadLeft => {
-                                        push_key(egui::Key::ArrowLeft);
+                                        if is_url_open {
+                                            push_key(egui::Key::ArrowLeft);
+                                        } else {
+                                            egui_ctx.memory_mut(|m| {
+                                                if let Some(id) = m.focused() {
+                                                    m.surrender_focus(id);
+                                                }
+                                            });
+                                            state.egui_gamepad_events.push(egui::Event::Key {
+                                                key: egui::Key::ArrowUp,
+                                                physical_key: None,
+                                                pressed: true,
+                                                repeat: false,
+                                                modifiers: egui::Modifiers::ALT,
+                                            });
+                                            state.egui_gamepad_events.push(egui::Event::Key {
+                                                key: egui::Key::ArrowUp,
+                                                physical_key: None,
+                                                pressed: false,
+                                                repeat: false,
+                                                modifiers: egui::Modifiers::ALT,
+                                            });
+                                        }
                                         continue;
                                     }
                                     gilrs::Button::DPadRight => {
-                                        push_key(egui::Key::ArrowRight);
+                                        if is_url_open {
+                                            push_key(egui::Key::ArrowRight);
+                                        } else {
+                                            egui_ctx.memory_mut(|m| {
+                                                if let Some(id) = m.focused() {
+                                                    m.surrender_focus(id);
+                                                }
+                                            });
+                                            push_key(egui::Key::Enter);
+                                        }
                                         continue;
                                     }
                                     gilrs::Button::South => {
+                                        if !is_url_open {
+                                            egui_ctx.memory_mut(|m| {
+                                                if let Some(id) = m.focused() {
+                                                    m.surrender_focus(id);
+                                                }
+                                            });
+                                        }
                                         push_key(egui::Key::Enter);
                                         continue;
                                     }
                                     gilrs::Button::East => {
+                                        if !is_url_open {
+                                            egui_ctx.memory_mut(|m| {
+                                                if let Some(id) = m.focused() {
+                                                    m.surrender_focus(id);
+                                                }
+                                            });
+                                        }
                                         push_key(egui::Key::Escape);
                                         continue;
                                     }
@@ -3088,7 +3945,7 @@ async fn run_gui(
                             } else {
                                 let is_splash = {
                                     let state = app_state.lock().unwrap();
-                                    !state.file_loaded
+                                    !state.file_loaded && !state.show_vis_picker
                                 };
                                 if is_splash {
                                     let mut state = app_state.lock().unwrap();
@@ -3114,29 +3971,33 @@ async fn run_gui(
                                         });
                                     };
                                     match button {
-                                        gilrs::Button::DPadLeft => {
+                                        gilrs::Button::DPadLeft | gilrs::Button::DPadUp => {
                                             push_tab(true);
                                             continue;
                                         }
-                                        gilrs::Button::DPadRight => {
+                                        gilrs::Button::DPadRight | gilrs::Button::DPadDown => {
                                             push_tab(false);
                                             continue;
                                         }
                                         gilrs::Button::South => {
-                                            state.egui_gamepad_events.push(egui::Event::Key {
-                                                key: egui::Key::Enter,
-                                                physical_key: None,
-                                                pressed: true,
-                                                repeat: false,
-                                                modifiers: egui::Modifiers::NONE,
-                                            });
-                                            state.egui_gamepad_events.push(egui::Event::Key {
-                                                key: egui::Key::Enter,
-                                                physical_key: None,
-                                                pressed: false,
-                                                repeat: false,
-                                                modifiers: egui::Modifiers::NONE,
-                                            });
+                                            if egui_ctx.memory(|m| m.focused().is_none()) {
+                                                state.open_file_request = true;
+                                            } else {
+                                                state.egui_gamepad_events.push(egui::Event::Key {
+                                                    key: egui::Key::Enter,
+                                                    physical_key: None,
+                                                    pressed: true,
+                                                    repeat: false,
+                                                    modifiers: egui::Modifiers::NONE,
+                                                });
+                                                state.egui_gamepad_events.push(egui::Event::Key {
+                                                    key: egui::Key::Enter,
+                                                    physical_key: None,
+                                                    pressed: false,
+                                                    repeat: false,
+                                                    modifiers: egui::Modifiers::NONE,
+                                                });
+                                            }
                                             continue;
                                         }
                                         _ => {}
@@ -3198,6 +4059,31 @@ async fn run_gui(
                                         state.osd_timer = 2.0;
                                     }
                                 }
+                                gilrs::Button::LeftTrigger2 => {
+                                    // L2 Trigger -> Toggle HUD
+                                    let mut state = app_state.lock().unwrap();
+                                    state.show_hud = !state.show_hud;
+                                    state.video_mode = 0;
+                                    let mode_name = if state.show_hud {
+                                        "Standard View"
+                                    } else {
+                                        "Full Screen Visualizer"
+                                    };
+                                    state.osd_text = Some(format!("View: {}", mode_name));
+                                    state.osd_timer = 2.0;
+                                }
+                                gilrs::Button::RightTrigger2 => {
+                                    // R2 Trigger -> Toggle GPU FFT
+                                    let mut state = app_state.lock().unwrap();
+                                    state.gpu_fft = !state.gpu_fft;
+                                    let mode_name = if state.gpu_fft {
+                                        "GPU FFT: ON"
+                                    } else {
+                                        "GPU FFT: OFF"
+                                    };
+                                    state.osd_text = Some(mode_name.to_string());
+                                    state.osd_timer = 2.0;
+                                }
                                 gilrs::Button::North => {
                                     // 'Y' or Triangle
                                     let mut state = app_state.lock().unwrap();
@@ -3206,7 +4092,15 @@ async fn run_gui(
                                 gilrs::Button::West => {
                                     // 'X' or Square
                                     let mut state = app_state.lock().unwrap();
-                                    if state.video_frame_rx.is_some() || state.has_video_stream {
+                                    if state.show_vis_picker {
+                                        let cursor = state.vis_picker_cursor;
+                                        if cursor != 0 && cursor < state.vis_enabled.len() {
+                                            state.vis_enabled[cursor] = !state.vis_enabled[cursor];
+                                            state.vis_user_overridden[cursor] = true;
+                                        }
+                                    } else if state.video_frame_rx.is_some()
+                                        || state.has_video_stream
+                                    {
                                         state.video_mode = (state.video_mode + 1) % 4;
                                         let mode_name = match state.video_mode {
                                             0 => "Standard View",
@@ -3216,6 +4110,7 @@ async fn run_gui(
                                             _ => "Video",
                                         };
                                         state.osd_text = Some(format!("View: {}", mode_name));
+                                        state.osd_timer = 2.0;
                                     } else {
                                         state.show_hud = !state.show_hud;
                                         state.video_mode = 0;
@@ -3225,8 +4120,8 @@ async fn run_gui(
                                             "Full Screen Visualizer"
                                         };
                                         state.osd_text = Some(format!("View: {}", mode_name));
+                                        state.osd_timer = 2.0;
                                     }
-                                    state.osd_timer = 2.0;
                                 }
                                 gilrs::Button::East => {
                                     // 'B' or Circle
@@ -3774,7 +4669,11 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::clamp_window_geometry_to_monitor;
+    use super::{
+        AppState, apply_gamepad_stick_panel_resize, clamp_panel_split_ratio,
+        clamp_window_geometry_to_monitor, extract_rusttracker_shortcut_appids,
+        provision_steam_shortcut_artwork_in_root, upsert_rusttracker_shortcut_in_vdf,
+    };
 
     #[test]
     fn test_window_geometry_fits_1080p_at_150_percent_scale() {
@@ -3832,5 +4731,143 @@ mod tests {
         assert_eq!((min_w, min_h), (1024.0, 600.0));
         assert!(pos_x >= -2560 && pos_x + 1456 <= 0);
         assert!(pos_y >= 0 && pos_y + 878 <= 1440);
+    }
+
+    #[test]
+    fn test_window_geometry_preserves_full_steamdeck_1280x800_display() {
+        let ((w, h), (min_w, min_h), (pos_x, pos_y)) =
+            clamp_window_geometry_to_monitor(1280, 800, 0, 0, 1.0, 1280.0, 800.0);
+
+        assert_eq!((w, h), (1280.0, 800.0));
+        assert_eq!((min_w, min_h), (1024.0, 600.0));
+        assert_eq!((pos_x, pos_y), (0, 0));
+    }
+
+    #[test]
+    fn test_gamepad_stick_resizes_panel_split_with_left_or_right_stick() {
+        let mut state = AppState::new("test.mod".to_string());
+        state.file_loaded = true;
+        state.panel_split_ratio = 0.5;
+
+        // Left stick UP (+1.0) shrinks top panel (moves split bar up)
+        assert!(apply_gamepad_stick_panel_resize(&mut state, 1.0, 0.0, 0.1));
+        assert!((state.panel_split_ratio - 0.4).abs() < 1e-5);
+
+        // Right stick DOWN (-1.0) expands top panel (moves split bar down)
+        assert!(apply_gamepad_stick_panel_resize(&mut state, 0.0, -1.0, 0.2));
+        assert!((state.panel_split_ratio - 0.6).abs() < 1e-5);
+
+        // Stick inside deadzone (<= 0.1) does not change ratio
+        assert!(!apply_gamepad_stick_panel_resize(
+            &mut state, 0.05, -0.09, 0.1
+        ));
+        assert!((state.panel_split_ratio - 0.6).abs() < 1e-5);
+
+        // Moving stick while HUD is hidden restores HUD visibility
+        state.show_hud = false;
+        state.video_mode = 3;
+        assert!(apply_gamepad_stick_panel_resize(&mut state, 0.5, 0.0, 0.1));
+        assert!(state.show_hud);
+        assert_eq!(state.video_mode, 0);
+
+        // Modal dialogs suppress background panel resizing
+        state.show_vis_picker = true;
+        let before = state.panel_split_ratio;
+        assert!(!apply_gamepad_stick_panel_resize(&mut state, 1.0, 1.0, 0.2));
+        assert_eq!(state.panel_split_ratio, before);
+    }
+
+    #[test]
+    fn test_clamp_panel_split_ratio_allows_full_steamdeck_range() {
+        // On 1280x800 Steam Deck, min_h = 120px corresponds to [0.15, 0.85]
+        assert!((clamp_panel_split_ratio(0.10, 800.0) - 0.15).abs() < 1e-5);
+        assert!((clamp_panel_split_ratio(0.90, 800.0) - 0.85).abs() < 1e-5);
+        assert!((clamp_panel_split_ratio(0.20, 800.0) - 0.20).abs() < 1e-5);
+        assert!((clamp_panel_split_ratio(0.80, 800.0) - 0.80).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_extract_and_provision_steam_shortcut_artwork() {
+        // Construct a realistic binary shortcuts.vdf with 1 RustTracker entry (appid 0xEA304690 = 3929032336)
+        // and 1 unrelated entry (appid 0x81234567)
+        let mut vdf = Vec::new();
+        vdf.extend_from_slice(b"\x00shortcuts\x00");
+        vdf.extend_from_slice(b"\x000\x00");
+        vdf.extend_from_slice(b"\x02appid\x00\x90\x46\x30\xea");
+        vdf.extend_from_slice(b"\x01AppName\x00RustTracker-SteamDeck-GamePad.AppImage\x00");
+        vdf.extend_from_slice(
+            b"\x01Exe\x00\"/home/deck/Downloads/RustTracker-SteamDeck-GamePad.AppImage\"\x00",
+        );
+        vdf.extend_from_slice(b"\x01icon\x00\x00");
+        vdf.extend_from_slice(b"\x00tags\x00\x08\x08");
+        vdf.extend_from_slice(b"\x001\x00");
+        vdf.extend_from_slice(b"\x02appid\x00\x67\x45\x23\x81");
+        vdf.extend_from_slice(b"\x01AppName\x00OtherApp\x00");
+        vdf.extend_from_slice(b"\x01Exe\x00\"/usr/bin/other\"\x00\x08");
+        vdf.push(0x08);
+
+        let appids = extract_rusttracker_shortcut_appids(&vdf);
+        assert_eq!(appids, vec![3929032336]);
+
+        let tmp_root =
+            std::env::temp_dir().join(format!("rusttracker_steamgrid_test_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp_root);
+        let config_dir = tmp_root.join("userdata/8232340/config");
+        std::fs::create_dir_all(&config_dir).unwrap();
+        std::fs::write(config_dir.join("shortcuts.vdf"), &vdf).unwrap();
+
+        let steamgrid_dir = std::path::Path::new("assets/steamgrid");
+        let icon_png = std::path::Path::new("assets/icons/hicolor/512x512/apps/rusttracker.png");
+        let count =
+            provision_steam_shortcut_artwork_in_root(&tmp_root, steamgrid_dir, Some(icon_png));
+        assert_eq!(count, 1);
+
+        // Verify shortcuts.vdf had AppName normalized to "RustTracker" and icon populated
+        let updated_vdf = std::fs::read(config_dir.join("shortcuts.vdf")).unwrap();
+        assert!(
+            updated_vdf
+                .windows(b"\x01AppName\x00RustTracker\x00".len())
+                .any(|w| w == b"\x01AppName\x00RustTracker\x00")
+        );
+        assert!(
+            updated_vdf
+                .windows(b"rusttracker.png\x00".len())
+                .any(|w| w == b"rusttracker.png\x00")
+        );
+
+        assert!(config_dir.join("grid/3929032336.jpg").exists());
+        assert!(config_dir.join("grid/3929032336p.jpg").exists());
+        assert!(config_dir.join("grid/3929032336_hero.jpg").exists());
+        assert!(config_dir.join("grid/3929032336_logo.png").exists());
+        assert!(config_dir.join("grid/3929032336_icon.png").exists());
+        assert!(
+            tmp_root
+                .join("appcache/librarycache/3929032336/header.jpg")
+                .exists()
+        );
+        assert!(
+            tmp_root
+                .join("appcache/librarycache/3929032336_header.jpg")
+                .exists()
+        );
+        assert!(
+            tmp_root
+                .join("appcache/librarycache/3929032336/library_600x900.jpg")
+                .exists()
+        );
+
+        // Verify upsert into an empty shortcuts.vdf creates a valid RustTracker entry
+        let (created_vdf, created_id) = upsert_rusttracker_shortcut_in_vdf(
+            &[],
+            "/home/deck/Downloads/RustTracker-SteamDeck.AppImage",
+            "/home/deck/Downloads/",
+            "/home/deck/.local/share/icons/hicolor/512x512/apps/rusttracker.png",
+        );
+        assert_eq!(created_id, 3929032336);
+        assert_eq!(
+            extract_rusttracker_shortcut_appids(&created_vdf),
+            vec![3929032336]
+        );
+        let _ = std::fs::remove_dir_all(&tmp_root);
     }
 }

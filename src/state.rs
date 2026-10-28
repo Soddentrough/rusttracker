@@ -802,8 +802,8 @@ impl AppState {
             load_request: None,
 
             video_info: None,
-            show_stats: false,
-            show_help: false,
+            show_stats: std::env::var("SHOW_STATS").is_ok(),
+            show_help: std::env::var("SHOW_HELP").is_ok(),
             stats: PerformanceStats::default(),
             current_fps: 0.0,
             current_sample_rate: 44100.0,
