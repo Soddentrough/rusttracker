@@ -9451,11 +9451,12 @@ impl VulkanEngine {
                                         }
                                     }
 
-                                    if response.drag_stopped() || !response.is_pointer_button_down_on() {
-                                        if active_handle != 0 {
-                                            active_handle = 0;
-                                            col.ctx().data_mut(|d| d.insert_temp(drag_id, 0u8));
-                                        }
+                                    if (response.drag_stopped()
+                                        || !response.is_pointer_button_down_on())
+                                        && active_handle != 0
+                                    {
+                                        active_handle = 0;
+                                        col.ctx().data_mut(|d| d.insert_temp(drag_id, 0u8));
                                     }
 
                                     if response.hovered() && active_handle == 0 {
@@ -9706,7 +9707,10 @@ impl VulkanEngine {
                                         painter.circle_stroke(
                                             node_pos,
                                             if is_active { 7.0 } else { 5.5 },
-                                            egui::Stroke::new(if is_active { 2.5 } else { 2.0 }, node_color),
+                                            egui::Stroke::new(
+                                                if is_active { 2.5_f32 } else { 2.0_f32 },
+                                                node_color,
+                                            ),
                                         );
                                         painter.circle_filled(node_pos, 2.5, egui::Color32::WHITE);
 

@@ -1664,6 +1664,15 @@ mod wasapi_bitstream {
                         let eof_flag = Arc::new(AtomicBool::new(false));
                         let eof_flag_worker = eof_flag.clone();
                         let eof_flag_feeder = eof_flag.clone();
+                        let initial_epoch =
+                            shared_state_pump.lock().map(|s| s.seek_epoch).unwrap_or(0);
+                        let writer_epoch =
+                            Arc::new(std::sync::atomic::AtomicU64::new(initial_epoch));
+                        let writer_epoch_worker = writer_epoch.clone();
+                        let writer_epoch_feeder = writer_epoch.clone();
+                        let pipe_flushing = Arc::new(AtomicBool::new(false));
+                        let pipe_flushing_worker = pipe_flushing.clone();
+                        let pipe_flushing_feeder = pipe_flushing.clone();
 
                         let ffmpeg_worker = std::thread::spawn(move || {
                             println!(
@@ -1783,6 +1792,7 @@ mod wasapi_bitstream {
                                 };
 
                                 if let Some((pos, epoch)) = seek_req {
+                                    pipe_flushing_worker.store(true, Ordering::SeqCst);
                                     current_seek_epoch = epoch;
                                     is_eof = false;
                                     eof_flag_worker.store(false, Ordering::SeqCst);
@@ -1839,6 +1849,18 @@ mod wasapi_bitstream {
                                     for acc in &mut accumulator {
                                         acc.fill(0.0);
                                     }
+                                    // Wait briefly for feeder_thread to drain any pre-seek SPDIF bytes
+                                    // buffered in the OS named pipe before advancing writer_epoch.
+                                    let flush_wait_start = std::time::Instant::now();
+                                    while pipe_flushing_worker.load(Ordering::SeqCst)
+                                        && !stop_token_worker.load(Ordering::Relaxed)
+                                        && flush_wait_start.elapsed()
+                                            < std::time::Duration::from_millis(50)
+                                    {
+                                        std::thread::sleep(std::time::Duration::from_micros(500));
+                                    }
+                                    pipe_flushing_worker.store(false, Ordering::SeqCst);
+                                    writer_epoch_worker.store(epoch, Ordering::SeqCst);
                                     current_seconds = pos;
                                 }
 
@@ -2136,14 +2158,35 @@ mod wasapi_bitstream {
                                     PeekNamedPipe(pipe_h, None, 0, None, Some(&mut avail), None)
                                 };
                                 if peek_ok.is_err() {
+                                    pipe_flushing_feeder.store(false, Ordering::SeqCst);
                                     break;
+                                }
+                                if pipe_flushing_feeder.load(Ordering::SeqCst) {
+                                    while avail > 0 {
+                                        let to_drain = (avail as usize).min(buf.len());
+                                        let _ = file.read(&mut buf[..to_drain]);
+                                        avail = 0;
+                                        if unsafe {
+                                            PeekNamedPipe(
+                                                pipe_h,
+                                                None,
+                                                0,
+                                                None,
+                                                Some(&mut avail),
+                                                None,
+                                            )
+                                        }
+                                        .is_err()
+                                        {
+                                            break;
+                                        }
+                                    }
+                                    pipe_flushing_feeder.store(false, Ordering::SeqCst);
+                                    continue;
                                 }
                                 if avail == 0 {
                                     if eof_flag_feeder.swap(false, Ordering::SeqCst) {
-                                        let cur_epoch = shared_state_feeder
-                                            .lock()
-                                            .map(|s| s.seek_epoch)
-                                            .unwrap_or(0);
+                                        let cur_epoch = writer_epoch_feeder.load(Ordering::SeqCst);
                                         let _ = pcm_tx_feeder.try_send(AudioPacket {
                                             pcm_bytes: Vec::new(),
                                             epoch: cur_epoch,
@@ -2153,17 +2196,17 @@ mod wasapi_bitstream {
                                     std::thread::sleep(std::time::Duration::from_millis(2));
                                     continue;
                                 }
+                                let chunk_epoch = writer_epoch_feeder.load(Ordering::SeqCst);
                                 let to_read = (avail as usize).min(buf.len());
                                 match file.read(&mut buf[..to_read]) {
                                     Ok(0) => break,
                                     Ok(n) => {
-                                        let cur_epoch = shared_state_feeder
-                                            .lock()
-                                            .map(|s| s.seek_epoch)
-                                            .unwrap_or(0);
+                                        if pipe_flushing_feeder.load(Ordering::SeqCst) {
+                                            continue;
+                                        }
                                         let pkt = AudioPacket {
                                             pcm_bytes: buf[..n].to_vec(),
-                                            epoch: cur_epoch,
+                                            epoch: chunk_epoch,
                                             is_eof: false,
                                         };
                                         let mut pending = Some(pkt);

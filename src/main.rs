@@ -2568,11 +2568,19 @@ async fn run_gui(
                                     {
                                         state.load_request = Some(reload_path);
                                         resume_pos_on_reload = Some(state.current_seconds);
-                                        state.osd_text = Some(if pt_enabled {
-                                            "Bitstream Passthrough: ON (Exclusive)".to_string()
+                                        if state.surround_upmix.enabled && !pt_enabled {
+                                            state.osd_text = Some(
+                                                "🔊 Auto Surround & Height Upmix: ON (7.1.4 + Crossover EQ)"
+                                                    .to_string(),
+                                            );
                                         } else {
-                                            "Bitstream Passthrough: OFF (Shared Mode)".to_string()
-                                        });
+                                            state.osd_text = Some(if pt_enabled {
+                                                "Bitstream Passthrough: ON (Exclusive)".to_string()
+                                            } else {
+                                                "Bitstream Passthrough: OFF (Shared Mode)"
+                                                    .to_string()
+                                            });
+                                        }
                                         state.osd_timer = 3.0;
                                     }
                                 }
@@ -3203,6 +3211,10 @@ async fn run_gui(
                                     }
                                     EngineAction::SetPassthrough(val) => {
                                         state.passthrough_enabled = val;
+                                        if val {
+                                            state.surround_upmix.enabled = false;
+                                            state.force_stereo_downmix = false;
+                                        }
                                         state.passthrough_change_request = Some(val);
                                     }
                                     EngineAction::SetSplitRatio(val) => {
@@ -4326,8 +4338,9 @@ where
             app_state.lock().unwrap().is_paused = false;
         }
 
-        let load_path = {
+        let (load_path, resume_pos_on_reload) = {
             let mut state = app_state.lock().unwrap();
+            let mut resume_pos_on_reload: Option<f64> = None;
 
             let device_change = state.audio_device_change_request.take();
             if let Some(new_device) = device_change {
@@ -4342,7 +4355,36 @@ where
 
                 if !reload_path.is_empty() || is_mic_launch {
                     state.load_request = Some(reload_path);
+                    resume_pos_on_reload = Some(state.current_seconds);
                     state.osd_text = Some(format!("Audio Output: {}", new_device));
+                    state.osd_timer = 3.0;
+                }
+            }
+
+            if let Some(pt_enabled) = state.passthrough_change_request.take() {
+                let reload_path = if is_mic_launch {
+                    "".to_string()
+                } else if state.playlist_index < state.playlist.len() {
+                    state.playlist[state.playlist_index].clone()
+                } else {
+                    state.song_title.clone()
+                };
+
+                if (!reload_path.is_empty() && state.file_loaded) || is_mic_launch {
+                    state.load_request = Some(reload_path);
+                    resume_pos_on_reload = Some(state.current_seconds);
+                    if state.surround_upmix.enabled && !pt_enabled {
+                        state.osd_text = Some(
+                            "🔊 Auto Surround & Height Upmix: ON (7.1.4 + Crossover EQ)"
+                                .to_string(),
+                        );
+                    } else {
+                        state.osd_text = Some(if pt_enabled {
+                            "Bitstream Passthrough: ON (Exclusive)".to_string()
+                        } else {
+                            "Bitstream Passthrough: OFF (Shared Mode)".to_string()
+                        });
+                    }
                     state.osd_timer = 3.0;
                 }
             }
@@ -4374,7 +4416,7 @@ where
                 }
             }
 
-            state.load_request.take()
+            (state.load_request.take(), resume_pos_on_reload)
         };
 
         if let Some(path) = load_path {
@@ -4448,6 +4490,13 @@ where
                         crate::lyrics::load_lyrics_for_file(&path).map(std::sync::Arc::new)
                     };
                     state.track_ended = false;
+                    if let Some(pos) = resume_pos_on_reload
+                        && pos > 0.1
+                    {
+                        state.current_seconds = pos;
+                        state.seek_request = Some(pos);
+                        state.seek_epoch += 1;
+                    }
                     active_stream = Some(stream);
                 } else {
                     let mut state = app_state.lock().unwrap();
@@ -4703,7 +4752,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, apply_gamepad_stick_panel_resize, clamp_panel_split_ratio,
+        AppState, Args, Parser, apply_gamepad_stick_panel_resize, clamp_panel_split_ratio,
         clamp_window_geometry_to_monitor, extract_rusttracker_shortcut_appids,
         provision_steam_shortcut_artwork_in_root, upsert_rusttracker_shortcut_in_vdf,
     };
@@ -4931,5 +4980,20 @@ mod tests {
         state.toggle_surround_upmix();
         assert!(!state.surround_upmix.enabled);
         assert_eq!(state.num_channels, 2);
+
+        // Verify enabling surround upmix while bitstream passthrough is active exits bitstream mode
+        state.passthrough_enabled = true;
+        state.stats.bitstream_active = true;
+        state.raw_channel_vus = vec![0.1; 6];
+        state.set_surround_upmix(true);
+        assert!(state.surround_upmix.enabled);
+        assert!(!state.passthrough_enabled);
+        assert_eq!(state.passthrough_change_request, Some(false));
+        assert_eq!(state.num_channels, 12);
+
+        // Verify disabling surround upmix restores intrinsic channel count from raw_channel_vus
+        state.set_surround_upmix(false);
+        assert!(!state.surround_upmix.enabled);
+        assert_eq!(state.num_channels, 6);
     }
 }

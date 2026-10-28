@@ -1297,6 +1297,12 @@ impl AppState {
         self.surround_upmix.enabled = enabled;
         if enabled {
             self.force_stereo_downmix = false;
+            if self.passthrough_enabled || self.stats.bitstream_active {
+                self.passthrough_enabled = false;
+                if self.file_loaded && self.stats.bitstream_active {
+                    self.passthrough_change_request = Some(false);
+                }
+            }
             self.num_channels = 12;
             if self.file_loaded {
                 self.show_hud = true;
@@ -1309,6 +1315,8 @@ impl AppState {
         } else {
             self.num_channels = if let Some(tc) = self.tracker_channels {
                 tc + 2
+            } else if !self.raw_channel_vus.is_empty() && self.raw_channel_vus.len() != 12 {
+                self.raw_channel_vus.len() as i32
             } else {
                 self.hardware_channels.max(2)
             };

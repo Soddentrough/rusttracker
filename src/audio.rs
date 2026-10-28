@@ -120,6 +120,15 @@ impl BiquadFilter {
         self.b2 = coeffs.b2;
         self.a1 = coeffs.a1;
         self.a2 = coeffs.a2;
+        if (self.b0 - 1.0).abs() < 1e-6
+            && self.b1.abs() < 1e-6
+            && self.b2.abs() < 1e-6
+            && self.a1.abs() < 1e-6
+            && self.a2.abs() < 1e-6
+        {
+            self.z1 = 0.0;
+            self.z2 = 0.0;
+        }
     }
 
     /// 2nd-order Linkwitz-Riley (Q = 0.5) or general RBJ Low-Pass filter.
@@ -421,6 +430,28 @@ impl SurroundUpmixerDsp {
         }
     }
 
+    /// Apply the 5-band parametric/shelf EQ cascade to a stereo `(L, R)` pair.
+    /// When all 5 EQ bands are flat (`|gain_db| < 1e-3`), returns `(l_in, r_in)` untouched
+    /// so stereo playback on 2-channel speakers has zero tonal shift.
+    #[inline(always)]
+    pub fn process_stereo_eq(
+        &mut self,
+        l_in: f32,
+        r_in: f32,
+        cfg: &crate::state::SurroundUpmixConfig,
+    ) -> (f32, f32) {
+        if cfg.band_gains_db.iter().all(|&g| g.abs() < 1e-3) {
+            return (l_in, r_in);
+        }
+        let mut l_eq = l_in;
+        let mut r_eq = r_in;
+        for (el, er) in self.eq_l.iter_mut().zip(self.eq_r.iter_mut()) {
+            l_eq = el.process(l_eq);
+            r_eq = er.process(r_eq);
+        }
+        (Self::soft_limit(l_eq), Self::soft_limit(r_eq))
+    }
+
     /// Process a stereo (L, R) frame into 12 discrete 7.1.4 spatial channels:
     /// `[0:FL, 1:FR, 2:FC, 3:LFE, 4:SL, 5:SR, 6:RL, 7:RR, 8:TFL, 9:TFR, 10:TRL, 11:TRR]`.
     #[inline(always)]
@@ -430,14 +461,18 @@ impl SurroundUpmixerDsp {
         r_in: f32,
         cfg: &crate::state::SurroundUpmixConfig,
     ) -> [f32; 12] {
-        // 1. Apply 5-band parametric/shelf EQ cascade to Left and Right channels
-        let mut l_eq = l_in;
-        let mut r_eq = r_in;
-        for (el, er) in self.eq_l.iter_mut().zip(self.eq_r.iter_mut()) {
-            l_eq = el.process(l_eq);
-            r_eq = er.process(r_eq);
-        }
+        let (l_eq, r_eq) = self.process_stereo_eq(l_in, r_in, cfg);
+        self.process_stereo_to_7_1_4_from_eq(l_eq, r_eq, cfg)
+    }
 
+    /// Process an already-EQ'd stereo `(l_eq, r_eq)` pair into 12 discrete 7.1.4 spatial channels.
+    #[inline(always)]
+    pub fn process_stereo_to_7_1_4_from_eq(
+        &mut self,
+        l_eq: f32,
+        r_eq: f32,
+        cfg: &crate::state::SurroundUpmixConfig,
+    ) -> [f32; 12] {
         // 2. Mid/Side decomposition & width shaping
         let mid = (l_eq + r_eq) * 0.5;
         let side = (l_eq - r_eq) * 0.5 * cfg.stereo_width.clamp(0.0, 2.0);
@@ -448,11 +483,13 @@ impl SurroundUpmixerDsp {
         let lfe_low = self.sub_lp.process(mid);
         let lfe = Self::soft_limit(lfe_low * cfg.lfe_level);
 
-        // 4. Linkwitz-Riley crossover at height_crossover_hz splitting Bed vs. Height frequencies
+        // 4. Linkwitz-Riley 2nd-order (Q = 0.5) crossover at height_crossover_hz splitting Bed vs. Height.
+        // Invert high-pass polarity (-height_hp) so LP and HP sum in phase at the crossover frequency
+        // instead of creating a 180-degree phase-cancellation notch.
         let l_low = self.height_lp_l.process(l_eq);
-        let l_high = self.height_hp_l.process(l_wide);
+        let l_high = -self.height_hp_l.process(l_wide);
         let r_low = self.height_lp_r.process(r_eq);
-        let r_high = self.height_hp_r.process(r_wide);
+        let r_high = -self.height_hp_r.process(r_wide);
 
         // 5. Left/Right Hemisphere Bed Routing + Preferential High-Frequency Height Routing
         let high_bleed = cfg.surround_high_bleed.clamp(0.0, 1.0);
@@ -529,20 +566,12 @@ pub fn map_7_1_4_channel_to_hardware(
 ) -> f32 {
     let [fl, fr, fc, lfe, sl, sr, rl, rr, tfl, tfr, trl, trr] = *spatial;
     let s = match hardware_channels {
-        1 => {
-            ((fl + fr) * 0.5
-                + fc * 0.5
-                + lfe * 0.35
-                + (sl + sr + rl + rr) * 0.25
-                + (tfl + tfr + trl + trr) * 0.25)
-                * 0.55
-        }
+        1 => (fl + fr) * 0.5,
         2 => {
-            let c_gain = std::f32::consts::FRAC_1_SQRT_2;
             if out_channel == 0 {
-                (fl + fc * c_gain + lfe * 0.55 + (sl + rl) * 0.55 + (tfl + trl) * 0.65) * 0.56
+                fl
             } else {
-                (fr + fc * c_gain + lfe * 0.55 + (sr + rr) * 0.55 + (tfr + trr) * 0.65) * 0.56
+                fr
             }
         }
         4 => {
@@ -611,6 +640,64 @@ fn is_relevant_audio_device(name: &str) -> bool {
     true
 }
 
+pub fn format_cpal_device_name(desc: &cpal::DeviceDescription) -> String {
+    #[cfg(target_os = "windows")]
+    if let Some(friendly) = desc.extended().first()
+        && !friendly.trim().is_empty()
+    {
+        return friendly.clone();
+    }
+    desc.name().to_string()
+}
+
+pub fn cpal_device_matches_name(desc: &cpal::DeviceDescription, target: &str) -> bool {
+    let formatted = format_cpal_device_name(desc);
+    formatted == target
+        || desc.name() == target
+        || formatted.eq_ignore_ascii_case(target)
+        || desc.name().eq_ignore_ascii_case(target)
+}
+
+pub type OutputConfigRankKey = (
+    std::cmp::Reverse<bool>,
+    std::cmp::Reverse<bool>,
+    std::cmp::Reverse<bool>,
+    std::cmp::Reverse<bool>,
+    std::cmp::Reverse<u16>,
+);
+
+#[allow(clippy::too_many_arguments)]
+pub fn rank_output_config_key(
+    channels: u16,
+    min_rate: u32,
+    max_rate: u32,
+    sample_format: cpal::SampleFormat,
+    target_channels: u16,
+    target_rate: u32,
+    surround_upmix_enabled: bool,
+    force_stereo: bool,
+) -> OutputConfigRankKey {
+    let ch_match = if surround_upmix_enabled && !force_stereo {
+        (6..=12).contains(&channels)
+    } else {
+        channels == target_channels
+    };
+    let stereo = channels >= 2;
+    let rate_match = min_rate <= target_rate && max_rate >= target_rate;
+    // Prefer IEEE 32-bit float (F32) over 16-bit integer (I16):
+    // On Windows WASAPI, cpal maps F32 to WAVE_FORMAT_EXTENSIBLE (KSDATAFORMAT_SUBTYPE_IEEE_FLOAT),
+    // which is required by Shared Mode for >2ch (5.1/7.1) endpoints and avoids f32->i16->f32 quantization.
+    let is_f32 = sample_format == cpal::SampleFormat::F32;
+
+    (
+        std::cmp::Reverse(ch_match),
+        std::cmp::Reverse(stereo),
+        std::cmp::Reverse(rate_match),
+        std::cmp::Reverse(is_f32),
+        std::cmp::Reverse(channels),
+    )
+}
+
 pub fn get_available_audio_devices(mic: bool) -> Vec<String> {
     let host = cpal::default_host();
     let devices = if mic {
@@ -623,8 +710,8 @@ pub fn get_available_audio_devices(mic: bool) -> Vec<String> {
     if let Ok(devices) = devices {
         for d in devices {
             if let Ok(desc) = d.description() {
-                let name = desc.name().to_string();
-                if is_relevant_audio_device(&name) {
+                let name = format_cpal_device_name(&desc);
+                if is_relevant_audio_device(&name) && !names.contains(&name) {
                     names.push(name);
                 }
             }
@@ -640,7 +727,11 @@ pub fn get_default_audio_device_name(mic: bool) -> Option<String> {
     } else {
         host.default_output_device()
     };
-    default_device.and_then(|d| d.description().ok().map(|desc| desc.name().to_string()))
+    default_device.and_then(|d| {
+        d.description()
+            .ok()
+            .map(|desc| format_cpal_device_name(&desc))
+    })
 }
 
 pub fn calculate_power_of_two_window_size(sample_rate: u32) -> usize {
@@ -907,8 +998,12 @@ pub fn spawn_dsp_thread(
 
                 state.raw_channel_vus.clear();
                 state.raw_channel_vus.extend_from_slice(&msg.channel_vus);
-                if !msg.channel_vus.is_empty() && state.surround_upmix.enabled {
-                    state.num_channels = msg.channel_vus.len() as i32;
+                if !msg.channel_vus.is_empty() {
+                    state.num_channels = if state.surround_upmix.enabled {
+                        12
+                    } else {
+                        msg.channel_vus.len() as i32
+                    };
                 }
 
                 if !msg.channel_audio_data.is_empty() {
@@ -4818,8 +4913,19 @@ pub fn start_audio_thread(
                 | "truehd"
                 | "mlp"
         );
-        let passthrough = shared_state.lock().unwrap().passthrough_enabled;
-        let should_try_bitstream = if passthrough && can_bitstream {
+        let (passthrough, surround_upmix_enabled, force_stereo) = {
+            let s = shared_state.lock().unwrap();
+            (
+                s.passthrough_enabled,
+                s.surround_upmix.enabled,
+                s.force_stereo_downmix,
+            )
+        };
+        let should_try_bitstream = if passthrough
+            && can_bitstream
+            && !surround_upmix_enabled
+            && !force_stereo
+        {
             true
         } else if can_bitstream {
             match load_audio_source(file_path) {
@@ -4953,15 +5059,11 @@ pub fn start_audio_thread(
         let s = shared_state.lock().unwrap();
         (s.force_stereo_downmix, s.surround_upmix.enabled)
     };
-    let mut target_channels = audio_source_opt
+    let source_channels = audio_source_opt
         .as_mut()
         .map(|a| a.get_num_channels() as u16)
         .unwrap_or(2);
-    if force_stereo {
-        target_channels = 2;
-    } else if surround_upmix_enabled && target_channels < 12 {
-        target_channels = 12;
-    }
+    let target_channels = if force_stereo { 2 } else { source_channels };
 
     if mic {
         let selected_device_name = {
@@ -4973,12 +5075,11 @@ pub fn start_audio_thread(
             && let Ok(devices) = host.input_devices()
         {
             for d in devices {
-                if let Ok(desc) = d.description() {
-                    let d_name = desc.name();
-                    if d_name == *name {
-                        dev = Some(d);
-                        break;
-                    }
+                if let Ok(desc) = d.description()
+                    && cpal_device_matches_name(&desc, name)
+                {
+                    dev = Some(d);
+                    break;
                 }
             }
         }
@@ -4993,14 +5094,19 @@ pub fn start_audio_thread(
             let supported_configs_range = device
                 .supported_input_configs()
                 .context("error while querying input configs")?;
-            supported_configs_range
-                .into_iter()
-                .find(|c| {
+            let mut input_configs: Vec<_> = supported_configs_range
+                .filter(|c| {
                     c.max_sample_rate() >= target_rate
                         && c.min_sample_rate() <= target_rate
                         && (c.sample_format() == cpal::SampleFormat::F32
                             || c.sample_format() == cpal::SampleFormat::I16)
                 })
+                .collect();
+            input_configs
+                .sort_by_key(|c| std::cmp::Reverse(c.sample_format() == cpal::SampleFormat::F32));
+            input_configs
+                .into_iter()
+                .next()
                 .map(|c| c.with_sample_rate(target_rate))
                 .or_else(|| device.default_input_config().ok())
                 .context("No supported config?!")?
@@ -5066,7 +5172,7 @@ pub fn start_audio_thread(
             // that bypasses PulseAudio/PipeWire and fails with ALSA `unable to open slave` lock errors.
             if let Some(default_dev) = host.default_output_device()
                 && let Ok(desc) = default_dev.description()
-                && desc.name() == *name
+                && cpal_device_matches_name(&desc, name)
             {
                 candidates.push(default_dev);
                 is_default = true;
@@ -5075,7 +5181,7 @@ pub fn start_audio_thread(
             if !is_default && let Ok(devices) = host.output_devices() {
                 for d in devices {
                     if let Ok(desc) = d.description()
-                        && desc.name() == *name
+                        && cpal_device_matches_name(&desc, name)
                     {
                         candidates.push(d);
                         break;
@@ -5099,7 +5205,7 @@ pub fn start_audio_thread(
                 for d in devices {
                     if let Some(default_dev) = host.default_output_device()
                         && let (Ok(desc1), Ok(desc2)) = (d.description(), default_dev.description())
-                        && desc1.name() == desc2.name()
+                        && format_cpal_device_name(&desc1) == format_cpal_device_name(&desc2)
                     {
                         continue;
                     }
@@ -5117,7 +5223,7 @@ pub fn start_audio_thread(
         for device in devices_to_try {
             let device_name = device
                 .description()
-                .map(|desc| desc.name().to_string())
+                .map(|desc| format_cpal_device_name(&desc))
                 .unwrap_or_else(|_| "Unknown Device".to_string());
 
             // Reuse initial audio source for the first attempt, or reload if retrying on fallback device
@@ -5132,10 +5238,28 @@ pub fn start_audio_thread(
             };
 
             let result = (|| -> Result<(cpal::Stream, Arc<std::sync::atomic::AtomicBool>)> {
-                let supported_config = {
-                    let supported_configs_range = device
-                        .supported_output_configs()
-                        .context("error while querying output configs")?;
+                let default_device_channels = device
+                    .default_output_config()
+                    .ok()
+                    .map(|c| c.channels())
+                    .unwrap_or(2);
+                // Only request >2 output channels for surround upmix when the OS audio endpoint
+                // is actually configured for multi-channel surround (>2ch). On standard stereo
+                // speakers (default_device_channels <= 2), virtual plugins such as ALSA `default`
+                // (PipeWire/PulseAudio) advertise 1..=32 virtual channels that lack a 7.1.4 channel
+                // map; keeping hardware_channels = 2 preserves bit-transparent stereo output.
+                let upmix_to_multichannel_hw =
+                    surround_upmix_enabled && default_device_channels > 2;
+                let device_target_channels = if force_stereo {
+                    2
+                } else if upmix_to_multichannel_hw && target_channels < 12 {
+                    12
+                } else {
+                    target_channels
+                };
+
+                let mut candidate_configs: Vec<cpal::SupportedStreamConfig> = Vec::new();
+                if let Ok(supported_configs_range) = device.supported_output_configs() {
                     let mut configs: Vec<_> = supported_configs_range
                         .filter(|c| {
                             c.sample_format() == cpal::SampleFormat::F32
@@ -5144,107 +5268,121 @@ pub fn start_audio_thread(
                         .collect();
 
                     configs.sort_by_key(|c| {
-                        let ch_match = if surround_upmix_enabled && !force_stereo {
-                            c.channels() >= 6 && c.channels() <= 12
-                        } else {
-                            c.channels() == target_channels
-                        };
-                        let stereo = c.channels() >= 2;
-                        let rate_match = c.min_sample_rate() <= target_rate
-                            && c.max_sample_rate() >= target_rate;
-
-                        (
-                            std::cmp::Reverse(ch_match),
-                            std::cmp::Reverse(stereo),
-                            std::cmp::Reverse(rate_match),
-                            std::cmp::Reverse(c.channels()),
+                        rank_output_config_key(
+                            c.channels(),
+                            c.min_sample_rate(),
+                            c.max_sample_rate(),
+                            c.sample_format(),
+                            device_target_channels,
+                            target_rate,
+                            upmix_to_multichannel_hw,
+                            force_stereo,
                         )
                     });
 
-                    configs
-                        .into_iter()
-                        .next()
-                        .map(|c| {
-                            let rate = if c.min_sample_rate() <= target_rate
-                                && c.max_sample_rate() >= target_rate
-                            {
-                                target_rate
-                            } else {
-                                c.max_sample_rate()
-                            };
-                            c.with_sample_rate(rate)
-                        })
-                        .or_else(|| device.default_output_config().ok())
-                        .context("No supported config?!")?
-                };
-
-                let config: cpal::StreamConfig = supported_config.clone().into();
-                let (tx, rx) = bounded::<DspMessage>(32);
-
-                let audio_source = attempt_audio_source_opt
-                    .as_mut()
-                    .ok_or_else(|| anyhow::anyhow!("No audio source available"))?;
-
-                {
-                    let mut state = shared_state_closure.lock().unwrap();
-                    populate_state_from_audio_source(
-                        &mut state,
-                        audio_source.as_mut(),
-                        config.channels as i32,
-                        config.sample_rate,
-                    );
+                    for c in configs {
+                        let rate = if c.min_sample_rate() <= target_rate
+                            && c.max_sample_rate() >= target_rate
+                        {
+                            target_rate
+                        } else {
+                            c.max_sample_rate()
+                        };
+                        let resolved = c.with_sample_rate(rate);
+                        if !candidate_configs.iter().any(|existing| {
+                            existing.channels() == resolved.channels()
+                                && existing.sample_rate() == resolved.sample_rate()
+                                && existing.sample_format() == resolved.sample_format()
+                        }) {
+                            candidate_configs.push(resolved);
+                            if candidate_configs.len() >= 4 {
+                                break;
+                            }
+                        }
+                    }
                 }
 
-                let max_frequency = { shared_state_closure.lock().unwrap().max_frequency };
-                let window_size = calculate_power_of_two_window_size(config.sample_rate);
+                if let Ok(default_cfg) = device.default_output_config()
+                    && matches!(
+                        default_cfg.sample_format(),
+                        cpal::SampleFormat::F32 | cpal::SampleFormat::I16 | cpal::SampleFormat::U16
+                    )
+                    && !candidate_configs.iter().any(|existing| {
+                        existing.channels() == default_cfg.channels()
+                            && existing.sample_rate() == default_cfg.sample_rate()
+                            && existing.sample_format() == default_cfg.sample_format()
+                    })
+                {
+                    candidate_configs.push(default_cfg);
+                }
 
-                spawn_dsp_thread(
-                    rx,
-                    shared_state_closure.clone(),
-                    config.sample_rate,
-                    max_frequency,
-                    window_size,
-                );
+                if candidate_configs.is_empty() {
+                    return Err(anyhow::anyhow!("No supported output config on device"));
+                }
 
-                let (stream, stop_token) = match supported_config.sample_format() {
-                    cpal::SampleFormat::F32 => run::<f32>(
-                        &device,
-                        &config,
-                        &mut attempt_audio_source_opt,
-                        shared_state_closure.clone(),
-                        tx,
-                        config.sample_rate,
-                        max_frequency,
-                        window_size,
-                        file_path,
-                    ),
-                    cpal::SampleFormat::I16 => run::<i16>(
-                        &device,
-                        &config,
-                        &mut attempt_audio_source_opt,
-                        shared_state_closure.clone(),
-                        tx,
-                        config.sample_rate,
-                        max_frequency,
-                        window_size,
-                        file_path,
-                    ),
-                    cpal::SampleFormat::U16 => run::<u16>(
-                        &device,
-                        &config,
-                        &mut attempt_audio_source_opt,
-                        shared_state_closure.clone(),
-                        tx,
-                        config.sample_rate,
-                        max_frequency,
-                        window_size,
-                        file_path,
-                    ),
-                    _ => return Err(anyhow::anyhow!("Unsupported sample format")),
-                }?;
+                let mut last_cfg_err = anyhow::anyhow!("No output config succeeded on device");
+                for supported_config in candidate_configs {
+                    let config: cpal::StreamConfig = supported_config.clone().into();
+                    let (tx, rx) = bounded::<DspMessage>(32);
+                    let window_size = calculate_power_of_two_window_size(config.sample_rate);
 
-                stream.play().context("Failed to play stream")?;
-                Ok((stream, stop_token))
+                    let stream_res = match supported_config.sample_format() {
+                        cpal::SampleFormat::F32 => run::<f32>(
+                            &device,
+                            &config,
+                            &mut attempt_audio_source_opt,
+                            shared_state_closure.clone(),
+                            tx,
+                            config.sample_rate,
+                            0.0,
+                            window_size,
+                            file_path,
+                        ),
+                        cpal::SampleFormat::I16 => run::<i16>(
+                            &device,
+                            &config,
+                            &mut attempt_audio_source_opt,
+                            shared_state_closure.clone(),
+                            tx,
+                            config.sample_rate,
+                            0.0,
+                            window_size,
+                            file_path,
+                        ),
+                        cpal::SampleFormat::U16 => run::<u16>(
+                            &device,
+                            &config,
+                            &mut attempt_audio_source_opt,
+                            shared_state_closure.clone(),
+                            tx,
+                            config.sample_rate,
+                            0.0,
+                            window_size,
+                            file_path,
+                        ),
+                        _ => Err(anyhow::anyhow!("Unsupported sample format")),
+                    };
+
+                    match stream_res {
+                        Ok((stream, stop_token)) => {
+                            let max_frequency =
+                                { shared_state_closure.lock().unwrap().max_frequency };
+                            spawn_dsp_thread(
+                                rx,
+                                shared_state_closure.clone(),
+                                config.sample_rate,
+                                max_frequency,
+                                window_size,
+                            );
+                            return Ok((stream, stop_token));
+                        }
+                        Err(e) => {
+                            last_cfg_err = e;
+                        }
+                    }
+                }
+
+                Err(last_cfg_err)
             })();
 
             match result {
@@ -6840,8 +6978,8 @@ fn run_dummy(
                         upmix_peak_vus = [0.0f32; 12];
                         let src_ch = (chunk.spatial_channels as usize).max(1);
                         for i in 0..to_copy {
-                            let frame_slice = &chunk.samples
-                                [i * hardware_channels..(i + 1) * hardware_channels];
+                            let frame_slice =
+                                &chunk.samples[i * hardware_channels..(i + 1) * hardware_channels];
                             let (l_in, r_in) = extract_stereo_pair_from_frame(frame_slice, src_ch);
                             let spatial_12 =
                                 upmixer_dsp.process_stereo_to_7_1_4(l_in, r_in, &upmix_cfg);
@@ -6856,15 +6994,9 @@ fn run_dummy(
                             let mono = (spatial_12[0] + spatial_12[1]) * 0.38
                                 + spatial_12[2] * 0.25
                                 + spatial_12[3] * 0.32
-                                + (spatial_12[4]
-                                    + spatial_12[5]
-                                    + spatial_12[6]
-                                    + spatial_12[7])
+                                + (spatial_12[4] + spatial_12[5] + spatial_12[6] + spatial_12[7])
                                     * 0.14
-                                + (spatial_12[8]
-                                    + spatial_12[9]
-                                    + spatial_12[10]
-                                    + spatial_12[11])
+                                + (spatial_12[8] + spatial_12[9] + spatial_12[10] + spatial_12[11])
                                     * 0.16;
                             fft_buffer[fft_index] = mono.clamp(-1.0, 1.0);
                             fft_index = (fft_index + 1) % window_size;
@@ -6901,7 +7033,10 @@ fn run_dummy(
                     let (dsp_channels, vu_slice): (usize, &[f32]) = if upmix_cfg.enabled {
                         (12, &upmix_peak_vus)
                     } else {
-                        (hardware_channels, &chunk.channel_vus)
+                        (
+                            hardware_channels.min(chunk.channel_vus.len().max(1)),
+                            &chunk.channel_vus,
+                        )
                     };
 
                     let msg = build_recycled_dsp_message(
@@ -7197,17 +7332,30 @@ where
                             let frame_slice = &chunk.samples[src_frame_idx * hardware_channels
                                 ..(src_frame_idx + 1) * hardware_channels];
                             let (l_in, r_in) = extract_stereo_pair_from_frame(frame_slice, src_ch);
+                            let (l_eq, r_eq) =
+                                upmixer_dsp.process_stereo_eq(l_in, r_in, &upmix_cfg);
                             let spatial_12 =
-                                upmixer_dsp.process_stereo_to_7_1_4(l_in, r_in, &upmix_cfg);
+                                upmixer_dsp.process_stereo_to_7_1_4_from_eq(l_eq, r_eq, &upmix_cfg);
 
-                            for c in 0..hardware_channels {
-                                let out_s = map_7_1_4_channel_to_hardware(
-                                    &spatial_12,
-                                    hardware_channels,
-                                    c,
-                                );
-                                data[dst_frame_idx * hardware_channels + c] =
-                                    T::from_sample(out_s);
+                            if hardware_channels == 1 {
+                                let out_s = ((l_eq + r_eq) * 0.5).clamp(-1.0, 1.0);
+                                data[dst_frame_idx] = T::from_sample(out_s);
+                            } else if hardware_channels == 2 {
+                                // Standard stereo speakers: output the stereo pair directly
+                                // (100% bit-transparent when the 5-band EQ is at 0 dB, or pure EQ
+                                // when EQ bands are adjusted) without Haas delay comb-filtering.
+                                data[dst_frame_idx * 2] = T::from_sample(l_eq.clamp(-1.0, 1.0));
+                                data[dst_frame_idx * 2 + 1] = T::from_sample(r_eq.clamp(-1.0, 1.0));
+                            } else {
+                                for c in 0..hardware_channels {
+                                    let out_s = map_7_1_4_channel_to_hardware(
+                                        &spatial_12,
+                                        hardware_channels,
+                                        c,
+                                    );
+                                    data[dst_frame_idx * hardware_channels + c] =
+                                        T::from_sample(out_s);
+                                }
                             }
 
                             for ((&s, peak_vu), ch_buf) in spatial_12
@@ -7219,19 +7367,7 @@ where
                                 ch_buf[fft_index] = s;
                             }
 
-                            let mono = (spatial_12[0] + spatial_12[1]) * 0.38
-                                + spatial_12[2] * 0.25
-                                + spatial_12[3] * 0.32
-                                + (spatial_12[4]
-                                    + spatial_12[5]
-                                    + spatial_12[6]
-                                    + spatial_12[7])
-                                    * 0.14
-                                + (spatial_12[8]
-                                    + spatial_12[9]
-                                    + spatial_12[10]
-                                    + spatial_12[11])
-                                    * 0.16;
+                            let mono = (l_eq + r_eq) * 0.5;
                             fft_buffer[fft_index] = mono.clamp(-1.0, 1.0);
                             fft_index = (fft_index + 1) % window_size;
                         }
@@ -7282,7 +7418,10 @@ where
                 let (dsp_channels, vu_slice): (usize, &[f32]) = if upmix_cfg.enabled {
                     (12, &upmix_peak_vus)
                 } else {
-                    (hardware_channels, &last_channel_vus)
+                    (
+                        hardware_channels.min(last_channel_vus.len().max(1)),
+                        &last_channel_vus,
+                    )
                 };
                 let msg = build_recycled_dsp_message(
                     &recycle_rx,
@@ -7334,8 +7473,22 @@ where
         None,
     )?;
 
-    // Only take the audio source once stream creation has succeeded
-    let audio_source = audio_source_opt.take().unwrap();
+    stream.play().context("Failed to play stream")?;
+
+    // Only populate state and take the audio source once stream creation and play() have succeeded
+    let mut audio_source = audio_source_opt
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("No audio source available"))?;
+    {
+        let mut state = shared_state.lock().unwrap();
+        populate_state_from_audio_source(
+            &mut state,
+            audio_source.as_mut(),
+            config.channels as i32,
+            config.sample_rate,
+        );
+    }
+
     spawn_media_decoder_threads(
         audio_source,
         shared_state,
@@ -7918,6 +8071,84 @@ mod tests {
         assert!(
             peak_hi[8] < 1e-4,
             "TFL must remain silent for pure right input"
+        );
+    }
+
+    #[test]
+    fn test_rank_output_config_key_prioritizes_f32_over_i16_on_wasapi_configs() {
+        // Simulate cpal WASAPI supported_formats() enumeration order: I16 appears before F32
+        let mut wasapi_configs = [
+            (6u16, 48_000u32, 48_000u32, cpal::SampleFormat::I16),
+            (6u16, 48_000u32, 48_000u32, cpal::SampleFormat::F32),
+            (6u16, 44_100u32, 44_100u32, cpal::SampleFormat::I16),
+            (6u16, 44_100u32, 44_100u32, cpal::SampleFormat::F32),
+        ];
+        wasapi_configs.sort_by_key(|&(ch, min_r, max_r, fmt)| {
+            rank_output_config_key(ch, min_r, max_r, fmt, 6, 48_000, false, false)
+        });
+        assert_eq!(
+            wasapi_configs[0],
+            (6, 48_000, 48_000, cpal::SampleFormat::F32),
+            "F32 must be selected before I16 so Windows WASAPI uses WAVE_FORMAT_EXTENSIBLE on 5.1/7.1 endpoints"
+        );
+
+        // Also verify stereo (2ch) endpoint with surround upmix enabled prefers F32 at target rate
+        let mut stereo_configs = [
+            (2u16, 48_000u32, 48_000u32, cpal::SampleFormat::I16),
+            (2u16, 48_000u32, 48_000u32, cpal::SampleFormat::F32),
+        ];
+        stereo_configs.sort_by_key(|&(ch, min_r, max_r, fmt)| {
+            rank_output_config_key(ch, min_r, max_r, fmt, 12, 48_000, true, false)
+        });
+        assert_eq!(
+            stereo_configs[0].3,
+            cpal::SampleFormat::F32,
+            "Stereo endpoint must also prefer F32 over I16"
+        );
+    }
+
+    #[test]
+    fn test_surround_upmixer_stereo_speakers_bit_transparent_and_crossover_phase() {
+        let sample_rate = 48_000;
+        let mut dsp = SurroundUpmixerDsp::new(sample_rate);
+        let cfg = crate::state::SurroundUpmixConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        dsp.sync_config(&cfg, sample_rate);
+
+        // 1. On standard 2-channel stereo speakers with flat 0 dB EQ, stereo output must be
+        // 100% bit-identical to the input stereo pair (zero comb filtering or coloration).
+        let mut crossover_peak_fl = 0.0f32;
+        for n in 0..2048 {
+            let t = n as f32 / sample_rate as f32;
+            // Drive right at the 2800 Hz Linkwitz-Riley height crossover frequency on L
+            let l_in = (2.0 * std::f32::consts::PI * cfg.height_crossover_hz * t).sin() * 0.95;
+            let r_in = (2.0 * std::f32::consts::PI * 440.0 * t).cos() * 0.95;
+            let (l_eq, r_eq) = dsp.process_stereo_eq(l_in, r_in, &cfg);
+            assert_eq!(
+                l_eq.to_bits(),
+                l_in.to_bits(),
+                "Flat 0dB EQ must be bit-identical on Left channel for stereo speakers"
+            );
+            assert_eq!(
+                r_eq.to_bits(),
+                r_in.to_bits(),
+                "Flat 0dB EQ must be bit-identical on Right channel for stereo speakers"
+            );
+
+            let spatial = dsp.process_stereo_to_7_1_4_from_eq(l_eq, r_eq, &cfg);
+            if n > 512 {
+                crossover_peak_fl = crossover_peak_fl.max(spatial[0].abs());
+            }
+        }
+
+        // 2. Verify that at the exact height_crossover_hz (2800 Hz), FL does NOT suffer a
+        // 180-degree Linkwitz-Riley phase-cancellation notch when LP and HP are recombined.
+        assert!(
+            crossover_peak_fl > 0.70,
+            "FL must not have a phase-cancellation notch at height_crossover_hz (got peak {})",
+            crossover_peak_fl
         );
     }
 }
