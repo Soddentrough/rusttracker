@@ -76,6 +76,14 @@ struct Args {
 
     #[arg(
         long,
+        visible_alias = "upmix",
+        default_value_t = false,
+        help = "Enable automatic 7.1.4 surround & height upmixing with configurable crossover EQ"
+    )]
+    surround_upmix: bool,
+
+    #[arg(
+        long,
         default_value_t = false,
         help = "Headlessly register RustTracker as a Non-Steam shortcut with SteamOS Home Screen artwork and exit (ideal for SSH deployment)"
     )]
@@ -208,6 +216,9 @@ fn main() -> Result<(), Box<dyn Error>> {
         state.playlist = args.file.clone();
         if args.passthrough {
             state.passthrough_enabled = true;
+        }
+        if args.surround_upmix {
+            state.set_surround_upmix(true);
         }
         state.playlist_index = 0;
 
@@ -2125,6 +2136,10 @@ async fn run_gui(
                                             let mut state = app_state.lock().unwrap();
                                             state.gpu_fft = !state.gpu_fft;
                                         }
+                                        WinitKeyCode::KeyU | WinitKeyCode::KeyE => {
+                                            let mut state = app_state.lock().unwrap();
+                                            state.toggle_surround_upmix();
+                                        }
                                         WinitKeyCode::KeyC => {
                                             let mut state = app_state.lock().unwrap();
                                             if state.visualizer_mode == 20 {
@@ -3172,10 +3187,19 @@ async fn run_gui(
                                     }
                                     EngineAction::SetForceStereo(val) => {
                                         state.force_stereo_downmix = val;
+                                        if val {
+                                            state.surround_upmix.enabled = false;
+                                        }
                                         if state.file_loaded {
                                             state.passthrough_change_request =
                                                 Some(state.passthrough_enabled);
                                         }
+                                    }
+                                    EngineAction::ToggleSurroundUpmix(val) => {
+                                        state.set_surround_upmix(val);
+                                    }
+                                    EngineAction::SetSurroundUpmix(cfg) => {
+                                        state.surround_upmix = cfg;
                                     }
                                     EngineAction::SetPassthrough(val) => {
                                         state.passthrough_enabled = val;
@@ -4084,6 +4108,11 @@ async fn run_gui(
                                     state.osd_text = Some(mode_name.to_string());
                                     state.osd_timer = 2.0;
                                 }
+                                gilrs::Button::LeftThumb | gilrs::Button::RightThumb => {
+                                    // L3 / R3 thumbstick click: toggle Auto Surround & Height Upmix + Crossover EQ
+                                    let mut state = app_state.lock().unwrap();
+                                    state.toggle_surround_upmix();
+                                }
                                 gilrs::Button::North => {
                                     // 'Y' or Triangle
                                     let mut state = app_state.lock().unwrap();
@@ -4577,6 +4606,10 @@ where
                             state.tui_device_picker_cursor = idx;
                         }
                     }
+                    KeyCode::Char('u') | KeyCode::Char('e') => {
+                        let mut state = app_state.lock().unwrap();
+                        state.toggle_surround_upmix();
+                    }
                     KeyCode::Char('n') => {
                         let mut state = app_state.lock().unwrap();
                         if !state.playlist.is_empty()
@@ -4869,5 +4902,34 @@ mod tests {
             vec![3929032336]
         );
         let _ = std::fs::remove_dir_all(&tmp_root);
+    }
+
+    #[test]
+    fn test_cli_surround_upmix_flag_and_state_toggle() {
+        let args_long = Args::try_parse_from(["rusttracker", "--surround-upmix"]).unwrap();
+        assert!(args_long.surround_upmix);
+
+        let args_alias = Args::try_parse_from(["rusttracker", "--upmix"]).unwrap();
+        assert!(args_alias.surround_upmix);
+
+        let args_default = Args::try_parse_from(["rusttracker"]).unwrap();
+        assert!(!args_default.surround_upmix);
+
+        let mut state = AppState::new("Test Track".to_string());
+        state.force_stereo_downmix = true;
+        state.show_hud = false;
+        state.video_mode = 3;
+        state.file_loaded = true;
+
+        state.toggle_surround_upmix();
+        assert!(state.surround_upmix.enabled);
+        assert!(!state.force_stereo_downmix);
+        assert_eq!(state.num_channels, 12);
+        assert!(state.show_hud);
+        assert_eq!(state.video_mode, 0);
+
+        state.toggle_surround_upmix();
+        assert!(!state.surround_upmix.enabled);
+        assert_eq!(state.num_channels, 2);
     }
 }

@@ -76,6 +76,8 @@ pub enum EngineAction {
     SetAudioTrackVolume(usize, f32),
     SetAudioMixTracks(Vec<(usize, f32)>),
     ToggleVisPicker,
+    ToggleSurroundUpmix(bool),
+    SetSurroundUpmix(crate::state::SurroundUpmixConfig),
 }
 
 #[repr(C)]
@@ -6839,7 +6841,9 @@ impl VulkanEngine {
             smooth_time: self.play_time as f32,
             heatmap_row: self.heatmap_row,
             fft_channels: state.raw_audio_channels.len() as u32,
-            num_spatial_channels: if let Some(tc) = state.tracker_channels.filter(|&n| n > 0) {
+            num_spatial_channels: if state.surround_upmix.enabled {
+                state.channel_vus.len().min(16) as u32
+            } else if let Some(tc) = state.tracker_channels.filter(|&n| n > 0) {
                 (tc as u32).min(16)
             } else {
                 state.channel_vus.len().min(16) as u32
@@ -6913,12 +6917,15 @@ impl VulkanEngine {
 
         // 1. Populate UI Display Channels (may be visually remapped)
         let mut display_order: Vec<usize> = (0..ch_len).collect();
-        if state.tracker_channels.is_none() {
+        if state.tracker_channels.is_none() || state.surround_upmix.enabled {
             if ch_len == 6 {
                 display_order = vec![4, 0, 2, 3, 1, 5]; // Ls, L, C, LFE, R, Rs
             } else if ch_len == 8 {
                 // SMPTE 7.1: ch4=Ls(side), ch5=Rs(side), ch6=Lrs(rear), ch7=Rrs(rear)
                 display_order = vec![6, 4, 0, 2, 3, 1, 5, 7]; // Lrs, Ls, L, C, LFE, R, Rs, Rrs
+            } else if ch_len == 12 {
+                // 7.1.4 HUD display order matching ["Ltr", "Ltf", "Ls", "L", "C", "LFE", "R", "Rs", "Rtf", "Rtr", "Lrs", "Rrs"]
+                display_order = vec![10, 8, 4, 0, 2, 3, 1, 5, 9, 11, 6, 7];
             } else if ch_len == 16 {
                 // 16 channels: fan out symmetrically from C with LFE (3) positioned physically but skipped by shaders
                 display_order = vec![14, 12, 10, 8, 6, 4, 0, 2, 3, 1, 5, 7, 9, 11, 13, 15];
@@ -6945,7 +6952,10 @@ impl VulkanEngine {
                 smoothed
             }
         };
-        if let Some(num_tracks) = state.tracker_channels.filter(|&n| n > 0) {
+        if let Some(num_tracks) = state
+            .tracker_channels
+            .filter(|&n| n > 0 && !state.surround_upmix.enabled)
+        {
             // For tracker files, channel_vus is [L_Peak, Track1..N, R_Peak].
             // Map individual tracker tracks into spatial channels so surround/room visualizers
             // light up each speaker with its actual instrument track!
@@ -8194,6 +8204,7 @@ impl VulkanEngine {
                                 shortcut(ui, "q / esc", Some("Select"), "Quit");
                                 shortcut(ui, "f", Some("Start"), "Toggle Fullscreen");
                                 shortcut(ui, "g", Some("R2"), "Toggle GPU FFT");
+                                shortcut(ui, "u", Some("L3 / R3"), "Surround Upmix & EQ");
                                 shortcut(ui, "n / p", Some("L1 / R1"), "Prev / Next Track");
                                 shortcut(ui, "1-9", None, "Select Audio Track");
                                 shortcut(ui, "[ / ]", Some("L/R Stick"), "Scale Panels");
@@ -8555,6 +8566,7 @@ impl VulkanEngine {
                                                             kb_shortcut("q / esc", "Quit");
                                                             kb_shortcut("f", "Fullscreen");
                                                             kb_shortcut("g", "GPU FFT");
+                                                            kb_shortcut("u", "Surround Upmix");
                                                             kb_shortcut("1-9", "Audio Track");
                                                             kb_shortcut("n / p", "Prev/Next");
                                                             let ctrl_mod =
@@ -8649,6 +8661,7 @@ impl VulkanEngine {
                                                             gp_shortcut("Select", "Quit");
                                                             gp_shortcut("Start", "Fullscreen");
                                                             gp_shortcut("R2", "GPU FFT");
+                                                            gp_shortcut("L3 / R3", "Surround Upmix");
                                                             gp_shortcut("L1 / R1", "Prev/Next");
                                                         });
                                                 });
@@ -9022,6 +9035,23 @@ impl VulkanEngine {
                                                     EngineAction::SetForceStereo(force_stereo);
                                             }
 
+                                            let mut surround_upmix = state.surround_upmix.enabled;
+                                            if ui
+                                                .checkbox(
+                                                    &mut surround_upmix,
+                                                    egui::RichText::new(
+                                                        "Auto Surround & Height Upmix (L/R Side Fill + Height EQ Split)",
+                                                    )
+                                                    .size(12.5)
+                                                    .color(egui::Color32::from_rgb(130, 235, 255)),
+                                                )
+                                                .on_hover_text("Upmixes stereo and non-surround sources across all left/right surround speakers and splits high frequencies up to the height channels, replacing the top-middle Piano Roll with a live Configurable Crossover EQ.")
+                                                .changed()
+                                            {
+                                                engine_action =
+                                                    EngineAction::ToggleSurroundUpmix(surround_upmix);
+                                            }
+
                                             #[cfg(any(
                                                 target_os = "windows",
                                                 target_os = "linux"
@@ -9203,7 +9233,9 @@ impl VulkanEngine {
 
                                         // Label
                                         if num_channels <= 16 {
-                                            let label = if state.tracker_channels.is_some() {
+                                            let label = if state.tracker_channels.is_some()
+                                                && !state.surround_upmix.enabled
+                                            {
                                                 if i == 0 {
                                                     "L".to_string()
                                                 } else if i == num_channels - 1 {
@@ -9239,7 +9271,542 @@ impl VulkanEngine {
                                 }
                             };
 
-                            let render_col_heatmap = |col: &mut egui::Ui, out_heatmap_rect: &mut Option<egui::Rect>| {
+                            let render_col_heatmap = |col: &mut egui::Ui, out_heatmap_rect: &mut Option<egui::Rect>, engine_action: &mut EngineAction| {
+                                if state.surround_upmix.enabled {
+                                    // Swap out the Piano Roll / Pattern Heatmap with the Configurable Surround & Height Crossover EQ
+                                    *out_heatmap_rect = None;
+                                    let mut cfg = state.surround_upmix;
+                                    let mut cfg_changed = false;
+
+                                    if !is_portrait {
+                                        col.horizontal(|ui| {
+                                            ui.heading("Surround Crossover & EQ");
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                let off_btn = egui::Button::new(
+                                                    egui::RichText::new("✕ Off")
+                                                        .size(11.0)
+                                                        .strong()
+                                                        .color(egui::Color32::from_rgb(255, 200, 195)),
+                                                )
+                                                .fill(egui::Color32::from_rgb(62, 32, 36))
+                                                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(150, 75, 85)))
+                                                .corner_radius(4.0);
+                                                if ui
+                                                    .add(off_btn)
+                                                    .on_hover_text("Disable Auto Surround & Height Upmix and return to Piano Roll (Shortcut: 'u' / L3·R3)")
+                                                    .clicked()
+                                                {
+                                                    *engine_action = EngineAction::ToggleSurroundUpmix(false);
+                                                }
+                                                ui.add_space(4.0);
+                                                let reset_btn = egui::Button::new(
+                                                    egui::RichText::new("↺ Reset")
+                                                        .size(11.0)
+                                                        .strong()
+                                                        .color(egui::Color32::from_rgb(220, 230, 245)),
+                                                )
+                                                .fill(egui::Color32::from_rgb(35, 45, 62))
+                                                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(80, 105, 140)))
+                                                .corner_radius(4.0);
+                                                if ui
+                                                    .add(reset_btn)
+                                                    .on_hover_text("Reset EQ bands, crossovers, and speaker levels to defaults")
+                                                    .clicked()
+                                                {
+                                                    cfg.reset_tuning();
+                                                    cfg_changed = true;
+                                                }
+                                                ui.add_space(4.0);
+                                                ui.label(
+                                                    egui::RichText::new("● Height ↑")
+                                                        .size(10.5)
+                                                        .color(egui::Color32::from_rgb(110, 255, 110)),
+                                                );
+                                                ui.label(
+                                                    egui::RichText::new("● L/R Bed")
+                                                        .size(10.5)
+                                                        .color(egui::Color32::from_rgb(0, 215, 255)),
+                                                );
+                                                ui.label(
+                                                    egui::RichText::new("● LFE")
+                                                        .size(10.5)
+                                                        .color(egui::Color32::from_rgb(255, 105, 55)),
+                                                );
+                                            });
+                                        });
+                                        col.separator();
+                                    }
+
+                                    let controls_h = 46.0;
+                                    let graph_h = (col.available_height() - controls_h - 4.0).max(56.0);
+                                    let (graph_rect, response) = col.allocate_exact_size(
+                                        egui::vec2(col.available_width(), graph_h),
+                                        egui::Sense::click_and_drag(),
+                                    );
+
+                                    let min_freq = 20.0f32;
+                                    let max_freq = 20000.0f32;
+                                    let log_span = (max_freq / min_freq).ln();
+                                    let pad_x = 24.0f32;
+                                    let pad_top = 14.0f32;
+                                    let pad_bot = 15.0f32;
+                                    let plot_rect = egui::Rect::from_min_max(
+                                        egui::pos2(graph_rect.left() + pad_x, graph_rect.top() + pad_top),
+                                        egui::pos2((graph_rect.right() - 8.0).max(graph_rect.left() + pad_x + 20.0), (graph_rect.bottom() - pad_bot).max(graph_rect.top() + pad_top + 20.0)),
+                                    );
+
+                                    let freq_to_x = |f: f32| -> f32 {
+                                        let t = ((f.clamp(min_freq, max_freq) / min_freq).ln() / log_span).clamp(0.0, 1.0);
+                                        plot_rect.left() + t * plot_rect.width()
+                                    };
+                                    let x_to_freq = |x: f32| -> f32 {
+                                        let t = ((x - plot_rect.left()) / plot_rect.width().max(1.0)).clamp(0.0, 1.0);
+                                        min_freq * (max_freq / min_freq).powf(t)
+                                    };
+                                    let db_to_y = |db: f32| -> f32 {
+                                        let norm = ((15.0 - db.clamp(-15.0, 15.0)) / 30.0).clamp(0.0, 1.0);
+                                        plot_rect.top() + norm * plot_rect.height()
+                                    };
+                                    let y_to_db = |y: f32| -> f32 {
+                                        let norm = ((y - plot_rect.top()) / plot_rect.height().max(1.0)).clamp(0.0, 1.0);
+                                        (15.0 - norm * 30.0).clamp(-12.0, 12.0)
+                                    };
+                                    let mag_to_y = |mag: f32| -> f32 {
+                                        let db = 20.0 * mag.max(0.001).log10();
+                                        db_to_y(db)
+                                    };
+
+                                    // Pointer interaction for 5 EQ band nodes (1..=5), Sub Crossover (6), Height Crossover (7)
+                                    let drag_id = egui::Id::new("surround_eq_active_handle");
+                                    let mut active_handle: u8 = col.ctx().data_mut(|d| *d.get_temp_mut_or_default::<u8>(drag_id));
+
+                                    let pointer_pos = response
+                                        .interact_pointer_pos()
+                                        .or_else(|| col.ctx().pointer_latest_pos());
+
+                                    if let Some(pos) = pointer_pos {
+                                        if response.double_clicked() || response.secondary_clicked() {
+                                            for (i, &bf) in crate::state::SurroundUpmixConfig::EQ_BAND_FREQS.iter().enumerate() {
+                                                let node_pos = egui::pos2(freq_to_x(bf), db_to_y(cfg.band_gains_db[i]));
+                                                if pos.distance(node_pos) <= 16.0 {
+                                                    cfg.band_gains_db[i] = 0.0;
+                                                    cfg_changed = true;
+                                                }
+                                            }
+                                        }
+
+                                        if response.drag_started() || (response.clicked() && active_handle == 0) {
+                                            let mut best_h = 0u8;
+                                            let mut best_dist = 18.0f32;
+                                            for (i, &bf) in crate::state::SurroundUpmixConfig::EQ_BAND_FREQS.iter().enumerate() {
+                                                let node_pos = egui::pos2(freq_to_x(bf), db_to_y(cfg.band_gains_db[i]));
+                                                let d = pos.distance(node_pos);
+                                                if d < best_dist {
+                                                    best_dist = d;
+                                                    best_h = (i + 1) as u8;
+                                                }
+                                            }
+                                            let sub_x = freq_to_x(cfg.sub_crossover_hz);
+                                            let height_x = freq_to_x(cfg.height_crossover_hz);
+                                            let sub_d = (pos.x - sub_x).abs();
+                                            if sub_d < best_dist.min(13.0) {
+                                                best_dist = sub_d;
+                                                best_h = 6;
+                                            }
+                                            let height_d = (pos.x - height_x).abs();
+                                            if height_d < best_dist.min(13.0) {
+                                                best_h = 7;
+                                            }
+                                            active_handle = best_h;
+                                            col.ctx().data_mut(|d| d.insert_temp(drag_id, active_handle));
+                                        }
+
+                                        if (response.dragged() || response.is_pointer_button_down_on()) && active_handle != 0 {
+                                            col.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                                            match active_handle {
+                                                1..=5 => {
+                                                    let idx = (active_handle - 1) as usize;
+                                                    let new_db = (y_to_db(pos.y) * 4.0).round() / 4.0;
+                                                    if (cfg.band_gains_db[idx] - new_db).abs() > 1e-3 {
+                                                        cfg.band_gains_db[idx] = new_db;
+                                                        cfg_changed = true;
+                                                    }
+                                                }
+                                                6 => {
+                                                    let new_sub = x_to_freq(pos.x).clamp(40.0, 250.0).round();
+                                                    if (cfg.sub_crossover_hz - new_sub).abs() > 0.2 {
+                                                        cfg.sub_crossover_hz = new_sub;
+                                                        cfg_changed = true;
+                                                    }
+                                                }
+                                                7 => {
+                                                    let new_h = (x_to_freq(pos.x).clamp(800.0, 10000.0) / 10.0).round() * 10.0;
+                                                    if (cfg.height_crossover_hz - new_h).abs() > 1.0 {
+                                                        cfg.height_crossover_hz = new_h;
+                                                        cfg_changed = true;
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+
+                                    if response.drag_stopped() || !response.is_pointer_button_down_on() {
+                                        if active_handle != 0 {
+                                            active_handle = 0;
+                                            col.ctx().data_mut(|d| d.insert_temp(drag_id, 0u8));
+                                        }
+                                    }
+
+                                    if response.hovered() && active_handle == 0 {
+                                        col.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                    }
+
+                                    let painter = col.painter().with_clip_rect(graph_rect);
+                                    // Studio dark glass backdrop
+                                    painter.rect(
+                                        graph_rect,
+                                        5.0,
+                                        egui::Color32::from_rgba_unmultiplied(10, 13, 20, 235),
+                                        egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(70, 105, 150, 95)),
+                                        egui::StrokeKind::Inside,
+                                    );
+
+                                    // Horizontal dB grid lines (+12, +6, 0, -6, -12 dB)
+                                    for &db in &[12.0f32, 6.0, 0.0, -6.0, -12.0] {
+                                        let y = db_to_y(db);
+                                        let is_zero = db.abs() < 0.1;
+                                        let line_col = if is_zero {
+                                            egui::Color32::from_rgba_unmultiplied(150, 180, 220, 85)
+                                        } else {
+                                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 18)
+                                        };
+                                        painter.line_segment(
+                                            [egui::pos2(plot_rect.left(), y), egui::pos2(plot_rect.right(), y)],
+                                            (if is_zero { 1.2 } else { 1.0 }, line_col),
+                                        );
+                                        let lbl = if db > 0.0 {
+                                            format!("+{:.0}", db)
+                                        } else {
+                                            format!("{:.0}", db)
+                                        };
+                                        painter.text(
+                                            egui::pos2(plot_rect.left() - 3.0, y),
+                                            egui::Align2::RIGHT_CENTER,
+                                            lbl,
+                                            egui::FontId::proportional(9.5),
+                                            egui::Color32::from_rgb(130, 145, 165),
+                                        );
+                                    }
+
+                                    // Vertical log-frequency grid lines
+                                    for &(f_grid, f_lbl) in &[
+                                        (60.0f32, "60"),
+                                        (120.0, "120"),
+                                        (250.0, "250"),
+                                        (500.0, "500"),
+                                        (1000.0, "1k"),
+                                        (2500.0, "2.5k"),
+                                        (5000.0, "5k"),
+                                        (10000.0, "10k"),
+                                    ] {
+                                        let x = freq_to_x(f_grid);
+                                        painter.line_segment(
+                                            [egui::pos2(x, plot_rect.top()), egui::pos2(x, plot_rect.bottom())],
+                                            (1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16)),
+                                        );
+                                        painter.text(
+                                            egui::pos2(x, graph_rect.bottom() - 2.0),
+                                            egui::Align2::CENTER_BOTTOM,
+                                            f_lbl,
+                                            egui::FontId::proportional(9.5),
+                                            egui::Color32::from_rgb(135, 150, 170),
+                                        );
+                                    }
+
+                                    // Live background spectrum bars colored by LFE / Bed / Height routing split
+                                    if !state.spectrum_data.is_empty() {
+                                        let num_bars = 72usize;
+                                        let bar_step = plot_rect.width() / num_bars as f32;
+                                        let spec_len = state.spectrum_data.len();
+                                        let max_f_spec = state.max_frequency.max(2000.0);
+                                        let log_spec_span = (max_f_spec / min_freq).ln();
+                                        for b in 0..num_bars {
+                                            let x0 = plot_rect.left() + b as f32 * bar_step;
+                                            let f_bar = x_to_freq(x0 + bar_step * 0.5);
+                                            let spec_t = ((f_bar / min_freq).ln() / log_spec_span).clamp(0.0, 1.0);
+                                            let bin_idx = ((spec_t * (spec_len - 1) as f32).round() as usize).min(spec_len - 1);
+                                            let val = (state.spectrum_data[bin_idx] / 100.0).clamp(0.0, 1.0);
+                                            if val > 0.01 {
+                                                let bh = val * plot_rect.height() * 0.85;
+                                                let (_, lfe_m, bed_m, h_m) = cfg.evaluate_band_routing(f_bar);
+                                                let sum_m = (lfe_m + bed_m + h_m).max(0.01);
+                                                let r_c = ((lfe_m * 255.0 + bed_m * 0.0 + h_m * 110.0) / sum_m).clamp(0.0, 255.0) as u8;
+                                                let g_c = ((lfe_m * 95.0 + bed_m * 210.0 + h_m * 255.0) / sum_m).clamp(0.0, 255.0) as u8;
+                                                let b_c = ((lfe_m * 45.0 + bed_m * 255.0 + h_m * 110.0) / sum_m).clamp(0.0, 255.0) as u8;
+                                                let bar_rect = egui::Rect::from_min_max(
+                                                    egui::pos2(x0 + 0.5, plot_rect.bottom() - bh),
+                                                    egui::pos2(x0 + (bar_step - 0.8).max(1.0), plot_rect.bottom()),
+                                                );
+                                                painter.rect_filled(
+                                                    bar_rect,
+                                                    1.0,
+                                                    egui::Color32::from_rgba_unmultiplied(r_c, g_c, b_c, 48),
+                                                );
+                                            }
+                                        }
+                                    }
+
+                                    // Compute & draw LFE, Bed Surround, Height, and Master EQ transfer curves
+                                    let samples = 112usize;
+                                    let mut lfe_pts = Vec::with_capacity(samples);
+                                    let mut bed_pts = Vec::with_capacity(samples);
+                                    let mut height_pts = Vec::with_capacity(samples);
+                                    let mut eq_pts = Vec::with_capacity(samples);
+
+                                    for s in 0..samples {
+                                        let t = s as f32 / (samples - 1) as f32;
+                                        let x = plot_rect.left() + t * plot_rect.width();
+                                        let f = x_to_freq(x);
+                                        let (eq_gain, lfe_m, bed_m, height_m) = cfg.evaluate_band_routing(f);
+                                        let y_lfe = mag_to_y(lfe_m);
+                                        let y_bed = mag_to_y(bed_m);
+                                        let y_height = mag_to_y(height_m);
+                                        let y_eq = mag_to_y(eq_gain);
+
+                                        lfe_pts.push(egui::pos2(x, y_lfe));
+                                        bed_pts.push(egui::pos2(x, y_bed));
+                                        height_pts.push(egui::pos2(x, y_height));
+                                        eq_pts.push(egui::pos2(x, y_eq));
+
+                                        // Subtle vertical tint columns under each curve for instant visual split clarity
+                                        if s + 1 < samples {
+                                            let col_w = (plot_rect.width() / (samples - 1) as f32) + 0.5;
+                                            if y_bed < plot_rect.bottom() - 1.0 {
+                                                painter.rect_filled(
+                                                    egui::Rect::from_min_max(egui::pos2(x, y_bed), egui::pos2(x + col_w, plot_rect.bottom())),
+                                                    0.0,
+                                                    egui::Color32::from_rgba_unmultiplied(0, 195, 255, 20),
+                                                );
+                                            }
+                                            if y_height < plot_rect.bottom() - 1.0 {
+                                                painter.rect_filled(
+                                                    egui::Rect::from_min_max(egui::pos2(x, y_height), egui::pos2(x + col_w, plot_rect.bottom())),
+                                                    0.0,
+                                                    egui::Color32::from_rgba_unmultiplied(95, 255, 110, 24),
+                                                );
+                                            }
+                                            if y_lfe < plot_rect.bottom() - 1.0 {
+                                                painter.rect_filled(
+                                                    egui::Rect::from_min_max(egui::pos2(x, y_lfe), egui::pos2(x + col_w, plot_rect.bottom())),
+                                                    0.0,
+                                                    egui::Color32::from_rgba_unmultiplied(255, 95, 45, 24),
+                                                );
+                                            }
+                                        }
+                                    }
+
+                                    painter.add(egui::Shape::line(
+                                        lfe_pts,
+                                        egui::Stroke::new(1.8_f32, egui::Color32::from_rgb(255, 105, 55)),
+                                    ));
+                                    painter.add(egui::Shape::line(
+                                        bed_pts,
+                                        egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(0, 215, 255)),
+                                    ));
+                                    painter.add(egui::Shape::line(
+                                        height_pts,
+                                        egui::Stroke::new(2.1_f32, egui::Color32::from_rgb(110, 255, 110)),
+                                    ));
+                                    painter.add(egui::Shape::line(
+                                        eq_pts,
+                                        egui::Stroke::new(1.5_f32, egui::Color32::from_rgba_unmultiplied(240, 245, 255, 210)),
+                                    ));
+
+                                    // Draw vertical Crossover Handles (LFE Sub & Height Split)
+                                    let sub_x = freq_to_x(cfg.sub_crossover_hz);
+                                    let sub_col = if active_handle == 6 {
+                                        egui::Color32::from_rgb(255, 175, 110)
+                                    } else {
+                                        egui::Color32::from_rgb(255, 105, 55)
+                                    };
+                                    painter.line_segment(
+                                        [egui::pos2(sub_x, plot_rect.top()), egui::pos2(sub_x, plot_rect.bottom())],
+                                        (1.5, sub_col),
+                                    );
+                                    let sub_badge_text = format!("SUB {:.0}Hz", cfg.sub_crossover_hz);
+                                    let sub_galley = painter.layout_no_wrap(
+                                        sub_badge_text,
+                                        egui::FontId::proportional(10.0),
+                                        egui::Color32::WHITE,
+                                    );
+                                    let sub_badge_rect = egui::Rect::from_center_size(
+                                        egui::pos2(sub_x.clamp(plot_rect.left() + 28.0, plot_rect.right() - 28.0), graph_rect.top() + 8.0),
+                                        sub_galley.size() + egui::vec2(8.0, 2.0),
+                                    );
+                                    painter.rect(
+                                        sub_badge_rect,
+                                        3.0,
+                                        egui::Color32::from_rgba_unmultiplied(50, 20, 12, 230),
+                                        egui::Stroke::new(1.0_f32, sub_col),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                    painter.galley(sub_badge_rect.min + egui::vec2(4.0, 1.0), sub_galley, egui::Color32::WHITE);
+
+                                    let height_x = freq_to_x(cfg.height_crossover_hz);
+                                    let height_col = if active_handle == 7 {
+                                        egui::Color32::from_rgb(190, 255, 170)
+                                    } else {
+                                        egui::Color32::from_rgb(110, 255, 110)
+                                    };
+                                    painter.line_segment(
+                                        [egui::pos2(height_x, plot_rect.top()), egui::pos2(height_x, plot_rect.bottom())],
+                                        (1.5, height_col),
+                                    );
+                                    let height_badge_text = if cfg.height_crossover_hz >= 1000.0 {
+                                        format!("HEIGHT ↑ {:.1}kHz", cfg.height_crossover_hz / 1000.0)
+                                    } else {
+                                        format!("HEIGHT ↑ {:.0}Hz", cfg.height_crossover_hz)
+                                    };
+                                    let height_galley = painter.layout_no_wrap(
+                                        height_badge_text,
+                                        egui::FontId::proportional(10.0),
+                                        egui::Color32::WHITE,
+                                    );
+                                    let height_badge_rect = egui::Rect::from_center_size(
+                                        egui::pos2(height_x.clamp(plot_rect.left() + 42.0, plot_rect.right() - 42.0), graph_rect.top() + 8.0),
+                                        height_galley.size() + egui::vec2(8.0, 2.0),
+                                    );
+                                    painter.rect(
+                                        height_badge_rect,
+                                        3.0,
+                                        egui::Color32::from_rgba_unmultiplied(14, 48, 22, 230),
+                                        egui::Stroke::new(1.0_f32, height_col),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                    painter.galley(height_badge_rect.min + egui::vec2(4.0, 1.0), height_galley, egui::Color32::WHITE);
+
+                                    // Draw the 5 interactive Parametric EQ Band Nodes
+                                    for (i, &bf) in crate::state::SurroundUpmixConfig::EQ_BAND_FREQS.iter().enumerate() {
+                                        let gain_db = cfg.band_gains_db[i];
+                                        let node_pos = egui::pos2(freq_to_x(bf), db_to_y(gain_db));
+                                        let is_active = active_handle == (i + 1) as u8;
+                                        let node_color = if bf <= cfg.sub_crossover_hz * 1.1 {
+                                            egui::Color32::from_rgb(255, 120, 65)
+                                        } else if bf >= cfg.height_crossover_hz {
+                                            egui::Color32::from_rgb(120, 255, 120)
+                                        } else {
+                                            egui::Color32::from_rgb(40, 220, 255)
+                                        };
+                                        painter.circle_filled(
+                                            node_pos,
+                                            if is_active { 7.0 } else { 5.5 },
+                                            egui::Color32::from_rgb(16, 22, 32),
+                                        );
+                                        painter.circle_stroke(
+                                            node_pos,
+                                            if is_active { 7.0 } else { 5.5 },
+                                            egui::Stroke::new(if is_active { 2.5 } else { 2.0 }, node_color),
+                                        );
+                                        painter.circle_filled(node_pos, 2.5, egui::Color32::WHITE);
+
+                                        if is_active || gain_db.abs() >= 0.25 {
+                                            let sign = if gain_db > 0.0 { "+" } else { "" };
+                                            let db_txt = format!("{}{:.1}dB", sign, gain_db);
+                                            let lbl_y = if node_pos.y > plot_rect.top() + 18.0 {
+                                                node_pos.y - 11.0
+                                            } else {
+                                                node_pos.y + 11.0
+                                            };
+                                            painter.text(
+                                                egui::pos2(node_pos.x, lbl_y),
+                                                egui::Align2::CENTER_CENTER,
+                                                db_txt,
+                                                egui::FontId::proportional(10.0),
+                                                egui::Color32::WHITE,
+                                            );
+                                        }
+                                    }
+
+                                    // Bottom compact speaker routing & level sliders (2 rows x 3 columns)
+                                    col.add_space(3.0);
+                                    col.columns(3, |cols| {
+                                        cols[0].horizontal(|ui| {
+                                            ui.spacing_mut().slider_width = (ui.available_width() - 56.0).max(28.0);
+                                            ui.label(egui::RichText::new("Front").size(11.0).color(egui::Color32::from_rgb(0, 215, 255)));
+                                            if ui
+                                                .add(egui::Slider::new(&mut cfg.front_level, 0.0..=1.5).show_value(false))
+                                                .on_hover_text(format!("Front L/R Level: {:.0}%", cfg.front_level * 100.0))
+                                                .changed()
+                                            {
+                                                cfg_changed = true;
+                                            }
+                                        });
+                                        cols[1].horizontal(|ui| {
+                                            ui.spacing_mut().slider_width = (ui.available_width() - 62.0).max(28.0);
+                                            ui.label(egui::RichText::new("Side/Rear").size(11.0).color(egui::Color32::from_rgb(80, 195, 255)));
+                                            if ui
+                                                .add(egui::Slider::new(&mut cfg.side_rear_level, 0.0..=1.5).show_value(false))
+                                                .on_hover_text(format!("Side & Rear L/R Surround Bed Level: {:.0}%", cfg.side_rear_level * 100.0))
+                                                .changed()
+                                            {
+                                                cfg_changed = true;
+                                            }
+                                        });
+                                        cols[2].horizontal(|ui| {
+                                            ui.spacing_mut().slider_width = (ui.available_width() - 58.0).max(28.0);
+                                            ui.label(egui::RichText::new("Height ↑").size(11.0).color(egui::Color32::from_rgb(110, 255, 110)));
+                                            if ui
+                                                .add(egui::Slider::new(&mut cfg.height_level, 0.0..=1.5).show_value(false))
+                                                .on_hover_text(format!("Height (Top Front / Top Rear) Level: {:.0}%", cfg.height_level * 100.0))
+                                                .changed()
+                                            {
+                                                cfg_changed = true;
+                                            }
+                                        });
+                                    });
+                                    col.columns(3, |cols| {
+                                        cols[0].horizontal(|ui| {
+                                            ui.spacing_mut().slider_width = (ui.available_width() - 56.0).max(28.0);
+                                            ui.label(egui::RichText::new("LFE Sub").size(11.0).color(egui::Color32::from_rgb(255, 105, 55)));
+                                            if ui
+                                                .add(egui::Slider::new(&mut cfg.lfe_level, 0.0..=1.5).show_value(false))
+                                                .on_hover_text(format!("LFE Subwoofer Level: {:.0}%", cfg.lfe_level * 100.0))
+                                                .changed()
+                                            {
+                                                cfg_changed = true;
+                                            }
+                                        });
+                                        cols[1].horizontal(|ui| {
+                                            ui.spacing_mut().slider_width = (ui.available_width() - 62.0).max(28.0);
+                                            ui.label(egui::RichText::new("Center").size(11.0).color(egui::Color32::from_rgb(255, 200, 70)));
+                                            if ui
+                                                .add(egui::Slider::new(&mut cfg.center_level, 0.0..=1.5).show_value(false))
+                                                .on_hover_text(format!("Center Speaker Mid Level: {:.0}% (0% = Pure Left/Right Side Split)", cfg.center_level * 100.0))
+                                                .changed()
+                                            {
+                                                cfg_changed = true;
+                                            }
+                                        });
+                                        cols[2].horizontal(|ui| {
+                                            ui.spacing_mut().slider_width = (ui.available_width() - 58.0).max(28.0);
+                                            ui.label(egui::RichText::new("Hi-Bleed").size(11.0).color(egui::Color32::from_rgb(175, 215, 235)));
+                                            if ui
+                                                .add(egui::Slider::new(&mut cfg.surround_high_bleed, 0.0..=1.0).show_value(false))
+                                                .on_hover_text(format!("High-Frequency Bleed in Ear-Level Side/Rear Speakers: {:.0}% (0% routes highs exclusively to Height speakers)", cfg.surround_high_bleed * 100.0))
+                                                .changed()
+                                            {
+                                                cfg_changed = true;
+                                            }
+                                        });
+                                    });
+
+                                    if cfg_changed {
+                                        *engine_action = EngineAction::SetSurroundUpmix(cfg);
+                                    }
+                                    return;
+                                }
+
                                 if !is_portrait {
                                     let col1_heading = if state.lyrics.is_some() {
                                         "Lyrics"
@@ -9530,6 +10097,41 @@ impl VulkanEngine {
                                             .min_size(egui::vec2(92.0, if is_portrait { 30.0 } else { 24.0 }));
                                             if ui.add(open_hdr_btn).clicked() {
                                                 *engine_action = EngineAction::OpenFile;
+                                            }
+
+                                            ui.add_space(4.0);
+                                            let upmix_on = state.surround_upmix.enabled;
+                                            let (upmix_label, upmix_fill, upmix_stroke, upmix_text_col) = if upmix_on {
+                                                (
+                                                    "🔊 7.1.4 EQ: ON",
+                                                    egui::Color32::from_rgb(18, 92, 118),
+                                                    egui::Color32::from_rgb(70, 225, 255),
+                                                    egui::Color32::from_rgb(220, 252, 255),
+                                                )
+                                            } else {
+                                                (
+                                                    "🔊 UPMIX EQ",
+                                                    egui::Color32::from_rgb(32, 42, 58),
+                                                    egui::Color32::from_rgb(80, 108, 145),
+                                                    egui::Color32::from_rgb(205, 220, 240),
+                                                )
+                                            };
+                                            let upmix_hdr_btn = egui::Button::new(
+                                                egui::RichText::new(upmix_label)
+                                                    .size(11.5)
+                                                    .strong()
+                                                    .color(upmix_text_col),
+                                            )
+                                            .fill(upmix_fill)
+                                            .stroke(egui::Stroke::new(1.0_f32, upmix_stroke))
+                                            .corner_radius(4.0)
+                                            .min_size(egui::vec2(88.0, if is_portrait { 30.0 } else { 24.0 }));
+                                            if ui
+                                                .add(upmix_hdr_btn)
+                                                .on_hover_text("Toggle Auto 7.1.4 Surround & Height Upmix + Configurable Crossover EQ (Shortcut: 'u' / L3·R3)")
+                                                .clicked()
+                                            {
+                                                *engine_action = EngineAction::ToggleSurroundUpmix(!upmix_on);
                                             }
                                         });
                                     });
@@ -10108,6 +10710,41 @@ impl VulkanEngine {
                                                 }
                                             });
 
+                                            ui.horizontal(|ui| {
+                                                let upmix_enabled = state.surround_upmix.enabled;
+                                                let (btn_text, btn_fill, btn_stroke, txt_col) = if upmix_enabled {
+                                                    (
+                                                        "🔊 Auto Surround & Height Upmix (7.1.4 + EQ): ON",
+                                                        egui::Color32::from_rgb(16, 84, 108),
+                                                        egui::Color32::from_rgb(65, 220, 255),
+                                                        egui::Color32::from_rgb(215, 250, 255),
+                                                    )
+                                                } else {
+                                                    (
+                                                        "🔊 Auto Surround & Height Upmix (7.1.4 + EQ): OFF",
+                                                        egui::Color32::from_rgb(28, 36, 50),
+                                                        egui::Color32::from_rgb(70, 95, 130),
+                                                        egui::Color32::from_rgb(185, 200, 220),
+                                                    )
+                                                };
+                                                let upmix_btn = egui::Button::new(
+                                                    egui::RichText::new(btn_text)
+                                                        .size(11.5)
+                                                        .strong()
+                                                        .color(txt_col),
+                                                )
+                                                .fill(btn_fill)
+                                                .stroke(egui::Stroke::new(1.0_f32, btn_stroke))
+                                                .corner_radius(4.0);
+                                                if ui
+                                                    .add(upmix_btn)
+                                                    .on_hover_text("Automatically upmix stereo and non-surround audio so Left/Right spread across all left/right speakers (FL, SL, RL / FR, SR, RR) with Haas decorrelation, LFE crossover, and high-frequency routing to the height speakers (TFL, TFR, TRL, TRR). Replaces the top middle Piano Roll panel with a live Crossover & 5-band Parametric EQ editor. (Shortcut: 'u' / L3·R3)")
+                                                    .clicked()
+                                                {
+                                                    *engine_action = EngineAction::ToggleSurroundUpmix(!upmix_enabled);
+                                                }
+                                            });
+
                                             // 8. Next Song (placed at the bottom, smooth marquee if long)
                                             if state.playlist_index + 1 < state.playlist.len() {
                                                 let next_path = std::path::Path::new(&state.playlist[state.playlist_index + 1]);
@@ -10138,7 +10775,7 @@ impl VulkanEngine {
                                                 render_col_channels(ui, &mut out_meters_rect, &mut out_fire_rect, &mut engine_action);
                                             }
                                             crate::state::MobileHudTab::Heatmap => {
-                                                render_col_heatmap(ui, &mut out_heatmap_rect);
+                                                render_col_heatmap(ui, &mut out_heatmap_rect, &mut engine_action);
                                             }
                                             crate::state::MobileHudTab::Info => {
                                                 render_col_info(ui, &mut out_track_info_rect, &mut engine_action);
@@ -10162,7 +10799,7 @@ impl VulkanEngine {
                             } else {
                                 ui.columns(3, |columns| {
                                     render_col_channels(&mut columns[0], &mut out_meters_rect, &mut out_fire_rect, &mut engine_action);
-                                    render_col_heatmap(&mut columns[1], &mut out_heatmap_rect);
+                                    render_col_heatmap(&mut columns[1], &mut out_heatmap_rect, &mut engine_action);
                                     render_col_info(&mut columns[2], &mut out_track_info_rect, &mut engine_action);
                                 });
                             }

@@ -69,6 +69,514 @@ pub struct DspMessage {
     pub seek_epoch: u64,
 }
 
+// ---------------------------------------------------------
+// Automatic Surround & Height Upmixer + 5-Band Crossover EQ
+// ---------------------------------------------------------
+
+#[derive(Clone, Copy, Debug)]
+pub struct BiquadFilter {
+    b0: f32,
+    b1: f32,
+    b2: f32,
+    a1: f32,
+    a2: f32,
+    z1: f32,
+    z2: f32,
+}
+
+impl Default for BiquadFilter {
+    fn default() -> Self {
+        Self {
+            b0: 1.0,
+            b1: 0.0,
+            b2: 0.0,
+            a1: 0.0,
+            a2: 0.0,
+            z1: 0.0,
+            z2: 0.0,
+        }
+    }
+}
+
+impl BiquadFilter {
+    #[inline(always)]
+    pub fn process(&mut self, x: f32) -> f32 {
+        let y = self.b0 * x + self.z1;
+        self.z1 = self.b1 * x - self.a1 * y + self.z2;
+        self.z2 = self.b2 * x - self.a2 * y;
+        if !y.is_finite() {
+            self.z1 = 0.0;
+            self.z2 = 0.0;
+            0.0
+        } else {
+            y
+        }
+    }
+
+    #[inline(always)]
+    pub fn update_coeffs(&mut self, coeffs: Self) {
+        self.b0 = coeffs.b0;
+        self.b1 = coeffs.b1;
+        self.b2 = coeffs.b2;
+        self.a1 = coeffs.a1;
+        self.a2 = coeffs.a2;
+    }
+
+    /// 2nd-order Linkwitz-Riley (Q = 0.5) or general RBJ Low-Pass filter.
+    pub fn lowpass(sample_rate: f32, freq_hz: f32, q: f32) -> Self {
+        let sr = sample_rate.max(8000.0);
+        let f = freq_hz.clamp(20.0, sr * 0.45);
+        let w0 = 2.0 * std::f32::consts::PI * f / sr;
+        let cos_w0 = w0.cos();
+        let sin_w0 = w0.sin();
+        let alpha = sin_w0 / (2.0 * q.max(0.1));
+
+        let b0 = (1.0 - cos_w0) * 0.5;
+        let b1 = 1.0 - cos_w0;
+        let b2 = (1.0 - cos_w0) * 0.5;
+        let a0 = 1.0 + alpha;
+        let a1 = -2.0 * cos_w0;
+        let a2 = 1.0 - alpha;
+
+        Self {
+            b0: b0 / a0,
+            b1: b1 / a0,
+            b2: b2 / a0,
+            a1: a1 / a0,
+            a2: a2 / a0,
+            z1: 0.0,
+            z2: 0.0,
+        }
+    }
+
+    /// 2nd-order Linkwitz-Riley (Q = 0.5) or general RBJ High-Pass filter.
+    pub fn highpass(sample_rate: f32, freq_hz: f32, q: f32) -> Self {
+        let sr = sample_rate.max(8000.0);
+        let f = freq_hz.clamp(20.0, sr * 0.45);
+        let w0 = 2.0 * std::f32::consts::PI * f / sr;
+        let cos_w0 = w0.cos();
+        let sin_w0 = w0.sin();
+        let alpha = sin_w0 / (2.0 * q.max(0.1));
+
+        let b0 = (1.0 + cos_w0) * 0.5;
+        let b1 = -(1.0 + cos_w0);
+        let b2 = (1.0 + cos_w0) * 0.5;
+        let a0 = 1.0 + alpha;
+        let a1 = -2.0 * cos_w0;
+        let a2 = 1.0 - alpha;
+
+        Self {
+            b0: b0 / a0,
+            b1: b1 / a0,
+            b2: b2 / a0,
+            a1: a1 / a0,
+            a2: a2 / a0,
+            z1: 0.0,
+            z2: 0.0,
+        }
+    }
+
+    pub fn peaking_eq(sample_rate: f32, freq_hz: f32, q: f32, gain_db: f32) -> Self {
+        if gain_db.abs() < 1e-3 {
+            return Self::default();
+        }
+        let sr = sample_rate.max(8000.0);
+        let f = freq_hz.clamp(20.0, sr * 0.45);
+        let a = 10.0f32.powf(gain_db / 40.0);
+        let w0 = 2.0 * std::f32::consts::PI * f / sr;
+        let cos_w0 = w0.cos();
+        let sin_w0 = w0.sin();
+        let alpha = sin_w0 / (2.0 * q.max(0.1));
+
+        let b0 = 1.0 + alpha * a;
+        let b1 = -2.0 * cos_w0;
+        let b2 = 1.0 - alpha * a;
+        let a0 = 1.0 + alpha / a;
+        let a1 = -2.0 * cos_w0;
+        let a2 = 1.0 - alpha / a;
+
+        Self {
+            b0: b0 / a0,
+            b1: b1 / a0,
+            b2: b2 / a0,
+            a1: a1 / a0,
+            a2: a2 / a0,
+            z1: 0.0,
+            z2: 0.0,
+        }
+    }
+
+    pub fn low_shelf(sample_rate: f32, freq_hz: f32, q: f32, gain_db: f32) -> Self {
+        if gain_db.abs() < 1e-3 {
+            return Self::default();
+        }
+        let sr = sample_rate.max(8000.0);
+        let f = freq_hz.clamp(20.0, sr * 0.45);
+        let a = 10.0f32.powf(gain_db / 40.0);
+        let w0 = 2.0 * std::f32::consts::PI * f / sr;
+        let cos_w0 = w0.cos();
+        let sin_w0 = w0.sin();
+        let alpha = sin_w0 / (2.0 * q.max(0.1));
+        let two_sqrt_a_alpha = 2.0 * a.sqrt() * alpha;
+
+        let b0 = a * ((a + 1.0) - (a - 1.0) * cos_w0 + two_sqrt_a_alpha);
+        let b1 = 2.0 * a * ((a - 1.0) - (a + 1.0) * cos_w0);
+        let b2 = a * ((a + 1.0) - (a - 1.0) * cos_w0 - two_sqrt_a_alpha);
+        let a0 = (a + 1.0) + (a - 1.0) * cos_w0 + two_sqrt_a_alpha;
+        let a1 = -2.0 * ((a - 1.0) + (a + 1.0) * cos_w0);
+        let a2 = (a + 1.0) + (a - 1.0) * cos_w0 - two_sqrt_a_alpha;
+
+        Self {
+            b0: b0 / a0,
+            b1: b1 / a0,
+            b2: b2 / a0,
+            a1: a1 / a0,
+            a2: a2 / a0,
+            z1: 0.0,
+            z2: 0.0,
+        }
+    }
+
+    pub fn high_shelf(sample_rate: f32, freq_hz: f32, q: f32, gain_db: f32) -> Self {
+        if gain_db.abs() < 1e-3 {
+            return Self::default();
+        }
+        let sr = sample_rate.max(8000.0);
+        let f = freq_hz.clamp(20.0, sr * 0.45);
+        let a = 10.0f32.powf(gain_db / 40.0);
+        let w0 = 2.0 * std::f32::consts::PI * f / sr;
+        let cos_w0 = w0.cos();
+        let sin_w0 = w0.sin();
+        let alpha = sin_w0 / (2.0 * q.max(0.1));
+        let two_sqrt_a_alpha = 2.0 * a.sqrt() * alpha;
+
+        let b0 = a * ((a + 1.0) + (a - 1.0) * cos_w0 + two_sqrt_a_alpha);
+        let b1 = -2.0 * a * ((a - 1.0) + (a + 1.0) * cos_w0);
+        let b2 = a * ((a + 1.0) + (a - 1.0) * cos_w0 - two_sqrt_a_alpha);
+        let a0 = (a + 1.0) - (a - 1.0) * cos_w0 + two_sqrt_a_alpha;
+        let a1 = 2.0 * ((a - 1.0) - (a + 1.0) * cos_w0);
+        let a2 = (a + 1.0) - (a - 1.0) * cos_w0 - two_sqrt_a_alpha;
+
+        Self {
+            b0: b0 / a0,
+            b1: b1 / a0,
+            b2: b2 / a0,
+            a1: a1 / a0,
+            a2: a2 / a0,
+            z1: 0.0,
+            z2: 0.0,
+        }
+    }
+}
+
+/// Zero-allocation circular delay line for Haas acoustic decorrelation across surround/height speakers.
+pub struct HaasDelayLine<const N: usize> {
+    buf: [f32; N],
+    write_idx: usize,
+    delay_samples: usize,
+}
+
+impl<const N: usize> HaasDelayLine<N> {
+    pub fn new(delay_samples: usize) -> Self {
+        Self {
+            buf: [0.0; N],
+            write_idx: 0,
+            delay_samples: delay_samples.clamp(1, N.saturating_sub(1)),
+        }
+    }
+
+    pub fn set_delay_ms(&mut self, sample_rate: u32, delay_ms: f32) {
+        let samples = ((sample_rate as f32 * delay_ms * 0.001).round() as usize)
+            .clamp(1, N.saturating_sub(1));
+        self.delay_samples = samples;
+    }
+
+    #[inline(always)]
+    pub fn process(&mut self, input: f32) -> f32 {
+        let read_idx = (self.write_idx + N - self.delay_samples) % N;
+        let out = self.buf[read_idx];
+        self.buf[self.write_idx] = input;
+        self.write_idx = (self.write_idx + 1) % N;
+        out
+    }
+}
+
+/// Real-time 7.1.4 Surround & Height Upmixer with 5-Band EQ and Linkwitz-Riley Crossovers.
+pub struct SurroundUpmixerDsp {
+    sample_rate: u32,
+    last_config: crate::state::SurroundUpmixConfig,
+    eq_l: [BiquadFilter; 5],
+    eq_r: [BiquadFilter; 5],
+    sub_lp: BiquadFilter,
+    height_lp_l: BiquadFilter,
+    height_hp_l: BiquadFilter,
+    height_lp_r: BiquadFilter,
+    height_hp_r: BiquadFilter,
+    delay_sl: HaasDelayLine<2048>,
+    delay_sr: HaasDelayLine<2048>,
+    delay_rl: HaasDelayLine<2048>,
+    delay_rr: HaasDelayLine<2048>,
+    delay_tfl: HaasDelayLine<2048>,
+    delay_tfr: HaasDelayLine<2048>,
+    delay_trl: HaasDelayLine<2048>,
+    delay_trr: HaasDelayLine<2048>,
+}
+
+impl SurroundUpmixerDsp {
+    pub fn new(sample_rate: u32) -> Self {
+        let sr = sample_rate.max(8000);
+        let default_cfg = crate::state::SurroundUpmixConfig::default();
+        let mut dsp = Self {
+            sample_rate: sr,
+            last_config: default_cfg,
+            eq_l: [BiquadFilter::default(); 5],
+            eq_r: [BiquadFilter::default(); 5],
+            sub_lp: BiquadFilter::default(),
+            height_lp_l: BiquadFilter::default(),
+            height_hp_l: BiquadFilter::default(),
+            height_lp_r: BiquadFilter::default(),
+            height_hp_r: BiquadFilter::default(),
+            delay_sl: HaasDelayLine::new(115),
+            delay_sr: HaasDelayLine::new(115),
+            delay_rl: HaasDelayLine::new(250),
+            delay_rr: HaasDelayLine::new(250),
+            delay_tfl: HaasDelayLine::new(158),
+            delay_tfr: HaasDelayLine::new(158),
+            delay_trl: HaasDelayLine::new(307),
+            delay_trr: HaasDelayLine::new(307),
+        };
+        dsp.rebuild_all_filters(&default_cfg, sr);
+        dsp
+    }
+
+    fn rebuild_all_filters(&mut self, cfg: &crate::state::SurroundUpmixConfig, sample_rate: u32) {
+        let sr = sample_rate.max(8000) as f32;
+        self.sample_rate = sample_rate.max(8000);
+        self.last_config = *cfg;
+
+        let freqs = crate::state::SurroundUpmixConfig::EQ_BAND_FREQS;
+        let q_shelf = std::f32::consts::FRAC_1_SQRT_2;
+        let b0 = BiquadFilter::low_shelf(sr, freqs[0], q_shelf, cfg.band_gains_db[0]);
+        let b1 = BiquadFilter::peaking_eq(sr, freqs[1], 1.0, cfg.band_gains_db[1]);
+        let b2 = BiquadFilter::peaking_eq(sr, freqs[2], 1.0, cfg.band_gains_db[2]);
+        let b3 = BiquadFilter::peaking_eq(sr, freqs[3], 1.0, cfg.band_gains_db[3]);
+        let b4 = BiquadFilter::high_shelf(sr, freqs[4], q_shelf, cfg.band_gains_db[4]);
+        let bands = [b0, b1, b2, b3, b4];
+        for ((el, er), &b) in self
+            .eq_l
+            .iter_mut()
+            .zip(self.eq_r.iter_mut())
+            .zip(bands.iter())
+        {
+            el.update_coeffs(b);
+            er.update_coeffs(b);
+        }
+
+        // Linkwitz-Riley 2nd-order (Q = 0.5) LFE low-pass and Height low-pass/high-pass crossovers
+        let sub_lp = BiquadFilter::lowpass(sr, cfg.sub_crossover_hz.clamp(40.0, 250.0), 0.5);
+        self.sub_lp.update_coeffs(sub_lp);
+
+        let h_fc = cfg.height_crossover_hz.clamp(800.0, 10000.0);
+        let h_lp = BiquadFilter::lowpass(sr, h_fc, 0.5);
+        let h_hp = BiquadFilter::highpass(sr, h_fc, 0.5);
+        self.height_lp_l.update_coeffs(h_lp);
+        self.height_hp_l.update_coeffs(h_hp);
+        self.height_lp_r.update_coeffs(h_lp);
+        self.height_hp_r.update_coeffs(h_hp);
+
+        self.delay_sl.set_delay_ms(self.sample_rate, 2.4);
+        self.delay_sr.set_delay_ms(self.sample_rate, 2.4);
+        self.delay_rl.set_delay_ms(self.sample_rate, 5.2);
+        self.delay_rr.set_delay_ms(self.sample_rate, 5.2);
+        self.delay_tfl.set_delay_ms(self.sample_rate, 3.3);
+        self.delay_tfr.set_delay_ms(self.sample_rate, 3.3);
+        self.delay_trl.set_delay_ms(self.sample_rate, 6.4);
+        self.delay_trr.set_delay_ms(self.sample_rate, 6.4);
+    }
+
+    #[inline(always)]
+    pub fn sync_config(&mut self, cfg: &crate::state::SurroundUpmixConfig, sample_rate: u32) {
+        let sr = sample_rate.max(8000);
+        if sr != self.sample_rate
+            || (cfg.sub_crossover_hz - self.last_config.sub_crossover_hz).abs() > 0.1
+            || (cfg.height_crossover_hz - self.last_config.height_crossover_hz).abs() > 0.5
+            || cfg.band_gains_db != self.last_config.band_gains_db
+        {
+            self.rebuild_all_filters(cfg, sr);
+        } else {
+            self.last_config = *cfg;
+        }
+    }
+
+    #[inline(always)]
+    fn soft_limit(x: f32) -> f32 {
+        // Gentle cubic soft knee above |x| = 0.85 to prevent harsh digital clipping on +12dB EQ boosts
+        let ax = x.abs();
+        if ax <= 0.85 {
+            x
+        } else {
+            let excess = (ax - 0.85) / 0.45;
+            let compressed = 0.85 + 0.15 * (excess / (1.0 + excess));
+            compressed.copysign(x).clamp(-1.0, 1.0)
+        }
+    }
+
+    /// Process a stereo (L, R) frame into 12 discrete 7.1.4 spatial channels:
+    /// `[0:FL, 1:FR, 2:FC, 3:LFE, 4:SL, 5:SR, 6:RL, 7:RR, 8:TFL, 9:TFR, 10:TRL, 11:TRR]`.
+    #[inline(always)]
+    pub fn process_stereo_to_7_1_4(
+        &mut self,
+        l_in: f32,
+        r_in: f32,
+        cfg: &crate::state::SurroundUpmixConfig,
+    ) -> [f32; 12] {
+        // 1. Apply 5-band parametric/shelf EQ cascade to Left and Right channels
+        let mut l_eq = l_in;
+        let mut r_eq = r_in;
+        for (el, er) in self.eq_l.iter_mut().zip(self.eq_r.iter_mut()) {
+            l_eq = el.process(l_eq);
+            r_eq = er.process(r_eq);
+        }
+
+        // 2. Mid/Side decomposition & width shaping
+        let mid = (l_eq + r_eq) * 0.5;
+        let side = (l_eq - r_eq) * 0.5 * cfg.stereo_width.clamp(0.0, 2.0);
+        let l_wide = l_eq + side * 0.35;
+        let r_wide = r_eq - side * 0.35;
+
+        // 3. LFE Subwoofer low-pass extraction (< sub_crossover_hz)
+        let lfe_low = self.sub_lp.process(mid);
+        let lfe = Self::soft_limit(lfe_low * cfg.lfe_level);
+
+        // 4. Linkwitz-Riley crossover at height_crossover_hz splitting Bed vs. Height frequencies
+        let l_low = self.height_lp_l.process(l_eq);
+        let l_high = self.height_hp_l.process(l_wide);
+        let r_low = self.height_lp_r.process(r_eq);
+        let r_high = self.height_hp_r.process(r_wide);
+
+        // 5. Left/Right Hemisphere Bed Routing + Preferential High-Frequency Height Routing
+        let high_bleed = cfg.surround_high_bleed.clamp(0.0, 1.0);
+        let front_high_keep = (1.0 - 0.30 * cfg.height_level.clamp(0.0, 1.0)).clamp(0.55, 1.0);
+
+        let fl = Self::soft_limit((l_low + l_high * front_high_keep) * cfg.front_level);
+        let fr = Self::soft_limit((r_low + r_high * front_high_keep) * cfg.front_level);
+        let fc = Self::soft_limit(mid * cfg.center_level * std::f32::consts::FRAC_1_SQRT_2);
+
+        let sl_raw = self.delay_sl.process(l_low + l_high * high_bleed);
+        let sr_raw = self.delay_sr.process(r_low + r_high * high_bleed);
+        let sl = Self::soft_limit(sl_raw * cfg.side_rear_level);
+        let sr = Self::soft_limit(sr_raw * cfg.side_rear_level);
+
+        let rl_raw = self
+            .delay_rl
+            .process((l_low + side * 0.22) + l_high * (high_bleed * 0.85));
+        let rr_raw = self
+            .delay_rr
+            .process((r_low - side * 0.22) + r_high * (high_bleed * 0.85));
+        let rl = Self::soft_limit(rl_raw * (cfg.side_rear_level * 0.92));
+        let rr = Self::soft_limit(rr_raw * (cfg.side_rear_level * 0.92));
+
+        let tfl_raw = self.delay_tfl.process(l_high);
+        let tfr_raw = self.delay_tfr.process(r_high);
+        let tfl = Self::soft_limit(tfl_raw * cfg.height_level);
+        let tfr = Self::soft_limit(tfr_raw * cfg.height_level);
+
+        let trl_raw = self.delay_trl.process(l_high + side * 0.28);
+        let trr_raw = self.delay_trr.process(r_high - side * 0.28);
+        let trl = Self::soft_limit(trl_raw * (cfg.height_level * 0.92));
+        let trr = Self::soft_limit(trr_raw * (cfg.height_level * 0.92));
+
+        [fl, fr, fc, lfe, sl, sr, rl, rr, tfl, tfr, trl, trr]
+    }
+}
+
+/// Extract a representative `(L, R)` stereo input pair from a decoded frame slice of length `hardware_channels`.
+#[inline(always)]
+pub fn extract_stereo_pair_from_frame(frame: &[f32], source_channels: usize) -> (f32, f32) {
+    if frame.is_empty() {
+        return (0.0, 0.0);
+    }
+    let fl = frame[0];
+    if frame.len() == 1 || source_channels <= 1 {
+        return (fl, fl);
+    }
+    let fr = frame[1];
+    if frame.len() >= 6 && source_channels >= 6 {
+        let fc = frame[2] * std::f32::consts::FRAC_1_SQRT_2;
+        let lfe = frame[3] * 0.5;
+        let sl = frame[4] * std::f32::consts::FRAC_1_SQRT_2;
+        let sr = frame[5] * std::f32::consts::FRAC_1_SQRT_2;
+        let (rl, rr) = if frame.len() >= 8 && source_channels >= 8 {
+            (frame[6] * 0.5, frame[7] * 0.5)
+        } else {
+            (0.0, 0.0)
+        };
+        let l = (fl + fc + lfe + sl + rl) * 0.65;
+        let r = (fr + fc + lfe + sr + rr) * 0.65;
+        (l, r)
+    } else {
+        (fl, fr)
+    }
+}
+
+/// Map a 12-channel 7.1.4 spatial frame `[FL, FR, FC, LFE, SL, SR, RL, RR, TFL, TFR, TRL, TRR]`
+/// to physical output channel `out_channel` for a hardware stream with `hardware_channels`.
+#[inline(always)]
+pub fn map_7_1_4_channel_to_hardware(
+    spatial: &[f32; 12],
+    hardware_channels: usize,
+    out_channel: usize,
+) -> f32 {
+    let [fl, fr, fc, lfe, sl, sr, rl, rr, tfl, tfr, trl, trr] = *spatial;
+    let s = match hardware_channels {
+        1 => {
+            ((fl + fr) * 0.5
+                + fc * 0.5
+                + lfe * 0.35
+                + (sl + sr + rl + rr) * 0.25
+                + (tfl + tfr + trl + trr) * 0.25)
+                * 0.55
+        }
+        2 => {
+            let c_gain = std::f32::consts::FRAC_1_SQRT_2;
+            if out_channel == 0 {
+                (fl + fc * c_gain + lfe * 0.55 + (sl + rl) * 0.55 + (tfl + trl) * 0.65) * 0.56
+            } else {
+                (fr + fc * c_gain + lfe * 0.55 + (sr + rr) * 0.55 + (tfr + trr) * 0.65) * 0.56
+            }
+        }
+        4 => {
+            let c_gain = std::f32::consts::FRAC_1_SQRT_2;
+            match out_channel {
+                0 => (fl + fc * c_gain + lfe * 0.5 + tfl * 0.65) * 0.68,
+                1 => (fr + fc * c_gain + lfe * 0.5 + tfr * 0.65) * 0.68,
+                2 => (sl + rl + trl * 0.75) * 0.62,
+                _ => (sr + rr + trr * 0.75) * 0.62,
+            }
+        }
+        6 => match out_channel {
+            0 => (fl + tfl * 0.55) * 0.82,
+            1 => (fr + tfr * 0.55) * 0.82,
+            2 => fc,
+            3 => lfe,
+            4 => (sl + rl * 0.85 + (tfl + trl) * 0.45) * 0.65,
+            _ => (sr + rr * 0.85 + (tfr + trr) * 0.45) * 0.65,
+        },
+        8 => match out_channel {
+            0 => (fl + tfl * 0.55) * 0.82,
+            1 => (fr + tfr * 0.55) * 0.82,
+            2 => fc,
+            3 => lfe,
+            4 => (sl + tfl * 0.40) * 0.82,
+            5 => (sr + tfr * 0.40) * 0.82,
+            6 => (rl + trl * 0.65) * 0.78,
+            _ => (rr + trr * 0.65) * 0.78,
+        },
+        _ => spatial.get(out_channel).copied().unwrap_or(0.0),
+    };
+    s.clamp(-1.0, 1.0)
+}
+
 fn is_relevant_audio_device(name: &str) -> bool {
     let name_lower = name.to_lowercase();
     // Filter out dummy/silent devices
@@ -399,6 +907,9 @@ pub fn spawn_dsp_thread(
 
                 state.raw_channel_vus.clear();
                 state.raw_channel_vus.extend_from_slice(&msg.channel_vus);
+                if !msg.channel_vus.is_empty() && state.surround_upmix.enabled {
+                    state.num_channels = msg.channel_vus.len() as i32;
+                }
 
                 if !msg.channel_audio_data.is_empty() {
                     if state.raw_audio_channels.len() != num_channels {
@@ -4438,13 +4949,18 @@ pub fn start_audio_thread(
         .and_then(|a| a.get_intrinsic_sample_rate())
         .unwrap_or(48000);
     let target_rate: cpal::SampleRate = rate;
-    let force_stereo = shared_state.lock().unwrap().force_stereo_downmix;
+    let (force_stereo, surround_upmix_enabled) = {
+        let s = shared_state.lock().unwrap();
+        (s.force_stereo_downmix, s.surround_upmix.enabled)
+    };
     let mut target_channels = audio_source_opt
         .as_mut()
         .map(|a| a.get_num_channels() as u16)
         .unwrap_or(2);
     if force_stereo {
         target_channels = 2;
+    } else if surround_upmix_enabled && target_channels < 12 {
+        target_channels = 12;
     }
 
     if mic {
@@ -4628,7 +5144,11 @@ pub fn start_audio_thread(
                         .collect();
 
                     configs.sort_by_key(|c| {
-                        let ch_match = c.channels() == target_channels;
+                        let ch_match = if surround_upmix_enabled && !force_stereo {
+                            c.channels() >= 6 && c.channels() <= 12
+                        } else {
+                            c.channels() == target_channels
+                        };
                         let stereo = c.channels() >= 2;
                         let rate_match = c.min_sample_rate() <= target_rate
                             && c.max_sample_rate() >= target_rate;
@@ -4821,7 +5341,9 @@ fn populate_state_from_audio_source(
     state.module_type = audio_source.get_type();
     state.duration_seconds = audio_source.get_duration_seconds();
     let tracker_channels = audio_source.get_tracker_channels();
-    state.num_channels = if let Some(tc) = tracker_channels {
+    state.num_channels = if state.surround_upmix.enabled {
+        12
+    } else if let Some(tc) = tracker_channels {
         tc + 2
     } else {
         audio_source.get_num_channels()
@@ -5130,7 +5652,11 @@ fn process_decoder_state_requests(
             if let Some(&first_idx) = state.active_audio_tracks.first() {
                 state.selected_audio_track = first_idx;
             }
-            state.num_channels = audio_source.get_num_channels();
+            state.num_channels = if state.surround_upmix.enabled {
+                12
+            } else {
+                audio_source.get_num_channels()
+            };
             let ch_count = state.num_channels as usize;
             state.channel_vus.resize(ch_count, 0.0);
             state.peak_vus.resize(ch_count, 0.0);
@@ -5196,7 +5722,11 @@ fn process_decoder_state_requests(
             state.selected_audio_track = track_idx;
             state.active_audio_tracks = vec![track_idx];
             state.multi_track_mix_mode = false;
-            state.num_channels = audio_source.get_num_channels();
+            state.num_channels = if state.surround_upmix.enabled {
+                12
+            } else {
+                audio_source.get_num_channels()
+            };
             let ch_count = state.num_channels as usize;
             state.channel_vus.resize(ch_count, 0.0);
             state.peak_vus.resize(ch_count, 0.0);
@@ -6265,17 +6795,21 @@ fn run_dummy(
     let thread_handle = std::thread::spawn(move || {
         let mut fft_buffer: Vec<f32> = vec![0.0; window_size];
         let mut channel_fft_buffers: Vec<Vec<f32>> =
-            vec![vec![0.0; window_size]; hardware_channels];
+            vec![vec![0.0; window_size]; hardware_channels.max(12)];
         let mut fft_index = 0;
         let recycle_rx = dsp_recycle_channel().1.clone();
 
         let mut was_paused = false;
         let mut latest_seek_epoch = 0u64;
+        let mut upmix_cfg = crate::state::SurroundUpmixConfig::default();
+        let mut upmixer_dsp = SurroundUpmixerDsp::new(sample_rate);
+        let mut upmix_peak_vus = [0.0f32; 12];
 
         while !stop_token_clone.load(std::sync::atomic::Ordering::Relaxed) {
             if let Ok(state) = shared_state_dummy.try_lock() {
                 was_paused = state.is_paused;
                 latest_seek_epoch = state.seek_epoch;
+                upmix_cfg = state.surround_upmix;
             }
 
             if was_paused {
@@ -6301,31 +6835,74 @@ fn run_dummy(
 
                     // Process chunk for FFT and VU levels
                     let to_copy = chunk.valid_frames;
-                    for i in 0..to_copy {
-                        let mut mono = 0.0;
-                        for (c, buf) in channel_fft_buffers
-                            .iter_mut()
-                            .enumerate()
-                            .take(hardware_channels)
-                        {
-                            let sample = chunk.samples[i * hardware_channels + c].clamp(-1.0, 1.0);
-                            let ch_weight = match c {
-                                0 | 1 => {
-                                    if hardware_channels == 1 {
-                                        1.0
-                                    } else {
-                                        0.5
-                                    }
-                                }
-                                2 => std::f32::consts::FRAC_1_SQRT_2,
-                                _ => 0.25,
-                            };
-                            mono += sample * ch_weight;
-                            buf[fft_index] = sample;
+                    if upmix_cfg.enabled {
+                        upmixer_dsp.sync_config(&upmix_cfg, sample_rate);
+                        upmix_peak_vus = [0.0f32; 12];
+                        let src_ch = (chunk.spatial_channels as usize).max(1);
+                        for i in 0..to_copy {
+                            let frame_slice = &chunk.samples
+                                [i * hardware_channels..(i + 1) * hardware_channels];
+                            let (l_in, r_in) = extract_stereo_pair_from_frame(frame_slice, src_ch);
+                            let spatial_12 =
+                                upmixer_dsp.process_stereo_to_7_1_4(l_in, r_in, &upmix_cfg);
+                            for ((&s, peak_vu), ch_buf) in spatial_12
+                                .iter()
+                                .zip(upmix_peak_vus.iter_mut())
+                                .zip(channel_fft_buffers.iter_mut())
+                            {
+                                *peak_vu = peak_vu.max(s.abs());
+                                ch_buf[fft_index] = s;
+                            }
+                            let mono = (spatial_12[0] + spatial_12[1]) * 0.38
+                                + spatial_12[2] * 0.25
+                                + spatial_12[3] * 0.32
+                                + (spatial_12[4]
+                                    + spatial_12[5]
+                                    + spatial_12[6]
+                                    + spatial_12[7])
+                                    * 0.14
+                                + (spatial_12[8]
+                                    + spatial_12[9]
+                                    + spatial_12[10]
+                                    + spatial_12[11])
+                                    * 0.16;
+                            fft_buffer[fft_index] = mono.clamp(-1.0, 1.0);
+                            fft_index = (fft_index + 1) % window_size;
                         }
-                        fft_buffer[fft_index] = mono.clamp(-1.0, 1.0);
-                        fft_index = (fft_index + 1) % window_size;
+                    } else {
+                        for i in 0..to_copy {
+                            let mut mono = 0.0;
+                            for (c, buf) in channel_fft_buffers
+                                .iter_mut()
+                                .enumerate()
+                                .take(hardware_channels)
+                            {
+                                let sample =
+                                    chunk.samples[i * hardware_channels + c].clamp(-1.0, 1.0);
+                                let ch_weight = match c {
+                                    0 | 1 => {
+                                        if hardware_channels == 1 {
+                                            1.0
+                                        } else {
+                                            0.5
+                                        }
+                                    }
+                                    2 => std::f32::consts::FRAC_1_SQRT_2,
+                                    _ => 0.25,
+                                };
+                                mono += sample * ch_weight;
+                                buf[fft_index] = sample;
+                            }
+                            fft_buffer[fft_index] = mono.clamp(-1.0, 1.0);
+                            fft_index = (fft_index + 1) % window_size;
+                        }
                     }
+
+                    let (dsp_channels, vu_slice): (usize, &[f32]) = if upmix_cfg.enabled {
+                        (12, &upmix_peak_vus)
+                    } else {
+                        (hardware_channels, &chunk.channel_vus)
+                    };
 
                     let msg = build_recycled_dsp_message(
                         &recycle_rx,
@@ -6333,8 +6910,8 @@ fn run_dummy(
                         &channel_fft_buffers,
                         fft_index,
                         window_size,
-                        hardware_channels,
-                        &chunk.channel_vus,
+                        dsp_channels,
+                        vu_slice,
                         chunk.current_order,
                         chunk.current_row,
                         chunk.bpm,
@@ -6494,7 +7071,8 @@ where
     let mut chunk_frame_pos = 0;
 
     let mut fft_buffer: Vec<f32> = vec![0.0; window_size];
-    let mut channel_fft_buffers: Vec<Vec<f32>> = vec![vec![0.0; window_size]; hardware_channels];
+    let mut channel_fft_buffers: Vec<Vec<f32>> =
+        vec![vec![0.0; window_size]; hardware_channels.max(12)];
     let mut fft_index = 0;
     let recycle_rx = dsp_recycle_channel().1.clone();
     let dsp_send_interval = (sample_rate as usize / 120).max(1);
@@ -6510,6 +7088,9 @@ where
     let mut last_seek_epoch = 0u64;
     let mut latest_seek_epoch = 0u64;
     let mut was_paused = false;
+    let mut upmix_cfg = crate::state::SurroundUpmixConfig::default();
+    let mut upmixer_dsp = SurroundUpmixerDsp::new(sample_rate);
+    let mut upmix_peak_vus = [0.0f32; 12];
 
     let shared_state_err = shared_state.clone();
     let shared_state_cb = shared_state.clone();
@@ -6523,6 +7104,7 @@ where
             if let Ok(state) = shared_state_cb.try_lock() {
                 was_paused = state.is_paused;
                 latest_seek_epoch = state.seek_epoch;
+                upmix_cfg = state.surround_upmix;
             }
 
             if let Some(ref c) = current_chunk
@@ -6542,6 +7124,10 @@ where
                     state.raw_spectrum_data.fill(0.0);
                 }
                 return;
+            }
+
+            if upmix_cfg.enabled {
+                upmixer_dsp.sync_config(&upmix_cfg, sample_rate);
             }
 
             let frames_to_render = data.len() / hardware_channels;
@@ -6603,32 +7189,81 @@ where
 
                     let to_copy = std::cmp::min(frames_available, frames_needed);
 
-                    for i in 0..to_copy {
-                        let src_frame_idx = chunk_frame_pos + i;
-                        let dst_frame_idx = frames_written + i;
+                    if upmix_cfg.enabled {
+                        let src_ch = (chunk.spatial_channels as usize).max(1);
+                        for i in 0..to_copy {
+                            let src_frame_idx = chunk_frame_pos + i;
+                            let dst_frame_idx = frames_written + i;
+                            let frame_slice = &chunk.samples[src_frame_idx * hardware_channels
+                                ..(src_frame_idx + 1) * hardware_channels];
+                            let (l_in, r_in) = extract_stereo_pair_from_frame(frame_slice, src_ch);
+                            let spatial_12 =
+                                upmixer_dsp.process_stereo_to_7_1_4(l_in, r_in, &upmix_cfg);
 
-                        let mut mono = 0.0;
-                        for c in 0..hardware_channels {
-                            let sample = chunk.samples[src_frame_idx * hardware_channels + c]
-                                .clamp(-1.0, 1.0);
-                            data[dst_frame_idx * hardware_channels + c] = T::from_sample(sample);
-                            let ch_weight = match c {
-                                0 | 1 => {
-                                    if hardware_channels == 1 {
-                                        1.0
-                                    } else {
-                                        0.5
-                                    }
-                                }
-                                2 => std::f32::consts::FRAC_1_SQRT_2,
-                                _ => 0.25,
-                            };
-                            mono += sample * ch_weight;
-                            channel_fft_buffers[c][fft_index] = sample;
+                            for c in 0..hardware_channels {
+                                let out_s = map_7_1_4_channel_to_hardware(
+                                    &spatial_12,
+                                    hardware_channels,
+                                    c,
+                                );
+                                data[dst_frame_idx * hardware_channels + c] =
+                                    T::from_sample(out_s);
+                            }
+
+                            for ((&s, peak_vu), ch_buf) in spatial_12
+                                .iter()
+                                .zip(upmix_peak_vus.iter_mut())
+                                .zip(channel_fft_buffers.iter_mut())
+                            {
+                                *peak_vu = peak_vu.max(s.abs());
+                                ch_buf[fft_index] = s;
+                            }
+
+                            let mono = (spatial_12[0] + spatial_12[1]) * 0.38
+                                + spatial_12[2] * 0.25
+                                + spatial_12[3] * 0.32
+                                + (spatial_12[4]
+                                    + spatial_12[5]
+                                    + spatial_12[6]
+                                    + spatial_12[7])
+                                    * 0.14
+                                + (spatial_12[8]
+                                    + spatial_12[9]
+                                    + spatial_12[10]
+                                    + spatial_12[11])
+                                    * 0.16;
+                            fft_buffer[fft_index] = mono.clamp(-1.0, 1.0);
+                            fft_index = (fft_index + 1) % window_size;
                         }
+                    } else {
+                        for i in 0..to_copy {
+                            let src_frame_idx = chunk_frame_pos + i;
+                            let dst_frame_idx = frames_written + i;
 
-                        fft_buffer[fft_index] = mono.clamp(-1.0, 1.0);
-                        fft_index = (fft_index + 1) % window_size;
+                            let mut mono = 0.0;
+                            for c in 0..hardware_channels {
+                                let sample = chunk.samples[src_frame_idx * hardware_channels + c]
+                                    .clamp(-1.0, 1.0);
+                                data[dst_frame_idx * hardware_channels + c] =
+                                    T::from_sample(sample);
+                                let ch_weight = match c {
+                                    0 | 1 => {
+                                        if hardware_channels == 1 {
+                                            1.0
+                                        } else {
+                                            0.5
+                                        }
+                                    }
+                                    2 => std::f32::consts::FRAC_1_SQRT_2,
+                                    _ => 0.25,
+                                };
+                                mono += sample * ch_weight;
+                                channel_fft_buffers[c][fft_index] = sample;
+                            }
+
+                            fft_buffer[fft_index] = mono.clamp(-1.0, 1.0);
+                            fft_index = (fft_index + 1) % window_size;
+                        }
                     }
 
                     chunk_frame_pos += to_copy;
@@ -6644,14 +7279,19 @@ where
                 frames_since_last_dsp_send = 0;
                 let play_time =
                     last_current_seconds + (chunk_frame_pos as f64 / sample_rate as f64);
+                let (dsp_channels, vu_slice): (usize, &[f32]) = if upmix_cfg.enabled {
+                    (12, &upmix_peak_vus)
+                } else {
+                    (hardware_channels, &last_channel_vus)
+                };
                 let msg = build_recycled_dsp_message(
                     &recycle_rx,
                     &fft_buffer,
                     &channel_fft_buffers,
                     fft_index,
                     window_size,
-                    hardware_channels,
-                    &last_channel_vus,
+                    dsp_channels,
+                    vu_slice,
                     last_current_order,
                     last_current_row,
                     last_bpm,
@@ -6661,6 +7301,9 @@ where
                     last_seek_epoch,
                     true,
                 );
+                if upmix_cfg.enabled {
+                    upmix_peak_vus = [0.0f32; 12];
+                }
                 let _ = tx_cb.try_send(msg);
             }
         },
@@ -7193,5 +7836,88 @@ mod tests {
         update_lookahead_timeline_from_queue(&s.lookahead_queue, &[], &[], 10.0, &mut timeline);
         assert!((timeline[100 * 8 + 1] - 0.6).abs() < 1e-4);
         assert!((timeline[100 * 8 + 3] - 0.4).abs() < 1e-4);
+    }
+
+    #[test]
+    fn test_surround_upmixer_left_right_hemisphere_and_height_crossover() {
+        let sample_rate = 48_000;
+        let mut dsp = SurroundUpmixerDsp::new(sample_rate);
+        let cfg = crate::state::SurroundUpmixConfig {
+            enabled: true,
+            sub_crossover_hz: 90.0,
+            height_crossover_hz: 2500.0,
+            surround_high_bleed: 0.0, // Pure split: highs only to height speakers
+            stereo_width: 0.0,        // Disable Mid/Side cross-feed to test strict L/R isolation
+            ..Default::default()
+        };
+        dsp.sync_config(&cfg, sample_rate);
+
+        // 1. Feed a low-mid 250 Hz sine wave strictly on the LEFT channel (R = 0.0)
+        let mut peak_low = [0.0f32; 12];
+        for n in 0..2048 {
+            let l =
+                (2.0 * std::f32::consts::PI * 250.0 * n as f32 / sample_rate as f32).sin() * 0.7;
+            let out = dsp.process_stereo_to_7_1_4(l, 0.0, &cfg);
+            if n > 512 {
+                for (p, &s) in peak_low.iter_mut().zip(out.iter()) {
+                    *p = p.max(s.abs());
+                }
+            }
+        }
+        // Left bed speakers (FL=0, SL=4, RL=6) must be strongly active, Right bed (FR=1, SR=5, RR=7) silent
+        assert!(peak_low[0] > 0.4, "FL must carry 250Hz left signal");
+        assert!(peak_low[4] > 0.35, "SL must carry 250Hz left signal");
+        assert!(peak_low[6] > 0.30, "RL must carry 250Hz left signal");
+        assert!(
+            peak_low[1] < 1e-4,
+            "FR must remain silent for pure left input"
+        );
+        assert!(
+            peak_low[5] < 1e-4,
+            "SR must remain silent for pure left input"
+        );
+        assert!(
+            peak_low[7] < 1e-4,
+            "RR must remain silent for pure left input"
+        );
+        // At 250 Hz (well below 2500 Hz height crossover), height speakers (TFL=8) are strongly attenuated
+        assert!(
+            peak_low[8] < peak_low[4] * 0.15,
+            "TFL must be attenuated at 250Hz (< 2.5kHz height crossover)"
+        );
+
+        // 2. Feed a high-frequency 8000 Hz sine wave strictly on the RIGHT channel (L = 0.0)
+        let mut dsp_hi = SurroundUpmixerDsp::new(sample_rate);
+        dsp_hi.sync_config(&cfg, sample_rate);
+        let mut peak_hi = [0.0f32; 12];
+        for n in 0..2048 {
+            let r =
+                (2.0 * std::f32::consts::PI * 8000.0 * n as f32 / sample_rate as f32).sin() * 0.7;
+            let out = dsp_hi.process_stereo_to_7_1_4(0.0, r, &cfg);
+            if n > 512 {
+                for (p, &s) in peak_hi.iter_mut().zip(out.iter()) {
+                    *p = p.max(s.abs());
+                }
+            }
+        }
+        // Right height speakers (TFR=9, TRR=11) must be strongly active, and significantly louder than ear-level SR/RR
+        assert!(
+            peak_hi[9] > 0.45,
+            "TFR must carry 8kHz right high-frequency signal"
+        );
+        assert!(
+            peak_hi[11] > 0.40,
+            "TRR must carry 8kHz right high-frequency signal"
+        );
+        assert!(
+            peak_hi[9] > peak_hi[5] * 3.0,
+            "At 8kHz (> 2.5kHz crossover), TFR height speaker ({}) must dominate SR bed speaker ({})",
+            peak_hi[9],
+            peak_hi[5]
+        );
+        assert!(
+            peak_hi[8] < 1e-4,
+            "TFL must remain silent for pure right input"
+        );
     }
 }

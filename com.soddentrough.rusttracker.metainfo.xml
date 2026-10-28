@@ -65,6 +65,11 @@
   <content_rating type="oars-1.1" />
   
   <releases>
+    <release version="0.9.33" date="2026-10-28">
+      <description>
+        <p>Automatic 7.1.4 surround and height upmixing with Haas decorrelation, LFE crossover, high-frequency height routing, and interactive 5-band parametric EQ &amp; crossover panel.</p>
+      </description>
+    </release>
     <release version="0.9.31" date="2026-10-27">
       <description>
         <p>Hardware GPU capability tier classification, runtime frame-budget watchdog, hardware VSync pacing and status indicator, and 3D FLIP hydrodynamic Ferrofluid and Acoustic Glass Water Chamber visualizers.</p>

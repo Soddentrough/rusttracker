@@ -567,6 +567,125 @@ pub struct AudioTrackInfo {
     pub language: Option<String>,
 }
 
+/// Configuration for Automatic Surround & Height Upmixing and the 5-Band Crossover EQ.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SurroundUpmixConfig {
+    /// Whether automatic surround & height upmixing is active.
+    pub enabled: bool,
+    /// Low-pass Linkwitz-Riley crossover frequency (Hz) for LFE subwoofer extraction (40..=250 Hz).
+    pub sub_crossover_hz: f32,
+    /// High-pass Linkwitz-Riley crossover frequency (Hz) splitting highs up to height speakers (800..=10000 Hz).
+    pub height_crossover_hz: f32,
+    /// 5-band parametric EQ gains in dB (-12.0..=12.0 dB) at center frequencies [60, 250, 1000, 3500, 10000] Hz.
+    pub band_gains_db: [f32; 5],
+    /// Front L/R speaker level weight (0.0..=1.5).
+    pub front_level: f32,
+    /// Side & Rear L/R bed surround speaker level weight (0.0..=1.5).
+    pub side_rear_level: f32,
+    /// Height (Top Front / Top Rear) L/R speaker level weight (0.0..=1.5).
+    pub height_level: f32,
+    /// Center speaker mid-extraction level weight (0.0..=1.5; 0.0 = pure Left/Right side-only).
+    pub center_level: f32,
+    /// LFE subwoofer level weight (0.0..=1.5).
+    pub lfe_level: f32,
+    /// Fraction of high-frequency band (> height_crossover_hz) kept in ear-level Side/Rear speakers (0.0..=1.0).
+    pub surround_high_bleed: f32,
+    /// Mid/Side ambient extraction boost for rear and height speakers (0.0..=2.0).
+    pub stereo_width: f32,
+}
+
+impl Default for SurroundUpmixConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            sub_crossover_hz: 90.0,
+            height_crossover_hz: 2800.0,
+            band_gains_db: [0.0; 5],
+            front_level: 1.0,
+            side_rear_level: 0.85,
+            height_level: 0.95,
+            center_level: 0.45,
+            lfe_level: 0.85,
+            surround_high_bleed: 0.25,
+            stereo_width: 1.0,
+        }
+    }
+}
+
+impl SurroundUpmixConfig {
+    pub const EQ_BAND_FREQS: [f32; 5] = [60.0, 250.0, 1000.0, 3500.0, 10000.0];
+    pub const EQ_BAND_LABELS: [&'static str; 5] = ["60Hz", "250Hz", "1kHz", "3.5kHz", "10kHz"];
+
+    /// Reset EQ bands, crossover cutoffs, and speaker levels back to factory defaults,
+    /// preserving the current `enabled` state.
+    pub fn reset_tuning(&mut self) {
+        let enabled = self.enabled;
+        *self = Self::default();
+        self.enabled = enabled;
+    }
+
+    /// Evaluate the composite 5-band EQ gain in dB at a given frequency `freq_hz`.
+    pub fn evaluate_eq_db(&self, freq_hz: f32) -> f32 {
+        let f = freq_hz.clamp(20.0, 20000.0);
+        let log_f = f.log2();
+        let mut total_db = 0.0f32;
+
+        for (i, &center_f) in Self::EQ_BAND_FREQS.iter().enumerate() {
+            let gain_db = self.band_gains_db[i].clamp(-12.0, 12.0);
+            if gain_db.abs() < 1e-4 {
+                continue;
+            }
+            let log_c = center_f.log2();
+            let oct_dist = log_f - log_c;
+            let weight = if i == 0 {
+                // Low-shelf with gentle bell transition above 60 Hz
+                if oct_dist <= 0.0 {
+                    1.0
+                } else {
+                    (-oct_dist * oct_dist * 1.15).exp()
+                }
+            } else if i == 4 {
+                // High-shelf with gentle bell transition below 10 kHz
+                if oct_dist >= 0.0 {
+                    1.0
+                } else {
+                    (-oct_dist * oct_dist * 1.15).exp()
+                }
+            } else {
+                // Parametric peaking bell (~1.1 octave bandwidth)
+                (-oct_dist * oct_dist * 1.35).exp()
+            };
+            total_db += gain_db * weight;
+        }
+        total_db.clamp(-15.0, 15.0)
+    }
+
+    /// Evaluate the Linkwitz-Riley 2nd-order crossover routing magnitudes at `freq_hz`.
+    /// Returns `(eq_linear_gain, lfe_mag, side_rear_bed_mag, height_mag)`.
+    pub fn evaluate_band_routing(&self, freq_hz: f32) -> (f32, f32, f32, f32) {
+        let f = freq_hz.clamp(20.0, 20000.0);
+        let eq_db = self.evaluate_eq_db(f);
+        let eq_gain = 10.0f32.powf(eq_db / 20.0);
+
+        let f_sub = self.sub_crossover_hz.clamp(40.0, 250.0);
+        let sub_ratio_sq = (f / f_sub).powi(2);
+        let lfe_lp = 1.0 / (1.0 + sub_ratio_sq);
+
+        let f_height = self.height_crossover_hz.clamp(800.0, 10000.0);
+        let height_ratio_sq = (f / f_height).powi(2);
+        let height_lp = 1.0 / (1.0 + height_ratio_sq);
+        let height_hp = height_ratio_sq / (1.0 + height_ratio_sq);
+
+        let lfe_mag = eq_gain * lfe_lp * self.lfe_level;
+        let bed_mag = eq_gain
+            * (height_lp + self.surround_high_bleed.clamp(0.0, 1.0) * height_hp)
+            * self.side_rear_level;
+        let height_mag = eq_gain * height_hp * self.height_level;
+
+        (eq_gain, lfe_mag, bed_mag, height_mag)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AppState {
     pub song_title: String,
@@ -678,6 +797,7 @@ pub struct AppState {
     pub drag_cursor_pos: Option<[f32; 2]>,
     pub track_info_rect: Option<[f32; 4]>,
     pub mobile_hud_tab: MobileHudTab,
+    pub surround_upmix: SurroundUpmixConfig,
 }
 
 pub fn get_history_file_path() -> std::path::PathBuf {
@@ -860,6 +980,7 @@ impl AppState {
             drag_cursor_pos: None,
             track_info_rect: None,
             mobile_hud_tab: MobileHudTab::default(),
+            surround_upmix: SurroundUpmixConfig::default(),
         }
     }
 
@@ -902,7 +1023,11 @@ impl AppState {
                 Vec::new()
             },
             raw_spectrum_data: Vec::new(),
-            spectrum_data: Vec::new(), // Only used in engine.update() (under lock)
+            spectrum_data: if self.file_loaded && self.surround_upmix.enabled {
+                self.spectrum_data.clone()
+            } else {
+                Vec::new()
+            },
             spectrum_peaks: Vec::new(), // Only used in TUI / engine.update()
             spectrum_history: VecDeque::new(), // Skipped in snapshot
             waveform_history: VecDeque::new(), // Skipped in snapshot
@@ -996,6 +1121,7 @@ impl AppState {
             drag_cursor_pos: self.drag_cursor_pos,
             track_info_rect: self.track_info_rect,
             mobile_hud_tab: self.mobile_hud_tab,
+            surround_upmix: self.surround_upmix,
         }
     }
 
@@ -1164,6 +1290,37 @@ impl AppState {
                 }
             }
         }
+    }
+
+    /// Enables or disables automatic 7.1.4 surround & height upmixing with configurable crossover EQ.
+    pub fn set_surround_upmix(&mut self, enabled: bool) {
+        self.surround_upmix.enabled = enabled;
+        if enabled {
+            self.force_stereo_downmix = false;
+            self.num_channels = 12;
+            if self.file_loaded {
+                self.show_hud = true;
+                if self.video_mode == 3 {
+                    self.video_mode = 0;
+                }
+            }
+            self.osd_text =
+                Some("🔊 Auto Surround & Height Upmix: ON (7.1.4 + Crossover EQ)".to_string());
+        } else {
+            self.num_channels = if let Some(tc) = self.tracker_channels {
+                tc + 2
+            } else {
+                self.hardware_channels.max(2)
+            };
+            self.osd_text = Some("🔊 Auto Surround & Height Upmix: OFF".to_string());
+        }
+        self.osd_timer = 2.5;
+    }
+
+    /// Toggles automatic 7.1.4 surround & height upmixing with configurable crossover EQ.
+    pub fn toggle_surround_upmix(&mut self) {
+        let next = !self.surround_upmix.enabled;
+        self.set_surround_upmix(next);
     }
 }
 
