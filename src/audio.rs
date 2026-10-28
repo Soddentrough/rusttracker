@@ -2778,7 +2778,8 @@ impl FfmpegSource {
                 if (track.channels != dec_ch
                     || track.resampler.input().format != decoded.format()
                     || track.resampler.input().rate != dec_rate
-                    || track.resampler.input().channel_layout != dec_layout)
+                    || track.resampler.input().channel_layout != dec_layout
+                    || track.resampler.output().rate != self.output_sample_rate)
                     && let Ok(new_resamp) = ffmpeg_next::software::resampling::context::Context::get(
                         decoded.format(),
                         dec_layout,
@@ -2925,7 +2926,8 @@ impl FfmpegSource {
                             if (track.channels != dec_ch
                                 || track.resampler.input().format != decoded.format()
                                 || track.resampler.input().rate != dec_rate
-                                || track.resampler.input().channel_layout != dec_layout)
+                                || track.resampler.input().channel_layout != dec_layout
+                                || track.resampler.output().rate != self.output_sample_rate)
                                 && let Ok(new_resamp) =
                                     ffmpeg_next::software::resampling::context::Context::get(
                                         decoded.format(),
@@ -4131,7 +4133,7 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
             let in_rate = if dec.rate() > 0 {
                 dec.rate()
             } else {
-                sample_rate.max(48000)
+                sample_rate.max(8000)
             };
             if let Ok(resamp) = ffmpeg_next::software::resampling::context::Context::get(
                 fmt,
@@ -4139,7 +4141,7 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
                 in_rate,
                 ffmpeg_next::format::sample::Sample::F32(ffmpeg_next::format::sample::Type::Packed),
                 layout,
-                sample_rate.max(48000),
+                sample_rate.max(8000),
             ) {
                 let vol = if t_idx == selected_track_idx {
                     1.0
@@ -4169,6 +4171,12 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
                 );
             }
         }
+    }
+
+    if !active_tracks.contains_key(&stream_index) {
+        return Err(anyhow::anyhow!(
+            "Failed to initialize FFmpeg audio decoder for primary stream"
+        ));
     }
 
     let is_full_mix_guide = if audio_tracks.len() == 2 {
@@ -5163,8 +5171,24 @@ pub fn start_audio_thread(
             state.selected_audio_device.clone()
         };
 
-        let devices_to_try = if let Some(ref name) = selected_device_name {
-            let mut candidates = Vec::new();
+        let mut devices_to_try = Vec::new();
+        let push_unique_device = |list: &mut Vec<cpal::Device>, dev: cpal::Device| {
+            let d_name = dev
+                .description()
+                .map(|desc| format_cpal_device_name(&desc))
+                .unwrap_or_else(|_| "Unknown Device".to_string());
+            let already_present = list.iter().any(|existing| {
+                existing
+                    .description()
+                    .map(|desc| format_cpal_device_name(&desc) == d_name)
+                    .unwrap_or(false)
+            });
+            if !already_present {
+                list.push(dev);
+            }
+        };
+
+        if let Some(ref name) = selected_device_name {
             let mut is_default = false;
 
             // ALSA WORKAROUND: If the user selected the default device by name, ensure we use the REAL default host handle.
@@ -5174,7 +5198,7 @@ pub fn start_audio_thread(
                 && let Ok(desc) = default_dev.description()
                 && cpal_device_matches_name(&desc, name)
             {
-                candidates.push(default_dev);
+                push_unique_device(&mut devices_to_try, default_dev);
                 is_default = true;
             }
 
@@ -5183,44 +5207,34 @@ pub fn start_audio_thread(
                     if let Ok(desc) = d.description()
                         && cpal_device_matches_name(&desc, name)
                     {
-                        candidates.push(d);
+                        push_unique_device(&mut devices_to_try, d);
                         break;
                     }
                 }
             }
+        }
 
-            if candidates.is_empty() {
-                return Err(anyhow::anyhow!(
-                    "Selected audio device '{}' not found",
-                    name
-                ));
-            }
-            candidates
-        } else {
-            let mut candidates = Vec::new();
-            if let Some(default_dev) = host.default_output_device() {
-                candidates.push(default_dev);
-            }
-            if let Ok(devices) = host.output_devices() {
-                for d in devices {
-                    if let Some(default_dev) = host.default_output_device()
-                        && let (Ok(desc1), Ok(desc2)) = (d.description(), default_dev.description())
-                        && format_cpal_device_name(&desc1) == format_cpal_device_name(&desc2)
-                    {
-                        continue;
-                    }
-                    candidates.push(d);
+        if let Some(default_dev) = host.default_output_device() {
+            push_unique_device(&mut devices_to_try, default_dev);
+        }
+        if let Ok(devices) = host.output_devices() {
+            for d in devices {
+                let is_relevant = d
+                    .description()
+                    .map(|desc| is_relevant_audio_device(&format_cpal_device_name(&desc)))
+                    .unwrap_or(true);
+                if is_relevant {
+                    push_unique_device(&mut devices_to_try, d);
                 }
             }
-            candidates
-        };
+        }
 
         if devices_to_try.is_empty() {
             return Err(anyhow::anyhow!("No audio output devices found."));
         }
 
         let mut last_err = anyhow::anyhow!("No candidate audio device succeeded");
-        for device in devices_to_try {
+        for (dev_idx, device) in devices_to_try.into_iter().enumerate() {
             let device_name = device
                 .description()
                 .map(|desc| format_cpal_device_name(&desc))
@@ -5374,6 +5388,15 @@ pub fn start_audio_thread(
                                 max_frequency,
                                 window_size,
                             );
+                            if dev_idx > 0
+                                && let Ok(mut state) = shared_state_closure.lock()
+                            {
+                                eprintln!(
+                                    "[audio] Switched to available fallback audio device: '{}'",
+                                    device_name
+                                );
+                                state.selected_audio_device = Some(device_name.clone());
+                            }
                             return Ok((stream, stop_token));
                         }
                         Err(e) => {

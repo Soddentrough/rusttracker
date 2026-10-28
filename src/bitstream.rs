@@ -1410,11 +1410,17 @@ mod wasapi_bitstream {
                         .ok()
                 };
 
-                // Helper to test if a device accepts any of the given profiles
+                // Helper to test if a device accepts and can initialize any of the given profiles
+                type NegotiatedClient = (
+                    IAudioClient,
+                    IAudioRenderClient,
+                    HANDLE,
+                    u32,
+                    AudioProfile,
+                    Vec<u8>,
+                );
                 let test_device_formats =
-                    |dev: &IMMDevice,
-                     profs: &[AudioProfile]|
-                     -> Option<(IAudioClient, AudioProfile, Vec<u8>)> {
+                    |dev: &IMMDevice, profs: &[AudioProfile]| -> Option<NegotiatedClient> {
                         let client: IAudioClient = unsafe { dev.Activate(CLSCTX_ALL, None).ok()? };
                         for p in profs {
                             let fmt = build_format(p);
@@ -1430,7 +1436,11 @@ mod wasapi_bitstream {
                                     "  [bitstream] Device accepted profile: {} ({}ch x {}Hz)",
                                     p.name, p.channels, p.rate
                                 );
-                                return Some((client, p.clone(), fmt));
+                                if let Ok((ac, rc, ev, bf)) =
+                                    initialize_exclusive_client(dev, p, &fmt)
+                                {
+                                    return Some((ac, rc, ev, bf, p.clone(), fmt));
+                                }
                             }
                         }
                         None
@@ -1440,30 +1450,38 @@ mod wasapi_bitstream {
                     println!(
                         "[bitstream] Testing selected audio device for exclusive/bitstream support..."
                     );
-                    test_device_formats(dev, &profiles).map(|(c, p, f)| (dev.clone(), c, p, f))
-                } else if let Some(ref dev) = default_device {
-                    println!(
-                        "[bitstream] Testing default audio endpoint for exclusive/bitstream support..."
-                    );
-                    test_device_formats(dev, &profiles).map(|(c, p, f)| (dev.clone(), c, p, f))
+                    test_device_formats(dev, &profiles)
+                        .map(|(ac, rc, ev, bf, p, f)| (dev.clone(), ac, rc, ev, bf, p, f))
                 } else {
                     None
                 };
 
-                // If target/default endpoint rejected the formats, probe other active endpoints
-                if false && negotiated.is_none() {
+                if negotiated.is_none()
+                    && let Some(ref dev) = default_device
+                {
+                    println!(
+                        "[bitstream] Testing default audio endpoint for exclusive/bitstream support..."
+                    );
+                    negotiated = test_device_formats(dev, &profiles)
+                        .map(|(ac, rc, ev, bf, p, f)| (dev.clone(), ac, rc, ev, bf, p, f));
+                }
+
+                // If target/default endpoint rejected or failed to initialize formats, probe other active endpoints
+                if negotiated.is_none() {
                     println!(
                         "[bitstream] Default/selected endpoint rejected formats; probing other active endpoints for AVR/HDMI..."
                     );
                     for i in 0..count {
                         if let Ok(dev) = unsafe { collection.Item(i) } {
                             let dev_name = get_device_name(&dev).unwrap_or_default();
-                            if let Some((c, p, f)) = test_device_formats(&dev, &profiles) {
+                            if let Some((ac, rc, ev, bf, p, f)) =
+                                test_device_formats(&dev, &profiles)
+                            {
                                 println!(
                                     "[bitstream] Selected capable endpoint [{}]: {}",
                                     i, dev_name
                                 );
-                                negotiated = Some((dev, c, p, f));
+                                negotiated = Some((dev, ac, rc, ev, bf, p, f));
                                 break;
                             }
                         }
@@ -1475,113 +1493,13 @@ mod wasapi_bitstream {
                 drop(target_device);
                 drop(default_device);
 
-                let (device, mut audio_client, profile, format) = negotiated
-                    .ok_or_else(|| anyhow::anyhow!("No exclusive/bitstream format accepted by available audio endpoints.\n\
+                let (device, audio_client, render_client, event, buffer_frames, profile, format) =
+                    negotiated.ok_or_else(|| anyhow::anyhow!("No exclusive/bitstream format accepted by available audio endpoints.\n\
                         Ensure your audio receiver supports multichannel LPCM or bitstream output over HDMI/SPDIF."))?;
 
-                println!(
-                    "\n[bitstream] Initializing audio client for {}...",
-                    profile.name
-                );
-
-                let mut default_period = 0;
-                let mut min_period = 0;
-                unsafe {
-                    audio_client
-                        .GetDevicePeriod(Some(&mut default_period), Some(&mut min_period))?;
-                }
-
-                println!(
-                    "  Device Periods: Default = {}ns, Min = {}ns",
-                    default_period * 100,
-                    min_period * 100
-                );
-
-                let mut buffer_duration = if min_period > 0 {
-                    min_period
-                } else {
-                    default_period.max(100_000)
-                };
-
-                let mut hr = unsafe {
-                    audio_client.Initialize(
-                        AUDCLNT_SHAREMODE_EXCLUSIVE,
-                        AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                        buffer_duration,
-                        buffer_duration,
-                        format.as_ptr() as *const _,
-                        None,
-                    )
-                };
-
-                if let Err(e) = &hr {
-                    if e.code() == windows::core::HRESULT(0x88890019u32 as i32)
-                        || e.code() == windows::core::HRESULT(0x80070057u32 as i32)
-                    {
-                        println!(
-                            "  Initialize rejected duration {} (HRESULT: {:?}). Attempting to align...",
-                            buffer_duration,
-                            e.code()
-                        );
-
-                        let aligned_frames = unsafe { audio_client.GetBufferSize().unwrap_or(0) };
-                        if aligned_frames > 0 {
-                            buffer_duration =
-                                (aligned_frames as i64 * 10_000_000) / profile.rate as i64;
-                            println!(
-                                "  Aligned buffer duration: {}ns ({} frames)",
-                                buffer_duration * 100,
-                                aligned_frames
-                            );
-
-                            let audio_client_new: IAudioClient =
-                                unsafe { device.Activate(CLSCTX_ALL, None)? };
-                            hr = unsafe {
-                                audio_client_new.Initialize(
-                                    AUDCLNT_SHAREMODE_EXCLUSIVE,
-                                    AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                                    buffer_duration,
-                                    buffer_duration,
-                                    format.as_ptr() as *const _,
-                                    None,
-                                )
-                            };
-
-                            if hr.is_ok() {
-                                audio_client = audio_client_new;
-                            } else {
-                                hr.map_err(|e| anyhow::anyhow!(e))?;
-                            }
-                        } else {
-                            hr.map_err(|e| anyhow::anyhow!(e))?;
-                        }
-                    } else {
-                        hr.map_err(|e| anyhow::anyhow!(e))?;
-                    }
-                }
-
                 // Keep `device` alive so Exclusive Mode can release on pause and re-acquire on resume
-
-                let event = unsafe { CreateEventW(None, false, false, None)? };
-                if let Err(e) = unsafe { audio_client.SetEventHandle(event) } {
-                    unsafe {
-                        let _ = CloseHandle(event);
-                    }
-                    return Err(anyhow::anyhow!(e));
-                }
-
-                let buffer_frames = unsafe { audio_client.GetBufferSize()? };
                 let bytes_per_sample = (profile.container_bits / 8) as u32;
                 let frame_bytes = profile.channels as u32 * bytes_per_sample;
-                let render_client: IAudioRenderClient = match unsafe { audio_client.GetService() } {
-                    Ok(rc) => rc,
-                    Err(e) => {
-                        unsafe {
-                            let _ = CloseHandle(event);
-                        }
-                        return Err(anyhow::anyhow!(e));
-                    }
-                };
                 println!(
                     "Buffer: {} frames ({:.1} ms)",
                     buffer_frames,
@@ -2908,9 +2826,7 @@ mod wasapi_bitstream {
                                     playback_time = Some(t);
                                 }
                             }
-                            if started
-                                || prebuffer_start.elapsed() > std::time::Duration::from_millis(500)
-                            {
+                            if started {
                                 if let Some((ac, rc, ev)) = active_client.take() {
                                     unsafe {
                                         let _ = ac.Stop();
