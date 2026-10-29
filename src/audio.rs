@@ -7690,85 +7690,10 @@ fn run_wasapi_exclusive_multichannel(
         data3: 0x0010,
         data4: [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
     };
-    const KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_MLP: GUID = GUID {
-        data1: 0x0000000c,
-        data2: 0x0cea,
-        data3: 0x0010,
-        data4: [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
-    };
-    const KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_MAT20: GUID = GUID {
-        data1: 0x0000000f,
-        data2: 0x0cea,
-        data3: 0x0010,
-        data4: [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
-    };
-    const KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_DIGITAL_PLUS: GUID = GUID {
-        data1: 0x0000000a,
-        data2: 0x0cea,
-        data3: 0x0010,
-        data4: [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
-    };
     const PKEY_DEVICE_FRIENDLY_NAME: PROPERTYKEY = PROPERTYKEY {
         fmtid: GUID::from_u128(0xa45c254e_df1c_4efd_8020_67d146a850e0),
         pid: 14,
     };
-
-    fn device_supports_atmos_height(probe_client: &IAudioClient) -> bool {
-        let probes = [
-            (
-                KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_MLP,
-                8u16,
-                192_000u32,
-                0x63Fu32,
-            ),
-            (
-                KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_MAT20,
-                8u16,
-                192_000u32,
-                0x63Fu32,
-            ),
-            (
-                KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_DIGITAL_PLUS,
-                2u16,
-                192_000u32,
-                0x3u32,
-            ),
-            (
-                KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_DIGITAL_PLUS,
-                8u16,
-                192_000u32,
-                0x63Fu32,
-            ),
-        ];
-        for (sub_format, channels, rate, mask) in probes {
-            let block_align = channels * 2;
-            let wf = WAVEFORMATEXTENSIBLE {
-                Format: WAVEFORMATEX {
-                    wFormatTag: 0xFFFE,
-                    nChannels: channels,
-                    nSamplesPerSec: rate,
-                    nAvgBytesPerSec: rate * block_align as u32,
-                    nBlockAlign: block_align,
-                    wBitsPerSample: 16,
-                    cbSize: 22,
-                },
-                Samples: WAVEFORMATEXTENSIBLE_0 {
-                    wValidBitsPerSample: 16,
-                },
-                dwChannelMask: mask,
-                SubFormat: sub_format,
-            };
-            let wf_ptr = &wf as *const WAVEFORMATEXTENSIBLE as *const WAVEFORMATEX;
-            if unsafe {
-                probe_client
-                    .IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, wf_ptr, None)
-                    .is_ok()
-            } {
-                return true;
-            }
-        }
-        false
-    }
 
     #[derive(Clone, Copy, Debug)]
     enum WasapiPcmFormat {
@@ -8022,17 +7947,10 @@ fn run_wasapi_exclusive_multichannel(
         } else {
             match target_channels {
                 c if c >= 12 => vec![(12, 0x2D63F), (8, 0x63F), (8, 0xFF), (6, 0x3F)],
-                7 | 8 => vec![(12, 0x2D63F), (8, 0x63F), (8, 0xFF), (6, 0x3F)],
-                5 | 6 => vec![(12, 0x2D63F), (8, 0x63F), (8, 0xFF), (6, 0x3F), (6, 0x60F)],
-                3 | 4 => vec![(12, 0x2D63F), (8, 0x63F), (6, 0x3F), (4, 0x33)],
-                _ => vec![
-                    (12, 0x2D63F),
-                    (8, 0x63F),
-                    (8, 0xFF),
-                    (6, 0x3F),
-                    (6, 0x60F),
-                    (4, 0x33),
-                ],
+                7 | 8 => vec![(8, 0x63F), (8, 0xFF), (6, 0x3F)],
+                5 | 6 => vec![(6, 0x3F), (6, 0x60F), (8, 0x63F), (8, 0xFF)],
+                3 | 4 => vec![(4, 0x33), (6, 0x3F), (8, 0x63F)],
+                _ => Vec::new(),
             }
         };
 
@@ -8043,12 +7961,6 @@ fn run_wasapi_exclusive_multichannel(
             }
         }
 
-        let hw_probe_fmt_candidates = [
-            WasapiPcmFormat::I24In32,
-            WasapiPcmFormat::F32,
-            WasapiPcmFormat::I32,
-            WasapiPcmFormat::I16,
-        ];
         // In WASAPI Shared Mode, the Windows Audio Engine operates natively in 32-bit IEEE Float.
         let shared_fmt_candidates = [
             WasapiPcmFormat::F32,
@@ -8057,7 +7969,6 @@ fn run_wasapi_exclusive_multichannel(
             WasapiPcmFormat::I16,
         ];
 
-        let wants_height_12ch = channel_candidates.iter().any(|&(c, _)| c >= 12);
         let mut opened: Option<(
             IMMDevice,
             String,
@@ -8066,12 +7977,11 @@ fn run_wasapi_exclusive_multichannel(
             HANDLE,
             u32,
             u16,
-            u16,
             u32,
             WasapiPcmFormat,
         )> = None;
         let mut last_err = anyhow::anyhow!(
-            "No multichannel WASAPI hardware support detected on candidate endpoints"
+            "No multichannel WASAPI Shared Mode support detected on candidate endpoints"
         );
 
         'dev_loop: for (dev, dev_name) in candidate_devices {
@@ -8089,54 +7999,48 @@ fn run_wasapi_exclusive_multichannel(
             } else {
                 2
             };
-            let supports_atmos_height = wants_height_12ch
-                && probe_client
-                    .as_ref()
-                    .is_some_and(device_supports_atmos_height);
+
+            // In WASAPI Shared Mode, AudioDg.exe mixes to the endpoint's Shared Mode MixFormat.
+            // If MixFormat is Stereo/Mono (mix_channels <= 2), opening a >2ch Shared Mode stream
+            // with AUTOCONVERTPCM would cause Windows to immediately downmix the surround channels
+            // back to 2ch stereo, coloring stereo output on stereo speakers.
+            if mix_channels <= 2 {
+                continue;
+            }
 
             for &(ch, mask) in &channel_candidates {
-                let hw_supports_ch = if ch >= 12 {
-                    supports_atmos_height
-                        || mix_channels >= 12
-                        || probe_client.as_ref().is_some_and(|pc| {
-                            rate_candidates.iter().any(|&r| {
-                                hw_probe_fmt_candidates.iter().any(|&pfmt| {
-                                    let wf = build_wave_format(ch, r, mask, pfmt);
-                                    let wf_ptr =
-                                        &wf as *const WAVEFORMATEXTENSIBLE as *const WAVEFORMATEX;
-                                    unsafe {
-                                        pc.IsFormatSupported(
-                                            AUDCLNT_SHAREMODE_EXCLUSIVE,
-                                            wf_ptr,
-                                            None,
-                                        )
-                                        .is_ok()
-                                    }
-                                })
-                            })
-                        })
+                let shared_supports_ch = if ch <= mix_channels {
+                    true
+                } else if let Some(ref pc) = probe_client {
+                    // Allow >mix_channels (e.g. 12ch 7.1.4 when Spatial Audio / 7.1.4 endpoint is active)
+                    // only if WASAPI Shared Mode natively accepts `ch` without downconverting nChannels.
+                    rate_candidates.iter().any(|&r| {
+                        let wf = build_wave_format(ch, r, mask, WasapiPcmFormat::F32);
+                        let wf_ptr = &wf as *const WAVEFORMATEXTENSIBLE as *const WAVEFORMATEX;
+                        let mut closest_ptr: *mut WAVEFORMATEX = std::ptr::null_mut();
+                        let hr = unsafe {
+                            pc.IsFormatSupported(
+                                AUDCLNT_SHAREMODE_SHARED,
+                                wf_ptr,
+                                Some(&mut closest_ptr),
+                            )
+                        };
+                        let matched_ch = if !closest_ptr.is_null() {
+                            let c = unsafe { (*closest_ptr).nChannels };
+                            unsafe {
+                                CoTaskMemFree(Some(closest_ptr as *const std::ffi::c_void));
+                            }
+                            c
+                        } else {
+                            ch
+                        };
+                        hr == windows::core::HRESULT(0) && matched_ch == ch
+                    })
                 } else {
-                    mix_channels >= ch
-                        || probe_client.as_ref().is_some_and(|pc| {
-                            rate_candidates.iter().any(|&r| {
-                                hw_probe_fmt_candidates.iter().any(|&pfmt| {
-                                    let wf = build_wave_format(ch, r, mask, pfmt);
-                                    let wf_ptr =
-                                        &wf as *const WAVEFORMATEXTENSIBLE as *const WAVEFORMATEX;
-                                    unsafe {
-                                        pc.IsFormatSupported(
-                                            AUDCLNT_SHAREMODE_EXCLUSIVE,
-                                            wf_ptr,
-                                            None,
-                                        )
-                                        .is_ok()
-                                    }
-                                })
-                            })
-                        })
+                    false
                 };
 
-                if !hw_supports_ch {
+                if !shared_supports_ch {
                     continue;
                 }
 
@@ -8145,25 +8049,17 @@ fn run_wasapi_exclusive_multichannel(
                         match try_open_shared_client(&dev, ch, rate, mask, fmt) {
                             Ok((ac, rc, ev, buf_frames)) => {
                                 drop(probe_client);
-                                let logical_ch = if ch == 8 && supports_atmos_height {
-                                    12
-                                } else {
-                                    ch
-                                };
                                 eprintln!(
-                                    "[audio] WASAPI Shared Multichannel LPCM negotiated on '{}': {}ch physical / {}ch logical (mask 0x{:X}) @ {} Hz [{}] (buffer {} frames)",
+                                    "[audio] WASAPI Shared Multichannel LPCM negotiated on '{}': {}ch (mask 0x{:X}) @ {} Hz [{}] (buffer {} frames)",
                                     dev_name,
                                     ch,
-                                    logical_ch,
                                     mask,
                                     rate,
                                     fmt.label(),
                                     buf_frames
                                 );
-                                opened = Some((
-                                    dev, dev_name, ac, rc, ev, buf_frames, ch, logical_ch, rate,
-                                    fmt,
-                                ));
+                                opened =
+                                    Some((dev, dev_name, ac, rc, ev, buf_frames, ch, rate, fmt));
                                 break 'dev_loop;
                             }
                             Err(e) => {
@@ -8182,7 +8078,6 @@ fn run_wasapi_exclusive_multichannel(
             render_client,
             event,
             buffer_frames,
-            physical_negotiated_channels,
             negotiated_channels,
             negotiated_rate,
             negotiated_fmt,
@@ -8238,9 +8133,8 @@ fn run_wasapi_exclusive_multichannel(
         };
 
         let hardware_channels = negotiated_channels as usize;
-        let physical_channels = physical_negotiated_channels as usize;
         let bytes_per_sample = negotiated_fmt.bytes_per_sample();
-        let frame_bytes = physical_channels * bytes_per_sample;
+        let frame_bytes = hardware_channels * bytes_per_sample;
         let window_size = calculate_power_of_two_window_size(negotiated_rate);
 
         let mut fft_buffer = vec![0.0f32; window_size];
@@ -8430,18 +8324,8 @@ fn run_wasapi_exclusive_multichannel(
                                     target_upmix,
                                 );
 
-                            for c in 0..physical_channels {
-                                let raw_s = if physical_channels == 8
-                                    && hardware_channels == 12
-                                    && (4..8).contains(&c)
-                                {
-                                    out_channels[c]
-                                        + out_channels[c + 4] * std::f32::consts::FRAC_1_SQRT_2
-                                } else if c < 12 {
-                                    out_channels[c]
-                                } else {
-                                    0.0
-                                };
+                            for c in 0..hardware_channels {
+                                let raw_s = if c < 12 { out_channels[c] } else { 0.0 };
                                 let out_s = raw_s * fade_gain;
                                 write_wasapi_sample(
                                     &mut out_bytes[dst_byte_base + c * bytes_per_sample
@@ -8479,14 +8363,12 @@ fn run_wasapi_exclusive_multichannel(
                                 let sample = (chunk.samples[src_frame_idx * hardware_channels + c]
                                     * fade_gain)
                                     .clamp(-1.0, 1.0);
-                                if c < physical_channels {
-                                    write_wasapi_sample(
-                                        &mut out_bytes[dst_byte_base + c * bytes_per_sample
-                                            ..dst_byte_base + (c + 1) * bytes_per_sample],
-                                        sample,
-                                        negotiated_fmt,
-                                    );
-                                }
+                                write_wasapi_sample(
+                                    &mut out_bytes[dst_byte_base + c * bytes_per_sample
+                                        ..dst_byte_base + (c + 1) * bytes_per_sample],
+                                    sample,
+                                    negotiated_fmt,
+                                );
                                 let ch_weight = match c {
                                     0 | 1 => {
                                         if hardware_channels == 1 {
