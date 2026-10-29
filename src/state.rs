@@ -679,7 +679,22 @@ impl SurroundUpmixConfig {
     /// except where the media file's channel count matches the output device (`source_channels == device_channels`).
     #[inline]
     pub fn should_enable_by_default(source_channels: i32, device_channels: i32) -> bool {
-        device_channels > 2 && source_channels != device_channels
+        device_channels > 2 && source_channels > 0 && source_channels < device_channels
+    }
+
+    /// Returns `true` when surround upmixing is applicable for a source with `source_channels`
+    /// on an output device with `hardware_channels`. When the source already has at least as many
+    /// discrete channels as the output hardware (`source_channels >= hardware_channels`), upmixing
+    /// is not applicable because all output channels are already driven by discrete source stems.
+    #[inline]
+    pub fn can_upmix(source_channels: i32, hardware_channels: i32) -> bool {
+        hardware_channels > 2 && (source_channels <= 0 || source_channels < hardware_channels)
+    }
+
+    /// Returns `true` when surround upmixing is both enabled and applicable for `(source_channels, hardware_channels)`.
+    #[inline]
+    pub fn is_active_for(&self, source_channels: i32, hardware_channels: i32) -> bool {
+        self.enabled && Self::can_upmix(source_channels, hardware_channels)
     }
 
     /// Returns `true` when the output hardware layout includes overhead height channels
@@ -784,6 +799,7 @@ pub struct AppState {
     pub speed: i32,
     pub num_channels: i32,
     pub hardware_channels: i32,
+    pub source_channels: i32,
     pub raw_channel_vus: Vec<f32>,
     pub channel_vus: Vec<f32>,
     pub peak_vus: Vec<f32>,
@@ -965,6 +981,7 @@ impl AppState {
             speed: 0,
             num_channels: 0,
             hardware_channels: 0,
+            source_channels: 0,
             raw_channel_vus: Vec::new(),
             channel_vus: Vec::new(),
             peak_vus: Vec::new(),
@@ -1089,6 +1106,7 @@ impl AppState {
             speed: self.speed,
             num_channels: self.num_channels,
             hardware_channels: self.hardware_channels,
+            source_channels: self.source_channels,
             raw_channel_vus: Vec::new(), // Skipped in snapshot
             channel_vus: if self.file_loaded {
                 self.channel_vus.clone()
@@ -1373,6 +1391,20 @@ impl AppState {
     /// Enables or disables automatic surround upmixing with configurable crossover routing.
     /// Only affects playback when connected to a multi-channel surround output device (`hardware_channels > 2`).
     pub fn set_surround_upmix(&mut self, enabled: bool) {
+        if enabled
+            && self.file_loaded
+            && self.hardware_channels > 2
+            && self.source_channels >= self.hardware_channels
+        {
+            self.surround_upmix.enabled = false;
+            let short_tag = SurroundUpmixConfig::short_tag(self.hardware_channels);
+            self.osd_text = Some(format!(
+                "🔊 Native Discrete {} Audio ({}ch) — Upmix Not Applicable",
+                short_tag, self.source_channels
+            ));
+            self.osd_timer = 2.5;
+            return;
+        }
         let prev_enabled = self.surround_upmix.enabled;
         self.surround_upmix.enabled = enabled;
         self.surround_upmix.user_overridden = true;
@@ -1403,13 +1435,19 @@ impl AppState {
                 );
             }
         } else {
-            if self.file_loaded && prev_enabled && self.hardware_channels > 2 {
+            if self.file_loaded
+                && prev_enabled
+                && self.hardware_channels > 2
+                && self.passthrough_enabled
+            {
                 self.passthrough_change_request = Some(self.passthrough_enabled);
             }
             if self.hardware_channels > 2 {
                 let upmix_ch = self.hardware_channels.min(12) as usize;
                 self.num_channels = if let Some(tc) = self.tracker_channels {
                     tc + 2
+                } else if self.source_channels > 0 {
+                    self.source_channels
                 } else if !self.raw_channel_vus.is_empty() && self.raw_channel_vus.len() != upmix_ch
                 {
                     self.raw_channel_vus.len() as i32

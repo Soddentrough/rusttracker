@@ -114,6 +114,12 @@ impl BiquadFilter {
     }
 
     #[inline(always)]
+    pub fn clear_state(&mut self) {
+        self.z1 = 0.0;
+        self.z2 = 0.0;
+    }
+
+    #[inline(always)]
     pub fn update_coeffs(&mut self, coeffs: Self) {
         self.b0 = coeffs.b0;
         self.b1 = coeffs.b1;
@@ -301,6 +307,12 @@ impl<const N: usize> HaasDelayLine<N> {
     }
 
     #[inline(always)]
+    pub fn clear(&mut self) {
+        self.buf.fill(0.0);
+        self.write_idx = 0;
+    }
+
+    #[inline(always)]
     pub fn process(&mut self, input: f32) -> f32 {
         let read_idx = (self.write_idx + N - self.delay_samples) % N;
         let out = self.buf[read_idx];
@@ -332,6 +344,8 @@ pub struct SurroundUpmixerDsp {
     delay_tfr: HaasDelayLine<2048>,
     delay_trl: HaasDelayLine<2048>,
     delay_trr: HaasDelayLine<2048>,
+    blend: f32,
+    blend_initialized: bool,
 }
 
 impl SurroundUpmixerDsp {
@@ -359,6 +373,8 @@ impl SurroundUpmixerDsp {
             delay_tfr: HaasDelayLine::new(158),
             delay_trl: HaasDelayLine::new(307),
             delay_trr: HaasDelayLine::new(307),
+            blend: 1.0,
+            blend_initialized: false,
         };
         dsp.rebuild_all_filters(&default_cfg, sr);
         dsp
@@ -741,6 +757,142 @@ impl SurroundUpmixerDsp {
                 ],
             }
         }
+    }
+
+    /// Upmixes a decoded multi-channel frame `frame_slice` with `source_channels` intrinsic channels
+    /// to `hardware_channels`:
+    /// - When `source_channels >= hardware_channels` or `hardware_channels <= 2`: passes all discrete
+    ///   channels through 1:1 untouched (never folds down native 7.1/5.1 to 2.0 stereo).
+    /// - When `source_channels <= 2`: performs full ITU-R BS.775 constant-power stereo-to-surround upmixing.
+    /// - When `2 < source_channels < hardware_channels` (e.g., discrete 5.1 on 7.1 or 7.1.4 hardware):
+    ///   preserves the discrete front/center/LFE channels (`FL, FR, FC, LFE`) 1:1 and expands the
+    ///   discrete surround channels (`SL, SR`) into rear (`RL, RR`) and height (`TFL..TRR`) speakers.
+    #[inline]
+    pub fn process_multichannel_frame_for_hardware(
+        &mut self,
+        frame_slice: &[f32],
+        source_channels: usize,
+        cfg: &crate::state::SurroundUpmixConfig,
+        hardware_channels: usize,
+    ) -> [f32; 12] {
+        let src_ch = source_channels.max(1);
+        if hardware_channels <= 2 || src_ch >= hardware_channels {
+            let mut out = [0.0f32; 12];
+            let copy_len = frame_slice.len().min(hardware_channels).min(12);
+            out[..copy_len].copy_from_slice(&frame_slice[..copy_len]);
+            return out;
+        }
+        if src_ch <= 2 {
+            let (l_in, r_in) = extract_stereo_pair_from_frame(frame_slice, src_ch);
+            return self.process_frame_for_hardware(l_in, r_in, cfg, hardware_channels);
+        }
+        // Discrete multi-channel expansion (e.g. 5.1 -> 7.1 or 7.1.4):
+        // Keep discrete Front/Center/LFE channels untouched, and feed the surround pair (SL, SR)
+        // into the decorrelated bed/height expander with 1/sqrt(2) constant-power split across SL/RL.
+        let (sur_l, sur_r) = if frame_slice.len() >= 6 && src_ch >= 6 {
+            (frame_slice[4], frame_slice[5])
+        } else if frame_slice.len() >= 4 {
+            (frame_slice[2], frame_slice[3])
+        } else {
+            (
+                frame_slice.first().copied().unwrap_or(0.0),
+                frame_slice.get(1).copied().unwrap_or(0.0),
+            )
+        };
+        let mut expanded = self.process_frame_for_hardware(sur_l, sur_r, cfg, hardware_channels);
+        let discrete_front_count = src_ch.min(4).min(frame_slice.len());
+        expanded[..discrete_front_count].copy_from_slice(&frame_slice[..discrete_front_count]);
+        if src_ch >= 6 && frame_slice.len() >= 6 && hardware_channels >= 8 {
+            let pair_norm = std::f32::consts::FRAC_1_SQRT_2;
+            expanded[4] = (frame_slice[4] * pair_norm).clamp(-1.0, 1.0);
+            expanded[5] = (frame_slice[5] * pair_norm).clamp(-1.0, 1.0);
+        }
+        expanded
+    }
+
+    /// Clears internal biquad filter states and Haas delay-line buffers so transitioning from
+    /// completely bypassed (`blend == 0.0`) into active upmixing never replays stale delay samples.
+    pub fn clear_state(&mut self) {
+        for (el, er) in self.eq_l.iter_mut().zip(self.eq_r.iter_mut()) {
+            el.clear_state();
+            er.clear_state();
+        }
+        self.sub_lp.clear_state();
+        self.sub_hp_l.clear_state();
+        self.sub_hp_r.clear_state();
+        self.sub_hp_c.clear_state();
+        self.height_lp_l.clear_state();
+        self.height_hp_l.clear_state();
+        self.height_lp_r.clear_state();
+        self.height_hp_r.clear_state();
+        self.delay_sl.clear();
+        self.delay_sr.clear();
+        self.delay_rl.clear();
+        self.delay_rr.clear();
+        self.delay_tfl.clear();
+        self.delay_tfr.clear();
+        self.delay_trl.clear();
+        self.delay_trr.clear();
+    }
+
+    /// Returns `true` when upmixing is either actively enabled or in the middle of a smooth
+    /// 65 ms raised-cosine crossfade transition (`blend > 0.0`).
+    #[inline(always)]
+    pub fn is_blending_or_active(&self, target_active: bool) -> bool {
+        target_active || !self.blend_initialized || self.blend > 0.0
+    }
+
+    /// Advances the 65 ms raised-cosine crossfade envelope toward `target_active` (`1.0` when
+    /// active, `0.0` when bypassed) and blends between the dry native frame and the upmixed frame.
+    #[inline]
+    pub fn process_multichannel_frame_for_hardware_blended(
+        &mut self,
+        frame_slice: &[f32],
+        source_channels: usize,
+        cfg: &crate::state::SurroundUpmixConfig,
+        hardware_channels: usize,
+        target_active: bool,
+    ) -> [f32; 12] {
+        let src_ch = source_channels.max(1);
+        let effective_target = target_active && hardware_channels > 2 && src_ch < hardware_channels;
+        if !self.blend_initialized {
+            self.blend = if effective_target { 1.0 } else { 0.0 };
+            self.blend_initialized = true;
+        } else {
+            let step = 1.0 / ((self.sample_rate.max(8000) as f32) * 0.065);
+            if effective_target {
+                if self.blend <= 0.0 {
+                    self.clear_state();
+                }
+                self.blend = (self.blend + step).min(1.0);
+            } else {
+                self.blend = (self.blend - step).max(0.0);
+            }
+        }
+
+        if self.blend <= 0.0 || hardware_channels <= 2 || src_ch >= hardware_channels {
+            let mut out = [0.0f32; 12];
+            let copy_len = frame_slice.len().min(hardware_channels).min(12);
+            out[..copy_len].copy_from_slice(&frame_slice[..copy_len]);
+            return out;
+        }
+
+        let mut upmixed = self.process_multichannel_frame_for_hardware(
+            frame_slice,
+            src_ch,
+            cfg,
+            hardware_channels,
+        );
+        if self.blend < 1.0 {
+            let w = 0.5 - 0.5 * (std::f32::consts::PI * self.blend).cos();
+            let dry_w = 1.0 - w;
+            let active_ch = hardware_channels.min(12);
+            for (c, sample_out) in upmixed.iter_mut().enumerate().take(active_ch) {
+                let dry = frame_slice.get(c).copied().unwrap_or(0.0);
+                *sample_out = (dry * dry_w + *sample_out * w).clamp(-1.0, 1.0);
+            }
+        }
+        upmixed
     }
 }
 
@@ -5475,8 +5627,7 @@ pub fn start_audio_thread(
                 if !mic
                     && !force_stereo
                     && default_device_channels <= 2
-                    && ((surround_upmix_user_overridden && surround_upmix_enabled)
-                        || target_channels > 2)
+                    && ((!passthrough_enabled && surround_upmix_enabled) || target_channels > 2)
                 {
                     match run_wasapi_exclusive_multichannel(
                         Some(device_name.as_str()),
@@ -5484,7 +5635,7 @@ pub fn start_audio_thread(
                         shared_state_closure.clone(),
                         target_rate,
                         target_channels,
-                        surround_upmix_user_overridden && surround_upmix_enabled,
+                        !passthrough_enabled && surround_upmix_enabled,
                         file_path,
                     ) {
                         Ok(handle) => {
@@ -5754,7 +5905,10 @@ fn populate_state_from_audio_source(
     let tracker_channels = audio_source.get_tracker_channels();
     state.hardware_channels = hardware_channels;
     let source_channels = audio_source.get_num_channels();
-    if !state.surround_upmix.user_overridden {
+    state.source_channels = source_channels;
+    if !crate::state::SurroundUpmixConfig::can_upmix(source_channels, hardware_channels) {
+        state.surround_upmix.enabled = false;
+    } else if !state.surround_upmix.user_overridden {
         state.surround_upmix.enabled = !state.force_stereo_downmix
             && !state.passthrough_enabled
             && crate::state::SurroundUpmixConfig::should_enable_by_default(
@@ -5764,7 +5918,7 @@ fn populate_state_from_audio_source(
     }
     state.num_channels = if state
         .surround_upmix
-        .is_active_for_hardware(hardware_channels)
+        .is_active_for(source_channels, hardware_channels)
     {
         hardware_channels.min(12)
     } else if let Some(tc) = tracker_channels {
@@ -6100,20 +6254,24 @@ fn process_decoder_state_requests(
             if let Some(&first_idx) = state.active_audio_tracks.first() {
                 state.selected_audio_track = first_idx;
             }
-            if !state.surround_upmix.user_overridden {
+            let source_channels = audio_source.get_num_channels();
+            state.source_channels = source_channels;
+            if !crate::state::SurroundUpmixConfig::can_upmix(
+                source_channels,
+                state.hardware_channels,
+            ) {
+                state.surround_upmix.enabled = false;
+            } else if !state.surround_upmix.user_overridden {
                 state.surround_upmix.enabled = !state.force_stereo_downmix
                     && !state.passthrough_enabled
                     && crate::state::SurroundUpmixConfig::should_enable_by_default(
-                        audio_source.get_num_channels(),
+                        source_channels,
                         state.hardware_channels,
                     );
             }
-            if true {
-                let _ = 0;
-            }
             state.num_channels = if state
                 .surround_upmix
-                .is_active_for_hardware(state.hardware_channels)
+                .is_active_for(source_channels, state.hardware_channels)
             {
                 state.hardware_channels.min(12)
             } else {
@@ -6184,17 +6342,24 @@ fn process_decoder_state_requests(
             state.selected_audio_track = track_idx;
             state.active_audio_tracks = vec![track_idx];
             state.multi_track_mix_mode = false;
-            if !state.surround_upmix.user_overridden {
+            let source_channels = audio_source.get_num_channels();
+            state.source_channels = source_channels;
+            if !crate::state::SurroundUpmixConfig::can_upmix(
+                source_channels,
+                state.hardware_channels,
+            ) {
+                state.surround_upmix.enabled = false;
+            } else if !state.surround_upmix.user_overridden {
                 state.surround_upmix.enabled = !state.force_stereo_downmix
                     && !state.passthrough_enabled
                     && crate::state::SurroundUpmixConfig::should_enable_by_default(
-                        audio_source.get_num_channels(),
+                        source_channels,
                         state.hardware_channels,
                     );
             }
             state.num_channels = if state
                 .surround_upmix
-                .is_active_for_hardware(state.hardware_channels)
+                .is_active_for(source_channels, state.hardware_channels)
             {
                 state.hardware_channels.min(12)
             } else {
@@ -7353,7 +7518,8 @@ fn run_dummy(
 
                     // Process chunk for FFT and VU levels (dummy device is 2ch stereo, so surround upmix is bypassed)
                     let to_copy = chunk.valid_frames;
-                    let upmix_active = upmix_cfg.is_active_for_hardware(hardware_channels as i32);
+                    let upmix_active = upmix_cfg
+                        .is_active_for(chunk.spatial_channels as i32, hardware_channels as i32);
                     if upmix_active {
                         upmixer_dsp.sync_config(&upmix_cfg, sample_rate);
                         upmix_peak_vus = [0.0f32; 12];
@@ -7362,10 +7528,9 @@ fn run_dummy(
                         for i in 0..to_copy {
                             let frame_slice =
                                 &chunk.samples[i * hardware_channels..(i + 1) * hardware_channels];
-                            let (l_in, r_in) = extract_stereo_pair_from_frame(frame_slice, src_ch);
-                            let out_channels = upmixer_dsp.process_frame_for_hardware(
-                                l_in,
-                                r_in,
+                            let out_channels = upmixer_dsp.process_multichannel_frame_for_hardware(
+                                frame_slice,
+                                src_ch,
                                 &upmix_cfg,
                                 hardware_channels,
                             );
@@ -7374,7 +7539,7 @@ fn run_dummy(
                                 upmix_peak_vus[c] = upmix_peak_vus[c].max(s.abs());
                                 channel_fft_buffers[c][fft_index] = s;
                             }
-                            let mono = (l_in + r_in) * 0.5;
+                            let mono = (out_channels[0] + out_channels[1]) * 0.5;
                             fft_buffer[fft_index] = mono.clamp(-1.0, 1.0);
                             fft_index = (fft_index + 1) % window_size;
                         }
@@ -7597,6 +7762,7 @@ fn run_wasapi_exclusive_multichannel(
         unsafe {
             audio_client
                 .IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, wf_ptr, None)
+                .ok()
                 .map_err(|e| anyhow::anyhow!(e))?;
         }
         let mut default_period = 0i64;
@@ -8097,8 +8263,10 @@ fn run_wasapi_exclusive_multichannel(
 
                     let to_copy = std::cmp::min(frames_available, frames_needed);
 
-                    if upmix_active {
-                        let src_ch = (chunk.spatial_channels as usize).max(1);
+                    let src_ch = (chunk.spatial_channels as usize).max(1);
+                    let target_upmix = upmix_active && src_ch < hardware_channels;
+                    if upmixer_dsp.is_blending_or_active(target_upmix) && src_ch < hardware_channels
+                    {
                         let active_ch = hardware_channels.min(12);
                         for i in 0..to_copy {
                             let src_frame_idx = chunk_frame_pos + i;
@@ -8106,13 +8274,14 @@ fn run_wasapi_exclusive_multichannel(
                             let dst_byte_base = dst_frame_idx * frame_bytes;
                             let frame_slice = &chunk.samples[src_frame_idx * hardware_channels
                                 ..(src_frame_idx + 1) * hardware_channels];
-                            let (l_in, r_in) = extract_stereo_pair_from_frame(frame_slice, src_ch);
-                            let out_channels = upmixer_dsp.process_frame_for_hardware(
-                                l_in,
-                                r_in,
-                                &upmix_cfg,
-                                hardware_channels,
-                            );
+                            let out_channels = upmixer_dsp
+                                .process_multichannel_frame_for_hardware_blended(
+                                    frame_slice,
+                                    src_ch,
+                                    &upmix_cfg,
+                                    hardware_channels,
+                                    target_upmix,
+                                );
 
                             for c in 0..hardware_channels {
                                 let out_s = if c < 12 { out_channels[c] } else { 0.0 };
@@ -8130,7 +8299,7 @@ fn run_wasapi_exclusive_multichannel(
                                 channel_fft_buffers[c][fft_index] = s;
                             }
 
-                            let mono = (l_in + r_in) * 0.5;
+                            let mono = (out_channels[0] + out_channels[1]) * 0.5;
                             fft_buffer[fft_index] = mono.clamp(-1.0, 1.0);
                             fft_index = (fft_index + 1) % window_size;
                         }
@@ -8187,15 +8356,16 @@ fn run_wasapi_exclusive_multichannel(
                 frames_since_last_dsp_send = 0;
                 let play_time =
                     last_current_seconds + (chunk_frame_pos as f64 / negotiated_rate as f64);
-                let (dsp_channels, vu_slice): (usize, &[f32]) = if upmix_active {
-                    let active_ch = hardware_channels.min(12);
-                    (active_ch, &upmix_peak_vus[..active_ch])
-                } else {
-                    (
-                        hardware_channels.min(last_channel_vus.len().max(1)),
-                        &last_channel_vus,
-                    )
-                };
+                let (dsp_channels, vu_slice): (usize, &[f32]) =
+                    if upmix_active && last_channel_vus.len() < hardware_channels {
+                        let active_ch = hardware_channels.min(12);
+                        (active_ch, &upmix_peak_vus[..active_ch])
+                    } else {
+                        (
+                            hardware_channels.min(last_channel_vus.len().max(1)),
+                            &last_channel_vus,
+                        )
+                    };
 
                 let msg = build_recycled_dsp_message(
                     &recycle_rx,
@@ -8578,21 +8748,24 @@ where
 
                     let to_copy = std::cmp::min(frames_available, frames_needed);
 
-                    if upmix_active {
-                        let src_ch = (chunk.spatial_channels as usize).max(1);
+                    let src_ch = (chunk.spatial_channels as usize).max(1);
+                    let target_upmix = upmix_active && src_ch < hardware_channels;
+                    if upmixer_dsp.is_blending_or_active(target_upmix) && src_ch < hardware_channels
+                    {
                         let active_ch = hardware_channels.min(12);
                         for i in 0..to_copy {
                             let src_frame_idx = chunk_frame_pos + i;
                             let dst_frame_idx = frames_written + i;
                             let frame_slice = &chunk.samples[src_frame_idx * hardware_channels
                                 ..(src_frame_idx + 1) * hardware_channels];
-                            let (l_in, r_in) = extract_stereo_pair_from_frame(frame_slice, src_ch);
-                            let out_channels = upmixer_dsp.process_frame_for_hardware(
-                                l_in,
-                                r_in,
-                                &upmix_cfg,
-                                hardware_channels,
-                            );
+                            let out_channels = upmixer_dsp
+                                .process_multichannel_frame_for_hardware_blended(
+                                    frame_slice,
+                                    src_ch,
+                                    &upmix_cfg,
+                                    hardware_channels,
+                                    target_upmix,
+                                );
 
                             for c in 0..hardware_channels {
                                 let out_s = if c < 12 { out_channels[c] } else { 0.0 };
@@ -8605,7 +8778,7 @@ where
                                 channel_fft_buffers[c][fft_index] = s;
                             }
 
-                            let mono = (l_in + r_in) * 0.5;
+                            let mono = (out_channels[0] + out_channels[1]) * 0.5;
                             fft_buffer[fft_index] = mono.clamp(-1.0, 1.0);
                             fft_index = (fft_index + 1) % window_size;
                         }
@@ -8653,15 +8826,16 @@ where
                 frames_since_last_dsp_send = 0;
                 let play_time =
                     last_current_seconds + (chunk_frame_pos as f64 / sample_rate as f64);
-                let (dsp_channels, vu_slice): (usize, &[f32]) = if upmix_active {
-                    let active_ch = hardware_channels.min(12);
-                    (active_ch, &upmix_peak_vus[..active_ch])
-                } else {
-                    (
-                        hardware_channels.min(last_channel_vus.len().max(1)),
-                        &last_channel_vus,
-                    )
-                };
+                let (dsp_channels, vu_slice): (usize, &[f32]) =
+                    if upmix_active && last_channel_vus.len() < hardware_channels {
+                        let active_ch = hardware_channels.min(12);
+                        (active_ch, &upmix_peak_vus[..active_ch])
+                    } else {
+                        (
+                            hardware_channels.min(last_channel_vus.len().max(1)),
+                            &last_channel_vus,
+                        )
+                    };
                 let msg = build_recycled_dsp_message(
                     &recycle_rx,
                     &fft_buffer,
@@ -9684,5 +9858,79 @@ mod tests {
             peak_lfe_40hz,
             peak_sl_40hz
         );
+
+        // 9. Verify native discrete 8-channel (7.1) on 8-channel hardware cannot be upmixed
+        // and passes all 8 discrete channels 1:1 untouched without fold-down attenuation.
+        assert!(!crate::state::SurroundUpmixConfig::can_upmix(8, 8));
+        assert!(!crate::state::SurroundUpmixConfig::can_upmix(6, 6));
+        assert!(crate::state::SurroundUpmixConfig::can_upmix(2, 8));
+        assert!(crate::state::SurroundUpmixConfig::can_upmix(6, 8));
+        let discrete_8ch = [0.8f32, -0.7, 0.5, 0.4, -0.6, 0.6, -0.35, 0.35];
+        let out_discrete =
+            dsp_8ch.process_multichannel_frame_for_hardware(&discrete_8ch, 8, &cfg, 8);
+        assert_eq!(&out_discrete[..8], &discrete_8ch[..]);
+
+        let mut state_8ch = AppState::new("8ch Test".to_string());
+        state_8ch.file_loaded = true;
+        state_8ch.hardware_channels = 8;
+        state_8ch.source_channels = 8;
+        state_8ch.surround_upmix.enabled = false;
+        state_8ch.set_surround_upmix(true);
+        assert!(
+            !state_8ch.surround_upmix.enabled,
+            "Enabling upmix on an 8-channel source with 8-channel hardware must be blocked"
+        );
+        assert!(
+            state_8ch
+                .osd_text
+                .as_deref()
+                .unwrap_or("")
+                .contains("Upmix Not Applicable")
+        );
+
+        // 10. Verify toggling Upmix OFF/ON on a stereo track with 8ch hardware never requests
+        // a stream reload (`passthrough_change_request` stays None) and crossfades smoothly.
+        let mut state_2ch_on_8ch = AppState::new("2ch on 8ch Test".to_string());
+        state_2ch_on_8ch.file_loaded = true;
+        state_2ch_on_8ch.hardware_channels = 8;
+        state_2ch_on_8ch.source_channels = 2;
+        state_2ch_on_8ch.passthrough_enabled = false;
+        state_2ch_on_8ch.surround_upmix.enabled = true;
+        state_2ch_on_8ch.set_surround_upmix(false);
+        assert!(!state_2ch_on_8ch.surround_upmix.enabled);
+        assert!(
+            state_2ch_on_8ch.passthrough_change_request.is_none(),
+            "Toggling upmix OFF on 8ch hardware must happen in-place without tearing down the stream"
+        );
+        state_2ch_on_8ch.set_surround_upmix(true);
+        assert!(state_2ch_on_8ch.surround_upmix.enabled);
+        assert!(
+            state_2ch_on_8ch.passthrough_change_request.is_none(),
+            "Toggling upmix ON on 8ch hardware must happen in-place without tearing down the stream"
+        );
+
+        let mut dsp_fade = SurroundUpmixerDsp::new(sr);
+        dsp_fade.sync_config(&cfg, sr);
+        let dry_frame = [0.6f32, 0.6, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let mut prev_out =
+            dsp_fade.process_multichannel_frame_for_hardware_blended(&dry_frame, 2, &cfg, 8, true);
+        for _ in 0..512 {
+            prev_out = dsp_fade
+                .process_multichannel_frame_for_hardware_blended(&dry_frame, 2, &cfg, 8, true);
+        }
+        // Now toggle target_active = false and verify the first step has no abrupt discontinuity
+        let next_out =
+            dsp_fade.process_multichannel_frame_for_hardware_blended(&dry_frame, 2, &cfg, 8, false);
+        assert!(
+            (next_out[0] - prev_out[0]).abs() < 0.005 && (next_out[4] - prev_out[4]).abs() < 0.005,
+            "Switching upmix OFF must crossfade smoothly with zero step discontinuity"
+        );
+        // After 65ms (3120 frames at 48kHz), blend reaches 0.0 (pure dry stereo)
+        for _ in 0..3200 {
+            prev_out = dsp_fade
+                .process_multichannel_frame_for_hardware_blended(&dry_frame, 2, &cfg, 8, false);
+        }
+        assert!((prev_out[0] - 0.6).abs() < 1e-6 && prev_out[4].abs() < 1e-6);
+        assert!(!dsp_fade.is_blending_or_active(false));
     }
 }

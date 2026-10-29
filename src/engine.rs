@@ -9236,7 +9236,7 @@ impl VulkanEngine {
                                             let label = if state.tracker_channels.is_some()
                                                 && !state
                                                     .surround_upmix
-                                                    .is_active_for_hardware(state.hardware_channels)
+                                                    .is_active_for(state.source_channels, state.hardware_channels)
                                             {
                                                 if i == 0 {
                                                     "L".to_string()
@@ -9276,7 +9276,7 @@ impl VulkanEngine {
                             let render_col_heatmap = |col: &mut egui::Ui, out_heatmap_rect: &mut Option<egui::Rect>, engine_action: &mut EngineAction| {
                                 if state
                                     .surround_upmix
-                                    .is_active_for_hardware(state.hardware_channels)
+                                    .is_active_for(state.source_channels, state.hardware_channels)
                                 {
                                     // Swap out the Piano Roll / Pattern Heatmap with the Surround Routing & Crossover Curve
                                     // ONLY when actively upmixing to a multi-channel surround system (>2ch).
@@ -10163,7 +10163,7 @@ impl VulkanEngine {
                                             let upmix_on = state.surround_upmix.enabled;
                                             let upmix_active = state
                                                 .surround_upmix
-                                                .is_active_for_hardware(state.hardware_channels);
+                                                .is_active_for(state.source_channels, state.hardware_channels);
                                             let short_tag = crate::state::SurroundUpmixConfig::short_tag(
                                                 state.hardware_channels,
                                             );
@@ -10207,7 +10207,7 @@ impl VulkanEngine {
                                             .corner_radius(4.0)
                                             .min_size(egui::vec2(88.0, if is_portrait { 30.0 } else { 24.0 }));
                                             if ui
-                                                .add(upmix_hdr_btn)
+                                                .ctx().input(|_| !state.file_loaded || crate::state::SurroundUpmixConfig::can_upmix(state.source_channels, state.hardware_channels)) && ui.add(upmix_hdr_btn)
                                                 .on_hover_text("Toggle Auto Surround Upmix (5.1/7.1 Bed or 7.1.4 Bed + Height; stereo/mono outputs remain unchanged) (Shortcut: 'u' / L3·R3)")
                                                 .clicked()
                                             {
@@ -10817,7 +10817,7 @@ impl VulkanEngine {
                                                 .stroke(egui::Stroke::new(1.0_f32, btn_stroke))
                                                 .corner_radius(4.0);
                                                 if ui
-                                                    .add(upmix_btn)
+                                                    .ctx().input(|_| !state.file_loaded || crate::state::SurroundUpmixConfig::can_upmix(state.source_channels, state.hardware_channels)) && ui.add(upmix_btn)
                                                     .on_hover_text("Automatically upmix stereo and non-surround audio so Left/Right spread across all left/right speakers (FL, SL, RL / FR, SR, RR) with Haas decorrelation, LFE crossover, and high-frequency routing to the height speakers (TFL, TFR, TRL, TRR). Replaces the top middle Piano Roll panel with a live Crossover & 5-band Parametric EQ editor. (Shortcut: 'u' / L3·R3)")
                                                     .clicked()
                                                 {
