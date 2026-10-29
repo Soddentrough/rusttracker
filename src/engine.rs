@@ -9043,7 +9043,7 @@ impl VulkanEngine {
                                                         "Auto Surround Upmix (5.1/7.1 Bed or 7.1.4 Bed + Height)",
                                                     )
                                                     .size(12.5)
-                                                    .color(egui::Color32::from_rgb(130, 235, 255)),
+                                                    .color(egui::Color32::from_rgb(255, 180, 85)),
                                                 )
                                                 .on_hover_text("When connected to a multi-channel surround output (>2ch), upmixes stereo sources across the surround bed (5.1/7.1) or bed + overhead height channels (7.1.4). Stereo/mono outputs (<=2ch) remain completely unchanged.")
                                                 .changed()
@@ -9301,13 +9301,13 @@ impl VulkanEngine {
                                             ui.heading(panel_title);
                                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                                 let off_btn = egui::Button::new(
-                                                    egui::RichText::new("✕ Off")
+                                                    egui::RichText::new("× Off")
                                                         .size(11.0)
                                                         .strong()
-                                                        .color(egui::Color32::from_rgb(255, 200, 195)),
+                                                        .color(egui::Color32::from_rgb(245, 200, 185)),
                                                 )
-                                                .fill(egui::Color32::from_rgb(62, 32, 36))
-                                                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(150, 75, 85)))
+                                                .fill(egui::Color32::from_rgb(56, 30, 24))
+                                                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(155, 75, 50)))
                                                 .corner_radius(4.0);
                                                 if ui
                                                     .add(off_btn)
@@ -9321,10 +9321,10 @@ impl VulkanEngine {
                                                     egui::RichText::new("↺ Reset")
                                                         .size(11.0)
                                                         .strong()
-                                                        .color(egui::Color32::from_rgb(220, 230, 245)),
+                                                        .color(egui::Color32::from_rgb(225, 220, 212)),
                                                 )
-                                                .fill(egui::Color32::from_rgb(35, 45, 62))
-                                                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(80, 105, 140)))
+                                                .fill(egui::Color32::from_rgb(44, 42, 40))
+                                                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(105, 98, 90)))
                                                 .corner_radius(4.0);
                                                 if ui
                                                     .add(reset_btn)
@@ -9337,20 +9337,20 @@ impl VulkanEngine {
                                                 ui.add_space(4.0);
                                                 if has_height {
                                                     ui.label(
-                                                        egui::RichText::new("● Height ↑")
+                                                        egui::RichText::new("• Height ↑")
                                                             .size(10.5)
-                                                            .color(egui::Color32::from_rgb(110, 255, 110)),
+                                                            .color(egui::Color32::from_rgb(255, 225, 130)),
                                                     );
                                                 }
                                                 ui.label(
-                                                    egui::RichText::new("● Surround Bed")
+                                                    egui::RichText::new("• Surround Bed")
                                                         .size(10.5)
-                                                        .color(egui::Color32::from_rgb(0, 215, 255)),
+                                                        .color(egui::Color32::from_rgb(255, 165, 35)),
                                                 );
                                                 ui.label(
-                                                    egui::RichText::new("● LFE")
+                                                    egui::RichText::new("• LFE")
                                                         .size(10.5)
-                                                        .color(egui::Color32::from_rgb(255, 105, 55)),
+                                                        .color(egui::Color32::from_rgb(220, 68, 32)),
                                                 );
                                             });
                                         });
@@ -9493,8 +9493,8 @@ impl VulkanEngine {
                                     painter.rect(
                                         graph_rect,
                                         5.0,
-                                        egui::Color32::from_rgba_unmultiplied(10, 13, 20, 235),
-                                        egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(70, 105, 150, 95)),
+                                        egui::Color32::from_rgba_unmultiplied(18, 18, 20, 240),
+                                        egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(110, 92, 74, 110)),
                                         egui::StrokeKind::Inside,
                                     );
 
@@ -9503,7 +9503,7 @@ impl VulkanEngine {
                                         let y = db_to_y(db);
                                         let is_zero = db.abs() < 0.1;
                                         let line_col = if is_zero {
-                                            egui::Color32::from_rgba_unmultiplied(150, 180, 220, 85)
+                                            egui::Color32::from_rgba_unmultiplied(190, 182, 172, 95)
                                         } else {
                                             egui::Color32::from_rgba_unmultiplied(255, 255, 255, 18)
                                         };
@@ -9521,7 +9521,7 @@ impl VulkanEngine {
                                             egui::Align2::RIGHT_CENTER,
                                             lbl,
                                             egui::FontId::proportional(9.5),
-                                            egui::Color32::from_rgb(130, 145, 165),
+                                            egui::Color32::from_rgb(155, 148, 140),
                                         );
                                     }
 
@@ -9546,7 +9546,7 @@ impl VulkanEngine {
                                             egui::Align2::CENTER_BOTTOM,
                                             f_lbl,
                                             egui::FontId::proportional(9.5),
-                                            egui::Color32::from_rgb(135, 150, 170),
+                                            egui::Color32::from_rgb(155, 148, 140),
                                         );
                                     }
 
@@ -9568,9 +9568,9 @@ impl VulkanEngine {
                                                 let (_, lfe_m, bed_m, h_m) =
                                                     cfg.evaluate_band_routing_for_layout(f_bar, has_height);
                                                 let sum_m = (lfe_m + bed_m + h_m).max(0.01);
-                                                let r_c = ((lfe_m * 255.0 + bed_m * 0.0 + h_m * 110.0) / sum_m).clamp(0.0, 255.0) as u8;
-                                                let g_c = ((lfe_m * 95.0 + bed_m * 210.0 + h_m * 255.0) / sum_m).clamp(0.0, 255.0) as u8;
-                                                let b_c = ((lfe_m * 45.0 + bed_m * 255.0 + h_m * 110.0) / sum_m).clamp(0.0, 255.0) as u8;
+                                                let r_c = ((lfe_m * 220.0 + bed_m * 255.0 + h_m * 255.0) / sum_m).clamp(0.0, 255.0) as u8;
+                                                let g_c = ((lfe_m * 68.0 + bed_m * 165.0 + h_m * 225.0) / sum_m).clamp(0.0, 255.0) as u8;
+                                                let b_c = ((lfe_m * 32.0 + bed_m * 35.0 + h_m * 130.0) / sum_m).clamp(0.0, 255.0) as u8;
                                                 let bar_rect = egui::Rect::from_min_max(
                                                     egui::pos2(x0 + 0.5, plot_rect.bottom() - bh),
                                                     egui::pos2(x0 + (bar_step - 0.8).max(1.0), plot_rect.bottom()),
@@ -9616,21 +9616,21 @@ impl VulkanEngine {
                                                 painter.rect_filled(
                                                     egui::Rect::from_min_max(egui::pos2(x, y_bed), egui::pos2(x + col_w, plot_rect.bottom())),
                                                     0.0,
-                                                    egui::Color32::from_rgba_unmultiplied(0, 195, 255, 20),
+                                                    egui::Color32::from_rgba_unmultiplied(255, 160, 35, 18),
                                                 );
                                             }
                                             if has_height && y_height < plot_rect.bottom() - 1.0 {
                                                 painter.rect_filled(
                                                     egui::Rect::from_min_max(egui::pos2(x, y_height), egui::pos2(x + col_w, plot_rect.bottom())),
                                                     0.0,
-                                                    egui::Color32::from_rgba_unmultiplied(95, 255, 110, 24),
+                                                    egui::Color32::from_rgba_unmultiplied(255, 225, 130, 20),
                                                 );
                                             }
                                             if y_lfe < plot_rect.bottom() - 1.0 {
                                                 painter.rect_filled(
                                                     egui::Rect::from_min_max(egui::pos2(x, y_lfe), egui::pos2(x + col_w, plot_rect.bottom())),
                                                     0.0,
-                                                    egui::Color32::from_rgba_unmultiplied(255, 95, 45, 24),
+                                                    egui::Color32::from_rgba_unmultiplied(220, 65, 30, 26),
                                                 );
                                             }
                                         }
@@ -9638,29 +9638,29 @@ impl VulkanEngine {
 
                                     painter.add(egui::Shape::line(
                                         lfe_pts,
-                                        egui::Stroke::new(1.8_f32, egui::Color32::from_rgb(255, 105, 55)),
+                                        egui::Stroke::new(1.8_f32, egui::Color32::from_rgb(220, 68, 32)),
                                     ));
                                     painter.add(egui::Shape::line(
                                         bed_pts,
-                                        egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(0, 215, 255)),
+                                        egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 165, 35)),
                                     ));
                                     if has_height {
                                         painter.add(egui::Shape::line(
                                             height_pts,
-                                            egui::Stroke::new(2.1_f32, egui::Color32::from_rgb(110, 255, 110)),
+                                            egui::Stroke::new(2.1_f32, egui::Color32::from_rgb(255, 225, 130)),
                                         ));
                                     }
                                     painter.add(egui::Shape::line(
                                         eq_pts,
-                                        egui::Stroke::new(1.5_f32, egui::Color32::from_rgba_unmultiplied(240, 245, 255, 210)),
+                                        egui::Stroke::new(1.5_f32, egui::Color32::from_rgba_unmultiplied(220, 215, 208, 215)),
                                     ));
 
                                     // Draw vertical Crossover Handles (LFE Sub & optional Height Split)
                                     let sub_x = freq_to_x(cfg.sub_crossover_hz);
                                     let sub_col = if active_handle == 6 {
-                                        egui::Color32::from_rgb(255, 175, 110)
+                                        egui::Color32::from_rgb(255, 150, 95)
                                     } else {
-                                        egui::Color32::from_rgb(255, 105, 55)
+                                        egui::Color32::from_rgb(220, 68, 32)
                                     };
                                     painter.line_segment(
                                         [egui::pos2(sub_x, plot_rect.top()), egui::pos2(sub_x, plot_rect.bottom())],
@@ -9688,9 +9688,9 @@ impl VulkanEngine {
                                     if has_height {
                                         let height_x = freq_to_x(cfg.height_crossover_hz);
                                         let height_col = if active_handle == 7 {
-                                            egui::Color32::from_rgb(190, 255, 170)
+                                            egui::Color32::from_rgb(255, 242, 185)
                                         } else {
-                                            egui::Color32::from_rgb(110, 255, 110)
+                                            egui::Color32::from_rgb(255, 225, 130)
                                         };
                                         painter.line_segment(
                                             [egui::pos2(height_x, plot_rect.top()), egui::pos2(height_x, plot_rect.bottom())],
@@ -9713,7 +9713,7 @@ impl VulkanEngine {
                                         painter.rect(
                                             height_badge_rect,
                                             3.0,
-                                            egui::Color32::from_rgba_unmultiplied(14, 48, 22, 230),
+                                            egui::Color32::from_rgba_unmultiplied(46, 36, 16, 235),
                                             egui::Stroke::new(1.0_f32, height_col),
                                             egui::StrokeKind::Inside,
                                         );
@@ -9726,16 +9726,16 @@ impl VulkanEngine {
                                         let node_pos = egui::pos2(freq_to_x(bf), db_to_y(gain_db));
                                         let is_active = active_handle == (i + 1) as u8;
                                         let node_color = if bf <= cfg.sub_crossover_hz * 1.1 {
-                                            egui::Color32::from_rgb(255, 120, 65)
+                                            egui::Color32::from_rgb(225, 75, 35)
                                         } else if has_height && bf >= cfg.height_crossover_hz {
-                                            egui::Color32::from_rgb(120, 255, 120)
+                                            egui::Color32::from_rgb(255, 225, 130)
                                         } else {
-                                            egui::Color32::from_rgb(40, 220, 255)
+                                            egui::Color32::from_rgb(255, 165, 35)
                                         };
                                         painter.circle_filled(
                                             node_pos,
                                             if is_active { 7.0 } else { 5.5 },
-                                            egui::Color32::from_rgb(16, 22, 32),
+                                            egui::Color32::from_rgb(24, 22, 20),
                                         );
                                         painter.circle_stroke(
                                             node_pos,
@@ -9771,7 +9771,7 @@ impl VulkanEngine {
                                     col.columns(3, |cols| {
                                         cols[0].horizontal(|ui| {
                                             ui.spacing_mut().slider_width = (ui.available_width() - 56.0).max(28.0);
-                                            ui.label(egui::RichText::new("Front").size(11.0).color(egui::Color32::from_rgb(0, 215, 255)));
+                                            ui.label(egui::RichText::new("Front").size(11.0).color(egui::Color32::from_rgb(210, 205, 198)));
                                             if ui
                                                 .add(egui::Slider::new(&mut cfg.front_level, 0.0..=1.5).show_value(false))
                                                 .on_hover_text(format!("Front L/R Anchor Level (uncolored): {:.0}%", cfg.front_level * 100.0))
@@ -9782,7 +9782,7 @@ impl VulkanEngine {
                                         });
                                         cols[1].horizontal(|ui| {
                                             ui.spacing_mut().slider_width = (ui.available_width() - 62.0).max(28.0);
-                                            ui.label(egui::RichText::new("Side/Rear").size(11.0).color(egui::Color32::from_rgb(80, 195, 255)));
+                                            ui.label(egui::RichText::new("Side/Rear").size(11.0).color(egui::Color32::from_rgb(255, 165, 35)));
                                             if ui
                                                 .add(egui::Slider::new(&mut cfg.side_rear_level, 0.0..=1.5).show_value(false))
                                                 .on_hover_text(format!("Side & Rear Surround Bed Level: {:.0}%", cfg.side_rear_level * 100.0))
@@ -9794,7 +9794,7 @@ impl VulkanEngine {
                                         cols[2].horizontal(|ui| {
                                             ui.spacing_mut().slider_width = (ui.available_width() - 58.0).max(28.0);
                                             if has_height {
-                                                ui.label(egui::RichText::new("Height ↑").size(11.0).color(egui::Color32::from_rgb(110, 255, 110)));
+                                                ui.label(egui::RichText::new("Height ↑").size(11.0).color(egui::Color32::from_rgb(255, 225, 130)));
                                                 if ui
                                                     .add(egui::Slider::new(&mut cfg.height_level, 0.0..=1.5).show_value(false))
                                                     .on_hover_text(format!("Overhead Height (Top Front / Top Rear) Level: {:.0}%", cfg.height_level * 100.0))
@@ -9803,7 +9803,7 @@ impl VulkanEngine {
                                                     cfg_changed = true;
                                                 }
                                             } else {
-                                                ui.label(egui::RichText::new("Width").size(11.0).color(egui::Color32::from_rgb(140, 225, 255)));
+                                                ui.label(egui::RichText::new("Width").size(11.0).color(egui::Color32::from_rgb(235, 185, 105)));
                                                 if ui
                                                     .add(egui::Slider::new(&mut cfg.stereo_width, 0.0..=2.0).show_value(false))
                                                     .on_hover_text(format!("Surround Bed Ambient Width: {:.0}%", cfg.stereo_width * 100.0))
@@ -9817,7 +9817,7 @@ impl VulkanEngine {
                                     col.columns(3, |cols| {
                                         cols[0].horizontal(|ui| {
                                             ui.spacing_mut().slider_width = (ui.available_width() - 56.0).max(28.0);
-                                            ui.label(egui::RichText::new("LFE Sub").size(11.0).color(egui::Color32::from_rgb(255, 105, 55)));
+                                            ui.label(egui::RichText::new("LFE Sub").size(11.0).color(egui::Color32::from_rgb(225, 75, 35)));
                                             if ui
                                                 .add(egui::Slider::new(&mut cfg.lfe_level, 0.0..=1.5).show_value(false))
                                                 .on_hover_text(format!("LFE Subwoofer Level: {:.0}%", cfg.lfe_level * 100.0))
@@ -9828,7 +9828,7 @@ impl VulkanEngine {
                                         });
                                         cols[1].horizontal(|ui| {
                                             ui.spacing_mut().slider_width = (ui.available_width() - 62.0).max(28.0);
-                                            ui.label(egui::RichText::new("Center").size(11.0).color(egui::Color32::from_rgb(255, 200, 70)));
+                                            ui.label(egui::RichText::new("Center").size(11.0).color(egui::Color32::from_rgb(245, 195, 85)));
                                             if ui
                                                 .add(egui::Slider::new(&mut cfg.center_level, 0.0..=1.5).show_value(false))
                                                 .on_hover_text(format!("Center Speaker Mid Level: {:.0}% (0% = Pure Left/Right Side Split)", cfg.center_level * 100.0))
@@ -9840,7 +9840,7 @@ impl VulkanEngine {
                                         cols[2].horizontal(|ui| {
                                             ui.spacing_mut().slider_width = (ui.available_width() - 58.0).max(28.0);
                                             if has_height {
-                                                ui.label(egui::RichText::new("Hi-Bleed").size(11.0).color(egui::Color32::from_rgb(175, 215, 235)));
+                                                ui.label(egui::RichText::new("Hi-Bleed").size(11.0).color(egui::Color32::from_rgb(215, 195, 165)));
                                                 if ui
                                                     .add(egui::Slider::new(&mut cfg.surround_high_bleed, 0.0..=1.0).show_value(false))
                                                     .on_hover_text(format!("High-Frequency Bleed in Ear-Level Side/Rear Speakers: {:.0}% (0% routes highs exclusively to Height speakers)", cfg.surround_high_bleed * 100.0))
@@ -9849,7 +9849,7 @@ impl VulkanEngine {
                                                     cfg_changed = true;
                                                 }
                                             } else {
-                                                ui.label(egui::RichText::new("Sub X-O").size(11.0).color(egui::Color32::from_rgb(255, 145, 95)));
+                                                ui.label(egui::RichText::new("Sub X-O").size(11.0).color(egui::Color32::from_rgb(235, 120, 60)));
                                                 if ui
                                                     .add(egui::Slider::new(&mut cfg.sub_crossover_hz, 40.0..=250.0).show_value(false))
                                                     .on_hover_text(format!("LFE Subwoofer Low-Pass Crossover: {:.0} Hz", cfg.sub_crossover_hz))
@@ -10170,30 +10170,30 @@ impl VulkanEngine {
                                             let (upmix_label, upmix_fill, upmix_stroke, upmix_text_col) = if upmix_active {
                                                 (
                                                     format!("🔊 {short_tag} UPMIX: ON"),
-                                                    egui::Color32::from_rgb(18, 92, 118),
-                                                    egui::Color32::from_rgb(70, 225, 255),
-                                                    egui::Color32::from_rgb(220, 252, 255),
+                                                    egui::Color32::from_rgb(165, 85, 12),
+                                                    egui::Color32::from_rgb(255, 175, 50),
+                                                    egui::Color32::from_rgb(255, 240, 200),
                                                 )
                                             } else if upmix_on {
                                                 (
                                                     "🔊 UPMIX (2CH)".to_string(),
-                                                    egui::Color32::from_rgb(42, 56, 72),
-                                                    egui::Color32::from_rgb(95, 140, 175),
-                                                    egui::Color32::from_rgb(190, 215, 235),
+                                                    egui::Color32::from_rgb(68, 45, 20),
+                                                    egui::Color32::from_rgb(165, 115, 55),
+                                                    egui::Color32::from_rgb(230, 205, 165),
                                                 )
                                             } else if state.hardware_channels > 2 {
                                                 (
                                                     format!("🔊 {short_tag} UPMIX"),
-                                                    egui::Color32::from_rgb(32, 42, 58),
-                                                    egui::Color32::from_rgb(80, 108, 145),
-                                                    egui::Color32::from_rgb(205, 220, 240),
+                                                    egui::Color32::from_rgb(38, 36, 38),
+                                                    egui::Color32::from_rgb(95, 88, 80),
+                                                    egui::Color32::from_rgb(210, 202, 192),
                                                 )
                                             } else {
                                                 (
                                                     "🔊 UPMIX".to_string(),
-                                                    egui::Color32::from_rgb(32, 42, 58),
-                                                    egui::Color32::from_rgb(80, 108, 145),
-                                                    egui::Color32::from_rgb(205, 220, 240),
+                                                    egui::Color32::from_rgb(38, 36, 38),
+                                                    egui::Color32::from_rgb(95, 88, 80),
+                                                    egui::Color32::from_rgb(210, 202, 192),
                                                 )
                                             };
                                             let upmix_hdr_btn = egui::Button::new(
@@ -10795,16 +10795,16 @@ impl VulkanEngine {
                                                 let (btn_text, btn_fill, btn_stroke, txt_col) = if upmix_enabled {
                                                     (
                                                         "🔊 Auto Surround & Height Upmix (7.1.4 + EQ): ON",
-                                                        egui::Color32::from_rgb(16, 84, 108),
-                                                        egui::Color32::from_rgb(65, 220, 255),
-                                                        egui::Color32::from_rgb(215, 250, 255),
+                                                        egui::Color32::from_rgb(165, 85, 12),
+                                                        egui::Color32::from_rgb(255, 175, 50),
+                                                        egui::Color32::from_rgb(255, 240, 200),
                                                     )
                                                 } else {
                                                     (
                                                         "🔊 Auto Surround & Height Upmix (7.1.4 + EQ): OFF",
-                                                        egui::Color32::from_rgb(28, 36, 50),
-                                                        egui::Color32::from_rgb(70, 95, 130),
-                                                        egui::Color32::from_rgb(185, 200, 220),
+                                                        egui::Color32::from_rgb(36, 34, 36),
+                                                        egui::Color32::from_rgb(90, 84, 76),
+                                                        egui::Color32::from_rgb(200, 192, 182),
                                                     )
                                                 };
                                                 let upmix_btn = egui::Button::new(

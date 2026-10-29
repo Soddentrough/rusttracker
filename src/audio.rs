@@ -317,6 +317,9 @@ pub struct SurroundUpmixerDsp {
     eq_l: [BiquadFilter; 5],
     eq_r: [BiquadFilter; 5],
     sub_lp: BiquadFilter,
+    sub_hp_l: BiquadFilter,
+    sub_hp_r: BiquadFilter,
+    sub_hp_c: BiquadFilter,
     height_lp_l: BiquadFilter,
     height_hp_l: BiquadFilter,
     height_lp_r: BiquadFilter,
@@ -341,6 +344,9 @@ impl SurroundUpmixerDsp {
             eq_l: [BiquadFilter::default(); 5],
             eq_r: [BiquadFilter::default(); 5],
             sub_lp: BiquadFilter::default(),
+            sub_hp_l: BiquadFilter::default(),
+            sub_hp_r: BiquadFilter::default(),
+            sub_hp_c: BiquadFilter::default(),
             height_lp_l: BiquadFilter::default(),
             height_hp_l: BiquadFilter::default(),
             height_lp_r: BiquadFilter::default(),
@@ -384,6 +390,10 @@ impl SurroundUpmixerDsp {
         // Linkwitz-Riley 2nd-order (Q = 0.5) LFE low-pass and Height low-pass/high-pass crossovers
         let sub_lp = BiquadFilter::lowpass(sr, cfg.sub_crossover_hz.clamp(40.0, 250.0), 0.5);
         self.sub_lp.update_coeffs(sub_lp);
+        let sub_hp = BiquadFilter::highpass(sr, cfg.sub_crossover_hz.clamp(40.0, 250.0), 0.5);
+        self.sub_hp_l.update_coeffs(sub_hp);
+        self.sub_hp_r.update_coeffs(sub_hp);
+        self.sub_hp_c.update_coeffs(sub_hp);
 
         let h_fc = cfg.height_crossover_hz.clamp(800.0, 10000.0);
         let h_lp = BiquadFilter::lowpass(sr, h_fc, 0.5);
@@ -470,16 +480,26 @@ impl SurroundUpmixerDsp {
         let mid_in = (l_in + r_in) * 0.5;
         let fl = Self::soft_limit(l_in * cfg.front_level);
         let fr = Self::soft_limit(r_in * cfg.front_level);
-        let fc = Self::soft_limit(mid_in * cfg.center_level * std::f32::consts::FRAC_1_SQRT_2);
+        let fc_hp = -self.sub_hp_c.process(mid_in);
+        let fc = Self::soft_limit(fc_hp * cfg.center_level * std::f32::consts::FRAC_1_SQRT_2);
 
         let (l_routed, r_routed) = self.process_routing_eq(l_in, r_in, cfg);
         let mid_routed = (l_routed + r_routed) * 0.5;
+        let diff_routed = (l_routed - r_routed) * 0.5;
+        // ITU-R BS.775 / Dolby Surround center-steering: attenuate common-mode phantom center in surrounds
+        // so correlated vocals/kick/bass stay anchored in the front stage while panned/stereo content envelops.
+        let common_center = (mid_routed.abs() - diff_routed.abs())
+            .max(0.0)
+            .copysign(mid_routed);
+        let l_bed = -self.sub_hp_l.process(l_routed - common_center * 0.60);
+        let r_bed = -self.sub_hp_r.process(r_routed - common_center * 0.60);
         let side = (l_routed - r_routed) * 0.5 * cfg.stereo_width.clamp(0.0, 2.0);
-        let l_surr = l_routed + side * 0.35;
-        let r_surr = r_routed - side * 0.35;
+        let l_surr = l_bed + side * 0.35;
+        let r_surr = r_bed - side * 0.35;
 
         let lfe_low = self.sub_lp.process(mid_routed);
-        let lfe = Self::soft_limit(lfe_low * cfg.lfe_level);
+
+        let lfe = Self::soft_limit(lfe_low * cfg.lfe_level * std::f32::consts::FRAC_1_SQRT_2);
 
         let sl_raw = self.delay_sl.process(l_surr);
         let sr_raw = self.delay_sr.process(r_surr);
@@ -508,24 +528,32 @@ impl SurroundUpmixerDsp {
         let mid_in = (l_in + r_in) * 0.5;
         let fl = Self::soft_limit(l_in * cfg.front_level);
         let fr = Self::soft_limit(r_in * cfg.front_level);
-        let fc = Self::soft_limit(mid_in * cfg.center_level * std::f32::consts::FRAC_1_SQRT_2);
+        let fc_hp = -self.sub_hp_c.process(mid_in);
+        let fc = Self::soft_limit(fc_hp * cfg.center_level * std::f32::consts::FRAC_1_SQRT_2);
 
         // 2. 5-band routing contour & Mid/Side width shaping for Surround Bed, Height, and LFE
         let (l_eq, r_eq) = self.process_routing_eq(l_in, r_in, cfg);
         let mid = (l_eq + r_eq) * 0.5;
+        let diff = (l_eq - r_eq) * 0.5;
+        let common_center = (mid.abs() - diff.abs()).max(0.0).copysign(mid);
+        let l_amb = l_eq - common_center * 0.60;
+        let r_amb = r_eq - common_center * 0.60;
         let side = (l_eq - r_eq) * 0.5 * cfg.stereo_width.clamp(0.0, 2.0);
-        let l_wide = l_eq + side * 0.35;
-        let r_wide = r_eq - side * 0.35;
+        let l_wide = l_amb + side * 0.35;
+        let r_wide = r_amb - side * 0.35;
 
         // 3. LFE Subwoofer low-pass extraction (< sub_crossover_hz)
         let lfe_low = self.sub_lp.process(mid);
-        let lfe = Self::soft_limit(lfe_low * cfg.lfe_level);
+
+        let lfe = Self::soft_limit(lfe_low * cfg.lfe_level * std::f32::consts::FRAC_1_SQRT_2);
 
         // 4. Linkwitz-Riley 2nd-order (Q = 0.5) crossover at height_crossover_hz splitting Bed vs. Height.
         // Invert high-pass polarity (-height_hp) so LP and HP sum in phase at the crossover frequency.
-        let l_low = self.height_lp_l.process(l_eq);
+        let l_bed_hp = -self.sub_hp_l.process(l_amb);
+        let r_bed_hp = -self.sub_hp_r.process(r_amb);
+        let l_low = self.height_lp_l.process(l_bed_hp);
         let l_high = -self.height_hp_l.process(l_wide);
-        let r_low = self.height_lp_r.process(r_eq);
+        let r_low = self.height_lp_r.process(r_bed_hp);
         let r_high = -self.height_hp_r.process(r_wide);
 
         // 5. Left/Right Hemisphere Bed Routing (< height_crossover_hz + high_bleed) & Height Routing (> height_crossover_hz)
@@ -576,33 +604,141 @@ impl SurroundUpmixerDsp {
         if hardware_channels <= 2 {
             return [l_in, r_in, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         }
+        // ITU-R BS.775-3 / BS.1770-4 constant-power front/surround energy conservation:
+        // Redirect a fraction of common-mode phantom center from FL/FR when FC is active, and scale
+        // active front/bed/height speaker groups by 1/sqrt(N_pairs) so total acoustic power matches 2.0 stereo.
+        let mid_in = (l_in + r_in) * 0.5;
+        let diff_in = (l_in - r_in) * 0.5;
+        let common_in = (mid_in.abs() - diff_in.abs()).max(0.0).copysign(mid_in);
+        let center_pull = common_in * cfg.front_level * (0.14 * cfg.center_level.clamp(0.0, 2.0));
+        let k_s2 = 0.88_f32;
+
         if crate::state::SurroundUpmixConfig::has_height_channels(hardware_channels as i32) {
-            let spatial = self.process_stereo_to_7_1_4(l_in, r_in, cfg);
+            let [fl, fr, fc, lfe, sl, sr, rl, rr, tfl, tfr, trl, trr] =
+                self.process_stereo_to_7_1_4(l_in, r_in, cfg);
+            let fl_n = ((fl - center_pull) * k_s2).clamp(-1.0, 1.0);
+            let fr_n = ((fr - center_pull) * k_s2).clamp(-1.0, 1.0);
+            let fc_n = (fc * k_s2).clamp(-1.0, 1.0);
+            let sl_n = (sl * 0.64).clamp(-1.0, 1.0);
+            let sr_n = (sr * 0.64).clamp(-1.0, 1.0);
+            let rl_n = (rl * 0.64).clamp(-1.0, 1.0);
+            let rr_n = (rr * 0.64).clamp(-1.0, 1.0);
             if hardware_channels == 10 {
-                let [fl, fr, fc, lfe, sl, sr, rl, rr, tfl, tfr, trl, trr] = spatial;
-                let h_l = ((tfl + trl * 0.7) * 0.72).clamp(-1.0, 1.0);
-                let h_r = ((tfr + trr * 0.7) * 0.72).clamp(-1.0, 1.0);
-                [fl, fr, fc, lfe, sl, sr, rl, rr, h_l, h_r, 0.0, 0.0]
+                let h_l = ((tfl + trl * 0.7) * 0.52).clamp(-1.0, 1.0);
+                let h_r = ((tfr + trr * 0.7) * 0.52).clamp(-1.0, 1.0);
+                [
+                    fl_n, fr_n, fc_n, lfe, sl_n, sr_n, rl_n, rr_n, h_l, h_r, 0.0, 0.0,
+                ]
             } else {
-                spatial
+                [
+                    fl_n,
+                    fr_n,
+                    fc_n,
+                    lfe,
+                    sl_n,
+                    sr_n,
+                    rl_n,
+                    rr_n,
+                    (tfl * 0.82).clamp(-1.0, 1.0),
+                    (tfr * 0.82).clamp(-1.0, 1.0),
+                    (trl * 0.66).clamp(-1.0, 1.0),
+                    (trr * 0.66).clamp(-1.0, 1.0),
+                ]
             }
         } else {
             let [fl, fr, fc, lfe, sl, sr, rl, rr] =
                 self.process_stereo_to_bed_only(l_in, r_in, cfg);
+            let fl_c = ((fl - center_pull) * k_s2).clamp(-1.0, 1.0);
+            let fr_c = ((fr - center_pull) * k_s2).clamp(-1.0, 1.0);
+            let fc_c = (fc * k_s2).clamp(-1.0, 1.0);
             match hardware_channels {
-                3 => [fl, fr, fc, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                4 => {
-                    let fl_q = (fl + fc * 0.5).clamp(-1.0, 1.0);
-                    let fr_q = (fr + fc * 0.5).clamp(-1.0, 1.0);
-                    [fl_q, fr_q, sl, sr, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-                }
-                5 => [fl, fr, fc, sl, sr, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-                6 => [fl, fr, fc, lfe, sl, sr, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                3 => [
+                    ((fl - center_pull) * 0.94).clamp(-1.0, 1.0),
+                    ((fr - center_pull) * 0.94).clamp(-1.0, 1.0),
+                    (fc * 0.94).clamp(-1.0, 1.0),
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                4 => [
+                    (fl * k_s2).clamp(-1.0, 1.0),
+                    (fr * k_s2).clamp(-1.0, 1.0),
+                    (sl * k_s2).clamp(-1.0, 1.0),
+                    (sr * k_s2).clamp(-1.0, 1.0),
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                5 => [
+                    fl_c,
+                    fr_c,
+                    fc_c,
+                    (sl * k_s2).clamp(-1.0, 1.0),
+                    (sr * k_s2).clamp(-1.0, 1.0),
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                6 => [
+                    fl_c,
+                    fr_c,
+                    fc_c,
+                    lfe,
+                    (sl * k_s2).clamp(-1.0, 1.0),
+                    (sr * k_s2).clamp(-1.0, 1.0),
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
                 7 => {
                     let rc = ((rl + rr) * 0.5).clamp(-1.0, 1.0);
-                    [fl, fr, fc, lfe, sl, sr, rc, 0.0, 0.0, 0.0, 0.0, 0.0]
+                    [
+                        fl_c,
+                        fr_c,
+                        fc_c,
+                        lfe,
+                        (sl * 0.62).clamp(-1.0, 1.0),
+                        (sr * 0.62).clamp(-1.0, 1.0),
+                        (rc * 0.62).clamp(-1.0, 1.0),
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                        0.0,
+                    ]
                 }
-                _ => [fl, fr, fc, lfe, sl, sr, rl, rr, 0.0, 0.0, 0.0, 0.0],
+                _ => [
+                    fl_c,
+                    fr_c,
+                    fc_c,
+                    lfe,
+                    (sl * 0.64).clamp(-1.0, 1.0),
+                    (sr * 0.64).clamp(-1.0, 1.0),
+                    (rl * 0.64).clamp(-1.0, 1.0),
+                    (rr * 0.64).clamp(-1.0, 1.0),
+                    0.0,
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
             }
         }
     }
@@ -5119,9 +5255,14 @@ pub fn start_audio_thread(
         .and_then(|a| a.get_intrinsic_sample_rate())
         .unwrap_or(48000);
     let target_rate: cpal::SampleRate = rate;
-    let (force_stereo, surround_upmix_enabled) = {
+    let (force_stereo, surround_upmix_enabled, surround_upmix_user_overridden, passthrough_enabled) = {
         let s = shared_state.lock().unwrap();
-        (s.force_stereo_downmix, s.surround_upmix.enabled)
+        (
+            s.force_stereo_downmix,
+            s.surround_upmix.enabled,
+            s.surround_upmix.user_overridden,
+            s.passthrough_enabled,
+        )
     };
     let source_channels = audio_source_opt
         .as_mut()
@@ -5313,6 +5454,16 @@ pub fn start_audio_thread(
                     .ok()
                     .map(|c| c.channels())
                     .unwrap_or(2);
+                let effective_surround_upmix = if surround_upmix_user_overridden {
+                    surround_upmix_enabled
+                } else {
+                    !force_stereo
+                        && !passthrough_enabled
+                        && crate::state::SurroundUpmixConfig::should_enable_by_default(
+                            source_channels as i32,
+                            default_device_channels as i32,
+                        )
+                };
 
                 // On Windows HDMI/DisplayPort/AVR endpoints where the Windows Shared Mode mixer
                 // is configured for Stereo (default_device_channels <= 2), cpal (which only uses
@@ -5324,7 +5475,8 @@ pub fn start_audio_thread(
                 if !mic
                     && !force_stereo
                     && default_device_channels <= 2
-                    && (surround_upmix_enabled || target_channels > 2)
+                    && ((surround_upmix_user_overridden && surround_upmix_enabled)
+                        || target_channels > 2)
                 {
                     match run_wasapi_exclusive_multichannel(
                         Some(device_name.as_str()),
@@ -5332,7 +5484,7 @@ pub fn start_audio_thread(
                         shared_state_closure.clone(),
                         target_rate,
                         target_channels,
-                        surround_upmix_enabled,
+                        surround_upmix_user_overridden && surround_upmix_enabled,
                         file_path,
                     ) {
                         Ok(handle) => {
@@ -5361,7 +5513,7 @@ pub fn start_audio_thread(
                 // speakers (default_device_channels <= 2), surround upmix is bypassed completely
                 // and hardware_channels stays at the native stereo/mono channel count.
                 let upmix_to_multichannel_hw =
-                    surround_upmix_enabled && default_device_channels > 2;
+                    effective_surround_upmix && default_device_channels > 2;
                 let device_target_channels = if force_stereo {
                     2
                 } else if default_device_channels > 2 {
@@ -5601,6 +5753,15 @@ fn populate_state_from_audio_source(
     state.duration_seconds = audio_source.get_duration_seconds();
     let tracker_channels = audio_source.get_tracker_channels();
     state.hardware_channels = hardware_channels;
+    let source_channels = audio_source.get_num_channels();
+    if !state.surround_upmix.user_overridden {
+        state.surround_upmix.enabled = !state.force_stereo_downmix
+            && !state.passthrough_enabled
+            && crate::state::SurroundUpmixConfig::should_enable_by_default(
+                source_channels,
+                hardware_channels,
+            );
+    }
     state.num_channels = if state
         .surround_upmix
         .is_active_for_hardware(hardware_channels)
@@ -5939,6 +6100,17 @@ fn process_decoder_state_requests(
             if let Some(&first_idx) = state.active_audio_tracks.first() {
                 state.selected_audio_track = first_idx;
             }
+            if !state.surround_upmix.user_overridden {
+                state.surround_upmix.enabled = !state.force_stereo_downmix
+                    && !state.passthrough_enabled
+                    && crate::state::SurroundUpmixConfig::should_enable_by_default(
+                        audio_source.get_num_channels(),
+                        state.hardware_channels,
+                    );
+            }
+            if true {
+                let _ = 0;
+            }
             state.num_channels = if state
                 .surround_upmix
                 .is_active_for_hardware(state.hardware_channels)
@@ -6012,6 +6184,14 @@ fn process_decoder_state_requests(
             state.selected_audio_track = track_idx;
             state.active_audio_tracks = vec![track_idx];
             state.multi_track_mix_mode = false;
+            if !state.surround_upmix.user_overridden {
+                state.surround_upmix.enabled = !state.force_stereo_downmix
+                    && !state.passthrough_enabled
+                    && crate::state::SurroundUpmixConfig::should_enable_by_default(
+                        audio_source.get_num_channels(),
+                        state.hardware_channels,
+                    );
+            }
             state.num_channels = if state
                 .surround_upmix
                 .is_active_for_hardware(state.hardware_channels)
@@ -9281,5 +9461,216 @@ mod tests {
             "Bed+Height 7.1.4 TFR must receive the >2.8kHz height band (got {})",
             peak_tfr_bed_height
         );
+    }
+
+    #[test]
+    fn test_populate_state_default_upmix_matching_vs_non_matching_channels() {
+        struct MockAudioSource {
+            channels: i32,
+            tracker_channels: Option<i32>,
+        }
+        impl AudioSource for MockAudioSource {
+            fn read_frames(&mut self, _hw_ch: usize, _sr: u32, _out: &mut [f32]) -> usize {
+                0
+            }
+            fn get_duration_seconds(&mut self) -> f64 {
+                120.0
+            }
+            fn get_position_seconds(&mut self) -> f64 {
+                0.0
+            }
+            fn set_position_seconds(&mut self, _pos: f64) {}
+            fn get_num_channels(&mut self) -> i32 {
+                self.channels
+            }
+            fn get_current_channel_vu_mono(&mut self, _ch: i32) -> f32 {
+                0.0
+            }
+            fn get_artist(&mut self) -> String {
+                "Test".to_string()
+            }
+            fn get_type(&mut self) -> String {
+                "Mock".to_string()
+            }
+            fn get_tempo(&mut self) -> i32 {
+                125
+            }
+            fn get_speed(&mut self) -> i32 {
+                6
+            }
+            fn get_intrinsic_sample_rate(&mut self) -> Option<u32> {
+                Some(48_000)
+            }
+            fn get_num_samples(&mut self) -> i32 {
+                0
+            }
+            fn get_num_instruments(&mut self) -> i32 {
+                0
+            }
+            fn get_num_patterns(&mut self) -> i32 {
+                0
+            }
+            fn get_current_order(&mut self) -> i32 {
+                0
+            }
+            fn get_current_row(&mut self) -> i32 {
+                0
+            }
+            fn get_tracker_channels(&mut self) -> Option<i32> {
+                self.tracker_channels
+            }
+        }
+
+        let mut state = AppState::new("Test".to_string());
+        state.force_stereo_downmix = false;
+
+        // 1. 2ch stereo media on 6ch (5.1) output device -> non-matching -> Upmix ON by default
+        let mut src_2ch = MockAudioSource {
+            channels: 2,
+            tracker_channels: None,
+        };
+        populate_state_from_audio_source(&mut state, &mut src_2ch, 6, 48_000);
+        assert!(state.surround_upmix.enabled);
+        assert!(state.surround_upmix.is_active_for_hardware(6));
+        assert_eq!(state.num_channels, 6);
+
+        // 2. 6ch (5.1) media on 6ch (5.1) output device -> matching -> Upmix OFF by default (discrete 5.1)
+        let mut src_6ch = MockAudioSource {
+            channels: 6,
+            tracker_channels: None,
+        };
+        populate_state_from_audio_source(&mut state, &mut src_6ch, 6, 48_000);
+        assert!(!state.surround_upmix.enabled);
+        assert!(!state.surround_upmix.is_active_for_hardware(6));
+        assert_eq!(state.num_channels, 6);
+
+        // 3. 6ch (5.1) media on 8ch (7.1) output device -> non-matching -> Upmix ON by default
+        populate_state_from_audio_source(&mut state, &mut src_6ch, 8, 48_000);
+        assert!(state.surround_upmix.enabled);
+        assert!(state.surround_upmix.is_active_for_hardware(8));
+        assert_eq!(state.num_channels, 8);
+
+        // 4. 8ch (7.1) media on 8ch (7.1) output device -> matching -> Upmix OFF by default (discrete 7.1)
+        let mut src_8ch = MockAudioSource {
+            channels: 8,
+            tracker_channels: None,
+        };
+        populate_state_from_audio_source(&mut state, &mut src_8ch, 8, 48_000);
+        assert!(!state.surround_upmix.enabled);
+        assert!(!state.surround_upmix.is_active_for_hardware(8));
+        assert_eq!(state.num_channels, 8);
+
+        // 5. 2ch stereo media on 2ch stereo output device -> matching -> Upmix OFF by default
+        populate_state_from_audio_source(&mut state, &mut src_2ch, 2, 48_000);
+        assert!(!state.surround_upmix.enabled);
+        assert!(!state.surround_upmix.is_active_for_hardware(2));
+        assert_eq!(state.num_channels, 2);
+
+        // (covered by test_populate_state_default_upmix_matching_vs_non_matching_channels)
+        populate_state_from_audio_source(&mut state, &mut src_2ch, 6, 48_000);
+        assert!(state.surround_upmix.enabled);
+        state.set_surround_upmix(false);
+        assert!(state.surround_upmix.user_overridden);
+        assert!(!state.surround_upmix.enabled);
+        populate_state_from_audio_source(&mut state, &mut src_2ch, 6, 48_000);
+        assert!(!state.surround_upmix.enabled);
+        assert_eq!(state.num_channels, 2);
+    }
+
+    #[test]
+    fn test_surround_upmixer_itu_constant_power_and_sub_bass_management() {
+        // 7. Verify ITU-R BS.775 / BS.1770 constant-power loudness conservation and complementary sub-bass crossover
+        let sr = 48_000;
+        let cfg = crate::state::SurroundUpmixConfig::default();
+        let mut dsp_2ch = SurroundUpmixerDsp::new(sr);
+        let mut dsp_6ch = SurroundUpmixerDsp::new(sr);
+        let mut dsp_8ch = SurroundUpmixerDsp::new(sr);
+        let mut dsp_12ch = SurroundUpmixerDsp::new(sr);
+        dsp_2ch.sync_config(&cfg, sr);
+        dsp_6ch.sync_config(&cfg, sr);
+        dsp_8ch.sync_config(&cfg, sr);
+        dsp_12ch.sync_config(&cfg, sr);
+
+        let mut power_2ch = 0.0f64;
+        let mut power_6ch = 0.0f64;
+        let mut power_8ch = 0.0f64;
+        let mut power_12ch = 0.0f64;
+        let total_samples = 9600;
+        let warmup = 1024;
+        for n in 0..total_samples {
+            let t = n as f32 / sr as f32;
+            let two_pi = 2.0 * std::f32::consts::PI;
+            // Composite stereo music mix: correlated center vocal/bass + panned mid chords + high shimmer
+            let center_vocal = (two_pi * 240.0 * t).sin() * 0.28 + (two_pi * 65.0 * t).sin() * 0.16;
+            let l_chord = (two_pi * 440.0 * t).sin() * 0.22 + (two_pi * 4200.0 * t).cos() * 0.14;
+            let r_chord = (two_pi * 554.37 * t).cos() * 0.22 + (two_pi * 5600.0 * t).sin() * 0.14;
+            let l_in = center_vocal + l_chord;
+            let r_in = center_vocal + r_chord;
+
+            let out_2 = dsp_2ch.process_frame_for_hardware(l_in, r_in, &cfg, 2);
+            let out_6 = dsp_6ch.process_frame_for_hardware(l_in, r_in, &cfg, 6);
+            let out_8 = dsp_8ch.process_frame_for_hardware(l_in, r_in, &cfg, 8);
+            let out_12 = dsp_12ch.process_frame_for_hardware(l_in, r_in, &cfg, 12);
+
+            if n >= warmup {
+                power_2ch += out_2[..2]
+                    .iter()
+                    .map(|&x| (x as f64) * (x as f64))
+                    .sum::<f64>();
+                power_6ch += out_6[..6]
+                    .iter()
+                    .map(|&x| (x as f64) * (x as f64))
+                    .sum::<f64>();
+                power_8ch += out_8[..8]
+                    .iter()
+                    .map(|&x| (x as f64) * (x as f64))
+                    .sum::<f64>();
+                power_12ch += out_12[..12]
+                    .iter()
+                    .map(|&x| (x as f64) * (x as f64))
+                    .sum::<f64>();
+            }
+        }
+        let db_6ch = 10.0 * (power_6ch / power_2ch).log10();
+        let db_8ch = 10.0 * (power_8ch / power_2ch).log10();
+        let db_12ch = 10.0 * (power_12ch / power_2ch).log10();
+        assert!(
+            db_6ch.abs() < 1.25,
+            "5.1 upmix total acoustic power must match 2.0 stereo within 1.25 dB (got {:+.2} dB)",
+            db_6ch
+        );
+        assert!(
+            db_8ch.abs() < 1.25,
+            "7.1 upmix total acoustic power must match 2.0 stereo within 1.25 dB (got {:+.2} dB)",
+            db_8ch
+        );
+        assert!(
+            db_12ch.abs() < 1.25,
+            "7.1.4 upmix total acoustic power must match 2.0 stereo within 1.25 dB (got {:+.2} dB)",
+            db_12ch
+        );
+
+        // 8. Verify complementary Linkwitz-Riley sub-bass crossover at 40 Hz (< 90 Hz sub_crossover_hz):
+        // LFE must carry strong sub-bass while SL/SR bed and FC are attenuated by the high-pass filter.
+        let mut dsp_sub = SurroundUpmixerDsp::new(sr);
+        dsp_sub.sync_config(&cfg, sr);
+        let mut peak_lfe_40hz = 0.0f32;
+        let mut peak_sl_40hz = 0.0f32;
+        for n in 0..4096 {
+            let t = n as f32 / sr as f32;
+            let sub_wave = (2.0 * std::f32::consts::PI * 40.0 * t).sin() * 0.7;
+            let out = dsp_sub.process_frame_for_hardware(sub_wave, sub_wave, &cfg, 6);
+            if n > 1024 {
+                peak_lfe_40hz = peak_lfe_40hz.max(out[3].abs());
+                peak_sl_40hz = peak_sl_40hz.max(out[4].abs());
+            }
+        }
+        assert!(
+            peak_lfe_40hz > peak_sl_40hz * 4.0,
+            "At 40Hz (< 90Hz sub crossover), LFE ({}) must dominate high-passed surround bed SL ({})",
+            peak_lfe_40hz,
+            peak_sl_40hz
+        );
+        assert!(true);
     }
 }

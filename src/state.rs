@@ -572,6 +572,8 @@ pub struct AudioTrackInfo {
 pub struct SurroundUpmixConfig {
     /// Whether automatic surround & height upmixing is active.
     pub enabled: bool,
+    /// Whether the user has manually toggled or overridden `enabled`.
+    pub user_overridden: bool,
     /// Low-pass Linkwitz-Riley crossover frequency (Hz) for LFE subwoofer extraction (40..=250 Hz).
     pub sub_crossover_hz: f32,
     /// High-pass Linkwitz-Riley crossover frequency (Hz) splitting highs up to height speakers (800..=10000 Hz).
@@ -597,7 +599,8 @@ pub struct SurroundUpmixConfig {
 impl Default for SurroundUpmixConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
+            user_overridden: false,
             sub_crossover_hz: 90.0,
             height_crossover_hz: 2800.0,
             band_gains_db: [0.0; 5],
@@ -619,9 +622,11 @@ impl SurroundUpmixConfig {
     /// Reset EQ bands, crossover cutoffs, and speaker levels back to factory defaults,
     /// preserving the current `enabled` state.
     pub fn reset_tuning(&mut self) {
+        let user_overridden = self.user_overridden;
         let enabled = self.enabled;
         *self = Self::default();
         self.enabled = enabled;
+        self.user_overridden = user_overridden;
     }
 
     /// Evaluate the composite 5-band EQ gain in dB at a given frequency `freq_hz`.
@@ -666,6 +671,15 @@ impl SurroundUpmixConfig {
     #[inline]
     pub fn is_active_for_hardware(&self, hardware_channels: i32) -> bool {
         self.enabled && hardware_channels > 2
+    }
+
+    /// Returns `true` when surround upmixing should be enabled by default for a media file
+    /// with `source_channels` playing on an output device with `device_channels`:
+    /// enabled for all cases on multi-channel output hardware (`device_channels > 2`)
+    /// except where the media file's channel count matches the output device (`source_channels == device_channels`).
+    #[inline]
+    pub fn should_enable_by_default(source_channels: i32, device_channels: i32) -> bool {
+        device_channels > 2 && source_channels != device_channels
     }
 
     /// Returns `true` when the output hardware layout includes overhead height channels
@@ -1041,7 +1055,10 @@ impl AppState {
             drag_cursor_pos: None,
             track_info_rect: None,
             mobile_hud_tab: MobileHudTab::default(),
-            surround_upmix: SurroundUpmixConfig::default(),
+            surround_upmix: SurroundUpmixConfig {
+                enabled: !is_steam_deck,
+                ..SurroundUpmixConfig::default()
+            },
         }
     }
 
@@ -1358,6 +1375,7 @@ impl AppState {
     pub fn set_surround_upmix(&mut self, enabled: bool) {
         let prev_enabled = self.surround_upmix.enabled;
         self.surround_upmix.enabled = enabled;
+        self.surround_upmix.user_overridden = true;
         if enabled {
             self.force_stereo_downmix = false;
             if self.passthrough_enabled || self.stats.bitstream_active {

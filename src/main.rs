@@ -2549,6 +2549,7 @@ async fn run_gui(
                                         state.load_request = Some(reload_path);
                                         state.osd_text =
                                             Some(format!("Audio Output: {}", new_device));
+                                        state.surround_upmix.user_overridden = false;
                                         resume_pos_on_reload = Some(state.current_seconds);
                                         state.osd_timer = 3.0;
                                     }
@@ -2606,6 +2607,9 @@ async fn run_gui(
                                     }
                                 }
 
+                                if resume_pos_on_reload.is_none() && state.load_request.is_some() {
+                                    state.surround_upmix.user_overridden = false;
+                                }
                                 (state.load_request.take(), resume_pos_on_reload)
                             };
 
@@ -4387,6 +4391,7 @@ where
                     state.load_request = Some(reload_path);
                     resume_pos_on_reload = Some(state.current_seconds);
                     state.osd_text = Some(format!("Audio Output: {}", new_device));
+                    state.surround_upmix.user_overridden = false;
                     state.osd_timer = 3.0;
                 }
             }
@@ -4446,6 +4451,9 @@ where
                 }
             }
 
+            if resume_pos_on_reload.is_none() && state.load_request.is_some() {
+                state.surround_upmix.user_overridden = false;
+            }
             (state.load_request.take(), resume_pos_on_reload)
         };
 
@@ -4994,7 +5002,31 @@ mod tests {
         let args_default = Args::try_parse_from(["rusttracker"]).unwrap();
         assert!(!args_default.surround_upmix);
 
+        assert!(crate::state::SurroundUpmixConfig::default().enabled);
+        assert!(!crate::state::SurroundUpmixConfig::default().user_overridden);
+        assert!(!crate::state::SurroundUpmixConfig::should_enable_by_default(2, 2));
+        assert!(!crate::state::SurroundUpmixConfig::should_enable_by_default(6, 6));
+        assert!(!crate::state::SurroundUpmixConfig::should_enable_by_default(8, 8));
+        assert!(!crate::state::SurroundUpmixConfig::should_enable_by_default(12, 12));
+        assert!(crate::state::SurroundUpmixConfig::should_enable_by_default(
+            2, 6
+        ));
+        assert!(crate::state::SurroundUpmixConfig::should_enable_by_default(
+            2, 8
+        ));
+        assert!(crate::state::SurroundUpmixConfig::should_enable_by_default(
+            2, 12
+        ));
+        assert!(crate::state::SurroundUpmixConfig::should_enable_by_default(
+            6, 8
+        ));
+        assert!(crate::state::SurroundUpmixConfig::should_enable_by_default(
+            6, 12
+        ));
+
         let mut state = AppState::new("Test Track".to_string());
+        state.surround_upmix.enabled =
+            crate::state::SurroundUpmixConfig::should_enable_by_default(2, 2);
         state.force_stereo_downmix = true;
         state.show_hud = false;
         state.video_mode = 3;
