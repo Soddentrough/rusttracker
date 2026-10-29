@@ -7594,6 +7594,11 @@ fn run_wasapi_exclusive_multichannel(
         let wf_ptr = &wf as *const WAVEFORMATEXTENSIBLE as *const WAVEFORMATEX;
 
         let mut audio_client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
+        unsafe {
+            audio_client
+                .IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, wf_ptr, None)
+                .map_err(|e| anyhow::anyhow!(e))?;
+        }
         let mut default_period = 0i64;
         let mut min_period = 0i64;
         unsafe {
@@ -7625,9 +7630,11 @@ fn run_wasapi_exclusive_multichannel(
             if aligned_frames > 0 {
                 buffer_duration =
                     ((aligned_frames as i64 * 10_000_000) + (rate as i64 / 2)) / rate as i64;
-                let audio_client_new: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
+                // Drop the old IAudioClient FIRST so the driver releases the exclusive session before re-activating
+                drop(audio_client);
+                audio_client = unsafe { device.Activate(CLSCTX_ALL, None)? };
                 hr = unsafe {
-                    audio_client_new.Initialize(
+                    audio_client.Initialize(
                         AUDCLNT_SHAREMODE_EXCLUSIVE,
                         AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
                         buffer_duration,
@@ -7636,9 +7643,6 @@ fn run_wasapi_exclusive_multichannel(
                         None,
                     )
                 };
-                if hr.is_ok() {
-                    audio_client = audio_client_new;
-                }
             }
         }
         hr.map_err(|e| anyhow::anyhow!(e))?;
@@ -7830,9 +7834,9 @@ fn run_wasapi_exclusive_multichannel(
         let (
             active_device,
             active_device_name,
-            mut audio_client,
-            mut render_client,
-            mut event,
+            audio_client,
+            render_client,
+            event,
             mut buffer_frames,
             negotiated_channels,
             negotiated_rate,
@@ -7913,7 +7917,6 @@ fn run_wasapi_exclusive_multichannel(
         let mut upmix_peak_vus = [0.0f32; 12];
         let mut current_chunk: Option<AudioChunk> = None;
         let mut chunk_frame_pos = 0usize;
-        let mut was_paused = false;
 
         let (mut latest_seek_epoch, mut upmix_cfg) = {
             let state = shared_state_thread.lock().unwrap();
@@ -7939,6 +7942,8 @@ fn run_wasapi_exclusive_multichannel(
             }
         }
 
+        let mut active_client = Some((audio_client, render_client, event));
+
         while !stop_token_thread.load(std::sync::atomic::Ordering::Relaxed) {
             let mut is_paused = false;
             if let Ok(state) = shared_state_thread.try_lock() {
@@ -7956,8 +7961,7 @@ fn run_wasapi_exclusive_multichannel(
             }
 
             if is_paused {
-                if !was_paused {
-                    was_paused = true;
+                if let Some((ac, rc, ev)) = active_client.take() {
                     if let Ok(mut state) = shared_state_thread.try_lock() {
                         state.raw_channel_vus.fill(0.0);
                         state.raw_spectrum_data.fill(0.0);
@@ -7966,14 +7970,18 @@ fn run_wasapi_exclusive_multichannel(
                         "[audio] Playback paused; releasing WASAPI Exclusive Multichannel hardware lock..."
                     );
                     unsafe {
-                        let _ = audio_client.Stop();
-                        let _ = CloseHandle(event);
+                        let _ = ac.Stop();
+                        let _ = ac.Reset();
                     }
-                    event = HANDLE::default();
+                    drop(rc);
+                    drop(ac);
+                    unsafe {
+                        let _ = CloseHandle(ev);
+                    }
                 }
                 std::thread::sleep(std::time::Duration::from_millis(20));
                 continue;
-            } else if was_paused {
+            } else if active_client.is_none() {
                 eprintln!(
                     "[audio] Playback resumed; re-acquiring WASAPI Exclusive Multichannel hardware lock..."
                 );
@@ -7985,25 +7993,22 @@ fn run_wasapi_exclusive_multichannel(
                     negotiated_fmt,
                 ) {
                     Ok((new_ac, new_rc, new_ev, new_frames)) => {
-                        audio_client = new_ac;
-                        render_client = new_rc;
-                        event = new_ev;
                         buffer_frames = new_frames;
                         unsafe {
-                            if let Ok(buf_ptr) = render_client.GetBuffer(buffer_frames) {
+                            if let Ok(buf_ptr) = new_rc.GetBuffer(buffer_frames) {
                                 std::ptr::write_bytes(
                                     buf_ptr,
                                     0,
                                     (buffer_frames as usize) * frame_bytes,
                                 );
-                                let _ = render_client.ReleaseBuffer(
+                                let _ = new_rc.ReleaseBuffer(
                                     buffer_frames,
                                     AUDCLNT_BUFFERFLAGS_SILENT.0 as u32,
                                 );
                             }
-                            let _ = audio_client.Start();
+                            let _ = new_ac.Start();
                         }
-                        was_paused = false;
+                        active_client = Some((new_ac, new_rc, new_ev));
                     }
                     Err(e) => {
                         eprintln!(
@@ -8015,6 +8020,11 @@ fn run_wasapi_exclusive_multichannel(
                     }
                 }
             }
+
+            let (_audio_client, render_client, event) = active_client
+                .as_ref()
+                .map(|(ac, rc, ev)| (ac, rc, *ev))
+                .unwrap();
 
             let wait_res = unsafe { WaitForSingleObject(event, 20) };
             if wait_res.0 != WAIT_OBJECT_0 {
@@ -8211,14 +8221,17 @@ fn run_wasapi_exclusive_multichannel(
             }
         }
 
-        unsafe {
-            if !was_paused {
-                let _ = audio_client.Stop();
-                let _ = CloseHandle(event);
+        if let Some((ac, rc, ev)) = active_client.take() {
+            unsafe {
+                let _ = ac.Stop();
+                let _ = ac.Reset();
+            }
+            drop(rc);
+            drop(ac);
+            unsafe {
+                let _ = CloseHandle(ev);
             }
         }
-        drop(render_client);
-        drop(audio_client);
         drop(active_device);
         drop(enumerator);
         unsafe {
@@ -9671,6 +9684,5 @@ mod tests {
             peak_lfe_40hz,
             peak_sl_40hz
         );
-        assert!(true);
     }
 }
