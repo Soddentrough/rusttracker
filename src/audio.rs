@@ -602,9 +602,12 @@ impl SurroundUpmixerDsp {
         [fl, fr, fc, lfe, sl, sr, rl, rr, tfl, tfr, trl, trr]
     }
 
-    /// Upmix a stereo `(l_in, r_in)` frame according to the hardware output topology:
-    /// - **Bed-Only (`hardware_channels` in `3..=8`)**: uses `process_stereo_to_bed_only` (no height crossover split, no height fold-down).
-    /// - **Bed + Height (`hardware_channels > 8`)**: uses `process_stereo_to_7_1_4` (Linkwitz-Riley height crossover split to overhead channels).
+    /// Upmix a stereo `(l_in, r_in)` frame to `hardware_channels` (up to 12 channels):
+    /// - For Bed + Height layouts (`> 8` channels, e.g. `10` = 7.1.2 or `12` = 7.1.4): runs the full
+    ///   Linkwitz-Riley height crossover split (`process_stereo_to_7_1_4`).
+    /// - For Bed-Only layouts (`3..=8` channels, e.g. `4` = 4.0, `6` = 5.1, `8` = 7.1): runs
+    ///   `process_stereo_to_bed_only` so surround speakers receive the full high-frequency band
+    ///   without losing energy above `height_crossover_hz` to non-existent height speakers.
     #[inline(always)]
     pub fn process_frame_for_hardware(
         &mut self,
@@ -632,34 +635,56 @@ impl SurroundUpmixerDsp {
         if crate::state::SurroundUpmixConfig::has_height_channels(hardware_channels as i32) {
             let [fl, fr, fc, lfe, sl, sr, rl, rr, tfl, tfr, trl, trr] =
                 self.process_stereo_to_7_1_4(l_in, r_in, cfg);
-            let fl_n = ((fl - center_pull) * k_s2).clamp(-1.0, 1.0);
-            let fr_n = ((fr - center_pull) * k_s2).clamp(-1.0, 1.0);
-            let fc_n = (fc * k_s2).clamp(-1.0, 1.0);
-            let sl_n = (sl * 0.64).clamp(-1.0, 1.0);
-            let sr_n = (sr * 0.64).clamp(-1.0, 1.0);
-            let rl_n = (rl * 0.64).clamp(-1.0, 1.0);
-            let rr_n = (rr * 0.64).clamp(-1.0, 1.0);
-            if hardware_channels == 10 {
-                let h_l = ((tfl + trl * 0.7) * 0.52).clamp(-1.0, 1.0);
-                let h_r = ((tfr + trr * 0.7) * 0.52).clamp(-1.0, 1.0);
-                [
-                    fl_n, fr_n, fc_n, lfe, sl_n, sr_n, rl_n, rr_n, h_l, h_r, 0.0, 0.0,
-                ]
-            } else {
-                [
-                    fl_n,
-                    fr_n,
-                    fc_n,
+            let fl_c = ((fl - center_pull) * k_s2).clamp(-1.0, 1.0);
+            let fr_c = ((fr - center_pull) * k_s2).clamp(-1.0, 1.0);
+            let fc_c = (fc * k_s2).clamp(-1.0, 1.0);
+            match hardware_channels {
+                9 => [
+                    fl_c,
+                    fr_c,
+                    fc_c,
                     lfe,
-                    sl_n,
-                    sr_n,
-                    rl_n,
-                    rr_n,
+                    (sl * 0.64).clamp(-1.0, 1.0),
+                    (sr * 0.64).clamp(-1.0, 1.0),
+                    (rl * 0.64).clamp(-1.0, 1.0),
+                    (rr * 0.64).clamp(-1.0, 1.0),
+                    ((tfl + tfr) * 0.45).clamp(-1.0, 1.0),
+                    0.0,
+                    0.0,
+                    0.0,
+                ],
+                10 => {
+                    let h_l = ((tfl + trl * 0.7) * 0.52).clamp(-1.0, 1.0);
+                    let h_r = ((tfr + trr * 0.7) * 0.52).clamp(-1.0, 1.0);
+                    [
+                        fl_c,
+                        fr_c,
+                        fc_c,
+                        lfe,
+                        (sl * 0.64).clamp(-1.0, 1.0),
+                        (sr * 0.64).clamp(-1.0, 1.0),
+                        (rl * 0.64).clamp(-1.0, 1.0),
+                        (rr * 0.64).clamp(-1.0, 1.0),
+                        h_l,
+                        h_r,
+                        0.0,
+                        0.0,
+                    ]
+                }
+                _ => [
+                    fl_c,
+                    fr_c,
+                    fc_c,
+                    lfe,
+                    (sl * 0.64).clamp(-1.0, 1.0),
+                    (sr * 0.64).clamp(-1.0, 1.0),
+                    (rl * 0.64).clamp(-1.0, 1.0),
+                    (rr * 0.64).clamp(-1.0, 1.0),
                     (tfl * 0.82).clamp(-1.0, 1.0),
                     (tfr * 0.82).clamp(-1.0, 1.0),
                     (trl * 0.66).clamp(-1.0, 1.0),
                     (trr * 0.66).clamp(-1.0, 1.0),
-                ]
+                ],
             }
         } else {
             let [fl, fr, fc, lfe, sl, sr, rl, rr] =
@@ -786,10 +811,15 @@ impl SurroundUpmixerDsp {
             let (l_in, r_in) = extract_stereo_pair_from_frame(frame_slice, src_ch);
             return self.process_frame_for_hardware(l_in, r_in, cfg, hardware_channels);
         }
-        // Discrete multi-channel expansion (e.g. 5.1 -> 7.1 or 7.1.4):
-        // Keep discrete Front/Center/LFE channels untouched, and feed the surround pair (SL, SR)
-        // into the decorrelated bed/height expander with 1/sqrt(2) constant-power split across SL/RL.
-        let (sur_l, sur_r) = if frame_slice.len() >= 6 && src_ch >= 6 {
+        // Discrete multi-channel expansion (e.g. 5.1 -> 7.1 or 5.1/7.1 -> 7.1.4):
+        // Keep discrete bed channels untouched, and feed the surround pair (SL, SR)
+        // into the decorrelated bed/height expander.
+        let (sur_l, sur_r) = if frame_slice.len() >= 8 && src_ch >= 8 {
+            (
+                (frame_slice[4] + frame_slice[6]) * std::f32::consts::FRAC_1_SQRT_2,
+                (frame_slice[5] + frame_slice[7]) * std::f32::consts::FRAC_1_SQRT_2,
+            )
+        } else if frame_slice.len() >= 6 && src_ch >= 6 {
             (frame_slice[4], frame_slice[5])
         } else if frame_slice.len() >= 4 {
             (frame_slice[2], frame_slice[3])
@@ -800,12 +830,16 @@ impl SurroundUpmixerDsp {
             )
         };
         let mut expanded = self.process_frame_for_hardware(sur_l, sur_r, cfg, hardware_channels);
-        let discrete_front_count = src_ch.min(4).min(frame_slice.len());
-        expanded[..discrete_front_count].copy_from_slice(&frame_slice[..discrete_front_count]);
-        if src_ch >= 6 && frame_slice.len() >= 6 && hardware_channels >= 8 {
-            let pair_norm = std::f32::consts::FRAC_1_SQRT_2;
-            expanded[4] = (frame_slice[4] * pair_norm).clamp(-1.0, 1.0);
-            expanded[5] = (frame_slice[5] * pair_norm).clamp(-1.0, 1.0);
+        if src_ch >= 8 && frame_slice.len() >= 8 {
+            expanded[..8].copy_from_slice(&frame_slice[..8]);
+        } else {
+            let discrete_front_count = src_ch.min(4).min(frame_slice.len());
+            expanded[..discrete_front_count].copy_from_slice(&frame_slice[..discrete_front_count]);
+            if src_ch >= 6 && frame_slice.len() >= 6 && hardware_channels >= 8 {
+                let pair_norm = std::f32::consts::FRAC_1_SQRT_2;
+                expanded[4] = (frame_slice[4] * pair_norm).clamp(-1.0, 1.0);
+                expanded[5] = (frame_slice[5] * pair_norm).clamp(-1.0, 1.0);
+            }
         }
         expanded
     }
@@ -886,9 +920,12 @@ impl SurroundUpmixerDsp {
         if self.blend < 1.0 {
             let w = 0.5 - 0.5 * (std::f32::consts::PI * self.blend).cos();
             let dry_w = 1.0 - w;
-            let active_ch = hardware_channels.min(12);
-            for (c, sample_out) in upmixed.iter_mut().enumerate().take(active_ch) {
-                let dry = frame_slice.get(c).copied().unwrap_or(0.0);
+            for (c, sample_out) in upmixed.iter_mut().enumerate() {
+                let dry = if c < hardware_channels {
+                    frame_slice.get(c).copied().unwrap_or(0.0)
+                } else {
+                    0.0
+                };
                 *sample_out = (dry * dry_w + *sample_out * w).clamp(-1.0, 1.0);
             }
         }
@@ -1322,7 +1359,7 @@ pub fn spawn_dsp_thread(
                 if !msg.channel_vus.is_empty() {
                     state.num_channels = if state
                         .surround_upmix
-                        .is_active_for_hardware(state.hardware_channels)
+                        .is_active_for(state.source_channels, state.hardware_channels)
                     {
                         state.hardware_channels.min(12)
                     } else {
@@ -5617,25 +5654,21 @@ pub fn start_audio_thread(
                         )
                 };
 
-                // On Windows HDMI/DisplayPort/AVR endpoints where the Windows Shared Mode mixer
-                // is configured for Stereo (default_device_channels <= 2), cpal (which only uses
-                // WASAPI Shared Mode) is locked to 2 channels even when the endpoint natively
-                // supports 5.1 / 7.1 / 7.1.4 LPCM in WASAPI Exclusive Mode. When Surround Upmix
-                // is enabled or the source has >2 channels, probe WASAPI Exclusive Mode for
-                // direct multi-channel LPCM output before falling back to Shared Mode.
+                // On Windows HDMI/DisplayPort/AVR endpoints where the Windows Shared Mode default
+                // mix format may be Stereo (default_device_channels <= 2) or 5.1/7.1, cpal only
+                // exposes `GetMixFormat()` and cannot open 12-channel (7.1.4 / 11.1) or non-default
+                // multi-channel speaker masks. Probe the endpoint's hardware speaker capabilities
+                // and open a multi-channel WASAPI Shared Mode (32-bit IEEE Float) stream when the
+                // output device supports >2 channels (up to 12 channels / 7.1.4).
                 #[cfg(windows)]
-                if !mic
-                    && !force_stereo
-                    && default_device_channels <= 2
-                    && ((!passthrough_enabled && surround_upmix_enabled) || target_channels > 2)
-                {
+                if !mic && !force_stereo && !passthrough_enabled {
                     match run_wasapi_exclusive_multichannel(
                         Some(device_name.as_str()),
                         &mut attempt_audio_source_opt,
                         shared_state_closure.clone(),
                         target_rate,
                         target_channels,
-                        !passthrough_enabled && surround_upmix_enabled,
+                        surround_upmix_enabled || !surround_upmix_user_overridden,
                         file_path,
                     ) {
                         Ok(handle) => {
@@ -5652,7 +5685,7 @@ pub fn start_audio_thread(
                         }
                         Err(e) => {
                             eprintln!(
-                                "[audio] WASAPI Exclusive Multichannel probe on '{}': {:?} (falling back to Shared Mode)",
+                                "[audio] WASAPI Shared Multichannel probe on '{}': {:?} (falling back to CPAL)",
                                 device_name, e
                             );
                         }
@@ -7518,8 +7551,8 @@ fn run_dummy(
 
                     // Process chunk for FFT and VU levels (dummy device is 2ch stereo, so surround upmix is bypassed)
                     let to_copy = chunk.valid_frames;
-                    let upmix_active = upmix_cfg
-                        .is_active_for(chunk.spatial_channels as i32, hardware_channels as i32);
+                    let upmix_active =
+                        upmix_cfg.is_active_for(chunk.spatial_channels, hardware_channels as i32);
                     if upmix_active {
                         upmixer_dsp.sync_config(&upmix_cfg, sample_rate);
                         upmix_peak_vus = [0.0f32; 12];
@@ -7627,7 +7660,7 @@ fn run_dummy(
 }
 
 #[cfg(windows)]
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn run_wasapi_exclusive_multichannel(
     selected_device_name: Option<&str>,
     audio_source_opt: &mut Option<Box<dyn AudioSource>>,
@@ -7657,10 +7690,85 @@ fn run_wasapi_exclusive_multichannel(
         data3: 0x0010,
         data4: [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
     };
+    const KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_MLP: GUID = GUID {
+        data1: 0x0000000c,
+        data2: 0x0cea,
+        data3: 0x0010,
+        data4: [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
+    };
+    const KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_MAT20: GUID = GUID {
+        data1: 0x0000000f,
+        data2: 0x0cea,
+        data3: 0x0010,
+        data4: [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
+    };
+    const KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_DIGITAL_PLUS: GUID = GUID {
+        data1: 0x0000000a,
+        data2: 0x0cea,
+        data3: 0x0010,
+        data4: [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
+    };
     const PKEY_DEVICE_FRIENDLY_NAME: PROPERTYKEY = PROPERTYKEY {
         fmtid: GUID::from_u128(0xa45c254e_df1c_4efd_8020_67d146a850e0),
         pid: 14,
     };
+
+    fn device_supports_atmos_height(probe_client: &IAudioClient) -> bool {
+        let probes = [
+            (
+                KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_MLP,
+                8u16,
+                192_000u32,
+                0x63Fu32,
+            ),
+            (
+                KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_MAT20,
+                8u16,
+                192_000u32,
+                0x63Fu32,
+            ),
+            (
+                KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_DIGITAL_PLUS,
+                2u16,
+                192_000u32,
+                0x3u32,
+            ),
+            (
+                KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_DIGITAL_PLUS,
+                8u16,
+                192_000u32,
+                0x63Fu32,
+            ),
+        ];
+        for (sub_format, channels, rate, mask) in probes {
+            let block_align = channels * 2;
+            let wf = WAVEFORMATEXTENSIBLE {
+                Format: WAVEFORMATEX {
+                    wFormatTag: 0xFFFE,
+                    nChannels: channels,
+                    nSamplesPerSec: rate,
+                    nAvgBytesPerSec: rate * block_align as u32,
+                    nBlockAlign: block_align,
+                    wBitsPerSample: 16,
+                    cbSize: 22,
+                },
+                Samples: WAVEFORMATEXTENSIBLE_0 {
+                    wValidBitsPerSample: 16,
+                },
+                dwChannelMask: mask,
+                SubFormat: sub_format,
+            };
+            let wf_ptr = &wf as *const WAVEFORMATEXTENSIBLE as *const WAVEFORMATEX;
+            if unsafe {
+                probe_client
+                    .IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, wf_ptr, None)
+                    .is_ok()
+            } {
+                return true;
+            }
+        }
+        false
+    }
 
     #[derive(Clone, Copy, Debug)]
     enum WasapiPcmFormat {
@@ -7748,7 +7856,7 @@ fn run_wasapi_exclusive_multichannel(
         }
     }
 
-    fn try_open_exclusive_client(
+    fn try_open_shared_client(
         device: &IMMDevice,
         channels: u16,
         rate: u32,
@@ -7758,60 +7866,36 @@ fn run_wasapi_exclusive_multichannel(
         let wf = build_wave_format(channels, rate, channel_mask, fmt);
         let wf_ptr = &wf as *const WAVEFORMATEXTENSIBLE as *const WAVEFORMATEX;
 
-        let mut audio_client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
-        unsafe {
-            audio_client
-                .IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, wf_ptr, None)
-                .ok()
-                .map_err(|e| anyhow::anyhow!(e))?;
-        }
+        let audio_client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
         let mut default_period = 0i64;
         let mut min_period = 0i64;
         unsafe {
-            audio_client.GetDevicePeriod(Some(&mut default_period), Some(&mut min_period))?;
+            let _ = audio_client.GetDevicePeriod(Some(&mut default_period), Some(&mut min_period));
         }
-        let mut buffer_duration = if default_period > 0 {
-            default_period.max(100_000)
+        let buffer_duration = if default_period > 0 {
+            default_period.max(200_000)
         } else if min_period > 0 {
-            min_period.max(100_000)
+            min_period.max(200_000)
         } else {
-            100_000
+            200_000
         };
 
-        let mut hr = unsafe {
-            audio_client.Initialize(
-                AUDCLNT_SHAREMODE_EXCLUSIVE,
-                AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                buffer_duration,
-                buffer_duration,
-                wf_ptr,
-                None,
-            )
-        };
-        if let Err(e) = &hr
-            && (e.code() == windows::core::HRESULT(0x88890019u32 as i32)
-                || e.code() == windows::core::HRESULT(0x80070057u32 as i32))
-        {
-            let aligned_frames = unsafe { audio_client.GetBufferSize().unwrap_or(0) };
-            if aligned_frames > 0 {
-                buffer_duration =
-                    ((aligned_frames as i64 * 10_000_000) + (rate as i64 / 2)) / rate as i64;
-                // Drop the old IAudioClient FIRST so the driver releases the exclusive session before re-activating
-                drop(audio_client);
-                audio_client = unsafe { device.Activate(CLSCTX_ALL, None)? };
-                hr = unsafe {
-                    audio_client.Initialize(
-                        AUDCLNT_SHAREMODE_EXCLUSIVE,
-                        AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
-                        buffer_duration,
-                        buffer_duration,
-                        wf_ptr,
-                        None,
-                    )
-                };
-            }
+        let stream_flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK
+            | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+            | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+
+        unsafe {
+            audio_client
+                .Initialize(
+                    AUDCLNT_SHAREMODE_SHARED,
+                    stream_flags,
+                    buffer_duration,
+                    0,
+                    wf_ptr,
+                    None,
+                )
+                .map_err(|e| anyhow::anyhow!(e))?;
         }
-        hr.map_err(|e| anyhow::anyhow!(e))?;
 
         let event = unsafe { CreateEventW(None, false, false, None)? };
         if let Err(e) = unsafe { audio_client.SetEventHandle(event) } {
@@ -7927,14 +8011,28 @@ fn run_wasapi_exclusive_multichannel(
         }
 
         let channel_candidates: Vec<(u16, u32)> = if surround_upmix_enabled {
-            vec![(12, 0x2D63F), (8, 0x63F), (8, 0xFF), (6, 0x3F), (6, 0x60F)]
+            vec![
+                (12, 0x2D63F),
+                (8, 0x63F),
+                (8, 0xFF),
+                (6, 0x3F),
+                (6, 0x60F),
+                (4, 0x33),
+            ]
         } else {
             match target_channels {
                 c if c >= 12 => vec![(12, 0x2D63F), (8, 0x63F), (8, 0xFF), (6, 0x3F)],
-                7 | 8 => vec![(8, 0x63F), (8, 0xFF), (6, 0x3F)],
-                5 | 6 => vec![(6, 0x3F), (6, 0x60F), (8, 0x63F), (8, 0xFF)],
-                3 | 4 => vec![(4, 0x33), (6, 0x3F), (8, 0x63F)],
-                _ => vec![(8, 0x63F), (8, 0xFF), (6, 0x3F)],
+                7 | 8 => vec![(12, 0x2D63F), (8, 0x63F), (8, 0xFF), (6, 0x3F)],
+                5 | 6 => vec![(12, 0x2D63F), (8, 0x63F), (8, 0xFF), (6, 0x3F), (6, 0x60F)],
+                3 | 4 => vec![(12, 0x2D63F), (8, 0x63F), (6, 0x3F), (4, 0x33)],
+                _ => vec![
+                    (12, 0x2D63F),
+                    (8, 0x63F),
+                    (8, 0xFF),
+                    (6, 0x3F),
+                    (6, 0x60F),
+                    (4, 0x33),
+                ],
             }
         };
 
@@ -7945,13 +8043,21 @@ fn run_wasapi_exclusive_multichannel(
             }
         }
 
-        let fmt_candidates = [
+        let hw_probe_fmt_candidates = [
             WasapiPcmFormat::I24In32,
             WasapiPcmFormat::F32,
             WasapiPcmFormat::I32,
             WasapiPcmFormat::I16,
         ];
+        // In WASAPI Shared Mode, the Windows Audio Engine operates natively in 32-bit IEEE Float.
+        let shared_fmt_candidates = [
+            WasapiPcmFormat::F32,
+            WasapiPcmFormat::I24In32,
+            WasapiPcmFormat::I32,
+            WasapiPcmFormat::I16,
+        ];
 
+        let wants_height_12ch = channel_candidates.iter().any(|&(c, _)| c >= 12);
         let mut opened: Option<(
             IMMDevice,
             String,
@@ -7960,31 +8066,103 @@ fn run_wasapi_exclusive_multichannel(
             HANDLE,
             u32,
             u16,
-            u32,
+            u16,
             u32,
             WasapiPcmFormat,
         )> = None;
         let mut last_err = anyhow::anyhow!(
-            "No multichannel WASAPI Exclusive format supported on candidate endpoints"
+            "No multichannel WASAPI hardware support detected on candidate endpoints"
         );
 
         'dev_loop: for (dev, dev_name) in candidate_devices {
+            let probe_client: Option<IAudioClient> = unsafe { dev.Activate(CLSCTX_ALL, None).ok() };
+            let mix_channels = if let Some(ref pc) = probe_client {
+                unsafe {
+                    if let Ok(mix_ptr) = pc.GetMixFormat() {
+                        let ch = (*mix_ptr).nChannels;
+                        CoTaskMemFree(Some(mix_ptr as *const std::ffi::c_void));
+                        ch
+                    } else {
+                        2
+                    }
+                }
+            } else {
+                2
+            };
+            let supports_atmos_height = wants_height_12ch
+                && probe_client
+                    .as_ref()
+                    .is_some_and(device_supports_atmos_height);
+
             for &(ch, mask) in &channel_candidates {
+                let hw_supports_ch = if ch >= 12 {
+                    supports_atmos_height
+                        || mix_channels >= 12
+                        || probe_client.as_ref().is_some_and(|pc| {
+                            rate_candidates.iter().any(|&r| {
+                                hw_probe_fmt_candidates.iter().any(|&pfmt| {
+                                    let wf = build_wave_format(ch, r, mask, pfmt);
+                                    let wf_ptr =
+                                        &wf as *const WAVEFORMATEXTENSIBLE as *const WAVEFORMATEX;
+                                    unsafe {
+                                        pc.IsFormatSupported(
+                                            AUDCLNT_SHAREMODE_EXCLUSIVE,
+                                            wf_ptr,
+                                            None,
+                                        )
+                                        .is_ok()
+                                    }
+                                })
+                            })
+                        })
+                } else {
+                    mix_channels >= ch
+                        || probe_client.as_ref().is_some_and(|pc| {
+                            rate_candidates.iter().any(|&r| {
+                                hw_probe_fmt_candidates.iter().any(|&pfmt| {
+                                    let wf = build_wave_format(ch, r, mask, pfmt);
+                                    let wf_ptr =
+                                        &wf as *const WAVEFORMATEXTENSIBLE as *const WAVEFORMATEX;
+                                    unsafe {
+                                        pc.IsFormatSupported(
+                                            AUDCLNT_SHAREMODE_EXCLUSIVE,
+                                            wf_ptr,
+                                            None,
+                                        )
+                                        .is_ok()
+                                    }
+                                })
+                            })
+                        })
+                };
+
+                if !hw_supports_ch {
+                    continue;
+                }
+
                 for &rate in &rate_candidates {
-                    for &fmt in &fmt_candidates {
-                        match try_open_exclusive_client(&dev, ch, rate, mask, fmt) {
+                    for &fmt in &shared_fmt_candidates {
+                        match try_open_shared_client(&dev, ch, rate, mask, fmt) {
                             Ok((ac, rc, ev, buf_frames)) => {
+                                drop(probe_client);
+                                let logical_ch = if ch == 8 && supports_atmos_height {
+                                    12
+                                } else {
+                                    ch
+                                };
                                 eprintln!(
-                                    "[audio] WASAPI Exclusive Multichannel LPCM negotiated on '{}': {}ch (mask 0x{:X}) @ {} Hz [{}] (buffer {} frames)",
+                                    "[audio] WASAPI Shared Multichannel LPCM negotiated on '{}': {}ch physical / {}ch logical (mask 0x{:X}) @ {} Hz [{}] (buffer {} frames)",
                                     dev_name,
                                     ch,
+                                    logical_ch,
                                     mask,
                                     rate,
                                     fmt.label(),
                                     buf_frames
                                 );
                                 opened = Some((
-                                    dev, dev_name, ac, rc, ev, buf_frames, ch, rate, mask, fmt,
+                                    dev, dev_name, ac, rc, ev, buf_frames, ch, logical_ch, rate,
+                                    fmt,
                                 ));
                                 break 'dev_loop;
                             }
@@ -8003,10 +8181,10 @@ fn run_wasapi_exclusive_multichannel(
             audio_client,
             render_client,
             event,
-            mut buffer_frames,
+            buffer_frames,
+            physical_negotiated_channels,
             negotiated_channels,
             negotiated_rate,
-            negotiated_mask,
             negotiated_fmt,
         ) = match opened {
             Some(v) => v,
@@ -8060,8 +8238,9 @@ fn run_wasapi_exclusive_multichannel(
         };
 
         let hardware_channels = negotiated_channels as usize;
+        let physical_channels = physical_negotiated_channels as usize;
         let bytes_per_sample = negotiated_fmt.bytes_per_sample();
-        let frame_bytes = hardware_channels * bytes_per_sample;
+        let frame_bytes = physical_channels * bytes_per_sample;
         let window_size = calculate_power_of_two_window_size(negotiated_rate);
 
         let mut fft_buffer = vec![0.0f32; window_size];
@@ -8072,6 +8251,7 @@ fn run_wasapi_exclusive_multichannel(
         let mut frames_since_last_dsp_send = dsp_send_interval;
 
         let mut last_channel_vus = Vec::new();
+        let mut last_spatial_channels = 2usize;
         let mut last_current_order = 0;
         let mut last_current_row = 0;
         let mut last_bpm = 0;
@@ -8083,21 +8263,27 @@ fn run_wasapi_exclusive_multichannel(
         let mut upmix_peak_vus = [0.0f32; 12];
         let mut current_chunk: Option<AudioChunk> = None;
         let mut chunk_frame_pos = 0usize;
+        let startup_fade_frames = ((negotiated_rate as usize) * 35 / 1000).max(64);
+        let mut startup_fade_pos = 0usize;
 
         let (mut latest_seek_epoch, mut upmix_cfg) = {
             let state = shared_state_thread.lock().unwrap();
             (state.seek_epoch, state.surround_upmix)
         };
 
-        // Prime the initial exclusive buffer with silence before calling Start()
+        // Prime the initial shared buffer with silence before calling Start()
         unsafe {
-            if let Ok(buf_ptr) = render_client.GetBuffer(buffer_frames) {
-                std::ptr::write_bytes(buf_ptr, 0, (buffer_frames as usize) * frame_bytes);
+            let padding = audio_client.GetCurrentPadding().unwrap_or(0);
+            let prime_frames = buffer_frames.saturating_sub(padding);
+            if prime_frames > 0
+                && let Ok(buf_ptr) = render_client.GetBuffer(prime_frames)
+            {
+                std::ptr::write_bytes(buf_ptr, 0, (prime_frames as usize) * frame_bytes);
                 let _ =
-                    render_client.ReleaseBuffer(buffer_frames, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32);
+                    render_client.ReleaseBuffer(prime_frames, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32);
             }
             if let Err(e) = audio_client.Start() {
-                eprintln!("[audio] WASAPI Exclusive Start() failed: {:?}", e);
+                eprintln!("[audio] WASAPI Shared Start() failed: {:?}", e);
                 let _ = CloseHandle(event);
                 drop(render_client);
                 drop(audio_client);
@@ -8107,8 +8293,6 @@ fn run_wasapi_exclusive_multichannel(
                 return;
             }
         }
-
-        let mut active_client = Some((audio_client, render_client, event));
 
         while !stop_token_thread.load(std::sync::atomic::Ordering::Relaxed) {
             let mut is_paused = false;
@@ -8126,79 +8310,34 @@ fn run_wasapi_exclusive_multichannel(
                 chunk_frame_pos = 0;
             }
 
-            if is_paused {
-                if let Some((ac, rc, ev)) = active_client.take() {
-                    if let Ok(mut state) = shared_state_thread.try_lock() {
-                        state.raw_channel_vus.fill(0.0);
-                        state.raw_spectrum_data.fill(0.0);
-                    }
-                    eprintln!(
-                        "[audio] Playback paused; releasing WASAPI Exclusive Multichannel hardware lock..."
-                    );
-                    unsafe {
-                        let _ = ac.Stop();
-                        let _ = ac.Reset();
-                    }
-                    drop(rc);
-                    drop(ac);
-                    unsafe {
-                        let _ = CloseHandle(ev);
-                    }
-                }
-                std::thread::sleep(std::time::Duration::from_millis(20));
-                continue;
-            } else if active_client.is_none() {
-                eprintln!(
-                    "[audio] Playback resumed; re-acquiring WASAPI Exclusive Multichannel hardware lock..."
-                );
-                match try_open_exclusive_client(
-                    &active_device,
-                    negotiated_channels,
-                    negotiated_rate,
-                    negotiated_mask,
-                    negotiated_fmt,
-                ) {
-                    Ok((new_ac, new_rc, new_ev, new_frames)) => {
-                        buffer_frames = new_frames;
-                        unsafe {
-                            if let Ok(buf_ptr) = new_rc.GetBuffer(buffer_frames) {
-                                std::ptr::write_bytes(
-                                    buf_ptr,
-                                    0,
-                                    (buffer_frames as usize) * frame_bytes,
-                                );
-                                let _ = new_rc.ReleaseBuffer(
-                                    buffer_frames,
-                                    AUDCLNT_BUFFERFLAGS_SILENT.0 as u32,
-                                );
-                            }
-                            let _ = new_ac.Start();
-                        }
-                        active_client = Some((new_ac, new_rc, new_ev));
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[audio] Waiting to re-acquire WASAPI Exclusive Multichannel lock: {:?}",
-                            e
-                        );
-                        std::thread::sleep(std::time::Duration::from_millis(100));
-                        continue;
-                    }
-                }
-            }
-
-            let (_audio_client, render_client, event) = active_client
-                .as_ref()
-                .map(|(ac, rc, ev)| (ac, rc, *ev))
-                .unwrap();
-
             let wait_res = unsafe { WaitForSingleObject(event, 20) };
             if wait_res.0 != WAIT_OBJECT_0 {
                 continue;
             }
 
-            let frames_to_render = buffer_frames as usize;
-            let buf_ptr = match unsafe { render_client.GetBuffer(buffer_frames) } {
+            let padding = unsafe { audio_client.GetCurrentPadding().unwrap_or(0) };
+            let avail_frames = buffer_frames.saturating_sub(padding);
+            if avail_frames == 0 {
+                continue;
+            }
+
+            if is_paused {
+                if let Ok(mut state) = shared_state_thread.try_lock() {
+                    state.raw_channel_vus.fill(0.0);
+                    state.raw_spectrum_data.fill(0.0);
+                }
+                if let Ok(buf_ptr) = unsafe { render_client.GetBuffer(avail_frames) } {
+                    unsafe {
+                        std::ptr::write_bytes(buf_ptr, 0, (avail_frames as usize) * frame_bytes);
+                        let _ = render_client
+                            .ReleaseBuffer(avail_frames, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32);
+                    }
+                }
+                continue;
+            }
+
+            let frames_to_render = avail_frames as usize;
+            let buf_ptr = match unsafe { render_client.GetBuffer(avail_frames) } {
                 Ok(ptr) => ptr,
                 Err(_) => continue,
             };
@@ -8223,6 +8362,7 @@ fn run_wasapi_exclusive_multichannel(
                             }
                             last_channel_vus.clear();
                             last_channel_vus.extend_from_slice(&chunk.channel_vus);
+                            last_spatial_channels = (chunk.spatial_channels as usize).max(1);
                             last_current_order = chunk.current_order;
                             last_current_row = chunk.current_row;
                             last_bpm = chunk.bpm;
@@ -8272,6 +8412,13 @@ fn run_wasapi_exclusive_multichannel(
                             let src_frame_idx = chunk_frame_pos + i;
                             let dst_frame_idx = frames_written + i;
                             let dst_byte_base = dst_frame_idx * frame_bytes;
+                            let fade_gain = if startup_fade_pos < startup_fade_frames {
+                                let t = startup_fade_pos as f32 / startup_fade_frames as f32;
+                                startup_fade_pos += 1;
+                                0.5 - 0.5 * (std::f32::consts::PI * t).cos()
+                            } else {
+                                1.0
+                            };
                             let frame_slice = &chunk.samples[src_frame_idx * hardware_channels
                                 ..(src_frame_idx + 1) * hardware_channels];
                             let out_channels = upmixer_dsp
@@ -8283,8 +8430,19 @@ fn run_wasapi_exclusive_multichannel(
                                     target_upmix,
                                 );
 
-                            for c in 0..hardware_channels {
-                                let out_s = if c < 12 { out_channels[c] } else { 0.0 };
+                            for c in 0..physical_channels {
+                                let raw_s = if physical_channels == 8
+                                    && hardware_channels == 12
+                                    && (4..8).contains(&c)
+                                {
+                                    out_channels[c]
+                                        + out_channels[c + 4] * std::f32::consts::FRAC_1_SQRT_2
+                                } else if c < 12 {
+                                    out_channels[c]
+                                } else {
+                                    0.0
+                                };
+                                let out_s = raw_s * fade_gain;
                                 write_wasapi_sample(
                                     &mut out_bytes[dst_byte_base + c * bytes_per_sample
                                         ..dst_byte_base + (c + 1) * bytes_per_sample],
@@ -8294,12 +8452,12 @@ fn run_wasapi_exclusive_multichannel(
                             }
 
                             for c in 0..active_ch {
-                                let s = out_channels[c];
+                                let s = out_channels[c] * fade_gain;
                                 upmix_peak_vus[c] = upmix_peak_vus[c].max(s.abs());
                                 channel_fft_buffers[c][fft_index] = s;
                             }
 
-                            let mono = (out_channels[0] + out_channels[1]) * 0.5;
+                            let mono = (out_channels[0] + out_channels[1]) * 0.5 * fade_gain;
                             fft_buffer[fft_index] = mono.clamp(-1.0, 1.0);
                             fft_index = (fft_index + 1) % window_size;
                         }
@@ -8308,17 +8466,27 @@ fn run_wasapi_exclusive_multichannel(
                             let src_frame_idx = chunk_frame_pos + i;
                             let dst_frame_idx = frames_written + i;
                             let dst_byte_base = dst_frame_idx * frame_bytes;
+                            let fade_gain = if startup_fade_pos < startup_fade_frames {
+                                let t = startup_fade_pos as f32 / startup_fade_frames as f32;
+                                startup_fade_pos += 1;
+                                0.5 - 0.5 * (std::f32::consts::PI * t).cos()
+                            } else {
+                                1.0
+                            };
 
                             let mut mono = 0.0f32;
                             for c in 0..hardware_channels {
-                                let sample = chunk.samples[src_frame_idx * hardware_channels + c]
+                                let sample = (chunk.samples[src_frame_idx * hardware_channels + c]
+                                    * fade_gain)
                                     .clamp(-1.0, 1.0);
-                                write_wasapi_sample(
-                                    &mut out_bytes[dst_byte_base + c * bytes_per_sample
-                                        ..dst_byte_base + (c + 1) * bytes_per_sample],
-                                    sample,
-                                    negotiated_fmt,
-                                );
+                                if c < physical_channels {
+                                    write_wasapi_sample(
+                                        &mut out_bytes[dst_byte_base + c * bytes_per_sample
+                                            ..dst_byte_base + (c + 1) * bytes_per_sample],
+                                        sample,
+                                        negotiated_fmt,
+                                    );
+                                }
                                 let ch_weight = match c {
                                     0 | 1 => {
                                         if hardware_channels == 1 {
@@ -8345,7 +8513,7 @@ fn run_wasapi_exclusive_multichannel(
             }
 
             unsafe {
-                let _ = render_client.ReleaseBuffer(buffer_frames, 0);
+                let _ = render_client.ReleaseBuffer(avail_frames, 0);
             }
 
             frames_since_last_dsp_send += frames_written;
@@ -8357,14 +8525,11 @@ fn run_wasapi_exclusive_multichannel(
                 let play_time =
                     last_current_seconds + (chunk_frame_pos as f64 / negotiated_rate as f64);
                 let (dsp_channels, vu_slice): (usize, &[f32]) =
-                    if upmix_active && last_channel_vus.len() < hardware_channels {
+                    if upmix_active && last_spatial_channels < hardware_channels {
                         let active_ch = hardware_channels.min(12);
                         (active_ch, &upmix_peak_vus[..active_ch])
                     } else {
-                        (
-                            hardware_channels.min(last_channel_vus.len().max(1)),
-                            &last_channel_vus,
-                        )
+                        (last_channel_vus.len().max(1), &last_channel_vus)
                     };
 
                 let msg = build_recycled_dsp_message(
@@ -8391,16 +8556,14 @@ fn run_wasapi_exclusive_multichannel(
             }
         }
 
-        if let Some((ac, rc, ev)) = active_client.take() {
-            unsafe {
-                let _ = ac.Stop();
-                let _ = ac.Reset();
-            }
-            drop(rc);
-            drop(ac);
-            unsafe {
-                let _ = CloseHandle(ev);
-            }
+        unsafe {
+            let _ = audio_client.Stop();
+            let _ = audio_client.Reset();
+        }
+        drop(render_client);
+        drop(audio_client);
+        unsafe {
+            let _ = CloseHandle(event);
         }
         drop(active_device);
         drop(enumerator);
@@ -8637,6 +8800,7 @@ where
     let mut frames_since_last_dsp_send = dsp_send_interval;
 
     let mut last_channel_vus = Vec::new();
+    let mut last_spatial_channels = 2usize;
     let mut last_current_order = 0;
     let mut last_current_row = 0;
     let mut last_bpm = 0;
@@ -8644,11 +8808,29 @@ where
     let mut last_current_seconds = 0.0;
     let mut last_current_row_string = String::new();
     let mut last_seek_epoch = 0u64;
-    let mut latest_seek_epoch = 0u64;
-    let mut was_paused = false;
-    let mut upmix_cfg = crate::state::SurroundUpmixConfig::default();
+    let initial_src_ch = audio_source_opt
+        .as_mut()
+        .map(|s| s.get_num_channels())
+        .unwrap_or(2);
+    let (mut latest_seek_epoch, mut was_paused, mut upmix_cfg) = {
+        let state = shared_state.lock().unwrap();
+        let mut cfg = state.surround_upmix;
+        if !crate::state::SurroundUpmixConfig::can_upmix(initial_src_ch, hardware_channels as i32) {
+            cfg.enabled = false;
+        } else if !cfg.user_overridden {
+            cfg.enabled = !state.force_stereo_downmix
+                && !state.passthrough_enabled
+                && crate::state::SurroundUpmixConfig::should_enable_by_default(
+                    initial_src_ch,
+                    hardware_channels as i32,
+                );
+        }
+        (state.seek_epoch, state.is_paused, cfg)
+    };
     let mut upmixer_dsp = SurroundUpmixerDsp::new(sample_rate);
     let mut upmix_peak_vus = [0.0f32; 12];
+    let startup_fade_frames = ((sample_rate as usize) * 35 / 1000).max(64);
+    let mut startup_fade_pos = 0usize;
 
     let shared_state_err = shared_state.clone();
     let shared_state_cb = shared_state.clone();
@@ -8702,6 +8884,7 @@ where
                             }
                             last_channel_vus.clear();
                             last_channel_vus.extend_from_slice(&chunk.channel_vus);
+                            last_spatial_channels = (chunk.spatial_channels as usize).max(1);
                             last_current_order = chunk.current_order;
                             last_current_row = chunk.current_row;
                             last_bpm = chunk.bpm;
@@ -8756,6 +8939,13 @@ where
                         for i in 0..to_copy {
                             let src_frame_idx = chunk_frame_pos + i;
                             let dst_frame_idx = frames_written + i;
+                            let fade_gain = if startup_fade_pos < startup_fade_frames {
+                                let t = startup_fade_pos as f32 / startup_fade_frames as f32;
+                                startup_fade_pos += 1;
+                                0.5 - 0.5 * (std::f32::consts::PI * t).cos()
+                            } else {
+                                1.0
+                            };
                             let frame_slice = &chunk.samples[src_frame_idx * hardware_channels
                                 ..(src_frame_idx + 1) * hardware_channels];
                             let out_channels = upmixer_dsp
@@ -8768,17 +8958,21 @@ where
                                 );
 
                             for c in 0..hardware_channels {
-                                let out_s = if c < 12 { out_channels[c] } else { 0.0 };
+                                let out_s = if c < 12 {
+                                    out_channels[c] * fade_gain
+                                } else {
+                                    0.0
+                                };
                                 data[dst_frame_idx * hardware_channels + c] = T::from_sample(out_s);
                             }
 
                             for c in 0..active_ch {
-                                let s = out_channels[c];
+                                let s = out_channels[c] * fade_gain;
                                 upmix_peak_vus[c] = upmix_peak_vus[c].max(s.abs());
                                 channel_fft_buffers[c][fft_index] = s;
                             }
 
-                            let mono = (out_channels[0] + out_channels[1]) * 0.5;
+                            let mono = (out_channels[0] + out_channels[1]) * 0.5 * fade_gain;
                             fft_buffer[fft_index] = mono.clamp(-1.0, 1.0);
                             fft_index = (fft_index + 1) % window_size;
                         }
@@ -8786,10 +8980,18 @@ where
                         for i in 0..to_copy {
                             let src_frame_idx = chunk_frame_pos + i;
                             let dst_frame_idx = frames_written + i;
+                            let fade_gain = if startup_fade_pos < startup_fade_frames {
+                                let t = startup_fade_pos as f32 / startup_fade_frames as f32;
+                                startup_fade_pos += 1;
+                                0.5 - 0.5 * (std::f32::consts::PI * t).cos()
+                            } else {
+                                1.0
+                            };
 
                             let mut mono = 0.0;
                             for c in 0..hardware_channels {
-                                let sample = chunk.samples[src_frame_idx * hardware_channels + c]
+                                let sample = (chunk.samples[src_frame_idx * hardware_channels + c]
+                                    * fade_gain)
                                     .clamp(-1.0, 1.0);
                                 data[dst_frame_idx * hardware_channels + c] =
                                     T::from_sample(sample);
@@ -8827,14 +9029,11 @@ where
                 let play_time =
                     last_current_seconds + (chunk_frame_pos as f64 / sample_rate as f64);
                 let (dsp_channels, vu_slice): (usize, &[f32]) =
-                    if upmix_active && last_channel_vus.len() < hardware_channels {
+                    if upmix_active && last_spatial_channels < hardware_channels {
                         let active_ch = hardware_channels.min(12);
                         (active_ch, &upmix_peak_vus[..active_ch])
                     } else {
-                        (
-                            hardware_channels.min(last_channel_vus.len().max(1)),
-                            &last_channel_vus,
-                        )
+                        (last_channel_vus.len().max(1), &last_channel_vus)
                     };
                 let msg = build_recycled_dsp_message(
                     &recycle_rx,
@@ -8886,9 +9085,8 @@ where
         None,
     )?;
 
-    stream.play().context("Failed to play stream")?;
-
-    // Only populate state and take the audio source once stream creation and play() have succeeded
+    // Populate state and pre-buffer initial prime chunks BEFORE calling stream.play()
+    // so the real-time audio callback never underruns or misses the initial upmix config lock.
     let mut audio_source = audio_source_opt
         .take()
         .ok_or_else(|| anyhow::anyhow!("No audio source available"))?;
@@ -8917,6 +9115,11 @@ where
         4,
         current_path,
     );
+
+    if let Err(e) = stream.play().context("Failed to play stream") {
+        stop_token.store(true, std::sync::atomic::Ordering::Relaxed);
+        return Err(e);
+    }
 
     Ok((stream, stop_token))
 }
@@ -9554,8 +9757,10 @@ mod tests {
         assert!(cfg.is_active_for_hardware(6));
         assert!(cfg.is_active_for_hardware(8));
         assert!(cfg.is_active_for_hardware(12));
+        assert!(!crate::state::SurroundUpmixConfig::has_height_channels(2));
         assert!(!crate::state::SurroundUpmixConfig::has_height_channels(6));
         assert!(!crate::state::SurroundUpmixConfig::has_height_channels(8));
+        assert!(crate::state::SurroundUpmixConfig::has_height_channels(10));
         assert!(crate::state::SurroundUpmixConfig::has_height_channels(12));
 
         dsp_stereo.sync_config(&cfg, sample_rate);
@@ -9630,16 +9835,17 @@ mod tests {
 
         assert!(
             peak_sr_bed_only > 0.35,
-            "Bed-only 5.1 SR must retain full-bandwidth 8kHz surround energy (got {})",
+            "Bed-Only 5.1 SR must retain full-bandwidth 8kHz surround energy (got {})",
             peak_sr_bed_only
         );
         assert!(
             peak_tfr_bed_only < 1e-6,
-            "Bed-only 5.1 must not populate height channels"
+            "Bed-Only 5.1 must not populate overhead height channels (got {})",
+            peak_tfr_bed_only
         );
         assert!(
             peak_sr_bed_only > peak_sr_bed_height * 3.0,
-            "Bed-only SR ({}) must carry highs that Bed+Height splits to TFR (Bed+Height SR={})",
+            "Bed-Only SR ({}) must retain high frequencies that Bed+Height SR ({}) routes to overhead speakers",
             peak_sr_bed_only,
             peak_sr_bed_height
         );
@@ -9731,7 +9937,7 @@ mod tests {
         assert!(!state.surround_upmix.is_active_for_hardware(6));
         assert_eq!(state.num_channels, 6);
 
-        // 3. 6ch (5.1) media on 8ch (7.1) output device -> non-matching -> Upmix ON by default
+        // 3. 6ch (5.1) media on 8ch (7.1) output device -> non-matching -> Upmix ON by default (5.1 -> 7.1)
         populate_state_from_audio_source(&mut state, &mut src_6ch, 8, 48_000);
         assert!(state.surround_upmix.enabled);
         assert!(state.surround_upmix.is_active_for_hardware(8));

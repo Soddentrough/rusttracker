@@ -5049,7 +5049,7 @@ mod tests {
         assert!(!state.surround_upmix.enabled);
         assert_eq!(state.num_channels, 2);
 
-        // 2. On a Bed-Only 5.1 (6ch) or 7.1 (8ch) device, enabling surround upmix sets num_channels to 6 or 8
+        // 2. On a Bed-Only 5.1 (6ch) device, enabling surround upmix sets num_channels to 6 (not 12)
         state.hardware_channels = 6;
         state.show_hud = false;
         state.video_mode = 3;
