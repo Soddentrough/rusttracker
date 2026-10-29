@@ -1095,12 +1095,513 @@ pub fn format_cpal_device_name(desc: &cpal::DeviceDescription) -> String {
     desc.name().to_string()
 }
 
+pub const SYSTEM_DEFAULT_AUDIO_DEVICE: &str = "System Default (Auto)";
+
+pub fn is_default_audio_device_selection(selected: Option<&str>) -> bool {
+    match selected {
+        None => true,
+        Some(s) => {
+            let trimmed = s.trim();
+            let lower = trimmed.to_lowercase();
+            trimmed.is_empty()
+                || trimmed.eq_ignore_ascii_case(SYSTEM_DEFAULT_AUDIO_DEVICE)
+                || trimmed.eq_ignore_ascii_case("default")
+                || trimmed.eq_ignore_ascii_case("default device")
+                || lower.starts_with("default alsa output")
+                || lower.starts_with("default alsa input")
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AudioSinkTopology {
+    pub sink_id: String,
+    pub description: String,
+    pub channels: u16,
+}
+
+pub fn parse_wpctl_inspect_topology(output: &str) -> Option<AudioSinkTopology> {
+    let mut node_id_fallback = String::new();
+    let mut is_valid_node = false;
+    let mut sink_id = String::new();
+    let mut description = String::new();
+    let mut nick = String::new();
+    let mut explicit_channels: Option<u16> = None;
+    let mut position_channels: Option<u16> = None;
+
+    for (line_idx, raw_line) in output.lines().enumerate() {
+        let trimmed = raw_line.trim();
+        if line_idx == 0
+            && trimmed.starts_with("id ")
+            && trimmed.contains("PipeWire:Interface:Node")
+        {
+            is_valid_node = true;
+            if let Some(after_id) = trimmed.strip_prefix("id ")
+                && let Some((num_str, _)) = after_id.split_once(',')
+            {
+                node_id_fallback = format!("pipewire_node_{}", num_str.trim());
+            }
+            continue;
+        }
+        let clean = trimmed.strip_prefix('*').map(str::trim).unwrap_or(trimmed);
+        let Some((key, raw_val)) = clean.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        let val = raw_val.trim().trim_matches('"').trim();
+        match key {
+            "node.name" if !val.is_empty() => {
+                sink_id = val.to_string();
+                is_valid_node = true;
+            }
+            "node.description" if !val.is_empty() => {
+                description = val.to_string();
+            }
+            "node.nick" if !val.is_empty() => {
+                nick = val.to_string();
+            }
+            "audio.channels" => {
+                if let Ok(ch) = val.parse::<u16>()
+                    && ch > 0
+                {
+                    explicit_channels = Some(ch);
+                }
+            }
+            "audio.position" => {
+                let inner = val.trim_start_matches('[').trim_end_matches(']').trim();
+                if !inner.is_empty() {
+                    let count = inner
+                        .split(|c: char| c == ',' || c.is_whitespace())
+                        .map(str::trim)
+                        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("UNKNOWN"))
+                        .count() as u16;
+                    if count > 0 {
+                        position_channels = Some(count);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !is_valid_node {
+        return None;
+    }
+    if sink_id.is_empty() {
+        sink_id = node_id_fallback;
+    }
+    if sink_id.is_empty() {
+        return None;
+    }
+    let final_desc = if !description.is_empty() {
+        description
+    } else if !nick.is_empty() {
+        nick
+    } else {
+        sink_id.clone()
+    };
+    let channels = explicit_channels
+        .or(position_channels)
+        .unwrap_or(2)
+        .clamp(1, 32);
+
+    Some(AudioSinkTopology {
+        sink_id,
+        description: final_desc,
+        channels,
+    })
+}
+
+pub fn parse_pactl_sink_topology(
+    default_sink: &str,
+    sinks_output: &str,
+) -> Option<AudioSinkTopology> {
+    let target = default_sink.trim();
+    let mut first_candidate: Option<AudioSinkTopology> = None;
+
+    // 1. Support verbose `pactl list sinks` blocks (`Sink #N`, `Name:`, `Description:`, `Sample Specification:`)
+    if sinks_output.contains("Sample Specification:") || sinks_output.contains("Name:") {
+        let mut cur_name: Option<String> = None;
+        let mut cur_desc: Option<String> = None;
+        let mut cur_channels: u16 = 2;
+
+        let flush_block = |name: Option<String>,
+                           desc: Option<String>,
+                           channels: u16,
+                           first: &mut Option<AudioSinkTopology>|
+         -> Option<AudioSinkTopology> {
+            let sink_id = name?;
+            if sink_id.is_empty() {
+                return None;
+            }
+            let description = desc
+                .filter(|d| !d.is_empty())
+                .unwrap_or_else(|| sink_id.clone());
+            let topo = AudioSinkTopology {
+                sink_id: sink_id.clone(),
+                description,
+                channels,
+            };
+            if !target.is_empty() && target != "@DEFAULT_SINK@" && sink_id == target {
+                return Some(topo);
+            }
+            if first.is_none() {
+                *first = Some(topo);
+            }
+            None
+        };
+
+        for raw_line in sinks_output.lines() {
+            let line = raw_line.trim();
+            if line.starts_with("Sink #") {
+                if let Some(matched) = flush_block(
+                    cur_name.take(),
+                    cur_desc.take(),
+                    cur_channels,
+                    &mut first_candidate,
+                ) {
+                    return Some(matched);
+                }
+                cur_channels = 2;
+            } else if let Some(rest) = line.strip_prefix("Name:") {
+                cur_name = Some(rest.trim().to_string());
+            } else if let Some(rest) = line.strip_prefix("Description:") {
+                cur_desc = Some(rest.trim().to_string());
+            } else if let Some(rest) = line.strip_prefix("Sample Specification:") {
+                for token in rest.split_whitespace() {
+                    if let Some(ch_str) = token.strip_suffix("ch")
+                        && let Ok(ch) = ch_str.parse::<u16>()
+                        && ch > 0
+                    {
+                        cur_channels = ch.clamp(1, 32);
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(matched) = flush_block(
+            cur_name.take(),
+            cur_desc.take(),
+            cur_channels,
+            &mut first_candidate,
+        ) {
+            return Some(matched);
+        }
+        if first_candidate.is_some() {
+            return first_candidate;
+        }
+    }
+
+    // 2. Support `pactl list sinks short` tab-separated lines
+    for line in sinks_output.lines() {
+        let cols: Vec<&str> = line.split('\t').map(str::trim).collect();
+        if cols.len() < 4 {
+            continue;
+        }
+        let sink_name = cols[1];
+        if sink_name.is_empty() {
+            continue;
+        }
+        let format_col = cols[3];
+        let mut channels = 2u16;
+        for token in format_col.split_whitespace() {
+            if let Some(ch_str) = token.strip_suffix("ch")
+                && let Ok(ch) = ch_str.parse::<u16>()
+                && ch > 0
+            {
+                channels = ch.clamp(1, 32);
+                break;
+            }
+        }
+        let topo = AudioSinkTopology {
+            sink_id: sink_name.to_string(),
+            description: sink_name.to_string(),
+            channels,
+        };
+        if !target.is_empty() && target != "@DEFAULT_SINK@" && sink_name == target {
+            return Some(topo);
+        }
+        if first_candidate.is_none() {
+            first_candidate = Some(topo);
+        }
+    }
+
+    if !target.is_empty() && target != "@DEFAULT_SINK@" {
+        if let Some(cand) = first_candidate {
+            return Some(cand);
+        }
+        return Some(AudioSinkTopology {
+            sink_id: target.to_string(),
+            description: target.to_string(),
+            channels: 2,
+        });
+    }
+
+    first_candidate
+}
+
+pub fn parse_proc_asound_max_playback_channels(stream_text: &str) -> Option<u16> {
+    let mut in_playback = false;
+    let mut max_ch: Option<u16> = None;
+    for raw_line in stream_text.lines() {
+        let trimmed = raw_line.trim();
+        if trimmed.starts_with("Playback:") {
+            in_playback = true;
+            continue;
+        }
+        if trimmed.starts_with("Capture:") {
+            in_playback = false;
+            continue;
+        }
+        if in_playback
+            && let Some(ch_str) = trimmed.strip_prefix("Channels:")
+            && let Ok(ch) = ch_str.trim().parse::<u16>()
+            && ch > 0
+        {
+            max_ch = Some(max_ch.map_or(ch, |m| m.max(ch)));
+        } else if let Some(ch_str) = trimmed.strip_prefix("channels:")
+            && let Ok(ch) = ch_str.trim().parse::<u16>()
+            && ch > 0
+        {
+            max_ch = Some(max_ch.map_or(ch, |m| m.max(ch)));
+        }
+    }
+    max_ch
+}
+
+pub fn query_active_audio_sink_topology(mic: bool) -> Option<AudioSinkTopology> {
+    #[cfg(target_os = "linux")]
+    {
+        let target_node = if mic {
+            "@DEFAULT_AUDIO_SOURCE@"
+        } else {
+            "@DEFAULT_AUDIO_SINK@"
+        };
+        if let Ok(out) = std::process::Command::new("wpctl")
+            .args(["inspect", target_node])
+            .output()
+            && out.status.success()
+        {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if let Some(topo) = parse_wpctl_inspect_topology(&text) {
+                return Some(topo);
+            }
+        }
+
+        if !mic
+            && let Ok(def_out) = std::process::Command::new("pactl")
+                .arg("get-default-sink")
+                .output()
+            && def_out.status.success()
+            && let Ok(list_out) = std::process::Command::new("pactl")
+                .args(["list", "sinks", "short"])
+                .output()
+            && list_out.status.success()
+        {
+            let def_str = String::from_utf8_lossy(&def_out.stdout);
+            let list_str = String::from_utf8_lossy(&list_out.stdout);
+            if let Some(topo) = parse_pactl_sink_topology(&def_str, &list_str) {
+                return Some(topo);
+            }
+        }
+    }
+
+    let host = cpal::default_host();
+    let default_dev = if mic {
+        host.default_input_device()
+    } else {
+        host.default_output_device()
+    }?;
+    let desc = default_dev.description().ok()?;
+    let name = format_cpal_device_name(&desc);
+    let channels = if mic {
+        default_dev
+            .default_input_config()
+            .ok()
+            .map(|c| c.channels())
+            .unwrap_or(1)
+    } else {
+        default_dev
+            .default_output_config()
+            .ok()
+            .map(|c| c.channels())
+            .unwrap_or(2)
+    };
+    Some(AudioSinkTopology {
+        sink_id: name.clone(),
+        description: name,
+        channels,
+    })
+}
+
+pub fn resolve_device_target_channels(
+    force_stereo: bool,
+    default_device_channels: u16,
+    _target_channels: u16,
+) -> u16 {
+    if force_stereo || default_device_channels <= 2 {
+        default_device_channels.clamp(1, 2)
+    } else {
+        default_device_channels.clamp(1, 12)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TopologyTransitionAction {
+    pub reload_stream: bool,
+    pub osd_message: Option<String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn evaluate_topology_transition(
+    prev: Option<&AudioSinkTopology>,
+    next: &AudioSinkTopology,
+    is_auto_device: bool,
+    file_loaded: bool,
+    is_mic: bool,
+    current_hardware_channels: i32,
+    force_stereo_downmix: bool,
+    is_dummy_audio_output: bool,
+    bitstream_active: bool,
+    passthrough_enabled: bool,
+    os_auto_reroutes_same_channel_streams: bool,
+) -> TopologyTransitionAction {
+    if !is_auto_device {
+        return TopologyTransitionAction {
+            reload_stream: false,
+            osd_message: None,
+        };
+    }
+
+    let expected_hw_channels = if force_stereo_downmix {
+        (next.channels as i32).clamp(1, 2)
+    } else {
+        (next.channels as i32).clamp(1, 12)
+    };
+
+    let format_sink_osd = |desc: &str, hw_ch: i32| -> String {
+        if hw_ch > 2 {
+            let badge = crate::state::SurroundUpmixConfig::layout_badge(hw_ch);
+            format!("🔊 Audio Output: {} ({})", desc, badge)
+        } else {
+            let tag = crate::state::SurroundUpmixConfig::short_tag(hw_ch);
+            format!("🎧 Audio Output: {} ({})", desc, tag)
+        }
+    };
+
+    let Some(prev_topo) = prev else {
+        let initial_mismatch = (file_loaded || is_mic)
+            && (is_dummy_audio_output
+                || (current_hardware_channels > 0
+                    && !bitstream_active
+                    && current_hardware_channels != expected_hw_channels));
+        let osd_message = if initial_mismatch {
+            Some(format_sink_osd(&next.description, expected_hw_channels))
+        } else {
+            None
+        };
+        return TopologyTransitionAction {
+            reload_stream: initial_mismatch,
+            osd_message,
+        };
+    };
+
+    if prev_topo.sink_id == next.sink_id
+        && prev_topo.channels == next.channels
+        && !is_dummy_audio_output
+    {
+        return TopologyTransitionAction {
+            reload_stream: false,
+            osd_message: None,
+        };
+    }
+
+    let channel_mismatch = current_hardware_channels > 0
+        && current_hardware_channels != expected_hw_channels
+        && !bitstream_active;
+    let sink_changed = prev_topo.sink_id != next.sink_id;
+    let reload_stream = (file_loaded || is_mic)
+        && (is_dummy_audio_output
+            || channel_mismatch
+            || (sink_changed
+                && (!os_auto_reroutes_same_channel_streams
+                    || passthrough_enabled
+                    || bitstream_active)));
+
+    let osd_message = Some(format_sink_osd(&next.description, expected_hw_channels));
+
+    TopologyTransitionAction {
+        reload_stream,
+        osd_message,
+    }
+}
+
+pub fn spawn_audio_topology_watcher(shared_state: Arc<Mutex<AppState>>, is_mic: bool) {
+    std::thread::spawn(move || {
+        let mut last_topology: Option<AudioSinkTopology> = None;
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(750));
+
+            let Some(next_topo) = query_active_audio_sink_topology(is_mic) else {
+                continue;
+            };
+
+            let topology_changed = last_topology.as_ref() != Some(&next_topo);
+            let refreshed_devices = if topology_changed {
+                Some(get_available_audio_devices(is_mic))
+            } else {
+                None
+            };
+
+            if let Ok(mut state) = shared_state.lock() {
+                if let Some(devs) = refreshed_devices {
+                    state.available_audio_devices = devs;
+                }
+                let is_auto =
+                    is_default_audio_device_selection(state.selected_audio_device.as_deref());
+                let action = evaluate_topology_transition(
+                    last_topology.as_ref(),
+                    &next_topo,
+                    is_auto,
+                    state.file_loaded,
+                    is_mic,
+                    state.hardware_channels,
+                    state.force_stereo_downmix,
+                    state.is_dummy_audio_output,
+                    state.stats.bitstream_active,
+                    state.passthrough_enabled,
+                    cfg!(target_os = "linux"),
+                );
+
+                state.active_audio_sink_id = Some(next_topo.sink_id.clone());
+                state.active_audio_sink_description = Some(next_topo.description.clone());
+                state.active_audio_sink_channels = next_topo.channels;
+
+                if action.reload_stream {
+                    let msg = action
+                        .osd_message
+                        .unwrap_or_else(|| format!("Audio Output: {}", next_topo.description));
+                    state.audio_topology_reload_request = Some(msg);
+                } else if let Some(osd) = action.osd_message {
+                    state.osd_text = Some(osd);
+                    state.osd_timer = 3.0;
+                }
+            }
+
+            last_topology = Some(next_topo);
+        }
+    });
+}
+
 pub fn cpal_device_matches_name(desc: &cpal::DeviceDescription, target: &str) -> bool {
     let formatted = format_cpal_device_name(desc);
     formatted == target
         || desc.name() == target
         || formatted.eq_ignore_ascii_case(target)
         || desc.name().eq_ignore_ascii_case(target)
+        || desc
+            .driver()
+            .is_some_and(|drv| drv.eq_ignore_ascii_case(target))
 }
 
 pub type OutputConfigRankKey = (
@@ -1153,12 +1654,15 @@ pub fn get_available_audio_devices(mic: bool) -> Vec<String> {
         host.output_devices()
     };
 
-    let mut names = Vec::new();
+    let mut names = vec![SYSTEM_DEFAULT_AUDIO_DEVICE.to_string()];
     if let Ok(devices) = devices {
         for d in devices {
             if let Ok(desc) = d.description() {
                 let name = format_cpal_device_name(&desc);
-                if is_relevant_audio_device(&name) && !names.contains(&name) {
+                if is_relevant_audio_device(&name)
+                    && !is_default_audio_device_selection(Some(&name))
+                    && !names.contains(&name)
+                {
                     names.push(name);
                 }
             }
@@ -1167,18 +1671,8 @@ pub fn get_available_audio_devices(mic: bool) -> Vec<String> {
     names
 }
 
-pub fn get_default_audio_device_name(mic: bool) -> Option<String> {
-    let host = cpal::default_host();
-    let default_device = if mic {
-        host.default_input_device()
-    } else {
-        host.default_output_device()
-    };
-    default_device.and_then(|d| {
-        d.description()
-            .ok()
-            .map(|desc| format_cpal_device_name(&desc))
-    })
+pub fn get_default_audio_device_name(_mic: bool) -> Option<String> {
+    Some(SYSTEM_DEFAULT_AUDIO_DEVICE.to_string())
 }
 
 pub fn calculate_power_of_two_window_size(sample_rate: u32) -> usize {
@@ -2747,6 +3241,17 @@ pub fn get_downmixed_sample(
         (tc, 1, 0) if tc > 8 => {
             let sum: f32 = base_slice.iter().take(tc as usize).copied().sum();
             sum / (tc as f32).sqrt()
+        }
+        // 7.1 / 7.1.4 (tc >= 8) to 5.1 (hc == 6): fold Back + Side surround pairs into 5.1 surround L/R
+        (tc, 6, 4) if tc >= 8 => {
+            let bl = base_slice.get(4).copied().unwrap_or(0.0);
+            let sl = base_slice.get(6).copied().unwrap_or(0.0);
+            (bl + sl) * INV_SQRT2
+        }
+        (tc, 6, 5) if tc >= 8 => {
+            let br = base_slice.get(5).copied().unwrap_or(0.0);
+            let sr = base_slice.get(7).copied().unwrap_or(0.0);
+            (br + sr) * INV_SQRT2
         }
         // General fallback: if channel index exists in source, take it
         (tc, _, c) if c < tc as usize => base_slice.get(c).copied().unwrap_or(0.0),
@@ -6628,6 +7133,7 @@ pub fn start_audio_thread(
                         "Hardware Passthrough".to_string()
                     };
                     state.stats.bitstream_active = true;
+                    state.is_dummy_audio_output = false;
                     state.current_sample_rate = sample_rate as f32;
                     state.duration_seconds = meta_duration;
                     let ch = (channels as i32).max(2);
@@ -6654,6 +7160,7 @@ pub fn start_audio_thread(
     {
         let mut state = shared_state.lock().unwrap();
         state.stats.bitstream_active = false;
+        state.is_dummy_audio_output = false;
         state.stats.audio_buffer_fill_pct = 0.0;
     }
 
@@ -6691,7 +7198,8 @@ pub fn start_audio_thread(
             state.selected_audio_device.clone()
         };
         let mut dev = None;
-        if let Some(ref name) = selected_device_name
+        if !is_default_audio_device_selection(selected_device_name.as_deref())
+            && let Some(ref name) = selected_device_name
             && let Ok(devices) = host.input_devices()
         {
             for d in devices {
@@ -6800,7 +7308,9 @@ pub fn start_audio_thread(
             }
         };
 
-        if let Some(ref name) = selected_device_name {
+        if !is_default_audio_device_selection(selected_device_name.as_deref())
+            && let Some(ref name) = selected_device_name
+        {
             let mut is_default = false;
 
             // ALSA WORKAROUND: If the user selected the default device by name, ensure we use the REAL default host handle.
@@ -6864,11 +7374,31 @@ pub fn start_audio_thread(
             };
 
             let result = (|| -> Result<PlaybackHandle> {
-                let default_device_channels = device
+                #[allow(unused_mut)]
+                let mut default_device_channels = device
                     .default_output_config()
                     .ok()
                     .map(|c| c.channels())
                     .unwrap_or(2);
+                #[cfg(target_os = "linux")]
+                {
+                    let is_default_cand = dev_idx == 0
+                        && is_default_audio_device_selection(selected_device_name.as_deref());
+                    let d_lower = device_name.to_lowercase();
+                    if (is_default_cand
+                        || d_lower == "default"
+                        || d_lower.contains("pipewire")
+                        || d_lower.contains("pulseaudio"))
+                        && let Some(topo) = query_active_audio_sink_topology(false)
+                    {
+                        default_device_channels = topo.channels.max(1);
+                        if let Ok(mut state) = shared_state_closure.lock() {
+                            state.active_audio_sink_id = Some(topo.sink_id);
+                            state.active_audio_sink_description = Some(topo.description);
+                            state.active_audio_sink_channels = topo.channels;
+                        }
+                    }
+                }
                 let effective_surround_upmix = if surround_upmix_user_overridden {
                     surround_upmix_enabled
                 } else {
@@ -6898,6 +7428,9 @@ pub fn start_audio_thread(
                     ) {
                         Ok(handle) => {
                             if dev_idx > 0
+                                && !is_default_audio_device_selection(
+                                    selected_device_name.as_deref(),
+                                )
                                 && let Ok(mut state) = shared_state_closure.lock()
                             {
                                 eprintln!(
@@ -6923,13 +7456,11 @@ pub fn start_audio_thread(
                 // and hardware_channels stays at the native stereo/mono channel count.
                 let upmix_to_multichannel_hw =
                     effective_surround_upmix && default_device_channels > 2;
-                let device_target_channels = if force_stereo {
-                    2
-                } else if default_device_channels > 2 {
-                    default_device_channels.max(target_channels)
-                } else {
-                    target_channels
-                };
+                let device_target_channels = resolve_device_target_channels(
+                    force_stereo,
+                    default_device_channels,
+                    target_channels,
+                );
 
                 let mut candidate_configs: Vec<cpal::SupportedStreamConfig> = Vec::new();
                 if let Ok(supported_configs_range) = device.supported_output_configs() {
@@ -7048,6 +7579,9 @@ pub fn start_audio_thread(
                                 window_size,
                             );
                             if dev_idx > 0
+                                && !is_default_audio_device_selection(
+                                    selected_device_name.as_deref(),
+                                )
                                 && let Ok(mut state) = shared_state_closure.lock()
                             {
                                 eprintln!(
@@ -7108,6 +7642,7 @@ pub fn start_audio_thread(
 
                 {
                     let mut state = shared_state.lock().unwrap();
+                    state.is_dummy_audio_output = true;
                     populate_state_from_audio_source(
                         &mut state,
                         audio_source.as_mut(),
@@ -9534,7 +10069,19 @@ fn run_wasapi_exclusive_multichannel(
             let avail_frames = if is_exclusive {
                 buffer_frames
             } else {
-                let padding = unsafe { audio_client.GetCurrentPadding().unwrap_or(0) };
+                let padding = match unsafe { audio_client.GetCurrentPadding() } {
+                    Ok(p) => p,
+                    Err(e) => {
+                        eprintln!(
+                            "[audio] WASAPI Shared GetCurrentPadding failed (device disconnected?): {:?}",
+                            e
+                        );
+                        if let Ok(mut state) = shared_state_thread.lock() {
+                            state.audio_device_lost = true;
+                        }
+                        break;
+                    }
+                };
                 buffer_frames.saturating_sub(padding)
             };
             if avail_frames == 0 {
@@ -9570,7 +10117,16 @@ fn run_wasapi_exclusive_multichannel(
 
             let buf_ptr = match unsafe { render_client.GetBuffer(avail_frames) } {
                 Ok(ptr) => ptr,
-                Err(_) => continue,
+                Err(e) => {
+                    eprintln!(
+                        "[audio] WASAPI Shared GetBuffer failed (device disconnected?): {:?}",
+                        e
+                    );
+                    if let Ok(mut state) = shared_state_thread.lock() {
+                        state.audio_device_lost = true;
+                    }
+                    break;
+                }
             };
 
             let frames_to_render = avail_frames as usize;
@@ -11684,5 +12240,324 @@ mod tests {
                 let _ = std::fs::remove_file(path);
             }
         }
+    }
+
+    #[test]
+    fn test_parse_wpctl_inspect_and_pactl_topology_steamdeck_scenarios() {
+        // 1. Steam Deck built-in speakers (2ch stereo)
+        let wpctl_speakers = r#"id 46, type PipeWire:Interface:Node
+    alsa.card_name = "acp5x"
+    audio.channels = "2"
+    audio.position = "[ FL FR ]"
+    node.description = "Speaker"
+    node.name = "alsa_output.pci-0000_04_00.5-platform-acp5x_mach.0.HiFi__hw_acp5x_1__sink"
+    media.class = "Audio/Sink"
+"#;
+        let speaker_topo = parse_wpctl_inspect_topology(wpctl_speakers).expect("speaker topology");
+        assert_eq!(
+            speaker_topo.sink_id,
+            "alsa_output.pci-0000_04_00.5-platform-acp5x_mach.0.HiFi__hw_acp5x_1__sink"
+        );
+        assert_eq!(speaker_topo.description, "Speaker");
+        assert_eq!(speaker_topo.channels, 2);
+
+        // 2. Bluetooth headphones (2ch stereo)
+        let wpctl_bt = r#"id 78, type PipeWire:Interface:Node
+    api.bluez5.address = "14:3F:A6:88:99:AA"
+    audio.channels = "2"
+    audio.position = "[ FL FR ]"
+    node.description = "WH-1000XM5"
+    node.name = "bluez_output.14_3F_A6_88_99_AA.1"
+    media.class = "Audio/Sink"
+"#;
+        let bt_topo = parse_wpctl_inspect_topology(wpctl_bt).expect("bt topology");
+        assert_eq!(bt_topo.sink_id, "bluez_output.14_3F_A6_88_99_AA.1");
+        assert_eq!(bt_topo.description, "WH-1000XM5");
+        assert_eq!(bt_topo.channels, 2);
+
+        // 3. USB-C stereo headset (2ch stereo)
+        let wpctl_usbc = r#"id 92, type PipeWire:Interface:Node
+    audio.channels = "2"
+    audio.position = "[ FL FR ]"
+    node.description = "USB-C Headset Analog Stereo"
+    node.name = "alsa_output.usb-Google_Inc._USB-C_Headset-00.analog-stereo"
+    media.class = "Audio/Sink"
+"#;
+        let usbc_topo = parse_wpctl_inspect_topology(wpctl_usbc).expect("usbc topology");
+        assert_eq!(
+            usbc_topo.sink_id,
+            "alsa_output.usb-Google_Inc._USB-C_Headset-00.analog-stereo"
+        );
+        assert_eq!(usbc_topo.description, "USB-C Headset Analog Stereo");
+        assert_eq!(usbc_topo.channels, 2);
+
+        // 4. USB Surround sound system (7.1 / 8ch)
+        let wpctl_usb_71 = r#"id 105, type PipeWire:Interface:Node
+  * audio.channels = "8"
+    audio.position = "[ FL FR FC LFE RL RR SL SR ]"
+    node.description = "USB Audio 7.1 Surround"
+    node.name = "alsa_output.usb-Generic_USB_Surround_Audio-00.analog-surround-71"
+    media.class = "Audio/Sink"
+"#;
+        let usb_71_topo = parse_wpctl_inspect_topology(wpctl_usb_71).expect("usb 7.1 topology");
+        assert_eq!(
+            usb_71_topo.sink_id,
+            "alsa_output.usb-Generic_USB_Surround_Audio-00.analog-surround-71"
+        );
+        assert_eq!(usb_71_topo.description, "USB Audio 7.1 Surround");
+        assert_eq!(usb_71_topo.channels, 8);
+
+        // 5. Fallback to audio.position when audio.channels is omitted (both comma and space separated)
+        let wpctl_pos_only = r#"id 106, type PipeWire:Interface:Node
+    audio.position = "[ FL, FR, FC, LFE, RL, RR ]"
+    node.nick = "USB 5.1 DAC"
+    node.name = "alsa_output.usb-DAC_51.analog-surround-51"
+"#;
+        let usb_51_topo = parse_wpctl_inspect_topology(wpctl_pos_only).expect("usb 5.1 topology");
+        assert_eq!(usb_51_topo.channels, 6);
+        assert_eq!(usb_51_topo.description, "USB 5.1 DAC");
+
+        let wpctl_space_pos_only = r#"id 107, type PipeWire:Interface:Node
+    audio.position = "[ FL FR FC LFE RL RR SL SR ]"
+    node.nick = "USB 7.1 DAC"
+    node.name = "alsa_output.usb-DAC_71.analog-surround-71"
+"#;
+        let usb_71_space_topo =
+            parse_wpctl_inspect_topology(wpctl_space_pos_only).expect("usb 7.1 space topology");
+        assert_eq!(usb_71_space_topo.channels, 8);
+
+        // 6. pactl fallback parser
+        let pactl_sinks = r#"Sink #46
+	State: SUSPENDED
+	Name: alsa_output.pci-0000_04_00.5.Speaker
+	Description: Speaker
+	Sample Specification: s16le 2ch 48000Hz
+	Channel Map: front-left,front-right
+
+Sink #105
+	State: RUNNING
+	Name: alsa_output.usb-Generic_USB_Surround_Audio-00.analog-surround-71
+	Description: USB Audio 7.1 Surround
+	Sample Specification: s32le 8ch 48000Hz
+	Channel Map: front-left,front-right,front-center,lfe,rear-left,rear-right,side-left,side-right
+"#;
+        let pactl_topo = parse_pactl_sink_topology(
+            "alsa_output.usb-Generic_USB_Surround_Audio-00.analog-surround-71",
+            pactl_sinks,
+        )
+        .expect("pactl 7.1 topology");
+        assert_eq!(pactl_topo.channels, 8);
+        assert_eq!(pactl_topo.description, "USB Audio 7.1 Surround");
+
+        // 7. /proc/asound/card*/pcm*p/sub0/hw_params parser
+        let proc_hw_params = "access: MMAP_INTERLEAVED\nformat: S32_LE\nsubformat: STD\nchannels: 6\nrate: 48000 (48000/1)\n";
+        assert_eq!(
+            parse_proc_asound_max_playback_channels(proc_hw_params),
+            Some(6)
+        );
+    }
+
+    #[test]
+    fn test_steamdeck_dynamic_routing_and_surround_topology_lifecycle() {
+        let speaker_topo = AudioSinkTopology {
+            sink_id: "alsa_output.acp5x.Speaker".to_string(),
+            description: "Speaker".to_string(),
+            channels: 2,
+        };
+        let bt_topo = AudioSinkTopology {
+            sink_id: "bluez_output.WH_1000XM5".to_string(),
+            description: "WH-1000XM5".to_string(),
+            channels: 2,
+        };
+        let usbc_topo = AudioSinkTopology {
+            sink_id: "alsa_output.usb-TypeC_Headphones".to_string(),
+            description: "USB-C Headphones".to_string(),
+            channels: 2,
+        };
+        let usb_surround_6ch = AudioSinkTopology {
+            sink_id: "alsa_output.usb-Surround_51".to_string(),
+            description: "USB 5.1 Audio System".to_string(),
+            channels: 6,
+        };
+        let usb_surround_8ch = AudioSinkTopology {
+            sink_id: "alsa_output.usb-Surround_71".to_string(),
+            description: "USB 7.1 Audio System".to_string(),
+            channels: 8,
+        };
+
+        // Stage 1: Built-in Speakers (2ch)
+        // Even if playing a 5.1 (6ch) or 7.1 (8ch) file, a 2ch sink resolves to 2 hardware channels
+        // so RustTracker downmixes to stereo cleanly without needing force_stereo_downmix.
+        assert_eq!(resolve_device_target_channels(false, 2, 6), 2);
+        assert_eq!(resolve_device_target_channels(false, 2, 8), 2);
+        assert_eq!(resolve_device_target_channels(false, 2, 2), 2);
+
+        // Stage 2: Connect Bluetooth headphones (2ch -> 2ch)
+        // On Linux (PipeWire), stream moves live without reload; OSD updates to show Bluetooth headphones.
+        let step_bt_linux = evaluate_topology_transition(
+            Some(&speaker_topo),
+            &bt_topo,
+            true,
+            true,
+            false,
+            2,
+            false,
+            false,
+            false,
+            false,
+            true,
+        );
+        assert!(!step_bt_linux.reload_stream);
+        assert_eq!(
+            step_bt_linux.osd_message.as_deref(),
+            Some("🎧 Audio Output: WH-1000XM5 (2.0)")
+        );
+
+        // On Windows/macOS (non-PipeWire), changing default sink triggers stream reload onto the new device.
+        let step_bt_other = evaluate_topology_transition(
+            Some(&speaker_topo),
+            &bt_topo,
+            true,
+            true,
+            false,
+            2,
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert!(step_bt_other.reload_stream);
+
+        // Stage 3: Disconnect Bluetooth and connect USB-C stereo headphones (2ch -> 2ch)
+        let step_usbc = evaluate_topology_transition(
+            Some(&bt_topo),
+            &usbc_topo,
+            true,
+            true,
+            false,
+            2,
+            false,
+            false,
+            false,
+            false,
+            true,
+        );
+        assert!(!step_usbc.reload_stream);
+        assert_eq!(
+            step_usbc.osd_message.as_deref(),
+            Some("🎧 Audio Output: USB-C Headphones (2.0)")
+        );
+
+        // Stage 4a: Disconnect USB-C headphones and connect to USB 5.1 Surround System (2ch -> 6ch)
+        let step_surround_51 = evaluate_topology_transition(
+            Some(&usbc_topo),
+            &usb_surround_6ch,
+            true,
+            true,
+            false,
+            2,
+            false,
+            false,
+            false,
+            false,
+            true,
+        );
+        assert!(
+            step_surround_51.reload_stream,
+            "Switching from 2ch USB-C headphones to 6ch USB surround must reload stream to unlock 6 channels"
+        );
+        assert_eq!(
+            step_surround_51.osd_message.as_deref(),
+            Some("🔊 Audio Output: USB 5.1 Audio System (5.1 Surround — Bed Only)")
+        );
+        // Verify channel resolution on the 6ch surround sink:
+        // - 5.1 source -> 6ch discrete surround
+        // - 2.0 source with surround_upmix enabled -> 6ch surround upmix
+        assert_eq!(resolve_device_target_channels(false, 6, 6), 6);
+        assert_eq!(resolve_device_target_channels(false, 6, 2), 6);
+
+        // Stage 4b: Connect to USB 7.1 Surround System (6ch -> 8ch)
+        let step_surround_71 = evaluate_topology_transition(
+            Some(&usb_surround_6ch),
+            &usb_surround_8ch,
+            true,
+            true,
+            false,
+            6,
+            false,
+            false,
+            false,
+            false,
+            true,
+        );
+        assert!(step_surround_71.reload_stream);
+        assert_eq!(
+            step_surround_71.osd_message.as_deref(),
+            Some("🔊 Audio Output: USB 7.1 Audio System (7.1 Surround — Bed Only)")
+        );
+        assert_eq!(resolve_device_target_channels(false, 8, 8), 8);
+        assert_eq!(resolve_device_target_channels(false, 8, 2), 8);
+
+        // Stage 5: Unplug USB surround system -> fallback to built-in stereo speakers (8ch -> 2ch)
+        let step_back_to_speakers = evaluate_topology_transition(
+            Some(&usb_surround_8ch),
+            &speaker_topo,
+            true,
+            true,
+            false,
+            8,
+            false,
+            false,
+            false,
+            false,
+            true,
+        );
+        assert!(
+            step_back_to_speakers.reload_stream,
+            "Switching from 8ch surround back to 2ch speakers must reload stream to downmix to stereo"
+        );
+        assert_eq!(
+            step_back_to_speakers.osd_message.as_deref(),
+            Some("🎧 Audio Output: Speaker (2.0)")
+        );
+
+        // Stage 6: Recovery from dummy output when a real sink appears
+        let step_from_dummy = evaluate_topology_transition(
+            Some(&speaker_topo),
+            &speaker_topo,
+            true,
+            true,
+            false,
+            2,
+            false,
+            true,
+            false,
+            false,
+            true,
+        );
+        assert!(step_from_dummy.reload_stream);
+    }
+
+    #[test]
+    fn test_downmix_7_1_to_5_1_and_stereo() {
+        // 8ch frame: FL=0.5, FR=-0.5, FC=0.2, LFE=0.1, BL=0.4, BR=-0.4, SL=0.3, SR=-0.3
+        let frame_8ch = [0.5f32, -0.5, 0.2, 0.1, 0.4, -0.4, 0.3, -0.3];
+
+        // When outputting to a 5.1 (6ch) sink:
+        // Ch 0..4 pass directly; Ch 4 folds BL + SL; Ch 5 folds BR + SR
+        assert!((get_downmixed_sample(8, &frame_8ch, 6, 0) - 0.5).abs() < 1e-6);
+        assert!((get_downmixed_sample(8, &frame_8ch, 6, 1) - (-0.5)).abs() < 1e-6);
+        assert!((get_downmixed_sample(8, &frame_8ch, 6, 2) - 0.2).abs() < 1e-6);
+        assert!((get_downmixed_sample(8, &frame_8ch, 6, 3) - 0.1).abs() < 1e-6);
+        let expected_ls = (0.4 + 0.3) * std::f32::consts::FRAC_1_SQRT_2;
+        let expected_rs = (-0.4 - 0.3) * std::f32::consts::FRAC_1_SQRT_2;
+        assert!((get_downmixed_sample(8, &frame_8ch, 6, 4) - expected_ls).abs() < 1e-6);
+        assert!((get_downmixed_sample(8, &frame_8ch, 6, 5) - expected_rs).abs() < 1e-6);
+
+        // When outputting to a 2.0 (2ch) stereo sink: ITU-R BS.775 fold-down
+        let l_stereo = get_downmixed_sample(8, &frame_8ch, 2, 0);
+        let r_stereo = get_downmixed_sample(8, &frame_8ch, 2, 1);
+        assert!(l_stereo > 0.4 && r_stereo < -0.2);
     }
 }

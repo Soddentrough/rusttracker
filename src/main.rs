@@ -316,6 +316,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     } else {
         None
     };
+
+    audio::spawn_audio_topology_watcher(Arc::clone(&app_state), args.mic);
+
     if args.tui {
         let original_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |panic_info| {
@@ -2515,6 +2518,7 @@ async fn run_gui(
 
                             let (load_path, resume_pos_on_reload) = {
                                 let mut state = app_state.lock().unwrap();
+                                let mut resume_pos_on_reload: Option<f64> = None;
 
                                 if state.audio_device_lost {
                                     state.audio_device_lost = false;
@@ -2528,13 +2532,34 @@ async fn run_gui(
 
                                     if !reload_path.is_empty() || is_mic_launch {
                                         state.load_request = Some(reload_path);
+                                        state.surround_upmix.user_overridden = false;
+                                        resume_pos_on_reload = Some(state.current_seconds);
                                         state.osd_text =
                                             Some("Audio Device Reconnected".to_string());
                                         state.osd_timer = 3.0;
                                     }
                                 }
 
-                                let mut resume_pos_on_reload: Option<f64> = None;
+                                if let Some(osd_msg) = state.audio_topology_reload_request.take() {
+                                    let reload_path = if is_mic_launch {
+                                        "".to_string()
+                                    } else if state.playlist_index < state.playlist.len() {
+                                        state.playlist[state.playlist_index].clone()
+                                    } else {
+                                        state.song_title.clone()
+                                    };
+
+                                    if (!reload_path.is_empty() && state.file_loaded)
+                                        || is_mic_launch
+                                    {
+                                        state.load_request = Some(reload_path);
+                                        state.surround_upmix.user_overridden = false;
+                                        resume_pos_on_reload = Some(state.current_seconds);
+                                        state.osd_text = Some(osd_msg);
+                                        state.osd_timer = 3.0;
+                                    }
+                                }
+
                                 let device_change = state.audio_device_change_request.take();
                                 if let Some(new_device) = device_change {
                                     let reload_path = if is_mic_launch {
@@ -2717,20 +2742,27 @@ async fn run_gui(
                                                 state.seek_request = Some(pos);
                                                 state.seek_epoch += 1;
                                             }
+                                            let preserve_device_osd =
+                                                state.osd_text.as_ref().is_some_and(|s| {
+                                                    s.contains("Audio Output:")
+                                                        || s.starts_with("Audio Device")
+                                                });
                                             if state.surround_upmix.enabled {
                                                 if state.hardware_channels > 2 {
-                                                    let badge =
-                                                        crate::state::SurroundUpmixConfig::layout_badge(
-                                                            state.hardware_channels,
-                                                        );
-                                                    state.osd_text = Some(format!(
-                                                        "🔊 Auto Surround Upmix: ON ({badge})"
-                                                    ));
-                                                    state.show_hud = true;
+                                                    if !preserve_device_osd {
+                                                        let badge =
+                                                            crate::state::SurroundUpmixConfig::layout_badge(
+                                                                state.hardware_channels,
+                                                            );
+                                                        state.osd_text = Some(format!(
+                                                            "🔊 Auto Surround Upmix: ON ({badge})"
+                                                        ));
+                                                        state.show_hud = true;
+                                                    }
                                                     if state.video_mode == 3 {
                                                         state.video_mode = 0;
                                                     }
-                                                } else {
+                                                } else if !preserve_device_osd {
                                                     state.osd_text = Some(
                                                         "🔊 Auto Surround Upmix: Armed (Stereo/Mono Output — No Change)".to_string(),
                                                     );
@@ -4424,6 +4456,24 @@ where
                 }
             }
 
+            if let Some(osd_msg) = state.audio_topology_reload_request.take() {
+                let reload_path = if is_mic_launch {
+                    "".to_string()
+                } else if state.playlist_index < state.playlist.len() {
+                    state.playlist[state.playlist_index].clone()
+                } else {
+                    state.song_title.clone()
+                };
+
+                if (!reload_path.is_empty() && state.file_loaded) || is_mic_launch {
+                    state.load_request = Some(reload_path);
+                    resume_pos_on_reload = Some(state.current_seconds);
+                    state.surround_upmix.user_overridden = false;
+                    state.osd_text = Some(osd_msg);
+                    state.osd_timer = 3.0;
+                }
+            }
+
             if state.audio_device_lost {
                 state.audio_device_lost = false;
                 let reload_path = if is_mic_launch {
@@ -4436,6 +4486,8 @@ where
 
                 if !reload_path.is_empty() || is_mic_launch {
                     state.load_request = Some(reload_path);
+                    resume_pos_on_reload = Some(state.current_seconds);
+                    state.surround_upmix.user_overridden = false;
                     state.osd_text = Some("Audio Device Reconnected".to_string());
                     state.osd_timer = 3.0;
                 }
