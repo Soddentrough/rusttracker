@@ -4539,7 +4539,12 @@ pub fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(
 
 pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
     #[cfg(not(target_os = "android"))]
-    ffmpeg_next::format::network::init();
+    {
+        unsafe {
+            ffmpeg_next::ffi::av_log_set_level(ffmpeg_next::ffi::AV_LOG_FATAL);
+        }
+        ffmpeg_next::format::network::init();
+    }
 
     if file_path.starts_with("http") {
         let mut actual_path = file_path.to_string();
@@ -6027,6 +6032,9 @@ fn open_video_decoder(
     params: &ffmpeg_next::codec::Parameters,
     allow_hw: bool,
 ) -> Result<(ffmpeg_next::decoder::Video, Option<String>), ffmpeg_next::Error> {
+    unsafe {
+        ffmpeg_next::ffi::av_log_set_level(ffmpeg_next::ffi::AV_LOG_FATAL);
+    }
     if allow_hw {
         #[cfg(target_os = "windows")]
         let preferred_hw: &[(ffmpeg_next::ffi::AVHWDeviceType, &str)] = &[
@@ -6070,7 +6078,7 @@ fn open_video_decoder(
             unsafe { ffmpeg_next::ffi::avcodec_find_decoder((*params.as_ptr()).codec_id) };
         if !codec_ptr.is_null() {
             for &(hw_type, label) in preferred_hw {
-                let mut supported = false;
+                let mut hw_pix_fmt = ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_NONE;
                 let mut idx = 0;
                 loop {
                     let cfg = unsafe { ffmpeg_next::ffi::avcodec_get_hw_config(codec_ptr, idx) };
@@ -6084,13 +6092,13 @@ fn open_video_decoder(
                         != 0
                         && dev_type == hw_type
                     {
-                        supported = true;
+                        hw_pix_fmt = unsafe { (*cfg).pix_fmt };
                         break;
                     }
                     idx += 1;
                 }
 
-                if !supported {
+                if hw_pix_fmt == ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_NONE {
                     continue;
                 }
 
@@ -6111,10 +6119,52 @@ fn open_video_decoder(
                         unsafe {
                             (*context.as_mut_ptr()).hw_device_ctx =
                                 ffmpeg_next::ffi::av_buffer_ref(hw_device_ctx);
-                            ffmpeg_next::ffi::av_buffer_unref(&mut hw_device_ctx);
                         }
-                        if let Ok(decoder) = context.decoder().video() {
-                            return Ok((decoder, Some(label.to_string())));
+                        if let Ok(mut decoder) = context.decoder().video() {
+                            // Verify that the hardware device driver actually supports this codec,
+                            // profile, and resolution (e.g. Fedora's stock Mesa VAAPI driver omits
+                            // H.264/HEVC profiles unless mesa-va-drivers-freeworld is installed).
+                            let frames_ok = unsafe {
+                                if (*decoder.as_ptr()).sw_pix_fmt
+                                    == ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_NONE
+                                {
+                                    (*decoder.as_mut_ptr()).sw_pix_fmt = if (*decoder.as_ptr())
+                                        .pix_fmt
+                                        != ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_NONE
+                                    {
+                                        (*decoder.as_ptr()).pix_fmt
+                                    } else {
+                                        ffmpeg_next::ffi::AVPixelFormat::AV_PIX_FMT_YUV420P
+                                    };
+                                }
+                                let mut test_frames_ctx: *mut ffmpeg_next::ffi::AVBufferRef =
+                                    std::ptr::null_mut();
+                                let ret = ffmpeg_next::ffi::avcodec_get_hw_frames_parameters(
+                                    decoder.as_mut_ptr(),
+                                    hw_device_ctx,
+                                    hw_pix_fmt,
+                                    &mut test_frames_ctx,
+                                );
+                                if !test_frames_ctx.is_null() {
+                                    ffmpeg_next::ffi::av_buffer_unref(&mut test_frames_ctx);
+                                }
+                                ffmpeg_next::ffi::av_buffer_unref(&mut hw_device_ctx);
+                                ret == 0
+                            };
+                            if frames_ok {
+                                return Ok((decoder, Some(label.to_string())));
+                            }
+                            #[cfg(target_os = "linux")]
+                            if hw_type == ffmpeg_next::ffi::AVHWDeviceType::AV_HWDEVICE_TYPE_VAAPI {
+                                // On Linux, VAAPI and Vulkan/VDPAU share the same GPU decode block
+                                // and Mesa codec build config; if VAAPI opened the device and
+                                // rejected the codec profile, skip redundant Vulkan/VDPAU probes.
+                                break;
+                            }
+                        } else {
+                            unsafe {
+                                ffmpeg_next::ffi::av_buffer_unref(&mut hw_device_ctx);
+                            }
                         }
                     } else {
                         unsafe {
