@@ -558,17 +558,32 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                 }
 
                 // Check for audio device reconnect / track ended / playlist auto-advance / pending load requests
-                let pending_load = {
+                let (pending_load, resume_pos_on_reload) = {
                     let mut state = self.app_state.lock().unwrap();
+                    let mut resume_pos_on_reload: Option<f64> = None;
                     if state.audio_device_lost {
                         state.audio_device_lost = false;
                         if state.playlist_index < state.playlist.len() {
                             let reload = state.playlist[state.playlist_index].clone();
                             if !reload.is_empty() {
                                 state.load_request = Some(reload);
+                                state.surround_upmix.user_overridden = false;
+                                resume_pos_on_reload = Some(state.current_seconds);
                                 state.osd_text = Some("Audio Output Reconnected".to_string());
                                 state.osd_timer = 3.0;
                             }
+                        }
+                    }
+                    if let Some(osd_msg) = state.audio_topology_reload_request.take()
+                        && state.playlist_index < state.playlist.len()
+                    {
+                        let reload = state.playlist[state.playlist_index].clone();
+                        if !reload.is_empty() && state.file_loaded {
+                            state.load_request = Some(reload);
+                            state.surround_upmix.user_overridden = false;
+                            resume_pos_on_reload = Some(state.current_seconds);
+                            state.osd_text = Some(osd_msg);
+                            state.osd_timer = 3.0;
                         }
                     }
                     if let Some(new_dev) = state.audio_device_change_request.take()
@@ -577,6 +592,8 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                         let reload = state.playlist[state.playlist_index].clone();
                         if !reload.is_empty() {
                             state.load_request = Some(reload);
+                            state.surround_upmix.user_overridden = false;
+                            resume_pos_on_reload = Some(state.current_seconds);
                             state.osd_text = Some(format!("Audio Output: {}", new_dev));
                             state.osd_timer = 3.0;
                         }
@@ -590,10 +607,21 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                             state.is_paused = true;
                         }
                     }
-                    state.load_request.take()
+                    if resume_pos_on_reload.is_none() && state.load_request.is_some() {
+                        state.surround_upmix.user_overridden = false;
+                    }
+                    (state.load_request.take(), resume_pos_on_reload)
                 };
                 if let Some(load_path) = pending_load {
                     self.load_and_play_file(&load_path);
+                    if let Some(pos) = resume_pos_on_reload
+                        && pos > 0.1
+                    {
+                        let mut state = self.app_state.lock().unwrap();
+                        state.current_seconds = pos;
+                        state.seek_request = Some(pos);
+                        state.seek_epoch += 1;
+                    }
                 }
 
                 let (Some(ref mut eng), Some(ref mut st)) =

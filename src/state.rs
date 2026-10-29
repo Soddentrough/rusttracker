@@ -880,6 +880,11 @@ pub struct AppState {
     pub selected_audio_device: Option<String>,
     pub available_audio_devices: Vec<String>,
     pub audio_device_change_request: Option<String>,
+    pub audio_topology_reload_request: Option<String>,
+    pub active_audio_sink_id: Option<String>,
+    pub active_audio_sink_description: Option<String>,
+    pub active_audio_sink_channels: u16,
+    pub is_dummy_audio_output: bool,
     pub passthrough_change_request: Option<bool>,
     pub show_tui_device_picker: bool,
     pub tui_device_picker_cursor: usize,
@@ -1037,7 +1042,7 @@ impl AppState {
             url_input_text: String::new(),
             url_history,
             egui_gamepad_events: Vec::new(),
-            force_stereo_downmix: is_steam_deck,
+            force_stereo_downmix: false,
             append_to_playlist: false,
             panel_split_ratio: 0.5,
             gamepad_type: if is_steam_deck {
@@ -1064,6 +1069,11 @@ impl AppState {
             selected_audio_device: default_audio_device,
             available_audio_devices,
             audio_device_change_request: None,
+            audio_topology_reload_request: None,
+            active_audio_sink_id: None,
+            active_audio_sink_description: None,
+            active_audio_sink_channels: 0,
+            is_dummy_audio_output: false,
             passthrough_change_request: None,
             show_tui_device_picker: false,
             tui_device_picker_cursor: 0,
@@ -1072,10 +1082,7 @@ impl AppState {
             drag_cursor_pos: None,
             track_info_rect: None,
             mobile_hud_tab: MobileHudTab::default(),
-            surround_upmix: SurroundUpmixConfig {
-                enabled: !is_steam_deck,
-                ..SurroundUpmixConfig::default()
-            },
+            surround_upmix: SurroundUpmixConfig::default(),
         }
     }
 
@@ -1209,6 +1216,11 @@ impl AppState {
             selected_audio_device: self.selected_audio_device.clone(),
             available_audio_devices: self.available_audio_devices.clone(),
             audio_device_change_request: self.audio_device_change_request.clone(),
+            audio_topology_reload_request: self.audio_topology_reload_request.clone(),
+            active_audio_sink_id: self.active_audio_sink_id.clone(),
+            active_audio_sink_description: self.active_audio_sink_description.clone(),
+            active_audio_sink_channels: self.active_audio_sink_channels,
+            is_dummy_audio_output: self.is_dummy_audio_output,
             passthrough_change_request: self.passthrough_change_request,
             show_tui_device_picker: self.show_tui_device_picker,
             tui_device_picker_cursor: self.tui_device_picker_cursor,

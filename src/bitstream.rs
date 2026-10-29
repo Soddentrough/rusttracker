@@ -301,6 +301,11 @@ pub fn start_bitstream_thread(
                         item.packet.rescale_ts(item.time_base, ost_time_base);
                         item.packet.set_stream(ost_index);
                         if item.packet.write(&mut octx).is_err() {
+                            if !stop_for_pump.load(std::sync::atomic::Ordering::Relaxed)
+                                && let Ok(mut state) = state_for_pump.lock()
+                            {
+                                state.audio_device_lost = true;
+                            }
                             break;
                         }
                         for msg in item.dsp_messages {
@@ -1378,7 +1383,9 @@ mod wasapi_bitstream {
                 let count = unsafe { collection.GetCount()? };
 
                 let mut target_device: Option<IMMDevice> = None;
-                if let Some(target) = &selected_device_name {
+                if !crate::audio::is_default_audio_device_selection(selected_device_name.as_deref())
+                    && let Some(target) = &selected_device_name
+                {
                     let target_lower = target.to_lowercase();
                     for i in 0..count {
                         if let Ok(dev) = unsafe { collection.Item(i) } {
@@ -3016,11 +3023,17 @@ mod wasapi_bitstream {
                                     };
                                     if let Err(e) = render_client.ReleaseBuffer(available, flags) {
                                         eprintln!("[bitstream] ReleaseBuffer error: {:?}", e);
+                                        if let Ok(mut state) = shared_state_pump.lock() {
+                                            state.audio_device_lost = true;
+                                        }
                                         break;
                                     }
                                 }
                                 Err(e) => {
                                     eprintln!("[bitstream] GetBuffer error: {:?}", e);
+                                    if let Ok(mut state) = shared_state_pump.lock() {
+                                        state.audio_device_lost = true;
+                                    }
                                     break;
                                 }
                             }
@@ -3030,6 +3043,9 @@ mod wasapi_bitstream {
                             unsafe {
                                 if let Err(e) = audio_client.Start() {
                                     eprintln!("[bitstream] audio_client.Start error: {:?}", e);
+                                    if let Ok(mut state) = shared_state_pump.lock() {
+                                        state.audio_device_lost = true;
+                                    }
                                     break;
                                 }
                             }
