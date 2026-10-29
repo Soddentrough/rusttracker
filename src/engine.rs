@@ -9287,18 +9287,10 @@ impl VulkanEngine {
                                         crate::state::SurroundUpmixConfig::has_height_channels(
                                             state.hardware_channels,
                                         );
-                                    let short_tag = crate::state::SurroundUpmixConfig::short_tag(
-                                        state.hardware_channels,
-                                    );
 
                                     if !is_portrait {
                                         col.horizontal(|ui| {
-                                            let panel_title = if has_height {
-                                                format!("{short_tag} Bed + Height Upmix")
-                                            } else {
-                                                format!("{short_tag} Bed Upmix")
-                                            };
-                                            ui.heading(panel_title);
+                                            ui.heading("Surround Upmix");
                                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                                 let off_btn = egui::Button::new(
                                                     egui::RichText::new("× Off")
@@ -10159,59 +10151,47 @@ impl VulkanEngine {
                                                 *engine_action = EngineAction::OpenFile;
                                             }
 
-                                            ui.add_space(4.0);
-                                            let upmix_on = state.surround_upmix.enabled;
-                                            let upmix_active = state
-                                                .surround_upmix
-                                                .is_active_for(state.source_channels, state.hardware_channels);
-                                            let short_tag = crate::state::SurroundUpmixConfig::short_tag(
+                                            if crate::state::SurroundUpmixConfig::can_upmix(
+                                                state.source_channels,
                                                 state.hardware_channels,
-                                            );
-                                            let (upmix_label, upmix_fill, upmix_stroke, upmix_text_col) = if upmix_active {
-                                                (
-                                                    format!("🔊 {short_tag} UPMIX: ON"),
-                                                    egui::Color32::from_rgb(165, 85, 12),
-                                                    egui::Color32::from_rgb(255, 175, 50),
-                                                    egui::Color32::from_rgb(255, 240, 200),
+                                            ) {
+                                                ui.add_space(4.0);
+                                                let upmix_on = state.surround_upmix.enabled;
+                                                let upmix_active = state
+                                                    .surround_upmix
+                                                    .is_active_for(state.source_channels, state.hardware_channels);
+                                                let (upmix_label, upmix_fill, upmix_stroke, upmix_text_col) = if upmix_active {
+                                                    (
+                                                        "🔊 SURROUND UPMIX: ON",
+                                                        egui::Color32::from_rgb(165, 85, 12),
+                                                        egui::Color32::from_rgb(255, 175, 50),
+                                                        egui::Color32::from_rgb(255, 240, 200),
+                                                    )
+                                                } else {
+                                                    (
+                                                        "🔊 SURROUND UPMIX: OFF",
+                                                        egui::Color32::from_rgb(38, 36, 38),
+                                                        egui::Color32::from_rgb(95, 88, 80),
+                                                        egui::Color32::from_rgb(210, 202, 192),
+                                                    )
+                                                };
+                                                let upmix_hdr_btn = egui::Button::new(
+                                                    egui::RichText::new(upmix_label)
+                                                        .size(11.5)
+                                                        .strong()
+                                                        .color(upmix_text_col),
                                                 )
-                                            } else if upmix_on {
-                                                (
-                                                    "🔊 UPMIX (2CH)".to_string(),
-                                                    egui::Color32::from_rgb(68, 45, 20),
-                                                    egui::Color32::from_rgb(165, 115, 55),
-                                                    egui::Color32::from_rgb(230, 205, 165),
-                                                )
-                                            } else if state.hardware_channels > 2 {
-                                                (
-                                                    format!("🔊 {short_tag} UPMIX"),
-                                                    egui::Color32::from_rgb(38, 36, 38),
-                                                    egui::Color32::from_rgb(95, 88, 80),
-                                                    egui::Color32::from_rgb(210, 202, 192),
-                                                )
-                                            } else {
-                                                (
-                                                    "🔊 UPMIX".to_string(),
-                                                    egui::Color32::from_rgb(38, 36, 38),
-                                                    egui::Color32::from_rgb(95, 88, 80),
-                                                    egui::Color32::from_rgb(210, 202, 192),
-                                                )
-                                            };
-                                            let upmix_hdr_btn = egui::Button::new(
-                                                egui::RichText::new(upmix_label)
-                                                    .size(11.5)
-                                                    .strong()
-                                                    .color(upmix_text_col),
-                                            )
-                                            .fill(upmix_fill)
-                                            .stroke(egui::Stroke::new(1.0_f32, upmix_stroke))
-                                            .corner_radius(4.0)
-                                            .min_size(egui::vec2(88.0, if is_portrait { 30.0 } else { 24.0 }));
-                                            if ui
-                                                .ctx().input(|_| !state.file_loaded || crate::state::SurroundUpmixConfig::can_upmix(state.source_channels, state.hardware_channels)) && ui.add(upmix_hdr_btn)
-                                                .on_hover_text("Toggle Auto Surround Upmix (5.1/7.1 Bed or 7.1.4 Bed + Height; stereo/mono outputs remain unchanged) (Shortcut: 'u' / L3·R3)")
-                                                .clicked()
-                                            {
-                                                *engine_action = EngineAction::ToggleSurroundUpmix(!upmix_on);
+                                                .fill(upmix_fill)
+                                                .stroke(egui::Stroke::new(1.0_f32, upmix_stroke))
+                                                .corner_radius(4.0)
+                                                .min_size(egui::vec2(88.0, if is_portrait { 30.0 } else { 24.0 }));
+                                                if ui
+                                                    .add(upmix_hdr_btn)
+                                                    .on_hover_text("Toggle Surround Upmix to fill all remaining available channels on the output device (Shortcut: 'u' / L3·R3)")
+                                                    .clicked()
+                                                {
+                                                    *engine_action = EngineAction::ToggleSurroundUpmix(!upmix_on);
+                                                }
                                             }
                                         });
                                     });
@@ -10790,40 +10770,45 @@ impl VulkanEngine {
                                                 }
                                             });
 
-                                            ui.horizontal(|ui| {
-                                                let upmix_enabled = state.surround_upmix.enabled;
-                                                let (btn_text, btn_fill, btn_stroke, txt_col) = if upmix_enabled {
-                                                    (
-                                                        "🔊 Auto Surround & Height Upmix (7.1.4 + EQ): ON",
-                                                        egui::Color32::from_rgb(165, 85, 12),
-                                                        egui::Color32::from_rgb(255, 175, 50),
-                                                        egui::Color32::from_rgb(255, 240, 200),
+                                            if crate::state::SurroundUpmixConfig::can_upmix(
+                                                state.source_channels,
+                                                state.hardware_channels,
+                                            ) {
+                                                ui.horizontal(|ui| {
+                                                    let upmix_enabled = state.surround_upmix.enabled;
+                                                    let (btn_text, btn_fill, btn_stroke, txt_col) = if upmix_enabled {
+                                                        (
+                                                            "🔊 Surround Upmix: ON",
+                                                            egui::Color32::from_rgb(165, 85, 12),
+                                                            egui::Color32::from_rgb(255, 175, 50),
+                                                            egui::Color32::from_rgb(255, 240, 200),
+                                                        )
+                                                    } else {
+                                                        (
+                                                            "🔊 Surround Upmix: OFF",
+                                                            egui::Color32::from_rgb(36, 34, 36),
+                                                            egui::Color32::from_rgb(90, 84, 76),
+                                                            egui::Color32::from_rgb(200, 192, 182),
+                                                        )
+                                                    };
+                                                    let upmix_btn = egui::Button::new(
+                                                        egui::RichText::new(btn_text)
+                                                            .size(11.5)
+                                                            .strong()
+                                                            .color(txt_col),
                                                     )
-                                                } else {
-                                                    (
-                                                        "🔊 Auto Surround & Height Upmix (7.1.4 + EQ): OFF",
-                                                        egui::Color32::from_rgb(36, 34, 36),
-                                                        egui::Color32::from_rgb(90, 84, 76),
-                                                        egui::Color32::from_rgb(200, 192, 182),
-                                                    )
-                                                };
-                                                let upmix_btn = egui::Button::new(
-                                                    egui::RichText::new(btn_text)
-                                                        .size(11.5)
-                                                        .strong()
-                                                        .color(txt_col),
-                                                )
-                                                .fill(btn_fill)
-                                                .stroke(egui::Stroke::new(1.0_f32, btn_stroke))
-                                                .corner_radius(4.0);
-                                                if ui
-                                                    .ctx().input(|_| !state.file_loaded || crate::state::SurroundUpmixConfig::can_upmix(state.source_channels, state.hardware_channels)) && ui.add(upmix_btn)
-                                                    .on_hover_text("Automatically upmix stereo and non-surround audio so Left/Right spread across all left/right speakers (FL, SL, RL / FR, SR, RR) with Haas decorrelation, LFE crossover, and high-frequency routing to the height speakers (TFL, TFR, TRL, TRR). Replaces the top middle Piano Roll panel with a live Crossover & 5-band Parametric EQ editor. (Shortcut: 'u' / L3·R3)")
-                                                    .clicked()
-                                                {
-                                                    *engine_action = EngineAction::ToggleSurroundUpmix(!upmix_enabled);
-                                                }
-                                            });
+                                                    .fill(btn_fill)
+                                                    .stroke(egui::Stroke::new(1.0_f32, btn_stroke))
+                                                    .corner_radius(4.0);
+                                                    if ui
+                                                        .add(upmix_btn)
+                                                        .on_hover_text("Upmix the media file's audio channels to fill all remaining available channels on the surround output device. Replaces the top middle Piano Roll panel with a live Crossover & 5-band Parametric EQ editor. (Shortcut: 'u' / L3·R3)")
+                                                        .clicked()
+                                                    {
+                                                        *engine_action = EngineAction::ToggleSurroundUpmix(!upmix_enabled);
+                                                    }
+                                                });
+                                            }
 
                                             // 8. Next Song (placed at the bottom, smooth marquee if long)
                                             if state.playlist_index + 1 < state.playlist.len() {

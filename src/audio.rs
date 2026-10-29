@@ -787,11 +787,12 @@ impl SurroundUpmixerDsp {
     /// Upmixes a decoded multi-channel frame `frame_slice` with `source_channels` intrinsic channels
     /// to `hardware_channels`:
     /// - When `source_channels >= hardware_channels` or `hardware_channels <= 2`: passes all discrete
-    ///   channels through 1:1 untouched (never folds down native 7.1/5.1 to 2.0 stereo).
-    /// - When `source_channels <= 2`: performs full ITU-R BS.775 constant-power stereo-to-surround upmixing.
-    /// - When `2 < source_channels < hardware_channels` (e.g., discrete 5.1 on 7.1 or 7.1.4 hardware):
-    ///   preserves the discrete front/center/LFE channels (`FL, FR, FC, LFE`) 1:1 and expands the
-    ///   discrete surround channels (`SL, SR`) into rear (`RL, RR`) and height (`TFL..TRR`) speakers.
+    ///   channels through 1:1 untouched (never folds down native surround to stereo).
+    /// - When `source_channels <= 2`: performs full ITU-R BS.775 constant-power mono/stereo-to-surround upmixing
+    ///   across all `hardware_channels`.
+    /// - When `2 < source_channels < hardware_channels`: preserves all existing discrete channels from
+    ///   the media file in their canonical speaker positions and synthesizes the remaining available
+    ///   output channels (`FC`, `LFE`, `SL/SR`, `RL/RR`, `TFL..TRR`) so every output speaker is driven.
     #[inline]
     pub fn process_multichannel_frame_for_hardware(
         &mut self,
@@ -811,37 +812,125 @@ impl SurroundUpmixerDsp {
             let (l_in, r_in) = extract_stereo_pair_from_frame(frame_slice, src_ch);
             return self.process_frame_for_hardware(l_in, r_in, cfg, hardware_channels);
         }
-        // Discrete multi-channel expansion (e.g. 5.1 -> 7.1 or 5.1/7.1 -> 7.1.4):
-        // Keep discrete bed channels untouched, and feed the surround pair (SL, SR)
-        // into the decorrelated bed/height expander.
-        let (sur_l, sur_r) = if frame_slice.len() >= 8 && src_ch >= 8 {
-            (
-                (frame_slice[4] + frame_slice[6]) * std::f32::consts::FRAC_1_SQRT_2,
-                (frame_slice[5] + frame_slice[7]) * std::f32::consts::FRAC_1_SQRT_2,
-            )
-        } else if frame_slice.len() >= 6 && src_ch >= 6 {
-            (frame_slice[4], frame_slice[5])
-        } else if frame_slice.len() >= 4 {
-            (frame_slice[2], frame_slice[3])
-        } else {
-            (
-                frame_slice.first().copied().unwrap_or(0.0),
-                frame_slice.get(1).copied().unwrap_or(0.0),
-            )
-        };
-        let mut expanded = self.process_frame_for_hardware(sur_l, sur_r, cfg, hardware_channels);
-        if src_ch >= 8 && frame_slice.len() >= 8 {
-            expanded[..8].copy_from_slice(&frame_slice[..8]);
-        } else {
-            let discrete_front_count = src_ch.min(4).min(frame_slice.len());
-            expanded[..discrete_front_count].copy_from_slice(&frame_slice[..discrete_front_count]);
-            if src_ch >= 6 && frame_slice.len() >= 6 && hardware_channels >= 8 {
-                let pair_norm = std::f32::consts::FRAC_1_SQRT_2;
-                expanded[4] = (frame_slice[4] * pair_norm).clamp(-1.0, 1.0);
-                expanded[5] = (frame_slice[5] * pair_norm).clamp(-1.0, 1.0);
+
+        let fl = frame_slice.first().copied().unwrap_or(0.0);
+        let fr = frame_slice.get(1).copied().unwrap_or(fl);
+        const INV_SQRT2: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
+        match src_ch {
+            // 3.0 (FL, FR, FC) -> 4.0 / 5.0 / 5.1 / 6.1 / 7.1 / 7.1.x:
+            // Preserve discrete FL, FR, FC and synthesize LFE + Surround Bed (+ Height if >8ch) from (FL, FR).
+            3 => {
+                let fc = frame_slice.get(2).copied().unwrap_or(0.0);
+                let mut out = self.process_frame_for_hardware(fl, fr, cfg, hardware_channels);
+                if hardware_channels == 4 {
+                    // 4.0 Quad has [FL, FR, SL, SR] (no physical Center speaker)
+                    out[0] = (fl + fc * INV_SQRT2).clamp(-1.0, 1.0);
+                    out[1] = (fr + fc * INV_SQRT2).clamp(-1.0, 1.0);
+                } else {
+                    out[0] = fl.clamp(-1.0, 1.0);
+                    out[1] = fr.clamp(-1.0, 1.0);
+                    out[2] = fc.clamp(-1.0, 1.0);
+                }
+                out
+            }
+            // 4.0 Quad (FL, FR, SL, SR) -> 5.0 / 5.1 / 6.1 / 7.1 / 7.1.x:
+            // Preserve discrete FL, FR, SL, SR; synthesize FC + LFE from (FL, FR) and RL/RR (+ Height) from (SL, SR).
+            4 => {
+                let sl = frame_slice.get(2).copied().unwrap_or(0.0);
+                let sr = frame_slice.get(3).copied().unwrap_or(0.0);
+                let l_comb = (fl + sl * INV_SQRT2) * 0.75;
+                let r_comb = (fr + sr * INV_SQRT2) * 0.75;
+                let mut out =
+                    self.process_frame_for_hardware(l_comb, r_comb, cfg, hardware_channels);
+                out[0] = fl.clamp(-1.0, 1.0);
+                out[1] = fr.clamp(-1.0, 1.0);
+                if hardware_channels == 5 {
+                    // 5.0: [FL, FR, FC, SL, SR]
+                    out[3] = sl.clamp(-1.0, 1.0);
+                    out[4] = sr.clamp(-1.0, 1.0);
+                } else if hardware_channels == 6 {
+                    // 5.1: [FL, FR, FC, LFE, SL, SR]
+                    out[4] = sl.clamp(-1.0, 1.0);
+                    out[5] = sr.clamp(-1.0, 1.0);
+                } else {
+                    // >= 7 channels (6.1 / 7.1 / 7.1.x): scale discrete SL/SR by 1/sqrt(2) as rear pair is added
+                    out[4] = (sl * INV_SQRT2).clamp(-1.0, 1.0);
+                    out[5] = (sr * INV_SQRT2).clamp(-1.0, 1.0);
+                }
+                out
+            }
+            // 5.0 (FL, FR, FC, SL, SR) -> 5.1 / 6.1 / 7.1 / 7.1.x:
+            // Preserve discrete FL, FR, FC, SL, SR; synthesize LFE and RL/RR (+ Height).
+            5 => {
+                let fc = frame_slice.get(2).copied().unwrap_or(0.0);
+                let sl = frame_slice.get(3).copied().unwrap_or(0.0);
+                let sr = frame_slice.get(4).copied().unwrap_or(0.0);
+                let l_comb = (fl + fc * 0.5 + sl * INV_SQRT2) * 0.7;
+                let r_comb = (fr + fc * 0.5 + sr * INV_SQRT2) * 0.7;
+                let mut out =
+                    self.process_frame_for_hardware(l_comb, r_comb, cfg, hardware_channels);
+                out[0] = fl.clamp(-1.0, 1.0);
+                out[1] = fr.clamp(-1.0, 1.0);
+                out[2] = fc.clamp(-1.0, 1.0);
+                if hardware_channels == 6 {
+                    out[4] = sl.clamp(-1.0, 1.0);
+                    out[5] = sr.clamp(-1.0, 1.0);
+                } else {
+                    out[4] = (sl * INV_SQRT2).clamp(-1.0, 1.0);
+                    out[5] = (sr * INV_SQRT2).clamp(-1.0, 1.0);
+                }
+                out
+            }
+            // 5.1 (FL, FR, FC, LFE, SL, SR) -> 6.1 / 7.1 / 7.1.x:
+            // Preserve discrete FL, FR, FC, LFE, SL, SR and expand (SL, SR) into RL, RR (+ Height).
+            6 => {
+                let sl = frame_slice.get(4).copied().unwrap_or(0.0);
+                let sr = frame_slice.get(5).copied().unwrap_or(0.0);
+                let mut out = self.process_frame_for_hardware(sl, sr, cfg, hardware_channels);
+                for c in 0..4 {
+                    out[c] = frame_slice.get(c).copied().unwrap_or(0.0).clamp(-1.0, 1.0);
+                }
+                out[4] = (sl * INV_SQRT2).clamp(-1.0, 1.0);
+                out[5] = (sr * INV_SQRT2).clamp(-1.0, 1.0);
+                out
+            }
+            // 6.1 (FL, FR, FC, LFE, BC, SL, SR) -> 7.1 / 7.1.x:
+            // Preserve FL, FR, FC, LFE, SL, SR and expand BC + (SL, SR) into RL, RR (+ Height).
+            7 => {
+                let bc = frame_slice.get(4).copied().unwrap_or(0.0);
+                let sl = frame_slice.get(5).copied().unwrap_or(0.0);
+                let sr = frame_slice.get(6).copied().unwrap_or(0.0);
+                let mut out = self.process_frame_for_hardware(
+                    (sl + bc * INV_SQRT2) * INV_SQRT2,
+                    (sr + bc * INV_SQRT2) * INV_SQRT2,
+                    cfg,
+                    hardware_channels,
+                );
+                for c in 0..4 {
+                    out[c] = frame_slice.get(c).copied().unwrap_or(0.0).clamp(-1.0, 1.0);
+                }
+                out[4] = sl.clamp(-1.0, 1.0);
+                out[5] = sr.clamp(-1.0, 1.0);
+                out[6] = ((out[6] + bc * INV_SQRT2) * 0.75).clamp(-1.0, 1.0);
+                out[7] = ((out[7] + bc * INV_SQRT2) * 0.75).clamp(-1.0, 1.0);
+                out
+            }
+            // >= 8 channels (e.g. 7.1 -> 7.1.2 / 7.1.4):
+            // Preserve all existing discrete channels 0..src_ch and expand surround bed into remaining channels.
+            _ => {
+                let sur_l = (frame_slice.get(4).copied().unwrap_or(0.0)
+                    + frame_slice.get(6).copied().unwrap_or(0.0))
+                    * INV_SQRT2;
+                let sur_r = (frame_slice.get(5).copied().unwrap_or(0.0)
+                    + frame_slice.get(7).copied().unwrap_or(0.0))
+                    * INV_SQRT2;
+                let mut out = self.process_frame_for_hardware(sur_l, sur_r, cfg, hardware_channels);
+                let copy_n = src_ch.min(frame_slice.len()).min(12);
+                out[..copy_n].copy_from_slice(&frame_slice[..copy_n]);
+                out
             }
         }
-        expanded
     }
 
     /// Clears internal biquad filter states and Haas delay-line buffers so transitioning from
@@ -2532,6 +2621,18 @@ pub fn get_downmixed_sample(
             let sr = base_slice.get(6).copied().unwrap_or(0.0);
             (fl + fr + SQRT2 * fc + bc + sl + sr + lfe) * 0.3
         }
+        // 7.1 (FL, FR, FC, LFE, BL, BR, SL, SR) to 5.1 (FL, FR, FC, LFE, SL/BL, SR/BR)
+        (8, 6, c @ 0..=3) => base_slice.get(c).copied().unwrap_or(0.0),
+        (8, 6, 4) => {
+            let bl = base_slice.get(4).copied().unwrap_or(0.0);
+            let sl = base_slice.get(6).copied().unwrap_or(0.0);
+            (bl + sl) * INV_SQRT2
+        }
+        (8, 6, 5) => {
+            let br = base_slice.get(5).copied().unwrap_or(0.0);
+            let sr = base_slice.get(7).copied().unwrap_or(0.0);
+            (br + sr) * INV_SQRT2
+        }
         // 7.1 (FL, FR, FC, LFE, BL, BR, SL, SR) to Stereo
         (8, 2, 0) => {
             let fl = base_slice.first().copied().unwrap_or(0.0);
@@ -2560,6 +2661,62 @@ pub fn get_downmixed_sample(
             let sl = base_slice.get(6).copied().unwrap_or(0.0);
             let sr = base_slice.get(7).copied().unwrap_or(0.0);
             (fl + fr + SQRT2 * fc + bl + br + sl + sr + lfe) * 0.28
+        }
+        // >8 channels (7.1.4, 7.1.2, 5.1.4, Ambisonics) to 7.1 (FL, FR, FC, LFE, BL, BR, SL, SR)
+        (tc, 8, 0) if tc > 8 => {
+            let fl = base_slice.first().copied().unwrap_or(0.0);
+            let tfl = base_slice.get(8).copied().unwrap_or(0.0);
+            (fl + INV_SQRT2 * tfl) * 0.85
+        }
+        (tc, 8, 1) if tc > 8 => {
+            let fr = base_slice.get(1).copied().unwrap_or(0.0);
+            let tfr = base_slice.get(9).copied().unwrap_or(0.0);
+            (fr + INV_SQRT2 * tfr) * 0.85
+        }
+        (tc, 8, c @ 2..=3) if tc > 8 => base_slice.get(c).copied().unwrap_or(0.0) * 0.85,
+        (tc, 8, 4) if tc > 8 => {
+            let bl = base_slice.get(4).copied().unwrap_or(0.0);
+            let tbl = base_slice.get(10).copied().unwrap_or(0.0);
+            (bl + 0.5 * tbl) * 0.85
+        }
+        (tc, 8, 5) if tc > 8 => {
+            let br = base_slice.get(5).copied().unwrap_or(0.0);
+            let tbr = base_slice.get(11).copied().unwrap_or(0.0);
+            (br + 0.5 * tbr) * 0.85
+        }
+        (tc, 8, 6) if tc > 8 => {
+            let sl = base_slice.get(6).copied().unwrap_or(0.0);
+            let tbl = base_slice.get(10).copied().unwrap_or(0.0);
+            (sl + 0.5 * tbl) * 0.85
+        }
+        (tc, 8, 7) if tc > 8 => {
+            let sr = base_slice.get(7).copied().unwrap_or(0.0);
+            let tbr = base_slice.get(11).copied().unwrap_or(0.0);
+            (sr + 0.5 * tbr) * 0.85
+        }
+        // >8 channels (7.1.4, 7.1.2, 5.1.4, Ambisonics) to 5.1 (FL, FR, FC, LFE, SL/BL, SR/BR)
+        (tc, 6, 0) if tc > 8 => {
+            let fl = base_slice.first().copied().unwrap_or(0.0);
+            let tfl = base_slice.get(8).copied().unwrap_or(0.0);
+            (fl + INV_SQRT2 * tfl) * 0.8
+        }
+        (tc, 6, 1) if tc > 8 => {
+            let fr = base_slice.get(1).copied().unwrap_or(0.0);
+            let tfr = base_slice.get(9).copied().unwrap_or(0.0);
+            (fr + INV_SQRT2 * tfr) * 0.8
+        }
+        (tc, 6, c @ 2..=3) if tc > 8 => base_slice.get(c).copied().unwrap_or(0.0) * 0.8,
+        (tc, 6, 4) if tc > 8 => {
+            let bl = base_slice.get(4).copied().unwrap_or(0.0);
+            let sl = base_slice.get(6).copied().unwrap_or(0.0);
+            let tbl = base_slice.get(10).copied().unwrap_or(0.0);
+            (bl + sl + INV_SQRT2 * tbl) * 0.65
+        }
+        (tc, 6, 5) if tc > 8 => {
+            let br = base_slice.get(5).copied().unwrap_or(0.0);
+            let sr = base_slice.get(7).copied().unwrap_or(0.0);
+            let tbr = base_slice.get(11).copied().unwrap_or(0.0);
+            (br + sr + INV_SQRT2 * tbr) * 0.65
         }
         // >8 channels (7.1.4, Ambisonics, etc.) to Stereo
         (tc, 2, 0) if tc > 8 => {
@@ -3004,6 +3161,7 @@ impl AudioSource for SymphoniaSource {
             .map(|t| t.track_idx)
             .collect();
         list.sort();
+        list.dedup();
         if list.is_empty() {
             vec![self.selected_track_idx]
         } else {
@@ -3062,8 +3220,804 @@ impl AudioSource for SymphoniaSource {
 }
 
 // ---------------------------------------------------------
-// FFmpeg Native Decoder
+// FFmpeg Native Decoder (including AOMedia IAMF / Eclipsa Audio)
 // ---------------------------------------------------------
+#[cfg(not(target_os = "android"))]
+#[derive(Clone, Debug)]
+pub struct IamfSubstreamChannelMap {
+    pub stream_index: usize,
+    pub substream_channel: usize,
+    /// `(target_speaker_idx, linear_gain)` in canonical speaker order:
+    /// `[0:FL, 1:FR, 2:FC, 3:LFE, 4:BL, 5:BR, 6:SL, 7:SR, 8:TFL, 9:TFR, 10:TBL, 11:TBR]`
+    pub targets: Vec<(usize, f32)>,
+}
+
+#[cfg(not(target_os = "android"))]
+#[derive(Clone, Debug)]
+pub struct IamfTrackGroup {
+    pub substream_indices: Vec<usize>,
+    pub reconstructed_channels: u16,
+    pub layout_label: String,
+    pub annotation: Option<String>,
+    pub language: Option<String>,
+    pub channel_mappings: Vec<IamfSubstreamChannelMap>,
+}
+
+#[cfg(not(target_os = "android"))]
+#[repr(C)]
+struct FfiIamfLayer {
+    av_class: *const ffmpeg_next::ffi::AVClass,
+    ch_layout: ffmpeg_next::ffi::AVChannelLayout,
+    flags: std::ffi::c_uint,
+    output_gain_flags: std::ffi::c_uint,
+    output_gain: ffmpeg_next::ffi::AVRational,
+    ambisonics_mode: std::ffi::c_uint,
+    demixing_matrix: *mut ffmpeg_next::ffi::AVRational,
+    nb_demixing_matrix: std::ffi::c_uint,
+}
+
+#[cfg(not(target_os = "android"))]
+#[repr(C)]
+struct FfiIamfAudioElement {
+    av_class: *const ffmpeg_next::ffi::AVClass,
+    layers: *mut *mut FfiIamfLayer,
+    nb_layers: std::ffi::c_uint,
+    demixing_info: *mut std::ffi::c_void,
+    recon_gain_info: *mut std::ffi::c_void,
+    audio_element_type: std::ffi::c_uint,
+    default_w: std::ffi::c_uint,
+}
+
+#[cfg(not(target_os = "android"))]
+#[repr(C)]
+struct FfiIamfSubmixElement {
+    av_class: *const ffmpeg_next::ffi::AVClass,
+    audio_element_id: std::ffi::c_uint,
+    element_mix_config: *mut std::ffi::c_void,
+    default_mix_gain: ffmpeg_next::ffi::AVRational,
+    headphones_rendering_mode: std::ffi::c_uint,
+    annotations: *mut ffmpeg_next::ffi::AVDictionary,
+}
+
+#[cfg(not(target_os = "android"))]
+#[repr(C)]
+struct FfiIamfSubmix {
+    av_class: *const ffmpeg_next::ffi::AVClass,
+    elements: *mut *mut FfiIamfSubmixElement,
+    nb_elements: std::ffi::c_uint,
+    layouts: *mut *mut std::ffi::c_void,
+    nb_layouts: std::ffi::c_uint,
+    output_mix_config: *mut std::ffi::c_void,
+    default_mix_gain: ffmpeg_next::ffi::AVRational,
+}
+
+#[cfg(not(target_os = "android"))]
+#[repr(C)]
+struct FfiIamfMixPresentation {
+    av_class: *const ffmpeg_next::ffi::AVClass,
+    submixes: *mut *mut FfiIamfSubmix,
+    nb_submixes: std::ffi::c_uint,
+    annotations: *mut ffmpeg_next::ffi::AVDictionary,
+}
+
+#[cfg(not(target_os = "android"))]
+fn iamf_rational_db_to_linear(r: ffmpeg_next::ffi::AVRational) -> f32 {
+    if r.den == 0 || r.num == 0 {
+        return 1.0;
+    }
+    let db = (r.num as f32 / r.den as f32).clamp(-60.0, 24.0);
+    10.0f32.powf(db / 20.0)
+}
+
+#[cfg(not(target_os = "android"))]
+unsafe fn extract_first_av_dict_entry(
+    dict: *const ffmpeg_next::ffi::AVDictionary,
+) -> (Option<String>, Option<String>) {
+    if dict.is_null() {
+        return (None, None);
+    }
+    let entry = unsafe {
+        ffmpeg_next::ffi::av_dict_get(
+            dict,
+            c"".as_ptr(),
+            std::ptr::null(),
+            ffmpeg_next::ffi::AV_DICT_IGNORE_SUFFIX,
+        )
+    };
+    if entry.is_null() {
+        return (None, None);
+    }
+    let key = if !unsafe { (*entry).key }.is_null() {
+        unsafe { std::ffi::CStr::from_ptr((*entry).key) }
+            .to_str()
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && s.to_lowercase() != "und")
+    } else {
+        None
+    };
+    let val = if !unsafe { (*entry).value }.is_null() {
+        unsafe { std::ffi::CStr::from_ptr((*entry).value) }
+            .to_str()
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty() && s != "default_mix_presentation")
+    } else {
+        None
+    };
+    (key, val)
+}
+
+#[cfg(not(target_os = "android"))]
+pub fn map_iamf_av_channels_to_canonical(
+    av_channels: &[i32],
+    substreams: &[(usize, u16)],
+) -> (u16, String, Vec<IamfSubstreamChannelMap>) {
+    use ffmpeg_next::ffi::AVChannel::*;
+    const INV_SQRT2: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
+    let has_height = av_channels.iter().any(|&c| {
+        c == AV_CHAN_TOP_CENTER as i32
+            || c == AV_CHAN_TOP_FRONT_LEFT as i32
+            || c == AV_CHAN_TOP_FRONT_CENTER as i32
+            || c == AV_CHAN_TOP_FRONT_RIGHT as i32
+            || c == AV_CHAN_TOP_BACK_LEFT as i32
+            || c == AV_CHAN_TOP_BACK_CENTER as i32
+            || c == AV_CHAN_TOP_BACK_RIGHT as i32
+            || c == AV_CHAN_TOP_SIDE_LEFT as i32
+            || c == AV_CHAN_TOP_SIDE_RIGHT as i32
+            || c == AV_CHAN_TOP_SURROUND_LEFT as i32
+            || c == AV_CHAN_TOP_SURROUND_RIGHT as i32
+    });
+    let has_back = av_channels
+        .iter()
+        .any(|&c| c == AV_CHAN_BACK_LEFT as i32 || c == AV_CHAN_BACK_RIGHT as i32);
+    let has_side = av_channels.iter().any(|&c| {
+        c == AV_CHAN_SIDE_LEFT as i32
+            || c == AV_CHAN_SIDE_RIGHT as i32
+            || c == AV_CHAN_SIDE_SURROUND_LEFT as i32
+            || c == AV_CHAN_SIDE_SURROUND_RIGHT as i32
+            || c == AV_CHAN_SURROUND_DIRECT_LEFT as i32
+            || c == AV_CHAN_SURROUND_DIRECT_RIGHT as i32
+    });
+    let has_top_back = av_channels
+        .iter()
+        .any(|&c| c == AV_CHAN_TOP_BACK_LEFT as i32 || c == AV_CHAN_TOP_BACK_RIGHT as i32);
+
+    let nb_ch = av_channels.len();
+    let (recon_channels, layout_label) = if has_height {
+        let lbl = match nb_ch {
+            12 => "7.1.4".to_string(),
+            10 if has_back && has_side => "7.1.2".to_string(),
+            10 => "5.1.4".to_string(),
+            8 => "5.1.2".to_string(),
+            6 => "3.1.2".to_string(),
+            14 => "9.1.4".to_string(),
+            16 => "9.1.6".to_string(),
+            n => format!("{} ch", n),
+        };
+        (12u16, lbl)
+    } else if nb_ch >= 7 {
+        (
+            8u16,
+            if nb_ch == 8 {
+                "7.1".to_string()
+            } else {
+                "6.1".to_string()
+            },
+        )
+    } else if nb_ch >= 5 {
+        (
+            6u16,
+            if nb_ch == 6 {
+                "5.1".to_string()
+            } else {
+                "5.0".to_string()
+            },
+        )
+    } else if nb_ch == 4 {
+        (4u16, "4.0".to_string())
+    } else if nb_ch == 3 {
+        (3u16, "3.0".to_string())
+    } else if nb_ch == 2 {
+        (2u16, "Stereo".to_string())
+    } else {
+        (1u16, "Mono".to_string())
+    };
+
+    let mut mappings = Vec::with_capacity(nb_ch);
+    let mut flat_idx = 0usize;
+    for &(stream_index, sub_ch_count) in substreams {
+        for sub_ch in 0..(sub_ch_count as usize) {
+            let chan_id = av_channels
+                .get(flat_idx)
+                .copied()
+                .unwrap_or(AV_CHAN_NONE as i32);
+            flat_idx += 1;
+
+            let targets: Vec<(usize, f32)> = if chan_id == AV_CHAN_FRONT_LEFT as i32
+                || chan_id == AV_CHAN_STEREO_LEFT as i32
+                || chan_id == AV_CHAN_BINAURAL_LEFT as i32
+                || chan_id == AV_CHAN_WIDE_LEFT as i32
+            {
+                vec![(0, 1.0)]
+            } else if chan_id == AV_CHAN_FRONT_RIGHT as i32
+                || chan_id == AV_CHAN_STEREO_RIGHT as i32
+                || chan_id == AV_CHAN_BINAURAL_RIGHT as i32
+                || chan_id == AV_CHAN_WIDE_RIGHT as i32
+            {
+                vec![(1, 1.0)]
+            } else if chan_id == AV_CHAN_FRONT_CENTER as i32 {
+                if recon_channels == 1 {
+                    vec![(0, 1.0)]
+                } else if recon_channels == 2 {
+                    vec![(0, INV_SQRT2), (1, INV_SQRT2)]
+                } else {
+                    vec![(2, 1.0)]
+                }
+            } else if chan_id == AV_CHAN_LOW_FREQUENCY as i32
+                || chan_id == AV_CHAN_LOW_FREQUENCY_2 as i32
+            {
+                if recon_channels >= 4 {
+                    vec![(3, 1.0)]
+                } else {
+                    vec![(0, 0.5), (1, 0.5)]
+                }
+            } else if chan_id == AV_CHAN_BACK_LEFT as i32 {
+                if recon_channels == 6 {
+                    vec![(4, 1.0)]
+                } else if recon_channels >= 8 {
+                    if !has_side {
+                        vec![(4, INV_SQRT2), (6, INV_SQRT2)]
+                    } else {
+                        vec![(4, 1.0)]
+                    }
+                } else if recon_channels == 4 {
+                    vec![(2, 1.0)]
+                } else {
+                    vec![(0, INV_SQRT2)]
+                }
+            } else if chan_id == AV_CHAN_BACK_RIGHT as i32 {
+                if recon_channels == 6 {
+                    vec![(5, 1.0)]
+                } else if recon_channels >= 8 {
+                    if !has_side {
+                        vec![(5, INV_SQRT2), (7, INV_SQRT2)]
+                    } else {
+                        vec![(5, 1.0)]
+                    }
+                } else if recon_channels == 4 {
+                    vec![(3, 1.0)]
+                } else {
+                    vec![(1, INV_SQRT2)]
+                }
+            } else if chan_id == AV_CHAN_SIDE_LEFT as i32
+                || chan_id == AV_CHAN_SIDE_SURROUND_LEFT as i32
+                || chan_id == AV_CHAN_SURROUND_DIRECT_LEFT as i32
+            {
+                if recon_channels == 6 {
+                    vec![(4, 1.0)]
+                } else if recon_channels >= 8 {
+                    if !has_back {
+                        vec![(4, INV_SQRT2), (6, INV_SQRT2)]
+                    } else {
+                        vec![(6, 1.0)]
+                    }
+                } else if recon_channels == 4 {
+                    vec![(2, 1.0)]
+                } else {
+                    vec![(0, INV_SQRT2)]
+                }
+            } else if chan_id == AV_CHAN_SIDE_RIGHT as i32
+                || chan_id == AV_CHAN_SIDE_SURROUND_RIGHT as i32
+                || chan_id == AV_CHAN_SURROUND_DIRECT_RIGHT as i32
+            {
+                if recon_channels == 6 {
+                    vec![(5, 1.0)]
+                } else if recon_channels >= 8 {
+                    if !has_back {
+                        vec![(5, INV_SQRT2), (7, INV_SQRT2)]
+                    } else {
+                        vec![(7, 1.0)]
+                    }
+                } else if recon_channels == 4 {
+                    vec![(3, 1.0)]
+                } else {
+                    vec![(1, INV_SQRT2)]
+                }
+            } else if chan_id == AV_CHAN_BACK_CENTER as i32 {
+                if recon_channels >= 6 {
+                    vec![(4, INV_SQRT2), (5, INV_SQRT2)]
+                } else {
+                    vec![(0, 0.5), (1, 0.5)]
+                }
+            } else if chan_id == AV_CHAN_TOP_FRONT_LEFT as i32
+                || chan_id == AV_CHAN_TOP_SIDE_LEFT as i32
+                || chan_id == AV_CHAN_TOP_SURROUND_LEFT as i32
+            {
+                if recon_channels >= 12 {
+                    if !has_top_back {
+                        vec![(8, INV_SQRT2), (10, INV_SQRT2)]
+                    } else {
+                        vec![(8, 1.0)]
+                    }
+                } else {
+                    vec![(0, INV_SQRT2)]
+                }
+            } else if chan_id == AV_CHAN_TOP_FRONT_RIGHT as i32
+                || chan_id == AV_CHAN_TOP_SIDE_RIGHT as i32
+                || chan_id == AV_CHAN_TOP_SURROUND_RIGHT as i32
+            {
+                if recon_channels >= 12 {
+                    if !has_top_back {
+                        vec![(9, INV_SQRT2), (11, INV_SQRT2)]
+                    } else {
+                        vec![(9, 1.0)]
+                    }
+                } else {
+                    vec![(1, INV_SQRT2)]
+                }
+            } else if chan_id == AV_CHAN_TOP_BACK_LEFT as i32 {
+                if recon_channels >= 12 {
+                    vec![(10, 1.0)]
+                } else {
+                    vec![(4, INV_SQRT2)]
+                }
+            } else if chan_id == AV_CHAN_TOP_BACK_RIGHT as i32 {
+                if recon_channels >= 12 {
+                    vec![(11, 1.0)]
+                } else {
+                    vec![(5, INV_SQRT2)]
+                }
+            } else if chan_id == AV_CHAN_TOP_FRONT_CENTER as i32 {
+                if recon_channels >= 12 {
+                    vec![(8, INV_SQRT2), (9, INV_SQRT2)]
+                } else {
+                    vec![(2, INV_SQRT2)]
+                }
+            } else if chan_id == AV_CHAN_TOP_BACK_CENTER as i32 {
+                if recon_channels >= 12 {
+                    vec![(10, INV_SQRT2), (11, INV_SQRT2)]
+                } else {
+                    vec![(4, 0.5), (5, 0.5)]
+                }
+            } else if chan_id == AV_CHAN_TOP_CENTER as i32 {
+                if recon_channels >= 12 {
+                    vec![(8, 0.5), (9, 0.5), (10, 0.5), (11, 0.5)]
+                } else {
+                    vec![(0, 0.5), (1, 0.5)]
+                }
+            } else if chan_id == AV_CHAN_FRONT_LEFT_OF_CENTER as i32 {
+                if recon_channels >= 3 {
+                    vec![(0, 0.8), (2, 0.5)]
+                } else {
+                    vec![(0, 1.0)]
+                }
+            } else if chan_id == AV_CHAN_FRONT_RIGHT_OF_CENTER as i32 {
+                if recon_channels >= 3 {
+                    vec![(1, 0.8), (2, 0.5)]
+                } else {
+                    vec![(1, 1.0)]
+                }
+            } else {
+                let fallback_ch = (flat_idx - 1).min(recon_channels.saturating_sub(1) as usize);
+                vec![(fallback_ch, 1.0)]
+            };
+
+            mappings.push(IamfSubstreamChannelMap {
+                stream_index,
+                substream_channel: sub_ch,
+                targets,
+            });
+        }
+    }
+
+    (recon_channels, layout_label, mappings)
+}
+
+#[cfg(not(target_os = "android"))]
+fn map_iamf_ambisonics_to_canonical(
+    substreams: &[(usize, u16)],
+    nb_acn_channels: usize,
+) -> (u16, String, Vec<IamfSubstreamChannelMap>) {
+    // ITU-R BS.2051-3 7.1.4 speaker unit vectors (x=cos(az)*cos(el), y=sin(az)*cos(el), z=sin(el))
+    // in canonical speaker order [0:FL, 1:FR, 2:FC, 3:LFE, 4:BL, 5:BR, 6:SL, 7:SR, 8:TFL, 9:TFR, 10:TBL, 11:TBR]
+    const SPEAKER_DIRS: [(f32, f32, f32); 12] = [
+        (0.8660, 0.5000, 0.0000),   // 0: FL (+30, 0)
+        (0.8660, -0.5000, 0.0000),  // 1: FR (-30, 0)
+        (1.0000, 0.0000, 0.0000),   // 2: FC (0, 0)
+        (0.0000, 0.0000, 0.0000),   // 3: LFE (omni W only)
+        (-0.7071, 0.7071, 0.0000),  // 4: BL (+135, 0)
+        (-0.7071, -0.7071, 0.0000), // 5: BR (-135, 0)
+        (0.0000, 1.0000, 0.0000),   // 6: SL (+90, 0)
+        (0.0000, -1.0000, 0.0000),  // 7: SR (-90, 0)
+        (0.5000, 0.5000, 0.7071),   // 8: TFL (+45, +45)
+        (0.5000, -0.5000, 0.7071),  // 9: TFR (-45, +45)
+        (-0.5000, 0.5000, 0.7071),  // 10: TBL (+135, +45)
+        (-0.5000, -0.5000, 0.7071), // 11: TBR (-135, +45)
+    ];
+
+    let mut mappings = Vec::new();
+    let mut acn_idx = 0usize;
+    for &(stream_index, sub_ch_count) in substreams {
+        for sub_ch in 0..(sub_ch_count as usize) {
+            let mut targets = Vec::new();
+            match acn_idx {
+                // ACN 0 = W (omnidirectional)
+                0 => {
+                    for s in 0..12 {
+                        let w = if s == 3 { 0.25 } else { 0.35 };
+                        targets.push((s, w));
+                    }
+                }
+                // ACN 1 = Y (Left-Right dipole)
+                1 => {
+                    for (s, &(_, y, _)) in SPEAKER_DIRS.iter().enumerate() {
+                        if s != 3 && y.abs() > 0.01 {
+                            targets.push((s, 0.35 * y));
+                        }
+                    }
+                }
+                // ACN 2 = Z (Up-Down dipole)
+                2 => {
+                    for (s, &(_, _, z)) in SPEAKER_DIRS.iter().enumerate() {
+                        if s != 3 && z.abs() > 0.01 {
+                            targets.push((s, 0.35 * z));
+                        }
+                    }
+                }
+                // ACN 3 = X (Front-Back dipole)
+                3 => {
+                    for (s, &(x, _, _)) in SPEAKER_DIRS.iter().enumerate() {
+                        if s != 3 && x.abs() > 0.01 {
+                            targets.push((s, 0.35 * x));
+                        }
+                    }
+                }
+                _ => {}
+            }
+            mappings.push(IamfSubstreamChannelMap {
+                stream_index,
+                substream_channel: sub_ch,
+                targets,
+            });
+            acn_idx += 1;
+        }
+    }
+
+    let order_label = match nb_acn_channels {
+        4 => "FOA 7.1.4".to_string(),
+        9 => "SOA 7.1.4".to_string(),
+        16 => "TOA 7.1.4".to_string(),
+        n => format!("Ambisonics {}ch", n),
+    };
+    (12, order_label, mappings)
+}
+
+#[cfg(not(target_os = "android"))]
+fn probe_iamf_stream_groups(ictx: &ffmpeg_next::format::context::Input) -> Vec<IamfTrackGroup> {
+    let mut result = Vec::new();
+
+    unsafe {
+        let fmt_ptr = ictx.as_ptr();
+        if fmt_ptr.is_null() {
+            return result;
+        }
+        let nb_groups = (*fmt_ptr).nb_stream_groups as usize;
+        let groups_ptr = (*fmt_ptr).stream_groups;
+        if nb_groups == 0 || groups_ptr.is_null() {
+            return result;
+        }
+
+        let mut audio_elements: Vec<(i64, IamfTrackGroup)> = Vec::new();
+
+        // 1. Parse all IAMF Audio Element stream groups
+        for g_idx in 0..nb_groups {
+            let grp = *groups_ptr.add(g_idx);
+            if grp.is_null() {
+                continue;
+            }
+            if (*grp).type_
+                != ffmpeg_next::ffi::AVStreamGroupParamsType::AV_STREAM_GROUP_PARAMS_IAMF_AUDIO_ELEMENT
+            {
+                continue;
+            }
+            let elem_ptr = (*grp).params.iamf_audio_element as *const FfiIamfAudioElement;
+            if elem_ptr.is_null() || (*elem_ptr).nb_layers == 0 || (*elem_ptr).layers.is_null() {
+                continue;
+            }
+
+            let nb_streams = (*grp).nb_streams as usize;
+            if nb_streams == 0 || (*grp).streams.is_null() {
+                continue;
+            }
+
+            let mut substreams = Vec::with_capacity(nb_streams);
+            let mut substream_indices = Vec::with_capacity(nb_streams);
+            for s in 0..nb_streams {
+                let st_ptr = *(*grp).streams.add(s);
+                if st_ptr.is_null() || (*st_ptr).codecpar.is_null() {
+                    continue;
+                }
+                let s_idx = (*st_ptr).index as usize;
+                let ch = (*(*st_ptr).codecpar).ch_layout.nb_channels.max(1) as u16;
+                substreams.push((s_idx, ch));
+                if !substream_indices.contains(&s_idx) {
+                    substream_indices.push(s_idx);
+                }
+            }
+            if substreams.is_empty() {
+                continue;
+            }
+
+            let nb_layers = (*elem_ptr).nb_layers as usize;
+            let final_layer = *(*elem_ptr).layers.add(nb_layers - 1);
+            if final_layer.is_null() {
+                continue;
+            }
+
+            let layout_ptr = &(*final_layer).ch_layout;
+            let nb_layout_ch = layout_ptr.nb_channels.max(1) as usize;
+            let layer_gain = if (*final_layer).output_gain_flags != 0 {
+                iamf_rational_db_to_linear((*final_layer).output_gain)
+            } else {
+                1.0
+            };
+
+            let (recon_channels, layout_label, mut mappings) =
+                if (*elem_ptr).audio_element_type == 1 {
+                    map_iamf_ambisonics_to_canonical(&substreams, nb_layout_ch)
+                } else {
+                    let mut av_channels = Vec::with_capacity(nb_layout_ch);
+                    for c_idx in 0..nb_layout_ch {
+                        let ch_enum = ffmpeg_next::ffi::av_channel_layout_channel_from_index(
+                            layout_ptr,
+                            c_idx as std::ffi::c_uint,
+                        );
+                        av_channels.push(ch_enum as i32);
+                    }
+                    map_iamf_av_channels_to_canonical(&av_channels, &substreams)
+                };
+
+            if (layer_gain - 1.0).abs() > 1e-4 {
+                for m in &mut mappings {
+                    for t in &mut m.targets {
+                        t.1 *= layer_gain;
+                    }
+                }
+            }
+
+            audio_elements.push((
+                (*grp).id,
+                IamfTrackGroup {
+                    substream_indices,
+                    reconstructed_channels: recon_channels,
+                    layout_label,
+                    annotation: None,
+                    language: None,
+                    channel_mappings: mappings,
+                },
+            ));
+        }
+
+        if audio_elements.is_empty() {
+            return result;
+        }
+
+        let mut used_element_ids = std::collections::HashSet::new();
+
+        // 2. Parse IAMF Mix Presentation stream groups referencing the Audio Elements
+        for g_idx in 0..nb_groups {
+            let grp = *groups_ptr.add(g_idx);
+            if grp.is_null() {
+                continue;
+            }
+            if (*grp).type_
+                != ffmpeg_next::ffi::AVStreamGroupParamsType::AV_STREAM_GROUP_PARAMS_IAMF_MIX_PRESENTATION
+            {
+                continue;
+            }
+            let mix_ptr = (*grp).params.iamf_mix_presentation as *const FfiIamfMixPresentation;
+            if mix_ptr.is_null() || (*mix_ptr).nb_submixes == 0 || (*mix_ptr).submixes.is_null() {
+                continue;
+            }
+
+            let (mix_lang, mix_annot) = extract_first_av_dict_entry((*mix_ptr).annotations);
+            let nb_submixes = (*mix_ptr).nb_submixes as usize;
+
+            for sm_idx in 0..nb_submixes {
+                let submix_ptr = *(*mix_ptr).submixes.add(sm_idx);
+                if submix_ptr.is_null()
+                    || (*submix_ptr).nb_elements == 0
+                    || (*submix_ptr).elements.is_null()
+                {
+                    continue;
+                }
+                let submix_gain = iamf_rational_db_to_linear((*submix_ptr).default_mix_gain);
+                let nb_elems = (*submix_ptr).nb_elements as usize;
+
+                let mut combined_substreams = Vec::new();
+                let mut combined_mappings = Vec::new();
+                let mut max_recon_ch = 1u16;
+                let mut primary_layout_label = String::new();
+                let mut elem_annot_opt = None;
+                let mut elem_lang_opt = None;
+
+                for el_idx in 0..nb_elems {
+                    let sub_el = *(*submix_ptr).elements.add(el_idx);
+                    if sub_el.is_null() {
+                        continue;
+                    }
+                    let target_id = (*sub_el).audio_element_id as i64;
+                    let elem_gain =
+                        submix_gain * iamf_rational_db_to_linear((*sub_el).default_mix_gain);
+                    let (el_lang, el_annot) = extract_first_av_dict_entry((*sub_el).annotations);
+                    if elem_lang_opt.is_none() {
+                        elem_lang_opt = el_lang;
+                    }
+                    if elem_annot_opt.is_none() {
+                        elem_annot_opt = el_annot;
+                    }
+
+                    if let Some((_, elem_group)) =
+                        audio_elements.iter().find(|(id, _)| *id == target_id)
+                    {
+                        used_element_ids.insert(target_id);
+                        for &s_idx in &elem_group.substream_indices {
+                            if !combined_substreams.contains(&s_idx) {
+                                combined_substreams.push(s_idx);
+                            }
+                        }
+                        if elem_group.reconstructed_channels >= max_recon_ch {
+                            max_recon_ch = elem_group.reconstructed_channels;
+                            primary_layout_label = elem_group.layout_label.clone();
+                        }
+                        for mut m in elem_group.channel_mappings.clone() {
+                            if (elem_gain - 1.0).abs() > 1e-4 {
+                                for t in &mut m.targets {
+                                    t.1 *= elem_gain;
+                                }
+                            }
+                            combined_mappings.push(m);
+                        }
+                    }
+                }
+
+                if !combined_substreams.is_empty() {
+                    let annot = match (mix_annot.as_deref(), elem_annot_opt.as_deref()) {
+                        (Some(ma), Some(ea)) if ma != ea && ea != primary_layout_label => {
+                            Some(format!("{} - {}", ma, ea))
+                        }
+                        (Some(ma), _) if ma != primary_layout_label => Some(ma.to_string()),
+                        (_, Some(ea)) if ea != primary_layout_label => Some(ea.to_string()),
+                        _ => None,
+                    };
+                    result.push(IamfTrackGroup {
+                        substream_indices: combined_substreams,
+                        reconstructed_channels: max_recon_ch,
+                        layout_label: primary_layout_label,
+                        annotation: annot,
+                        language: mix_lang.clone().or(elem_lang_opt),
+                        channel_mappings: combined_mappings,
+                    });
+                }
+            }
+        }
+
+        // 3. Include any unreferenced IAMF Audio Elements directly
+        for (id, elem_group) in audio_elements {
+            if !used_element_ids.contains(&id) {
+                result.push(elem_group);
+            }
+        }
+    }
+
+    result
+}
+
+/// Estimates or scans the duration in seconds of a standalone `.iamf` OBU stream when
+/// container header duration is unavailable (`AV_NOPTS_VALUE`).
+#[cfg(not(target_os = "android"))]
+fn probe_iamf_duration_seconds(file_path: &str) -> Option<f64> {
+    let file_len = std::fs::metadata(file_path).ok()?.len();
+    if file_len == 0 {
+        return None;
+    }
+    let mut probe_ctx = ffmpeg_next::format::input(&file_path).ok()?;
+    let st0 = probe_ctx.stream(0)?;
+    let tb = st0.time_base();
+    if tb.denominator() <= 0 || tb.numerator() <= 0 {
+        return None;
+    }
+    let tb_f64 = tb.numerator() as f64 / tb.denominator() as f64;
+
+    let mut max_end_pts: i64 = 0;
+    let mut first_pos: Option<i64> = None;
+    let mut last_pos: i64 = 0;
+    let mut packets_seen = 0usize;
+    let scan_all = file_len <= 32 * 1024 * 1024;
+
+    for (stream, pkt) in probe_ctx.packets() {
+        let pos = pkt.position() as i64;
+        if pos > 0 {
+            if first_pos.is_none() {
+                first_pos = Some(pos);
+            }
+            if pos > last_pos {
+                last_pos = pos;
+            }
+        }
+        if stream.index() == 0 {
+            let pts = pkt.pts().or_else(|| pkt.dts()).unwrap_or(0).max(0);
+            let end_pts = pts + pkt.duration().max(0);
+            if end_pts > max_end_pts {
+                max_end_pts = end_pts;
+            }
+        }
+        packets_seen += 1;
+        if !scan_all && packets_seen >= 512 {
+            break;
+        }
+    }
+
+    let observed_sec = max_end_pts as f64 * tb_f64;
+    if observed_sec <= 0.0 {
+        return None;
+    }
+    if scan_all {
+        Some(observed_sec)
+    } else if let Some(fp) = first_pos
+        && last_pos > fp
+    {
+        let bytes_span = (last_pos - fp) as f64;
+        let total_payload = (file_len as i64 - fp).max(1) as f64;
+        Some((observed_sec * total_payload / bytes_span).max(observed_sec))
+    } else {
+        Some(observed_sec)
+    }
+}
+
+/// Detects whether a file is a standalone `.iamf` stream or an ISO-BMFF container (`.mp4`, `.m4a`, `.mov`)
+/// carrying IAMF / Eclipsa Audio (`iamf` brand or `iacb` configuration box).
+pub fn is_iamf_container(file_path: &str) -> bool {
+    let lower = file_path.to_lowercase();
+    if lower.ends_with(".iamf") {
+        return true;
+    }
+    if !lower.ends_with(".mp4")
+        && !lower.ends_with(".m4a")
+        && !lower.ends_with(".mov")
+        && !lower.ends_with(".m4v")
+    {
+        return false;
+    }
+    if let Ok(mut f) = std::fs::File::open(file_path) {
+        use std::io::{Read, Seek, SeekFrom};
+        let file_len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        let head_len = (256 * 1024).min(file_len as usize);
+        let mut buf = vec![0u8; head_len];
+        if let Ok(n) = f.read(&mut buf) {
+            buf.truncate(n);
+            if buf.windows(4).any(|w| w == b"iamf" || w == b"iacb") {
+                return true;
+            }
+        }
+        if file_len > 256 * 1024 {
+            let tail_len = (256 * 1024).min((file_len - 256 * 1024) as usize);
+            let mut tail = vec![0u8; tail_len];
+            if f.seek(SeekFrom::End(-(tail_len as i64))).is_ok()
+                && let Ok(n) = f.read(&mut tail)
+            {
+                tail.truncate(n);
+                if tail.windows(4).any(|w| w == b"iamf" || w == b"iacb") {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
 #[cfg(not(target_os = "android"))]
 struct ActiveFfmpegTrack {
     track_idx: usize,
@@ -3078,6 +4032,7 @@ struct ActiveFfmpegTrack {
     time_base: f64,
     current_time: f64,
     seek_in_progress: bool,
+    substream_bitrate_kbps: Option<u32>,
 }
 
 #[cfg(not(target_os = "android"))]
@@ -3085,6 +4040,7 @@ struct FfmpegSource {
     ictx: ffmpeg_next::format::context::Input,
     active_tracks: std::collections::HashMap<usize, ActiveFfmpegTrack>,
     primary_stream_index: usize,
+    iamf_groups: Vec<Option<IamfTrackGroup>>,
 
     channels: u16,
     time_base: f64,
@@ -3131,7 +4087,8 @@ impl FfmpegSource {
     fn fill_buffers(&mut self) -> bool {
         let mut progress = false;
         let target_pos_opt = self.target_seek_time;
-        let is_2track = self.audio_tracks.len() == 2;
+        let has_iamf = self.iamf_groups.iter().any(|g| g.is_some());
+        let is_2track = self.audio_tracks.len() == 2 && !has_iamf;
         let need_t0 = is_2track && (self.is_full_mix_guide || self.current_time < 3.0);
 
         // 1. Drain any packets currently in the active decoders
@@ -3278,11 +4235,10 @@ impl FfmpegSource {
                             } else {
                                 self.output_sample_rate
                             };
-                            if let Some(slot) = self.audio_track_bitrates.get_mut(track.track_idx)
-                                && slot.is_none()
-                            {
+                            if track.substream_bitrate_kbps.is_none() {
                                 if track.decoder.bit_rate() > 0 {
-                                    *slot = Some((track.decoder.bit_rate() / 1000).max(1) as u32);
+                                    track.substream_bitrate_kbps =
+                                        Some((track.decoder.bit_rate() / 1000).max(1) as u32);
                                 } else if decoded.samples() > 0 && dec_rate > 0 && packet.size() > 0
                                 {
                                     let frame_dur = decoded.samples() as f64 / dec_rate as f64;
@@ -3292,10 +4248,17 @@ impl FfmpegSource {
                                             .round()
                                             as u32;
                                         if kbps > 0 {
-                                            *slot = Some(kbps);
+                                            track.substream_bitrate_kbps = Some(kbps);
                                         }
                                     }
                                 }
+                            }
+                            if !has_iamf
+                                && let Some(slot) =
+                                    self.audio_track_bitrates.get_mut(track.track_idx)
+                                && slot.is_none()
+                            {
+                                *slot = track.substream_bitrate_kbps;
                             }
                             let dec_layout =
                                 safe_ffmpeg_channel_layout(decoded.channel_layout(), dec_ch);
@@ -3368,7 +4331,30 @@ impl FfmpegSource {
             }
         }
 
-        if let Some(primary) = self.active_tracks.get(&self.primary_stream_index)
+        if has_iamf {
+            for (t_idx, grp_opt) in self.iamf_groups.iter().enumerate() {
+                if let Some(grp) = grp_opt
+                    && let Some(slot) = self.audio_track_bitrates.get_mut(t_idx)
+                    && slot.is_none()
+                {
+                    let mut sum_kbps = 0u32;
+                    let mut all_known = true;
+                    for &s_idx in &grp.substream_indices {
+                        if let Some(st) = self.active_tracks.get(&s_idx)
+                            && let Some(br) = st.substream_bitrate_kbps
+                        {
+                            sum_kbps += br;
+                        } else {
+                            all_known = false;
+                            break;
+                        }
+                    }
+                    if all_known && sum_kbps > 0 {
+                        *slot = Some(sum_kbps);
+                    }
+                }
+            }
+        } else if let Some(primary) = self.active_tracks.get(&self.primary_stream_index)
             && self.channels != primary.channels
         {
             self.channels = primary.channels;
@@ -3433,7 +4419,8 @@ impl AudioSource for FfmpegSource {
         let frames_needed = output.len() / hardware_channels;
         self.channel_vus.fill(0.0);
 
-        let is_2track = self.audio_tracks.len() == 2;
+        let has_iamf = self.iamf_groups.iter().any(|g| g.is_some());
+        let is_2track = self.audio_tracks.len() == 2 && !has_iamf;
 
         // Dynamic energy-cancellation check for 2-track audio
         if !self.is_full_mix_guide && is_2track {
@@ -3596,6 +4583,55 @@ impl AudioSource for FfmpegSource {
                         if c < self.channel_vus.len() {
                             self.channel_vus[c] = self.channel_vus[c].max(final_val.abs());
                         }
+                    }
+                }
+            } else if let Some(Some(iamf_group)) =
+                self.iamf_groups.get(self.selected_track_idx).cloned()
+            {
+                let recon_ch = (iamf_group.reconstructed_channels as usize).clamp(1, 12);
+                let track_vol = self
+                    .active_tracks
+                    .get(&self.primary_stream_index)
+                    .map(|t| if t.enabled { t.volume } else { 1.0 })
+                    .unwrap_or(1.0);
+
+                for f in 0..frames_to_copy {
+                    let out_idx = (frames_written + f) * hardware_channels;
+                    let mut recon = [0.0f32; 12];
+
+                    for mapping in &iamf_group.channel_mappings {
+                        if let Some(sub_track) = self.active_tracks.get(&mapping.stream_index) {
+                            let in_idx = sub_track.buf_pos + f * sub_track.channels as usize;
+                            let sample = sub_track
+                                .sample_buf
+                                .get(in_idx + mapping.substream_channel)
+                                .copied()
+                                .unwrap_or(0.0);
+                            if sample != 0.0 {
+                                for &(dst_ch, weight) in &mapping.targets {
+                                    if dst_ch < 12 {
+                                        recon[dst_ch] += sample * weight;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    for ch in 0..recon_ch {
+                        recon[ch] = (recon[ch] * track_vol).clamp(-1.0, 1.0);
+                        if ch < self.channel_vus.len() {
+                            self.channel_vus[ch] = self.channel_vus[ch].max(recon[ch].abs());
+                        }
+                    }
+
+                    for c in 0..hardware_channels {
+                        let s_val = get_downmixed_sample(
+                            recon_ch as u16,
+                            &recon[..recon_ch],
+                            hardware_channels,
+                            c,
+                        );
+                        output[out_idx + c] = s_val.clamp(-1.0, 1.0);
                     }
                 }
             } else {
@@ -3834,6 +4870,7 @@ impl AudioSource for FfmpegSource {
             .map(|t| t.track_idx)
             .collect();
         list.sort();
+        list.dedup();
         if list.is_empty() {
             vec![self.selected_track_idx]
         } else {
@@ -3846,14 +4883,39 @@ impl AudioSource for FfmpegSource {
             return Ok(());
         }
 
-        let track_map: std::collections::HashMap<usize, f32> = tracks.iter().copied().collect();
-        for track in self.active_tracks.values_mut() {
-            if let Some(&vol) = track_map.get(&track.track_idx) {
-                track.enabled = true;
-                track.volume = vol;
-            } else {
+        if self.iamf_groups.iter().any(|g| g.is_some()) {
+            for track in self.active_tracks.values_mut() {
                 track.enabled = false;
                 track.volume = 0.0;
+            }
+            for &(t_idx, vol) in tracks {
+                if let Some(Some(grp)) = self.iamf_groups.get(t_idx) {
+                    for &s_idx in &grp.substream_indices {
+                        if let Some(st) = self.active_tracks.get_mut(&s_idx) {
+                            st.enabled = true;
+                            st.volume = vol;
+                            st.track_idx = t_idx;
+                        }
+                    }
+                } else {
+                    for track in self.active_tracks.values_mut() {
+                        if track.track_idx == t_idx {
+                            track.enabled = true;
+                            track.volume = vol;
+                        }
+                    }
+                }
+            }
+        } else {
+            let track_map: std::collections::HashMap<usize, f32> = tracks.iter().copied().collect();
+            for track in self.active_tracks.values_mut() {
+                if let Some(&vol) = track_map.get(&track.track_idx) {
+                    track.enabled = true;
+                    track.volume = vol;
+                } else {
+                    track.enabled = false;
+                    track.volume = 0.0;
+                }
             }
         }
 
@@ -4277,6 +5339,15 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
         .unwrap_or("FFMPEG")
         .to_uppercase();
 
+    let detected_iamf_groups = probe_iamf_stream_groups(&ictx);
+    if duration <= 0.0
+        && !is_network
+        && (!detected_iamf_groups.is_empty() || ext == "IAMF")
+        && let Some(probed_dur) = probe_iamf_duration_seconds(file_path)
+    {
+        duration = probed_dur;
+    }
+
     let mut video_info = None;
     let mut video_stream_index = None;
     let mut video_params = None;
@@ -4296,6 +5367,7 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
 
     let mut audio_tracks = Vec::new();
     let mut audio_track_bitrates: Vec<Option<u32>> = Vec::new();
+    let mut iamf_groups: Vec<Option<IamfTrackGroup>> = Vec::new();
     let mut selected_track_idx = 0;
 
     let mp4_track_names = if file_path.to_lowercase().ends_with(".mp4")
@@ -4307,9 +5379,127 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
         Vec::new()
     };
 
+    let mut iamf_substream_set = std::collections::HashSet::new();
+    for grp in &detected_iamf_groups {
+        for &s_idx in &grp.substream_indices {
+            iamf_substream_set.insert(s_idx);
+        }
+    }
+
+    for grp in detected_iamf_groups {
+        let primary_s_idx = grp.substream_indices[0];
+        let mut sub_codec_name = "Opus".to_string();
+        let mut rate = 48000u32;
+        let mut lang = None;
+        let mut total_br_kbps = 0u32;
+        let mut any_br = false;
+
+        for (i, &s_idx) in grp.substream_indices.iter().enumerate() {
+            if let Some(stream) = ictx.stream(s_idx) {
+                let p = stream.parameters();
+                if i == 0 {
+                    let codec_id = p.id();
+                    sub_codec_name = match codec_id {
+                        ffmpeg_next::codec::Id::OPUS => "Opus".to_string(),
+                        ffmpeg_next::codec::Id::FLAC => "FLAC".to_string(),
+                        ffmpeg_next::codec::Id::AAC => "AAC".to_string(),
+                        ffmpeg_next::codec::Id::PCM_S16LE
+                        | ffmpeg_next::codec::Id::PCM_S24LE
+                        | ffmpeg_next::codec::Id::PCM_S32LE
+                        | ffmpeg_next::codec::Id::PCM_F32LE => "PCM".to_string(),
+                        _ => format!("{:?}", codec_id).to_uppercase(),
+                    };
+                    let meta = stream.metadata();
+                    lang = meta
+                        .get("language")
+                        .or_else(|| meta.get("LANG"))
+                        .map(|s| s.to_string())
+                        .filter(|l| l.to_lowercase() != "und");
+                }
+                let mut sub_br = probe_stream_bitrate_kbps(&stream);
+                if let Ok(ctx) = ffmpeg_next::codec::context::Context::from_parameters(p)
+                    && let Ok(dec) = ctx.decoder().audio()
+                {
+                    if i == 0 && dec.rate() > 0 {
+                        rate = dec.rate();
+                    }
+                    if sub_br.is_none() && dec.bit_rate() > 0 {
+                        sub_br = Some((dec.bit_rate() / 1000).max(1) as u32);
+                    }
+                }
+                if let Some(br) = sub_br {
+                    total_br_kbps += br;
+                    any_br = true;
+                }
+            }
+        }
+
+        let codec_name = format!("IAMF ({})", sub_codec_name);
+        let channels = grp.reconstructed_channels;
+        let ch_desc = if !grp.layout_label.is_empty() {
+            grp.layout_label.clone()
+        } else {
+            match channels {
+                1 => "Mono".to_string(),
+                2 => "Stereo".to_string(),
+                4 => "4.0".to_string(),
+                6 => "5.1".to_string(),
+                8 => "7.1".to_string(),
+                10 => "7.1.2".to_string(),
+                12 => "7.1.4".to_string(),
+                n => format!("{} ch", n),
+            }
+        };
+
+        let lang = grp.language.clone().or(lang);
+        let title = grp
+            .annotation
+            .clone()
+            .or_else(|| mp4_track_names.get(audio_tracks.len()).cloned());
+
+        let mut desc_parts = Vec::new();
+        desc_parts.push(codec_name.clone());
+        desc_parts.push(ch_desc);
+        if rate > 0 {
+            desc_parts.push(format!("{}Hz", rate));
+        }
+
+        let technical = desc_parts.join(" ");
+        let display_title = match (lang.as_deref(), title.as_deref()) {
+            (Some(l), Some(t)) => format!(
+                "Track {}: {} [{} - {}]",
+                audio_tracks.len() + 1,
+                technical,
+                l,
+                t
+            ),
+            (Some(l), None) => {
+                format!("Track {}: {} [{}]", audio_tracks.len() + 1, technical, l)
+            }
+            (None, Some(t)) => {
+                format!("Track {}: {} [{}]", audio_tracks.len() + 1, technical, t)
+            }
+            (None, None) => format!("Track {}: {}", audio_tracks.len() + 1, technical),
+        };
+
+        audio_tracks.push(crate::state::AudioTrackInfo {
+            id: primary_s_idx,
+            title: display_title,
+            codec: codec_name,
+            channels,
+            sample_rate: rate,
+            language: lang,
+        });
+        audio_track_bitrates.push(if any_br { Some(total_br_kbps) } else { None });
+        iamf_groups.push(Some(grp));
+    }
+
     for stream in ictx.streams() {
         if stream.parameters().medium() == ffmpeg_next::media::Type::Audio {
             let s_idx = stream.index();
+            if iamf_substream_set.contains(&s_idx) {
+                continue;
+            }
             let p = stream.parameters();
             let codec_id = p.id();
             let codec_name = match codec_id {
@@ -4350,6 +5540,8 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
                 2 => "Stereo".to_string(),
                 6 => "5.1".to_string(),
                 8 => "7.1".to_string(),
+                10 => "7.1.2".to_string(),
+                12 => "7.1.4".to_string(),
                 n => format!("{} ch", n),
             };
 
@@ -4402,11 +5594,18 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
                 language: lang,
             });
             audio_track_bitrates.push(track_br);
+            iamf_groups.push(None);
         }
     }
 
     let container_kbps = if ictx.bit_rate() > 0 {
         Some((ictx.bit_rate() / 1000).max(1) as u32)
+    } else if !is_network
+        && duration > 0.0
+        && let Ok(meta) = std::fs::metadata(file_path)
+    {
+        let kbps = ((meta.len() as f64 * 8.0) / (duration * 1000.0)).round() as u32;
+        if kbps > 0 { Some(kbps) } else { None }
     } else {
         None
     };
@@ -4464,7 +5663,10 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
     }
 
     let best_audio_stream = ictx.streams().best(ffmpeg_next::media::Type::Audio);
-    let stream_index = if let Some(ref best) = best_audio_stream {
+    let stream_index = if iamf_groups.iter().any(|g| g.is_some()) {
+        selected_track_idx = 0;
+        audio_tracks[0].id
+    } else if let Some(ref best) = best_audio_stream {
         if let Some(pos) = audio_tracks.iter().position(|t| t.id == best.index()) {
             selected_track_idx = pos;
         }
@@ -4495,56 +5697,77 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
 
     let mut active_tracks = std::collections::HashMap::new();
     for (t_idx, track_info) in audio_tracks.iter().enumerate() {
-        if let Some(st) = ictx.stream(track_info.id)
-            && let Ok(ctx) = ffmpeg_next::codec::context::Context::from_parameters(st.parameters())
-            && let Ok(dec) = ctx.decoder().audio()
-        {
-            let ch = dec.channels().max(1);
-            let layout = safe_ffmpeg_channel_layout(dec.channel_layout(), ch);
-            let fmt = if dec.format() == ffmpeg_next::format::sample::Sample::None {
-                ffmpeg_next::format::sample::Sample::F32(ffmpeg_next::format::sample::Type::Planar)
-            } else {
-                dec.format()
-            };
-            let in_rate = if dec.rate() > 0 {
-                dec.rate()
-            } else {
-                sample_rate.max(8000)
-            };
-            if let Ok(resamp) = ffmpeg_next::software::resampling::context::Context::get(
-                fmt,
-                layout,
-                in_rate,
-                ffmpeg_next::format::sample::Sample::F32(ffmpeg_next::format::sample::Type::Packed),
-                layout,
-                sample_rate.max(8000),
-            ) {
-                let vol = if t_idx == selected_track_idx {
-                    1.0
+        let stream_ids: Vec<usize> = if let Some(Some(grp)) = iamf_groups.get(t_idx) {
+            grp.substream_indices.clone()
+        } else {
+            vec![track_info.id]
+        };
+
+        for st_id in stream_ids {
+            if active_tracks.contains_key(&st_id) {
+                continue;
+            }
+            if let Some(st) = ictx.stream(st_id)
+                && let Ok(ctx) =
+                    ffmpeg_next::codec::context::Context::from_parameters(st.parameters())
+                && let Ok(dec) = ctx.decoder().audio()
+            {
+                let mut sub_br = probe_stream_bitrate_kbps(&st);
+                if sub_br.is_none() && dec.bit_rate() > 0 {
+                    sub_br = Some((dec.bit_rate() / 1000).max(1) as u32);
+                }
+                let ch = dec.channels().max(1);
+                let layout = safe_ffmpeg_channel_layout(dec.channel_layout(), ch);
+                let fmt = if dec.format() == ffmpeg_next::format::sample::Sample::None {
+                    ffmpeg_next::format::sample::Sample::F32(
+                        ffmpeg_next::format::sample::Type::Planar,
+                    )
                 } else {
-                    0.0
+                    dec.format()
                 };
-                let enabled = t_idx == selected_track_idx;
-                let track_st_tb = st.time_base();
-                let track_tb_f64 =
-                    track_st_tb.numerator() as f64 / track_st_tb.denominator() as f64;
-                active_tracks.insert(
-                    track_info.id,
-                    ActiveFfmpegTrack {
-                        track_idx: t_idx,
-                        stream_index: track_info.id,
-                        decoder: dec,
-                        resampler: resamp,
-                        sample_buf: Vec::new(),
-                        buf_pos: 0,
-                        volume: vol,
-                        enabled,
-                        channels: ch,
-                        time_base: track_tb_f64,
-                        current_time: 0.0,
-                        seek_in_progress: video_stream_index.is_some(),
-                    },
-                );
+                let in_rate = if dec.rate() > 0 {
+                    dec.rate()
+                } else {
+                    sample_rate.max(8000)
+                };
+                if let Ok(resamp) = ffmpeg_next::software::resampling::context::Context::get(
+                    fmt,
+                    layout,
+                    in_rate,
+                    ffmpeg_next::format::sample::Sample::F32(
+                        ffmpeg_next::format::sample::Type::Packed,
+                    ),
+                    layout,
+                    sample_rate.max(8000),
+                ) {
+                    let vol = if t_idx == selected_track_idx {
+                        1.0
+                    } else {
+                        0.0
+                    };
+                    let enabled = t_idx == selected_track_idx;
+                    let track_st_tb = st.time_base();
+                    let track_tb_f64 =
+                        track_st_tb.numerator() as f64 / track_st_tb.denominator() as f64;
+                    active_tracks.insert(
+                        st_id,
+                        ActiveFfmpegTrack {
+                            track_idx: t_idx,
+                            stream_index: st_id,
+                            decoder: dec,
+                            resampler: resamp,
+                            sample_buf: Vec::new(),
+                            buf_pos: 0,
+                            volume: vol,
+                            enabled,
+                            channels: ch,
+                            time_base: track_tb_f64,
+                            current_time: 0.0,
+                            seek_in_progress: video_stream_index.is_some(),
+                            substream_bitrate_kbps: sub_br,
+                        },
+                    );
+                }
             }
         }
     }
@@ -4593,6 +5816,7 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
         is_eof: false,
         target_seek_time: None,
         is_full_mix_guide,
+        iamf_groups,
     }))
 }
 
@@ -5025,7 +6249,7 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
 
     let video_info = None; // Symphonia doesn't do video
 
-    // 1. Prioritize FFmpeg for video containers (MKV, MP4, WEBM, MOV, AVI) and raw surround bitstreams (DTS-HD, DTS, AC3, E-AC3, TrueHD) on desktop.
+    // 1. Prioritize FFmpeg for video containers (MKV, MP4, WEBM, MOV, AVI) and raw surround bitstreams (IAMF, DTS-HD, DTS, AC3, E-AC3, TrueHD) on desktop.
     #[cfg(not(target_os = "android"))]
     if matches!(
         ext.as_str(),
@@ -5045,6 +6269,7 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
             | "m2ts"
             | "ts"
             | "mts"
+            | "iamf"
             | "dtshd"
             | "dts"
             | "ac3"
@@ -5052,7 +6277,8 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
             | "thd"
             | "truehd"
             | "mlp"
-    ) {
+    ) || (ext == "m4a" && is_iamf_container(file_path))
+    {
         match try_ffmpeg(file_path, false) {
             Ok(source) => return Ok(source),
             Err(err) => {
@@ -5655,11 +6881,10 @@ pub fn start_audio_thread(
                 };
 
                 // On Windows HDMI/DisplayPort/AVR endpoints where the Windows Shared Mode default
-                // mix format may be Stereo (default_device_channels <= 2) or 5.1/7.1, cpal only
-                // exposes `GetMixFormat()` and cannot open 12-channel (7.1.4 / 11.1) or non-default
-                // multi-channel speaker masks. Probe the endpoint's hardware speaker capabilities
-                // and open a multi-channel WASAPI Shared Mode (32-bit IEEE Float) stream when the
-                // output device supports >2 channels (up to 12 channels / 7.1.4).
+                // mix format is Stereo (default_device_channels <= 2), cpal only exposes
+                // `GetMixFormat()` and AudioDg.exe downmixes any Shared Mode stream to 2.0 stereo.
+                // Probe and open WASAPI Exclusive Mode multi-channel LPCM (up to 7.1 / 7.1.4)
+                // directly on the endpoint so the HDMI Audio InfoFrame switches to multi-channel surround.
                 #[cfg(windows)]
                 if !mic && !force_stereo && !passthrough_enabled {
                     match run_wasapi_exclusive_multichannel(
@@ -5668,7 +6893,7 @@ pub fn start_audio_thread(
                         shared_state_closure.clone(),
                         target_rate,
                         target_channels,
-                        surround_upmix_enabled || !surround_upmix_user_overridden,
+                        true,
                         file_path,
                     ) {
                         Ok(handle) => {
@@ -5685,7 +6910,7 @@ pub fn start_audio_thread(
                         }
                         Err(e) => {
                             eprintln!(
-                                "[audio] WASAPI Shared Multichannel probe on '{}': {:?} (falling back to CPAL)",
+                                "[audio] WASAPI Exclusive Multichannel probe on '{}': {:?} (falling back to CPAL)",
                                 device_name, e
                             );
                         }
@@ -7781,6 +9006,99 @@ fn run_wasapi_exclusive_multichannel(
         }
     }
 
+    fn try_open_exclusive_client(
+        device: &IMMDevice,
+        channels: u16,
+        rate: u32,
+        channel_mask: u32,
+        fmt: WasapiPcmFormat,
+    ) -> Result<(IAudioClient, IAudioRenderClient, HANDLE, u32)> {
+        const AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED_HR: i32 = -2004287463i32; // 0x88890019
+
+        let wf = build_wave_format(channels, rate, channel_mask, fmt);
+        let wf_ptr = &wf as *const WAVEFORMATEXTENSIBLE as *const WAVEFORMATEX;
+
+        let audio_client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
+        if unsafe { audio_client.IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, wf_ptr, None) }
+            != windows::core::HRESULT(0)
+        {
+            return Err(anyhow::anyhow!(
+                "Format unsupported: {}ch @ {} Hz ({})",
+                channels,
+                rate,
+                fmt.label()
+            ));
+        }
+
+        let mut default_period = 0i64;
+        let mut min_period = 0i64;
+        unsafe {
+            let _ = audio_client.GetDevicePeriod(Some(&mut default_period), Some(&mut min_period));
+        }
+        let mut buffer_duration = if default_period > 0 {
+            default_period.max(200_000)
+        } else if min_period > 0 {
+            min_period.max(200_000)
+        } else {
+            200_000
+        };
+
+        let init_res = unsafe {
+            audio_client.Initialize(
+                AUDCLNT_SHAREMODE_EXCLUSIVE,
+                AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                buffer_duration,
+                buffer_duration,
+                wf_ptr,
+                None,
+            )
+        };
+
+        let active_client = match init_res {
+            Ok(()) => audio_client,
+            Err(e) if e.code().0 == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED_HR => {
+                let aligned_frames = unsafe { audio_client.GetBufferSize()? };
+                buffer_duration =
+                    ((10_000_000.0 * aligned_frames as f64 / rate as f64) + 0.5) as i64;
+                drop(audio_client);
+                let retry_client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
+                unsafe {
+                    retry_client
+                        .Initialize(
+                            AUDCLNT_SHAREMODE_EXCLUSIVE,
+                            AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                            buffer_duration,
+                            buffer_duration,
+                            wf_ptr,
+                            None,
+                        )
+                        .map_err(|e| anyhow::anyhow!(e))?;
+                }
+                retry_client
+            }
+            Err(e) => return Err(anyhow::anyhow!(e)),
+        };
+
+        let event = unsafe { CreateEventW(None, false, false, None)? };
+        if let Err(e) = unsafe { active_client.SetEventHandle(event) } {
+            unsafe {
+                let _ = CloseHandle(event);
+            }
+            return Err(anyhow::anyhow!(e));
+        }
+        let buffer_frames = unsafe { active_client.GetBufferSize()? };
+        let render_client: IAudioRenderClient = match unsafe { active_client.GetService() } {
+            Ok(rc) => rc,
+            Err(e) => {
+                unsafe {
+                    let _ = CloseHandle(event);
+                }
+                return Err(anyhow::anyhow!(e));
+            }
+        };
+        Ok((active_client, render_client, event, buffer_frames))
+    }
+
     fn try_open_shared_client(
         device: &IMMDevice,
         channels: u16,
@@ -7915,21 +9233,23 @@ fn run_wasapi_exclusive_multichannel(
             }
         }
 
-        if let Ok(default_dev) = unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) } {
-            push_unique_wasapi_dev(&mut candidate_devices, default_dev);
-        }
-
-        if selected_dev_owned.is_none()
-            && let Ok(collection) =
+        if selected_dev_owned.is_none() {
+            if let Ok(default_dev) =
+                unsafe { enumerator.GetDefaultAudioEndpoint(eRender, eConsole) }
+            {
+                push_unique_wasapi_dev(&mut candidate_devices, default_dev);
+            }
+            if let Ok(collection) =
                 unsafe { enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) }
-        {
-            let count = unsafe { collection.GetCount().unwrap_or(0) };
-            for i in 0..count {
-                if let Ok(dev) = unsafe { collection.Item(i) } {
-                    let name =
-                        get_wasapi_device_name(&dev).unwrap_or_else(|| "Unknown".to_string());
-                    if is_relevant_audio_device(&name) {
-                        push_unique_wasapi_dev(&mut candidate_devices, dev);
+            {
+                let count = unsafe { collection.GetCount().unwrap_or(0) };
+                for i in 0..count {
+                    if let Ok(dev) = unsafe { collection.Item(i) } {
+                        let name =
+                            get_wasapi_device_name(&dev).unwrap_or_else(|| "Unknown".to_string());
+                        if is_relevant_audio_device(&name) {
+                            push_unique_wasapi_dev(&mut candidate_devices, dev);
+                        }
                     }
                 }
             }
@@ -7946,7 +9266,7 @@ fn run_wasapi_exclusive_multichannel(
             ]
         } else {
             match target_channels {
-                c if c >= 12 => vec![(12, 0x2D63F), (8, 0x63F), (8, 0xFF), (6, 0x3F)],
+                c if c >= 9 => vec![(12, 0x2D63F), (8, 0x63F), (8, 0xFF), (6, 0x3F)],
                 7 | 8 => vec![(8, 0x63F), (8, 0xFF), (6, 0x3F)],
                 5 | 6 => vec![(6, 0x3F), (6, 0x60F), (8, 0x63F), (8, 0xFF)],
                 3 | 4 => vec![(4, 0x33), (6, 0x3F), (8, 0x63F)],
@@ -7961,7 +9281,12 @@ fn run_wasapi_exclusive_multichannel(
             }
         }
 
-        // In WASAPI Shared Mode, the Windows Audio Engine operates natively in 32-bit IEEE Float.
+        let exclusive_fmt_candidates = [
+            WasapiPcmFormat::I24In32,
+            WasapiPcmFormat::F32,
+            WasapiPcmFormat::I32,
+            WasapiPcmFormat::I16,
+        ];
         let shared_fmt_candidates = [
             WasapiPcmFormat::F32,
             WasapiPcmFormat::I24In32,
@@ -7978,11 +9303,12 @@ fn run_wasapi_exclusive_multichannel(
             u32,
             u16,
             u32,
+            u32,
             WasapiPcmFormat,
+            bool,
         )> = None;
-        let mut last_err = anyhow::anyhow!(
-            "No multichannel WASAPI Shared Mode support detected on candidate endpoints"
-        );
+        let mut last_err =
+            anyhow::anyhow!("No multichannel WASAPI support detected on candidate endpoints");
 
         'dev_loop: for (dev, dev_name) in candidate_devices {
             let probe_client: Option<IAudioClient> = unsafe { dev.Activate(CLSCTX_ALL, None).ok() };
@@ -7999,58 +9325,17 @@ fn run_wasapi_exclusive_multichannel(
             } else {
                 2
             };
-
-            // In WASAPI Shared Mode, AudioDg.exe mixes to the endpoint's Shared Mode MixFormat.
-            // If MixFormat is Stereo/Mono (mix_channels <= 2), opening a >2ch Shared Mode stream
-            // with AUTOCONVERTPCM would cause Windows to immediately downmix the surround channels
-            // back to 2ch stereo, coloring stereo output on stereo speakers.
-            if mix_channels <= 2 {
-                continue;
-            }
+            drop(probe_client);
 
             for &(ch, mask) in &channel_candidates {
-                let shared_supports_ch = if ch <= mix_channels {
-                    true
-                } else if let Some(ref pc) = probe_client {
-                    // Allow >mix_channels (e.g. 12ch 7.1.4 when Spatial Audio / 7.1.4 endpoint is active)
-                    // only if WASAPI Shared Mode natively accepts `ch` without downconverting nChannels.
-                    rate_candidates.iter().any(|&r| {
-                        let wf = build_wave_format(ch, r, mask, WasapiPcmFormat::F32);
-                        let wf_ptr = &wf as *const WAVEFORMATEXTENSIBLE as *const WAVEFORMATEX;
-                        let mut closest_ptr: *mut WAVEFORMATEX = std::ptr::null_mut();
-                        let hr = unsafe {
-                            pc.IsFormatSupported(
-                                AUDCLNT_SHAREMODE_SHARED,
-                                wf_ptr,
-                                Some(&mut closest_ptr),
-                            )
-                        };
-                        let matched_ch = if !closest_ptr.is_null() {
-                            let c = unsafe { (*closest_ptr).nChannels };
-                            unsafe {
-                                CoTaskMemFree(Some(closest_ptr as *const std::ffi::c_void));
-                            }
-                            c
-                        } else {
-                            ch
-                        };
-                        hr == windows::core::HRESULT(0) && matched_ch == ch
-                    })
-                } else {
-                    false
-                };
-
-                if !shared_supports_ch {
-                    continue;
-                }
-
                 for &rate in &rate_candidates {
-                    for &fmt in &shared_fmt_candidates {
-                        match try_open_shared_client(&dev, ch, rate, mask, fmt) {
+                    // 1. Primary path: WASAPI Exclusive Mode (bypasses AudioDg.exe's 2ch Shared Mode
+                    // mixer and reconfigures the physical HDMI Audio InfoFrame to multi-channel surround).
+                    for &fmt in &exclusive_fmt_candidates {
+                        match try_open_exclusive_client(&dev, ch, rate, mask, fmt) {
                             Ok((ac, rc, ev, buf_frames)) => {
-                                drop(probe_client);
                                 eprintln!(
-                                    "[audio] WASAPI Shared Multichannel LPCM negotiated on '{}': {}ch (mask 0x{:X}) @ {} Hz [{}] (buffer {} frames)",
+                                    "[audio] WASAPI Exclusive Multichannel LPCM negotiated on '{}': {}ch (mask 0x{:X}) @ {} Hz [{}] (buffer {} frames)",
                                     dev_name,
                                     ch,
                                     mask,
@@ -8058,12 +9343,42 @@ fn run_wasapi_exclusive_multichannel(
                                     fmt.label(),
                                     buf_frames
                                 );
-                                opened =
-                                    Some((dev, dev_name, ac, rc, ev, buf_frames, ch, rate, fmt));
+                                opened = Some((
+                                    dev, dev_name, ac, rc, ev, buf_frames, ch, mask, rate, fmt,
+                                    true,
+                                ));
                                 break 'dev_loop;
                             }
                             Err(e) => {
                                 last_err = e;
+                            }
+                        }
+                    }
+
+                    // 2. Fallback path: WASAPI Shared Mode ONLY when the Windows Shared Mode MixFormat
+                    // itself has >= `ch` discrete channels (so AudioDg.exe will not downmix to stereo).
+                    if mix_channels >= ch {
+                        for &fmt in &shared_fmt_candidates {
+                            match try_open_shared_client(&dev, ch, rate, mask, fmt) {
+                                Ok((ac, rc, ev, buf_frames)) => {
+                                    eprintln!(
+                                        "[audio] WASAPI Shared Multichannel LPCM negotiated on '{}': {}ch (mask 0x{:X}) @ {} Hz [{}] (buffer {} frames)",
+                                        dev_name,
+                                        ch,
+                                        mask,
+                                        rate,
+                                        fmt.label(),
+                                        buf_frames
+                                    );
+                                    opened = Some((
+                                        dev, dev_name, ac, rc, ev, buf_frames, ch, mask, rate, fmt,
+                                        false,
+                                    ));
+                                    break 'dev_loop;
+                                }
+                                Err(e) => {
+                                    last_err = e;
+                                }
                             }
                         }
                     }
@@ -8079,8 +9394,10 @@ fn run_wasapi_exclusive_multichannel(
             event,
             buffer_frames,
             negotiated_channels,
+            negotiated_mask,
             negotiated_rate,
             negotiated_fmt,
+            is_exclusive,
         ) = match opened {
             Some(v) => v,
             None => {
@@ -8157,6 +9474,7 @@ fn run_wasapi_exclusive_multichannel(
         let mut upmix_peak_vus = [0.0f32; 12];
         let mut current_chunk: Option<AudioChunk> = None;
         let mut chunk_frame_pos = 0usize;
+        let mut warmup_silent_buffers = if is_exclusive { 1u32 } else { 0u32 };
         let startup_fade_frames = ((negotiated_rate as usize) * 35 / 1000).max(64);
         let mut startup_fade_pos = 0usize;
 
@@ -8165,9 +9483,13 @@ fn run_wasapi_exclusive_multichannel(
             (state.seek_epoch, state.surround_upmix)
         };
 
-        // Prime the initial shared buffer with silence before calling Start()
+        // Prime the WASAPI buffer with silence before starting the hardware clock
         unsafe {
-            let padding = audio_client.GetCurrentPadding().unwrap_or(0);
+            let padding = if is_exclusive {
+                0
+            } else {
+                audio_client.GetCurrentPadding().unwrap_or(0)
+            };
             let prime_frames = buffer_frames.saturating_sub(padding);
             if prime_frames > 0
                 && let Ok(buf_ptr) = render_client.GetBuffer(prime_frames)
@@ -8177,7 +9499,7 @@ fn run_wasapi_exclusive_multichannel(
                     render_client.ReleaseBuffer(prime_frames, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32);
             }
             if let Err(e) = audio_client.Start() {
-                eprintln!("[audio] WASAPI Shared Start() failed: {:?}", e);
+                eprintln!("[audio] WASAPI Start() failed: {:?}", e);
                 let _ = CloseHandle(event);
                 drop(render_client);
                 drop(audio_client);
@@ -8209,9 +9531,25 @@ fn run_wasapi_exclusive_multichannel(
                 continue;
             }
 
-            let padding = unsafe { audio_client.GetCurrentPadding().unwrap_or(0) };
-            let avail_frames = buffer_frames.saturating_sub(padding);
+            let avail_frames = if is_exclusive {
+                buffer_frames
+            } else {
+                let padding = unsafe { audio_client.GetCurrentPadding().unwrap_or(0) };
+                buffer_frames.saturating_sub(padding)
+            };
             if avail_frames == 0 {
+                continue;
+            }
+
+            if warmup_silent_buffers > 0 {
+                warmup_silent_buffers -= 1;
+                if let Ok(buf_ptr) = unsafe { render_client.GetBuffer(avail_frames) } {
+                    unsafe {
+                        std::ptr::write_bytes(buf_ptr, 0, (avail_frames as usize) * frame_bytes);
+                        let _ = render_client
+                            .ReleaseBuffer(avail_frames, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32);
+                    }
+                }
                 continue;
             }
 
@@ -8230,12 +9568,12 @@ fn run_wasapi_exclusive_multichannel(
                 continue;
             }
 
-            let frames_to_render = avail_frames as usize;
             let buf_ptr = match unsafe { render_client.GetBuffer(avail_frames) } {
                 Ok(ptr) => ptr,
                 Err(_) => continue,
             };
 
+            let frames_to_render = avail_frames as usize;
             let out_bytes =
                 unsafe { std::slice::from_raw_parts_mut(buf_ptr, frames_to_render * frame_bytes) };
 
@@ -8324,8 +9662,28 @@ fn run_wasapi_exclusive_multichannel(
                                     target_upmix,
                                 );
 
+                            // Map upmixer output channels:
+                            //   out_channels = [0:FL, 1:FR, 2:FC, 3:LFE, 4:SL, 5:SR, 6:RL, 7:RR, 8:TFL, 9:TFR, 10:TRL, 11:TRR]
+                            // to physical WAVEFORMATEXTENSIBLE channel bit-order:
+                            //   for 0x63F (7.1) / 0x2D63F (7.1.4): [0:FL, 1:FR, 2:FC, 3:LFE, 4:BL(RL), 5:BR(RR), 6:SL, 7:SR, ...].
                             for c in 0..hardware_channels {
-                                let raw_s = if c < 12 { out_channels[c] } else { 0.0 };
+                                let raw_s = if hardware_channels >= 8
+                                    && (negotiated_mask & 0x630) == 0x630
+                                {
+                                    match c {
+                                        0..=3 => out_channels[c],
+                                        4 => out_channels[6],
+                                        5 => out_channels[7],
+                                        6 => out_channels[4],
+                                        7 => out_channels[5],
+                                        8..=11 => out_channels[c],
+                                        _ => 0.0,
+                                    }
+                                } else if c < 12 {
+                                    out_channels[c]
+                                } else {
+                                    0.0
+                                };
                                 let out_s = raw_s * fade_gain;
                                 write_wasapi_sample(
                                     &mut out_bytes[dst_byte_base + c * bytes_per_sample
@@ -8441,12 +9799,10 @@ fn run_wasapi_exclusive_multichannel(
         unsafe {
             let _ = audio_client.Stop();
             let _ = audio_client.Reset();
+            let _ = CloseHandle(event);
         }
         drop(render_client);
         drop(audio_client);
-        unsafe {
-            let _ = CloseHandle(event);
-        }
         drop(active_device);
         drop(enumerator);
         unsafe {
@@ -10020,5 +11376,313 @@ mod tests {
         }
         assert!((prev_out[0] - 0.6).abs() < 1e-6 && prev_out[4].abs() < 1e-6);
         assert!(!dsp_fade.is_blending_or_active(false));
+    }
+
+    #[test]
+    fn test_surround_upmixer_flexible_n_to_m_channel_matrix() {
+        let sr = 48_000;
+        let cfg = crate::state::SurroundUpmixConfig::default();
+
+        // Test every source_channels (1..=8) against every larger hardware_channels (3..=12)
+        for src_ch in 1..=8usize {
+            for hw_ch in [3usize, 4, 5, 6, 7, 8, 9, 10, 12] {
+                if src_ch >= hw_ch {
+                    assert!(!crate::state::SurroundUpmixConfig::can_upmix(
+                        src_ch as i32,
+                        hw_ch as i32
+                    ));
+                    continue;
+                }
+                assert!(crate::state::SurroundUpmixConfig::can_upmix(
+                    src_ch as i32,
+                    hw_ch as i32
+                ));
+
+                let mut dsp = SurroundUpmixerDsp::new(sr);
+                dsp.sync_config(&cfg, sr);
+                let mut peaks = [0.0f32; 12];
+
+                for n in 0..2048 {
+                    let t = n as f32 / sr as f32;
+                    let two_pi = 2.0 * std::f32::consts::PI;
+                    // Multi-band test signal (55 Hz sub-bass + 440 Hz mid + 5200 Hz high)
+                    let l_sig = (two_pi * 55.0 * t).sin() * 0.25
+                        + (two_pi * 440.0 * t).sin() * 0.35
+                        + (two_pi * 5200.0 * t).cos() * 0.25;
+                    let r_sig = (two_pi * 55.0 * t).sin() * 0.25
+                        + (two_pi * 554.37 * t).cos() * 0.35
+                        + (two_pi * 6400.0 * t).sin() * 0.25;
+
+                    let mut frame = [0.0f32; 12];
+                    for c in 0..src_ch {
+                        frame[c] = if c % 2 == 0 { l_sig } else { r_sig };
+                    }
+                    let out = dsp.process_multichannel_frame_for_hardware(
+                        &frame[..hw_ch],
+                        src_ch,
+                        &cfg,
+                        hw_ch,
+                    );
+                    if n >= 512 {
+                        for c in 0..12 {
+                            peaks[c] = peaks[c].max(out[c].abs());
+                        }
+                    }
+                }
+
+                // Every active hardware channel (0..hw_ch) must be driven with non-zero audio
+                for (c, &p) in peaks.iter().enumerate().take(hw_ch) {
+                    assert!(
+                        p > 0.02,
+                        "Upmix {}ch -> {}ch must populate channel {} (got peak {})",
+                        src_ch,
+                        hw_ch,
+                        c,
+                        p
+                    );
+                }
+                // Unused channels beyond hw_ch must remain silent
+                for (c, &p) in peaks.iter().enumerate().skip(hw_ch) {
+                    assert!(
+                        p < 1e-6,
+                        "Upmix {}ch -> {}ch must leave channel {} silent (got {})",
+                        src_ch,
+                        hw_ch,
+                        c,
+                        p
+                    );
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn test_iamf_channel_mapping_and_downmix() {
+        // 1. Verify IAMF 7.1.4 AVChannel -> Canonical [0..12] mapping
+        // IAMF 7.1.4 substream order: (FL,FR), (SL,SR), (BL,BR), (TFL,TFR), (TBL,TBR), (FC), (LFE)
+        // AVChannel IDs: FL=0, FR=1, FC=2, LFE=3, BL=4, BR=5, SL=9, SR=10, TFL=12, TFR=14, TBL=15, TBR=17
+        let av_7_1_4 = [0, 1, 9, 10, 4, 5, 12, 14, 15, 17, 2, 3];
+        let substreams_7_1_4 = [(0, 2), (1, 2), (2, 2), (3, 2), (4, 2), (5, 1), (6, 1)];
+        let (reconstructed_ch, layout_label, map_7_1_4) =
+            map_iamf_av_channels_to_canonical(&av_7_1_4, &substreams_7_1_4);
+        assert_eq!(reconstructed_ch, 12);
+        assert_eq!(layout_label, "7.1.4");
+        let expected_canonical = [0, 1, 6, 7, 4, 5, 8, 9, 10, 11, 2, 3];
+        for (k, &expected_dst) in expected_canonical.iter().enumerate() {
+            assert_eq!(map_7_1_4[k].targets.len(), 1);
+            assert_eq!(map_7_1_4[k].targets[0].0, expected_dst);
+            assert!((map_7_1_4[k].targets[0].1 - 1.0).abs() < 1e-6);
+        }
+
+        // 2. Verify IAMF 5.1 AVChannel -> Canonical [0..6] mapping
+        // IAMF 5.1 substream order: (FL,FR), (SL,SR), (FC), (LFE)
+        let av_5_1 = [0, 1, 9, 10, 2, 3];
+        let substreams_5_1 = [(0, 2), (1, 2), (2, 1), (3, 1)];
+        let (reconstructed_5_1, label_5_1, map_5_1) =
+            map_iamf_av_channels_to_canonical(&av_5_1, &substreams_5_1);
+        assert_eq!(reconstructed_5_1, 6);
+        assert_eq!(label_5_1, "5.1");
+        let expected_5_1 = [0, 1, 4, 5, 2, 3];
+        for (k, &expected_dst) in expected_5_1.iter().enumerate() {
+            assert_eq!(map_5_1[k].targets[0].0, expected_dst);
+        }
+
+        // 3. Verify Ambisonics FOA (4ch ACN/SN3D) -> 12ch (7.1.4) mapping
+        let substreams_foa = [(0, 1), (1, 1), (2, 1), (3, 1)];
+        let (ambi_ch, _ambi_label, ambi_map) = map_iamf_ambisonics_to_canonical(&substreams_foa, 4);
+        assert_eq!(ambi_ch, 12);
+        assert_eq!(ambi_map.len(), 4);
+        // W (omnidirectional ACN 0) contributes to all 12 speakers
+        assert_eq!(ambi_map[0].targets.len(), 12);
+
+        // 4. Verify 12-channel (7.1.4) downmixing to 8ch (7.1), 6ch (5.1), and 2ch (Stereo)
+        // Put unit impulse solely on TFL (ch 8) and TBR (ch 11)
+        let mut frame_12 = [0.0f32; 12];
+        frame_12[8] = 1.0; // TFL
+        frame_12[11] = 1.0; // TBR
+
+        // Downmix to 8ch (7.1): TFL folds into FL (ch 0), TBR folds into BR (ch 5) and SR (ch 7)
+        let fl_8 = get_downmixed_sample(12, &frame_12, 8, 0);
+        let br_8 = get_downmixed_sample(12, &frame_12, 8, 5);
+        let sr_8 = get_downmixed_sample(12, &frame_12, 8, 7);
+        assert!(
+            fl_8 > 0.5,
+            "TFL must fold into FL in 7.1 downmix (got {})",
+            fl_8
+        );
+        assert!(
+            br_8 > 0.4,
+            "TBR must fold into BR in 7.1 downmix (got {})",
+            br_8
+        );
+        assert!(
+            sr_8 > 0.2,
+            "TBR must fold into SR in 7.1 downmix (got {})",
+            sr_8
+        );
+
+        // Downmix to 6ch (5.1): TFL folds into FL (ch 0), TBR folds into BR/LS-RS (ch 5)
+        let fl_6 = get_downmixed_sample(12, &frame_12, 6, 0);
+        let br_6 = get_downmixed_sample(12, &frame_12, 6, 5);
+        assert!(
+            fl_6 > 0.5,
+            "TFL must fold into FL in 5.1 downmix (got {})",
+            fl_6
+        );
+        assert!(
+            br_6 > 0.45,
+            "TBR must fold into BR in 5.1 downmix (got {})",
+            br_6
+        );
+
+        // Downmix to 2ch (Stereo): TFL folds into L (ch 0), TBR folds into R (ch 1)
+        let l_2 = get_downmixed_sample(12, &frame_12, 2, 0);
+        let r_2 = get_downmixed_sample(12, &frame_12, 2, 1);
+        assert!(
+            l_2 > 0.4,
+            "TFL must fold into L in stereo downmix (got {})",
+            l_2
+        );
+        assert!(
+            r_2 > 0.35,
+            "TBR must fold into R in stereo downmix (got {})",
+            r_2
+        );
+    }
+
+    #[cfg(not(target_os = "android"))]
+    #[test]
+    fn test_iamf_7_1_4_demux_and_decode() {
+        let ffmpeg_bin = if std::path::Path::new(r"C:\msys64\ucrt64\bin\ffmpeg.exe").exists() {
+            r"C:\msys64\ucrt64\bin\ffmpeg.exe"
+        } else {
+            "ffmpeg"
+        };
+
+        let tmp_dir = std::env::temp_dir();
+        let iamf_path = tmp_dir.join("rusttracker_test_7_1_4.iamf");
+        let mp4_path = tmp_dir.join("rusttracker_test_7_1_4_iamf.mp4");
+
+        let sg_ae =
+            "type=iamf_audio_element:id=1:st=0:st=1:st=2:st=3:st=4:st=5:st=6,layer=ch_layout=7.1.4";
+        let sg_mp = "type=iamf_mix_presentation:id=2:stg=0:annotations=en-us=default_mix_presentation,submix=parameter_id=100:parameter_rate=48000:default_mix_gain=0.0|element=stg=0:parameter_id=101:parameter_rate=48000:annotations=en-us=7.1.4:default_mix_gain=0.0|layout=sound_system=7.1.4:integrated_loudness=0.0:digital_peak=0.0";
+
+        for path in [&iamf_path, &mp4_path] {
+            let status = std::process::Command::new(ffmpeg_bin)
+                .args([
+                    "-y",
+                    "-v",
+                    "error",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=440:sample_rate=48000:duration=0.5,pan=stereo|c0=0.5*c0|c1=0.5*c0",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=550:sample_rate=48000:duration=0.5,pan=stereo|c0=0.5*c0|c1=0.5*c0",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=660:sample_rate=48000:duration=0.5,pan=stereo|c0=0.5*c0|c1=0.5*c0",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=770:sample_rate=48000:duration=0.5,pan=stereo|c0=0.5*c0|c1=0.5*c0",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=880:sample_rate=48000:duration=0.5,pan=stereo|c0=0.5*c0|c1=0.5*c0",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=330:sample_rate=48000:duration=0.5",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "sine=frequency=110:sample_rate=48000:duration=0.5",
+                    "-streamid",
+                    "0:0",
+                    "-streamid",
+                    "1:1",
+                    "-streamid",
+                    "2:2",
+                    "-streamid",
+                    "3:3",
+                    "-streamid",
+                    "4:4",
+                    "-streamid",
+                    "5:5",
+                    "-streamid",
+                    "6:6",
+                    "-stream_group",
+                    sg_ae,
+                    "-stream_group",
+                    sg_mp,
+                    "-map",
+                    "0:a",
+                    "-map",
+                    "1:a",
+                    "-map",
+                    "2:a",
+                    "-map",
+                    "3:a",
+                    "-map",
+                    "4:a",
+                    "-map",
+                    "5:a",
+                    "-map",
+                    "6:a",
+                    "-c:a",
+                    "libopus",
+                    "-b:a",
+                    "64k",
+                    path.to_str().unwrap(),
+                ])
+                .status();
+
+            if let Ok(st) = status {
+                assert!(st.success(), "FFmpeg IAMF muxing failed for {:?}", path);
+                let mut src = load_audio_source(path.to_str().unwrap())
+                    .expect("Failed to load 7.1.4 IAMF file via load_audio_source");
+                assert_eq!(src.get_num_channels(), 12);
+                assert_eq!(src.get_type(), "IAMF (Opus)");
+                assert_eq!(src.get_active_audio_tracks().len(), 1);
+                assert!(
+                    src.get_duration_seconds() >= 0.45 && src.get_duration_seconds() <= 0.65,
+                    "Expected ~0.5s duration for {:?}, got {}",
+                    path,
+                    src.get_duration_seconds()
+                );
+
+                let mut out_12 = vec![0.0f32; 4800 * 12];
+                let frames = src.read_frames(12, 48000, &mut out_12);
+                assert!(
+                    frames > 1000,
+                    "Expected >1000 decoded frames, got {}",
+                    frames
+                );
+
+                let mut ch_peaks = [0.0f32; 12];
+                for f in 0..frames {
+                    for c in 0..12 {
+                        ch_peaks[c] = ch_peaks[c].max(out_12[f * 12 + c].abs());
+                    }
+                }
+                for (c, &peak) in ch_peaks.iter().enumerate() {
+                    assert!(
+                        peak > 0.05,
+                        "Expected non-zero audio on reconstructed IAMF 7.1.4 channel {} in {:?}, got {}",
+                        c,
+                        path,
+                        peak
+                    );
+                }
+                assert!(out_12.iter().all(|x| x.is_finite()));
+
+                let _ = std::fs::remove_file(path);
+            }
+        }
     }
 }

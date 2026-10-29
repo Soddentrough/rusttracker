@@ -35,6 +35,7 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     "thd",
     "truehd",
     "mlp",
+    "iamf",
     // Video containers
     "mp4",
     "m4v",
@@ -91,6 +92,7 @@ pub const FILE_DIALOG_EXTENSIONS: &[&str] = &[
     "thd",
     "truehd",
     "mlp",
+    "iamf",
     // Video containers
     "mp4",
     "m4v",

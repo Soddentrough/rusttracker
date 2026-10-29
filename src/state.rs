@@ -1428,11 +1428,10 @@ impl AppState {
                     }
                 }
                 let badge = SurroundUpmixConfig::layout_badge(self.hardware_channels);
-                self.osd_text = Some(format!("🔊 Auto Surround Upmix: ON ({})", badge));
+                self.osd_text = Some(format!("🔊 Surround Upmix: ON ({})", badge));
             } else {
-                self.osd_text = Some(
-                    "🔊 Auto Surround Upmix: Armed (Stereo/Mono Output — No Change)".to_string(),
-                );
+                self.osd_text =
+                    Some("🔊 Surround Upmix: Armed (Stereo/Mono Output — No Change)".to_string());
             }
         } else {
             if self.file_loaded
@@ -1458,7 +1457,7 @@ impl AppState {
                 self.channel_vus.resize(ch_count, 0.0);
                 self.peak_vus.resize(ch_count, 0.0);
             }
-            self.osd_text = Some("🔊 Auto Surround Upmix: OFF".to_string());
+            self.osd_text = Some("🔊 Surround Upmix: OFF".to_string());
         }
         self.osd_timer = 2.5;
     }
