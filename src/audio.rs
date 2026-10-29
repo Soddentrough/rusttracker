@@ -1108,6 +1108,21 @@ pub fn spawn_dsp_thread(
                         break;
                     }
                 }
+                let AppState {
+                    ref lookahead_queue,
+                    ref raw_waveform,
+                    ref raw_channel_vus,
+                    current_seconds,
+                    ref mut lookahead_timeline,
+                    ..
+                } = *state;
+                update_lookahead_timeline_from_queue(
+                    lookahead_queue,
+                    raw_waveform,
+                    raw_channel_vus,
+                    current_seconds,
+                    lookahead_timeline,
+                );
 
                 if state.current_tracker_order != msg.current_order
                     || state.current_tracker_row != msg.current_row
@@ -5587,13 +5602,12 @@ fn push_chunk_lookahead_slices(
         let mut treb_acc = 0.0f32;
 
         let cnt = slice_frames as f32;
+        let mut prev_l = 0.0f32;
         for i in start_f..end_f {
-            let l = state.lookahead_sample_buffer[i * hardware_channels];
-            let r = if hardware_channels > 1 {
-                state.lookahead_sample_buffer[i * hardware_channels + 1]
-            } else {
-                l
-            };
+            let frame_slice =
+                &state.lookahead_sample_buffer[i * hardware_channels..(i + 1) * hardware_channels];
+            let l = get_downmixed_sample(hardware_channels as u16, frame_slice, 2, 0);
+            let r = get_downmixed_sample(hardware_channels as u16, frame_slice, 2, 1);
 
             min_l = min_l.min(l);
             max_l = max_l.max(l);
@@ -5603,12 +5617,8 @@ fn push_chunk_lookahead_slices(
             sq_r += r * r;
 
             let mono = (l + r) * 0.5;
-            let diff = if i > start_f {
-                let prev_l = state.lookahead_sample_buffer[(i - 1) * hardware_channels];
-                (l - prev_l).abs()
-            } else {
-                0.0
-            };
+            let diff = if i > start_f { (l - prev_l).abs() } else { 0.0 };
+            prev_l = l;
 
             bass_acc += mono.abs();
             treb_acc += diff * 2.0;
@@ -5652,6 +5662,21 @@ fn push_chunk_lookahead_slices(
     while state.lookahead_queue.len() > 1800 {
         state.lookahead_queue.pop_front();
     }
+    let AppState {
+        ref lookahead_queue,
+        ref raw_waveform,
+        ref raw_channel_vus,
+        current_seconds,
+        ref mut lookahead_timeline,
+        ..
+    } = *state;
+    update_lookahead_timeline_from_queue(
+        lookahead_queue,
+        raw_waveform,
+        raw_channel_vus,
+        current_seconds,
+        lookahead_timeline,
+    );
 }
 
 pub fn push_planar_lookahead_slices(
@@ -5790,6 +5815,21 @@ pub fn push_planar_lookahead_slices(
     while state.lookahead_queue.len() > 1800 {
         state.lookahead_queue.pop_front();
     }
+    let AppState {
+        ref lookahead_queue,
+        ref raw_waveform,
+        ref raw_channel_vus,
+        current_seconds,
+        ref mut lookahead_timeline,
+        ..
+    } = *state;
+    update_lookahead_timeline_from_queue(
+        lookahead_queue,
+        raw_waveform,
+        raw_channel_vus,
+        current_seconds,
+        lookahead_timeline,
+    );
 }
 
 fn process_decoder_state_requests(

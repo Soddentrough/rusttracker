@@ -1419,32 +1419,33 @@ mod wasapi_bitstream {
                     AudioProfile,
                     Vec<u8>,
                 );
-                let test_device_formats =
-                    |dev: &IMMDevice, profs: &[AudioProfile]| -> Option<NegotiatedClient> {
-                        let client: IAudioClient = unsafe { dev.Activate(CLSCTX_ALL, None).ok()? };
-                        for p in profs {
-                            let fmt = build_format(p);
-                            let hr = unsafe {
-                                client.IsFormatSupported(
-                                    AUDCLNT_SHAREMODE_EXCLUSIVE,
-                                    fmt.as_ptr() as *const _,
-                                    None,
-                                )
-                            };
-                            if hr.is_ok() {
-                                println!(
-                                    "  [bitstream] Device accepted profile: {} ({}ch x {}Hz)",
-                                    p.name, p.channels, p.rate
-                                );
-                                if let Ok((ac, rc, ev, bf)) =
-                                    initialize_exclusive_client(dev, p, &fmt)
-                                {
-                                    return Some((ac, rc, ev, bf, p.clone(), fmt));
-                                }
+                fn test_device_formats(
+                    dev: &IMMDevice,
+                    profs: &[AudioProfile],
+                ) -> Option<NegotiatedClient> {
+                    let client: IAudioClient = unsafe { dev.Activate(CLSCTX_ALL, None).ok()? };
+                    for p in profs {
+                        let fmt = build_format(p);
+                        let hr = unsafe {
+                            client.IsFormatSupported(
+                                AUDCLNT_SHAREMODE_EXCLUSIVE,
+                                fmt.as_ptr() as *const _,
+                                None,
+                            )
+                        };
+                        if hr.is_ok() {
+                            println!(
+                                "  [bitstream] Device accepted profile: {} ({}ch x {}Hz)",
+                                p.name, p.channels, p.rate
+                            );
+                            if let Ok((ac, rc, ev, bf)) = initialize_exclusive_client(dev, p, &fmt)
+                            {
+                                return Some((ac, rc, ev, bf, p.clone(), fmt));
                             }
                         }
-                        None
-                    };
+                    }
+                    None
+                }
 
                 let mut negotiated = if let Some(ref dev) = target_device {
                     println!(
