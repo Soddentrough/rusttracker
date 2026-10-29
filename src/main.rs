@@ -2569,10 +2569,20 @@ async fn run_gui(
                                         state.load_request = Some(reload_path);
                                         resume_pos_on_reload = Some(state.current_seconds);
                                         if state.surround_upmix.enabled && !pt_enabled {
-                                            state.osd_text = Some(
-                                                "🔊 Auto Surround & Height Upmix: ON (7.1.4 + Crossover EQ)"
-                                                    .to_string(),
-                                            );
+                                            let hw_ch = state.hardware_channels;
+                                            let badge =
+                                                crate::state::SurroundUpmixConfig::layout_badge(
+                                                    hw_ch,
+                                                );
+                                            state.osd_text =
+                                                Some(format!("🔊 Surround Upmix: ON ({badge})"));
+                                        } else if !state.surround_upmix.enabled
+                                            && state
+                                                .osd_text
+                                                .as_ref()
+                                                .is_some_and(|s| s.contains("Surround Upmix"))
+                                        {
+                                            // Preserve "🔊 Auto Surround Upmix: OFF" OSD message
                                         } else {
                                             state.osd_text = Some(if pt_enabled {
                                                 "Bitstream Passthrough: ON (Exclusive)".to_string()
@@ -2697,12 +2707,32 @@ async fn run_gui(
                                                 .map(std::sync::Arc::new)
                                         };
                                         state.track_ended = false;
-                                        if let Some(pos) = resume_pos_on_reload
-                                            && pos > 0.1
-                                        {
-                                            state.current_seconds = pos;
-                                            state.seek_request = Some(pos);
-                                            state.seek_epoch += 1;
+                                        if let Some(pos) = resume_pos_on_reload {
+                                            if pos > 0.1 {
+                                                state.current_seconds = pos;
+                                                state.seek_request = Some(pos);
+                                                state.seek_epoch += 1;
+                                            }
+                                            if state.surround_upmix.enabled {
+                                                if state.hardware_channels > 2 {
+                                                    let badge =
+                                                        crate::state::SurroundUpmixConfig::layout_badge(
+                                                            state.hardware_channels,
+                                                        );
+                                                    state.osd_text = Some(format!(
+                                                        "🔊 Auto Surround Upmix: ON ({badge})"
+                                                    ));
+                                                    state.show_hud = true;
+                                                    if state.video_mode == 3 {
+                                                        state.video_mode = 0;
+                                                    }
+                                                } else {
+                                                    state.osd_text = Some(
+                                                        "🔊 Auto Surround Upmix: Armed (Stereo/Mono Output — No Change)".to_string(),
+                                                    );
+                                                }
+                                                state.osd_timer = 3.0;
+                                            }
                                         }
                                         active_stream = Some(stream);
                                     } else {
@@ -4970,10 +5000,34 @@ mod tests {
         state.video_mode = 3;
         state.file_loaded = true;
 
+        // 1. On a standard stereo (2ch) device, enabling surround upmix must NOT change num_channels
+        state.hardware_channels = 2;
+        state.num_channels = 2;
         state.toggle_surround_upmix();
+        let is_active_2 = state.surround_upmix.is_active_for_hardware(2);
         assert!(state.surround_upmix.enabled);
+        assert!(!is_active_2);
         assert!(!state.force_stereo_downmix);
-        assert_eq!(state.num_channels, 12);
+        assert_eq!(
+            state.num_channels, 2,
+            "Stereo (2ch) output device must remain 2ch when surround upmix is enabled"
+        );
+
+        state.toggle_surround_upmix();
+        assert!(!state.surround_upmix.enabled);
+        assert_eq!(state.num_channels, 2);
+
+        // 2. On a Bed-Only 5.1 (6ch) or 7.1 (8ch) device, enabling surround upmix sets num_channels to 6 or 8
+        state.hardware_channels = 6;
+        state.show_hud = false;
+        state.video_mode = 3;
+        state.toggle_surround_upmix();
+        let is_active_6 = state.surround_upmix.is_active_for_hardware(6);
+        let has_height_6 = crate::state::SurroundUpmixConfig::has_height_channels(6);
+        assert!(state.surround_upmix.enabled);
+        assert!(is_active_6);
+        assert!(!has_height_6);
+        assert_eq!(state.num_channels, 6);
         assert!(state.show_hud);
         assert_eq!(state.video_mode, 0);
 
@@ -4981,12 +5035,16 @@ mod tests {
         assert!(!state.surround_upmix.enabled);
         assert_eq!(state.num_channels, 2);
 
-        // Verify enabling surround upmix while bitstream passthrough is active exits bitstream mode
+        // 3. On a Bed + Height 7.1.4 (12ch) device, enabling surround upmix while bitstream passthrough
+        // is active exits bitstream mode and sets num_channels to 12
+        state.hardware_channels = 12;
         state.passthrough_enabled = true;
         state.stats.bitstream_active = true;
         state.raw_channel_vus = vec![0.1; 6];
         state.set_surround_upmix(true);
+        let has_height_12 = crate::state::SurroundUpmixConfig::has_height_channels(12);
         assert!(state.surround_upmix.enabled);
+        assert!(has_height_12);
         assert!(!state.passthrough_enabled);
         assert_eq!(state.passthrough_change_request, Some(false));
         assert_eq!(state.num_channels, 12);

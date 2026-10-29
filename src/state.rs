@@ -660,9 +660,65 @@ impl SurroundUpmixConfig {
         total_db.clamp(-15.0, 15.0)
     }
 
-    /// Evaluate the Linkwitz-Riley 2nd-order crossover routing magnitudes at `freq_hz`.
-    /// Returns `(eq_linear_gain, lfe_mag, side_rear_bed_mag, height_mag)`.
-    pub fn evaluate_band_routing(&self, freq_hz: f32) -> (f32, f32, f32, f32) {
+    /// Returns `true` when surround upmixing is enabled and the output hardware device
+    /// has a multi-channel surround layout (`> 2` channels). On stereo/mono devices (`<= 2`),
+    /// surround upmixing is bypassed so audio and channel counts remain untouched.
+    #[inline]
+    pub fn is_active_for_hardware(&self, hardware_channels: i32) -> bool {
+        self.enabled && hardware_channels > 2
+    }
+
+    /// Returns `true` when the output hardware layout includes overhead height channels
+    /// (`> 8` channels, e.g. 5.1.4 / 7.1.2 / 7.1.4). Layouts with `3..=8` channels are Bed-Only.
+    #[inline]
+    pub fn has_height_channels(hardware_channels: i32) -> bool {
+        hardware_channels > 8
+    }
+
+    /// Short speaker topology tag for compact HUD buttons (e.g. `"5.1"`, `"7.1"`, `"7.1.4"`).
+    #[inline]
+    pub fn short_tag(hardware_channels: i32) -> &'static str {
+        if hardware_channels <= 2 {
+            "2.0"
+        } else if hardware_channels <= 4 {
+            "4.0"
+        } else if hardware_channels <= 6 {
+            "5.1"
+        } else if hardware_channels <= 8 {
+            "7.1"
+        } else if hardware_channels <= 10 {
+            "7.1.2"
+        } else {
+            "7.1.4"
+        }
+    }
+
+    /// Descriptive speaker topology label distinguishing Bed-Only vs. Bed + Height systems.
+    #[inline]
+    pub fn layout_badge(hardware_channels: i32) -> &'static str {
+        if hardware_channels <= 2 {
+            "Stereo/Mono Output — No Change"
+        } else if hardware_channels <= 4 {
+            "4.0 Quad — Bed Only"
+        } else if hardware_channels <= 6 {
+            "5.1 Surround — Bed Only"
+        } else if hardware_channels <= 8 {
+            "7.1 Surround — Bed Only"
+        } else if hardware_channels <= 10 {
+            "7.1.2 Surround — Bed + Height"
+        } else {
+            "7.1.4 Surround — Bed + Height"
+        }
+    }
+
+    /// Evaluate the Linkwitz-Riley 2nd-order crossover routing magnitudes at `freq_hz`
+    /// for either a Bed-Only (`has_height == false`) or Bed + Height (`has_height == true`) system.
+    /// Returns `(routing_contour_gain, lfe_mag, side_rear_bed_mag, height_mag)`.
+    pub fn evaluate_band_routing_for_layout(
+        &self,
+        freq_hz: f32,
+        has_height: bool,
+    ) -> (f32, f32, f32, f32) {
         let f = freq_hz.clamp(20.0, 20000.0);
         let eq_db = self.evaluate_eq_db(f);
         let eq_gain = 10.0f32.powf(eq_db / 20.0);
@@ -670,19 +726,24 @@ impl SurroundUpmixConfig {
         let f_sub = self.sub_crossover_hz.clamp(40.0, 250.0);
         let sub_ratio_sq = (f / f_sub).powi(2);
         let lfe_lp = 1.0 / (1.0 + sub_ratio_sq);
-
-        let f_height = self.height_crossover_hz.clamp(800.0, 10000.0);
-        let height_ratio_sq = (f / f_height).powi(2);
-        let height_lp = 1.0 / (1.0 + height_ratio_sq);
-        let height_hp = height_ratio_sq / (1.0 + height_ratio_sq);
-
         let lfe_mag = eq_gain * lfe_lp * self.lfe_level;
-        let bed_mag = eq_gain
-            * (height_lp + self.surround_high_bleed.clamp(0.0, 1.0) * height_hp)
-            * self.side_rear_level;
-        let height_mag = eq_gain * height_hp * self.height_level;
 
-        (eq_gain, lfe_mag, bed_mag, height_mag)
+        if has_height {
+            let f_height = self.height_crossover_hz.clamp(800.0, 10000.0);
+            let height_ratio_sq = (f / f_height).powi(2);
+            let height_lp = 1.0 / (1.0 + height_ratio_sq);
+            let height_hp = height_ratio_sq / (1.0 + height_ratio_sq);
+
+            let bed_mag = eq_gain
+                * (height_lp + self.surround_high_bleed.clamp(0.0, 1.0) * height_hp)
+                * self.side_rear_level;
+            let height_mag = eq_gain * height_hp * self.height_level;
+            (eq_gain, lfe_mag, bed_mag, height_mag)
+        } else {
+            // Bed-Only surround (4.0 / 5.1 / 7.1): full-bandwidth surround bed routing without height split
+            let bed_mag = eq_gain * self.side_rear_level;
+            (eq_gain, lfe_mag, bed_mag, 0.0)
+        }
     }
 }
 
@@ -1292,40 +1353,61 @@ impl AppState {
         }
     }
 
-    /// Enables or disables automatic 7.1.4 surround & height upmixing with configurable crossover EQ.
+    /// Enables or disables automatic surround upmixing with configurable crossover routing.
+    /// Only affects playback when connected to a multi-channel surround output device (`hardware_channels > 2`).
     pub fn set_surround_upmix(&mut self, enabled: bool) {
+        let prev_enabled = self.surround_upmix.enabled;
         self.surround_upmix.enabled = enabled;
         if enabled {
             self.force_stereo_downmix = false;
             if self.passthrough_enabled || self.stats.bitstream_active {
                 self.passthrough_enabled = false;
-                if self.file_loaded && self.stats.bitstream_active {
-                    self.passthrough_change_request = Some(false);
-                }
             }
-            self.num_channels = 12;
-            if self.file_loaded {
-                self.show_hud = true;
-                if self.video_mode == 3 {
-                    self.video_mode = 0;
-                }
+            if self.file_loaded && (self.stats.bitstream_active || self.hardware_channels <= 2) {
+                self.passthrough_change_request = Some(false);
             }
-            self.osd_text =
-                Some("🔊 Auto Surround & Height Upmix: ON (7.1.4 + Crossover EQ)".to_string());
-        } else {
-            self.num_channels = if let Some(tc) = self.tracker_channels {
-                tc + 2
-            } else if !self.raw_channel_vus.is_empty() && self.raw_channel_vus.len() != 12 {
-                self.raw_channel_vus.len() as i32
+            if self.hardware_channels > 2 {
+                self.num_channels = self.hardware_channels.min(12);
+                let ch_count = self.num_channels as usize;
+                self.channel_vus.resize(ch_count, 0.0);
+                self.peak_vus.resize(ch_count, 0.0);
+                if self.file_loaded {
+                    self.show_hud = true;
+                    if self.video_mode == 3 {
+                        self.video_mode = 0;
+                    }
+                }
+                let badge = SurroundUpmixConfig::layout_badge(self.hardware_channels);
+                self.osd_text = Some(format!("🔊 Auto Surround Upmix: ON ({})", badge));
             } else {
-                self.hardware_channels.max(2)
-            };
-            self.osd_text = Some("🔊 Auto Surround & Height Upmix: OFF".to_string());
+                self.osd_text = Some(
+                    "🔊 Auto Surround Upmix: Armed (Stereo/Mono Output — No Change)".to_string(),
+                );
+            }
+        } else {
+            if self.file_loaded && prev_enabled && self.hardware_channels > 2 {
+                self.passthrough_change_request = Some(self.passthrough_enabled);
+            }
+            if self.hardware_channels > 2 {
+                let upmix_ch = self.hardware_channels.min(12) as usize;
+                self.num_channels = if let Some(tc) = self.tracker_channels {
+                    tc + 2
+                } else if !self.raw_channel_vus.is_empty() && self.raw_channel_vus.len() != upmix_ch
+                {
+                    self.raw_channel_vus.len() as i32
+                } else {
+                    2
+                };
+                let ch_count = self.num_channels as usize;
+                self.channel_vus.resize(ch_count, 0.0);
+                self.peak_vus.resize(ch_count, 0.0);
+            }
+            self.osd_text = Some("🔊 Auto Surround Upmix: OFF".to_string());
         }
         self.osd_timer = 2.5;
     }
 
-    /// Toggles automatic 7.1.4 surround & height upmixing with configurable crossover EQ.
+    /// Toggles automatic surround upmixing with configurable crossover routing.
     pub fn toggle_surround_upmix(&mut self) {
         let next = !self.surround_upmix.enabled;
         self.set_surround_upmix(next);

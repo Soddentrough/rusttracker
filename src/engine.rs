@@ -6826,6 +6826,9 @@ impl VulkanEngine {
         self.last_history_cam_z =
             ((self.last_history_push_count as f64 + step_fraction as f64) * 0.5) % 6000.0;
         let frame_dt = dt.clamp(0.0005, 0.1);
+        let upmix_active = state
+            .surround_upmix
+            .is_active_for_hardware(state.hardware_channels);
         let mut uniforms = AudioUniforms {
             spectrum: [0.0; 1024],
             fire_heat: [0.0; 1024],
@@ -6841,7 +6844,7 @@ impl VulkanEngine {
             smooth_time: self.play_time as f32,
             heatmap_row: self.heatmap_row,
             fft_channels: state.raw_audio_channels.len() as u32,
-            num_spatial_channels: if state.surround_upmix.enabled {
+            num_spatial_channels: if upmix_active {
                 state.channel_vus.len().min(16) as u32
             } else if let Some(tc) = state.tracker_channels.filter(|&n| n > 0) {
                 (tc as u32).min(16)
@@ -6917,7 +6920,7 @@ impl VulkanEngine {
 
         // 1. Populate UI Display Channels (may be visually remapped)
         let mut display_order: Vec<usize> = (0..ch_len).collect();
-        if state.tracker_channels.is_none() || state.surround_upmix.enabled {
+        if state.tracker_channels.is_none() || upmix_active {
             if ch_len == 6 {
                 display_order = vec![4, 0, 2, 3, 1, 5]; // Ls, L, C, LFE, R, Rs
             } else if ch_len == 8 {
@@ -6952,10 +6955,7 @@ impl VulkanEngine {
                 smoothed
             }
         };
-        if let Some(num_tracks) = state
-            .tracker_channels
-            .filter(|&n| n > 0 && !state.surround_upmix.enabled)
-        {
+        if let Some(num_tracks) = state.tracker_channels.filter(|&n| n > 0 && !upmix_active) {
             // For tracker files, channel_vus is [L_Peak, Track1..N, R_Peak].
             // Map individual tracker tracks into spatial channels so surround/room visualizers
             // light up each speaker with its actual instrument track!
@@ -9040,12 +9040,12 @@ impl VulkanEngine {
                                                 .checkbox(
                                                     &mut surround_upmix,
                                                     egui::RichText::new(
-                                                        "Auto Surround & Height Upmix (L/R Side Fill + Height EQ Split)",
+                                                        "Auto Surround Upmix (5.1/7.1 Bed or 7.1.4 Bed + Height)",
                                                     )
                                                     .size(12.5)
                                                     .color(egui::Color32::from_rgb(130, 235, 255)),
                                                 )
-                                                .on_hover_text("Upmixes stereo and non-surround sources across all left/right surround speakers and splits high frequencies up to the height channels, replacing the top-middle Piano Roll with a live Configurable Crossover EQ.")
+                                                .on_hover_text("When connected to a multi-channel surround output (>2ch), upmixes stereo sources across the surround bed (5.1/7.1) or bed + overhead height channels (7.1.4). Stereo/mono outputs (<=2ch) remain completely unchanged.")
                                                 .changed()
                                             {
                                                 engine_action =
@@ -9234,7 +9234,9 @@ impl VulkanEngine {
                                         // Label
                                         if num_channels <= 16 {
                                             let label = if state.tracker_channels.is_some()
-                                                && !state.surround_upmix.enabled
+                                                && !state
+                                                    .surround_upmix
+                                                    .is_active_for_hardware(state.hardware_channels)
                                             {
                                                 if i == 0 {
                                                     "L".to_string()
@@ -9272,15 +9274,31 @@ impl VulkanEngine {
                             };
 
                             let render_col_heatmap = |col: &mut egui::Ui, out_heatmap_rect: &mut Option<egui::Rect>, engine_action: &mut EngineAction| {
-                                if state.surround_upmix.enabled {
-                                    // Swap out the Piano Roll / Pattern Heatmap with the Configurable Surround & Height Crossover EQ
+                                if state
+                                    .surround_upmix
+                                    .is_active_for_hardware(state.hardware_channels)
+                                {
+                                    // Swap out the Piano Roll / Pattern Heatmap with the Surround Routing & Crossover Curve
+                                    // ONLY when actively upmixing to a multi-channel surround system (>2ch).
                                     *out_heatmap_rect = None;
                                     let mut cfg = state.surround_upmix;
                                     let mut cfg_changed = false;
+                                    let has_height =
+                                        crate::state::SurroundUpmixConfig::has_height_channels(
+                                            state.hardware_channels,
+                                        );
+                                    let short_tag = crate::state::SurroundUpmixConfig::short_tag(
+                                        state.hardware_channels,
+                                    );
 
                                     if !is_portrait {
                                         col.horizontal(|ui| {
-                                            ui.heading("Surround Crossover & EQ");
+                                            let panel_title = if has_height {
+                                                format!("{short_tag} Bed + Height Upmix")
+                                            } else {
+                                                format!("{short_tag} Bed Upmix")
+                                            };
+                                            ui.heading(panel_title);
                                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                                 let off_btn = egui::Button::new(
                                                     egui::RichText::new("✕ Off")
@@ -9293,7 +9311,7 @@ impl VulkanEngine {
                                                 .corner_radius(4.0);
                                                 if ui
                                                     .add(off_btn)
-                                                    .on_hover_text("Disable Auto Surround & Height Upmix and return to Piano Roll (Shortcut: 'u' / L3·R3)")
+                                                    .on_hover_text("Disable Surround Upmix and return to Piano Roll (Shortcut: 'u' / L3·R3)")
                                                     .clicked()
                                                 {
                                                     *engine_action = EngineAction::ToggleSurroundUpmix(false);
@@ -9310,20 +9328,22 @@ impl VulkanEngine {
                                                 .corner_radius(4.0);
                                                 if ui
                                                     .add(reset_btn)
-                                                    .on_hover_text("Reset EQ bands, crossovers, and speaker levels to defaults")
+                                                    .on_hover_text("Reset surround routing bands, crossovers, and speaker levels to defaults")
                                                     .clicked()
                                                 {
                                                     cfg.reset_tuning();
                                                     cfg_changed = true;
                                                 }
                                                 ui.add_space(4.0);
+                                                if has_height {
+                                                    ui.label(
+                                                        egui::RichText::new("● Height ↑")
+                                                            .size(10.5)
+                                                            .color(egui::Color32::from_rgb(110, 255, 110)),
+                                                    );
+                                                }
                                                 ui.label(
-                                                    egui::RichText::new("● Height ↑")
-                                                        .size(10.5)
-                                                        .color(egui::Color32::from_rgb(110, 255, 110)),
-                                                );
-                                                ui.label(
-                                                    egui::RichText::new("● L/R Bed")
+                                                    egui::RichText::new("● Surround Bed")
                                                         .size(10.5)
                                                         .color(egui::Color32::from_rgb(0, 215, 255)),
                                                 );
@@ -9376,9 +9396,12 @@ impl VulkanEngine {
                                         db_to_y(db)
                                     };
 
-                                    // Pointer interaction for 5 EQ band nodes (1..=5), Sub Crossover (6), Height Crossover (7)
+                                    // Pointer interaction for 5 surround routing band nodes (1..=5), Sub Crossover (6), Height Crossover (7, only when has_height)
                                     let drag_id = egui::Id::new("surround_eq_active_handle");
                                     let mut active_handle: u8 = col.ctx().data_mut(|d| *d.get_temp_mut_or_default::<u8>(drag_id));
+                                    if !has_height && active_handle == 7 {
+                                        active_handle = 0;
+                                    }
 
                                     let pointer_pos = response
                                         .interact_pointer_pos()
@@ -9407,15 +9430,17 @@ impl VulkanEngine {
                                                 }
                                             }
                                             let sub_x = freq_to_x(cfg.sub_crossover_hz);
-                                            let height_x = freq_to_x(cfg.height_crossover_hz);
                                             let sub_d = (pos.x - sub_x).abs();
                                             if sub_d < best_dist.min(13.0) {
                                                 best_dist = sub_d;
                                                 best_h = 6;
                                             }
-                                            let height_d = (pos.x - height_x).abs();
-                                            if height_d < best_dist.min(13.0) {
-                                                best_h = 7;
+                                            if has_height {
+                                                let height_x = freq_to_x(cfg.height_crossover_hz);
+                                                let height_d = (pos.x - height_x).abs();
+                                                if height_d < best_dist.min(13.0) {
+                                                    best_h = 7;
+                                                }
                                             }
                                             active_handle = best_h;
                                             col.ctx().data_mut(|d| d.insert_temp(drag_id, active_handle));
@@ -9439,7 +9464,7 @@ impl VulkanEngine {
                                                         cfg_changed = true;
                                                     }
                                                 }
-                                                7 => {
+                                                7 if has_height => {
                                                     let new_h = (x_to_freq(pos.x).clamp(800.0, 10000.0) / 10.0).round() * 10.0;
                                                     if (cfg.height_crossover_hz - new_h).abs() > 1.0 {
                                                         cfg.height_crossover_hz = new_h;
@@ -9540,7 +9565,8 @@ impl VulkanEngine {
                                             let val = (state.spectrum_data[bin_idx] / 100.0).clamp(0.0, 1.0);
                                             if val > 0.01 {
                                                 let bh = val * plot_rect.height() * 0.85;
-                                                let (_, lfe_m, bed_m, h_m) = cfg.evaluate_band_routing(f_bar);
+                                                let (_, lfe_m, bed_m, h_m) =
+                                                    cfg.evaluate_band_routing_for_layout(f_bar, has_height);
                                                 let sum_m = (lfe_m + bed_m + h_m).max(0.01);
                                                 let r_c = ((lfe_m * 255.0 + bed_m * 0.0 + h_m * 110.0) / sum_m).clamp(0.0, 255.0) as u8;
                                                 let g_c = ((lfe_m * 95.0 + bed_m * 210.0 + h_m * 255.0) / sum_m).clamp(0.0, 255.0) as u8;
@@ -9558,7 +9584,7 @@ impl VulkanEngine {
                                         }
                                     }
 
-                                    // Compute & draw LFE, Bed Surround, Height, and Master EQ transfer curves
+                                    // Compute & draw LFE, Bed Surround, Height (if present), and Surround Routing Contour curves
                                     let samples = 112usize;
                                     let mut lfe_pts = Vec::with_capacity(samples);
                                     let mut bed_pts = Vec::with_capacity(samples);
@@ -9569,7 +9595,8 @@ impl VulkanEngine {
                                         let t = s as f32 / (samples - 1) as f32;
                                         let x = plot_rect.left() + t * plot_rect.width();
                                         let f = x_to_freq(x);
-                                        let (eq_gain, lfe_m, bed_m, height_m) = cfg.evaluate_band_routing(f);
+                                        let (eq_gain, lfe_m, bed_m, height_m) =
+                                            cfg.evaluate_band_routing_for_layout(f, has_height);
                                         let y_lfe = mag_to_y(lfe_m);
                                         let y_bed = mag_to_y(bed_m);
                                         let y_height = mag_to_y(height_m);
@@ -9577,7 +9604,9 @@ impl VulkanEngine {
 
                                         lfe_pts.push(egui::pos2(x, y_lfe));
                                         bed_pts.push(egui::pos2(x, y_bed));
-                                        height_pts.push(egui::pos2(x, y_height));
+                                        if has_height {
+                                            height_pts.push(egui::pos2(x, y_height));
+                                        }
                                         eq_pts.push(egui::pos2(x, y_eq));
 
                                         // Subtle vertical tint columns under each curve for instant visual split clarity
@@ -9590,7 +9619,7 @@ impl VulkanEngine {
                                                     egui::Color32::from_rgba_unmultiplied(0, 195, 255, 20),
                                                 );
                                             }
-                                            if y_height < plot_rect.bottom() - 1.0 {
+                                            if has_height && y_height < plot_rect.bottom() - 1.0 {
                                                 painter.rect_filled(
                                                     egui::Rect::from_min_max(egui::pos2(x, y_height), egui::pos2(x + col_w, plot_rect.bottom())),
                                                     0.0,
@@ -9615,16 +9644,18 @@ impl VulkanEngine {
                                         bed_pts,
                                         egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(0, 215, 255)),
                                     ));
-                                    painter.add(egui::Shape::line(
-                                        height_pts,
-                                        egui::Stroke::new(2.1_f32, egui::Color32::from_rgb(110, 255, 110)),
-                                    ));
+                                    if has_height {
+                                        painter.add(egui::Shape::line(
+                                            height_pts,
+                                            egui::Stroke::new(2.1_f32, egui::Color32::from_rgb(110, 255, 110)),
+                                        ));
+                                    }
                                     painter.add(egui::Shape::line(
                                         eq_pts,
                                         egui::Stroke::new(1.5_f32, egui::Color32::from_rgba_unmultiplied(240, 245, 255, 210)),
                                     ));
 
-                                    // Draw vertical Crossover Handles (LFE Sub & Height Split)
+                                    // Draw vertical Crossover Handles (LFE Sub & optional Height Split)
                                     let sub_x = freq_to_x(cfg.sub_crossover_hz);
                                     let sub_col = if active_handle == 6 {
                                         egui::Color32::from_rgb(255, 175, 110)
@@ -9654,47 +9685,49 @@ impl VulkanEngine {
                                     );
                                     painter.galley(sub_badge_rect.min + egui::vec2(4.0, 1.0), sub_galley, egui::Color32::WHITE);
 
-                                    let height_x = freq_to_x(cfg.height_crossover_hz);
-                                    let height_col = if active_handle == 7 {
-                                        egui::Color32::from_rgb(190, 255, 170)
-                                    } else {
-                                        egui::Color32::from_rgb(110, 255, 110)
-                                    };
-                                    painter.line_segment(
-                                        [egui::pos2(height_x, plot_rect.top()), egui::pos2(height_x, plot_rect.bottom())],
-                                        (1.5, height_col),
-                                    );
-                                    let height_badge_text = if cfg.height_crossover_hz >= 1000.0 {
-                                        format!("HEIGHT ↑ {:.1}kHz", cfg.height_crossover_hz / 1000.0)
-                                    } else {
-                                        format!("HEIGHT ↑ {:.0}Hz", cfg.height_crossover_hz)
-                                    };
-                                    let height_galley = painter.layout_no_wrap(
-                                        height_badge_text,
-                                        egui::FontId::proportional(10.0),
-                                        egui::Color32::WHITE,
-                                    );
-                                    let height_badge_rect = egui::Rect::from_center_size(
-                                        egui::pos2(height_x.clamp(plot_rect.left() + 42.0, plot_rect.right() - 42.0), graph_rect.top() + 8.0),
-                                        height_galley.size() + egui::vec2(8.0, 2.0),
-                                    );
-                                    painter.rect(
-                                        height_badge_rect,
-                                        3.0,
-                                        egui::Color32::from_rgba_unmultiplied(14, 48, 22, 230),
-                                        egui::Stroke::new(1.0_f32, height_col),
-                                        egui::StrokeKind::Inside,
-                                    );
-                                    painter.galley(height_badge_rect.min + egui::vec2(4.0, 1.0), height_galley, egui::Color32::WHITE);
+                                    if has_height {
+                                        let height_x = freq_to_x(cfg.height_crossover_hz);
+                                        let height_col = if active_handle == 7 {
+                                            egui::Color32::from_rgb(190, 255, 170)
+                                        } else {
+                                            egui::Color32::from_rgb(110, 255, 110)
+                                        };
+                                        painter.line_segment(
+                                            [egui::pos2(height_x, plot_rect.top()), egui::pos2(height_x, plot_rect.bottom())],
+                                            (1.5, height_col),
+                                        );
+                                        let height_badge_text = if cfg.height_crossover_hz >= 1000.0 {
+                                            format!("HEIGHT ↑ {:.1}kHz", cfg.height_crossover_hz / 1000.0)
+                                        } else {
+                                            format!("HEIGHT ↑ {:.0}Hz", cfg.height_crossover_hz)
+                                        };
+                                        let height_galley = painter.layout_no_wrap(
+                                            height_badge_text,
+                                            egui::FontId::proportional(10.0),
+                                            egui::Color32::WHITE,
+                                        );
+                                        let height_badge_rect = egui::Rect::from_center_size(
+                                            egui::pos2(height_x.clamp(plot_rect.left() + 42.0, plot_rect.right() - 42.0), graph_rect.top() + 8.0),
+                                            height_galley.size() + egui::vec2(8.0, 2.0),
+                                        );
+                                        painter.rect(
+                                            height_badge_rect,
+                                            3.0,
+                                            egui::Color32::from_rgba_unmultiplied(14, 48, 22, 230),
+                                            egui::Stroke::new(1.0_f32, height_col),
+                                            egui::StrokeKind::Inside,
+                                        );
+                                        painter.galley(height_badge_rect.min + egui::vec2(4.0, 1.0), height_galley, egui::Color32::WHITE);
+                                    }
 
-                                    // Draw the 5 interactive Parametric EQ Band Nodes
+                                    // Draw the 5 interactive Surround Routing Band Nodes
                                     for (i, &bf) in crate::state::SurroundUpmixConfig::EQ_BAND_FREQS.iter().enumerate() {
                                         let gain_db = cfg.band_gains_db[i];
                                         let node_pos = egui::pos2(freq_to_x(bf), db_to_y(gain_db));
                                         let is_active = active_handle == (i + 1) as u8;
                                         let node_color = if bf <= cfg.sub_crossover_hz * 1.1 {
                                             egui::Color32::from_rgb(255, 120, 65)
-                                        } else if bf >= cfg.height_crossover_hz {
+                                        } else if has_height && bf >= cfg.height_crossover_hz {
                                             egui::Color32::from_rgb(120, 255, 120)
                                         } else {
                                             egui::Color32::from_rgb(40, 220, 255)
@@ -9732,7 +9765,8 @@ impl VulkanEngine {
                                         }
                                     }
 
-                                    // Bottom compact speaker routing & level sliders (2 rows x 3 columns)
+                                    // Bottom compact speaker routing & level sliders (2 rows x 3 columns),
+                                    // tailored to Bed + Height (>8ch) vs Bed-Only (3..=8ch) systems
                                     col.add_space(3.0);
                                     col.columns(3, |cols| {
                                         cols[0].horizontal(|ui| {
@@ -9740,7 +9774,7 @@ impl VulkanEngine {
                                             ui.label(egui::RichText::new("Front").size(11.0).color(egui::Color32::from_rgb(0, 215, 255)));
                                             if ui
                                                 .add(egui::Slider::new(&mut cfg.front_level, 0.0..=1.5).show_value(false))
-                                                .on_hover_text(format!("Front L/R Level: {:.0}%", cfg.front_level * 100.0))
+                                                .on_hover_text(format!("Front L/R Anchor Level (uncolored): {:.0}%", cfg.front_level * 100.0))
                                                 .changed()
                                             {
                                                 cfg_changed = true;
@@ -9751,7 +9785,7 @@ impl VulkanEngine {
                                             ui.label(egui::RichText::new("Side/Rear").size(11.0).color(egui::Color32::from_rgb(80, 195, 255)));
                                             if ui
                                                 .add(egui::Slider::new(&mut cfg.side_rear_level, 0.0..=1.5).show_value(false))
-                                                .on_hover_text(format!("Side & Rear L/R Surround Bed Level: {:.0}%", cfg.side_rear_level * 100.0))
+                                                .on_hover_text(format!("Side & Rear Surround Bed Level: {:.0}%", cfg.side_rear_level * 100.0))
                                                 .changed()
                                             {
                                                 cfg_changed = true;
@@ -9759,13 +9793,24 @@ impl VulkanEngine {
                                         });
                                         cols[2].horizontal(|ui| {
                                             ui.spacing_mut().slider_width = (ui.available_width() - 58.0).max(28.0);
-                                            ui.label(egui::RichText::new("Height ↑").size(11.0).color(egui::Color32::from_rgb(110, 255, 110)));
-                                            if ui
-                                                .add(egui::Slider::new(&mut cfg.height_level, 0.0..=1.5).show_value(false))
-                                                .on_hover_text(format!("Height (Top Front / Top Rear) Level: {:.0}%", cfg.height_level * 100.0))
-                                                .changed()
-                                            {
-                                                cfg_changed = true;
+                                            if has_height {
+                                                ui.label(egui::RichText::new("Height ↑").size(11.0).color(egui::Color32::from_rgb(110, 255, 110)));
+                                                if ui
+                                                    .add(egui::Slider::new(&mut cfg.height_level, 0.0..=1.5).show_value(false))
+                                                    .on_hover_text(format!("Overhead Height (Top Front / Top Rear) Level: {:.0}%", cfg.height_level * 100.0))
+                                                    .changed()
+                                                {
+                                                    cfg_changed = true;
+                                                }
+                                            } else {
+                                                ui.label(egui::RichText::new("Width").size(11.0).color(egui::Color32::from_rgb(140, 225, 255)));
+                                                if ui
+                                                    .add(egui::Slider::new(&mut cfg.stereo_width, 0.0..=2.0).show_value(false))
+                                                    .on_hover_text(format!("Surround Bed Ambient Width: {:.0}%", cfg.stereo_width * 100.0))
+                                                    .changed()
+                                                {
+                                                    cfg_changed = true;
+                                                }
                                             }
                                         });
                                     });
@@ -9794,13 +9839,24 @@ impl VulkanEngine {
                                         });
                                         cols[2].horizontal(|ui| {
                                             ui.spacing_mut().slider_width = (ui.available_width() - 58.0).max(28.0);
-                                            ui.label(egui::RichText::new("Hi-Bleed").size(11.0).color(egui::Color32::from_rgb(175, 215, 235)));
-                                            if ui
-                                                .add(egui::Slider::new(&mut cfg.surround_high_bleed, 0.0..=1.0).show_value(false))
-                                                .on_hover_text(format!("High-Frequency Bleed in Ear-Level Side/Rear Speakers: {:.0}% (0% routes highs exclusively to Height speakers)", cfg.surround_high_bleed * 100.0))
-                                                .changed()
-                                            {
-                                                cfg_changed = true;
+                                            if has_height {
+                                                ui.label(egui::RichText::new("Hi-Bleed").size(11.0).color(egui::Color32::from_rgb(175, 215, 235)));
+                                                if ui
+                                                    .add(egui::Slider::new(&mut cfg.surround_high_bleed, 0.0..=1.0).show_value(false))
+                                                    .on_hover_text(format!("High-Frequency Bleed in Ear-Level Side/Rear Speakers: {:.0}% (0% routes highs exclusively to Height speakers)", cfg.surround_high_bleed * 100.0))
+                                                    .changed()
+                                                {
+                                                    cfg_changed = true;
+                                                }
+                                            } else {
+                                                ui.label(egui::RichText::new("Sub X-O").size(11.0).color(egui::Color32::from_rgb(255, 145, 95)));
+                                                if ui
+                                                    .add(egui::Slider::new(&mut cfg.sub_crossover_hz, 40.0..=250.0).show_value(false))
+                                                    .on_hover_text(format!("LFE Subwoofer Low-Pass Crossover: {:.0} Hz", cfg.sub_crossover_hz))
+                                                    .changed()
+                                                {
+                                                    cfg_changed = true;
+                                                }
                                             }
                                         });
                                     });
@@ -10105,16 +10161,36 @@ impl VulkanEngine {
 
                                             ui.add_space(4.0);
                                             let upmix_on = state.surround_upmix.enabled;
-                                            let (upmix_label, upmix_fill, upmix_stroke, upmix_text_col) = if upmix_on {
+                                            let upmix_active = state
+                                                .surround_upmix
+                                                .is_active_for_hardware(state.hardware_channels);
+                                            let short_tag = crate::state::SurroundUpmixConfig::short_tag(
+                                                state.hardware_channels,
+                                            );
+                                            let (upmix_label, upmix_fill, upmix_stroke, upmix_text_col) = if upmix_active {
                                                 (
-                                                    "🔊 7.1.4 EQ: ON",
+                                                    format!("🔊 {short_tag} UPMIX: ON"),
                                                     egui::Color32::from_rgb(18, 92, 118),
                                                     egui::Color32::from_rgb(70, 225, 255),
                                                     egui::Color32::from_rgb(220, 252, 255),
                                                 )
+                                            } else if upmix_on {
+                                                (
+                                                    "🔊 UPMIX (2CH)".to_string(),
+                                                    egui::Color32::from_rgb(42, 56, 72),
+                                                    egui::Color32::from_rgb(95, 140, 175),
+                                                    egui::Color32::from_rgb(190, 215, 235),
+                                                )
+                                            } else if state.hardware_channels > 2 {
+                                                (
+                                                    format!("🔊 {short_tag} UPMIX"),
+                                                    egui::Color32::from_rgb(32, 42, 58),
+                                                    egui::Color32::from_rgb(80, 108, 145),
+                                                    egui::Color32::from_rgb(205, 220, 240),
+                                                )
                                             } else {
                                                 (
-                                                    "🔊 UPMIX EQ",
+                                                    "🔊 UPMIX".to_string(),
                                                     egui::Color32::from_rgb(32, 42, 58),
                                                     egui::Color32::from_rgb(80, 108, 145),
                                                     egui::Color32::from_rgb(205, 220, 240),
@@ -10132,7 +10208,7 @@ impl VulkanEngine {
                                             .min_size(egui::vec2(88.0, if is_portrait { 30.0 } else { 24.0 }));
                                             if ui
                                                 .add(upmix_hdr_btn)
-                                                .on_hover_text("Toggle Auto 7.1.4 Surround & Height Upmix + Configurable Crossover EQ (Shortcut: 'u' / L3·R3)")
+                                                .on_hover_text("Toggle Auto Surround Upmix (5.1/7.1 Bed or 7.1.4 Bed + Height; stereo/mono outputs remain unchanged) (Shortcut: 'u' / L3·R3)")
                                                 .clicked()
                                             {
                                                 *engine_action = EngineAction::ToggleSurroundUpmix(!upmix_on);
