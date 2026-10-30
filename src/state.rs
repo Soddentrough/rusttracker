@@ -1479,6 +1479,50 @@ impl AppState {
         let next = !self.surround_upmix.enabled;
         self.set_surround_upmix(next);
     }
+
+    /// Updates the OSD for a relative seek jump (`delta` in seconds).
+    /// Repeated jumps in the same direction while the seek OSD is still active accumulate
+    /// the total time jumped, resetting once the OSD timer expires (after 2.0 seconds)
+    /// or when jumping in the opposite direction.
+    pub fn record_seek_osd(&mut self, delta: f64) {
+        if delta.abs() < 0.1 {
+            self.cumulative_scrub = 0.0;
+            self.osd_text = Some(format!(
+                "{}1 Frame",
+                if delta > 0.0 { "+" } else { "-" }
+            ));
+            self.osd_timer = 2.0;
+            return;
+        }
+
+        let is_active_seek_osd = self.osd_timer > 0.0
+            && self
+                .osd_text
+                .as_deref()
+                .is_some_and(|s| (s.starts_with('+') || s.starts_with('-')) && s.ends_with('s'));
+
+        if is_active_seek_osd && self.cumulative_scrub * delta > 0.0 {
+            self.cumulative_scrub += delta;
+        } else {
+            self.cumulative_scrub = delta;
+        }
+
+        let sign = if self.cumulative_scrub >= 0.0 { "+" } else { "" };
+        self.osd_text = Some(format!("{}{:.1}s", sign, self.cumulative_scrub));
+        self.osd_timer = 2.0;
+    }
+
+    /// Advances the OSD countdown timer by `dt` seconds and clears the OSD text
+    /// and cumulative seek state once it expires.
+    pub fn tick_osd_timer(&mut self, dt: f32) {
+        if self.osd_timer > 0.0 {
+            self.osd_timer = (self.osd_timer - dt).max(0.0);
+            if self.osd_timer == 0.0 {
+                self.osd_text = None;
+                self.cumulative_scrub = 0.0;
+            }
+        }
+    }
 }
 
 /// Format a playback timestamp or duration in seconds as `H:MM:SS` (when >= 1 hour

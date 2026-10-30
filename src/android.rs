@@ -707,12 +707,7 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                     }
 
                     // OSD timer
-                    if state.osd_timer > 0.0 {
-                        state.osd_timer = (state.osd_timer - dt).max(0.0);
-                        if state.osd_timer == 0.0 {
-                            state.osd_text = None;
-                        }
-                    }
+                    state.tick_osd_timer(dt);
 
                     // Upload GPU uniforms
                     eng.update(&state, dt);

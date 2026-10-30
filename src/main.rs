@@ -1898,16 +1898,7 @@ async fn run_gui(
                                     state.spectrum_history.push_back(vec![0.0; 1024]);
                                 }
 
-                                let sign = if delta >= 0.0 { "+" } else { "" };
-                                if delta.abs() < 0.1 {
-                                    state.osd_text = Some(format!(
-                                        "{}1 Frame",
-                                        if delta > 0.0 { "+" } else { "-" }
-                                    ));
-                                } else {
-                                    state.osd_text = Some(format!("{}{:.1}s", sign, delta));
-                                }
-                                state.osd_timer = 2.0;
+                                state.record_seek_osd(delta);
                             }
                             _ => {
                                 if !kb_event.repeat {
@@ -2953,12 +2944,7 @@ async fn run_gui(
                                     dt,
                                 );
 
-                                if state.osd_timer > 0.0 {
-                                    state.osd_timer = (state.osd_timer - dt).max(0.0);
-                                    if state.osd_timer == 0.0 {
-                                        state.osd_text = None;
-                                    }
-                                }
+                                state.tick_osd_timer(dt);
 
                                 // Clamp panel split ratio to ensure both top and bottom panels have at least MIN_PANEL_HEIGHT_PX height
                                 let total_h =
@@ -3832,8 +3818,7 @@ async fn run_gui(
                                         for _ in 0..120 {
                                             state.spectrum_history.push_back(vec![0.0; 1024]);
                                         }
-                                        state.osd_text = Some("+10.0s".to_string());
-                                        state.osd_timer = 2.0;
+                                        state.record_seek_osd(10.0);
                                     }
                                     gilrs::Button::DPadLeft => {
                                         let mut state = app_state.lock().unwrap();
@@ -3845,8 +3830,7 @@ async fn run_gui(
                                         for _ in 0..120 {
                                             state.spectrum_history.push_back(vec![0.0; 1024]);
                                         }
-                                        state.osd_text = Some("-10.0s".to_string());
-                                        state.osd_timer = 2.0;
+                                        state.record_seek_osd(-10.0);
                                     }
                                     _ => {}
                                 }
@@ -4130,8 +4114,7 @@ async fn run_gui(
                                         for _ in 0..120 {
                                             state.spectrum_history.push_back(vec![0.0; 1024]);
                                         }
-                                        state.osd_text = Some("-60.0s".to_string());
-                                        state.osd_timer = 2.0;
+                                        state.record_seek_osd(-60.0);
                                     }
                                 }
                                 gilrs::Button::RightTrigger => {
@@ -4157,8 +4140,7 @@ async fn run_gui(
                                         for _ in 0..120 {
                                             state.spectrum_history.push_back(vec![0.0; 1024]);
                                         }
-                                        state.osd_text = Some("+60.0s".to_string());
-                                        state.osd_timer = 2.0;
+                                        state.record_seek_osd(60.0);
                                     }
                                 }
                                 gilrs::Button::LeftTrigger2 => {
@@ -4251,8 +4233,7 @@ async fn run_gui(
                                         for _ in 0..120 {
                                             state.spectrum_history.push_back(vec![0.0; 1024]);
                                         }
-                                        state.osd_text = Some("+10.0s".to_string());
-                                        state.osd_timer = 2.0;
+                                        state.record_seek_osd(10.0);
                                     }
                                 }
                                 gilrs::Button::DPadLeft => {
@@ -4266,8 +4247,7 @@ async fn run_gui(
                                         for _ in 0..120 {
                                             state.spectrum_history.push_back(vec![0.0; 1024]);
                                         }
-                                        state.osd_text = Some("-10.0s".to_string());
-                                        state.osd_timer = 2.0;
+                                        state.record_seek_osd(-10.0);
                                     }
                                 }
                                 gilrs::Button::DPadUp => {
@@ -5137,5 +5117,54 @@ mod tests {
         state.set_surround_upmix(false);
         assert!(!state.surround_upmix.enabled);
         assert_eq!(state.num_channels, 6);
+    }
+
+    #[test]
+    fn test_cumulative_seek_osd_and_reset() {
+        let mut state = AppState::new("Test Track".to_string());
+
+        // Single jump forward shows +5.0s
+        state.record_seek_osd(5.0);
+        assert_eq!(state.osd_text.as_deref(), Some("+5.0s"));
+        assert!((state.osd_timer - 2.0).abs() < 1e-5);
+
+        // Repeated jump forward before 2.0s timer expires accumulates
+        state.tick_osd_timer(0.5);
+        state.record_seek_osd(5.0);
+        assert_eq!(state.osd_text.as_deref(), Some("+10.0s"));
+        assert!((state.osd_timer - 2.0).abs() < 1e-5);
+
+        state.tick_osd_timer(0.8);
+        state.record_seek_osd(5.0);
+        assert_eq!(state.osd_text.as_deref(), Some("+15.0s"));
+        assert!((state.osd_timer - 2.0).abs() < 1e-5);
+
+        // After 2.0 seconds, the OSD expires and resets cumulative time
+        state.tick_osd_timer(2.0);
+        assert_eq!(state.osd_text, None);
+        assert_eq!(state.osd_timer, 0.0);
+        assert_eq!(state.cumulative_scrub, 0.0);
+
+        // Next jump starts fresh at +5.0s
+        state.record_seek_osd(5.0);
+        assert_eq!(state.osd_text.as_deref(), Some("+5.0s"));
+
+        // Jumping in the opposite direction resets to the new direction and accumulates backward
+        state.record_seek_osd(-5.0);
+        assert_eq!(state.osd_text.as_deref(), Some("-5.0s"));
+        state.record_seek_osd(-5.0);
+        assert_eq!(state.osd_text.as_deref(), Some("-10.0s"));
+
+        // Non-seek OSD message interrupts accumulation so subsequent seek starts fresh
+        state.osd_text = Some("Paused".to_string());
+        state.osd_timer = 2.0;
+        state.record_seek_osd(5.0);
+        assert_eq!(state.osd_text.as_deref(), Some("+5.0s"));
+
+        // Frame-stepping resets cumulative seconds
+        state.record_seek_osd(1.0 / 60.0);
+        assert_eq!(state.osd_text.as_deref(), Some("+1 Frame"));
+        state.record_seek_osd(5.0);
+        assert_eq!(state.osd_text.as_deref(), Some("+5.0s"));
     }
 }
