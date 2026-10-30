@@ -248,21 +248,26 @@ pub fn start_bitstream_thread(
             let ost_time_base = ost_stream.time_base();
 
             let mut sent_paused_preview_epoch: Option<u64> = None;
+            let (mut is_paused, mut latest_epoch) = if let Ok(state) = state_for_pump.lock() {
+                (state.is_paused, state.seek_epoch)
+            } else {
+                (false, 0)
+            };
 
             loop {
                 if stop_for_pump.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-                let (is_paused, latest_epoch) = if let Ok(state) = state_for_pump.try_lock() {
-                    (state.is_paused, state.seek_epoch)
-                } else {
-                    (false, 0)
-                };
+                if let Ok(state) = state_for_pump.try_lock() {
+                    is_paused = state.is_paused;
+                    latest_epoch = state.seek_epoch;
+                }
 
                 if is_paused {
                     if let Ok(mut state) = state_for_pump.try_lock() {
                         state.raw_channel_vus.fill(0.0);
                         state.raw_spectrum_data.fill(0.0);
+                        state.gpu_spectrum_data.fill(0.0);
                     }
                     // If a seek occurred while paused, drain stale packets and emit the first post-seek DspMessage
                     while let Ok(item) = spdif_rx_for_pump.try_recv() {

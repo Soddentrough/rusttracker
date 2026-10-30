@@ -2222,8 +2222,14 @@ pub fn spawn_dsp_thread(
                     continue;
                 }
 
-                if msg.audio_data.is_empty() {
+                let paused_loaded = state.is_paused && state.file_loaded;
+                if paused_loaded || msg.audio_data.is_empty() {
                     state.stats.fft_us = 0.0;
+                    if paused_loaded {
+                        state.raw_spectrum_data.fill(0.0);
+                        state.gpu_spectrum_data.fill(0.0);
+                        state.raw_channel_vus.fill(0.0);
+                    }
                 } else {
                     // Decay/smooth the execution stats for readability
                     state.stats.fft_us = state.stats.fft_us * 0.9 + fft_elapsed * 0.1;
@@ -2236,8 +2242,10 @@ pub fn spawn_dsp_thread(
                     }
                 }
 
-                state.raw_channel_vus.clear();
-                state.raw_channel_vus.extend_from_slice(&msg.channel_vus);
+                if !paused_loaded {
+                    state.raw_channel_vus.clear();
+                    state.raw_channel_vus.extend_from_slice(&msg.channel_vus);
+                }
                 if !msg.channel_vus.is_empty() {
                     state.num_channels = if state
                         .surround_upmix
@@ -2249,7 +2257,7 @@ pub fn spawn_dsp_thread(
                     };
                 }
 
-                if !msg.channel_audio_data.is_empty() {
+                if !paused_loaded && !msg.channel_audio_data.is_empty() {
                     if state.raw_audio_channels.len() != num_channels {
                         state.raw_audio_channels.resize_with(num_channels, Vec::new);
                     }
@@ -2264,7 +2272,7 @@ pub fn spawn_dsp_thread(
                     }
                 }
 
-                if !msg.audio_data.is_empty() {
+                if !paused_loaded && !msg.audio_data.is_empty() {
                     // --- Waveform extraction (Zero-Crossing Edge Trigger) ---
                     let visual_width = state.visual_width.clamp(128, 2048) as usize;
                     let target_fps = state.target_fps.clamp(30, 500);
@@ -9637,9 +9645,10 @@ fn run_dummy(
         let mut fft_index = 0;
         let recycle_rx = dsp_recycle_channel().1.clone();
 
-        let mut was_paused = false;
-        let mut latest_seek_epoch = 0u64;
-        let mut upmix_cfg = crate::state::SurroundUpmixConfig::default();
+        let (mut was_paused, mut latest_seek_epoch, mut upmix_cfg) = {
+            let state = shared_state_dummy.lock().unwrap();
+            (state.is_paused, state.seek_epoch, state.surround_upmix)
+        };
         let mut upmixer_dsp = SurroundUpmixerDsp::new(sample_rate);
         let mut upmix_peak_vus = [0.0f32; 12];
 
@@ -9654,6 +9663,7 @@ fn run_dummy(
                 if let Ok(mut state) = shared_state_dummy.try_lock() {
                     state.raw_channel_vus.fill(0.0);
                     state.raw_spectrum_data.fill(0.0);
+                    state.gpu_spectrum_data.fill(0.0);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(10));
                 continue;
@@ -9880,15 +9890,14 @@ fn run_linux_pipewire_mpegh_714(
         let recycle_rx = dsp_recycle_channel().1.clone();
         let mut upmixer_dsp = SurroundUpmixerDsp::new(sample_rate);
         let mut upmix_peak_vus = [0.0f32; 12];
-        let (mut latest_seek_epoch, mut upmix_cfg) = {
+        let (mut latest_seek_epoch, mut is_paused, mut upmix_cfg) = {
             let s = shared_state_thread.lock().unwrap();
-            (s.seek_epoch, s.surround_upmix)
+            (s.seek_epoch, s.is_paused, s.surround_upmix)
         };
         let mut iec_byte_queue: std::collections::VecDeque<u8> =
             std::collections::VecDeque::with_capacity(65536);
 
         while !stop_token_thread.load(std::sync::atomic::Ordering::Relaxed) {
-            let mut is_paused = false;
             if let Ok(state) = shared_state_thread.try_lock() {
                 is_paused = state.is_paused;
                 latest_seek_epoch = state.seek_epoch;
@@ -9899,6 +9908,7 @@ fn run_linux_pipewire_mpegh_714(
                 if let Ok(mut state) = shared_state_thread.try_lock() {
                     state.raw_channel_vus.fill(0.0);
                     state.raw_spectrum_data.fill(0.0);
+                    state.gpu_spectrum_data.fill(0.0);
                 }
                 std::thread::sleep(std::time::Duration::from_millis(20));
                 continue;
@@ -11260,7 +11270,6 @@ fn run_wasapi_exclusive_multichannel(
         } else {
             std::collections::VecDeque::new()
         };
-        let mut stream_started = !is_mpegh_iec_bitstream;
         let mut consecutive_render_errors = 0u32;
 
         let is_fatal_device_error = |hr: i32| -> bool {
@@ -11277,68 +11286,70 @@ fn run_wasapi_exclusive_multichannel(
             )
         };
 
-        let (mut latest_seek_epoch, mut upmix_cfg) = {
+        let (mut latest_seek_epoch, mut is_paused, mut upmix_cfg) = {
             let state = shared_state_thread.lock().unwrap();
-            (state.seek_epoch, state.surround_upmix)
+            (state.seek_epoch, state.is_paused, state.surround_upmix)
         };
+        let mut stream_started = !is_mpegh_iec_bitstream && !is_paused;
 
         // Start the hardware stream:
         // - For ISpatialAudioObjectRenderStream, call `stream.Start()` before entering the event loop.
         // - For LPCM WASAPI, prime the buffer with silence before calling `audio_client.Start()`.
         // - For IEC 61937-13 MPEG-H bitstreaming, pre-fill the first DMA buffer with real IEC 61937
         //   bursts inside the loop before calling `audio_client.Start()`.
-        if let Some(ref spatial) = spatial_state {
-            unsafe {
-                if let Err(e) = spatial.stream.Start() {
-                    eprintln!(
-                        "[audio] ISpatialAudioObjectRenderStream::Start() failed: {:?}",
-                        e
-                    );
-                    if !event.is_invalid() {
-                        let _ = CloseHandle(event);
+        if !is_paused {
+            if let Some(ref spatial) = spatial_state {
+                unsafe {
+                    if let Err(e) = spatial.stream.Start() {
+                        eprintln!(
+                            "[audio] ISpatialAudioObjectRenderStream::Start() failed: {:?}",
+                            e
+                        );
+                        if !event.is_invalid() {
+                            let _ = CloseHandle(event);
+                        }
+                        drop(spatial_state);
+                        drop(wasapi_clients);
+                        drop(active_device);
+                        drop(enumerator);
+                        CoUninitialize();
+                        return;
                     }
-                    drop(spatial_state);
-                    drop(wasapi_clients);
-                    drop(active_device);
-                    drop(enumerator);
-                    CoUninitialize();
-                    return;
                 }
-            }
-        } else if !is_mpegh_iec_bitstream
-            && let Some((ref audio_client, ref render_client)) = wasapi_clients
-        {
-            unsafe {
-                let padding = if is_exclusive {
-                    0
-                } else {
-                    audio_client.GetCurrentPadding().unwrap_or(0)
-                };
-                let prime_frames = buffer_frames.saturating_sub(padding);
-                if prime_frames > 0
-                    && let Ok(buf_ptr) = render_client.GetBuffer(prime_frames)
-                {
-                    std::ptr::write_bytes(buf_ptr, 0, (prime_frames as usize) * frame_bytes);
-                    let _ = render_client
-                        .ReleaseBuffer(prime_frames, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32);
-                }
-                if let Err(e) = audio_client.Start() {
-                    eprintln!("[audio] WASAPI Start() failed: {:?}", e);
-                    if !event.is_invalid() {
-                        let _ = CloseHandle(event);
+            } else if !is_mpegh_iec_bitstream
+                && let Some((ref audio_client, ref render_client)) = wasapi_clients
+            {
+                unsafe {
+                    let padding = if is_exclusive {
+                        0
+                    } else {
+                        audio_client.GetCurrentPadding().unwrap_or(0)
+                    };
+                    let prime_frames = buffer_frames.saturating_sub(padding);
+                    if prime_frames > 0
+                        && let Ok(buf_ptr) = render_client.GetBuffer(prime_frames)
+                    {
+                        std::ptr::write_bytes(buf_ptr, 0, (prime_frames as usize) * frame_bytes);
+                        let _ = render_client
+                            .ReleaseBuffer(prime_frames, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32);
                     }
-                    drop(spatial_state);
-                    drop(wasapi_clients);
-                    drop(active_device);
-                    drop(enumerator);
-                    CoUninitialize();
-                    return;
+                    if let Err(e) = audio_client.Start() {
+                        eprintln!("[audio] WASAPI Start() failed: {:?}", e);
+                        if !event.is_invalid() {
+                            let _ = CloseHandle(event);
+                        }
+                        drop(spatial_state);
+                        drop(wasapi_clients);
+                        drop(active_device);
+                        drop(enumerator);
+                        CoUninitialize();
+                        return;
+                    }
                 }
             }
         }
 
         while !stop_token_thread.load(std::sync::atomic::Ordering::Relaxed) {
-            let mut is_paused = false;
             if let Ok(state) = shared_state_thread.try_lock() {
                 is_paused = state.is_paused;
                 latest_seek_epoch = state.seek_epoch;
@@ -11369,6 +11380,13 @@ fn run_wasapi_exclusive_multichannel(
                 if let Ok(mut state) = shared_state_thread.try_lock() {
                     state.raw_channel_vus.fill(0.0);
                     state.raw_spectrum_data.fill(0.0);
+                    state.gpu_spectrum_data.fill(0.0);
+                }
+                if stream_started {
+                    fft_buffer.fill(0.0);
+                    for ch_buf in &mut channel_fft_buffers {
+                        ch_buf.fill(0.0);
+                    }
                 }
                 if let Some(ref spatial) = spatial_state {
                     if stream_started {
@@ -12540,6 +12558,7 @@ where
                 if let Ok(mut state) = shared_state_cb.try_lock() {
                     state.raw_channel_vus.fill(0.0);
                     state.raw_spectrum_data.fill(0.0);
+                    state.gpu_spectrum_data.fill(0.0);
                 }
                 return;
             }
@@ -13252,6 +13271,62 @@ mod tests {
             s.lookahead_queue.len() >= 295,
             "Post-seek lookahead_queue slices must not be pruned by stale pre-seek DspMessage (len={})",
             s.lookahead_queue.len()
+        );
+    }
+
+    #[test]
+    fn test_dsp_thread_zeroes_spectrum_while_paused_with_file_loaded() {
+        let state = Arc::new(Mutex::new(AppState::new("Test".to_string())));
+        {
+            let mut s = state.lock().unwrap();
+            s.file_loaded = true;
+            s.is_paused = true;
+            s.raw_spectrum_data.fill(10.0);
+            s.gpu_spectrum_data = vec![5.0; 256];
+            s.raw_channel_vus = vec![0.9, 0.9];
+        }
+
+        let (tx, rx) = bounded(4);
+        let window_size = 2048;
+        spawn_dsp_thread(rx, Arc::clone(&state), 48000, 20000.0, window_size);
+
+        let samples: Vec<f32> = (0..window_size)
+            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / 48000.0).sin())
+            .collect();
+        tx.send(DspMessage {
+            audio_data: samples.clone(),
+            channel_audio_data: vec![samples.clone(), samples],
+            channel_vus: vec![0.8, 0.8],
+            current_order: 0,
+            current_row: 0,
+            bpm: 120,
+            speed: 6,
+            current_seconds: 12.5,
+            current_row_string: String::new(),
+            seek_epoch: 0,
+        })
+        .unwrap();
+
+        for _ in 0..50 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let s = state.lock().unwrap();
+            if (s.current_seconds - 12.5).abs() < 1e-6 {
+                break;
+            }
+        }
+
+        let s = state.lock().unwrap();
+        assert!(
+            s.raw_spectrum_data.iter().all(|&v| v == 0.0),
+            "Paused playback must not allow DspMessage to blip raw_spectrum_data"
+        );
+        assert!(
+            s.gpu_spectrum_data.iter().all(|&v| v == 0.0),
+            "Paused playback must zero gpu_spectrum_data"
+        );
+        assert!(
+            s.raw_channel_vus.iter().all(|&v| v == 0.0),
+            "Paused playback must zero raw_channel_vus"
         );
     }
 
