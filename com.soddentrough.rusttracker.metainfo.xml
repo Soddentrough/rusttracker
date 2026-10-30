@@ -65,6 +65,11 @@
   <content_rating type="oars-1.1" />
   
   <releases>
+    <release version="0.9.35" date="2026-10-30">
+      <description>
+        <p>Added 11.1 (7.1.4) Windows Spatial Audio (Dolby Atmos MAT 2.0) and MPEG-H 3D Audio HDMI output, IAMF (Eclipsa Audio) support, flexible N-to-M surround upmixing, and automatic audio topology hotplug adaptation.</p>
+      </description>
+    </release>
     <release version="0.9.33" date="2026-10-28">
       <description>
         <p>Automatic 7.1.4 surround and height upmixing with Haas decorrelation, LFE crossover, high-frequency height routing, and interactive 5-band parametric EQ &amp; crossover panel.</p>

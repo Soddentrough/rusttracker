@@ -13538,6 +13538,8 @@ mod tests {
     fn test_iamf_7_1_4_demux_and_decode() {
         let ffmpeg_bin = if std::path::Path::new(r"C:\msys64\ucrt64\bin\ffmpeg.exe").exists() {
             r"C:\msys64\ucrt64\bin\ffmpeg.exe"
+        } else if std::path::Path::new("/opt/homebrew/opt/ffmpeg@7/bin/ffmpeg").exists() {
+            "/opt/homebrew/opt/ffmpeg@7/bin/ffmpeg"
         } else {
             "ffmpeg"
         };
