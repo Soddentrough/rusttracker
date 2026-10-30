@@ -3,6 +3,7 @@ pub mod bitstream;
 pub mod engine;
 pub mod ipc;
 pub mod lyrics;
+pub mod mpegh;
 pub mod playlist;
 pub mod state;
 pub mod touch;

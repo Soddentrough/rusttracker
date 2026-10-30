@@ -1082,6 +1082,11 @@ fn is_relevant_audio_device(name: &str) -> bool {
     if name_lower.contains("samplerate") || name_lower.contains("lavrate") {
         return false;
     }
+    // Filter out dead virtual mixer endpoints (e.g. ASUS Sonic Studio Virtual Mixer) whose WASAPI
+    // shared callback never clocks when the companion vendor utility is not actively routing.
+    if name_lower.contains("sonic studio virtual") {
+        return false;
+    }
     true
 }
 
@@ -1559,6 +1564,11 @@ pub fn spawn_audio_topology_watcher(shared_state: Arc<Mutex<AppState>>, is_mic: 
                 }
                 let is_auto =
                     is_default_audio_device_selection(state.selected_audio_device.as_deref());
+                let exclusive_or_bitstream_active = state.stats.bitstream_active
+                    || state.stats.mpegh_bitstream_active
+                    || (cfg!(windows)
+                        && state.hardware_channels > next_topo.channels as i32
+                        && !state.force_stereo_downmix);
                 let action = evaluate_topology_transition(
                     last_topology.as_ref(),
                     &next_topo,
@@ -1568,8 +1578,8 @@ pub fn spawn_audio_topology_watcher(shared_state: Arc<Mutex<AppState>>, is_mic: 
                     state.hardware_channels,
                     state.force_stereo_downmix,
                     state.is_dummy_audio_output,
-                    state.stats.bitstream_active,
-                    state.passthrough_enabled,
+                    exclusive_or_bitstream_active,
+                    state.passthrough_enabled || state.surround_upmix.mpegh_bitstream,
                     cfg!(target_os = "linux"),
                 );
 
@@ -7133,6 +7143,8 @@ pub fn start_audio_thread(
                         "Hardware Passthrough".to_string()
                     };
                     state.stats.bitstream_active = true;
+                    state.stats.mpegh_bitstream_active = false;
+                    state.stats.mpegh_carrier_info.clear();
                     state.is_dummy_audio_output = false;
                     state.current_sample_rate = sample_rate as f32;
                     state.duration_seconds = meta_duration;
@@ -7160,6 +7172,8 @@ pub fn start_audio_thread(
     {
         let mut state = shared_state.lock().unwrap();
         state.stats.bitstream_active = false;
+        state.stats.mpegh_bitstream_active = false;
+        state.stats.mpegh_carrier_info.clear();
         state.is_dummy_audio_output = false;
         state.stats.audio_buffer_fill_pct = 0.0;
     }
@@ -7177,13 +7191,22 @@ pub fn start_audio_thread(
         .and_then(|a| a.get_intrinsic_sample_rate())
         .unwrap_or(48000);
     let target_rate: cpal::SampleRate = rate;
-    let (force_stereo, surround_upmix_enabled, surround_upmix_user_overridden, passthrough_enabled) = {
+    let (
+        force_stereo,
+        surround_upmix_enabled,
+        surround_upmix_user_overridden,
+        passthrough_enabled,
+        mpegh_bitstream,
+        mpegh_user_overridden,
+    ) = {
         let s = shared_state.lock().unwrap();
         (
             s.force_stereo_downmix,
             s.surround_upmix.enabled,
             s.surround_upmix.user_overridden,
             s.passthrough_enabled,
+            s.surround_upmix.mpegh_bitstream,
+            s.surround_upmix.mpegh_user_overridden,
         )
     };
     let source_channels = audio_source_opt
@@ -7337,7 +7360,13 @@ pub fn start_audio_thread(
         }
 
         if let Some(default_dev) = host.default_output_device() {
-            push_unique_device(&mut devices_to_try, default_dev);
+            let is_relevant = default_dev
+                .description()
+                .map(|desc| is_relevant_audio_device(&format_cpal_device_name(&desc)))
+                .unwrap_or(true);
+            if is_relevant {
+                push_unique_device(&mut devices_to_try, default_dev);
+            }
         }
         if let Ok(devices) = host.output_devices() {
             for d in devices {
@@ -7413,17 +7442,32 @@ pub fn start_audio_thread(
                 // On Windows HDMI/DisplayPort/AVR endpoints where the Windows Shared Mode default
                 // mix format is Stereo (default_device_channels <= 2), cpal only exposes
                 // `GetMixFormat()` and AudioDg.exe downmixes any Shared Mode stream to 2.0 stereo.
-                // Probe and open WASAPI Exclusive Mode multi-channel LPCM (up to 7.1 / 7.1.4)
-                // directly on the endpoint so the HDMI Audio InfoFrame switches to multi-channel surround.
+                // Probe and open WASAPI Exclusive Mode multi-channel LPCM (up to 7.1 / 7.1.4) or
+                // IEC 61937-13 MPEG-H 3D Audio 7.1.4 (11.1) directly on the endpoint so the HDMI
+                // Audio InfoFrame switches to multi-channel surround.
                 #[cfg(windows)]
-                if !mic && !force_stereo && !passthrough_enabled {
+                if !mic && !force_stereo {
+                    let want_wasapi_upmix = if surround_upmix_user_overridden {
+                        surround_upmix_enabled
+                    } else {
+                        true
+                    };
+                    let wasapi_target_dev = if dev_idx == 0
+                        && is_default_audio_device_selection(selected_device_name.as_deref())
+                    {
+                        None
+                    } else {
+                        Some(device_name.as_str())
+                    };
                     match run_wasapi_exclusive_multichannel(
-                        Some(device_name.as_str()),
+                        wasapi_target_dev,
                         &mut attempt_audio_source_opt,
                         shared_state_closure.clone(),
                         target_rate,
                         target_channels,
-                        true,
+                        want_wasapi_upmix,
+                        mpegh_bitstream,
+                        mpegh_user_overridden,
                         file_path,
                     ) {
                         Ok(handle) => {
@@ -7444,6 +7488,33 @@ pub fn start_audio_thread(
                         Err(e) => {
                             eprintln!(
                                 "[audio] WASAPI Exclusive Multichannel probe on '{}': {:?} (falling back to CPAL)",
+                                device_name, e
+                            );
+                        }
+                    }
+                }
+
+                #[cfg(target_os = "linux")]
+                if !mic
+                    && !force_stereo
+                    && mpegh_bitstream
+                    && (effective_surround_upmix || target_channels >= 9)
+                    && (mpegh_user_overridden
+                        || (default_device_channels > 2
+                            && default_device_channels < 12
+                            && device_name.to_lowercase().contains("hdmi")))
+                {
+                    match run_linux_pipewire_mpegh_714(
+                        &mut attempt_audio_source_opt,
+                        shared_state_closure.clone(),
+                        file_path,
+                    ) {
+                        Ok(handle) => {
+                            return Ok(handle);
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[audio] Linux PipeWire MPEG-H 3D Audio 7.1.4 probe on '{}': {:?} (falling back to CPAL)",
                                 device_name, e
                             );
                         }
@@ -9419,6 +9490,257 @@ fn run_dummy(
     Ok(PlaybackHandle::Dummy(Some(thread_handle), stop_token))
 }
 
+#[cfg(target_os = "linux")]
+fn run_linux_pipewire_mpegh_714(
+    audio_source_opt: &mut Option<Box<dyn AudioSource>>,
+    shared_state: Arc<Mutex<AppState>>,
+    file_path: &str,
+) -> Result<PlaybackHandle> {
+    use std::io::Write;
+
+    let mut mpegh_encoder = crate::mpegh::Mpegh714Encoder::new(4, true)?;
+    let mut child = std::process::Command::new("pw-play")
+        .arg("--properties=node.passthrough=true")
+        .arg("-f")
+        .arg("s16")
+        .arg("-r")
+        .arg("192000")
+        .arg("-c")
+        .arg("2")
+        .arg("--raw")
+        .arg("-")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .context("Failed to spawn pw-play for MPEG-H 3D Audio 7.1.4 passthrough")?;
+
+    std::thread::sleep(std::time::Duration::from_millis(80));
+    if let Ok(Some(status)) = child.try_wait() {
+        return Err(anyhow::anyhow!(
+            "pw-play exited immediately with status: {}",
+            status
+        ));
+    }
+
+    let mut pw_stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("Failed to open pw-play stdin"))?;
+
+    let mut audio_source = audio_source_opt
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("No audio source available"))?;
+
+    let sample_rate = crate::mpegh::MPEGH_SAMPLE_RATE;
+    let hardware_channels = 12usize;
+    let max_frequency = {
+        let mut state = shared_state.lock().unwrap();
+        populate_state_from_audio_source(
+            &mut state,
+            audio_source.as_mut(),
+            hardware_channels as i32,
+            sample_rate,
+        );
+        state.stats.mpegh_bitstream_active = true;
+        state.stats.mpegh_carrier_info =
+            "PipeWire IEC 61937-13 MPEG-H (2ch @ 192 kHz)".to_string();
+        state.max_frequency
+    };
+
+    let (tx, rx) = bounded::<DspMessage>(32);
+    let window_size = calculate_power_of_two_window_size(sample_rate);
+    spawn_dsp_thread(
+        rx,
+        shared_state.clone(),
+        sample_rate,
+        max_frequency,
+        window_size,
+    );
+
+    let stop_token = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let chunk_frames = 1024;
+    let pool_size = ((sample_rate as usize * 8) / chunk_frames).clamp(384, 1024);
+    let (ready_tx, ready_rx) = bounded::<AudioChunk>(pool_size);
+    let (free_tx, free_rx) = unbounded::<AudioChunk>();
+
+    spawn_media_decoder_threads(
+        audio_source,
+        shared_state.clone(),
+        stop_token.clone(),
+        ready_tx,
+        ready_rx.clone(),
+        free_tx.clone(),
+        free_rx,
+        hardware_channels,
+        sample_rate,
+        chunk_frames,
+        pool_size,
+        4,
+        file_path,
+    );
+
+    let stop_token_thread = stop_token.clone();
+    let shared_state_thread = shared_state.clone();
+    let thread_handle = std::thread::spawn(move || {
+        let mut fft_buffer = vec![0.0f32; window_size];
+        let mut channel_fft_buffers = vec![vec![0.0f32; window_size]; 12];
+        let mut fft_index = 0usize;
+        let recycle_rx = dsp_recycle_channel().1.clone();
+        let mut upmixer_dsp = SurroundUpmixerDsp::new(sample_rate);
+        let mut upmix_peak_vus = [0.0f32; 12];
+        let (mut latest_seek_epoch, mut upmix_cfg) = {
+            let s = shared_state_thread.lock().unwrap();
+            (s.seek_epoch, s.surround_upmix)
+        };
+        let silence_burst = vec![0u8; 4096 * 4];
+        let mut iec_byte_queue: std::collections::VecDeque<u8> =
+            std::collections::VecDeque::with_capacity(65536);
+
+        while !stop_token_thread.load(std::sync::atomic::Ordering::Relaxed) {
+            let mut is_paused = false;
+            if let Ok(state) = shared_state_thread.try_lock() {
+                is_paused = state.is_paused;
+                latest_seek_epoch = state.seek_epoch;
+                upmix_cfg = state.surround_upmix;
+            }
+
+            if is_paused {
+                if let Ok(mut state) = shared_state_thread.try_lock() {
+                    state.raw_channel_vus.fill(0.0);
+                    state.raw_spectrum_data.fill(0.0);
+                }
+                if pw_stdin.write_all(&silence_burst).is_err() {
+                    break;
+                }
+                continue;
+            }
+
+            match ready_rx.recv_timeout(std::time::Duration::from_millis(25)) {
+                Ok(chunk) => {
+                    if chunk.seek_epoch < latest_seek_epoch {
+                        let _ = free_tx.try_send(chunk);
+                        continue;
+                    }
+                    if chunk.seek_epoch > latest_seek_epoch {
+                        latest_seek_epoch = chunk.seek_epoch;
+                    }
+                    if chunk.track_ended
+                        && let Ok(mut state) = shared_state_thread.try_lock()
+                    {
+                        state.track_ended = true;
+                    }
+
+                    let upmix_active = upmix_cfg.is_active_for_hardware(12);
+                    if upmix_active {
+                        upmixer_dsp.sync_config(&upmix_cfg, sample_rate);
+                    }
+                    let src_ch = (chunk.spatial_channels as usize).max(1);
+                    let target_upmix = upmix_active && src_ch < 12;
+                    let use_upmixer =
+                        upmixer_dsp.is_blending_or_active(target_upmix) && src_ch < 12;
+
+                    for i in 0..chunk.valid_frames {
+                        let frame_slice = &chunk.samples[i * 12..(i + 1) * 12];
+                        if use_upmixer {
+                            let out_channels = upmixer_dsp
+                                .process_multichannel_frame_for_hardware_blended(
+                                    frame_slice,
+                                    src_ch,
+                                    &upmix_cfg,
+                                    12,
+                                    target_upmix,
+                                );
+                            for c in 0..12 {
+                                let s = out_channels[c].clamp(-1.0, 1.0);
+                                upmix_peak_vus[c] = upmix_peak_vus[c].max(s.abs());
+                                channel_fft_buffers[c][fft_index] = s;
+                            }
+                            let mono = (out_channels[0] + out_channels[1]) * 0.5;
+                            fft_buffer[fft_index] = mono.clamp(-1.0, 1.0);
+                            fft_index = (fft_index + 1) % window_size;
+
+                            if let Ok(true) = mpegh_encoder
+                                .push_rusttracker_714_frame(&out_channels, &mut iec_byte_queue)
+                            {
+                                let (s1, s2) = iec_byte_queue.as_slices();
+                                if pw_stdin.write_all(s1).is_err()
+                                    || pw_stdin.write_all(s2).is_err()
+                                {
+                                    break;
+                                }
+                                iec_byte_queue.clear();
+                            }
+                        } else {
+                            let mut cicp_frame = [0.0f32; 12];
+                            let mut mono = 0.0f32;
+                            for c in 0..12 {
+                                let s = frame_slice[c].clamp(-1.0, 1.0);
+                                cicp_frame[c] = s;
+                                let ch_weight = match c {
+                                    0 | 1 => 0.5,
+                                    2 => std::f32::consts::FRAC_1_SQRT_2,
+                                    _ => 0.25,
+                                };
+                                mono += s * ch_weight;
+                                channel_fft_buffers[c][fft_index] = s;
+                            }
+                            fft_buffer[fft_index] = mono.clamp(-1.0, 1.0);
+                            fft_index = (fft_index + 1) % window_size;
+
+                            if let Ok(true) =
+                                mpegh_encoder.push_cicp19_frame(&cicp_frame, &mut iec_byte_queue)
+                            {
+                                let (s1, s2) = iec_byte_queue.as_slices();
+                                if pw_stdin.write_all(s1).is_err()
+                                    || pw_stdin.write_all(s2).is_err()
+                                {
+                                    break;
+                                }
+                                iec_byte_queue.clear();
+                            }
+                        }
+                    }
+
+                    let (dsp_channels, vu_slice): (usize, &[f32]) = if upmix_active && src_ch < 12 {
+                        (12, &upmix_peak_vus)
+                    } else {
+                        (chunk.channel_vus.len().max(1), &chunk.channel_vus)
+                    };
+                    let msg = build_recycled_dsp_message(
+                        &recycle_rx,
+                        &fft_buffer,
+                        &channel_fft_buffers,
+                        fft_index,
+                        window_size,
+                        dsp_channels,
+                        vu_slice,
+                        chunk.current_order,
+                        chunk.current_row,
+                        chunk.bpm,
+                        chunk.speed,
+                        chunk.current_seconds,
+                        &chunk.current_row_string,
+                        chunk.seek_epoch,
+                        true,
+                    );
+                    upmix_peak_vus = [0.0f32; 12];
+                    let _ = tx.try_send(msg);
+                    let _ = free_tx.try_send(chunk);
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        drop(pw_stdin);
+        let _ = child.kill();
+        let _ = child.wait();
+    });
+
+    Ok(PlaybackHandle::Dummy(Some(thread_handle), stop_token))
+}
+
 #[cfg(windows)]
 #[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn run_wasapi_exclusive_multichannel(
@@ -9428,6 +9750,8 @@ fn run_wasapi_exclusive_multichannel(
     target_rate: u32,
     target_channels: u16,
     surround_upmix_enabled: bool,
+    mpegh_bitstream: bool,
+    _mpegh_user_overridden: bool,
     file_path: &str,
 ) -> Result<PlaybackHandle> {
     use windows::Win32::Foundation::{CloseHandle, HANDLE, PROPERTYKEY};
@@ -9634,6 +9958,501 @@ fn run_wasapi_exclusive_multichannel(
         Ok((active_client, render_client, event, buffer_frames))
     }
 
+    #[allow(dead_code)]
+    fn device_supports_multichannel_lpcm(device: &IMMDevice) -> bool {
+        let Ok(audio_client) = (unsafe { device.Activate::<IAudioClient>(CLSCTX_ALL, None) })
+        else {
+            return false;
+        };
+        for &(ch, mask) in &[(8u16, 0x63Fu32), (6u16, 0x3Fu32)] {
+            for &fmt in &[
+                WasapiPcmFormat::I24In32,
+                WasapiPcmFormat::F32,
+                WasapiPcmFormat::I16,
+            ] {
+                let wf = build_wave_format(ch, 48_000, mask, fmt);
+                let wf_ptr = &wf as *const WAVEFORMATEXTENSIBLE as *const WAVEFORMATEX;
+                if unsafe {
+                    audio_client.IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, wf_ptr, None)
+                } == windows::core::HRESULT(0)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Negotiate a WASAPI Exclusive Mode IEC 61937-13 bitstream carrier for 12-channel (`7.1.4` / `11.1`)
+    /// MPEG-H 3D Audio (`CICP Layout 19`) to an HDMI AVR (such as the Denon AVR-X3800H).
+    ///
+    /// First probes dedicated MPEG-H IEC 61937 subtype GUIDs (`00000019-0cea-...` and `0000000f-0cea-...`).
+    /// When the endpoint is a multichannel HDMI AVR (or the user explicitly enabled MPEG-H 11.1) and the
+    /// Windows GPU HDMI driver only registers legacy CEA-861-D/E IEC 61937 subtypes in `IsFormatSupported`,
+    /// also probes high-bitrate 192 kHz IEC 61937 carriers (`E-AC-3` 2ch @ 192 kHz = 6.144 Mbps `rate_factor = 4`,
+    /// `DTS-HD` / `MLP` 8ch @ 192 kHz = 24.576 Mbps `rate_factor = 16`), because the AVR decodes the stream
+    /// from the embedded IEC 61937-13 `Pa/Pb/Pc` burst preamble (`Pc = 0x0019`).
+    fn try_open_exclusive_mpegh_iec61937_client(
+        device: &IMMDevice,
+        allow_cea_carrier_fallback: bool,
+    ) -> Result<(IAudioClient, IAudioRenderClient, HANDLE, u32, usize, String)> {
+        const AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED_HR: i32 = -2004287463i32; // 0x88890019
+
+        // CEA-861.3 / IEC 61937-13 MPEG-H 3D Audio and compatible 192 kHz HDMI IEC 61937 carriers:
+        // (guid_data1, channels, rate_hz, channel_mask, rate_factor, carrier_label, requires_avr_fallback)
+        let candidates: &[(u32, u16, u32, u32, usize, &str, bool)] = &[
+            (
+                0x00000019,
+                2,
+                192_000,
+                0x3,
+                4,
+                "IEC 61937-13 MPEG-H (2ch @ 192 kHz)",
+                false,
+            ),
+            (
+                0x0000000f,
+                2,
+                192_000,
+                0x3,
+                4,
+                "CEA-861-G MPEG-H 3D Audio (2ch @ 192 kHz)",
+                false,
+            ),
+            (
+                0x00000019,
+                8,
+                192_000,
+                0x63F,
+                16,
+                "IEC 61937-13 MPEG-H HBR (8ch @ 192 kHz)",
+                false,
+            ),
+            (
+                0x0000000f,
+                8,
+                192_000,
+                0x63F,
+                16,
+                "CEA-861-G MPEG-H 3D Audio HBR (8ch @ 192 kHz)",
+                false,
+            ),
+            (
+                0x0000000a,
+                2,
+                192_000,
+                0x3,
+                4,
+                "IEC 61937-13 over HDMI 192 kHz 2ch carrier",
+                true,
+            ),
+            (
+                0x0000000b,
+                8,
+                192_000,
+                0x63F,
+                16,
+                "IEC 61937-13 over HDMI 192 kHz 8ch HBR carrier",
+                true,
+            ),
+            (
+                0x0000000c,
+                8,
+                192_000,
+                0x63F,
+                16,
+                "IEC 61937-13 over HDMI 192 kHz 8ch MAT/MLP carrier",
+                true,
+            ),
+        ];
+
+        #[repr(C, packed)]
+        struct WaveFormatExtensibleIec61937 {
+            format_ext: WAVEFORMATEXTENSIBLE,
+            dw_encoded_samples_per_sec: u32,
+            dw_encoded_channel_count: u32,
+            dw_average_bytes_per_sec: u32,
+        }
+
+        let mut last_err = anyhow::anyhow!("No IEC 61937-13 MPEG-H carrier supported on endpoint");
+
+        for &(
+            guid_data1,
+            carrier_ch,
+            carrier_rate,
+            carrier_mask,
+            rate_factor,
+            label,
+            needs_fallback,
+        ) in candidates
+        {
+            if needs_fallback && !allow_cea_carrier_fallback {
+                continue;
+            }
+            let sub_format = GUID {
+                data1: guid_data1,
+                data2: 0x0cea,
+                data3: 0x0010,
+                data4: [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
+            };
+            let block_align = carrier_ch * 2; // 16-bit IEC 61937 words
+            let avg_bytes = carrier_rate * block_align as u32;
+
+            // Try both WAVEFORMATEXTENSIBLE_IEC61937 (cbSize = 34, standard for >48 kHz HDMI IEC 61937)
+            // and legacy WAVEFORMATEXTENSIBLE (cbSize = 22).
+            for &use_iec_ext in &[true, false] {
+                let wf_ext = WAVEFORMATEXTENSIBLE {
+                    Format: WAVEFORMATEX {
+                        wFormatTag: 0xFFFE,
+                        nChannels: carrier_ch,
+                        nSamplesPerSec: carrier_rate,
+                        nAvgBytesPerSec: avg_bytes,
+                        nBlockAlign: block_align,
+                        wBitsPerSample: 16,
+                        cbSize: if use_iec_ext { 34 } else { 22 },
+                    },
+                    Samples: WAVEFORMATEXTENSIBLE_0 {
+                        wValidBitsPerSample: 16,
+                    },
+                    dwChannelMask: carrier_mask,
+                    SubFormat: sub_format,
+                };
+                let wf_iec = WaveFormatExtensibleIec61937 {
+                    format_ext: wf_ext,
+                    dw_encoded_samples_per_sec: carrier_rate,
+                    dw_encoded_channel_count: carrier_ch as u32,
+                    dw_average_bytes_per_sec: avg_bytes,
+                };
+                let wf_ptr = if use_iec_ext {
+                    &wf_iec as *const WaveFormatExtensibleIec61937 as *const WAVEFORMATEX
+                } else {
+                    &wf_ext as *const WAVEFORMATEXTENSIBLE as *const WAVEFORMATEX
+                };
+
+                let audio_client: IAudioClient = match unsafe { device.Activate(CLSCTX_ALL, None) }
+                {
+                    Ok(c) => c,
+                    Err(e) => {
+                        last_err = anyhow::anyhow!(e);
+                        continue;
+                    }
+                };
+                if unsafe {
+                    audio_client.IsFormatSupported(AUDCLNT_SHAREMODE_EXCLUSIVE, wf_ptr, None)
+                } != windows::core::HRESULT(0)
+                {
+                    continue;
+                }
+
+                let mut default_period = 0i64;
+                let mut min_period = 0i64;
+                unsafe {
+                    let _ = audio_client
+                        .GetDevicePeriod(Some(&mut default_period), Some(&mut min_period));
+                }
+                let mut buffer_duration = if min_period > 0 {
+                    min_period
+                } else if default_period > 0 {
+                    default_period.max(100_000)
+                } else {
+                    100_000
+                };
+
+                let init_res = unsafe {
+                    audio_client.Initialize(
+                        AUDCLNT_SHAREMODE_EXCLUSIVE,
+                        AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                        buffer_duration,
+                        buffer_duration,
+                        wf_ptr,
+                        None,
+                    )
+                };
+
+                let active_client = match init_res {
+                    Ok(()) => audio_client,
+                    Err(e)
+                        if e.code().0 == AUDCLNT_E_BUFFER_SIZE_NOT_ALIGNED_HR
+                            || e.code() == windows::core::HRESULT(0x80070057u32 as i32) =>
+                    {
+                        let aligned_frames = match unsafe { audio_client.GetBufferSize() } {
+                            Ok(f) if f > 0 => f,
+                            _ => {
+                                last_err = anyhow::anyhow!(e);
+                                continue;
+                            }
+                        };
+                        buffer_duration = ((10_000_000.0 * aligned_frames as f64
+                            / carrier_rate as f64)
+                            + 0.5) as i64;
+                        drop(audio_client);
+                        let retry_client: IAudioClient =
+                            match unsafe { device.Activate(CLSCTX_ALL, None) } {
+                                Ok(c) => c,
+                                Err(e2) => {
+                                    last_err = anyhow::anyhow!(e2);
+                                    continue;
+                                }
+                            };
+                        if let Err(e2) = unsafe {
+                            retry_client.Initialize(
+                                AUDCLNT_SHAREMODE_EXCLUSIVE,
+                                AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+                                buffer_duration,
+                                buffer_duration,
+                                wf_ptr,
+                                None,
+                            )
+                        } {
+                            last_err = anyhow::anyhow!(e2);
+                            continue;
+                        }
+                        retry_client
+                    }
+                    Err(e) => {
+                        last_err = anyhow::anyhow!(e);
+                        continue;
+                    }
+                };
+
+                let event = match unsafe { CreateEventW(None, false, false, None) } {
+                    Ok(ev) => ev,
+                    Err(e) => {
+                        last_err = anyhow::anyhow!(e);
+                        continue;
+                    }
+                };
+                if let Err(e) = unsafe { active_client.SetEventHandle(event) } {
+                    unsafe {
+                        let _ = CloseHandle(event);
+                    }
+                    last_err = anyhow::anyhow!(e);
+                    continue;
+                }
+                let buffer_frames = match unsafe { active_client.GetBufferSize() } {
+                    Ok(f) => f,
+                    Err(e) => {
+                        unsafe {
+                            let _ = CloseHandle(event);
+                        }
+                        last_err = anyhow::anyhow!(e);
+                        continue;
+                    }
+                };
+                let render_client: IAudioRenderClient = match unsafe { active_client.GetService() }
+                {
+                    Ok(rc) => rc,
+                    Err(e) => {
+                        unsafe {
+                            let _ = CloseHandle(event);
+                        }
+                        last_err = anyhow::anyhow!(e);
+                        continue;
+                    }
+                };
+
+                return Ok((
+                    active_client,
+                    render_client,
+                    event,
+                    buffer_frames,
+                    rate_factor,
+                    label.to_string(),
+                ));
+            }
+        }
+
+        Err(last_err)
+    }
+
+    struct SpatialAudio714State {
+        _spatial_client: ISpatialAudioClient,
+        _fmt_enum: IAudioFormatEnumerator,
+        stream: ISpatialAudioObjectRenderStream,
+        objects: Vec<ISpatialAudioObject>,
+        carrier_label: String,
+    }
+
+    /// Opens a 12-channel (`7.1.4` / `11.1`) Windows Spatial Audio (`ISpatialAudioClient` ->
+    /// `ISpatialAudioObjectRenderStream`) stream with all 12 static 7.1.4 bed objects
+    /// (`FL, FR, FC, LFE, SL, SR, BL, BR, TFL, TFR, TBL, TBR`).
+    ///
+    /// When "Dolby Atmos for Home Theater" (`DolbyMatEnc.dll`) is active on the endpoint
+    /// (`GetMaxDynamicObjectCount() > 0`), Windows Spatial Audio encodes all 12 static bed objects
+    /// into Dolby MAT 2.0 over HDMI/eARC so the AVR (e.g. Denon AVR-X3800H via LG OLED C4 eARC)
+    /// receives discrete 7.1.4 (11.1) with height channels. If Windows Spatial Sound is Off
+    /// (`GetMaxDynamicObjectCount() == 0`) and the Shared Mode `MixFormat` has `< 12` channels,
+    /// `AudioDg.exe` would fold the 12 objects down to 2ch Stereo, so we decline and let WASAPI
+    /// Exclusive 8ch (7.1) LPCM take over instead.
+    fn try_open_spatial_audio_714_client(
+        device: &IMMDevice,
+        mix_channels: u16,
+    ) -> Result<(SpatialAudio714State, HANDLE, u32, u32)> {
+        use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+        use windows::Win32::System::Variant::VT_BLOB;
+        use windows::core::Interface;
+
+        let sac: ISpatialAudioClient =
+            unsafe { device.Activate(CLSCTX_ALL, None).map_err(|e| anyhow::anyhow!(e))? };
+        let max_dyn = unsafe { sac.GetMaxDynamicObjectCount().unwrap_or(0) };
+        if max_dyn == 0 && mix_channels < 12 {
+            return Err(anyhow::anyhow!(
+                "Windows Spatial Sound ('Dolby Atmos for Home Theater') is Off on endpoint (GetMaxDynamicObjectCount == 0, MixFormat == {}ch); declining ISpatialAudioClient to avoid stereo folddown",
+                mix_channels
+            ));
+        }
+
+        if let Err(e) = unsafe {
+            sac.IsSpatialAudioStreamAvailable(&ISpatialAudioObjectRenderStream::IID, None)
+        } {
+            return Err(anyhow::anyhow!(
+                "ISpatialAudioObjectRenderStream not available on endpoint: {}",
+                e
+            ));
+        }
+
+        let fmt_enum = unsafe {
+            sac.GetSupportedAudioObjectFormatEnumerator()
+                .map_err(|e| anyhow::anyhow!(e))?
+        };
+        let fmt_count = unsafe { fmt_enum.GetCount().unwrap_or(0) };
+        if fmt_count == 0 {
+            return Err(anyhow::anyhow!(
+                "ISpatialAudioClient reported 0 supported AudioObject formats"
+            ));
+        }
+
+        // Prefer 48000 Hz 32-bit float mono object format.
+        let mut chosen_wf_ptr: *const WAVEFORMATEX = std::ptr::null();
+        let mut chosen_rate = 48000u32;
+        for idx in 0..fmt_count {
+            if let Ok(wf_ptr) = unsafe { fmt_enum.GetFormat(idx) }
+                && !wf_ptr.is_null()
+            {
+                let wf = unsafe { *wf_ptr };
+                if wf.wBitsPerSample == 32 && wf.nChannels == 1 {
+                    chosen_wf_ptr = wf_ptr;
+                    chosen_rate = wf.nSamplesPerSec;
+                    if wf.nSamplesPerSec == 48000 {
+                        break;
+                    }
+                }
+            }
+        }
+        if chosen_wf_ptr.is_null() {
+            return Err(anyhow::anyhow!(
+                "No 32-bit float mono AudioObject format found in ISpatialAudioClient"
+            ));
+        }
+
+        let max_frames = unsafe {
+            sac.GetMaxFrameCount(chosen_wf_ptr)
+                .map_err(|e| anyhow::anyhow!(e))?
+        };
+        let event = unsafe { CreateEventW(None, false, false, None).map_err(|e| anyhow::anyhow!(e))? };
+
+        let mask_714 = AudioObjectType_FrontLeft
+            | AudioObjectType_FrontRight
+            | AudioObjectType_FrontCenter
+            | AudioObjectType_LowFrequency
+            | AudioObjectType_SideLeft
+            | AudioObjectType_SideRight
+            | AudioObjectType_BackLeft
+            | AudioObjectType_BackRight
+            | AudioObjectType_TopFrontLeft
+            | AudioObjectType_TopFrontRight
+            | AudioObjectType_TopBackLeft
+            | AudioObjectType_TopBackRight;
+
+        let mut params = SpatialAudioObjectRenderStreamActivationParams {
+            ObjectFormat: chosen_wf_ptr,
+            StaticObjectTypeMask: mask_714,
+            MinDynamicObjectCount: 0,
+            MaxDynamicObjectCount: 0,
+            Category: AudioCategory_Media,
+            EventHandle: event,
+            NotifyObject: std::mem::ManuallyDrop::new(None),
+        };
+        let mut pv = std::mem::ManuallyDrop::new(PROPVARIANT::default());
+        unsafe {
+            (*pv.Anonymous.Anonymous).vt = VT_BLOB;
+            (*pv.Anonymous.Anonymous).Anonymous.blob = BLOB {
+                cbSize: std::mem::size_of::<SpatialAudioObjectRenderStreamActivationParams>() as u32,
+                pBlobData: &mut params as *mut _ as *mut u8,
+            };
+        }
+
+        let stream: ISpatialAudioObjectRenderStream = match unsafe {
+            sac.ActivateSpatialAudioStream(&*pv)
+        } {
+            Ok(s) => s,
+            Err(e) => {
+                unsafe {
+                    let _ = CloseHandle(event);
+                }
+                return Err(anyhow::anyhow!(
+                    "ActivateSpatialAudioStream(7.1.4) failed: {}",
+                    e
+                ));
+            }
+        };
+
+        // Activate all 12 static 7.1.4 bed objects in RustTracker's canonical 12-channel order:
+        // [0:FL, 1:FR, 2:FC, 3:LFE, 4:SL, 5:SR, 6:BL(RL), 7:BR(RR), 8:TFL, 9:TFR, 10:TBL(TRL), 11:TBR(TRR)]
+        let static_types = [
+            AudioObjectType_FrontLeft,
+            AudioObjectType_FrontRight,
+            AudioObjectType_FrontCenter,
+            AudioObjectType_LowFrequency,
+            AudioObjectType_SideLeft,
+            AudioObjectType_SideRight,
+            AudioObjectType_BackLeft,
+            AudioObjectType_BackRight,
+            AudioObjectType_TopFrontLeft,
+            AudioObjectType_TopFrontRight,
+            AudioObjectType_TopBackLeft,
+            AudioObjectType_TopBackRight,
+        ];
+        let mut objects = Vec::with_capacity(12);
+        for obj_type in static_types {
+            match unsafe { stream.ActivateSpatialAudioObject(obj_type) } {
+                Ok(obj) => objects.push(obj),
+                Err(e) => {
+                    unsafe {
+                        let _ = CloseHandle(event);
+                    }
+                    return Err(anyhow::anyhow!(
+                        "ActivateSpatialAudioObject({:?}) failed: {}",
+                        obj_type,
+                        e
+                    ));
+                }
+            }
+        }
+
+        let carrier_label = if max_dyn > 0 {
+            format!(
+                "ISpatialAudioClient 7.1.4 (Dolby Atmos / MAT 2.0, {} dynamic objects supported)",
+                max_dyn
+            )
+        } else {
+            "ISpatialAudioClient 7.1.4 (Static Bed — enable 'Dolby Atmos for Home Theater' in Windows Sound Settings for eARC heights)".to_string()
+        };
+
+        Ok((
+            SpatialAudio714State {
+                _spatial_client: sac,
+                _fmt_enum: fmt_enum,
+                stream,
+                objects,
+                carrier_label,
+            },
+            event,
+            max_frames.max(480),
+            chosen_rate,
+        ))
+    }
+
     fn try_open_shared_client(
         device: &IMMDevice,
         channels: u16,
@@ -9699,7 +10518,8 @@ fn run_wasapi_exclusive_multichannel(
     let stop_token_thread = stop_token.clone();
     let shared_state_thread = shared_state.clone();
     let selected_dev_owned = selected_device_name.map(|s| s.to_string());
-    let (init_tx, init_rx) = bounded::<Result<(u16, u32, WasapiPcmFormat, String)>>(1);
+    let (init_tx, init_rx) =
+        bounded::<Result<(u16, u32, WasapiPcmFormat, String, bool, String)>>(1);
     let (pipe_tx, pipe_rx) =
         bounded::<(Receiver<AudioChunk>, Sender<AudioChunk>, Sender<DspMessage>)>(1);
 
@@ -9832,8 +10652,7 @@ fn run_wasapi_exclusive_multichannel(
         let mut opened: Option<(
             IMMDevice,
             String,
-            IAudioClient,
-            IAudioRenderClient,
+            Option<(IAudioClient, IAudioRenderClient)>,
             HANDLE,
             u32,
             u16,
@@ -9841,6 +10660,8 @@ fn run_wasapi_exclusive_multichannel(
             u32,
             WasapiPcmFormat,
             bool,
+            Option<(crate::mpegh::Mpegh714Encoder, usize, String)>,
+            Option<SpatialAudio714State>,
         )> = None;
         let mut last_err =
             anyhow::anyhow!("No multichannel WASAPI support detected on candidate endpoints");
@@ -9863,8 +10684,44 @@ fn run_wasapi_exclusive_multichannel(
             drop(probe_client);
 
             for &(ch, mask) in &channel_candidates {
+                // 0. When 12-channel (7.1.4 / 11.1) output is enabled (`ch == 12 && mpegh_bitstream`),
+                // first check if Windows Spatial Audio (`Dolby Atmos for Home Theater`, `GetMaxDynamicObjectCount() > 0`)
+                // is active on the endpoint BEFORE probing `AUDCLNT_SHAREMODE_EXCLUSIVE` (since exclusive-mode
+                // format/init calls can cause Windows `AudioDg.exe` to reset Spatial Sound to Off).
+                if ch == 12 && mpegh_bitstream {
+                    match try_open_spatial_audio_714_client(&dev, mix_channels) {
+                        Ok((spatial, ev, max_frames, spatial_rate)) => {
+                            eprintln!(
+                                "[audio] Windows Spatial Audio 7.1.4 (11.1) negotiated on '{}': 12 static bed objects @ {} Hz [{}] (max {} frames/period)",
+                                dev_name,
+                                spatial_rate,
+                                spatial.carrier_label,
+                                max_frames
+                            );
+                            opened = Some((
+                                dev,
+                                dev_name,
+                                None,
+                                ev,
+                                max_frames,
+                                12,
+                                0x2D63F,
+                                spatial_rate,
+                                WasapiPcmFormat::F32,
+                                false,
+                                None,
+                                Some(spatial),
+                            ));
+                            break 'dev_loop;
+                        }
+                        Err(e) => {
+                            last_err = e;
+                        }
+                    }
+                }
+
                 for &rate in &rate_candidates {
-                    // 1. Primary path: WASAPI Exclusive Mode (bypasses AudioDg.exe's 2ch Shared Mode
+                    // 1. Primary path: WASAPI Exclusive Mode LPCM (bypasses AudioDg.exe's 2ch Shared Mode
                     // mixer and reconfigures the physical HDMI Audio InfoFrame to multi-channel surround).
                     for &fmt in &exclusive_fmt_candidates {
                         match try_open_exclusive_client(&dev, ch, rate, mask, fmt) {
@@ -9879,8 +10736,18 @@ fn run_wasapi_exclusive_multichannel(
                                     buf_frames
                                 );
                                 opened = Some((
-                                    dev, dev_name, ac, rc, ev, buf_frames, ch, mask, rate, fmt,
+                                    dev,
+                                    dev_name,
+                                    Some((ac, rc)),
+                                    ev,
+                                    buf_frames,
+                                    ch,
+                                    mask,
+                                    rate,
+                                    fmt,
                                     true,
+                                    None,
+                                    None,
                                 ));
                                 break 'dev_loop;
                             }
@@ -9906,8 +10773,18 @@ fn run_wasapi_exclusive_multichannel(
                                         buf_frames
                                     );
                                     opened = Some((
-                                        dev, dev_name, ac, rc, ev, buf_frames, ch, mask, rate, fmt,
+                                        dev,
+                                        dev_name,
+                                        Some((ac, rc)),
+                                        ev,
+                                        buf_frames,
+                                        ch,
+                                        mask,
+                                        rate,
+                                        fmt,
                                         false,
+                                        None,
+                                        None,
                                     ));
                                     break 'dev_loop;
                                 }
@@ -9918,14 +10795,60 @@ fn run_wasapi_exclusive_multichannel(
                         }
                     }
                 }
+
+                // 3. Direct HDMI AVR fallback: probe native EDID IEC 61937-13 MPEG-H 3D Audio (CICP Layout 19)
+                // when connected directly to an HDMI sink that advertises MPEG-H (`0x00000019` / `0x0000000f`).
+                if ch == 12 && mpegh_bitstream {
+                    match try_open_exclusive_mpegh_iec61937_client(&dev, false) {
+                        Ok((ac, rc, ev, buf_frames, rate_factor, carrier_label)) => {
+                            match crate::mpegh::Mpegh714Encoder::new(rate_factor as u8, true) {
+                                Ok(enc) => {
+                                    let carrier_frame_bytes = rate_factor;
+                                    eprintln!(
+                                        "[audio] WASAPI Exclusive MPEG-H 3D Audio 7.1.4 (11.1, CICP 19) negotiated on '{}': 12ch @ {} Hz via {} (buffer {} carrier frames)",
+                                        dev_name,
+                                        crate::mpegh::MPEGH_SAMPLE_RATE,
+                                        carrier_label,
+                                        buf_frames
+                                    );
+                                    opened = Some((
+                                        dev,
+                                        dev_name,
+                                        Some((ac, rc)),
+                                        ev,
+                                        buf_frames,
+                                        12,
+                                        0x2D63F,
+                                        crate::mpegh::MPEGH_SAMPLE_RATE,
+                                        WasapiPcmFormat::I16,
+                                        true,
+                                        Some((enc, carrier_frame_bytes, carrier_label)),
+                                        None,
+                                    ));
+                                    break 'dev_loop;
+                                }
+                                Err(e) => {
+                                    unsafe {
+                                        let _ = CloseHandle(ev);
+                                    }
+                                    drop(rc);
+                                    drop(ac);
+                                    last_err = e;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            last_err = e;
+                        }
+                    }
+                }
             }
         }
 
         let (
             active_device,
             active_device_name,
-            audio_client,
-            render_client,
+            wasapi_clients,
             event,
             buffer_frames,
             negotiated_channels,
@@ -9933,6 +10856,8 @@ fn run_wasapi_exclusive_multichannel(
             negotiated_rate,
             negotiated_fmt,
             is_exclusive,
+            mut mpegh_state,
+            mut spatial_state,
         ) = match opened {
             Some(v) => v,
             None => {
@@ -9945,20 +10870,33 @@ fn run_wasapi_exclusive_multichannel(
             }
         };
 
+        let is_mpegh_iec_bitstream = mpegh_state.is_some();
+        let is_spatial_714 = spatial_state.is_some();
+        let is_11_1_active = is_mpegh_iec_bitstream || is_spatial_714;
+        let mpegh_carrier_label = if let Some((_, _, ref label)) = mpegh_state {
+            label.clone()
+        } else if let Some(ref spatial) = spatial_state {
+            spatial.carrier_label.clone()
+        } else {
+            String::new()
+        };
+
         if init_tx
             .send(Ok((
                 negotiated_channels,
                 negotiated_rate,
                 negotiated_fmt,
                 active_device_name.clone(),
+                is_11_1_active,
+                mpegh_carrier_label,
             )))
             .is_err()
         {
             unsafe {
                 let _ = CloseHandle(event);
             }
-            drop(render_client);
-            drop(audio_client);
+            drop(spatial_state);
+            drop(wasapi_clients);
             drop(active_device);
             drop(enumerator);
             unsafe {
@@ -9973,8 +10911,8 @@ fn run_wasapi_exclusive_multichannel(
                 unsafe {
                     let _ = CloseHandle(event);
                 }
-                drop(render_client);
-                drop(audio_client);
+                drop(spatial_state);
+                drop(wasapi_clients);
                 drop(active_device);
                 drop(enumerator);
                 unsafe {
@@ -9986,7 +10924,11 @@ fn run_wasapi_exclusive_multichannel(
 
         let hardware_channels = negotiated_channels as usize;
         let bytes_per_sample = negotiated_fmt.bytes_per_sample();
-        let frame_bytes = hardware_channels * bytes_per_sample;
+        let frame_bytes = if let Some((_, carrier_fb, _)) = mpegh_state.as_ref() {
+            *carrier_fb
+        } else {
+            hardware_channels * bytes_per_sample
+        };
         let window_size = calculate_power_of_two_window_size(negotiated_rate);
 
         let mut fft_buffer = vec![0.0f32; window_size];
@@ -10009,39 +10951,70 @@ fn run_wasapi_exclusive_multichannel(
         let mut upmix_peak_vus = [0.0f32; 12];
         let mut current_chunk: Option<AudioChunk> = None;
         let mut chunk_frame_pos = 0usize;
-        let mut warmup_silent_buffers = if is_exclusive { 1u32 } else { 0u32 };
+        let mut warmup_silent_buffers = if is_exclusive && !is_mpegh_iec_bitstream && !is_spatial_714 {
+            1u32
+        } else {
+            0u32
+        };
         let startup_fade_frames = ((negotiated_rate as usize) * 35 / 1000).max(64);
         let mut startup_fade_pos = 0usize;
+        let mut iec_byte_queue: std::collections::VecDeque<u8> = if is_mpegh_iec_bitstream {
+            std::collections::VecDeque::with_capacity(65536 * 2)
+        } else {
+            std::collections::VecDeque::new()
+        };
+        let mut stream_started = !is_mpegh_iec_bitstream;
 
         let (mut latest_seek_epoch, mut upmix_cfg) = {
             let state = shared_state_thread.lock().unwrap();
             (state.seek_epoch, state.surround_upmix)
         };
 
-        // Prime the WASAPI buffer with silence before starting the hardware clock
-        unsafe {
-            let padding = if is_exclusive {
-                0
-            } else {
-                audio_client.GetCurrentPadding().unwrap_or(0)
-            };
-            let prime_frames = buffer_frames.saturating_sub(padding);
-            if prime_frames > 0
-                && let Ok(buf_ptr) = render_client.GetBuffer(prime_frames)
-            {
-                std::ptr::write_bytes(buf_ptr, 0, (prime_frames as usize) * frame_bytes);
-                let _ =
-                    render_client.ReleaseBuffer(prime_frames, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32);
+        // Start the hardware stream:
+        // - For ISpatialAudioObjectRenderStream, call `stream.Start()` before entering the event loop.
+        // - For LPCM WASAPI, prime the buffer with silence before calling `audio_client.Start()`.
+        // - For IEC 61937-13 MPEG-H bitstreaming, pre-fill the first DMA buffer with real IEC 61937
+        //   bursts inside the loop before calling `audio_client.Start()`.
+        if let Some(ref spatial) = spatial_state {
+            unsafe {
+                if let Err(e) = spatial.stream.Start() {
+                    eprintln!("[audio] ISpatialAudioObjectRenderStream::Start() failed: {:?}", e);
+                    let _ = CloseHandle(event);
+                    drop(spatial_state);
+                    drop(wasapi_clients);
+                    drop(active_device);
+                    drop(enumerator);
+                    CoUninitialize();
+                    return;
+                }
             }
-            if let Err(e) = audio_client.Start() {
-                eprintln!("[audio] WASAPI Start() failed: {:?}", e);
-                let _ = CloseHandle(event);
-                drop(render_client);
-                drop(audio_client);
-                drop(active_device);
-                drop(enumerator);
-                CoUninitialize();
-                return;
+        } else if !is_mpegh_iec_bitstream
+            && let Some((ref audio_client, ref render_client)) = wasapi_clients
+        {
+            unsafe {
+                let padding = if is_exclusive {
+                    0
+                } else {
+                    audio_client.GetCurrentPadding().unwrap_or(0)
+                };
+                let prime_frames = buffer_frames.saturating_sub(padding);
+                if prime_frames > 0
+                    && let Ok(buf_ptr) = render_client.GetBuffer(prime_frames)
+                {
+                    std::ptr::write_bytes(buf_ptr, 0, (prime_frames as usize) * frame_bytes);
+                    let _ = render_client
+                        .ReleaseBuffer(prime_frames, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32);
+                }
+                if let Err(e) = audio_client.Start() {
+                    eprintln!("[audio] WASAPI Start() failed: {:?}", e);
+                    let _ = CloseHandle(event);
+                    drop(spatial_state);
+                    drop(wasapi_clients);
+                    drop(active_device);
+                    drop(enumerator);
+                    CoUninitialize();
+                    return;
+                }
             }
         }
 
@@ -10053,7 +11026,17 @@ fn run_wasapi_exclusive_multichannel(
                 upmix_cfg = state.surround_upmix;
             }
 
-            if let Some(ref c) = current_chunk
+            if latest_seek_epoch > last_seek_epoch {
+                last_seek_epoch = latest_seek_epoch;
+                if let Some(stale) = current_chunk.take() {
+                    let _ = free_tx.try_send(stale);
+                }
+                chunk_frame_pos = 0;
+                iec_byte_queue.clear();
+                if let Some((ref mut mpegh_encoder, _, _)) = mpegh_state {
+                    mpegh_encoder.clear_accumulator();
+                }
+            } else if let Some(ref c) = current_chunk
                 && c.seek_epoch < latest_seek_epoch
             {
                 let stale = current_chunk.take().unwrap();
@@ -10061,19 +11044,301 @@ fn run_wasapi_exclusive_multichannel(
                 chunk_frame_pos = 0;
             }
 
-            let wait_res = unsafe { WaitForSingleObject(event, 20) };
-            if wait_res.0 != WAIT_OBJECT_0 {
+            if !stream_started && is_paused {
+                if let Ok(mut state) = shared_state_thread.try_lock() {
+                    state.raw_channel_vus.fill(0.0);
+                    state.raw_spectrum_data.fill(0.0);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
                 continue;
             }
 
-            let avail_frames = if is_exclusive {
-                buffer_frames
-            } else {
-                let padding = match unsafe { audio_client.GetCurrentPadding() } {
-                    Ok(p) => p,
+            if stream_started {
+                let wait_res = unsafe { WaitForSingleObject(event, 50) };
+                if wait_res.0 != WAIT_OBJECT_0 {
+                    continue;
+                }
+            }
+
+            let mut frames_written = 0usize;
+            let upmix_active = upmix_cfg.is_active_for_hardware(hardware_channels as i32);
+
+            if let Some(ref mut spatial) = spatial_state {
+                let mut dyn_count = 0u32;
+                let mut avail_frames = 0u32;
+                if let Err(e) = unsafe {
+                    spatial
+                        .stream
+                        .BeginUpdatingAudioObjects(&mut dyn_count, &mut avail_frames)
+                } {
+                    eprintln!(
+                        "[audio] ISpatialAudioObjectRenderStream::BeginUpdatingAudioObjects failed: {:?}",
+                        e
+                    );
+                    if let Ok(mut state) = shared_state_thread.lock() {
+                        state.audio_device_lost = true;
+                    }
+                    break;
+                }
+                if avail_frames == 0 {
+                    unsafe {
+                        let _ = spatial.stream.EndUpdatingAudioObjects();
+                    }
+                    continue;
+                }
+
+                let frames_to_render = avail_frames as usize;
+                let mut obj_ptrs = [std::ptr::null_mut::<f32>(); 12];
+                let mut buffer_err = false;
+                for (c, obj) in spatial.objects.iter().enumerate().take(12) {
+                    let mut ptr: *mut u8 = std::ptr::null_mut();
+                    let mut byte_len = 0u32;
+                    if unsafe { obj.GetBuffer(&mut ptr, &mut byte_len) }.is_err()
+                        || ptr.is_null()
+                        || (byte_len as usize) < frames_to_render * 4
+                    {
+                        buffer_err = true;
+                        break;
+                    }
+                    obj_ptrs[c] = ptr as *mut f32;
+                }
+                if buffer_err {
+                    unsafe {
+                        let _ = spatial.stream.EndUpdatingAudioObjects();
+                    }
+                    continue;
+                }
+
+                if is_paused {
+                    if let Ok(mut state) = shared_state_thread.try_lock() {
+                        state.raw_channel_vus.fill(0.0);
+                        state.raw_spectrum_data.fill(0.0);
+                    }
+                    unsafe {
+                        for &ptr in &obj_ptrs {
+                            std::ptr::write_bytes(ptr, 0, frames_to_render);
+                        }
+                        let _ = spatial.stream.EndUpdatingAudioObjects();
+                    }
+                    continue;
+                }
+
+                if upmix_active {
+                    upmixer_dsp.sync_config(&upmix_cfg, negotiated_rate);
+                }
+
+                while frames_written < frames_to_render {
+                    if current_chunk.is_none() {
+                        match ready_rx.try_recv() {
+                            Ok(chunk) => {
+                                if chunk.seek_epoch < latest_seek_epoch {
+                                    let _ = free_tx.try_send(chunk);
+                                    continue;
+                                }
+                                last_channel_vus.clear();
+                                last_channel_vus.extend_from_slice(&chunk.channel_vus);
+                                last_spatial_channels = (chunk.spatial_channels as usize).max(1);
+                                last_current_order = chunk.current_order;
+                                last_current_row = chunk.current_row;
+                                last_bpm = chunk.bpm;
+                                last_speed = chunk.speed;
+                                last_current_seconds = chunk.current_seconds;
+                                last_current_row_string.clear();
+                                last_current_row_string.push_str(&chunk.current_row_string);
+                                last_seek_epoch = chunk.seek_epoch;
+                                if chunk.seek_epoch > latest_seek_epoch {
+                                    latest_seek_epoch = chunk.seek_epoch;
+                                }
+
+                                if chunk.track_ended
+                                    && let Ok(mut state) = shared_state_thread.try_lock()
+                                {
+                                    state.track_ended = true;
+                                }
+
+                                current_chunk = Some(chunk);
+                                chunk_frame_pos = 0;
+                            }
+                            Err(_) => {
+                                let rem = frames_to_render - frames_written;
+                                unsafe {
+                                    for &ptr in &obj_ptrs {
+                                        std::ptr::write_bytes(ptr.add(frames_written), 0, rem);
+                                    }
+                                }
+                                break;
+                            }
+                        }
+                    }
+
+                    if let Some(chunk) = current_chunk.as_mut() {
+                        let frames_available = chunk.valid_frames.saturating_sub(chunk_frame_pos);
+                        let frames_needed = frames_to_render - frames_written;
+
+                        if frames_available == 0 {
+                            let c = current_chunk.take().unwrap();
+                            let _ = free_tx.try_send(c);
+                            continue;
+                        }
+
+                        let to_copy = std::cmp::min(frames_available, frames_needed);
+                        let src_ch = (chunk.spatial_channels as usize).max(1);
+                        let target_upmix = upmix_active && src_ch < hardware_channels;
+
+                        if upmixer_dsp.is_blending_or_active(target_upmix)
+                            && src_ch < hardware_channels
+                        {
+                            for i in 0..to_copy {
+                                let src_frame_idx = chunk_frame_pos + i;
+                                let dst_frame_idx = frames_written + i;
+                                let fade_gain = if startup_fade_pos < startup_fade_frames {
+                                    let t = startup_fade_pos as f32 / startup_fade_frames as f32;
+                                    startup_fade_pos += 1;
+                                    0.5 - 0.5 * (std::f32::consts::PI * t).cos()
+                                } else {
+                                    1.0
+                                };
+                                let frame_slice = &chunk.samples[src_frame_idx * hardware_channels
+                                    ..(src_frame_idx + 1) * hardware_channels];
+                                let out_channels = upmixer_dsp
+                                    .process_multichannel_frame_for_hardware_blended(
+                                        frame_slice,
+                                        src_ch,
+                                        &upmix_cfg,
+                                        hardware_channels,
+                                        target_upmix,
+                                    );
+
+                                // `spatial.objects` are activated in RustTracker's canonical 12-channel order:
+                                // [0:FL, 1:FR, 2:FC, 3:LFE, 4:SL, 5:SR, 6:BL(RL), 7:BR(RR), 8:TFL, 9:TFR, 10:TBL(TRL), 11:TBR(TRR)].
+                                // Compensate for Windows Spatial Audio (`DolbyMatEnc.dll`) object-summing headroom pad
+                                // and AVR Dolby Atmos Dialnorm (~3.5-4.3 dB attenuation relative to 0 dBFS Exclusive LPCM).
+                                for c in 0..12 {
+                                    let atmos_makeup = if c < 4 { 1.50 } else { 1.65 };
+                                    let s = SurroundUpmixerDsp::soft_limit(
+                                        out_channels[c] * fade_gain * atmos_makeup,
+                                    );
+                                    unsafe {
+                                        *obj_ptrs[c].add(dst_frame_idx) = s;
+                                    }
+                                    upmix_peak_vus[c] = upmix_peak_vus[c].max(s.abs());
+                                    channel_fft_buffers[c][fft_index] = s;
+                                }
+
+                                let mono = (out_channels[0] + out_channels[1]) * 0.5 * fade_gain;
+                                fft_buffer[fft_index] = mono.clamp(-1.0, 1.0);
+                                fft_index = (fft_index + 1) % window_size;
+                            }
+                        } else {
+                            for i in 0..to_copy {
+                                let src_frame_idx = chunk_frame_pos + i;
+                                let dst_frame_idx = frames_written + i;
+                                let fade_gain = if startup_fade_pos < startup_fade_frames {
+                                    let t = startup_fade_pos as f32 / startup_fade_frames as f32;
+                                    startup_fade_pos += 1;
+                                    0.5 - 0.5 * (std::f32::consts::PI * t).cos()
+                                } else {
+                                    1.0
+                                };
+
+                                let mut mono = 0.0f32;
+                                for c in 0..12 {
+                                    let sample = if c < hardware_channels {
+                                        SurroundUpmixerDsp::soft_limit(
+                                            chunk.samples[src_frame_idx * hardware_channels + c]
+                                                * fade_gain
+                                                * 1.50,
+                                        )
+                                    } else {
+                                        0.0
+                                    };
+                                    unsafe {
+                                        *obj_ptrs[c].add(dst_frame_idx) = sample;
+                                    }
+                                    let ch_weight = match c {
+                                        0 | 1 => 0.5,
+                                        2 => std::f32::consts::FRAC_1_SQRT_2,
+                                        _ => 0.25,
+                                    };
+                                    mono += sample * ch_weight;
+                                    channel_fft_buffers[c][fft_index] = sample;
+                                }
+
+                                fft_buffer[fft_index] = mono.clamp(-1.0, 1.0);
+                                fft_index = (fft_index + 1) % window_size;
+                            }
+                        }
+
+                        chunk_frame_pos += to_copy;
+                        frames_written += to_copy;
+                    }
+                }
+
+                if let Err(e) = unsafe { spatial.stream.EndUpdatingAudioObjects() } {
+                    eprintln!(
+                        "[audio] ISpatialAudioObjectRenderStream::EndUpdatingAudioObjects failed: {:?}",
+                        e
+                    );
+                    if let Ok(mut state) = shared_state_thread.lock() {
+                        state.audio_device_lost = true;
+                    }
+                    break;
+                }
+            } else if let Some((ref audio_client, ref render_client)) = wasapi_clients {
+                let avail_frames = if is_exclusive {
+                    buffer_frames
+                } else {
+                    let padding = match unsafe { audio_client.GetCurrentPadding() } {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!(
+                                "[audio] WASAPI Shared GetCurrentPadding failed (device disconnected?): {:?}",
+                                e
+                            );
+                            if let Ok(mut state) = shared_state_thread.lock() {
+                                state.audio_device_lost = true;
+                            }
+                            break;
+                        }
+                    };
+                    buffer_frames.saturating_sub(padding)
+                };
+                if avail_frames == 0 {
+                    continue;
+                }
+
+                if warmup_silent_buffers > 0 {
+                    warmup_silent_buffers -= 1;
+                    if let Ok(buf_ptr) = unsafe { render_client.GetBuffer(avail_frames) } {
+                        unsafe {
+                            std::ptr::write_bytes(buf_ptr, 0, (avail_frames as usize) * frame_bytes);
+                            let _ = render_client
+                                .ReleaseBuffer(avail_frames, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32);
+                        }
+                    }
+                    continue;
+                }
+
+                if is_paused {
+                    if let Ok(mut state) = shared_state_thread.try_lock() {
+                        state.raw_channel_vus.fill(0.0);
+                        state.raw_spectrum_data.fill(0.0);
+                    }
+                    if let Ok(buf_ptr) = unsafe { render_client.GetBuffer(avail_frames) } {
+                        unsafe {
+                            std::ptr::write_bytes(buf_ptr, 0, (avail_frames as usize) * frame_bytes);
+                            let _ = render_client
+                                .ReleaseBuffer(avail_frames, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32);
+                        }
+                    }
+                    continue;
+                }
+
+                let buf_ptr = match unsafe { render_client.GetBuffer(avail_frames) } {
+                    Ok(ptr) => ptr,
                     Err(e) => {
                         eprintln!(
-                            "[audio] WASAPI Shared GetCurrentPadding failed (device disconnected?): {:?}",
+                            "[audio] WASAPI Shared GetBuffer failed (device disconnected?): {:?}",
                             e
                         );
                         if let Ok(mut state) = shared_state_thread.lock() {
@@ -10082,234 +11347,352 @@ fn run_wasapi_exclusive_multichannel(
                         break;
                     }
                 };
-                buffer_frames.saturating_sub(padding)
-            };
-            if avail_frames == 0 {
-                continue;
-            }
 
-            if warmup_silent_buffers > 0 {
-                warmup_silent_buffers -= 1;
-                if let Ok(buf_ptr) = unsafe { render_client.GetBuffer(avail_frames) } {
-                    unsafe {
-                        std::ptr::write_bytes(buf_ptr, 0, (avail_frames as usize) * frame_bytes);
-                        let _ = render_client
-                            .ReleaseBuffer(avail_frames, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32);
-                    }
+                let frames_to_render = avail_frames as usize;
+                let out_bytes =
+                    unsafe { std::slice::from_raw_parts_mut(buf_ptr, frames_to_render * frame_bytes) };
+
+                if upmix_active {
+                    upmixer_dsp.sync_config(&upmix_cfg, negotiated_rate);
                 }
-                continue;
-            }
 
-            if is_paused {
-                if let Ok(mut state) = shared_state_thread.try_lock() {
-                    state.raw_channel_vus.fill(0.0);
-                    state.raw_spectrum_data.fill(0.0);
-                }
-                if let Ok(buf_ptr) = unsafe { render_client.GetBuffer(avail_frames) } {
-                    unsafe {
-                        std::ptr::write_bytes(buf_ptr, 0, (avail_frames as usize) * frame_bytes);
-                        let _ = render_client
-                            .ReleaseBuffer(avail_frames, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32);
-                    }
-                }
-                continue;
-            }
+                if let Some((ref mut mpegh_encoder, _, _)) = mpegh_state {
+                    // Real-time 12-channel (7.1.4 / 11.1, CICP Layout 19) MPEG-H 3D Audio -> IEC 61937-13
+                    // HDMI bitstream encoding path. Each 1024-sample @ 48 kHz audio frame produces one
+                    // IEC 61937-13 burst covering 1024 * rate_factor carrier frames @ 192 kHz.
+                    let needed_iec_bytes = out_bytes.len();
+                    while iec_byte_queue.len() < needed_iec_bytes {
+                        if current_chunk.is_none() {
+                            let recv_res = if !stream_started {
+                                ready_rx
+                                    .recv_timeout(std::time::Duration::from_millis(100))
+                                    .map_err(|_| ())
+                            } else {
+                                ready_rx
+                                    .recv_timeout(std::time::Duration::from_millis(15))
+                                    .map_err(|_| ())
+                            };
+                            match recv_res {
+                                Ok(chunk) => {
+                                    if chunk.seek_epoch < latest_seek_epoch {
+                                        let _ = free_tx.try_send(chunk);
+                                        continue;
+                                    }
+                                    last_channel_vus.clear();
+                                    last_channel_vus.extend_from_slice(&chunk.channel_vus);
+                                    last_spatial_channels = (chunk.spatial_channels as usize).max(1);
+                                    last_current_order = chunk.current_order;
+                                    last_current_row = chunk.current_row;
+                                    last_bpm = chunk.bpm;
+                                    last_speed = chunk.speed;
+                                    last_current_seconds = chunk.current_seconds;
+                                    last_current_row_string.clear();
+                                    last_current_row_string.push_str(&chunk.current_row_string);
+                                    last_seek_epoch = chunk.seek_epoch;
+                                    if chunk.seek_epoch > latest_seek_epoch {
+                                        latest_seek_epoch = chunk.seek_epoch;
+                                    }
 
-            let buf_ptr = match unsafe { render_client.GetBuffer(avail_frames) } {
-                Ok(ptr) => ptr,
-                Err(e) => {
-                    eprintln!(
-                        "[audio] WASAPI Shared GetBuffer failed (device disconnected?): {:?}",
-                        e
-                    );
-                    if let Ok(mut state) = shared_state_thread.lock() {
-                        state.audio_device_lost = true;
-                    }
-                    break;
-                }
-            };
+                                    if chunk.track_ended
+                                        && let Ok(mut state) = shared_state_thread.try_lock()
+                                    {
+                                        state.track_ended = true;
+                                    }
 
-            let frames_to_render = avail_frames as usize;
-            let out_bytes =
-                unsafe { std::slice::from_raw_parts_mut(buf_ptr, frames_to_render * frame_bytes) };
+                                    current_chunk = Some(chunk);
+                                    chunk_frame_pos = 0;
+                                }
+                                Err(_) => {
+                                    break;
+                                }
+                            }
+                        }
 
-            let upmix_active = upmix_cfg.is_active_for_hardware(hardware_channels as i32);
-            if upmix_active {
-                upmixer_dsp.sync_config(&upmix_cfg, negotiated_rate);
-            }
-
-            let mut frames_written = 0usize;
-
-            while frames_written < frames_to_render {
-                if current_chunk.is_none() {
-                    match ready_rx.try_recv() {
-                        Ok(chunk) => {
-                            if chunk.seek_epoch < latest_seek_epoch {
-                                let _ = free_tx.try_send(chunk);
+                        if let Some(chunk) = current_chunk.as_mut() {
+                            let frames_available = chunk.valid_frames.saturating_sub(chunk_frame_pos);
+                            if frames_available == 0 {
+                                let c = current_chunk.take().unwrap();
+                                let _ = free_tx.try_send(c);
                                 continue;
                             }
-                            last_channel_vus.clear();
-                            last_channel_vus.extend_from_slice(&chunk.channel_vus);
-                            last_spatial_channels = (chunk.spatial_channels as usize).max(1);
-                            last_current_order = chunk.current_order;
-                            last_current_row = chunk.current_row;
-                            last_bpm = chunk.bpm;
-                            last_speed = chunk.speed;
-                            last_current_seconds = chunk.current_seconds;
-                            last_current_row_string.clear();
-                            last_current_row_string.push_str(&chunk.current_row_string);
-                            last_seek_epoch = chunk.seek_epoch;
-                            if chunk.seek_epoch > latest_seek_epoch {
-                                latest_seek_epoch = chunk.seek_epoch;
+
+                            let src_ch = (chunk.spatial_channels as usize).max(1);
+                            let target_upmix = upmix_active && src_ch < hardware_channels;
+                            let use_upmixer = upmixer_dsp.is_blending_or_active(target_upmix)
+                                && src_ch < hardware_channels;
+
+                            for _ in 0..frames_available {
+                                let src_frame_idx = chunk_frame_pos;
+                                let fade_gain = if startup_fade_pos < startup_fade_frames {
+                                    let t = startup_fade_pos as f32 / startup_fade_frames as f32;
+                                    startup_fade_pos += 1;
+                                    0.5 - 0.5 * (std::f32::consts::PI * t).cos()
+                                } else {
+                                    1.0
+                                };
+                                let frame_slice = &chunk.samples[src_frame_idx * hardware_channels
+                                    ..(src_frame_idx + 1) * hardware_channels];
+
+                                if use_upmixer {
+                                    let mut out_channels = upmixer_dsp
+                                        .process_multichannel_frame_for_hardware_blended(
+                                            frame_slice,
+                                            src_ch,
+                                            &upmix_cfg,
+                                            hardware_channels,
+                                            target_upmix,
+                                        );
+                                    for s in out_channels.iter_mut() {
+                                        *s = (*s * fade_gain).clamp(-1.0, 1.0);
+                                    }
+                                    for c in 0..12 {
+                                        let s = out_channels[c];
+                                        upmix_peak_vus[c] = upmix_peak_vus[c].max(s.abs());
+                                        channel_fft_buffers[c][fft_index] = s;
+                                    }
+                                    let mono = (out_channels[0] + out_channels[1]) * 0.5;
+                                    fft_buffer[fft_index] = mono.clamp(-1.0, 1.0);
+                                    fft_index = (fft_index + 1) % window_size;
+
+                                    let _ = mpegh_encoder
+                                        .push_rusttracker_714_frame(&out_channels, &mut iec_byte_queue);
+                                } else {
+                                    let mut cicp_frame = [0.0f32; 12];
+                                    let mut mono = 0.0f32;
+                                    for c in 0..12 {
+                                        let sample = if c < hardware_channels {
+                                            (frame_slice[c] * fade_gain).clamp(-1.0, 1.0)
+                                        } else {
+                                            0.0
+                                        };
+                                        cicp_frame[c] = sample;
+                                        let ch_weight = match c {
+                                            0 | 1 => 0.5,
+                                            2 => std::f32::consts::FRAC_1_SQRT_2,
+                                            _ => 0.25,
+                                        };
+                                        mono += sample * ch_weight;
+                                        channel_fft_buffers[c][fft_index] = sample;
+                                    }
+                                    fft_buffer[fft_index] = mono.clamp(-1.0, 1.0);
+                                    fft_index = (fft_index + 1) % window_size;
+
+                                    let _ = mpegh_encoder
+                                        .push_cicp19_frame(&cicp_frame, &mut iec_byte_queue);
+                                }
+
+                                chunk_frame_pos += 1;
+                                frames_written += 1;
+                                if iec_byte_queue.len() >= needed_iec_bytes {
+                                    break;
+                                }
                             }
 
-                            if chunk.track_ended
-                                && let Ok(mut state) = shared_state_thread.try_lock()
-                            {
-                                state.track_ended = true;
+                            if chunk_frame_pos >= chunk.valid_frames {
+                                let c = current_chunk.take().unwrap();
+                                let _ = free_tx.try_send(c);
                             }
-
-                            current_chunk = Some(chunk);
-                            chunk_frame_pos = 0;
                         }
-                        Err(_) => {
-                            out_bytes[frames_written * frame_bytes..].fill(0);
+                    }
+
+                    let copy_bytes = iec_byte_queue.len().min(out_bytes.len());
+                    for b in &mut out_bytes[..copy_bytes] {
+                        *b = iec_byte_queue.pop_front().unwrap_or(0);
+                    }
+                    if copy_bytes < out_bytes.len() {
+                        out_bytes[copy_bytes..].fill(0);
+                    }
+                } else {
+                    while frames_written < frames_to_render {
+                        if current_chunk.is_none() {
+                            match ready_rx.try_recv() {
+                                Ok(chunk) => {
+                                    if chunk.seek_epoch < latest_seek_epoch {
+                                        let _ = free_tx.try_send(chunk);
+                                        continue;
+                                    }
+                                    last_channel_vus.clear();
+                                    last_channel_vus.extend_from_slice(&chunk.channel_vus);
+                                    last_spatial_channels = (chunk.spatial_channels as usize).max(1);
+                                    last_current_order = chunk.current_order;
+                                    last_current_row = chunk.current_row;
+                                    last_bpm = chunk.bpm;
+                                    last_speed = chunk.speed;
+                                    last_current_seconds = chunk.current_seconds;
+                                    last_current_row_string.clear();
+                                    last_current_row_string.push_str(&chunk.current_row_string);
+                                    last_seek_epoch = chunk.seek_epoch;
+                                    if chunk.seek_epoch > latest_seek_epoch {
+                                        latest_seek_epoch = chunk.seek_epoch;
+                                    }
+
+                                    if chunk.track_ended
+                                        && let Ok(mut state) = shared_state_thread.try_lock()
+                                    {
+                                        state.track_ended = true;
+                                    }
+
+                                    current_chunk = Some(chunk);
+                                    chunk_frame_pos = 0;
+                                }
+                                Err(_) => {
+                                    out_bytes[frames_written * frame_bytes..].fill(0);
+                                    break;
+                                }
+                            }
+                        }
+
+                        if let Some(chunk) = current_chunk.as_mut() {
+                            let frames_available = chunk.valid_frames.saturating_sub(chunk_frame_pos);
+                            let frames_needed = frames_to_render - frames_written;
+
+                            if frames_available == 0 {
+                                let c = current_chunk.take().unwrap();
+                                let _ = free_tx.try_send(c);
+                                continue;
+                            }
+
+                            let to_copy = std::cmp::min(frames_available, frames_needed);
+
+                            let src_ch = (chunk.spatial_channels as usize).max(1);
+                            let target_upmix = upmix_active && src_ch < hardware_channels;
+                            if upmixer_dsp.is_blending_or_active(target_upmix)
+                                && src_ch < hardware_channels
+                            {
+                                let active_ch = hardware_channels.min(12);
+                                for i in 0..to_copy {
+                                    let src_frame_idx = chunk_frame_pos + i;
+                                    let dst_frame_idx = frames_written + i;
+                                    let dst_byte_base = dst_frame_idx * frame_bytes;
+                                    let fade_gain = if startup_fade_pos < startup_fade_frames {
+                                        let t = startup_fade_pos as f32 / startup_fade_frames as f32;
+                                        startup_fade_pos += 1;
+                                        0.5 - 0.5 * (std::f32::consts::PI * t).cos()
+                                    } else {
+                                        1.0
+                                    };
+                                    let frame_slice = &chunk.samples[src_frame_idx * hardware_channels
+                                        ..(src_frame_idx + 1) * hardware_channels];
+                                    let out_channels = upmixer_dsp
+                                        .process_multichannel_frame_for_hardware_blended(
+                                            frame_slice,
+                                            src_ch,
+                                            &upmix_cfg,
+                                            hardware_channels,
+                                            target_upmix,
+                                        );
+
+                                    // Map upmixer output channels:
+                                    //   out_channels = [0:FL, 1:FR, 2:FC, 3:LFE, 4:SL, 5:SR, 6:RL, 7:RR, 8:TFL, 9:TFR, 10:TRL, 11:TRR]
+                                    // to physical WAVEFORMATEXTENSIBLE channel bit-order:
+                                    //   for 0x63F (7.1) / 0x2D63F (7.1.4): [0:FL, 1:FR, 2:FC, 3:LFE, 4:BL(RL), 5:BR(RR), 6:SL, 7:SR, ...].
+                                    for c in 0..hardware_channels {
+                                        let raw_s = if hardware_channels >= 8
+                                            && (negotiated_mask & 0x630) == 0x630
+                                        {
+                                            match c {
+                                                0..=3 => out_channels[c],
+                                                4 => out_channels[6],
+                                                5 => out_channels[7],
+                                                6 => out_channels[4],
+                                                7 => out_channels[5],
+                                                8..=11 => out_channels[c],
+                                                _ => 0.0,
+                                            }
+                                        } else if c < 12 {
+                                            out_channels[c]
+                                        } else {
+                                            0.0
+                                        };
+                                        let out_s = raw_s * fade_gain;
+                                        write_wasapi_sample(
+                                            &mut out_bytes[dst_byte_base + c * bytes_per_sample
+                                                ..dst_byte_base + (c + 1) * bytes_per_sample],
+                                            out_s.clamp(-1.0, 1.0),
+                                            negotiated_fmt,
+                                        );
+                                    }
+
+                                    for c in 0..active_ch {
+                                        let s = out_channels[c] * fade_gain;
+                                        upmix_peak_vus[c] = upmix_peak_vus[c].max(s.abs());
+                                        channel_fft_buffers[c][fft_index] = s;
+                                    }
+
+                                    let mono = (out_channels[0] + out_channels[1]) * 0.5 * fade_gain;
+                                    fft_buffer[fft_index] = mono.clamp(-1.0, 1.0);
+                                    fft_index = (fft_index + 1) % window_size;
+                                }
+                            } else {
+                                for i in 0..to_copy {
+                                    let src_frame_idx = chunk_frame_pos + i;
+                                    let dst_frame_idx = frames_written + i;
+                                    let dst_byte_base = dst_frame_idx * frame_bytes;
+                                    let fade_gain = if startup_fade_pos < startup_fade_frames {
+                                        let t = startup_fade_pos as f32 / startup_fade_frames as f32;
+                                        startup_fade_pos += 1;
+                                        0.5 - 0.5 * (std::f32::consts::PI * t).cos()
+                                    } else {
+                                        1.0
+                                    };
+
+                                    let mut mono = 0.0f32;
+                                    for c in 0..hardware_channels {
+                                        let sample = (chunk.samples
+                                            [src_frame_idx * hardware_channels + c]
+                                            * fade_gain)
+                                            .clamp(-1.0, 1.0);
+                                        write_wasapi_sample(
+                                            &mut out_bytes[dst_byte_base + c * bytes_per_sample
+                                                ..dst_byte_base + (c + 1) * bytes_per_sample],
+                                            sample,
+                                            negotiated_fmt,
+                                        );
+                                        let ch_weight = match c {
+                                            0 | 1 => {
+                                                if hardware_channels == 1 {
+                                                    1.0
+                                                } else {
+                                                    0.5
+                                                }
+                                            }
+                                            2 => std::f32::consts::FRAC_1_SQRT_2,
+                                            _ => 0.25,
+                                        };
+                                        mono += sample * ch_weight;
+                                        channel_fft_buffers[c][fft_index] = sample;
+                                    }
+
+                                    fft_buffer[fft_index] = mono.clamp(-1.0, 1.0);
+                                    fft_index = (fft_index + 1) % window_size;
+                                }
+                            }
+
+                            chunk_frame_pos += to_copy;
+                            frames_written += to_copy;
+                        }
+                    }
+                }
+
+                unsafe {
+                    if let Err(e) = render_client.ReleaseBuffer(avail_frames, 0) {
+                        eprintln!("[audio] WASAPI ReleaseBuffer failed: {:?}", e);
+                        if let Ok(mut state) = shared_state_thread.lock() {
+                            state.audio_device_lost = true;
+                        }
+                        break;
+                    }
+                    if !stream_started {
+                        if let Err(e) = audio_client.Start() {
+                            eprintln!("[audio] WASAPI Start() failed: {:?}", e);
+                            if let Ok(mut state) = shared_state_thread.lock() {
+                                state.audio_device_lost = true;
+                            }
                             break;
                         }
+                        stream_started = true;
                     }
                 }
-
-                if let Some(chunk) = current_chunk.as_mut() {
-                    let frames_available = chunk.valid_frames.saturating_sub(chunk_frame_pos);
-                    let frames_needed = frames_to_render - frames_written;
-
-                    if frames_available == 0 {
-                        let c = current_chunk.take().unwrap();
-                        let _ = free_tx.try_send(c);
-                        continue;
-                    }
-
-                    let to_copy = std::cmp::min(frames_available, frames_needed);
-
-                    let src_ch = (chunk.spatial_channels as usize).max(1);
-                    let target_upmix = upmix_active && src_ch < hardware_channels;
-                    if upmixer_dsp.is_blending_or_active(target_upmix) && src_ch < hardware_channels
-                    {
-                        let active_ch = hardware_channels.min(12);
-                        for i in 0..to_copy {
-                            let src_frame_idx = chunk_frame_pos + i;
-                            let dst_frame_idx = frames_written + i;
-                            let dst_byte_base = dst_frame_idx * frame_bytes;
-                            let fade_gain = if startup_fade_pos < startup_fade_frames {
-                                let t = startup_fade_pos as f32 / startup_fade_frames as f32;
-                                startup_fade_pos += 1;
-                                0.5 - 0.5 * (std::f32::consts::PI * t).cos()
-                            } else {
-                                1.0
-                            };
-                            let frame_slice = &chunk.samples[src_frame_idx * hardware_channels
-                                ..(src_frame_idx + 1) * hardware_channels];
-                            let out_channels = upmixer_dsp
-                                .process_multichannel_frame_for_hardware_blended(
-                                    frame_slice,
-                                    src_ch,
-                                    &upmix_cfg,
-                                    hardware_channels,
-                                    target_upmix,
-                                );
-
-                            // Map upmixer output channels:
-                            //   out_channels = [0:FL, 1:FR, 2:FC, 3:LFE, 4:SL, 5:SR, 6:RL, 7:RR, 8:TFL, 9:TFR, 10:TRL, 11:TRR]
-                            // to physical WAVEFORMATEXTENSIBLE channel bit-order:
-                            //   for 0x63F (7.1) / 0x2D63F (7.1.4): [0:FL, 1:FR, 2:FC, 3:LFE, 4:BL(RL), 5:BR(RR), 6:SL, 7:SR, ...].
-                            for c in 0..hardware_channels {
-                                let raw_s = if hardware_channels >= 8
-                                    && (negotiated_mask & 0x630) == 0x630
-                                {
-                                    match c {
-                                        0..=3 => out_channels[c],
-                                        4 => out_channels[6],
-                                        5 => out_channels[7],
-                                        6 => out_channels[4],
-                                        7 => out_channels[5],
-                                        8..=11 => out_channels[c],
-                                        _ => 0.0,
-                                    }
-                                } else if c < 12 {
-                                    out_channels[c]
-                                } else {
-                                    0.0
-                                };
-                                let out_s = raw_s * fade_gain;
-                                write_wasapi_sample(
-                                    &mut out_bytes[dst_byte_base + c * bytes_per_sample
-                                        ..dst_byte_base + (c + 1) * bytes_per_sample],
-                                    out_s.clamp(-1.0, 1.0),
-                                    negotiated_fmt,
-                                );
-                            }
-
-                            for c in 0..active_ch {
-                                let s = out_channels[c] * fade_gain;
-                                upmix_peak_vus[c] = upmix_peak_vus[c].max(s.abs());
-                                channel_fft_buffers[c][fft_index] = s;
-                            }
-
-                            let mono = (out_channels[0] + out_channels[1]) * 0.5 * fade_gain;
-                            fft_buffer[fft_index] = mono.clamp(-1.0, 1.0);
-                            fft_index = (fft_index + 1) % window_size;
-                        }
-                    } else {
-                        for i in 0..to_copy {
-                            let src_frame_idx = chunk_frame_pos + i;
-                            let dst_frame_idx = frames_written + i;
-                            let dst_byte_base = dst_frame_idx * frame_bytes;
-                            let fade_gain = if startup_fade_pos < startup_fade_frames {
-                                let t = startup_fade_pos as f32 / startup_fade_frames as f32;
-                                startup_fade_pos += 1;
-                                0.5 - 0.5 * (std::f32::consts::PI * t).cos()
-                            } else {
-                                1.0
-                            };
-
-                            let mut mono = 0.0f32;
-                            for c in 0..hardware_channels {
-                                let sample = (chunk.samples[src_frame_idx * hardware_channels + c]
-                                    * fade_gain)
-                                    .clamp(-1.0, 1.0);
-                                write_wasapi_sample(
-                                    &mut out_bytes[dst_byte_base + c * bytes_per_sample
-                                        ..dst_byte_base + (c + 1) * bytes_per_sample],
-                                    sample,
-                                    negotiated_fmt,
-                                );
-                                let ch_weight = match c {
-                                    0 | 1 => {
-                                        if hardware_channels == 1 {
-                                            1.0
-                                        } else {
-                                            0.5
-                                        }
-                                    }
-                                    2 => std::f32::consts::FRAC_1_SQRT_2,
-                                    _ => 0.25,
-                                };
-                                mono += sample * ch_weight;
-                                channel_fft_buffers[c][fft_index] = sample;
-                            }
-
-                            fft_buffer[fft_index] = mono.clamp(-1.0, 1.0);
-                            fft_index = (fft_index + 1) % window_size;
-                        }
-                    }
-
-                    chunk_frame_pos += to_copy;
-                    frames_written += to_copy;
-                }
-            }
-
-            unsafe {
-                let _ = render_client.ReleaseBuffer(avail_frames, 0);
             }
 
             frames_since_last_dsp_send += frames_written;
@@ -10352,13 +11735,23 @@ fn run_wasapi_exclusive_multichannel(
             }
         }
 
+        if let Some(ref spatial) = spatial_state {
+            unsafe {
+                let _ = spatial.stream.Stop();
+                let _ = spatial.stream.Reset();
+            }
+        }
+        if let Some((ref audio_client, _)) = wasapi_clients {
+            unsafe {
+                let _ = audio_client.Stop();
+                let _ = audio_client.Reset();
+            }
+        }
         unsafe {
-            let _ = audio_client.Stop();
-            let _ = audio_client.Reset();
             let _ = CloseHandle(event);
         }
-        drop(render_client);
-        drop(audio_client);
+        drop(spatial_state);
+        drop(wasapi_clients);
         drop(active_device);
         drop(enumerator);
         unsafe {
@@ -10388,21 +11781,27 @@ fn run_wasapi_exclusive_multichannel(
         }
     }
 
-    let (negotiated_channels, negotiated_rate, _negotiated_fmt, _matched_dev_name) =
-        match init_rx.recv() {
-            Ok(Ok(info)) => info,
-            Ok(Err(e)) => {
-                let _ = thread_handle.join();
-                return Err(e);
-            }
-            Err(e) => {
-                let _ = thread_handle.join();
-                return Err(anyhow::anyhow!(
-                    "WASAPI Exclusive init channel closed unexpectedly: {}",
-                    e
-                ));
-            }
-        };
+    let (
+        negotiated_channels,
+        negotiated_rate,
+        _negotiated_fmt,
+        _matched_dev_name,
+        is_mpegh_bitstream,
+        mpegh_carrier_label,
+    ) = match init_rx.recv() {
+        Ok(Ok(info)) => info,
+        Ok(Err(e)) => {
+            let _ = thread_handle.join();
+            return Err(e);
+        }
+        Err(e) => {
+            let _ = thread_handle.join();
+            return Err(anyhow::anyhow!(
+                "WASAPI Exclusive init channel closed unexpectedly: {}",
+                e
+            ));
+        }
+    };
 
     let mut audio_source = audio_source_opt
         .take()
@@ -10416,6 +11815,8 @@ fn run_wasapi_exclusive_multichannel(
             negotiated_channels as i32,
             negotiated_rate,
         );
+        state.stats.mpegh_bitstream_active = is_mpegh_bitstream;
+        state.stats.mpegh_carrier_info = mpegh_carrier_label;
         state.max_frequency
     };
 
@@ -12559,5 +13960,462 @@ Sink #105
         let l_stereo = get_downmixed_sample(8, &frame_8ch, 2, 0);
         let r_stereo = get_downmixed_sample(8, &frame_8ch, 2, 1);
         assert!(l_stereo > 0.4 && r_stereo < -0.2);
+    }
+
+    #[test]
+    fn test_smoke_2nd_pm_mpegh_714_upmix_and_live_playback() {
+        let user_profile = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .unwrap_or_default();
+        let candidates = [
+            format!("{}\\Music\\2nd_pm.s3m", user_profile),
+            format!("{}/Music/2nd_pm.s3m", user_profile),
+            format!("{}\\Music\\2nd_pm.mod", user_profile),
+            format!("{}/Music/2nd_pm.mod", user_profile),
+        ];
+        let Some(track_path) = candidates
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists())
+        else {
+            eprintln!("Skipping 2nd_pm smoke test: file not found in ~/Music");
+            return;
+        };
+
+        eprintln!("=== [SMOKE TEST PART A] Offline 2nd_pm -> 7.1.4 Upmixer -> MPEG-H 3D Audio (CICP 19) -> IEC 61937-13 ===");
+        let file_bytes = std::fs::read(&track_path).expect("read 2nd_pm module");
+        let mut cursor = std::io::Cursor::new(&file_bytes);
+        let module = Module::create(&mut cursor, openmpt::module::Logger::None, &[])
+            .expect("OpenMPT load 2nd_pm");
+        let mut src = OpenMptSource {
+            module: SafeModule(module),
+            left_buf: Vec::new(),
+            right_buf: Vec::new(),
+        };
+        let duration = src.get_duration_seconds();
+        let tracker_ch = src.get_tracker_channels().unwrap_or(0);
+        let mod_type = src.get_type();
+        eprintln!(
+            "Loaded '{}' | Type: {} | Tracker Channels: {} | Duration: {:.2}s",
+            track_path, mod_type, tracker_ch, duration
+        );
+        assert!(duration > 60.0, "Expected 2nd_pm duration > 60s");
+        assert!(tracker_ch >= 4, "Expected tracker channels >= 4");
+
+        // Seek into the active main section (15.0s) so all frequency bands have strong musical content
+        src.set_position_seconds(15.0);
+        let sample_rate = crate::mpegh::MPEGH_SAMPLE_RATE;
+        let mut upmixer = SurroundUpmixerDsp::new(sample_rate);
+        let upmix_cfg = crate::state::SurroundUpmixConfig {
+            enabled: true,
+            mpegh_bitstream: true,
+            user_overridden: true,
+            mpegh_user_overridden: true,
+            ..crate::state::SurroundUpmixConfig::default()
+        };
+        upmixer.sync_config(&upmix_cfg, sample_rate);
+
+        let mut encoder = crate::mpegh::Mpegh714Encoder::new(4, true)
+            .expect("Mpegh714Encoder::new(rate_factor=4)");
+        let mut iec_out: std::collections::VecDeque<u8> =
+            std::collections::VecDeque::with_capacity(65536 * 2);
+
+        let total_frames = (sample_rate as usize) * 3; // 3.0 seconds = 144,000 frames @ 48 kHz
+        let chunk_frames = 1024usize;
+        let mut decode_buf = vec![0.0f32; chunk_frames * 12];
+        let mut ch_peak = [0.0f32; 12];
+        let mut ch_sum_sq = [0.0f64; 12];
+        let mut frames_processed = 0usize;
+        let mut bursts_verified = 0usize;
+        let mut total_iec_bytes = 0usize;
+        // Also simulate 192 kHz WASAPI Exclusive carrier DMA buffer drains (4608 frames * 4 bytes = 18,432 bytes)
+        let mut simulated_wasapi_dma = vec![0u8; 4608 * 4];
+        let mut dma_pulls = 0usize;
+
+        while frames_processed < total_frames {
+            let n = src.read_frames(12, sample_rate, &mut decode_buf);
+            assert!(n > 0, "Expected non-zero decoded frames from 2nd_pm");
+            let mut chunk_frame_pos = 0usize;
+            for _ in 0..n {
+                let src_frame_idx = chunk_frame_pos;
+                let frame_slice = &decode_buf[src_frame_idx * 12..(src_frame_idx + 1) * 12];
+                let out_12ch = upmixer.process_multichannel_frame_for_hardware_blended(
+                    frame_slice,
+                    2,
+                    &upmix_cfg,
+                    12,
+                    true,
+                );
+                for c in 0..12 {
+                    let s = out_12ch[c];
+                    assert!(s.is_finite(), "Channel {} produced non-finite sample", c);
+                    ch_peak[c] = ch_peak[c].max(s.abs());
+                    ch_sum_sq[c] += (s as f64) * (s as f64);
+                }
+                let prev_len = iec_out.len();
+                let emitted = encoder
+                    .push_rusttracker_714_frame(&out_12ch, &mut iec_out)
+                    .expect("push_rusttracker_714_frame");
+                if emitted {
+                    let burst_len = iec_out.len() - prev_len;
+                    assert_eq!(
+                        burst_len,
+                        16_384,
+                        "Each 4x IEC 61937-13 burst must be 16,384 bytes"
+                    );
+                    let b0 = iec_out[prev_len];
+                    let b1 = iec_out[prev_len + 1];
+                    let b2 = iec_out[prev_len + 2];
+                    let b3 = iec_out[prev_len + 3];
+                    let b4 = iec_out[prev_len + 4];
+                    let b5 = iec_out[prev_len + 5];
+                    let pa = u16::from_le_bytes([b0, b1]);
+                    let pb = u16::from_le_bytes([b2, b3]);
+                    let pc = u16::from_le_bytes([b4, b5]);
+                    assert_eq!(pa, 0xF872, "Invalid IEC 61937 Pa syncword");
+                    assert_eq!(pb, 0x4E1F, "Invalid IEC 61937 Pb syncword");
+                    assert_eq!(pc, 0x0839, "Invalid IEC 61937-13 MPEG-H Pc word");
+                    total_iec_bytes += burst_len;
+                    bursts_verified += 1;
+                }
+                while iec_out.len() >= simulated_wasapi_dma.len() {
+                    for b in &mut simulated_wasapi_dma {
+                        *b = iec_out.pop_front().unwrap_or(0);
+                    }
+                    dma_pulls += 1;
+                }
+                chunk_frame_pos += 1;
+                frames_processed += 1;
+            }
+        }
+        assert!(
+            dma_pulls >= 120,
+            "Expected >= 120 simulated 192 kHz WASAPI DMA pulls, got {}",
+            dma_pulls
+        );
+
+        let ch_names = [
+            "FL", "FR", "FC", "LFE", "SL", "SR", "RL", "RR", "TFL", "TFR", "TRL", "TRR",
+        ];
+        eprintln!(
+            "Encoded {} frames ({} IEC 61937-13 bursts, {} bytes):",
+            frames_processed, bursts_verified, total_iec_bytes
+        );
+        for c in 0..12 {
+            let rms = (ch_sum_sq[c] / frames_processed as f64).sqrt();
+            eprintln!(
+                "  Ch {:2} ({:3}): peak = {:.4}, rms = {:.4}",
+                c, ch_names[c], ch_peak[c], rms
+            );
+            assert!(
+                ch_peak[c] > 0.001,
+                "Expected active audio on upmixed channel {} ({}), got peak={}",
+                c,
+                ch_names[c],
+                ch_peak[c]
+            );
+        }
+        assert!(
+            bursts_verified >= 140,
+            "Expected >= 140 IEC 61937-13 bursts for 3.0s @ 48 kHz, got {}",
+            bursts_verified
+        );
+
+        eprintln!("=== [SMOKE TEST PART B1] Live WASAPI Exclusive MPEG-H 11.1 Playback of 2nd_pm (35.0s..42.0s) ===");
+        eprintln!(
+            "Available audio output devices: {:?}",
+            get_available_audio_devices(false)
+        );
+        let shared_state = std::sync::Arc::new(std::sync::Mutex::new(
+            crate::state::AppState::new("SmokeTest".to_string()),
+        ));
+        {
+            let mut st = shared_state.lock().unwrap();
+            st.file_loaded = true;
+            st.is_paused = false;
+            st.set_mpegh_bitstream(true);
+            st.set_surround_upmix(true);
+            st.seek_request = Some(35.0);
+        }
+        spawn_audio_topology_watcher(shared_state.clone(), false);
+        let playback_handle_b1 =
+            start_audio_thread(&track_path, false, shared_state.clone()).expect("start_audio_thread B1");
+
+        let mut max_sec = 0.0f64;
+        let mut min_sec_after_seek = f64::MAX;
+        let mut saw_12ch_vus = false;
+        let mut saw_spectrum = false;
+        for step in 1..=14 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let st = shared_state.lock().unwrap();
+            let vus: Vec<String> = st
+                .raw_channel_vus
+                .iter()
+                .map(|v| format!("{:.3}", v))
+                .collect();
+            let spec_max = st
+                .raw_spectrum_data
+                .iter()
+                .copied()
+                .fold(0.0f32, f32::max);
+            eprintln!(
+                "[B1 MPEG-H] t={:.1}s: sec={:.3} ord={} row={} hw_ch={} num_ch={} mpegh_active={} carrier='{}' reload_req={:?} spec_max={:.3} vus=[{}]",
+                step as f32 * 0.5,
+                st.current_seconds,
+                st.current_tracker_order,
+                st.current_tracker_row,
+                st.hardware_channels,
+                st.num_channels,
+                st.stats.mpegh_bitstream_active,
+                st.stats.mpegh_carrier_info,
+                st.audio_topology_reload_request,
+                spec_max,
+                vus.join(", ")
+            );
+            assert!(
+                st.audio_topology_reload_request.is_none(),
+                "Topology watcher must not falsely request stream reload during MPEG-H 11.1 playback"
+            );
+            if st.current_seconds >= 34.5 {
+                min_sec_after_seek = min_sec_after_seek.min(st.current_seconds);
+                max_sec = max_sec.max(st.current_seconds);
+            }
+            if st.raw_channel_vus.len() == 12 && st.raw_channel_vus.iter().any(|&v| v > 0.001) {
+                saw_12ch_vus = true;
+            }
+            if spec_max > 0.01 {
+                saw_spectrum = true;
+            }
+        }
+
+        {
+            let final_st = shared_state.lock().unwrap();
+            assert!(final_st.file_loaded, "2nd_pm must be loaded");
+            assert!(
+                max_sec > 37.0 && max_sec > min_sec_after_seek + 1.5,
+                "Live playback position must advance smoothly in real time (got min={:.3}s, max={:.3}s)",
+                min_sec_after_seek,
+                max_sec
+            );
+            if final_st.stats.mpegh_bitstream_active {
+                assert_eq!(final_st.hardware_channels, 12);
+                assert_eq!(final_st.num_channels, 12);
+                assert!(
+                    saw_12ch_vus,
+                    "Expected active 12-channel VUs during live MPEG-H 11.1 upmix playback"
+                );
+            }
+            assert!(saw_spectrum, "Expected active FFT spectrum data during live playback");
+        }
+        drop(playback_handle_b1);
+        std::thread::sleep(std::time::Duration::from_millis(250));
+
+        eprintln!("=== [SMOKE TEST PART B2] Live LPCM Playback of 2nd_pm (42.0s..49.0s) ===");
+        {
+            let mut st = shared_state.lock().unwrap();
+            st.is_paused = false;
+            st.set_mpegh_bitstream(false);
+            st.set_surround_upmix(true);
+            st.seek_request = Some(42.0);
+            st.audio_topology_reload_request = None;
+        }
+        let _playback_handle_b2 =
+            start_audio_thread(&track_path, false, shared_state.clone()).expect("start_audio_thread B2");
+        for step in 1..=14 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            let st = shared_state.lock().unwrap();
+            let vus: Vec<String> = st
+                .raw_channel_vus
+                .iter()
+                .map(|v| format!("{:.3}", v))
+                .collect();
+            let spec_max = st
+                .raw_spectrum_data
+                .iter()
+                .copied()
+                .fold(0.0f32, f32::max);
+            eprintln!(
+                "[B2 LPCM]   t={:.1}s: sec={:.3} ord={} row={} hw_ch={} num_ch={} mpegh_active={} reload_req={:?} spec_max={:.3} vus=[{}]",
+                step as f32 * 0.5,
+                st.current_seconds,
+                st.current_tracker_order,
+                st.current_tracker_row,
+                st.hardware_channels,
+                st.num_channels,
+                st.stats.mpegh_bitstream_active,
+                st.audio_topology_reload_request,
+                spec_max,
+                vus.join(", ")
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_spatial_audio_probe() {
+        use windows::Win32::Foundation::{CloseHandle, PROPERTYKEY};
+        use windows::Win32::Media::Audio::*;
+        use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+        use windows::Win32::System::Com::*;
+        use windows::Win32::System::Threading::CreateEventW;
+        use windows::Win32::System::Variant::{VT_BLOB, VT_LPWSTR};
+        use windows::core::{GUID, Interface};
+
+        const PKEY_DEVICE_FRIENDLY_NAME: PROPERTYKEY = PROPERTYKEY {
+            fmtid: GUID::from_u128(0xa45c254e_df1c_4efd_8020_67d146a850e0),
+            pid: 14,
+        };
+
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let enumerator: IMMDeviceEnumerator =
+                CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).unwrap();
+            let collection = enumerator
+                .EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE)
+                .unwrap();
+            let count = collection.GetCount().unwrap_or(0);
+            for i in 0..count {
+                let dev = collection.Item(i).unwrap();
+                let store = dev.OpenPropertyStore(STGM_READ).unwrap();
+                let propvar = store.GetValue(&PKEY_DEVICE_FRIENDLY_NAME).unwrap();
+                let name = if propvar.Anonymous.Anonymous.vt == VT_LPWSTR {
+                    propvar.Anonymous.Anonymous.Anonymous.pwszVal.to_string().unwrap_or_default()
+                } else {
+                    propvar.to_string()
+                };
+                eprintln!("=== Probing ISpatialAudioClient on '{}' ===", name);
+                match dev.Activate::<ISpatialAudioClient>(CLSCTX_ALL, None) {
+                    Ok(sac) => {
+                        let static_mask = sac.GetNativeStaticObjectTypeMask();
+                        let max_dyn = sac.GetMaxDynamicObjectCount();
+                        let avail = sac.IsSpatialAudioStreamAvailable(
+                            &ISpatialAudioObjectRenderStream::IID,
+                            None,
+                        );
+                        eprintln!(
+                            "  GetNativeStaticObjectTypeMask: {:?}, GetMaxDynamicObjectCount: {:?}, IsSpatialAudioStreamAvailable: {:?}",
+                            static_mask, max_dyn, avail
+                        );
+                        if let Ok(fmt_enum) = sac.GetSupportedAudioObjectFormatEnumerator() {
+                            let fmt_count = fmt_enum.GetCount().unwrap_or(0);
+                            eprintln!("  Supported AudioObject formats: {}", fmt_count);
+                            for f_idx in 0..fmt_count {
+                                if let Ok(wf_ptr) = fmt_enum.GetFormat(f_idx) {
+                                    let wf = *wf_ptr;
+                                    let tag = wf.wFormatTag;
+                                    let ch = wf.nChannels;
+                                    let rate = wf.nSamplesPerSec;
+                                    let bits = wf.wBitsPerSample;
+                                    let align = wf.nBlockAlign;
+                                    let max_frames = sac.GetMaxFrameCount(wf_ptr).unwrap_or(0);
+                                    eprintln!(
+                                        "    Format[{}]: tag=0x{:X} ch={} rate={} bits={} align={} max_frames={}",
+                                        f_idx, tag, ch, rate, bits, align, max_frames
+                                    );
+                                    let mask_714 = AudioObjectType_FrontLeft
+                                        | AudioObjectType_FrontRight
+                                        | AudioObjectType_FrontCenter
+                                        | AudioObjectType_LowFrequency
+                                        | AudioObjectType_SideLeft
+                                        | AudioObjectType_SideRight
+                                        | AudioObjectType_BackLeft
+                                        | AudioObjectType_BackRight
+                                        | AudioObjectType_TopFrontLeft
+                                        | AudioObjectType_TopFrontRight
+                                        | AudioObjectType_TopBackLeft
+                                        | AudioObjectType_TopBackRight;
+                                    let ev = CreateEventW(None, false, false, None).unwrap();
+                                    let mut params = SpatialAudioObjectRenderStreamActivationParams {
+                                        ObjectFormat: wf_ptr,
+                                        StaticObjectTypeMask: mask_714,
+                                        MinDynamicObjectCount: 0,
+                                        MaxDynamicObjectCount: 0,
+                                        Category: AudioCategory_Media,
+                                        EventHandle: ev,
+                                        NotifyObject: std::mem::ManuallyDrop::new(None),
+                                    };
+                                    let mut pv = std::mem::ManuallyDrop::new(PROPVARIANT::default());
+                                    (*pv.Anonymous.Anonymous).vt = VT_BLOB;
+                                    (*pv.Anonymous.Anonymous).Anonymous.blob = BLOB {
+                                        cbSize: std::mem::size_of::<
+                                            SpatialAudioObjectRenderStreamActivationParams,
+                                        >() as u32,
+                                        pBlobData: &mut params as *mut _ as *mut u8,
+                                    };
+                                    let stream_res = sac
+                                        .ActivateSpatialAudioStream::<ISpatialAudioObjectRenderStream>(
+                                            &*pv,
+                                        );
+                                    eprintln!(
+                                        "    ActivateSpatialAudioStream(7.1.4 static mask) => {:?}",
+                                        stream_res.as_ref().map(|_| "OK")
+                                    );
+                                    if let Ok(stream) = stream_res {
+                                        let static_types = [
+                                            ("FL", AudioObjectType_FrontLeft),
+                                            ("FR", AudioObjectType_FrontRight),
+                                            ("FC", AudioObjectType_FrontCenter),
+                                            ("LFE", AudioObjectType_LowFrequency),
+                                            ("SL", AudioObjectType_SideLeft),
+                                            ("SR", AudioObjectType_SideRight),
+                                            ("BL", AudioObjectType_BackLeft),
+                                            ("BR", AudioObjectType_BackRight),
+                                            ("TFL", AudioObjectType_TopFrontLeft),
+                                            ("TFR", AudioObjectType_TopFrontRight),
+                                            ("TBL", AudioObjectType_TopBackLeft),
+                                            ("TBR", AudioObjectType_TopBackRight),
+                                        ];
+                                        let mut objects = Vec::with_capacity(12);
+                                        for (label, obj_type) in static_types {
+                                            let obj = stream
+                                                .ActivateSpatialAudioObject(obj_type)
+                                                .expect("ActivateSpatialAudioObject");
+                                            objects.push((label, obj));
+                                        }
+                                        eprintln!(
+                                            "      Successfully activated all {} static 7.1.4 AudioObjects!",
+                                            objects.len()
+                                        );
+                                        stream.Start().expect("ISpatialAudioObjectRenderStream::Start");
+                                        for tick in 0..5 {
+                                            let wait_res = windows::Win32::System::Threading::WaitForSingleObject(ev, 100);
+                                            let mut dyn_count = 0u32;
+                                            let mut frame_count = 0u32;
+                                            stream
+                                                .BeginUpdatingAudioObjects(
+                                                    &mut dyn_count,
+                                                    &mut frame_count,
+                                                )
+                                                .expect("BeginUpdatingAudioObjects");
+                                            for (_, obj) in &objects {
+                                                let mut buf_ptr: *mut u8 = std::ptr::null_mut();
+                                                let mut buf_bytes = 0u32;
+                                                obj.GetBuffer(&mut buf_ptr, &mut buf_bytes)
+                                                    .expect("ISpatialAudioObject::GetBuffer");
+                                                if !buf_ptr.is_null() && buf_bytes > 0 {
+                                                    std::ptr::write_bytes(buf_ptr, 0, buf_bytes as usize);
+                                                }
+                                            }
+                                            stream
+                                                .EndUpdatingAudioObjects()
+                                                .expect("EndUpdatingAudioObjects");
+                                            eprintln!(
+                                                "      Tick {}: wait={} dyn_count={} frame_count={}",
+                                                tick, wait_res.0, dyn_count, frame_count
+                                            );
+                                        }
+                                        let _ = stream.Stop();
+                                    }
+                                    let _ = CloseHandle(ev);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("  Activate::<ISpatialAudioClient> failed: {:?}", e);
+                    }
+                }
+            }
+            CoUninitialize();
+        }
     }
 }

@@ -77,6 +77,7 @@ pub enum EngineAction {
     SetAudioMixTracks(Vec<(usize, f32)>),
     ToggleVisPicker,
     ToggleSurroundUpmix(bool),
+    ToggleMpeghBitstream(bool),
     SetSurroundUpmix(crate::state::SurroundUpmixConfig),
 }
 
@@ -7910,7 +7911,23 @@ impl VulkanEngine {
                                 }
                                 ui.separator();
 
-                                if state.stats.bitstream_active {
+                                if state.stats.mpegh_bitstream_active {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "MPEG-H 3D Audio 7.1.4 (11.1): ACTIVE",
+                                        )
+                                        .color(egui::Color32::from_rgb(0, 235, 255))
+                                        .strong(),
+                                    );
+                                    if !state.stats.mpegh_carrier_info.is_empty() {
+                                        ui.label(
+                                            egui::RichText::new(&state.stats.mpegh_carrier_info)
+                                                .color(egui::Color32::from_rgb(165, 235, 255))
+                                                .size(11.5),
+                                        );
+                                    }
+                                    ui.separator();
+                                } else if state.stats.bitstream_active {
                                     ui.label(
                                         egui::RichText::new("Bitstream Passthrough: ACTIVE")
                                             .color(egui::Color32::from_rgb(0, 255, 128))
@@ -9326,6 +9343,50 @@ impl VulkanEngine {
                                                     cfg.reset_tuning();
                                                     cfg_changed = true;
                                                 }
+                                                #[cfg(any(target_os = "windows", target_os = "linux"))]
+                                                {
+                                                    ui.add_space(4.0);
+                                                    let mpegh_on = state.surround_upmix.mpegh_bitstream;
+                                                    let mpegh_live = state.stats.mpegh_bitstream_active;
+                                                    let (m_lbl, m_fill, m_stroke, m_col) = if mpegh_live {
+                                                        (
+                                                            "MPEG-H 11.1",
+                                                            egui::Color32::from_rgb(12, 68, 92),
+                                                            egui::Color32::from_rgb(0, 210, 255),
+                                                            egui::Color32::from_rgb(200, 248, 255),
+                                                        )
+                                                    } else if mpegh_on {
+                                                        (
+                                                            "MPEG-H 11.1",
+                                                            egui::Color32::from_rgb(28, 52, 68),
+                                                            egui::Color32::from_rgb(70, 150, 190),
+                                                            egui::Color32::from_rgb(185, 225, 240),
+                                                        )
+                                                    } else {
+                                                        (
+                                                            "LPCM Bed",
+                                                            egui::Color32::from_rgb(38, 36, 38),
+                                                            egui::Color32::from_rgb(95, 88, 80),
+                                                            egui::Color32::from_rgb(195, 188, 180),
+                                                        )
+                                                    };
+                                                    let mpegh_btn = egui::Button::new(
+                                                        egui::RichText::new(m_lbl)
+                                                            .size(10.5)
+                                                            .strong()
+                                                            .color(m_col),
+                                                    )
+                                                    .fill(m_fill)
+                                                    .stroke(egui::Stroke::new(1.0_f32, m_stroke))
+                                                    .corner_radius(4.0);
+                                                    if ui
+                                                        .add(mpegh_btn)
+                                                        .on_hover_text("Toggle 12-channel 7.1.4 (11.1, CICP Layout 19) MPEG-H 3D Audio over IEC 61937-13 HDMI bitstream vs. uncompressed LPCM")
+                                                        .clicked()
+                                                    {
+                                                        *engine_action = EngineAction::ToggleMpeghBitstream(!mpegh_on);
+                                                    }
+                                                }
                                                 ui.add_space(4.0);
                                                 if has_height {
                                                     ui.label(
@@ -10368,7 +10429,13 @@ impl VulkanEngine {
                                                         format_name
                                                     };
 
-                                                    let ch_info = if let Some(tc) = state.tracker_channels {
+                                                    let ch_info = if state.stats.mpegh_bitstream_active {
+                                                        if let Some(tc) = state.tracker_channels {
+                                                            format!("11.1 MPEG-H (12ch) / {} tracker", tc)
+                                                        } else {
+                                                            "11.1 MPEG-H (7.1.4 / 12ch)".to_string()
+                                                        }
+                                                    } else if let Some(tc) = state.tracker_channels {
                                                         format!("{} hw / {} tracker", state.hardware_channels, tc)
                                                     } else if state.num_channels == 1 {
                                                         "1-channel".to_string()
@@ -10806,6 +10873,49 @@ impl VulkanEngine {
                                                         .clicked()
                                                     {
                                                         *engine_action = EngineAction::ToggleSurroundUpmix(!upmix_enabled);
+                                                    }
+                                                    #[cfg(any(target_os = "windows", target_os = "linux"))]
+                                                    {
+                                                        let mpegh_on = state.surround_upmix.mpegh_bitstream;
+                                                        let mpegh_live = state.stats.mpegh_bitstream_active;
+                                                        let (m_text, m_fill, m_stroke, m_txt_col) = if mpegh_live {
+                                                            (
+                                                                "MPEG-H 11.1: ACTIVE",
+                                                                egui::Color32::from_rgb(12, 68, 92),
+                                                                egui::Color32::from_rgb(0, 210, 255),
+                                                                egui::Color32::from_rgb(200, 248, 255),
+                                                            )
+                                                        } else if mpegh_on {
+                                                            (
+                                                                "MPEG-H 11.1: ON",
+                                                                egui::Color32::from_rgb(28, 52, 68),
+                                                                egui::Color32::from_rgb(70, 150, 190),
+                                                                egui::Color32::from_rgb(185, 225, 240),
+                                                            )
+                                                        } else {
+                                                            (
+                                                                "MPEG-H 11.1: OFF",
+                                                                egui::Color32::from_rgb(36, 34, 36),
+                                                                egui::Color32::from_rgb(90, 84, 76),
+                                                                egui::Color32::from_rgb(200, 192, 182),
+                                                            )
+                                                        };
+                                                        let mpegh_btn = egui::Button::new(
+                                                            egui::RichText::new(m_text)
+                                                                .size(11.5)
+                                                                .strong()
+                                                                .color(m_txt_col),
+                                                        )
+                                                        .fill(m_fill)
+                                                        .stroke(egui::Stroke::new(1.0_f32, m_stroke))
+                                                        .corner_radius(4.0);
+                                                        if ui
+                                                            .add(mpegh_btn)
+                                                            .on_hover_text("Encode 12-channel 7.1.4 (11.1, CICP Layout 19) audio as an MPEG-H 3D Audio IEC 61937-13 bitstream over HDMI to bypass HDMI's 8-channel LPCM ceiling on AVRs such as the Denon AVR-X3800H.")
+                                                            .clicked()
+                                                        {
+                                                            *engine_action = EngineAction::ToggleMpeghBitstream(!mpegh_on);
+                                                        }
                                                     }
                                                 });
                                             }

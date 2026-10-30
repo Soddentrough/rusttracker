@@ -4258,6 +4258,7 @@ dependencies = [
  "android-activity",
  "anyhow",
  "bytemuck",
+ "cc",
  "clap",
  "cpal",
  "crossbeam-channel",

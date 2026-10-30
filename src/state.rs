@@ -70,6 +70,8 @@ pub struct PerformanceStats {
     pub clipping_events: u32,
     pub bitstream_active: bool,
     pub bitstream_format: String,
+    pub mpegh_bitstream_active: bool,
+    pub mpegh_carrier_info: String,
     pub video_hw_decoder: String,
     pub video_fps: f32,
     pub video_bitrate_kbps: Option<u32>,
@@ -574,6 +576,11 @@ pub struct SurroundUpmixConfig {
     pub enabled: bool,
     /// Whether the user has manually toggled or overridden `enabled`.
     pub user_overridden: bool,
+    /// Whether to encode 7.1.4 (11.1, CICP Layout 19) output as an MPEG-H 3D Audio IEC 61937-13
+    /// bitstream over HDMI when 12-channel LPCM is capped at 8 channels by HDMI hardware.
+    pub mpegh_bitstream: bool,
+    /// Whether the user has manually toggled or overridden `mpegh_bitstream`.
+    pub mpegh_user_overridden: bool,
     /// Low-pass Linkwitz-Riley crossover frequency (Hz) for LFE subwoofer extraction (40..=250 Hz).
     pub sub_crossover_hz: f32,
     /// High-pass Linkwitz-Riley crossover frequency (Hz) splitting highs up to height speakers (800..=10000 Hz).
@@ -601,6 +608,8 @@ impl Default for SurroundUpmixConfig {
         Self {
             enabled: true,
             user_overridden: false,
+            mpegh_bitstream: true,
+            mpegh_user_overridden: false,
             sub_crossover_hz: 90.0,
             height_crossover_hz: 2800.0,
             band_gains_db: [0.0; 5],
@@ -620,13 +629,17 @@ impl SurroundUpmixConfig {
     pub const EQ_BAND_LABELS: [&'static str; 5] = ["60Hz", "250Hz", "1kHz", "3.5kHz", "10kHz"];
 
     /// Reset EQ bands, crossover cutoffs, and speaker levels back to factory defaults,
-    /// preserving the current `enabled` state.
+    /// preserving the current `enabled` and `mpegh_bitstream` states.
     pub fn reset_tuning(&mut self) {
         let user_overridden = self.user_overridden;
         let enabled = self.enabled;
+        let mpegh_bitstream = self.mpegh_bitstream;
+        let mpegh_user_overridden = self.mpegh_user_overridden;
         *self = Self::default();
         self.enabled = enabled;
         self.user_overridden = user_overridden;
+        self.mpegh_bitstream = mpegh_bitstream;
+        self.mpegh_user_overridden = mpegh_user_overridden;
     }
 
     /// Evaluate the composite 5-band EQ gain in dB at a given frequency `freq_hz`.
@@ -1448,10 +1461,10 @@ impl AppState {
         } else {
             if self.file_loaded
                 && prev_enabled
-                && self.hardware_channels > 2
                 && self.passthrough_enabled
+                && self.hardware_channels > 2
             {
-                self.passthrough_change_request = Some(self.passthrough_enabled);
+                self.passthrough_change_request = Some(true);
             }
             if self.hardware_channels > 2 {
                 let upmix_ch = self.hardware_channels.min(12) as usize;
@@ -1522,6 +1535,34 @@ impl AppState {
                 self.cumulative_scrub = 0.0;
             }
         }
+    }
+
+    /// Enables or disables 12-channel 7.1.4 (11.1, CICP Layout 19) MPEG-H 3D Audio IEC 61937-13
+    /// HDMI bitstreaming for surround upmixing and native >8ch playback on HDMI AVRs.
+    pub fn set_mpegh_bitstream(&mut self, enabled: bool) {
+        self.surround_upmix.mpegh_bitstream = enabled;
+        self.surround_upmix.mpegh_user_overridden = true;
+        if enabled {
+            self.force_stereo_downmix = false;
+            if self.passthrough_enabled {
+                self.passthrough_enabled = false;
+            }
+            self.osd_text =
+                Some("🔊 11.1 (7.1.4 Spatial Audio / MPEG-H 3D): ON".to_string());
+        } else {
+            self.osd_text =
+                Some("🔊 11.1 (7.1.4): OFF (Uncompressed 7.1 LPCM)".to_string());
+        }
+        self.osd_timer = 3.0;
+        if self.file_loaded {
+            self.passthrough_change_request = Some(self.passthrough_enabled);
+        }
+    }
+
+    /// Toggles 12-channel 7.1.4 (11.1, CICP Layout 19) MPEG-H 3D Audio IEC 61937-13 HDMI bitstreaming.
+    pub fn toggle_mpegh_bitstream(&mut self) {
+        let next = !self.surround_upmix.mpegh_bitstream;
+        self.set_mpegh_bitstream(next);
     }
 }
 

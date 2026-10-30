@@ -1,6 +1,50 @@
 use std::env;
+use std::path::PathBuf;
+
+fn build_libmpeghe() {
+    let manifest_dir =
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR must be set"));
+    let encoder_dir = manifest_dir.join("third_party/libmpeghe/encoder");
+    println!("cargo:rerun-if-changed={}", encoder_dir.display());
+
+    let mut c_files: Vec<PathBuf> = std::fs::read_dir(&encoder_dir)
+        .expect("Failed to read third_party/libmpeghe/encoder directory")
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("c"))
+        .collect();
+    c_files.sort();
+
+    let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
+    let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
+
+    let mut build = cc::Build::new();
+    build
+        .include(&encoder_dir)
+        .files(&c_files)
+        .opt_level(3)
+        .warnings(false)
+        .define("_LIB", None);
+
+    if target_env == "msvc" {
+        build
+            .define("__USE_40__", None)
+            .define("_CRT_SECURE_NO_WARNINGS", None)
+            .define("WIN32", None)
+            .define("_WINDOWS", None);
+    } else {
+        build.flag_if_supported("-w");
+        if target_arch == "aarch64" || target_arch == "arm" {
+            build.define("_ARM_", None);
+        } else {
+            build.define("_X86_", None);
+        }
+    }
+
+    build.compile("mpeghe");
+}
 
 fn main() {
+    build_libmpeghe();
     let target_os = env::var("CARGO_CFG_TARGET_OS").unwrap_or_default();
     if target_os == "windows" {
         println!("cargo:rerun-if-changed=icon.ico");
@@ -26,6 +70,7 @@ fn main() {
                 "cargo:rustc-link-arg-bin=rusttracker={}/resource.o",
                 out_dir
             );
+            println!("cargo:rustc-link-arg-cdylib=-Wl,--exclude-all-symbols");
         } else if target_env == "msvc" {
             println!(
                 "cargo:rustc-link-arg-bin=rusttracker={}/resource.lib",

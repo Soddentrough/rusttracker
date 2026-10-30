@@ -84,6 +84,21 @@ struct Args {
 
     #[arg(
         long,
+        visible_alias = "mpegh-714",
+        default_value_t = false,
+        help = "Encode 7.1.4 (11.1, CICP Layout 19) output as an MPEG-H 3D Audio IEC 61937-13 HDMI bitstream"
+    )]
+    mpegh: bool,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Disable MPEG-H 3D Audio 7.1.4 (11.1) HDMI bitstreaming and use uncompressed LPCM only"
+    )]
+    no_mpegh: bool,
+
+    #[arg(
+        long,
         default_value_t = false,
         help = "Headlessly register RustTracker as a Non-Steam shortcut with SteamOS Home Screen artwork and exit (ideal for SSH deployment)"
     )]
@@ -218,6 +233,12 @@ fn main() -> Result<(), Box<dyn Error>> {
             state.passthrough_enabled = true;
         }
         if args.surround_upmix {
+            state.set_surround_upmix(true);
+        }
+        if args.no_mpegh {
+            state.set_mpegh_bitstream(false);
+        } else if args.mpegh {
+            state.set_mpegh_bitstream(true);
             state.set_surround_upmix(true);
         }
         state.playlist_index = 0;
@@ -1727,6 +1748,26 @@ async fn run_gui(
                 app_state_for_init.lock().unwrap().track_info_rect = engine.track_info_rect;
             }
             window.set_visible(true);
+            #[cfg(windows)]
+            {
+                use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
+                if let Ok(wh) = window.window_handle()
+                    && let RawWindowHandle::Win32(h) = wh.as_raw()
+                {
+                    unsafe {
+                        #[link(name = "user32")]
+                        unsafe extern "system" {
+                            fn ShowWindow(hwnd: isize, nCmdShow: i32) -> i32;
+                            fn SetForegroundWindow(hwnd: isize) -> i32;
+                        }
+                        let hwnd = h.hwnd.get();
+                        ShowWindow(hwnd, 1);
+                        ShowWindow(hwnd, 1);
+                        SetForegroundWindow(hwnd);
+                    }
+                }
+            }
+            window.focus_window();
             window.request_redraw();
             Ok(DesktopRuntime {
                 window,
@@ -2591,8 +2632,14 @@ async fn run_gui(
                                                 crate::state::SurroundUpmixConfig::layout_badge(
                                                     hw_ch,
                                                 );
-                                            state.osd_text =
-                                                Some(format!("🔊 Surround Upmix: ON ({badge})"));
+                                            if !state
+                                                .osd_text
+                                                .as_ref()
+                                                .is_some_and(|s| s.contains("MPEG-H 3D Audio"))
+                                            {
+                                                state.osd_text =
+                                                    Some(format!("🔊 Surround Upmix: ON ({badge})"));
+                                            }
                                         } else if !state.surround_upmix.enabled
                                             && state
                                                 .osd_text
@@ -2683,6 +2730,8 @@ async fn run_gui(
                                         state.video_info = None;
                                         state.video_mode = 0;
                                         state.stats.bitstream_active = false;
+                                        state.stats.mpegh_bitstream_active = false;
+                                        state.stats.mpegh_carrier_info.clear();
                                         state.stats.audio_buffer_fill_pct = 0.0;
                                         state.stats.video_buffer_fill_pct = 0.0;
                                         state.stats.video_hw_decoder.clear();
@@ -2745,9 +2794,28 @@ async fn run_gui(
                                                             crate::state::SurroundUpmixConfig::layout_badge(
                                                                 state.hardware_channels,
                                                             );
-                                                        state.osd_text = Some(format!(
-                                                            "🔊 Auto Surround Upmix: ON ({badge})"
-                                                        ));
+                                                        if state.stats.mpegh_bitstream_active
+                                                            && !state
+                                                                .stats
+                                                                .mpegh_carrier_info
+                                                                .is_empty()
+                                                        {
+                                                            state.osd_text = Some(format!(
+                                                                "🔊 11.1 ({badge}): {}",
+                                                                state.stats.mpegh_carrier_info
+                                                            ));
+                                                        } else if state.surround_upmix.mpegh_bitstream
+                                                            && state.surround_upmix.mpegh_user_overridden
+                                                            && state.hardware_channels < 12
+                                                        {
+                                                            state.osd_text = Some(format!(
+                                                                "🔊 11.1 requires 'Dolby Atmos for Home Theater' in Windows Sound Settings — Playing {badge}"
+                                                            ));
+                                                        } else {
+                                                            state.osd_text = Some(format!(
+                                                                "🔊 Auto Surround Upmix: ON ({badge})"
+                                                            ));
+                                                        }
                                                         state.show_hud = true;
                                                     }
                                                     if state.video_mode == 3 {
@@ -3257,6 +3325,9 @@ async fn run_gui(
                                     }
                                     EngineAction::ToggleSurroundUpmix(val) => {
                                         state.set_surround_upmix(val);
+                                    }
+                                    EngineAction::ToggleMpeghBitstream(val) => {
+                                        state.set_mpegh_bitstream(val);
                                     }
                                     EngineAction::SetSurroundUpmix(cfg) => {
                                         state.surround_upmix = cfg;
@@ -5166,5 +5237,37 @@ mod tests {
         assert_eq!(state.osd_text.as_deref(), Some("+1 Frame"));
         state.record_seek_osd(5.0);
         assert_eq!(state.osd_text.as_deref(), Some("+5.0s"));
+    }
+
+    #[test]
+    fn test_cli_mpegh_flag_and_state_toggle() {
+        let args_mpegh = Args::try_parse_from(["rusttracker", "--mpegh"]).unwrap();
+        assert!(args_mpegh.mpegh);
+        assert!(!args_mpegh.no_mpegh);
+
+        let args_mpegh_714 = Args::try_parse_from(["rusttracker", "--mpegh-714"]).unwrap();
+        assert!(args_mpegh_714.mpegh);
+
+        let args_no_mpegh = Args::try_parse_from(["rusttracker", "--no-mpegh"]).unwrap();
+        assert!(args_no_mpegh.no_mpegh);
+        assert!(!args_no_mpegh.mpegh);
+
+        let default_cfg = crate::state::SurroundUpmixConfig::default();
+        assert!(default_cfg.mpegh_bitstream);
+        assert!(!default_cfg.mpegh_user_overridden);
+
+        let mut state = AppState::new("Test MPEG-H".to_string());
+        state.file_loaded = true;
+        state.set_mpegh_bitstream(false);
+        assert!(!state.surround_upmix.mpegh_bitstream);
+        assert!(state.surround_upmix.mpegh_user_overridden);
+        assert_eq!(state.passthrough_change_request, Some(false));
+
+        state.passthrough_change_request = None;
+        state.toggle_mpegh_bitstream();
+        assert!(state.surround_upmix.mpegh_bitstream);
+        assert!(state.surround_upmix.mpegh_user_overridden);
+        assert!(state.surround_upmix.enabled);
+        assert_eq!(state.passthrough_change_request, Some(false));
     }
 }
