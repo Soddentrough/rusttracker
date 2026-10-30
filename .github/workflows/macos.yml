@@ -167,6 +167,7 @@ jobs:
                           <string>thd</string>
                           <string>truehd</string>
                           <string>mlp</string>
+                          <string>iamf</string>
                       </array>
                   </dict>
                   <dict>
