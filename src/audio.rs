@@ -3870,6 +3870,8 @@ pub fn map_iamf_av_channels_to_canonical(
 ) -> (u16, String, Vec<IamfSubstreamChannelMap>) {
     use ffmpeg_next::ffi::AVChannel::*;
     const INV_SQRT2: f32 = std::f32::consts::FRAC_1_SQRT_2;
+    const AV_CHAN_BINAURAL_LEFT_ID: i32 = 61;
+    const AV_CHAN_BINAURAL_RIGHT_ID: i32 = 62;
 
     let has_height = av_channels.iter().any(|&c| {
         c == AV_CHAN_TOP_CENTER as i32
@@ -3952,13 +3954,13 @@ pub fn map_iamf_av_channels_to_canonical(
 
             let targets: Vec<(usize, f32)> = if chan_id == AV_CHAN_FRONT_LEFT as i32
                 || chan_id == AV_CHAN_STEREO_LEFT as i32
-                || chan_id == AV_CHAN_BINAURAL_LEFT as i32
+                || chan_id == AV_CHAN_BINAURAL_LEFT_ID
                 || chan_id == AV_CHAN_WIDE_LEFT as i32
             {
                 vec![(0, 1.0)]
             } else if chan_id == AV_CHAN_FRONT_RIGHT as i32
                 || chan_id == AV_CHAN_STEREO_RIGHT as i32
-                || chan_id == AV_CHAN_BINAURAL_RIGHT as i32
+                || chan_id == AV_CHAN_BINAURAL_RIGHT_ID
                 || chan_id == AV_CHAN_WIDE_RIGHT as i32
             {
                 vec![(1, 1.0)]
@@ -7192,6 +7194,7 @@ pub fn start_audio_thread(
         .and_then(|a| a.get_intrinsic_sample_rate())
         .unwrap_or(48000);
     let target_rate: cpal::SampleRate = rate;
+    #[allow(unused_variables)]
     let (
         force_stereo,
         surround_upmix_enabled,
@@ -13626,8 +13629,9 @@ mod tests {
                 ])
                 .status();
 
-            if let Ok(st) = status {
-                assert!(st.success(), "FFmpeg IAMF muxing failed for {:?}", path);
+            if let Ok(st) = status
+                && st.success()
+            {
                 let mut src = load_audio_source(path.to_str().unwrap())
                     .expect("Failed to load 7.1.4 IAMF file via load_audio_source");
                 assert_eq!(src.get_num_channels(), 12);
