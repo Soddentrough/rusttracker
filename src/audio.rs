@@ -328,7 +328,9 @@ pub struct SurroundUpmixerDsp {
     last_config: crate::state::SurroundUpmixConfig,
     eq_l: [BiquadFilter; 5],
     eq_r: [BiquadFilter; 5],
+    eq_mc: [[BiquadFilter; 5]; 12],
     sub_lp: BiquadFilter,
+    mc_sub_lp: BiquadFilter,
     sub_hp_l: BiquadFilter,
     sub_hp_r: BiquadFilter,
     sub_hp_c: BiquadFilter,
@@ -336,6 +338,8 @@ pub struct SurroundUpmixerDsp {
     height_hp_l: BiquadFilter,
     height_lp_r: BiquadFilter,
     height_hp_r: BiquadFilter,
+    mc_height_lp: [BiquadFilter; 4],
+    mc_height_hp: [BiquadFilter; 4],
     delay_sl: HaasDelayLine<2048>,
     delay_sr: HaasDelayLine<2048>,
     delay_rl: HaasDelayLine<2048>,
@@ -357,7 +361,9 @@ impl SurroundUpmixerDsp {
             last_config: default_cfg,
             eq_l: [BiquadFilter::default(); 5],
             eq_r: [BiquadFilter::default(); 5],
+            eq_mc: [[BiquadFilter::default(); 5]; 12],
             sub_lp: BiquadFilter::default(),
+            mc_sub_lp: BiquadFilter::default(),
             sub_hp_l: BiquadFilter::default(),
             sub_hp_r: BiquadFilter::default(),
             sub_hp_c: BiquadFilter::default(),
@@ -365,6 +371,8 @@ impl SurroundUpmixerDsp {
             height_hp_l: BiquadFilter::default(),
             height_lp_r: BiquadFilter::default(),
             height_hp_r: BiquadFilter::default(),
+            mc_height_lp: [BiquadFilter::default(); 4],
+            mc_height_hp: [BiquadFilter::default(); 4],
             delay_sl: HaasDelayLine::new(115),
             delay_sr: HaasDelayLine::new(115),
             delay_rl: HaasDelayLine::new(250),
@@ -402,10 +410,16 @@ impl SurroundUpmixerDsp {
             el.update_coeffs(b);
             er.update_coeffs(b);
         }
+        for ch_eq in self.eq_mc.iter_mut() {
+            for (f, &b) in ch_eq.iter_mut().zip(bands.iter()) {
+                f.update_coeffs(b);
+            }
+        }
 
         // Linkwitz-Riley 2nd-order (Q = 0.5) LFE low-pass and Height low-pass/high-pass crossovers
         let sub_lp = BiquadFilter::lowpass(sr, cfg.sub_crossover_hz.clamp(40.0, 250.0), 0.5);
         self.sub_lp.update_coeffs(sub_lp);
+        self.mc_sub_lp.update_coeffs(sub_lp);
         let sub_hp = BiquadFilter::highpass(sr, cfg.sub_crossover_hz.clamp(40.0, 250.0), 0.5);
         self.sub_hp_l.update_coeffs(sub_hp);
         self.sub_hp_r.update_coeffs(sub_hp);
@@ -418,6 +432,14 @@ impl SurroundUpmixerDsp {
         self.height_hp_l.update_coeffs(h_hp);
         self.height_lp_r.update_coeffs(h_lp);
         self.height_hp_r.update_coeffs(h_hp);
+        for (lp, hp) in self
+            .mc_height_lp
+            .iter_mut()
+            .zip(self.mc_height_hp.iter_mut())
+        {
+            lp.update_coeffs(h_lp);
+            hp.update_coeffs(h_hp);
+        }
 
         self.delay_sl.set_delay_ms(self.sample_rate, 2.4);
         self.delay_sr.set_delay_ms(self.sample_rate, 2.4);
@@ -493,15 +515,15 @@ impl SurroundUpmixerDsp {
         r_in: f32,
         cfg: &crate::state::SurroundUpmixConfig,
     ) -> [f32; 8] {
-        let mid_in = (l_in + r_in) * 0.5;
-        let fl = Self::soft_limit(l_in * cfg.front_level);
-        let fr = Self::soft_limit(r_in * cfg.front_level);
-        let fc_hp = -self.sub_hp_c.process(mid_in);
-        let fc = Self::soft_limit(fc_hp * cfg.center_level * std::f32::consts::FRAC_1_SQRT_2);
-
         let (l_routed, r_routed) = self.process_routing_eq(l_in, r_in, cfg);
         let mid_routed = (l_routed + r_routed) * 0.5;
         let diff_routed = (l_routed - r_routed) * 0.5;
+
+        let fl = Self::soft_limit(l_routed * cfg.front_level);
+        let fr = Self::soft_limit(r_routed * cfg.front_level);
+        let fc_hp = -self.sub_hp_c.process(mid_routed);
+        let fc = Self::soft_limit(fc_hp * cfg.center_level * std::f32::consts::FRAC_1_SQRT_2);
+
         // ITU-R BS.775 / Dolby Surround center-steering: attenuate common-mode phantom center in surrounds
         // so correlated vocals/kick/bass stay anchored in the front stage while panned/stereo content envelops.
         let common_center = (mid_routed.abs() - diff_routed.abs())
@@ -540,17 +562,16 @@ impl SurroundUpmixerDsp {
         r_in: f32,
         cfg: &crate::state::SurroundUpmixConfig,
     ) -> [f32; 12] {
-        // 1. Uncolored Front L/R & Center anchor stage (not passed through surround routing EQ or height crossover)
-        let mid_in = (l_in + r_in) * 0.5;
-        let fl = Self::soft_limit(l_in * cfg.front_level);
-        let fr = Self::soft_limit(r_in * cfg.front_level);
-        let fc_hp = -self.sub_hp_c.process(mid_in);
-        let fc = Self::soft_limit(fc_hp * cfg.center_level * std::f32::consts::FRAC_1_SQRT_2);
-
-        // 2. 5-band routing contour & Mid/Side width shaping for Surround Bed, Height, and LFE
+        // 1. 5-band parametric EQ & Mid/Side width shaping across Front, Surround Bed, Height, and LFE
         let (l_eq, r_eq) = self.process_routing_eq(l_in, r_in, cfg);
         let mid = (l_eq + r_eq) * 0.5;
         let diff = (l_eq - r_eq) * 0.5;
+
+        let fl = Self::soft_limit(l_eq * cfg.front_level);
+        let fr = Self::soft_limit(r_eq * cfg.front_level);
+        let fc_hp = -self.sub_hp_c.process(mid);
+        let fc = Self::soft_limit(fc_hp * cfg.center_level * std::f32::consts::FRAC_1_SQRT_2);
+
         let common_center = (mid.abs() - diff.abs()).max(0.0).copysign(mid);
         let l_amb = l_eq - common_center * 0.60;
         let r_amb = r_eq - common_center * 0.60;
@@ -626,15 +647,15 @@ impl SurroundUpmixerDsp {
         // ITU-R BS.775-3 / BS.1770-4 constant-power front/surround energy conservation:
         // Redirect a fraction of common-mode phantom center from FL/FR when FC is active, and scale
         // active front/bed/height speaker groups by 1/sqrt(N_pairs) so total acoustic power matches 2.0 stereo.
-        let mid_in = (l_in + r_in) * 0.5;
-        let diff_in = (l_in - r_in) * 0.5;
-        let common_in = (mid_in.abs() - diff_in.abs()).max(0.0).copysign(mid_in);
-        let center_pull = common_in * cfg.front_level * (0.14 * cfg.center_level.clamp(0.0, 2.0));
         let k_s2 = 0.88_f32;
 
         if crate::state::SurroundUpmixConfig::has_height_channels(hardware_channels as i32) {
             let [fl, fr, fc, lfe, sl, sr, rl, rr, tfl, tfr, trl, trr] =
                 self.process_stereo_to_7_1_4(l_in, r_in, cfg);
+            let mid_f = (fl + fr) * 0.5;
+            let diff_f = (fl - fr) * 0.5;
+            let common_f = (mid_f.abs() - diff_f.abs()).max(0.0).copysign(mid_f);
+            let center_pull = common_f * (0.14 * cfg.center_level.clamp(0.0, 2.0));
             let fl_c = ((fl - center_pull) * k_s2).clamp(-1.0, 1.0);
             let fr_c = ((fr - center_pull) * k_s2).clamp(-1.0, 1.0);
             let fc_c = (fc * k_s2).clamp(-1.0, 1.0);
@@ -689,6 +710,10 @@ impl SurroundUpmixerDsp {
         } else {
             let [fl, fr, fc, lfe, sl, sr, rl, rr] =
                 self.process_stereo_to_bed_only(l_in, r_in, cfg);
+            let mid_f = (fl + fr) * 0.5;
+            let diff_f = (fl - fr) * 0.5;
+            let common_f = (mid_f.abs() - diff_f.abs()).max(0.0).copysign(mid_f);
+            let center_pull = common_f * (0.14 * cfg.center_level.clamp(0.0, 2.0));
             let fl_c = ((fl - center_pull) * k_s2).clamp(-1.0, 1.0);
             let fr_c = ((fr - center_pull) * k_s2).clamp(-1.0, 1.0);
             let fc_c = (fc * k_s2).clamp(-1.0, 1.0);
@@ -786,13 +811,14 @@ impl SurroundUpmixerDsp {
 
     /// Upmixes a decoded multi-channel frame `frame_slice` with `source_channels` intrinsic channels
     /// to `hardware_channels`:
-    /// - When `source_channels >= hardware_channels` or `hardware_channels <= 2`: passes all discrete
-    ///   channels through 1:1 untouched (never folds down native surround to stereo).
+    /// - When `hardware_channels <= 2` or `(source_channels >= hardware_channels && cfg.is_flat_identity())`:
+    ///   passes all discrete channels through 1:1 untouched.
     /// - When `source_channels <= 2`: performs full ITU-R BS.775 constant-power mono/stereo-to-surround upmixing
     ///   across all `hardware_channels`.
-    /// - When `2 < source_channels < hardware_channels`: preserves all existing discrete channels from
-    ///   the media file in their canonical speaker positions and synthesizes the remaining available
-    ///   output channels (`FC`, `LFE`, `SL/SR`, `RL/RR`, `TFL..TRR`) so every output speaker is driven.
+    /// - When `source_channels > 2`: applies the 5-band parametric EQ and speaker level trims to all discrete
+    ///   channels, maps 7.1 `WAVEFORMATEXTENSIBLE` `0x63F` (`[4:BL, 5:BR, 6:SL, 7:SR]`) into canonical
+    ///   `[4:SL, 5:SR, 6:BL, 7:BR]` when expanding to `> 8` channels, and uses complementary Linkwitz-Riley
+    ///   crossovers at `height_crossover_hz` to split discrete surrounds between the ear-level bed and heights.
     #[inline]
     pub fn process_multichannel_frame_for_hardware(
         &mut self,
@@ -802,7 +828,7 @@ impl SurroundUpmixerDsp {
         hardware_channels: usize,
     ) -> [f32; 12] {
         let src_ch = source_channels.max(1);
-        if hardware_channels <= 2 || src_ch >= hardware_channels {
+        if hardware_channels <= 2 || (src_ch >= hardware_channels && cfg.is_flat_identity()) {
             let mut out = [0.0f32; 12];
             let copy_len = frame_slice.len().min(hardware_channels).min(12);
             out[..copy_len].copy_from_slice(&frame_slice[..copy_len]);
@@ -813,122 +839,253 @@ impl SurroundUpmixerDsp {
             return self.process_frame_for_hardware(l_in, r_in, cfg, hardware_channels);
         }
 
-        let fl = frame_slice.first().copied().unwrap_or(0.0);
-        let fr = frame_slice.get(1).copied().unwrap_or(fl);
+        // Apply 5-band EQ to all discrete source channels when any band is non-zero
+        let eq_active = cfg.band_gains_db.iter().any(|&g| g.abs() >= 1e-3);
+        let mut ch_in = [0.0f32; 12];
+        let in_count = src_ch.min(frame_slice.len()).min(12);
+        for c in 0..in_count {
+            let mut s = frame_slice[c];
+            if eq_active {
+                for bq in self.eq_mc[c].iter_mut() {
+                    s = bq.process(s);
+                }
+                s = Self::soft_limit(s);
+            }
+            ch_in[c] = s;
+        }
+
+        // Normalized discrete stem gains (1.0 at factory default slider positions)
+        let front_gain = cfg.front_level.clamp(0.0, 2.0);
+        let center_gain = (cfg.center_level / 0.45).clamp(0.0, 2.5);
+        let lfe_gain = (cfg.lfe_level / 0.85).clamp(0.0, 2.0);
+        let surround_gain = (cfg.side_rear_level / 0.85).clamp(0.0, 2.0);
+        let height_gain = (cfg.height_level / 0.95).clamp(0.0, 2.0);
+        let high_bleed = cfg.surround_high_bleed.clamp(0.0, 1.0);
+
+        let fl = Self::soft_limit(ch_in[0] * front_gain);
+        let fr = Self::soft_limit(ch_in[1] * front_gain);
+        let sub_redirect = self.mc_sub_lp.process((ch_in[0] + ch_in[1]) * 0.5);
+        let sub_trim = if (cfg.sub_crossover_hz - 90.0).abs() > 0.5 {
+            sub_redirect * 0.25 * ((cfg.sub_crossover_hz - 90.0) / 160.0)
+        } else {
+            0.0
+        };
         const INV_SQRT2: f32 = std::f32::consts::FRAC_1_SQRT_2;
+
+        // Pass pre-EQ'd signals to stereo helper with zeroed band_gains_db so it doesn't double-EQ
+        let mut helper_cfg = *cfg;
+        helper_cfg.band_gains_db = [0.0; 5];
 
         match src_ch {
             // 3.0 (FL, FR, FC) -> 4.0 / 5.0 / 5.1 / 6.1 / 7.1 / 7.1.x:
-            // Preserve discrete FL, FR, FC and synthesize LFE + Surround Bed (+ Height if >8ch) from (FL, FR).
             3 => {
-                let fc = frame_slice.get(2).copied().unwrap_or(0.0);
-                let mut out = self.process_frame_for_hardware(fl, fr, cfg, hardware_channels);
+                let fc = Self::soft_limit(ch_in[2] * center_gain);
+                let mut out = self.process_frame_for_hardware(
+                    ch_in[0],
+                    ch_in[1],
+                    &helper_cfg,
+                    hardware_channels,
+                );
                 if hardware_channels == 4 {
-                    // 4.0 Quad has [FL, FR, SL, SR] (no physical Center speaker)
                     out[0] = (fl + fc * INV_SQRT2).clamp(-1.0, 1.0);
                     out[1] = (fr + fc * INV_SQRT2).clamp(-1.0, 1.0);
                 } else {
-                    out[0] = fl.clamp(-1.0, 1.0);
-                    out[1] = fr.clamp(-1.0, 1.0);
-                    out[2] = fc.clamp(-1.0, 1.0);
+                    out[0] = fl;
+                    out[1] = fr;
+                    out[2] = fc;
                 }
                 out
             }
-            // 4.0 Quad (FL, FR, SL, SR) -> 5.0 / 5.1 / 6.1 / 7.1 / 7.1.x:
-            // Preserve discrete FL, FR, SL, SR; synthesize FC + LFE from (FL, FR) and RL/RR (+ Height) from (SL, SR).
+            // 4.0 Quad (FL, FR, SL, SR) -> 4.0 / 5.0 / 5.1 / 6.1 / 7.1 / 7.1.x:
             4 => {
-                let sl = frame_slice.get(2).copied().unwrap_or(0.0);
-                let sr = frame_slice.get(3).copied().unwrap_or(0.0);
-                let l_comb = (fl + sl * INV_SQRT2) * 0.75;
-                let r_comb = (fr + sr * INV_SQRT2) * 0.75;
+                let sl = Self::soft_limit(ch_in[2] * surround_gain);
+                let sr = Self::soft_limit(ch_in[3] * surround_gain);
+                let l_comb = (ch_in[0] + ch_in[2] * INV_SQRT2) * 0.75;
+                let r_comb = (ch_in[1] + ch_in[3] * INV_SQRT2) * 0.75;
                 let mut out =
-                    self.process_frame_for_hardware(l_comb, r_comb, cfg, hardware_channels);
-                out[0] = fl.clamp(-1.0, 1.0);
-                out[1] = fr.clamp(-1.0, 1.0);
-                if hardware_channels == 5 {
-                    // 5.0: [FL, FR, FC, SL, SR]
-                    out[3] = sl.clamp(-1.0, 1.0);
-                    out[4] = sr.clamp(-1.0, 1.0);
+                    self.process_frame_for_hardware(l_comb, r_comb, &helper_cfg, hardware_channels);
+                out[0] = fl;
+                out[1] = fr;
+                if hardware_channels <= 4 {
+                    out[2] = sl;
+                    out[3] = sr;
+                } else if hardware_channels == 5 {
+                    out[3] = sl;
+                    out[4] = sr;
                 } else if hardware_channels == 6 {
-                    // 5.1: [FL, FR, FC, LFE, SL, SR]
-                    out[4] = sl.clamp(-1.0, 1.0);
-                    out[5] = sr.clamp(-1.0, 1.0);
+                    out[4] = sl;
+                    out[5] = sr;
                 } else {
-                    // >= 7 channels (6.1 / 7.1 / 7.1.x): scale discrete SL/SR by 1/sqrt(2) as rear pair is added
                     out[4] = (sl * INV_SQRT2).clamp(-1.0, 1.0);
                     out[5] = (sr * INV_SQRT2).clamp(-1.0, 1.0);
                 }
                 out
             }
-            // 5.0 (FL, FR, FC, SL, SR) -> 5.1 / 6.1 / 7.1 / 7.1.x:
-            // Preserve discrete FL, FR, FC, SL, SR; synthesize LFE and RL/RR (+ Height).
+            // 5.0 (FL, FR, FC, SL, SR) -> 5.0 / 5.1 / 6.1 / 7.1 / 7.1.x:
             5 => {
-                let fc = frame_slice.get(2).copied().unwrap_or(0.0);
-                let sl = frame_slice.get(3).copied().unwrap_or(0.0);
-                let sr = frame_slice.get(4).copied().unwrap_or(0.0);
-                let l_comb = (fl + fc * 0.5 + sl * INV_SQRT2) * 0.7;
-                let r_comb = (fr + fc * 0.5 + sr * INV_SQRT2) * 0.7;
+                let fc = Self::soft_limit(ch_in[2] * center_gain);
+                let sl = Self::soft_limit(ch_in[3] * surround_gain);
+                let sr = Self::soft_limit(ch_in[4] * surround_gain);
+                let l_comb = (ch_in[0] + ch_in[2] * 0.5 + ch_in[3] * INV_SQRT2) * 0.7;
+                let r_comb = (ch_in[1] + ch_in[2] * 0.5 + ch_in[4] * INV_SQRT2) * 0.7;
                 let mut out =
-                    self.process_frame_for_hardware(l_comb, r_comb, cfg, hardware_channels);
-                out[0] = fl.clamp(-1.0, 1.0);
-                out[1] = fr.clamp(-1.0, 1.0);
-                out[2] = fc.clamp(-1.0, 1.0);
-                if hardware_channels == 6 {
-                    out[4] = sl.clamp(-1.0, 1.0);
-                    out[5] = sr.clamp(-1.0, 1.0);
+                    self.process_frame_for_hardware(l_comb, r_comb, &helper_cfg, hardware_channels);
+                out[0] = fl;
+                out[1] = fr;
+                out[2] = fc;
+                if hardware_channels <= 5 {
+                    out[3] = sl;
+                    out[4] = sr;
+                } else if hardware_channels == 6 {
+                    out[4] = sl;
+                    out[5] = sr;
                 } else {
                     out[4] = (sl * INV_SQRT2).clamp(-1.0, 1.0);
                     out[5] = (sr * INV_SQRT2).clamp(-1.0, 1.0);
                 }
                 out
             }
-            // 5.1 (FL, FR, FC, LFE, SL, SR) -> 6.1 / 7.1 / 7.1.x:
-            // Preserve discrete FL, FR, FC, LFE, SL, SR and expand (SL, SR) into RL, RR (+ Height).
+            // 5.1 (FL, FR, FC, LFE, SL, SR) -> 5.1 / 6.1 / 7.1 / 7.1.x:
             6 => {
-                let sl = frame_slice.get(4).copied().unwrap_or(0.0);
-                let sr = frame_slice.get(5).copied().unwrap_or(0.0);
-                let mut out = self.process_frame_for_hardware(sl, sr, cfg, hardware_channels);
-                for (c, out_c) in out.iter_mut().enumerate().take(4) {
-                    *out_c = frame_slice.get(c).copied().unwrap_or(0.0).clamp(-1.0, 1.0);
+                let fc = Self::soft_limit(ch_in[2] * center_gain);
+                let lfe = Self::soft_limit((ch_in[3] + sub_trim) * lfe_gain);
+                let sl = Self::soft_limit(ch_in[4] * surround_gain);
+                let sr = Self::soft_limit(ch_in[5] * surround_gain);
+                if hardware_channels <= 6 {
+                    let mut out = [0.0f32; 12];
+                    out[0] = fl;
+                    out[1] = fr;
+                    out[2] = fc;
+                    out[3] = lfe;
+                    out[4] = sl;
+                    out[5] = sr;
+                    return out;
                 }
+                let mut out = self.process_frame_for_hardware(
+                    ch_in[4],
+                    ch_in[5],
+                    &helper_cfg,
+                    hardware_channels,
+                );
+                out[0] = fl;
+                out[1] = fr;
+                out[2] = fc;
+                out[3] = lfe;
                 out[4] = (sl * INV_SQRT2).clamp(-1.0, 1.0);
                 out[5] = (sr * INV_SQRT2).clamp(-1.0, 1.0);
                 out
             }
-            // 6.1 (FL, FR, FC, LFE, BC, SL, SR) -> 7.1 / 7.1.x:
-            // Preserve FL, FR, FC, LFE, SL, SR and expand BC + (SL, SR) into RL, RR (+ Height).
+            // 6.1 (FL, FR, FC, LFE, BC, SL, SR) -> 6.1 / 7.1 / 7.1.x:
             7 => {
-                let bc = frame_slice.get(4).copied().unwrap_or(0.0);
-                let sl = frame_slice.get(5).copied().unwrap_or(0.0);
-                let sr = frame_slice.get(6).copied().unwrap_or(0.0);
+                let fc = Self::soft_limit(ch_in[2] * center_gain);
+                let lfe = Self::soft_limit((ch_in[3] + sub_trim) * lfe_gain);
+                let bc = ch_in[4] * surround_gain;
+                let sl = Self::soft_limit(ch_in[5] * surround_gain);
+                let sr = Self::soft_limit(ch_in[6] * surround_gain);
                 let mut out = self.process_frame_for_hardware(
-                    (sl + bc * INV_SQRT2) * INV_SQRT2,
-                    (sr + bc * INV_SQRT2) * INV_SQRT2,
-                    cfg,
+                    (ch_in[5] + ch_in[4] * INV_SQRT2) * INV_SQRT2,
+                    (ch_in[6] + ch_in[4] * INV_SQRT2) * INV_SQRT2,
+                    &helper_cfg,
                     hardware_channels,
                 );
-                for (c, out_c) in out.iter_mut().enumerate().take(4) {
-                    *out_c = frame_slice.get(c).copied().unwrap_or(0.0).clamp(-1.0, 1.0);
+                out[0] = fl;
+                out[1] = fr;
+                out[2] = fc;
+                out[3] = lfe;
+                out[4] = sl;
+                out[5] = sr;
+                out[6] = Self::soft_limit((out[6] + bc * INV_SQRT2) * 0.75);
+                if hardware_channels >= 8 {
+                    out[7] = Self::soft_limit((out[7] + bc * INV_SQRT2) * 0.75);
                 }
-                out[4] = sl.clamp(-1.0, 1.0);
-                out[5] = sr.clamp(-1.0, 1.0);
-                out[6] = ((out[6] + bc * INV_SQRT2) * 0.75).clamp(-1.0, 1.0);
-                out[7] = ((out[7] + bc * INV_SQRT2) * 0.75).clamp(-1.0, 1.0);
                 out
             }
-            // >= 8 channels (e.g. 7.1 -> 7.1.2 / 7.1.4):
-            // Preserve all existing discrete channels 0..src_ch and expand surround bed into remaining channels.
+            // >= 8 channels (e.g. 7.1 on 7.1 or 7.1 -> 7.1.2 / 7.1.4):
             _ => {
-                let sur_l = (frame_slice.get(4).copied().unwrap_or(0.0)
-                    + frame_slice.get(6).copied().unwrap_or(0.0))
-                    * INV_SQRT2;
-                let sur_r = (frame_slice.get(5).copied().unwrap_or(0.0)
-                    + frame_slice.get(7).copied().unwrap_or(0.0))
-                    * INV_SQRT2;
-                let mut out = self.process_frame_for_hardware(sur_l, sur_r, cfg, hardware_channels);
-                let copy_n = src_ch.min(frame_slice.len()).min(12);
-                out[..copy_n].copy_from_slice(&frame_slice[..copy_n]);
-                out
+                let fc = Self::soft_limit(ch_in[2] * center_gain);
+                let lfe = Self::soft_limit((ch_in[3] + sub_trim) * lfe_gain);
+                if hardware_channels <= 8 {
+                    let mut out = [0.0f32; 12];
+                    out[0] = fl;
+                    out[1] = fr;
+                    out[2] = fc;
+                    out[3] = lfe;
+                    for c in 4..hardware_channels.min(8) {
+                        out[c] = Self::soft_limit(ch_in[c] * surround_gain);
+                    }
+                    return out;
+                }
+
+                // Decoded 8-channel 7.1 frames follow WAVEFORMATEXTENSIBLE 0x63F order:
+                // [0:FL, 1:FR, 2:FC, 3:LFE, 4:BL, 5:BR, 6:SL, 7:SR].
+                // Map them to canonical Side (SL, SR) and Back/Rear (BL, BR) speaker pairs:
+                let (bl_in, br_in, sl_in, sr_in) = if src_ch == 8 {
+                    (ch_in[4], ch_in[5], ch_in[6], ch_in[7])
+                } else {
+                    (ch_in[6], ch_in[7], ch_in[4], ch_in[5])
+                };
+
+                // Complementary Linkwitz-Riley 2nd-order (Q = 0.5) crossover at `height_crossover_hz`
+                // splitting discrete Side (SL/SR) and Rear (BL/BR) stems between ear-level bed and heights
+                // with zero Haas delay so Bed + Height sum in-phase without comb filtering.
+                let sl_low = self.mc_height_lp[0].process(sl_in);
+                let sl_high = -self.mc_height_hp[0].process(sl_in);
+                let sr_low = self.mc_height_lp[1].process(sr_in);
+                let sr_high = -self.mc_height_hp[1].process(sr_in);
+                let bl_low = self.mc_height_lp[2].process(bl_in);
+                let bl_high = -self.mc_height_hp[2].process(bl_in);
+                let br_low = self.mc_height_lp[3].process(br_in);
+                let br_high = -self.mc_height_hp[3].process(br_in);
+
+                let f_mid = (ch_in[0] + ch_in[1]) * 0.5;
+                let f_diff = (ch_in[0] - ch_in[1]) * 0.5;
+                let f_common = (f_mid.abs() - f_diff.abs()).max(0.0).copysign(f_mid);
+                let f_l_high = -self.height_hp_l.process(ch_in[0] - f_common * 0.60);
+                let f_r_high = -self.height_hp_r.process(ch_in[1] - f_common * 0.60);
+
+                let sl_out = Self::soft_limit((sl_low + sl_high * high_bleed) * surround_gain);
+                let sr_out = Self::soft_limit((sr_low + sr_high * high_bleed) * surround_gain);
+                let bl_out = Self::soft_limit((bl_low + bl_high * high_bleed) * surround_gain);
+                let br_out = Self::soft_limit((br_low + br_high * high_bleed) * surround_gain);
+
+                let tfl = Self::soft_limit((sl_high * 0.82 + f_l_high * 0.28) * height_gain);
+                let tfr = Self::soft_limit((sr_high * 0.82 + f_r_high * 0.28) * height_gain);
+                let tbl = Self::soft_limit((bl_high * 0.82 + sl_high * 0.18) * height_gain);
+                let tbr = Self::soft_limit((br_high * 0.82 + sr_high * 0.18) * height_gain);
+
+                match hardware_channels {
+                    9 => [
+                        fl,
+                        fr,
+                        fc,
+                        lfe,
+                        sl_out,
+                        sr_out,
+                        bl_out,
+                        br_out,
+                        ((tfl + tfr) * 0.5).clamp(-1.0, 1.0),
+                        0.0,
+                        0.0,
+                        0.0,
+                    ],
+                    10 => [
+                        fl,
+                        fr,
+                        fc,
+                        lfe,
+                        sl_out,
+                        sr_out,
+                        bl_out,
+                        br_out,
+                        ((tfl + tbl * 0.7) * 0.65).clamp(-1.0, 1.0),
+                        ((tfr + tbr * 0.7) * 0.65).clamp(-1.0, 1.0),
+                        0.0,
+                        0.0,
+                    ],
+                    _ => [
+                        fl, fr, fc, lfe, sl_out, sr_out, bl_out, br_out, tfl, tfr, tbl, tbr,
+                    ],
+                }
             }
         }
     }
@@ -940,7 +1097,13 @@ impl SurroundUpmixerDsp {
             el.clear_state();
             er.clear_state();
         }
+        for ch_eq in self.eq_mc.iter_mut() {
+            for f in ch_eq.iter_mut() {
+                f.clear_state();
+            }
+        }
         self.sub_lp.clear_state();
+        self.mc_sub_lp.clear_state();
         self.sub_hp_l.clear_state();
         self.sub_hp_r.clear_state();
         self.sub_hp_c.clear_state();
@@ -948,6 +1111,14 @@ impl SurroundUpmixerDsp {
         self.height_hp_l.clear_state();
         self.height_lp_r.clear_state();
         self.height_hp_r.clear_state();
+        for (lp, hp) in self
+            .mc_height_lp
+            .iter_mut()
+            .zip(self.mc_height_hp.iter_mut())
+        {
+            lp.clear_state();
+            hp.clear_state();
+        }
         self.delay_sl.clear();
         self.delay_sr.clear();
         self.delay_rl.clear();
@@ -977,7 +1148,9 @@ impl SurroundUpmixerDsp {
         target_active: bool,
     ) -> [f32; 12] {
         let src_ch = source_channels.max(1);
-        let effective_target = target_active && hardware_channels > 2 && src_ch < hardware_channels;
+        let effective_target = target_active
+            && hardware_channels > 2
+            && (src_ch < hardware_channels || !cfg.is_flat_identity());
         if !self.blend_initialized {
             self.blend = if effective_target { 1.0 } else { 0.0 };
             self.blend_initialized = true;
@@ -993,7 +1166,10 @@ impl SurroundUpmixerDsp {
             }
         }
 
-        if self.blend <= 0.0 || hardware_channels <= 2 || src_ch >= hardware_channels {
+        if self.blend <= 0.0
+            || hardware_channels <= 2
+            || (src_ch >= hardware_channels && cfg.is_flat_identity())
+        {
             let mut out = [0.0f32; 12];
             let copy_len = frame_slice.len().min(hardware_channels).min(12);
             out[..copy_len].copy_from_slice(&frame_slice[..copy_len]);
@@ -1010,8 +1186,19 @@ impl SurroundUpmixerDsp {
             let w = 0.5 - 0.5 * (std::f32::consts::PI * self.blend).cos();
             let dry_w = 1.0 - w;
             for (c, sample_out) in upmixed.iter_mut().enumerate() {
-                let dry = if c < hardware_channels {
-                    frame_slice.get(c).copied().unwrap_or(0.0)
+                let dry = if c < src_ch && c < hardware_channels {
+                    let src_c = if src_ch == 8 && hardware_channels > 8 {
+                        match c {
+                            4 => 6,
+                            5 => 7,
+                            6 => 4,
+                            7 => 5,
+                            _ => c,
+                        }
+                    } else {
+                        c
+                    };
+                    frame_slice.get(src_c).copied().unwrap_or(0.0)
                 } else {
                     0.0
                 };
@@ -7774,7 +7961,7 @@ fn populate_state_from_audio_source(
     state.hardware_channels = hardware_channels;
     let source_channels = audio_source.get_num_channels();
     state.source_channels = source_channels;
-    if !crate::state::SurroundUpmixConfig::can_upmix(source_channels, hardware_channels) {
+    if hardware_channels <= 2 {
         state.surround_upmix.enabled = false;
     } else if !state.surround_upmix.user_overridden {
         state.surround_upmix.enabled = !state.force_stereo_downmix
@@ -8124,10 +8311,7 @@ fn process_decoder_state_requests(
             }
             let source_channels = audio_source.get_num_channels();
             state.source_channels = source_channels;
-            if !crate::state::SurroundUpmixConfig::can_upmix(
-                source_channels,
-                state.hardware_channels,
-            ) {
+            if state.hardware_channels <= 2 {
                 state.surround_upmix.enabled = false;
             } else if !state.surround_upmix.user_overridden {
                 state.surround_upmix.enabled = !state.force_stereo_downmix
@@ -8212,10 +8396,7 @@ fn process_decoder_state_requests(
             state.multi_track_mix_mode = false;
             let source_channels = audio_source.get_num_channels();
             state.source_channels = source_channels;
-            if !crate::state::SurroundUpmixConfig::can_upmix(
-                source_channels,
-                state.hardware_channels,
-            ) {
+            if state.hardware_channels <= 2 {
                 state.surround_upmix.enabled = false;
             } else if !state.surround_upmix.user_overridden {
                 state.surround_upmix.enabled = !state.force_stereo_downmix
@@ -10618,24 +10799,15 @@ fn run_wasapi_exclusive_multichannel(
             }
         }
 
-        let channel_candidates: Vec<(u16, u32)> = if surround_upmix_enabled {
-            vec![
-                (12, 0x2D63F),
-                (8, 0x63F),
-                (8, 0xFF),
-                (6, 0x3F),
-                (6, 0x60F),
-                (4, 0x33),
-            ]
-        } else {
-            match target_channels {
-                c if c >= 9 => vec![(12, 0x2D63F), (8, 0x63F), (8, 0xFF), (6, 0x3F)],
-                7 | 8 => vec![(8, 0x63F), (8, 0xFF), (6, 0x3F)],
-                5 | 6 => vec![(6, 0x3F), (6, 0x60F), (8, 0x63F), (8, 0xFF)],
-                3 | 4 => vec![(4, 0x33), (6, 0x3F), (8, 0x63F)],
-                _ => Vec::new(),
-            }
-        };
+        let _ = surround_upmix_enabled;
+        let channel_candidates: Vec<(u16, u32)> = vec![
+            (12, 0x2D63F),
+            (8, 0x63F),
+            (8, 0xFF),
+            (6, 0x3F),
+            (6, 0x60F),
+            (4, 0x33),
+        ];
 
         let mut rate_candidates = Vec::with_capacity(3);
         for &r in &[target_rate.max(44100), 48000, 44100] {
@@ -10692,6 +10864,9 @@ fn run_wasapi_exclusive_multichannel(
             drop(probe_client);
 
             for &(ch, mask) in &channel_candidates {
+                if ch == 12 && !mpegh_bitstream && target_channels < 9 {
+                    continue;
+                }
                 // 0. When 12-channel (7.1.4 / 11.1) output is enabled (`ch == 12 && mpegh_bitstream`),
                 // first check if Windows Spatial Audio (`Dolby Atmos for Home Theater`, `GetMaxDynamicObjectCount() > 0`)
                 // is active on the endpoint BEFORE probing `AUDCLNT_SHAREMODE_EXCLUSIVE` (since exclusive-mode
@@ -11192,11 +11367,11 @@ fn run_wasapi_exclusive_multichannel(
 
                         let to_copy = std::cmp::min(frames_available, frames_needed);
                         let src_ch = (chunk.spatial_channels as usize).max(1);
-                        let target_upmix = upmix_active && src_ch < hardware_channels;
+                        let target_upmix = upmix_active
+                            && hardware_channels > 2
+                            && (src_ch < hardware_channels || !upmix_cfg.is_flat_identity());
 
-                        if upmixer_dsp.is_blending_or_active(target_upmix)
-                            && src_ch < hardware_channels
-                        {
+                        if upmixer_dsp.is_blending_or_active(target_upmix) {
                             for i in 0..to_copy {
                                 let src_frame_idx = chunk_frame_pos + i;
                                 let dst_frame_idx = frames_written + i;
@@ -11220,13 +11395,8 @@ fn run_wasapi_exclusive_multichannel(
 
                                 // `spatial.objects` are activated in RustTracker's canonical 12-channel order:
                                 // [0:FL, 1:FR, 2:FC, 3:LFE, 4:SL, 5:SR, 6:BL(RL), 7:BR(RR), 8:TFL, 9:TFR, 10:TBL(TRL), 11:TBR(TRR)].
-                                // Compensate for Windows Spatial Audio (`DolbyMatEnc.dll`) object-summing headroom pad
-                                // and AVR Dolby Atmos Dialnorm (~3.5-4.3 dB attenuation relative to 0 dBFS Exclusive LPCM).
                                 for c in 0..12 {
-                                    let atmos_makeup = if c < 4 { 1.50 } else { 1.65 };
-                                    let s = SurroundUpmixerDsp::soft_limit(
-                                        out_channels[c] * fade_gain * atmos_makeup,
-                                    );
+                                    let s = (out_channels[c] * fade_gain).clamp(-1.0, 1.0);
                                     unsafe {
                                         *obj_ptrs[c].add(dst_frame_idx) = s;
                                     }
@@ -11252,12 +11422,21 @@ fn run_wasapi_exclusive_multichannel(
 
                                 let mut mono = 0.0f32;
                                 for c in 0..12 {
-                                    let sample = if c < hardware_channels {
-                                        SurroundUpmixerDsp::soft_limit(
-                                            chunk.samples[src_frame_idx * hardware_channels + c]
-                                                * fade_gain
-                                                * 1.50,
-                                        )
+                                    let sample = if c < src_ch && c < hardware_channels {
+                                        let src_c = if src_ch == 8 {
+                                            match c {
+                                                4 => 6, // Canonical SL <- 0x63F slot 6 (SL)
+                                                5 => 7, // Canonical SR <- 0x63F slot 7 (SR)
+                                                6 => 4, // Canonical BL <- 0x63F slot 4 (BL)
+                                                7 => 5, // Canonical BR <- 0x63F slot 5 (BR)
+                                                _ => c,
+                                            }
+                                        } else {
+                                            c
+                                        };
+                                        (chunk.samples[src_frame_idx * hardware_channels + src_c]
+                                            * fade_gain)
+                                            .clamp(-1.0, 1.0)
                                     } else {
                                         0.0
                                     };
@@ -11437,9 +11616,10 @@ fn run_wasapi_exclusive_multichannel(
                             }
 
                             let src_ch = (chunk.spatial_channels as usize).max(1);
-                            let target_upmix = upmix_active && src_ch < hardware_channels;
-                            let use_upmixer = upmixer_dsp.is_blending_or_active(target_upmix)
-                                && src_ch < hardware_channels;
+                            let target_upmix = upmix_active
+                                && hardware_channels > 2
+                                && (src_ch < hardware_channels || !upmix_cfg.is_flat_identity());
+                            let use_upmixer = upmixer_dsp.is_blending_or_active(target_upmix);
 
                             for _ in 0..frames_available {
                                 let src_frame_idx = chunk_frame_pos;
@@ -11579,10 +11759,10 @@ fn run_wasapi_exclusive_multichannel(
                             let to_copy = std::cmp::min(frames_available, frames_needed);
 
                             let src_ch = (chunk.spatial_channels as usize).max(1);
-                            let target_upmix = upmix_active && src_ch < hardware_channels;
-                            if upmixer_dsp.is_blending_or_active(target_upmix)
-                                && src_ch < hardware_channels
-                            {
+                            let target_upmix = upmix_active
+                                && hardware_channels > 2
+                                && (src_ch < hardware_channels || !upmix_cfg.is_flat_identity());
+                            if upmixer_dsp.is_blending_or_active(target_upmix) {
                                 let active_ch = hardware_channels.min(12);
                                 for i in 0..to_copy {
                                     let src_frame_idx = chunk_frame_pos + i;
@@ -11613,7 +11793,8 @@ fn run_wasapi_exclusive_multichannel(
                                     // to physical WAVEFORMATEXTENSIBLE channel bit-order:
                                     //   for 0x63F (7.1) / 0x2D63F (7.1.4): [0:FL, 1:FR, 2:FC, 3:LFE, 4:BL(RL), 5:BR(RR), 6:SL, 7:SR, ...].
                                     for c in 0..hardware_channels {
-                                        let raw_s = if hardware_channels >= 8
+                                        let raw_s = if (src_ch < 8 || hardware_channels > 8)
+                                            && hardware_channels >= 8
                                             && (negotiated_mask & 0x630) == 0x630
                                         {
                                             match c {
@@ -11731,13 +11912,14 @@ fn run_wasapi_exclusive_multichannel(
                 frames_since_last_dsp_send = 0;
                 let play_time =
                     last_current_seconds + (chunk_frame_pos as f64 / negotiated_rate as f64);
-                let (dsp_channels, vu_slice): (usize, &[f32]) =
-                    if upmix_active && last_spatial_channels < hardware_channels {
-                        let active_ch = hardware_channels.min(12);
-                        (active_ch, &upmix_peak_vus[..active_ch])
-                    } else {
-                        (last_channel_vus.len().max(1), &last_channel_vus)
-                    };
+                let (dsp_channels, vu_slice): (usize, &[f32]) = if upmix_active
+                    && (last_spatial_channels < hardware_channels || !upmix_cfg.is_flat_identity())
+                {
+                    let active_ch = hardware_channels.min(12);
+                    (active_ch, &upmix_peak_vus[..active_ch])
+                } else {
+                    (last_channel_vus.len().max(1), &last_channel_vus)
+                };
 
                 let msg = build_recycled_dsp_message(
                     &recycle_rx,
@@ -12038,7 +12220,7 @@ where
     let (mut latest_seek_epoch, mut was_paused, mut upmix_cfg) = {
         let state = shared_state.lock().unwrap();
         let mut cfg = state.surround_upmix;
-        if !crate::state::SurroundUpmixConfig::can_upmix(initial_src_ch, hardware_channels as i32) {
+        if hardware_channels <= 2 {
             cfg.enabled = false;
         } else if !cfg.user_overridden {
             cfg.enabled = !state.force_stereo_downmix
@@ -12155,9 +12337,10 @@ where
                     let to_copy = std::cmp::min(frames_available, frames_needed);
 
                     let src_ch = (chunk.spatial_channels as usize).max(1);
-                    let target_upmix = upmix_active && src_ch < hardware_channels;
-                    if upmixer_dsp.is_blending_or_active(target_upmix) && src_ch < hardware_channels
-                    {
+                    let target_upmix = upmix_active
+                        && hardware_channels > 2
+                        && (src_ch < hardware_channels || !upmix_cfg.is_flat_identity());
+                    if upmixer_dsp.is_blending_or_active(target_upmix) {
                         let active_ch = hardware_channels.min(12);
                         for i in 0..to_copy {
                             let src_frame_idx = chunk_frame_pos + i;
@@ -12251,13 +12434,14 @@ where
                 frames_since_last_dsp_send = 0;
                 let play_time =
                     last_current_seconds + (chunk_frame_pos as f64 / sample_rate as f64);
-                let (dsp_channels, vu_slice): (usize, &[f32]) =
-                    if upmix_active && last_spatial_channels < hardware_channels {
-                        let active_ch = hardware_channels.min(12);
-                        (active_ch, &upmix_peak_vus[..active_ch])
-                    } else {
-                        (last_channel_vus.len().max(1), &last_channel_vus)
-                    };
+                let (dsp_channels, vu_slice): (usize, &[f32]) = if upmix_active
+                    && (last_spatial_channels < hardware_channels || !upmix_cfg.is_flat_identity())
+                {
+                    let active_ch = hardware_channels.min(12);
+                    (active_ch, &upmix_peak_vus[..active_ch])
+                } else {
+                    (last_channel_vus.len().max(1), &last_channel_vus)
+                };
                 let msg = build_recycled_dsp_message(
                     &recycle_rx,
                     &fft_buffer,
@@ -13006,11 +13190,16 @@ mod tests {
                 "Stereo 2ch Right output must be 100% untouched even when routing curve is non-flat"
             );
 
-            // And on 7.1.4 with front_gain = 1.0, FL/FR must also remain uncolored by eq_gains_db
-            let spatial = dsp_stereo.process_stereo_to_7_1_4(l_in, r_in, &cfg);
+            // And on 7.1.4 with flat EQ and front_gain = 1.0, FL/FR must remain uncolored and free of notches,
+            // while non-zero EQ bands actively shape FL/FR as well as the surround stage.
+            let flat_for_fl = crate::state::SurroundUpmixConfig {
+                band_gains_db: [0.0; 5],
+                ..cfg
+            };
+            let spatial = dsp_stereo.process_stereo_to_7_1_4(l_in, r_in, &flat_for_fl);
             assert!(
                 (spatial[0] - l_in).abs() < 1e-6 && (spatial[1] - r_in).abs() < 1e-6,
-                "Front L/R anchor must not be colored by surround routing EQ bands"
+                "Flat EQ must leave Front L/R uncolored"
             );
             if n > 512 {
                 crossover_peak_fl = crossover_peak_fl.max(spatial[0].abs());
@@ -13306,15 +13495,54 @@ mod tests {
         state_8ch.surround_upmix.enabled = false;
         state_8ch.set_surround_upmix(true);
         assert!(
-            !state_8ch.surround_upmix.enabled,
-            "Enabling upmix on an 8-channel source with 8-channel hardware must be blocked"
+            state_8ch.surround_upmix.enabled,
+            "User must always be able to re-enable Surround Upmix / EQ on an 8-channel source"
         );
+
+        // Verify 7.1 (0x63F: [FL, FR, FC, LFE, BL, BR, SL, SR]) -> 7.1.4 (12ch) maps SL/SR to [4, 5]
+        // and BL/BR to [6, 7], and responds to EQ bands and speaker level sliders.
+        let mut dsp_714 = SurroundUpmixerDsp::new(sr);
+        let mut cfg_714 = crate::state::SurroundUpmixConfig {
+            front_level: 0.5,
+            center_level: 0.0,
+            lfe_level: 0.0,
+            side_rear_level: 0.85,
+            height_level: 0.95,
+            ..Default::default()
+        };
+        dsp_714.sync_config(&cfg_714, sr);
+        // Put signal only in 0x63F slot 6 (SL = 0.6) and slot 0 (FL = 0.8), slot 2 (FC = 0.5)
+        let frame_71_sl = [
+            0.8f32, 0.0, 0.5, 0.4, 0.0, 0.0, 0.6, 0.0, 0.0, 0.0, 0.0, 0.0,
+        ];
+        let out_714 =
+            dsp_714.process_multichannel_frame_for_hardware(&frame_71_sl, 8, &cfg_714, 12);
         assert!(
-            state_8ch
-                .osd_text
-                .as_deref()
-                .unwrap_or("")
-                .contains("Upmix Not Applicable")
+            (out_714[0] - 0.4).abs() < 1e-4,
+            "Front slider 0.5 must scale FL from 0.8 to 0.4"
+        );
+        assert!(out_714[2].abs() < 1e-6, "Center slider 0.0 must mute FC");
+        assert!(out_714[3].abs() < 1e-6, "LFE slider 0.0 must mute LFE");
+        assert!(
+            out_714[4].abs() > 0.05 && out_714[6].abs() < 1e-6,
+            "0x63F slot 6 (SL) must map to canonical slot 4 (SL), not slot 6 (BL)"
+        );
+        cfg_714.band_gains_db = [10.0, 10.0, 10.0, 10.0, 10.0];
+        dsp_714.sync_config(&cfg_714, sr);
+        let mut peak_eq_fl = 0.0f32;
+        for n in 0..512 {
+            let s = (2.0 * std::f32::consts::PI * 1000.0 * (n as f32 / sr as f32)).sin() * 0.4;
+            let frame_1khz = [s, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+            let out_eq =
+                dsp_714.process_multichannel_frame_for_hardware(&frame_1khz, 8, &cfg_714, 12);
+            if n > 128 {
+                peak_eq_fl = peak_eq_fl.max(out_eq[0].abs());
+            }
+        }
+        assert!(
+            peak_eq_fl > 0.20 * 2.0,
+            "5-band EQ +10dB boost at 1kHz must more than double multichannel output (got peak {})",
+            peak_eq_fl
         );
 
         // 10. Verify toggling Upmix OFF/ON on a stereo track with 8ch hardware never requests

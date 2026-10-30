@@ -9348,16 +9348,29 @@ impl VulkanEngine {
                                                     ui.add_space(4.0);
                                                     let mpegh_on = state.surround_upmix.mpegh_bitstream;
                                                     let mpegh_live = state.stats.mpegh_bitstream_active;
+                                                    let is_atmos_spatial = state
+                                                        .stats
+                                                        .mpegh_carrier_info
+                                                        .contains("SpatialAudio")
+                                                        || state.stats.mpegh_carrier_info.contains("Dolby");
                                                     let (m_lbl, m_fill, m_stroke, m_col) = if mpegh_live {
                                                         (
-                                                            "MPEG-H 11.1",
+                                                            if is_atmos_spatial {
+                                                                "ATMOS 11.1"
+                                                            } else {
+                                                                "MPEG-H 11.1"
+                                                            },
                                                             egui::Color32::from_rgb(12, 68, 92),
                                                             egui::Color32::from_rgb(0, 210, 255),
                                                             egui::Color32::from_rgb(200, 248, 255),
                                                         )
                                                     } else if mpegh_on {
                                                         (
-                                                            "MPEG-H 11.1",
+                                                            if cfg!(target_os = "windows") {
+                                                                "11.1 (7.1.4)"
+                                                            } else {
+                                                                "MPEG-H 11.1"
+                                                            },
                                                             egui::Color32::from_rgb(28, 52, 68),
                                                             egui::Color32::from_rgb(70, 150, 190),
                                                             egui::Color32::from_rgb(185, 225, 240),
@@ -9379,9 +9392,17 @@ impl VulkanEngine {
                                                     .fill(m_fill)
                                                     .stroke(egui::Stroke::new(1.0_f32, m_stroke))
                                                     .corner_radius(4.0);
+                                                    let hover_tip = if mpegh_live && !state.stats.mpegh_carrier_info.is_empty() {
+                                                        format!(
+                                                            "Active 11.1 (7.1.4) carrier: {}\nClick to switch to uncompressed 7.1 LPCM bed.",
+                                                            state.stats.mpegh_carrier_info
+                                                        )
+                                                    } else {
+                                                        "Toggle 12-channel 7.1.4 (11.1) output (Windows Spatial Audio Dolby Atmos MAT 2.0 / IEC 61937-13 MPEG-H 3D Audio) vs. uncompressed 7.1 LPCM bed".to_string()
+                                                    };
                                                     if ui
                                                         .add(mpegh_btn)
-                                                        .on_hover_text("Toggle 12-channel 7.1.4 (11.1, CICP Layout 19) MPEG-H 3D Audio over IEC 61937-13 HDMI bitstream vs. uncompressed LPCM")
+                                                        .on_hover_text(hover_tip)
                                                         .clicked()
                                                     {
                                                         *engine_action = EngineAction::ToggleMpeghBitstream(!mpegh_on);
@@ -10212,10 +10233,10 @@ impl VulkanEngine {
                                                 *engine_action = EngineAction::OpenFile;
                                             }
 
-                                            if crate::state::SurroundUpmixConfig::can_upmix(
-                                                state.source_channels,
-                                                state.hardware_channels,
-                                            ) {
+                                            if state.hardware_channels > 2
+                                                || state.surround_upmix.mpegh_bitstream
+                                                || state.surround_upmix.mpegh_user_overridden
+                                            {
                                                 ui.add_space(4.0);
                                                 let upmix_on = state.surround_upmix.enabled;
                                                 let upmix_active = state
@@ -10430,10 +10451,20 @@ impl VulkanEngine {
                                                     };
 
                                                     let ch_info = if state.stats.mpegh_bitstream_active {
-                                                        if let Some(tc) = state.tracker_channels {
-                                                            format!("11.1 MPEG-H (12ch) / {} tracker", tc)
+                                                        let is_atmos_spatial = state
+                                                            .stats
+                                                            .mpegh_carrier_info
+                                                            .contains("SpatialAudio")
+                                                            || state.stats.mpegh_carrier_info.contains("Dolby");
+                                                        let carrier_tag = if is_atmos_spatial {
+                                                            "Dolby Atmos"
                                                         } else {
-                                                            "11.1 MPEG-H (7.1.4 / 12ch)".to_string()
+                                                            "MPEG-H"
+                                                        };
+                                                        if let Some(tc) = state.tracker_channels {
+                                                            format!("11.1 {} (12ch) / {} tracker", carrier_tag, tc)
+                                                        } else {
+                                                            format!("11.1 {} (7.1.4 / 12ch)", carrier_tag)
                                                         }
                                                     } else if let Some(tc) = state.tracker_channels {
                                                         format!("{} hw / {} tracker", state.hardware_channels, tc)
@@ -10837,10 +10868,10 @@ impl VulkanEngine {
                                                 }
                                             });
 
-                                            if crate::state::SurroundUpmixConfig::can_upmix(
-                                                state.source_channels,
-                                                state.hardware_channels,
-                                            ) {
+                                            if state.hardware_channels > 2
+                                                || state.surround_upmix.mpegh_bitstream
+                                                || state.surround_upmix.mpegh_user_overridden
+                                            {
                                                 ui.horizontal(|ui| {
                                                     let upmix_enabled = state.surround_upmix.enabled;
                                                     let (btn_text, btn_fill, btn_stroke, txt_col) = if upmix_enabled {
@@ -10878,23 +10909,40 @@ impl VulkanEngine {
                                                     {
                                                         let mpegh_on = state.surround_upmix.mpegh_bitstream;
                                                         let mpegh_live = state.stats.mpegh_bitstream_active;
+                                                        let is_atmos_spatial = state
+                                                            .stats
+                                                            .mpegh_carrier_info
+                                                            .contains("SpatialAudio")
+                                                            || state.stats.mpegh_carrier_info.contains("Dolby");
                                                         let (m_text, m_fill, m_stroke, m_txt_col) = if mpegh_live {
                                                             (
-                                                                "MPEG-H 11.1: ACTIVE",
+                                                                if is_atmos_spatial {
+                                                                    "ATMOS 11.1: ACTIVE"
+                                                                } else {
+                                                                    "MPEG-H 11.1: ACTIVE"
+                                                                },
                                                                 egui::Color32::from_rgb(12, 68, 92),
                                                                 egui::Color32::from_rgb(0, 210, 255),
                                                                 egui::Color32::from_rgb(200, 248, 255),
                                                             )
                                                         } else if mpegh_on {
                                                             (
-                                                                "MPEG-H 11.1: ON",
+                                                                if cfg!(target_os = "windows") {
+                                                                    "11.1 (7.1.4): ON"
+                                                                } else {
+                                                                    "MPEG-H 11.1: ON"
+                                                                },
                                                                 egui::Color32::from_rgb(28, 52, 68),
                                                                 egui::Color32::from_rgb(70, 150, 190),
                                                                 egui::Color32::from_rgb(185, 225, 240),
                                                             )
                                                         } else {
                                                             (
-                                                                "MPEG-H 11.1: OFF",
+                                                                if cfg!(target_os = "windows") {
+                                                                    "11.1 (7.1.4): OFF"
+                                                                } else {
+                                                                    "MPEG-H 11.1: OFF"
+                                                                },
                                                                 egui::Color32::from_rgb(36, 34, 36),
                                                                 egui::Color32::from_rgb(90, 84, 76),
                                                                 egui::Color32::from_rgb(200, 192, 182),
@@ -10909,9 +10957,17 @@ impl VulkanEngine {
                                                         .fill(m_fill)
                                                         .stroke(egui::Stroke::new(1.0_f32, m_stroke))
                                                         .corner_radius(4.0);
+                                                        let hover_tip = if mpegh_live && !state.stats.mpegh_carrier_info.is_empty() {
+                                                            format!(
+                                                                "Active 11.1 (7.1.4) carrier: {}\nClick to toggle 12-channel 7.1.4 (11.1) output vs. 8-channel 7.1 LPCM.",
+                                                                state.stats.mpegh_carrier_info
+                                                            )
+                                                        } else {
+                                                            "Output 12-channel 7.1.4 (11.1) audio via Windows Spatial Audio (Dolby Atmos MAT 2.0) or MPEG-H 3D Audio IEC 61937-13 HDMI bitstream to bypass HDMI's 8-channel LPCM ceiling.".to_string()
+                                                        };
                                                         if ui
                                                             .add(mpegh_btn)
-                                                            .on_hover_text("Encode 12-channel 7.1.4 (11.1, CICP Layout 19) audio as an MPEG-H 3D Audio IEC 61937-13 bitstream over HDMI to bypass HDMI's 8-channel LPCM ceiling on AVRs such as the Denon AVR-X3800H.")
+                                                            .on_hover_text(hover_tip)
                                                             .clicked()
                                                         {
                                                             *engine_action = EngineAction::ToggleMpeghBitstream(!mpegh_on);

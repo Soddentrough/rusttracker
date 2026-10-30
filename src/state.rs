@@ -704,10 +704,26 @@ impl SurroundUpmixConfig {
         hardware_channels > 2 && (source_channels <= 0 || source_channels < hardware_channels)
     }
 
-    /// Returns `true` when surround upmixing is both enabled and applicable for `(source_channels, hardware_channels)`.
+    /// Returns `true` when all 5 EQ bands are at `0.0 dB` and all speaker level weights
+    /// and crossovers are at their factory defaults.
     #[inline]
-    pub fn is_active_for(&self, source_channels: i32, hardware_channels: i32) -> bool {
-        self.enabled && Self::can_upmix(source_channels, hardware_channels)
+    pub fn is_flat_identity(&self) -> bool {
+        self.band_gains_db.iter().all(|g| g.abs() < 1e-4)
+            && (self.front_level - 1.0).abs() < 1e-4
+            && (self.side_rear_level - 0.85).abs() < 1e-4
+            && (self.height_level - 0.95).abs() < 1e-4
+            && (self.center_level - 0.45).abs() < 1e-4
+            && (self.lfe_level - 0.85).abs() < 1e-4
+            && (self.sub_crossover_hz - 90.0).abs() < 0.5
+            && (self.height_crossover_hz - 2800.0).abs() < 1.0
+            && (self.surround_high_bleed - 0.25).abs() < 1e-4
+    }
+
+    /// Returns `true` when surround upmixing / multichannel DSP is enabled on a multi-channel
+    /// output device (`hardware_channels > 2`).
+    #[inline]
+    pub fn is_active_for(&self, _source_channels: i32, hardware_channels: i32) -> bool {
+        self.enabled && hardware_channels > 2
     }
 
     /// Returns `true` when the output hardware layout includes overhead height channels
@@ -1416,20 +1432,6 @@ impl AppState {
     /// Enables or disables automatic surround upmixing with configurable crossover routing.
     /// Only affects playback when connected to a multi-channel surround output device (`hardware_channels > 2`).
     pub fn set_surround_upmix(&mut self, enabled: bool) {
-        if enabled
-            && self.file_loaded
-            && self.hardware_channels > 2
-            && self.source_channels >= self.hardware_channels
-        {
-            self.surround_upmix.enabled = false;
-            let short_tag = SurroundUpmixConfig::short_tag(self.hardware_channels);
-            self.osd_text = Some(format!(
-                "🔊 Native Discrete {} Audio ({}ch) — Upmix Not Applicable",
-                short_tag, self.source_channels
-            ));
-            self.osd_timer = 2.5;
-            return;
-        }
         let prev_enabled = self.surround_upmix.enabled;
         self.surround_upmix.enabled = enabled;
         self.surround_upmix.user_overridden = true;
