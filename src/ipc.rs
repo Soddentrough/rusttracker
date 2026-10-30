@@ -286,6 +286,7 @@ pub fn start_ipc_server(tx: Sender<Vec<String>>) {
 
 #[cfg(test)]
 mod tests {
+    #[allow(unused_imports)]
     use super::*;
 
     #[test]

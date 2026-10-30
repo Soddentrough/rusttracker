@@ -1207,6 +1207,7 @@ mod wasapi_bitstream {
         }
     }
 
+    #[allow(dead_code)]
     pub fn list_devices() -> Result<()> {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
@@ -1771,7 +1772,7 @@ mod wasapi_bitstream {
                                             );
                                         }
                                     }
-                                    let _ = decoder.flush();
+                                    decoder.flush();
                                     for acc in &mut accumulator {
                                         acc.fill(0.0);
                                     }
@@ -2303,7 +2304,7 @@ mod wasapi_bitstream {
 
                                     if let Some(ref mut presamp) = pcm_resampler {
                                         let mut pcm_frame = ffmpeg_next::frame::Audio::empty();
-                                        if presamp.run(&frame, &mut pcm_frame).is_ok() {
+                                        if presamp.run(frame, &mut pcm_frame).is_ok() {
                                             let samples = pcm_frame.samples();
                                             let raw_bytes = pcm_frame.data(0);
                                             let expected_bytes =
@@ -2343,7 +2344,7 @@ mod wasapi_bitstream {
 
                                     if let Some(ref mut vresamp) = vis_resampler {
                                         let mut vis_frame = ffmpeg_next::frame::Audio::empty();
-                                        if vresamp.run(&frame, &mut vis_frame).is_ok() {
+                                        if vresamp.run(frame, &mut vis_frame).is_ok() {
                                             let total_samples = vis_frame.samples();
                                             let planes = (vis_frame.channels() as usize)
                                                 .min(target_channels);
@@ -2549,7 +2550,7 @@ mod wasapi_bitstream {
                                             );
                                         }
                                     }
-                                    let _ = decoder.flush();
+                                    decoder.flush();
                                     for acc in &mut accumulator {
                                         acc.fill(0.0);
                                     }
@@ -2626,10 +2627,10 @@ mod wasapi_bitstream {
                                                     {
                                                         break;
                                                     }
-                                                    if let Ok(state) = shared_state_lpcm.lock() {
-                                                        if state.seek_request.is_some() {
-                                                            break;
-                                                        }
+                                                    if let Ok(state) = shared_state_lpcm.lock()
+                                                        && state.seek_request.is_some()
+                                                    {
+                                                        break;
                                                     }
                                                     process_frame(
                                                         &frame,
@@ -2834,22 +2835,20 @@ mod wasapi_bitstream {
                                     playback_time = Some(t);
                                 }
                             }
-                            if started {
-                                if let Some((ac, rc, ev)) = active_client.take() {
-                                    unsafe {
-                                        let _ = ac.Stop();
-                                        let _ = ac.Reset();
-                                    }
-                                    drop(rc);
-                                    drop(ac);
-                                    unsafe {
-                                        let _ = CloseHandle(ev);
-                                    }
-                                    started = false;
-                                    println!(
-                                        "[bitstream] Paused: released WASAPI Exclusive audio device lock."
-                                    );
+                            if started && let Some((ac, rc, ev)) = active_client.take() {
+                                unsafe {
+                                    let _ = ac.Stop();
+                                    let _ = ac.Reset();
                                 }
+                                drop(rc);
+                                drop(ac);
+                                unsafe {
+                                    let _ = CloseHandle(ev);
+                                }
+                                started = false;
+                                println!(
+                                    "[bitstream] Paused: released WASAPI Exclusive audio device lock."
+                                );
                             }
                             std::thread::sleep(std::time::Duration::from_millis(15));
                             continue;

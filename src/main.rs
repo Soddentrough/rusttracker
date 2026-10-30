@@ -665,6 +665,7 @@ pub(crate) fn extract_rusttracker_shortcut_appids(vdf_bytes: &[u8]) -> Vec<u32> 
 /// Normalizes any RustTracker shortcut entry in a binary `shortcuts.vdf` buffer so that
 /// filename-based `AppName` values (e.g. `"RustTracker-SteamDeck-GamePad.AppImage"`) become
 /// `"RustTracker"` and an empty `icon` field is populated with `default_icon_path`.
+#[allow(dead_code)]
 pub(crate) fn normalize_rusttracker_shortcuts_vdf(
     vdf_bytes: &[u8],
     default_icon_path: Option<&str>,
@@ -1078,6 +1079,7 @@ fn register_steam_shortcut_cli() -> Result<(), Box<dyn Error>> {
 
 /// Copies Steam Grid (`userdata/<id>/config/grid/`) and LibraryCache (`appcache/librarycache/`)
 /// artwork for all discovered RustTracker non-Steam shortcuts under `steam_root`.
+#[allow(dead_code)]
 pub(crate) fn provision_steam_shortcut_artwork_in_root(
     steam_root: &std::path::Path,
     steamgrid_dir: &std::path::Path,
@@ -2637,8 +2639,9 @@ async fn run_gui(
                                                 .as_ref()
                                                 .is_some_and(|s| s.contains("MPEG-H 3D Audio"))
                                             {
-                                                state.osd_text =
-                                                    Some(format!("🔊 Surround Upmix: ON ({badge})"));
+                                                state.osd_text = Some(format!(
+                                                    "🔊 Surround Upmix: ON ({badge})"
+                                                ));
                                             }
                                         } else if !state.surround_upmix.enabled
                                             && state
@@ -2804,8 +2807,12 @@ async fn run_gui(
                                                                 "🔊 11.1 ({badge}): {}",
                                                                 state.stats.mpegh_carrier_info
                                                             ));
-                                                        } else if state.surround_upmix.mpegh_bitstream
-                                                            && state.surround_upmix.mpegh_user_overridden
+                                                        } else if state
+                                                            .surround_upmix
+                                                            .mpegh_bitstream
+                                                            && state
+                                                                .surround_upmix
+                                                                .mpegh_user_overridden
                                                             && state.hardware_channels < 12
                                                         {
                                                             state.osd_text = Some(format!(

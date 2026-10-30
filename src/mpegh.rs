@@ -50,10 +50,7 @@ unsafe extern "C" {
         bitrate: i32,
     ) -> *mut RustMpeghEncCtx;
 
-    fn rust_mpegh_enc_get_asc(
-        ctx: *const RustMpeghEncCtx,
-        out_asc_ptr: *mut *const u8,
-    ) -> i32;
+    fn rust_mpegh_enc_get_asc(ctx: *const RustMpeghEncCtx, out_asc_ptr: *mut *const u8) -> i32;
 
     fn rust_mpegh_enc_get_frame_length(ctx: *const RustMpeghEncCtx) -> i32;
 
@@ -250,7 +247,7 @@ impl Iec61937MpeghPackager {
         // 5. Pairwise 16-bit Little-Endian byte swap for s16le HDMI transport
         if self.swap_bytes_s16le {
             let active_len = (headers_and_preamble + mhas_len + 1) & !1;
-            for chunk in out_burst[..active_len].chunks_exact_mut(2) {
+            for chunk in out_burst[..active_len].as_chunks_mut::<2>().0 {
                 chunk.swap(0, 1);
             }
         }

@@ -1500,10 +1500,7 @@ impl AppState {
     pub fn record_seek_osd(&mut self, delta: f64) {
         if delta.abs() < 0.1 {
             self.cumulative_scrub = 0.0;
-            self.osd_text = Some(format!(
-                "{}1 Frame",
-                if delta > 0.0 { "+" } else { "-" }
-            ));
+            self.osd_text = Some(format!("{}1 Frame", if delta > 0.0 { "+" } else { "-" }));
             self.osd_timer = 2.0;
             return;
         }
@@ -1520,7 +1517,11 @@ impl AppState {
             self.cumulative_scrub = delta;
         }
 
-        let sign = if self.cumulative_scrub >= 0.0 { "+" } else { "" };
+        let sign = if self.cumulative_scrub >= 0.0 {
+            "+"
+        } else {
+            ""
+        };
         self.osd_text = Some(format!("{}{:.1}s", sign, self.cumulative_scrub));
         self.osd_timer = 2.0;
     }
@@ -1547,11 +1548,9 @@ impl AppState {
             if self.passthrough_enabled {
                 self.passthrough_enabled = false;
             }
-            self.osd_text =
-                Some("🔊 11.1 (7.1.4 Spatial Audio / MPEG-H 3D): ON".to_string());
+            self.osd_text = Some("🔊 11.1 (7.1.4 Spatial Audio / MPEG-H 3D): ON".to_string());
         } else {
-            self.osd_text =
-                Some("🔊 11.1 (7.1.4): OFF (Uncompressed 7.1 LPCM)".to_string());
+            self.osd_text = Some("🔊 11.1 (7.1.4): OFF (Uncompressed 7.1 LPCM)".to_string());
         }
         self.osd_timer = 3.0;
         if self.file_loaded {
