@@ -5598,3 +5598,268 @@ fn test_vis_spectrum_canyon_snapshot() {
         center_diff_pixels
     );
 }
+
+#[test]
+fn test_vis_midnight_storm_snapshot() {
+    let instance = Instance::new(InstanceDescriptor {
+        backends: Backends::PRIMARY,
+        flags: InstanceFlags::default(),
+        backend_options: BackendOptions::default(),
+        display: None,
+        memory_budget_thresholds: MemoryBudgetThresholds::default(),
+    });
+
+    let adapter = match pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
+        power_preference: PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+    })) {
+        Ok(a) => a,
+        Err(_) => {
+            println!("No GPU adapter found, skipping test.");
+            return;
+        }
+    };
+
+    let (device, queue) = pollster::block_on(adapter.request_device(&DeviceDescriptor {
+        label: Some("Midnight Storm Test Device"),
+        required_features: Features::empty(),
+        required_limits: Limits::default(),
+        memory_hints: MemoryHints::default(),
+        ..Default::default()
+    }))
+    .unwrap();
+
+    let width = 1280u32;
+    let height = 720u32;
+    let aspect = (width as f32) / (height as f32);
+    let color_format = TextureFormat::Rgba8UnormSrgb;
+
+    let render_target = device.create_texture(&TextureDescriptor {
+        label: Some("Midnight Storm Target"),
+        size: Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: color_format,
+        usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let color_view = render_target.create_view(&TextureViewDescriptor::default());
+
+    let mut uniforms = crate::engine::AudioUniforms {
+        spectrum: [0.0; 1024],
+        fire_heat: [0.0; 1024],
+        channels: [0.88; 32],
+        channel_peaks: [0.95; 32],
+        spatial_channels: [0.85; 16],
+        display_order: [0; 16],
+        channel_phases: [0.0; 32],
+        num_channels: 16,
+        mode: 16,
+        time: 12.02,
+        duration: 180.0,
+        smooth_time: 12.02,
+        heatmap_row: 64,
+        fft_channels: 2,
+        num_spatial_channels: 12,
+        ui_meters_rect: [0.0; 4],
+        ui_heatmap_rect: [0.0; 4],
+        ui_fire_rect: [0.0; 4],
+        waveform_resolution: 1024,
+        waveform_history_size: 60,
+        frame_count: 720,
+        step_fraction: 0.25,
+        steps_to_fill: 1,
+        aspect_ratio: aspect,
+        frame_dt: 0.016,
+        history_cam_z: 32.0,
+        fire_intensity: 1.0,
+        _pad1: 0.0,
+        _pad2: 0.0,
+        _pad3: 0.0,
+    };
+
+    for i in 0..1024 {
+        let f = (i as f32) / 1024.0;
+        let bass_boost = (-f * 6.5).exp() * 94.0;
+        let mid_groove = (-(f - 0.18).powi(2) / 0.025).exp() * 74.0;
+        let high_sparkle = (-(f - 0.55).powi(2) / 0.06).exp() * 62.0;
+        let val = (bass_boost + mid_groove + high_sparkle).clamp(10.0, 100.0);
+        uniforms.spectrum[i] = val;
+    }
+
+    let uniform_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("Audio Uniform Buffer"),
+        size: std::mem::size_of::<crate::engine::AudioUniforms>() as u64,
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+
+    let bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("storm_bind_group_layout"),
+        entries: &[BindGroupLayoutEntry {
+            binding: 0,
+            visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+            ty: BindingType::Buffer {
+                ty: BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+
+    let uniform_bind_group = device.create_bind_group(&BindGroupDescriptor {
+        label: Some("storm_bind_group"),
+        layout: &bind_group_layout,
+        entries: &[BindGroupEntry {
+            binding: 0,
+            resource: uniform_buffer.as_entire_binding(),
+        }],
+    });
+
+    let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+        label: Some("Storm Pipeline Layout"),
+        bind_group_layouts: &[Some(&bind_group_layout)],
+        immediate_size: 0,
+    });
+
+    let full_source = resolve_shader_includes(include_str!("../src/shaders/vis_rain.wgsl"));
+    let shader_module = device.create_shader_module(ShaderModuleDescriptor {
+        label: Some("Midnight Storm Shader"),
+        source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&full_source)),
+    });
+
+    let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+        label: Some("Midnight Storm Pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: VertexState {
+            module: &shader_module,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: PipelineCompilationOptions::default(),
+        },
+        fragment: Some(FragmentState {
+            module: &shader_module,
+            entry_point: Some("fs_main"),
+            targets: &[Some(ColorTargetState {
+                format: color_format,
+                blend: Some(BlendState::REPLACE),
+                write_mask: ColorWrites::ALL,
+            })],
+            compilation_options: PipelineCompilationOptions::default(),
+        }),
+        primitive: PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
+    {
+        let mut rp = encoder.begin_render_pass(&RenderPassDescriptor {
+            label: Some("Midnight Storm Render Pass"),
+            color_attachments: &[Some(RenderPassColorAttachment {
+                view: &color_view,
+                resolve_target: None,
+                ops: Operations {
+                    load: LoadOp::Clear(Color::BLACK),
+                    store: StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        rp.set_pipeline(&pipeline);
+        rp.set_bind_group(0, &uniform_bind_group, &[]);
+        rp.draw(0..3, 0..1);
+    }
+
+    let bytes_per_pixel = 4u32;
+    let unpadded_bytes_per_row = width * bytes_per_pixel;
+    let align = 256u32;
+    let bytes_per_row = (unpadded_bytes_per_row + align - 1) & !(align - 1);
+
+    let out_buf = device.create_buffer(&BufferDescriptor {
+        label: Some("Storm Readback Buf"),
+        size: (bytes_per_row * height) as u64,
+        usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    encoder.copy_texture_to_buffer(
+        TexelCopyTextureInfo {
+            texture: &render_target,
+            mip_level: 0,
+            origin: Origin3d::ZERO,
+            aspect: TextureAspect::All,
+        },
+        TexelCopyBufferInfo {
+            buffer: &out_buf,
+            layout: TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(height),
+            },
+        },
+        Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(Some(encoder.finish()));
+
+    let slice = out_buf.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(MapMode::Read, move |res| {
+        tx.send(res).unwrap();
+    });
+    let _ = device.poll(PollType::Wait {
+        submission_index: None,
+        timeout: None,
+    });
+    rx.recv().unwrap().unwrap();
+
+    let data = slice.get_mapped_range();
+    let mut img = image::ImageBuffer::<image::Rgba<u8>, _>::new(width, height);
+    let mut bright_bolt_pixels = 0usize;
+    for y in 0..height {
+        let row_start = (y * bytes_per_row) as usize;
+        for x in 0..width {
+            let px_start = row_start + (x * bytes_per_pixel) as usize;
+            let r = data[px_start];
+            let g = data[px_start + 1];
+            let b = data[px_start + 2];
+            let a = data[px_start + 3];
+            if r > 200 && g > 210 && b > 235 {
+                bright_bolt_pixels += 1;
+            }
+            img.put_pixel(x, y, image::Rgba([r, g, b, a]));
+        }
+    }
+    drop(data);
+    out_buf.unmap();
+
+    let out_path = std::path::PathBuf::from("target/vis_midnight_storm.png");
+    img.save(&out_path).unwrap();
+    println!(
+        "Saved Midnight Storm snapshot to {:?} (bright_bolt_pixels={})",
+        out_path, bright_bolt_pixels
+    );
+
+    assert!(
+        bright_bolt_pixels > 400,
+        "Expected active lightning plasma cores, got only {} bright pixels",
+        bright_bolt_pixels
+    );
+}

@@ -1598,6 +1598,90 @@ pub fn query_active_audio_sink_topology(mic: bool) -> Option<AudioSinkTopology> 
         }
     }
 
+    // On Windows, query the default endpoint's PropertyStore (PKEY_Device_FriendlyName and
+    // PKEY_AudioEngine_DeviceFormat) directly without calling `IMMDevice::Activate::<IAudioClient>()`
+    // or `GetMixFormat()`, avoiding periodic driver contention and HDMI glitches during playback.
+    #[cfg(windows)]
+    {
+        use windows::Win32::Foundation::PROPERTYKEY;
+        use windows::Win32::Media::Audio::{
+            IMMDeviceEnumerator, MMDeviceEnumerator, WAVEFORMATEX, eCapture, eConsole, eRender,
+        };
+        use windows::Win32::System::Com::{
+            CLSCTX_ALL, COINIT_MULTITHREADED, CoCreateInstance, CoInitializeEx, STGM_READ,
+        };
+        use windows::Win32::System::Variant::{VT_BLOB, VT_LPWSTR};
+        use windows::core::GUID;
+
+        const PKEY_DEVICE_FRIENDLY_NAME: PROPERTYKEY = PROPERTYKEY {
+            fmtid: GUID::from_u128(0xa45c254e_df1c_4efd_8020_67d146a850e0),
+            pid: 14,
+        };
+        const PKEY_AUDIO_ENGINE_DEVICE_FORMAT: PROPERTYKEY = PROPERTYKEY {
+            fmtid: GUID::from_u128(0xf19f064d_082c_4e27_bc73_6882a1bb8e4c),
+            pid: 0,
+        };
+
+        unsafe {
+            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            if let Ok(enumerator) =
+                CoCreateInstance::<_, IMMDeviceEnumerator>(&MMDeviceEnumerator, None, CLSCTX_ALL)
+                && let Ok(dev) = enumerator
+                    .GetDefaultAudioEndpoint(if mic { eCapture } else { eRender }, eConsole)
+                && let Ok(store) = dev.OpenPropertyStore(STGM_READ)
+            {
+                let name = store
+                    .GetValue(&PKEY_DEVICE_FRIENDLY_NAME)
+                    .ok()
+                    .and_then(|pv| {
+                        if pv.Anonymous.Anonymous.vt == VT_LPWSTR {
+                            let pwstr = pv.Anonymous.Anonymous.Anonymous.pwszVal;
+                            if !pwstr.is_null() {
+                                pwstr.to_string().ok()
+                            } else {
+                                None
+                            }
+                        } else {
+                            let s = pv.to_string();
+                            if s.is_empty() { None } else { Some(s) }
+                        }
+                    });
+                let channels = store
+                    .GetValue(&PKEY_AUDIO_ENGINE_DEVICE_FORMAT)
+                    .ok()
+                    .and_then(|pv| {
+                        if pv.Anonymous.Anonymous.vt == VT_BLOB {
+                            let blob = pv.Anonymous.Anonymous.Anonymous.blob;
+                            if !blob.pBlobData.is_null()
+                                && (blob.cbSize as usize) >= std::mem::size_of::<WAVEFORMATEX>()
+                            {
+                                let wf =
+                                    std::ptr::read_unaligned(blob.pBlobData as *const WAVEFORMATEX);
+                                Some(wf.nChannels.max(1))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        }
+                    })
+                    .unwrap_or(if mic { 1 } else { 2 });
+                let sink_id = dev
+                    .GetId()
+                    .ok()
+                    .and_then(|s| s.to_string().ok())
+                    .or_else(|| name.clone());
+                if let (Some(id), Some(desc)) = (sink_id, name) {
+                    return Some(AudioSinkTopology {
+                        sink_id: id,
+                        description: desc,
+                        channels,
+                    });
+                }
+            }
+        }
+    }
+
     let host = cpal::default_host();
     let default_dev = if mic {
         host.default_input_device()
@@ -1730,15 +1814,33 @@ pub fn evaluate_topology_transition(
 
 pub fn spawn_audio_topology_watcher(shared_state: Arc<Mutex<AppState>>, is_mic: bool) {
     std::thread::spawn(move || {
-        let mut last_topology: Option<AudioSinkTopology> = None;
+        let mut last_topology: Option<AudioSinkTopology> = query_active_audio_sink_topology(is_mic);
+        if let Some(ref init_topo) = last_topology
+            && let Ok(mut state) = shared_state.lock()
+        {
+            state.active_audio_sink_id = Some(init_topo.sink_id.clone());
+            state.active_audio_sink_description = Some(init_topo.description.clone());
+            state.active_audio_sink_channels = init_topo.channels;
+        }
+
         loop {
-            std::thread::sleep(std::time::Duration::from_millis(750));
+            std::thread::sleep(std::time::Duration::from_millis(2000));
 
             let Some(next_topo) = query_active_audio_sink_topology(is_mic) else {
                 continue;
             };
 
             let topology_changed = last_topology.as_ref() != Some(&next_topo);
+            if !topology_changed {
+                let is_dummy = shared_state
+                    .lock()
+                    .map(|s| s.is_dummy_audio_output)
+                    .unwrap_or(false);
+                if !is_dummy {
+                    continue;
+                }
+            }
+
             let refreshed_devices = if topology_changed {
                 Some(get_available_audio_devices(is_mic))
             } else {
@@ -7643,6 +7745,10 @@ pub fn start_audio_thread(
                     } else {
                         true
                     };
+                    let allow_exclusive = passthrough_enabled
+                        || (surround_upmix_user_overridden && surround_upmix_enabled)
+                        || mpegh_user_overridden
+                        || target_channels > 2;
                     let wasapi_target_dev = if dev_idx == 0
                         && is_default_audio_device_selection(selected_device_name.as_deref())
                     {
@@ -7658,7 +7764,7 @@ pub fn start_audio_thread(
                         target_channels,
                         want_wasapi_upmix,
                         mpegh_bitstream,
-                        mpegh_user_overridden,
+                        allow_exclusive,
                         file_path,
                     ) {
                         Ok(handle) => {
@@ -9778,7 +9884,6 @@ fn run_linux_pipewire_mpegh_714(
             let s = shared_state_thread.lock().unwrap();
             (s.seek_epoch, s.surround_upmix)
         };
-        let silence_burst = vec![0u8; 4096 * 4];
         let mut iec_byte_queue: std::collections::VecDeque<u8> =
             std::collections::VecDeque::with_capacity(65536);
 
@@ -9795,9 +9900,7 @@ fn run_linux_pipewire_mpegh_714(
                     state.raw_channel_vus.fill(0.0);
                     state.raw_spectrum_data.fill(0.0);
                 }
-                if pw_stdin.write_all(&silence_burst).is_err() {
-                    break;
-                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
                 continue;
             }
 
@@ -9936,13 +10039,16 @@ fn run_wasapi_exclusive_multichannel(
     target_channels: u16,
     surround_upmix_enabled: bool,
     mpegh_bitstream: bool,
-    _mpegh_user_overridden: bool,
+    allow_exclusive: bool,
     file_path: &str,
 ) -> Result<PlaybackHandle> {
     use windows::Win32::Foundation::{CloseHandle, HANDLE, PROPERTYKEY};
     use windows::Win32::Media::Audio::*;
     use windows::Win32::System::Com::*;
-    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+    use windows::Win32::System::Threading::{
+        CreateEventW, GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
+        WaitForSingleObject,
+    };
     use windows::Win32::System::Variant::VT_LPWSTR;
     use windows::core::GUID;
 
@@ -10715,6 +10821,7 @@ fn run_wasapi_exclusive_multichannel(
     let thread_handle = std::thread::spawn(move || {
         unsafe {
             let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
+            let _ = SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
         }
 
         let enumerator: IMMDeviceEnumerator =
@@ -10901,44 +11008,9 @@ fn run_wasapi_exclusive_multichannel(
                 }
 
                 for &rate in &rate_candidates {
-                    // 1. Primary path: WASAPI Exclusive Mode LPCM (bypasses AudioDg.exe's 2ch Shared Mode
-                    // mixer and reconfigures the physical HDMI Audio InfoFrame to multi-channel surround).
-                    for &fmt in &exclusive_fmt_candidates {
-                        match try_open_exclusive_client(&dev, ch, rate, mask, fmt) {
-                            Ok((ac, rc, ev, buf_frames)) => {
-                                eprintln!(
-                                    "[audio] WASAPI Exclusive Multichannel LPCM negotiated on '{}': {}ch (mask 0x{:X}) @ {} Hz [{}] (buffer {} frames)",
-                                    dev_name,
-                                    ch,
-                                    mask,
-                                    rate,
-                                    fmt.label(),
-                                    buf_frames
-                                );
-                                opened = Some((
-                                    dev,
-                                    dev_name,
-                                    Some((ac, rc)),
-                                    ev,
-                                    buf_frames,
-                                    ch,
-                                    mask,
-                                    rate,
-                                    fmt,
-                                    true,
-                                    None,
-                                    None,
-                                ));
-                                break 'dev_loop;
-                            }
-                            Err(e) => {
-                                last_err = e;
-                            }
-                        }
-                    }
-
-                    // 2. Fallback path: WASAPI Shared Mode ONLY when the Windows Shared Mode MixFormat
-                    // itself has >= `ch` discrete channels (so AudioDg.exe will not downmix to stereo).
+                    // 1. Primary LPCM path: WASAPI Shared Mode whenever the Windows Shared Mode MixFormat
+                    // itself has >= `ch` discrete channels (so AudioDg.exe outputs all `ch` channels natively
+                    // without Exclusive Mode HDMI InfoFrame renegotiation or locking out other apps).
                     if mix_channels >= ch {
                         for &fmt in &shared_fmt_candidates {
                             match try_open_shared_client(&dev, ch, rate, mask, fmt) {
@@ -10974,11 +11046,51 @@ fn run_wasapi_exclusive_multichannel(
                             }
                         }
                     }
+
+                    // 2. Fallback path: WASAPI Exclusive Mode LPCM (up to 8ch; standard HDMI LPCM maxes out
+                    // at 8 channels, so skip `ch > 8` to avoid hammering the GPU HDMI driver with unsupported
+                    // 12ch Exclusive LPCM probes). Only probe Exclusive Mode when `allow_exclusive` is true
+                    // (e.g. passthrough enabled, user-overridden surround/11.1, or discrete multichannel source).
+                    if allow_exclusive && mix_channels < ch && ch <= 8 {
+                        for &fmt in &exclusive_fmt_candidates {
+                            match try_open_exclusive_client(&dev, ch, rate, mask, fmt) {
+                                Ok((ac, rc, ev, buf_frames)) => {
+                                    eprintln!(
+                                        "[audio] WASAPI Exclusive Multichannel LPCM negotiated on '{}': {}ch (mask 0x{:X}) @ {} Hz [{}] (buffer {} frames)",
+                                        dev_name,
+                                        ch,
+                                        mask,
+                                        rate,
+                                        fmt.label(),
+                                        buf_frames
+                                    );
+                                    opened = Some((
+                                        dev,
+                                        dev_name,
+                                        Some((ac, rc)),
+                                        ev,
+                                        buf_frames,
+                                        ch,
+                                        mask,
+                                        rate,
+                                        fmt,
+                                        true,
+                                        None,
+                                        None,
+                                    ));
+                                    break 'dev_loop;
+                                }
+                                Err(e) => {
+                                    last_err = e;
+                                }
+                            }
+                        }
+                    }
                 }
 
                 // 3. Direct HDMI AVR fallback: probe native EDID IEC 61937-13 MPEG-H 3D Audio (CICP Layout 19)
                 // when connected directly to an HDMI sink that advertises MPEG-H (`0x00000019` / `0x0000000f`).
-                if ch == 12 && mpegh_bitstream {
+                if allow_exclusive && ch == 12 && mpegh_bitstream {
                     match try_open_exclusive_mpegh_iec61937_client(&dev, false) {
                         Ok((ac, rc, ev, buf_frames, rate_factor, carrier_label)) => {
                             match crate::mpegh::Mpegh714Encoder::new(rate_factor as u8, true) {
@@ -11028,9 +11140,9 @@ fn run_wasapi_exclusive_multichannel(
         let (
             active_device,
             active_device_name,
-            wasapi_clients,
-            event,
-            buffer_frames,
+            mut wasapi_clients,
+            mut event,
+            mut buffer_frames,
             negotiated_channels,
             negotiated_mask,
             negotiated_rate,
@@ -11072,8 +11184,10 @@ fn run_wasapi_exclusive_multichannel(
             )))
             .is_err()
         {
-            unsafe {
-                let _ = CloseHandle(event);
+            if !event.is_invalid() {
+                unsafe {
+                    let _ = CloseHandle(event);
+                }
             }
             drop(spatial_state);
             drop(wasapi_clients);
@@ -11088,8 +11202,10 @@ fn run_wasapi_exclusive_multichannel(
         let (ready_rx, free_tx, tx) = match pipe_rx.recv() {
             Ok(pipes) => pipes,
             Err(_) => {
-                unsafe {
-                    let _ = CloseHandle(event);
+                if !event.is_invalid() {
+                    unsafe {
+                        let _ = CloseHandle(event);
+                    }
                 }
                 drop(spatial_state);
                 drop(wasapi_clients);
@@ -11145,6 +11261,21 @@ fn run_wasapi_exclusive_multichannel(
             std::collections::VecDeque::new()
         };
         let mut stream_started = !is_mpegh_iec_bitstream;
+        let mut consecutive_render_errors = 0u32;
+
+        let is_fatal_device_error = |hr: i32| -> bool {
+            const AUDCLNT_E_DEVICE_INVALIDATED_HR: i32 = 0x88890004u32 as i32;
+            const AUDCLNT_E_RESOURCES_INVALIDATED_HR: i32 = 0x88890026u32 as i32;
+            const SPTLAUDCLNT_E_STREAM_NOT_AVAILABLE_HR: i32 = 0x88890106u32 as i32;
+            const SPTLAUDCLNT_E_INTERNAL_HR: i32 = 0x8889010Du32 as i32;
+            matches!(
+                hr,
+                AUDCLNT_E_DEVICE_INVALIDATED_HR
+                    | AUDCLNT_E_RESOURCES_INVALIDATED_HR
+                    | SPTLAUDCLNT_E_STREAM_NOT_AVAILABLE_HR
+                    | SPTLAUDCLNT_E_INTERNAL_HR
+            )
+        };
 
         let (mut latest_seek_epoch, mut upmix_cfg) = {
             let state = shared_state_thread.lock().unwrap();
@@ -11163,7 +11294,9 @@ fn run_wasapi_exclusive_multichannel(
                         "[audio] ISpatialAudioObjectRenderStream::Start() failed: {:?}",
                         e
                     );
-                    let _ = CloseHandle(event);
+                    if !event.is_invalid() {
+                        let _ = CloseHandle(event);
+                    }
                     drop(spatial_state);
                     drop(wasapi_clients);
                     drop(active_device);
@@ -11191,7 +11324,9 @@ fn run_wasapi_exclusive_multichannel(
                 }
                 if let Err(e) = audio_client.Start() {
                     eprintln!("[audio] WASAPI Start() failed: {:?}", e);
-                    let _ = CloseHandle(event);
+                    if !event.is_invalid() {
+                        let _ = CloseHandle(event);
+                    }
                     drop(spatial_state);
                     drop(wasapi_clients);
                     drop(active_device);
@@ -11228,13 +11363,160 @@ fn run_wasapi_exclusive_multichannel(
                 chunk_frame_pos = 0;
             }
 
-            if !stream_started && is_paused {
+            // Stop active hardware stream / release Exclusive Mode lock while paused so we never
+            // pump 100 Hz spatial objects or hold an Exclusive lock when playback is paused.
+            if is_paused {
                 if let Ok(mut state) = shared_state_thread.try_lock() {
                     state.raw_channel_vus.fill(0.0);
                     state.raw_spectrum_data.fill(0.0);
                 }
-                std::thread::sleep(std::time::Duration::from_millis(10));
+                if let Some(ref spatial) = spatial_state {
+                    if stream_started {
+                        unsafe {
+                            let _ = spatial.stream.Stop();
+                            let _ = spatial.stream.Reset();
+                        }
+                        stream_started = false;
+                    }
+                } else if is_exclusive {
+                    if let Some((ac, rc)) = wasapi_clients.take() {
+                        eprintln!(
+                            "[audio] Playback paused; releasing WASAPI Exclusive Multichannel hardware lock..."
+                        );
+                        unsafe {
+                            let _ = ac.Stop();
+                            let _ = ac.Reset();
+                        }
+                        drop(rc);
+                        drop(ac);
+                        if !event.is_invalid() {
+                            unsafe {
+                                let _ = CloseHandle(event);
+                            }
+                            event = HANDLE::default();
+                        }
+                        stream_started = false;
+                    }
+                } else if stream_started && let Some((ref ac, _)) = wasapi_clients {
+                    unsafe {
+                        let _ = ac.Stop();
+                        let _ = ac.Reset();
+                    }
+                    stream_started = false;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(15));
                 continue;
+            }
+
+            // Resume from pause: restart Spatial Audio / Shared Mode stream or re-acquire Exclusive Mode lock.
+            if let Some(ref spatial) = spatial_state {
+                if !stream_started {
+                    startup_fade_pos = 0;
+                    unsafe {
+                        if let Err(e) = spatial.stream.Start() {
+                            eprintln!(
+                                "[audio] ISpatialAudioObjectRenderStream::Start() on resume failed: {:?}",
+                                e
+                            );
+                            if let Ok(mut state) = shared_state_thread.lock() {
+                                state.audio_device_lost = true;
+                            }
+                            break;
+                        }
+                    }
+                    stream_started = true;
+                }
+            } else if is_exclusive && wasapi_clients.is_none() {
+                eprintln!(
+                    "[audio] Playback resumed; re-acquiring WASAPI Exclusive Multichannel hardware lock..."
+                );
+                if is_mpegh_iec_bitstream {
+                    match try_open_exclusive_mpegh_iec61937_client(&active_device, false) {
+                        Ok((new_ac, new_rc, new_ev, new_frames, _, _)) => {
+                            buffer_frames = new_frames;
+                            event = new_ev;
+                            wasapi_clients = Some((new_ac, new_rc));
+                            iec_byte_queue.clear();
+                            if let Some((ref mut mpegh_encoder, _, _)) = mpegh_state {
+                                mpegh_encoder.clear_accumulator();
+                            }
+                            startup_fade_pos = 0;
+                            stream_started = false;
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[audio] Waiting to re-acquire WASAPI Exclusive MPEG-H device: {:?}",
+                                e
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                            continue;
+                        }
+                    }
+                } else {
+                    match try_open_exclusive_client(
+                        &active_device,
+                        negotiated_channels,
+                        negotiated_rate,
+                        negotiated_mask,
+                        negotiated_fmt,
+                    ) {
+                        Ok((new_ac, new_rc, new_ev, new_frames)) => {
+                            buffer_frames = new_frames;
+                            event = new_ev;
+                            startup_fade_pos = 0;
+                            warmup_silent_buffers = 1;
+                            unsafe {
+                                if let Ok(buf_ptr) = new_rc.GetBuffer(buffer_frames) {
+                                    std::ptr::write_bytes(
+                                        buf_ptr,
+                                        0,
+                                        (buffer_frames as usize) * frame_bytes,
+                                    );
+                                    let _ = new_rc.ReleaseBuffer(
+                                        buffer_frames,
+                                        AUDCLNT_BUFFERFLAGS_SILENT.0 as u32,
+                                    );
+                                }
+                                let _ = new_ac.Start();
+                            }
+                            wasapi_clients = Some((new_ac, new_rc));
+                            stream_started = true;
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "[audio] Waiting to re-acquire WASAPI Exclusive LPCM device: {:?}",
+                                e
+                            );
+                            std::thread::sleep(std::time::Duration::from_millis(100));
+                            continue;
+                        }
+                    }
+                }
+            } else if !is_exclusive
+                && !stream_started
+                && !is_mpegh_iec_bitstream
+                && let Some((ref audio_client, ref render_client)) = wasapi_clients
+            {
+                startup_fade_pos = 0;
+                unsafe {
+                    let padding = audio_client.GetCurrentPadding().unwrap_or(0);
+                    let prime_frames = buffer_frames.saturating_sub(padding);
+                    if prime_frames > 0
+                        && let Ok(buf_ptr) = render_client.GetBuffer(prime_frames)
+                    {
+                        std::ptr::write_bytes(buf_ptr, 0, (prime_frames as usize) * frame_bytes);
+                        let _ = render_client
+                            .ReleaseBuffer(prime_frames, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32);
+                    }
+                    if let Err(e) = audio_client.Start() {
+                        eprintln!("[audio] WASAPI Shared Start() on resume failed: {:?}", e);
+                        if let Ok(mut state) = shared_state_thread.lock() {
+                            state.audio_device_lost = true;
+                        }
+                        break;
+                    }
+                }
+                stream_started = true;
             }
 
             if stream_started {
@@ -11255,14 +11537,18 @@ fn run_wasapi_exclusive_multichannel(
                         .stream
                         .BeginUpdatingAudioObjects(&mut dyn_count, &mut avail_frames)
                 } {
-                    eprintln!(
-                        "[audio] ISpatialAudioObjectRenderStream::BeginUpdatingAudioObjects failed: {:?}",
-                        e
-                    );
-                    if let Ok(mut state) = shared_state_thread.lock() {
-                        state.audio_device_lost = true;
+                    consecutive_render_errors += 1;
+                    if is_fatal_device_error(e.code().0) || consecutive_render_errors >= 8 {
+                        eprintln!(
+                            "[audio] ISpatialAudioObjectRenderStream::BeginUpdatingAudioObjects failed: {:?}",
+                            e
+                        );
+                        if let Ok(mut state) = shared_state_thread.lock() {
+                            state.audio_device_lost = true;
+                        }
+                        break;
                     }
-                    break;
+                    continue;
                 }
                 if avail_frames == 0 {
                     unsafe {
@@ -11288,20 +11574,6 @@ fn run_wasapi_exclusive_multichannel(
                 }
                 if buffer_err {
                     unsafe {
-                        let _ = spatial.stream.EndUpdatingAudioObjects();
-                    }
-                    continue;
-                }
-
-                if is_paused {
-                    if let Ok(mut state) = shared_state_thread.try_lock() {
-                        state.raw_channel_vus.fill(0.0);
-                        state.raw_spectrum_data.fill(0.0);
-                    }
-                    unsafe {
-                        for &ptr in &obj_ptrs {
-                            std::ptr::write_bytes(ptr, 0, frames_to_render);
-                        }
                         let _ = spatial.stream.EndUpdatingAudioObjects();
                     }
                     continue;
@@ -11463,15 +11735,20 @@ fn run_wasapi_exclusive_multichannel(
                 }
 
                 if let Err(e) = unsafe { spatial.stream.EndUpdatingAudioObjects() } {
-                    eprintln!(
-                        "[audio] ISpatialAudioObjectRenderStream::EndUpdatingAudioObjects failed: {:?}",
-                        e
-                    );
-                    if let Ok(mut state) = shared_state_thread.lock() {
-                        state.audio_device_lost = true;
+                    consecutive_render_errors += 1;
+                    if is_fatal_device_error(e.code().0) || consecutive_render_errors >= 8 {
+                        eprintln!(
+                            "[audio] ISpatialAudioObjectRenderStream::EndUpdatingAudioObjects failed: {:?}",
+                            e
+                        );
+                        if let Ok(mut state) = shared_state_thread.lock() {
+                            state.audio_device_lost = true;
+                        }
+                        break;
                     }
-                    break;
+                    continue;
                 }
+                consecutive_render_errors = 0;
             } else if let Some((ref audio_client, ref render_client)) = wasapi_clients {
                 let avail_frames = if is_exclusive {
                     buffer_frames
@@ -11479,14 +11756,18 @@ fn run_wasapi_exclusive_multichannel(
                     let padding = match unsafe { audio_client.GetCurrentPadding() } {
                         Ok(p) => p,
                         Err(e) => {
-                            eprintln!(
-                                "[audio] WASAPI Shared GetCurrentPadding failed (device disconnected?): {:?}",
-                                e
-                            );
-                            if let Ok(mut state) = shared_state_thread.lock() {
-                                state.audio_device_lost = true;
+                            consecutive_render_errors += 1;
+                            if is_fatal_device_error(e.code().0) || consecutive_render_errors >= 8 {
+                                eprintln!(
+                                    "[audio] WASAPI Shared GetCurrentPadding failed (device disconnected?): {:?}",
+                                    e
+                                );
+                                if let Ok(mut state) = shared_state_thread.lock() {
+                                    state.audio_device_lost = true;
+                                }
+                                break;
                             }
-                            break;
+                            continue;
                         }
                     };
                     buffer_frames.saturating_sub(padding)
@@ -11511,36 +11792,21 @@ fn run_wasapi_exclusive_multichannel(
                     continue;
                 }
 
-                if is_paused {
-                    if let Ok(mut state) = shared_state_thread.try_lock() {
-                        state.raw_channel_vus.fill(0.0);
-                        state.raw_spectrum_data.fill(0.0);
-                    }
-                    if let Ok(buf_ptr) = unsafe { render_client.GetBuffer(avail_frames) } {
-                        unsafe {
-                            std::ptr::write_bytes(
-                                buf_ptr,
-                                0,
-                                (avail_frames as usize) * frame_bytes,
-                            );
-                            let _ = render_client
-                                .ReleaseBuffer(avail_frames, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32);
-                        }
-                    }
-                    continue;
-                }
-
                 let buf_ptr = match unsafe { render_client.GetBuffer(avail_frames) } {
                     Ok(ptr) => ptr,
                     Err(e) => {
-                        eprintln!(
-                            "[audio] WASAPI Shared GetBuffer failed (device disconnected?): {:?}",
-                            e
-                        );
-                        if let Ok(mut state) = shared_state_thread.lock() {
-                            state.audio_device_lost = true;
+                        consecutive_render_errors += 1;
+                        if is_fatal_device_error(e.code().0) || consecutive_render_errors >= 8 {
+                            eprintln!(
+                                "[audio] WASAPI GetBuffer failed (device disconnected?): {:?}",
+                                e
+                            );
+                            if let Ok(mut state) = shared_state_thread.lock() {
+                                state.audio_device_lost = true;
+                            }
+                            break;
                         }
-                        break;
+                        continue;
                     }
                 };
 
@@ -11885,12 +12151,17 @@ fn run_wasapi_exclusive_multichannel(
 
                 unsafe {
                     if let Err(e) = render_client.ReleaseBuffer(avail_frames, 0) {
-                        eprintln!("[audio] WASAPI ReleaseBuffer failed: {:?}", e);
-                        if let Ok(mut state) = shared_state_thread.lock() {
-                            state.audio_device_lost = true;
+                        consecutive_render_errors += 1;
+                        if is_fatal_device_error(e.code().0) || consecutive_render_errors >= 8 {
+                            eprintln!("[audio] WASAPI ReleaseBuffer failed: {:?}", e);
+                            if let Ok(mut state) = shared_state_thread.lock() {
+                                state.audio_device_lost = true;
+                            }
+                            break;
                         }
-                        break;
+                        continue;
                     }
+                    consecutive_render_errors = 0;
                     if !stream_started {
                         if let Err(e) = audio_client.Start() {
                             eprintln!("[audio] WASAPI Start() failed: {:?}", e);
@@ -11957,8 +12228,10 @@ fn run_wasapi_exclusive_multichannel(
                 let _ = audio_client.Reset();
             }
         }
-        unsafe {
-            let _ = CloseHandle(event);
+        if !event.is_invalid() {
+            unsafe {
+                let _ = CloseHandle(event);
+            }
         }
         drop(spatial_state);
         drop(wasapi_clients);

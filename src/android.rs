@@ -1069,6 +1069,15 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                                 state.selected_audio_device = Some(dev.clone());
                                 state.audio_device_change_request = Some(dev);
                             }
+                            EngineAction::ToggleSurroundUpmix(val) => {
+                                self.app_state.lock().unwrap().set_surround_upmix(val);
+                            }
+                            EngineAction::ToggleMpeghBitstream(val) => {
+                                self.app_state.lock().unwrap().set_mpegh_bitstream(val);
+                            }
+                            EngineAction::SetSurroundUpmix(cfg) => {
+                                self.app_state.lock().unwrap().surround_upmix = cfg;
+                            }
                             EngineAction::None => {}
                         }
                     }
