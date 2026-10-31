@@ -65,6 +65,11 @@
   <content_rating type="oars-1.1" />
   
   <releases>
+    <release version="0.9.36" date="2026-10-31">
+      <description>
+        <p>Defaulted middle panel to piano roll, consolidated surround upmix controls, enabled Spatial Audio 7.1.4 alongside shared sessions, eliminated WASAPI Exclusive HDMI flicker and topology poll contention, and stopped streams cleanly on pause.</p>
+      </description>
+    </release>
     <release version="0.9.35" date="2026-10-30">
       <description>
         <p>Added 11.1 (7.1.4) Windows Spatial Audio (Dolby Atmos MAT 2.0) and MPEG-H 3D Audio HDMI output, IAMF (Eclipsa Audio) support, flexible N-to-M surround upmixing, and automatic audio topology hotplug adaptation.</p>
