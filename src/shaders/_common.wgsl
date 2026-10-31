@@ -151,8 +151,9 @@ fn stereo_upmix_12(
     mid_e: f32,
     high_e: f32
 ) -> f32 {
+    let _unused_phase = phase_l + phase_r;
     let mid_vu = (ch_l + ch_r) * 0.5;
-    let side_vu = abs(ch_l - ch_r) + abs(sin(phase_l - phase_r)) * min(ch_l, ch_r) * 0.35;
+    let side_vu = abs(ch_l - ch_r);
     switch idx {
         case 0u: { return ch_l; } // FL
         case 1u: { return ch_r; } // FR

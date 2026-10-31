@@ -79,6 +79,7 @@ pub enum EngineAction {
     ToggleSurroundUpmix(bool),
     ToggleMpeghBitstream(bool),
     SetSurroundUpmix(crate::state::SurroundUpmixConfig),
+    SetShowSurroundEq(bool),
 }
 
 #[repr(C)]
@@ -1074,7 +1075,15 @@ pub struct VulkanEngine {
     pub adapter_info: wgpu::AdapterInfo,
     pub config: wgpu::SurfaceConfiguration,
     pub size: winit::dpi::PhysicalSize<u32>,
-    render_pipelines: Vec<wgpu::RenderPipeline>,
+    render_pipelines: Vec<Option<wgpu::RenderPipeline>>,
+    shader_sources: Vec<String>,
+    fallback_pipeline: wgpu::RenderPipeline,
+    fallback_pipeline_3d: wgpu::RenderPipeline,
+    render_pipeline_layout: wgpu::PipelineLayout,
+    render_pipeline_layout_3d: wgpu::PipelineLayout,
+    flip_render_pipeline_layout: wgpu::PipelineLayout,
+    lyrics_render_pipeline_layout_3d: wgpu::PipelineLayout,
+    pipeline_cache: Option<wgpu::PipelineCache>,
     hud_pipeline: wgpu::RenderPipeline,
     uniform_buffer: wgpu::Buffer,
     waveform_storage_buffer: wgpu::Buffer,
@@ -1184,6 +1193,12 @@ pub struct VulkanEngine {
     neon_bg_pipeline: wgpu::RenderPipeline,
     storm_sky_pipeline: wgpu::RenderPipeline,
 
+    pending_uniforms: Option<AudioUniforms>,
+    cached_meta_path: String,
+    cached_file_dir: String,
+    cached_file_len: Option<u64>,
+    last_acquire_instant: Option<std::time::Instant>,
+
     // 3D Engine Extensions
     camera_uniform_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
@@ -1198,13 +1213,17 @@ pub struct VulkanEngine {
     play_time: f64,
     smooth_audio_seconds: f64,
     last_raw_state_seconds: f64,
-    smooth_dt: f64,
+    pub smooth_dt: f64,
     last_history_push_count: u64,
     time_since_last_push: f64,
     measured_push_interval: f64,
     vu_needle_angles: Vec<f32>,
     vu_needle_velocities: Vec<f32>,
     channel_phases: [f32; 32],
+    vu_prev_active_segments: [u32; 32],
+    vu_ghost1: [f32; 32],
+    vu_ghost2: [f32; 32],
+    vu_prev_num_channels: u32,
     // Change detection for waveform history uploads (skip 1.2MB write when unchanged)
     last_uploaded_push_count: u64,
     last_uploaded_vis_width: u32,
@@ -1216,7 +1235,8 @@ pub struct VulkanEngine {
     pub(crate) splash_cache: SplashCache,
     pub(crate) stats_cache: StatsDisplayCache,
     pub(crate) is_game_mode: bool,
-    pub(crate) last_ui_rects_data: [[f32; 4]; 3],
+    pub(crate) last_steps_to_fill: u32,
+    pub(crate) last_aspect_ratio: f32,
 }
 
 pub fn generate_lamp_mesh() -> (Vec<Vertex>, Vec<u32>) {
@@ -3528,25 +3548,57 @@ impl VulkanEngine {
     pub async fn new(window: Arc<Window>) -> Self {
         let size = window.inner_size();
 
-        // The instance is a handle to our GPU
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::PRIMARY, // Use platform native: Vulkan (Linux/Win) or Metal (MacOS)
+        // On Windows 11, default to the native DX12 backend (DXGI_SWAP_EFFECT_FLIP_DISCARD +
+        // DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT + SetMaximumFrameLatency(2)) over
+        // Vulkan's VK_KHR_win32_surface unless WGPU_BACKEND is explicitly overridden.
+        // AMDVLK's windowed Vulkan surface does not pace to DWM's waitable VBlank/VRR flip clock
+        // when a background game is driving VRR, causing unpaced >144 FPS presentation and flicker.
+        let explicit_backend = wgpu::Backends::from_env();
+        let preferred_backends = explicit_backend.unwrap_or(if cfg!(target_os = "windows") {
+            wgpu::Backends::DX12
+        } else {
+            wgpu::Backends::PRIMARY
+        });
+
+        let mut instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: preferred_backends,
             flags: wgpu::InstanceFlags::default(),
-            backend_options: wgpu::BackendOptions::default(),
+            backend_options: wgpu::BackendOptions::from_env_or_default(),
             display: None,
             memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
         });
 
-        let surface = instance.create_surface(window.clone()).unwrap();
+        let mut surface = instance.create_surface(window.clone()).unwrap();
 
-        let adapter = instance
+        let adapter = match instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
                 compatible_surface: Some(&surface),
                 force_fallback_adapter: false,
             })
             .await
-            .unwrap();
+        {
+            Ok(a) => a,
+            Err(_) if explicit_backend.is_none() && cfg!(target_os = "windows") => {
+                instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                    backends: wgpu::Backends::PRIMARY,
+                    flags: wgpu::InstanceFlags::default(),
+                    backend_options: wgpu::BackendOptions::from_env_or_default(),
+                    display: None,
+                    memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+                });
+                surface = instance.create_surface(window.clone()).unwrap();
+                instance
+                    .request_adapter(&wgpu::RequestAdapterOptions {
+                        power_preference: wgpu::PowerPreference::HighPerformance,
+                        compatible_surface: Some(&surface),
+                        force_fallback_adapter: false,
+                    })
+                    .await
+                    .unwrap()
+            }
+            Err(e) => panic!("Failed to request GPU adapter: {:?}", e),
+        };
         let adapter_info = adapter.get_info();
 
         let mut required_features = wgpu::Features::empty();
@@ -4044,7 +4096,8 @@ impl VulkanEngine {
             .map(|v| resolve_shader_includes(get_shader_source(v.id)))
             .collect();
 
-        let mut render_pipelines = Vec::new();
+        let render_pipelines: Vec<Option<wgpu::RenderPipeline>> =
+            (0..shader_sources.len()).map(|_| None).collect();
 
         let scope_fallback = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let fallback_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
@@ -4054,6 +4107,44 @@ impl VulkanEngine {
 
         let fallback_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("Fallback Render Pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &fallback_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &fallback_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview_mask: None,
+            cache: pipeline_cache_ref,
+        });
+
+        let fallback_pipeline_3d = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Fallback 3D Render Pipeline"),
             layout: Some(&render_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &fallback_shader,
@@ -4097,205 +4188,9 @@ impl VulkanEngine {
         });
         let _ = scope_fallback.pop().await;
 
-        let mut lamp_pipeline = fallback_pipeline.clone();
+        let lamp_pipeline = fallback_pipeline_3d.clone();
 
-        for (i, source) in shader_sources.iter().enumerate() {
-            let vis_def = &crate::state::VISUALIZERS[i];
-            let scope_main = device.push_error_scope(wgpu::ErrorFilter::Validation);
-
-            let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-                label: Some(&format!("Shader {}", i)),
-                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(source.as_str())),
-            });
-
-            let (layout, vertex_buffers, primitive, vs_entry) = if vis_def.id == 20 {
-                (
-                    &biolum_render_pipeline_layout,
-                    vec![Vertex::desc()],
-                    wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::TriangleList,
-                        strip_index_format: None,
-                        front_face: wgpu::FrontFace::Ccw,
-                        cull_mode: None,
-                        polygon_mode: wgpu::PolygonMode::Fill,
-                        unclipped_depth: false,
-                        conservative: false,
-                    },
-                    "vs_main_3d",
-                )
-            } else if vis_def.id == 23 {
-                (
-                    &lyrics_render_pipeline_layout_3d,
-                    vec![Vertex::desc()],
-                    wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::TriangleList,
-                        strip_index_format: None,
-                        front_face: wgpu::FrontFace::Ccw,
-                        cull_mode: None,
-                        polygon_mode: wgpu::PolygonMode::Fill,
-                        unclipped_depth: false,
-                        conservative: false,
-                    },
-                    "vs_main_3d",
-                )
-            } else if vis_def.id == 27 || vis_def.id == 28 {
-                (
-                    &flip_render_pipeline_layout,
-                    Vec::new(),
-                    wgpu::PrimitiveState {
-                        topology: wgpu::PrimitiveTopology::TriangleList,
-                        strip_index_format: None,
-                        front_face: wgpu::FrontFace::Ccw,
-                        cull_mode: None,
-                        polygon_mode: wgpu::PolygonMode::Fill,
-                        unclipped_depth: false,
-                        conservative: false,
-                    },
-                    "vs_main",
-                )
-            } else {
-                match vis_def.pipeline_type {
-                    crate::state::PipelineType::FullscreenQuad => (
-                        &render_pipeline_layout,
-                        Vec::new(),
-                        wgpu::PrimitiveState {
-                            topology: wgpu::PrimitiveTopology::TriangleList,
-                            strip_index_format: None,
-                            front_face: wgpu::FrontFace::Ccw,
-                            cull_mode: None,
-                            polygon_mode: wgpu::PolygonMode::Fill,
-                            unclipped_depth: false,
-                            conservative: false,
-                        },
-                        "vs_main",
-                    ),
-                    crate::state::PipelineType::Mesh3D { .. } => (
-                        &render_pipeline_layout_3d,
-                        vec![Vertex::desc()],
-                        wgpu::PrimitiveState {
-                            topology: wgpu::PrimitiveTopology::TriangleList,
-                            strip_index_format: None,
-                            front_face: wgpu::FrontFace::Ccw,
-                            cull_mode: None,
-                            polygon_mode: wgpu::PolygonMode::Fill,
-                            unclipped_depth: false,
-                            conservative: false,
-                        },
-                        "vs_main_3d",
-                    ),
-                }
-            };
-
-            let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some(&format!("Render Pipeline {}", i)),
-                layout: Some(layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some(vs_entry),
-                    buffers: &vertex_buffers,
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_main"),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: config.format,
-                        blend: Some(if vis_def.id == 4 {
-                            wgpu::BlendState {
-                                color: wgpu::BlendComponent {
-                                    src_factor: wgpu::BlendFactor::One,
-                                    dst_factor: wgpu::BlendFactor::One,
-                                    operation: wgpu::BlendOperation::Add,
-                                },
-                                alpha: wgpu::BlendComponent::OVER,
-                            }
-                        } else if vis_def.id == 3 {
-                            wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING
-                        } else {
-                            wgpu::BlendState::REPLACE
-                        }),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                    compilation_options: wgpu::PipelineCompilationOptions::default(),
-                }),
-                primitive,
-                depth_stencil: Some(wgpu::DepthStencilState {
-                    format: wgpu::TextureFormat::Depth32Float,
-                    depth_write_enabled: Some(vis_def.id != 4),
-                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                    stencil: wgpu::StencilState::default(),
-                    bias: wgpu::DepthBiasState::default(),
-                }),
-                multisample: wgpu::MultisampleState {
-                    count: 1,
-                    mask: !0,
-                    alpha_to_coverage_enabled: false,
-                },
-                multiview_mask: None,
-                cache: pipeline_cache_ref,
-            });
-
-            let error_future = scope_main.pop();
-            let _ = device.poll(wgpu::PollType::Wait {
-                submission_index: None,
-                timeout: None,
-            });
-
-            if let Some(error) = error_future.await {
-                eprintln!("WGSL compilation error in visualizer {}: {:?}", i, error);
-                render_pipelines.push(fallback_pipeline.clone());
-            } else {
-                render_pipelines.push(pipeline);
-                if vis_def.id == 13 {
-                    let lp = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                        label: Some("Lamp Render Pipeline"),
-                        layout: Some(&render_pipeline_layout_3d),
-                        vertex: wgpu::VertexState {
-                            module: &shader,
-                            entry_point: Some("vs_lamp"),
-                            buffers: &[Vertex::desc()],
-                            compilation_options: wgpu::PipelineCompilationOptions::default(),
-                        },
-                        fragment: Some(wgpu::FragmentState {
-                            module: &shader,
-                            entry_point: Some("fs_lamp"),
-                            targets: &[Some(wgpu::ColorTargetState {
-                                format: config.format,
-                                blend: Some(wgpu::BlendState::REPLACE),
-                                write_mask: wgpu::ColorWrites::ALL,
-                            })],
-                            compilation_options: wgpu::PipelineCompilationOptions::default(),
-                        }),
-                        primitive: wgpu::PrimitiveState {
-                            topology: wgpu::PrimitiveTopology::TriangleList,
-                            strip_index_format: None,
-                            front_face: wgpu::FrontFace::Ccw,
-                            cull_mode: None,
-                            polygon_mode: wgpu::PolygonMode::Fill,
-                            unclipped_depth: false,
-                            conservative: false,
-                        },
-                        depth_stencil: Some(wgpu::DepthStencilState {
-                            format: wgpu::TextureFormat::Depth32Float,
-                            depth_write_enabled: Some(true),
-                            depth_compare: Some(wgpu::CompareFunction::LessEqual),
-                            stencil: wgpu::StencilState::default(),
-                            bias: wgpu::DepthBiasState::default(),
-                        }),
-                        multisample: wgpu::MultisampleState {
-                            count: 1,
-                            mask: !0,
-                            alpha_to_coverage_enabled: false,
-                        },
-                        multiview_mask: None,
-                        cache: pipeline_cache_ref,
-                    });
-                    lamp_pipeline = lp;
-                }
-            }
-        }
-
-        // --- Video Pipeline ---
+        // --- Video Pipeline (2D no-depth + 3D depth-compatible variants) ---
         let video_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("Video Bind Group Layout"),
@@ -4364,7 +4259,7 @@ impl VulkanEngine {
         let video_shader =
             device.create_shader_module(wgpu::include_wgsl!("shaders/vis_video.wgsl"));
         let video_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Video Render Pipeline"),
+            label: Some("Video Render Pipeline (No Depth)"),
             layout: Some(&video_pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &video_shader,
@@ -4391,13 +4286,7 @@ impl VulkanEngine {
                 unclipped_depth: false,
                 conservative: false,
             },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Always),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
+            depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
             cache: pipeline_cache_ref,
@@ -4441,13 +4330,7 @@ impl VulkanEngine {
                 unclipped_depth: false,
                 conservative: false,
             },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Always),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
+            depth_stencil: None,
             multisample: wgpu::MultisampleState {
                 count: 1,
                 mask: !0,
@@ -6238,7 +6121,7 @@ impl VulkanEngine {
             }
         }
 
-        Self {
+        let mut engine = Self {
             instance,
             surface: Some(surface),
             device,
@@ -6247,6 +6130,14 @@ impl VulkanEngine {
             config,
             size,
             render_pipelines,
+            shader_sources,
+            fallback_pipeline,
+            fallback_pipeline_3d,
+            render_pipeline_layout,
+            render_pipeline_layout_3d,
+            flip_render_pipeline_layout,
+            lyrics_render_pipeline_layout_3d,
+            pipeline_cache,
             hud_pipeline,
             uniform_buffer,
             waveform_storage_buffer,
@@ -6341,6 +6232,12 @@ impl VulkanEngine {
             neon_bg_pipeline,
             storm_sky_pipeline,
 
+            pending_uniforms: None,
+            cached_meta_path: String::new(),
+            cached_file_dir: String::new(),
+            cached_file_len: None,
+            last_acquire_instant: None,
+
             camera_uniform_buffer,
             camera_bind_group,
             mesh_registry,
@@ -6361,6 +6258,10 @@ impl VulkanEngine {
             vu_needle_angles: vec![0.0; 32],
             vu_needle_velocities: vec![0.0; 32],
             channel_phases: [0.0; 32],
+            vu_prev_active_segments: [0; 32],
+            vu_ghost1: [0.0; 32],
+            vu_ghost2: [0.0; 32],
+            vu_prev_num_channels: 0,
             last_uploaded_push_count: u64::MAX,
             last_uploaded_vis_width: 0,
             last_uploaded_vis_id: u32::MAX,
@@ -6382,7 +6283,228 @@ impl VulkanEngine {
                 || std::fs::read_to_string("/sys/class/dmi/id/sys_vendor")
                     .map(|v| v.trim().eq_ignore_ascii_case("valve"))
                     .unwrap_or(false),
-            last_ui_rects_data: [[f32::NAN; 4]; 3],
+            last_steps_to_fill: 0,
+            last_aspect_ratio: size.width as f32 / size.height.max(1) as f32,
+        };
+        engine.ensure_visualizer_pipeline(0);
+        engine
+    }
+
+    pub fn ensure_visualizer_pipeline(&mut self, i: usize) {
+        if i >= self.render_pipelines.len() || self.render_pipelines[i].is_some() {
+            return;
+        }
+        let vis_def = &crate::state::VISUALIZERS[i];
+        let is_mesh_3d = matches!(
+            vis_def.pipeline_type,
+            crate::state::PipelineType::Mesh3D { .. }
+        );
+        let source = &self.shader_sources[i];
+        let scope_main = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+
+        let shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(&format!("Shader {}", i)),
+                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(source.as_str())),
+            });
+
+        let (layout, vertex_buffers, primitive, vs_entry) = if vis_def.id == 20 {
+            (
+                &self._biolum_render_pipeline_layout,
+                vec![Vertex::desc()],
+                wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                "vs_main_3d",
+            )
+        } else if vis_def.id == 23 {
+            (
+                &self.lyrics_render_pipeline_layout_3d,
+                vec![Vertex::desc()],
+                wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                "vs_main_3d",
+            )
+        } else if vis_def.id == 27 || vis_def.id == 28 {
+            (
+                &self.flip_render_pipeline_layout,
+                Vec::new(),
+                wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                "vs_main",
+            )
+        } else {
+            match vis_def.pipeline_type {
+                crate::state::PipelineType::FullscreenQuad => (
+                    &self.render_pipeline_layout,
+                    Vec::new(),
+                    wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        strip_index_format: None,
+                        front_face: wgpu::FrontFace::Ccw,
+                        cull_mode: None,
+                        polygon_mode: wgpu::PolygonMode::Fill,
+                        unclipped_depth: false,
+                        conservative: false,
+                    },
+                    "vs_main",
+                ),
+                crate::state::PipelineType::Mesh3D { .. } => (
+                    &self.render_pipeline_layout_3d,
+                    vec![Vertex::desc()],
+                    wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        strip_index_format: None,
+                        front_face: wgpu::FrontFace::Ccw,
+                        cull_mode: None,
+                        polygon_mode: wgpu::PolygonMode::Fill,
+                        unclipped_depth: false,
+                        conservative: false,
+                    },
+                    "vs_main_3d",
+                ),
+            }
+        };
+
+        let pipeline = self
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(&format!("Render Pipeline {}", i)),
+                layout: Some(layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some(vs_entry),
+                    buffers: &vertex_buffers,
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: self.config.format,
+                        blend: Some(if vis_def.id == 4 {
+                            wgpu::BlendState {
+                                color: wgpu::BlendComponent {
+                                    src_factor: wgpu::BlendFactor::One,
+                                    dst_factor: wgpu::BlendFactor::One,
+                                    operation: wgpu::BlendOperation::Add,
+                                },
+                                alpha: wgpu::BlendComponent::OVER,
+                            }
+                        } else if vis_def.id == 3 {
+                            wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING
+                        } else {
+                            wgpu::BlendState::REPLACE
+                        }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive,
+                depth_stencil: if is_mesh_3d {
+                    Some(wgpu::DepthStencilState {
+                        format: wgpu::TextureFormat::Depth32Float,
+                        depth_write_enabled: Some(vis_def.id != 4),
+                        depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                        stencil: wgpu::StencilState::default(),
+                        bias: wgpu::DepthBiasState::default(),
+                    })
+                } else {
+                    None
+                },
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview_mask: None,
+                cache: self.pipeline_cache.as_ref(),
+            });
+
+        let error_future = scope_main.pop();
+        let _ = self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+
+        if let Some(error) = pollster::block_on(error_future) {
+            eprintln!("WGSL compilation error in visualizer {}: {:?}", i, error);
+            self.render_pipelines[i] = Some(if is_mesh_3d {
+                self.fallback_pipeline_3d.clone()
+            } else {
+                self.fallback_pipeline.clone()
+            });
+        } else {
+            self.render_pipelines[i] = Some(pipeline);
+            if vis_def.id == 13 {
+                let lp = self
+                    .device
+                    .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                        label: Some("Lamp Render Pipeline"),
+                        layout: Some(&self.render_pipeline_layout_3d),
+                        vertex: wgpu::VertexState {
+                            module: &shader,
+                            entry_point: Some("vs_lamp"),
+                            buffers: &[Vertex::desc()],
+                            compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        },
+                        fragment: Some(wgpu::FragmentState {
+                            module: &shader,
+                            entry_point: Some("fs_lamp"),
+                            targets: &[Some(wgpu::ColorTargetState {
+                                format: self.config.format,
+                                blend: Some(wgpu::BlendState::REPLACE),
+                                write_mask: wgpu::ColorWrites::ALL,
+                            })],
+                            compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        }),
+                        primitive: wgpu::PrimitiveState {
+                            topology: wgpu::PrimitiveTopology::TriangleList,
+                            strip_index_format: None,
+                            front_face: wgpu::FrontFace::Ccw,
+                            cull_mode: None,
+                            polygon_mode: wgpu::PolygonMode::Fill,
+                            unclipped_depth: false,
+                            conservative: false,
+                        },
+                        depth_stencil: Some(wgpu::DepthStencilState {
+                            format: wgpu::TextureFormat::Depth32Float,
+                            depth_write_enabled: Some(true),
+                            depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                            stencil: wgpu::StencilState::default(),
+                            bias: wgpu::DepthBiasState::default(),
+                        }),
+                        multisample: wgpu::MultisampleState {
+                            count: 1,
+                            mask: !0,
+                            alpha_to_coverage_enabled: false,
+                        },
+                        multiview_mask: None,
+                        cache: self.pipeline_cache.as_ref(),
+                    });
+                self.lamp_pipeline = lp;
+            }
         }
     }
 
@@ -6442,6 +6564,77 @@ impl VulkanEngine {
 
     pub fn clear_video_state(&mut self) {
         self.video_state = None;
+        self.vu_prev_active_segments = [0; 32];
+        self.vu_ghost1 = [0.0; 32];
+        self.vu_ghost2 = [0.0; 32];
+        self.vu_prev_num_channels = 0;
+        self.channel_phases = [0.0; 32];
+        self.cached_meta_path.clear();
+    }
+
+    /// Updates the phosphor ghosting / fade-out envelope for the past two blocks above each
+    /// channel's active VU meter bar (50 ms drop-off on the 1st trailing block, 25 ms drop-off
+    /// on the 2nd trailing block) and returns the packed values for `AudioUniforms::channel_phases`.
+    pub fn step_vu_phosphor_ghosts(
+        prev_active: &mut [u32; 32],
+        ghost1: &mut [f32; 32],
+        ghost2: &mut [f32; 32],
+        channels: &[f32; 32],
+        num_channels: u32,
+        dt: f32,
+    ) -> [f32; 32] {
+        let mut packed = [0.0f32; 32];
+        let count = (num_channels as usize).min(32);
+        let dt_clamped = dt.clamp(0.0, 0.1);
+        let decay_50ms = dt_clamped / 0.050;
+        let decay_25ms = dt_clamped / 0.025;
+
+        for i in 0..count {
+            let vu = channels[i].clamp(0.0, 1.0);
+            let cur_active = (vu * 30.0).ceil() as u32;
+            let old_active = prev_active[i];
+            let prev_g1 = ghost1[i];
+            let prev_g2 = ghost2[i];
+
+            if cur_active == old_active {
+                ghost1[i] = (prev_g1 - decay_50ms).max(0.0);
+                ghost2[i] = (prev_g2 - decay_25ms).max(0.0);
+            } else if cur_active < old_active {
+                let drop = old_active - cur_active;
+                if drop == 1 {
+                    // Block at cur_active + 1 was previously Past Block 1 (at old_active);
+                    // Block at cur_active was previously active (< old_active).
+                    ghost2[i] = if prev_g1 > 0.20 {
+                        1.0
+                    } else {
+                        (prev_g1 * 2.0).clamp(0.0, 1.0)
+                    };
+                    ghost1[i] = 1.0;
+                } else {
+                    // Dropped by 2 or more blocks: both cur_active and cur_active + 1 were active
+                    ghost1[i] = 1.0;
+                    ghost2[i] = 1.0;
+                }
+            } else {
+                // Rising bar: blocks above cur_active were not just turned off
+                ghost1[i] = 0.0;
+                ghost2[i] = 0.0;
+            }
+
+            prev_active[i] = cur_active;
+
+            let g1_int = (ghost1[i].clamp(0.0, 1.0) * 1000.0).round();
+            let g2_frac = ghost2[i].clamp(0.0, 1.0) * 0.90;
+            packed[i] = g1_int + g2_frac;
+        }
+
+        for i in count..32 {
+            prev_active[i] = 0;
+            ghost1[i] = 0.0;
+            ghost2[i] = 0.0;
+        }
+
+        packed
     }
 
     pub fn step_fire_intensity(current: f32, state: &crate::state::AppState, dt: f32) -> f32 {
@@ -6725,15 +6918,21 @@ impl VulkanEngine {
     pub fn update(&mut self, state: &AppState, dt: f32) {
         self.frame_count = self.frame_count.wrapping_add(1);
 
-        // Exponential moving average to smooth CPU scheduling time jitter
+        // Exponential moving average to smooth CPU/GPU scheduling time jitter
         let alpha = 0.03f64;
         self.smooth_dt = self.smooth_dt * (1.0 - alpha) + (dt as f64).clamp(0.001, 0.1) * alpha;
         self.smooth_time += self.smooth_dt;
+        let frame_dt = (self.smooth_dt as f32).clamp(0.0005, 0.1);
 
         if !state.file_loaded {
             self.smooth_audio_seconds = 0.0;
             self.last_raw_state_seconds = 0.0;
             self.fire_intensity = 0.0;
+            self.vu_prev_active_segments = [0; 32];
+            self.vu_ghost1 = [0.0; 32];
+            self.vu_ghost2 = [0.0; 32];
+            self.vu_prev_num_channels = 0;
+            self.channel_phases = [0.0; 32];
             return;
         }
 
@@ -6819,14 +7018,13 @@ impl VulkanEngine {
         }
 
         // Progress bar fire dies off when playback stops / pauses / ends / reaches end of song
-        self.fire_intensity = Self::step_fire_intensity(self.fire_intensity, state, dt);
+        self.fire_intensity = Self::step_fire_intensity(self.fire_intensity, state, frame_dt);
 
         // World-Z camera position locked to history rows (0.5 units/row), used by
         // visualizers that scroll with the waveform/spectrum history ring buffer.
         // Wrapped modulo 6000.0 to maintain single-precision float accuracy in long sessions.
         self.last_history_cam_z =
             ((self.last_history_push_count as f64 + step_fraction as f64) * 0.5) % 6000.0;
-        let frame_dt = dt.clamp(0.0005, 0.1);
         let upmix_active = state
             .surround_upmix
             .is_active_for_hardware(state.hardware_channels);
@@ -6860,7 +7058,7 @@ impl VulkanEngine {
             frame_count: self.frame_count,
             step_fraction,
             steps_to_fill: steps,
-            aspect_ratio: self.size.width as f32 / self.size.height as f32,
+            aspect_ratio: self.last_aspect_ratio,
             frame_dt,
             history_cam_z: self.last_history_cam_z as f32,
             fire_intensity: self.fire_intensity,
@@ -6868,6 +7066,7 @@ impl VulkanEngine {
             _pad2: 0.0,
             _pad3: 0.0,
         };
+        self.last_steps_to_fill = steps;
 
         uniforms.spectrum.copy_from_slice(&state.spectrum_data);
         uniforms.fire_heat.copy_from_slice(&state.fire_heat);
@@ -6885,7 +7084,7 @@ impl VulkanEngine {
         let spring = omega_n * omega_n;
         let damping = 2.0 * damping_ratio * omega_n;
 
-        let dt_clamped = dt.min(0.05);
+        let dt_clamped = frame_dt.min(0.05);
         for i in 0..ch_count {
             let target = if i < state.raw_channel_vus.len() {
                 state.raw_channel_vus[i]
@@ -6942,7 +7141,8 @@ impl VulkanEngine {
             }
             if src_idx < state.channel_vus.len() {
                 uniforms.channels[disp_idx] = state.channel_vus[src_idx];
-                uniforms.channel_peaks[disp_idx] = state.peak_vus[src_idx];
+                uniforms.channel_peaks[disp_idx] =
+                    state.peak_vus.get(src_idx).copied().unwrap_or(0.0);
             }
         }
 
@@ -6990,6 +7190,22 @@ impl VulkanEngine {
                 }
             }
         }
+
+        if uniforms.num_channels != self.vu_prev_num_channels {
+            self.vu_prev_active_segments = [0; 32];
+            self.vu_ghost1 = [0.0; 32];
+            self.vu_ghost2 = [0.0; 32];
+            self.vu_prev_num_channels = uniforms.num_channels;
+        }
+        self.channel_phases = Self::step_vu_phosphor_ghosts(
+            &mut self.vu_prev_active_segments,
+            &mut self.vu_ghost1,
+            &mut self.vu_ghost2,
+            &uniforms.channels,
+            uniforms.num_channels,
+            frame_dt,
+        );
+        uniforms.channel_phases = self.channel_phases;
 
         if state.visualizer_mode == 23 {
             let display_secs = state.scrub_target_seconds.unwrap_or(state.current_seconds);
@@ -7143,8 +7359,7 @@ impl VulkanEngine {
         };
         uniforms.step_fraction = step_fraction;
 
-        self.queue
-            .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+        self.pending_uniforms = Some(uniforms);
 
         // Only upload waveform history when the active visualizer requires it,
         // and only when new rows were pushed or the width changed (saves a
@@ -7152,7 +7367,7 @@ impl VulkanEngine {
         let history_dirty = state.waveform_history_push_count != self.last_uploaded_push_count
             || vis_width != self.last_uploaded_vis_width
             || vis_def.id != self.last_uploaded_vis_id;
-        if vis_def.id == 24 {
+        if vis_def.id == 24 && (!state.is_paused || history_dirty) {
             crate::audio::update_lookahead_timeline_from_queue(
                 &state.lookahead_queue,
                 &state.raw_waveform,
@@ -7261,7 +7476,7 @@ impl VulkanEngine {
             );
         }
 
-        if vis_def.requires_fire {
+        if vis_def.requires_fire && (!state.is_paused || self.fire_intensity > 0.001) {
             if vis_def.id == 5 {
                 let start_sim = std::time::Instant::now();
                 self.update_retro_fire(state, &uniforms);
@@ -7900,6 +8115,18 @@ impl VulkanEngine {
                                         } else {
                                             egui::Color32::YELLOW
                                         })
+                                        .strong(),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new("•")
+                                            .color(egui::Color32::from_gray(100)),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{:?}",
+                                            self.adapter_info.backend
+                                        ))
+                                        .color(egui::Color32::from_rgb(130, 210, 255))
                                         .strong(),
                                     );
                                 });
@@ -9291,12 +9518,9 @@ impl VulkanEngine {
                             };
 
                             let render_col_heatmap = |col: &mut egui::Ui, out_heatmap_rect: &mut Option<egui::Rect>, engine_action: &mut EngineAction| {
-                                if state
-                                    .surround_upmix
-                                    .is_active_for(state.source_channels, state.hardware_channels)
-                                {
+                                if state.show_surround_eq {
                                     // Swap out the Piano Roll / Pattern Heatmap with the Surround Routing & Crossover Curve
-                                    // ONLY when actively upmixing to a multi-channel surround system (>2ch).
+                                    // when the user flips the middle panel to the EQ view.
                                     *out_heatmap_rect = None;
                                     let mut cfg = state.surround_upmix;
                                     let mut cfg_changed = false;
@@ -9306,24 +9530,34 @@ impl VulkanEngine {
                                         );
 
                                     if !is_portrait {
+                                        let eq_heading = if state.hardware_channels > 2 {
+                                            format!(
+                                                "Surround Upmix ({})",
+                                                crate::state::SurroundUpmixConfig::short_tag(
+                                                    state.hardware_channels,
+                                                )
+                                            )
+                                        } else {
+                                            "Surround Upmix".to_string()
+                                        };
                                         col.horizontal(|ui| {
-                                            ui.heading("Surround Upmix");
+                                            ui.heading(eq_heading);
                                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                let off_btn = egui::Button::new(
-                                                    egui::RichText::new("× Off")
+                                                let flip_btn = egui::Button::new(
+                                                    egui::RichText::new("🎹 Piano Roll")
                                                         .size(11.0)
                                                         .strong()
-                                                        .color(egui::Color32::from_rgb(245, 200, 185)),
+                                                        .color(egui::Color32::from_rgb(255, 228, 185)),
                                                 )
-                                                .fill(egui::Color32::from_rgb(56, 30, 24))
-                                                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(155, 75, 50)))
+                                                .fill(egui::Color32::from_rgb(48, 36, 24))
+                                                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(210, 135, 45)))
                                                 .corner_radius(4.0);
                                                 if ui
-                                                    .add(off_btn)
-                                                    .on_hover_text("Disable Surround Upmix and return to Piano Roll (Shortcut: 'u' / L3·R3)")
+                                                    .add(flip_btn)
+                                                    .on_hover_text("Flip middle panel back to Pattern Heatmap / Piano Roll")
                                                     .clicked()
                                                 {
-                                                    *engine_action = EngineAction::ToggleSurroundUpmix(false);
+                                                    *engine_action = EngineAction::SetShowSurroundEq(false);
                                                 }
                                                 ui.add_space(4.0);
                                                 let reset_btn = egui::Button::new(
@@ -9343,89 +9577,26 @@ impl VulkanEngine {
                                                     cfg.reset_tuning();
                                                     cfg_changed = true;
                                                 }
-                                                #[cfg(any(target_os = "windows", target_os = "linux"))]
-                                                {
+                                                if ui.available_width() > 110.0 {
                                                     ui.add_space(4.0);
-                                                    let mpegh_on = state.surround_upmix.mpegh_bitstream;
-                                                    let mpegh_live = state.stats.mpegh_bitstream_active;
-                                                    let is_atmos_spatial = state
-                                                        .stats
-                                                        .mpegh_carrier_info
-                                                        .contains("SpatialAudio")
-                                                        || state.stats.mpegh_carrier_info.contains("Dolby");
-                                                    let (m_lbl, m_fill, m_stroke, m_col) = if mpegh_live {
-                                                        (
-                                                            if is_atmos_spatial {
-                                                                "ATMOS 11.1"
-                                                            } else {
-                                                                "MPEG-H 11.1"
-                                                            },
-                                                            egui::Color32::from_rgb(12, 68, 92),
-                                                            egui::Color32::from_rgb(0, 210, 255),
-                                                            egui::Color32::from_rgb(200, 248, 255),
-                                                        )
-                                                    } else if mpegh_on {
-                                                        (
-                                                            if cfg!(target_os = "windows") {
-                                                                "11.1 (7.1.4)"
-                                                            } else {
-                                                                "MPEG-H 11.1"
-                                                            },
-                                                            egui::Color32::from_rgb(28, 52, 68),
-                                                            egui::Color32::from_rgb(70, 150, 190),
-                                                            egui::Color32::from_rgb(185, 225, 240),
-                                                        )
-                                                    } else {
-                                                        (
-                                                            "LPCM Bed",
-                                                            egui::Color32::from_rgb(38, 36, 38),
-                                                            egui::Color32::from_rgb(95, 88, 80),
-                                                            egui::Color32::from_rgb(195, 188, 180),
-                                                        )
-                                                    };
-                                                    let mpegh_btn = egui::Button::new(
-                                                        egui::RichText::new(m_lbl)
-                                                            .size(10.5)
-                                                            .strong()
-                                                            .color(m_col),
-                                                    )
-                                                    .fill(m_fill)
-                                                    .stroke(egui::Stroke::new(1.0_f32, m_stroke))
-                                                    .corner_radius(4.0);
-                                                    let hover_tip = if mpegh_live && !state.stats.mpegh_carrier_info.is_empty() {
-                                                        format!(
-                                                            "Active 11.1 (7.1.4) carrier: {}\nClick to switch to uncompressed 7.1 LPCM bed.",
-                                                            state.stats.mpegh_carrier_info
-                                                        )
-                                                    } else {
-                                                        "Toggle 12-channel 7.1.4 (11.1) output (Windows Spatial Audio Dolby Atmos MAT 2.0 / IEC 61937-13 MPEG-H 3D Audio) vs. uncompressed 7.1 LPCM bed".to_string()
-                                                    };
-                                                    if ui
-                                                        .add(mpegh_btn)
-                                                        .on_hover_text(hover_tip)
-                                                        .clicked()
-                                                    {
-                                                        *engine_action = EngineAction::ToggleMpeghBitstream(!mpegh_on);
+                                                    if has_height {
+                                                        ui.label(
+                                                            egui::RichText::new("• Height ↑")
+                                                                .size(10.5)
+                                                                .color(egui::Color32::from_rgb(255, 225, 130)),
+                                                        );
                                                     }
-                                                }
-                                                ui.add_space(4.0);
-                                                if has_height {
                                                     ui.label(
-                                                        egui::RichText::new("• Height ↑")
+                                                        egui::RichText::new("• Surround Bed")
                                                             .size(10.5)
-                                                            .color(egui::Color32::from_rgb(255, 225, 130)),
+                                                            .color(egui::Color32::from_rgb(255, 165, 35)),
+                                                    );
+                                                    ui.label(
+                                                        egui::RichText::new("• LFE")
+                                                            .size(10.5)
+                                                            .color(egui::Color32::from_rgb(220, 68, 32)),
                                                     );
                                                 }
-                                                ui.label(
-                                                    egui::RichText::new("• Surround Bed")
-                                                        .size(10.5)
-                                                        .color(egui::Color32::from_rgb(255, 165, 35)),
-                                                );
-                                                ui.label(
-                                                    egui::RichText::new("• LFE")
-                                                        .size(10.5)
-                                                        .color(egui::Color32::from_rgb(220, 68, 32)),
-                                                );
                                             });
                                         });
                                         col.separator();
@@ -9949,7 +10120,43 @@ impl VulkanEngine {
                                     } else {
                                         "Pattern Heatmap"
                                     };
-                                    col.heading(col1_heading);
+                                    col.horizontal(|ui| {
+                                        ui.heading(col1_heading);
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            let upmix_active = state
+                                                .surround_upmix
+                                                .is_active_for(state.source_channels, state.hardware_channels);
+                                            let (eq_fill, eq_stroke, eq_col) = if upmix_active {
+                                                (
+                                                    egui::Color32::from_rgb(56, 38, 20),
+                                                    egui::Color32::from_rgb(210, 135, 45),
+                                                    egui::Color32::from_rgb(255, 228, 185),
+                                                )
+                                            } else {
+                                                (
+                                                    egui::Color32::from_rgb(44, 42, 40),
+                                                    egui::Color32::from_rgb(105, 98, 90),
+                                                    egui::Color32::from_rgb(225, 220, 212),
+                                                )
+                                            };
+                                            let eq_btn = egui::Button::new(
+                                                egui::RichText::new("🎚 Surround EQ")
+                                                    .size(11.0)
+                                                    .strong()
+                                                    .color(eq_col),
+                                            )
+                                            .fill(eq_fill)
+                                            .stroke(egui::Stroke::new(1.0_f32, eq_stroke))
+                                            .corner_radius(4.0);
+                                            if ui
+                                                .add(eq_btn)
+                                                .on_hover_text("Flip middle panel between Pattern Heatmap / Piano Roll and Surround Upmix EQ")
+                                                .clicked()
+                                            {
+                                                *engine_action = EngineAction::SetShowSurroundEq(true);
+                                            }
+                                        });
+                                    });
                                     col.separator();
                                 }
                                 let hm_rect = col.available_rect_before_wrap();
@@ -10204,7 +10411,7 @@ impl VulkanEngine {
                                 }
                             };
 
-                            let render_col_info = |col: &mut egui::Ui, out_track_info_rect: &mut Option<egui::Rect>, engine_action: &mut EngineAction| {
+                            let mut render_col_info = |col: &mut egui::Ui, out_track_info_rect: &mut Option<egui::Rect>, engine_action: &mut EngineAction| {
                                 if state.video_mode == 1 && self.video_state.is_some() {
                                     let available = col.available_size();
                                     let (rect, _) = col.allocate_exact_size(available, egui::Sense::hover());
@@ -10231,49 +10438,6 @@ impl VulkanEngine {
                                             .min_size(egui::vec2(92.0, if is_portrait { 30.0 } else { 24.0 }));
                                             if ui.add(open_hdr_btn).clicked() {
                                                 *engine_action = EngineAction::OpenFile;
-                                            }
-
-                                            if state.hardware_channels > 2
-                                                || state.surround_upmix.mpegh_bitstream
-                                                || state.surround_upmix.mpegh_user_overridden
-                                            {
-                                                ui.add_space(4.0);
-                                                let upmix_on = state.surround_upmix.enabled;
-                                                let upmix_active = state
-                                                    .surround_upmix
-                                                    .is_active_for(state.source_channels, state.hardware_channels);
-                                                let (upmix_label, upmix_fill, upmix_stroke, upmix_text_col) = if upmix_active {
-                                                    (
-                                                        "🔊 SURROUND UPMIX: ON",
-                                                        egui::Color32::from_rgb(165, 85, 12),
-                                                        egui::Color32::from_rgb(255, 175, 50),
-                                                        egui::Color32::from_rgb(255, 240, 200),
-                                                    )
-                                                } else {
-                                                    (
-                                                        "🔊 SURROUND UPMIX: OFF",
-                                                        egui::Color32::from_rgb(38, 36, 38),
-                                                        egui::Color32::from_rgb(95, 88, 80),
-                                                        egui::Color32::from_rgb(210, 202, 192),
-                                                    )
-                                                };
-                                                let upmix_hdr_btn = egui::Button::new(
-                                                    egui::RichText::new(upmix_label)
-                                                        .size(11.5)
-                                                        .strong()
-                                                        .color(upmix_text_col),
-                                                )
-                                                .fill(upmix_fill)
-                                                .stroke(egui::Stroke::new(1.0_f32, upmix_stroke))
-                                                .corner_radius(4.0)
-                                                .min_size(egui::vec2(88.0, if is_portrait { 30.0 } else { 24.0 }));
-                                                if ui
-                                                    .add(upmix_hdr_btn)
-                                                    .on_hover_text("Toggle Surround Upmix to fill all remaining available channels on the output device (Shortcut: 'u' / L3·R3)")
-                                                    .clicked()
-                                                {
-                                                    *engine_action = EngineAction::ToggleSurroundUpmix(!upmix_on);
-                                                }
                                             }
                                         });
                                     });
@@ -10352,27 +10516,34 @@ impl VulkanEngine {
                                         let raw_fname = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
                                         strip_android_cache_prefix(&raw_fname)
                                     };
-                                    let file_dir = if is_network {
-                                        current_path_str.clone()
-                                    } else {
-                                        let abs_path = if std::path::Path::new(&current_path_str).is_absolute() {
-                                            std::path::PathBuf::from(&current_path_str)
-                                        } else if let Ok(cwd) = std::env::current_dir() {
-                                            cwd.join(&current_path_str)
+                                    if self.cached_meta_path != current_path_str {
+                                        self.cached_meta_path = current_path_str.clone();
+                                        if is_network {
+                                            self.cached_file_dir = current_path_str.clone();
+                                            self.cached_file_len = None;
                                         } else {
-                                            std::path::PathBuf::from(&current_path_str)
-                                        };
-                                        let dir_path = abs_path.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
-                                        if let Ok(home) = std::env::var("HOME") {
-                                            if dir_path.starts_with(&home) {
-                                                dir_path.replacen(&home, "~", 1)
+                                            let abs_path = if std::path::Path::new(&current_path_str).is_absolute() {
+                                                std::path::PathBuf::from(&current_path_str)
+                                            } else if let Ok(cwd) = std::env::current_dir() {
+                                                cwd.join(&current_path_str)
+                                            } else {
+                                                std::path::PathBuf::from(&current_path_str)
+                                            };
+                                            let dir_path = abs_path.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+                                            self.cached_file_dir = if let Ok(home) = std::env::var("HOME") {
+                                                if dir_path.starts_with(&home) {
+                                                    dir_path.replacen(&home, "~", 1)
+                                                } else {
+                                                    dir_path
+                                                }
                                             } else {
                                                 dir_path
-                                            }
-                                        } else {
-                                            dir_path
+                                            };
+                                            self.cached_file_len = std::fs::metadata(&current_path_str).ok().map(|m| m.len());
                                         }
-                                    };
+                                    }
+                                    let file_dir = self.cached_file_dir.clone();
+                                    let cached_file_len = self.cached_file_len;
 
                                     let avail_info_h = col.available_height().max(32.0);
                                     egui::ScrollArea::vertical()
@@ -10417,9 +10588,7 @@ impl VulkanEngine {
                                                     // 5 & 6. Format, Bitrate & Channels
                                                     let effective_bitrate = state.bitrate.or_else(|| {
                                                         if state.duration_seconds > 0.0 && !is_network {
-                                                            std::fs::metadata(&current_path_str)
-                                                                .ok()
-                                                                .map(|m| ((m.len() as f64 * 8.0) / (state.duration_seconds * 1000.0)).round() as u32)
+                                                            cached_file_len.map(|len| ((len as f64 * 8.0) / (state.duration_seconds * 1000.0)).round() as u32)
                                                         } else {
                                                             None
                                                         }
@@ -10869,21 +11038,39 @@ impl VulkanEngine {
                                             });
 
                                             if state.hardware_channels > 2
-                                                || state.surround_upmix.mpegh_bitstream
-                                                || state.surround_upmix.mpegh_user_overridden
+                                                || state.stats.mpegh_bitstream_active
+                                                || state.surround_upmix.user_overridden
                                             {
                                                 ui.horizontal(|ui| {
                                                     let upmix_enabled = state.surround_upmix.enabled;
-                                                    let (btn_text, btn_fill, btn_stroke, txt_col) = if upmix_enabled {
+                                                    let upmix_active = state
+                                                        .surround_upmix
+                                                        .is_active_for(state.source_channels, state.hardware_channels);
+                                                    let layout_tag =
+                                                        crate::state::SurroundUpmixConfig::short_tag(
+                                                            state.hardware_channels,
+                                                        );
+                                                    let (btn_text, btn_fill, btn_stroke, txt_col) = if upmix_active {
                                                         (
-                                                            "🔊 Surround Upmix: ON",
+                                                            format!("🔊 Surround Upmix ({layout_tag}): ON"),
+                                                            egui::Color32::from_rgb(165, 85, 12),
+                                                            egui::Color32::from_rgb(255, 175, 50),
+                                                            egui::Color32::from_rgb(255, 240, 200),
+                                                        )
+                                                    } else if upmix_enabled {
+                                                        (
+                                                            "🔊 Surround Upmix: ON".to_string(),
                                                             egui::Color32::from_rgb(165, 85, 12),
                                                             egui::Color32::from_rgb(255, 175, 50),
                                                             egui::Color32::from_rgb(255, 240, 200),
                                                         )
                                                     } else {
                                                         (
-                                                            "🔊 Surround Upmix: OFF",
+                                                            if state.hardware_channels > 2 {
+                                                                format!("🔊 Surround Upmix ({layout_tag}): OFF")
+                                                            } else {
+                                                                "🔊 Surround Upmix: OFF".to_string()
+                                                            },
                                                             egui::Color32::from_rgb(36, 34, 36),
                                                             egui::Color32::from_rgb(90, 84, 76),
                                                             egui::Color32::from_rgb(200, 192, 182),
@@ -10900,12 +11087,16 @@ impl VulkanEngine {
                                                     .corner_radius(4.0);
                                                     if ui
                                                         .add(upmix_btn)
-                                                        .on_hover_text("Upmix the media file's audio channels to fill all remaining available channels on the surround output device. Replaces the top middle Piano Roll panel with a live Crossover & 5-band Parametric EQ editor. (Shortcut: 'u' / L3·R3)")
+                                                        .on_hover_text("Upmix the media file's audio channels to fill all remaining available channels on the surround output device. Use the '🎚 Surround EQ' button in the middle panel title bar to view the live Crossover & 5-band Parametric EQ editor. (Shortcut: 'u' / L3·R3)")
                                                         .clicked()
                                                     {
                                                         *engine_action = EngineAction::ToggleSurroundUpmix(!upmix_enabled);
                                                     }
                                                     #[cfg(any(target_os = "windows", target_os = "linux"))]
+                                                    if state.stats.mpegh_bitstream_active
+                                                        || state.hardware_channels > 8
+                                                        || (state.surround_upmix.mpegh_user_overridden
+                                                            && !state.surround_upmix.mpegh_bitstream)
                                                     {
                                                         let mpegh_on = state.surround_upmix.mpegh_bitstream;
                                                         let mpegh_live = state.stats.mpegh_bitstream_active;
@@ -10917,32 +11108,24 @@ impl VulkanEngine {
                                                         let (m_text, m_fill, m_stroke, m_txt_col) = if mpegh_live {
                                                             (
                                                                 if is_atmos_spatial {
-                                                                    "ATMOS 11.1: ACTIVE"
+                                                                    "ATMOS 7.1.4"
                                                                 } else {
-                                                                    "MPEG-H 11.1: ACTIVE"
+                                                                    "MPEG-H 7.1.4"
                                                                 },
                                                                 egui::Color32::from_rgb(12, 68, 92),
                                                                 egui::Color32::from_rgb(0, 210, 255),
                                                                 egui::Color32::from_rgb(200, 248, 255),
                                                             )
-                                                        } else if mpegh_on {
+                                                        } else if state.hardware_channels > 8 && mpegh_on {
                                                             (
-                                                                if cfg!(target_os = "windows") {
-                                                                    "11.1 (7.1.4): ON"
-                                                                } else {
-                                                                    "MPEG-H 11.1: ON"
-                                                                },
+                                                                "7.1.4 Height: ON",
                                                                 egui::Color32::from_rgb(28, 52, 68),
                                                                 egui::Color32::from_rgb(70, 150, 190),
                                                                 egui::Color32::from_rgb(185, 225, 240),
                                                             )
                                                         } else {
                                                             (
-                                                                if cfg!(target_os = "windows") {
-                                                                    "11.1 (7.1.4): OFF"
-                                                                } else {
-                                                                    "MPEG-H 11.1: OFF"
-                                                                },
+                                                                "7.1 Bed Only",
                                                                 egui::Color32::from_rgb(36, 34, 36),
                                                                 egui::Color32::from_rgb(90, 84, 76),
                                                                 egui::Color32::from_rgb(200, 192, 182),
@@ -10959,11 +11142,11 @@ impl VulkanEngine {
                                                         .corner_radius(4.0);
                                                         let hover_tip = if mpegh_live && !state.stats.mpegh_carrier_info.is_empty() {
                                                             format!(
-                                                                "Active 11.1 (7.1.4) carrier: {}\nClick to toggle 12-channel 7.1.4 (11.1) output vs. 8-channel 7.1 LPCM.",
+                                                                "Active 7.1.4 carrier: {}\nClick to toggle 12-channel 7.1.4 height output vs. 8-channel 7.1 LPCM bed.",
                                                                 state.stats.mpegh_carrier_info
                                                             )
                                                         } else {
-                                                            "Output 12-channel 7.1.4 (11.1) audio via Windows Spatial Audio (Dolby Atmos MAT 2.0) or MPEG-H 3D Audio IEC 61937-13 HDMI bitstream to bypass HDMI's 8-channel LPCM ceiling.".to_string()
+                                                            "Toggle 12-channel 7.1.4 (Bed + Height) output vs. 8-channel 7.1 Bed Only.".to_string()
                                                         };
                                                         if ui
                                                             .add(mpegh_btn)
@@ -11304,21 +11487,6 @@ impl VulkanEngine {
         let ui_elapsed = ui_start.elapsed().as_micros() as f32;
         let phase_egui_layout_us = ui_elapsed; // Egui layout now accurately measures only UI logic and tessellation
 
-        // Write updated HUD rect uniforms only when playback is active and layout rects changed
-        if state.file_loaded {
-            const UI_RECTS_OFFSET: wgpu::BufferAddress =
-                std::mem::offset_of!(AudioUniforms, ui_meters_rect) as wgpu::BufferAddress;
-            let ui_rects_data = [self.meters_uv_rect, self.heatmap_uv_rect, self.fire_uv_rect];
-            if ui_rects_data != self.last_ui_rects_data {
-                self.last_ui_rects_data = ui_rects_data;
-                self.queue.write_buffer(
-                    &self.uniform_buffer,
-                    UI_RECTS_OFFSET,
-                    bytemuck::cast_slice(&ui_rects_data),
-                );
-            }
-        }
-
         for (id, image_delta) in &full_output.textures_delta.set {
             self.egui_renderer
                 .update_texture(&self.device, &self.queue, *id, image_delta);
@@ -11338,6 +11506,34 @@ impl VulkanEngine {
             wgpu::CurrentSurfaceTexture::Timeout => return Err(wgpu::SurfaceStatus::Timeout),
             _ => return Err(wgpu::SurfaceStatus::Lost),
         };
+        if is_vsync_present_mode(self.config.present_mode)
+            && crate::state::BENCH_FRAMES_OVERRIDE.load(Ordering::Relaxed) == 0
+            && std::env::var_os("BENCH_FRAMES").is_none()
+        {
+            // In windowed mode over a lower-FPS VRR game, DWM FLIP_DISCARD can occasionally
+            // recycle a queued backbuffer early and signal the waitable swapchain semaphore
+            // before the display's physical minimum refresh period (1 / target_fps) has elapsed.
+            // Clamp early wakeups to the monitor's max refresh rate ceiling (e.g. 144 Hz = 6.944 ms).
+            let min_frame_time =
+                std::time::Duration::from_secs_f32(1.0 / (state.target_fps.clamp(30, 500) as f32));
+            if let Some(last_acq) = self.last_acquire_instant {
+                let target_instant = last_acq + min_frame_time;
+                let now = std::time::Instant::now();
+                if target_instant > now {
+                    let rem = target_instant - now;
+                    let spin_margin = std::time::Duration::from_micros(1500);
+                    if rem > spin_margin {
+                        std::thread::sleep(rem - spin_margin);
+                    }
+                    while std::time::Instant::now() < target_instant {
+                        std::hint::spin_loop();
+                    }
+                }
+            }
+            self.last_acquire_instant = Some(std::time::Instant::now());
+        } else {
+            self.last_acquire_instant = None;
+        }
         let view = surface_texture
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
@@ -11348,6 +11544,193 @@ impl VulkanEngine {
             pixels_per_point: egui_ctx.pixels_per_point(),
         };
         let render_start = std::time::Instant::now();
+
+        let scale_factor = egui_ctx.pixels_per_point();
+        let vp_x =
+            ((central_rect.min.x * scale_factor).clamp(0.0, self.config.width as f32)).round();
+        let vp_y =
+            ((central_rect.min.y * scale_factor).clamp(0.0, self.config.height as f32)).round();
+        let max_w = (self.config.width as f32 - vp_x).max(1.0);
+        let vp_w = ((central_rect.width() * scale_factor).clamp(1.0, max_w)).round();
+        let max_h = (self.config.height as f32 - vp_y).max(1.0);
+        let vp_h = ((central_rect.height() * scale_factor).clamp(1.0, max_h)).round();
+
+        let is_portrait = self.config.width < self.config.height;
+        let is_video_active = state.file_loaded
+            && self.video_state.is_some()
+            && (state.video_mode > 0
+                || (is_portrait && state.mobile_hud_tab == crate::state::MobileHudTab::Video));
+
+        let mut v_vp_x = 0.0;
+        let mut v_vp_y = 0.0;
+        let mut v_vp_w = self.config.width as f32;
+        let mut v_vp_h = self.config.height as f32;
+
+        if state.file_loaded && is_video_active {
+            let target_rect = if state.video_mode == 3 {
+                None // mode 3: full screen
+            } else if is_portrait && state.mobile_hud_tab == crate::state::MobileHudTab::Video {
+                out_video_rect
+            } else if state.video_mode == 1 {
+                out_track_info_rect
+            } else if state.video_mode == 2 {
+                out_video_rect.or(out_top_panel_rect)
+            } else {
+                None // mode 3: full screen
+            };
+
+            if let Some(r) = target_rect {
+                v_vp_x = ((r.min.x * scale_factor).clamp(0.0, self.config.width as f32)).round();
+                v_vp_y = ((r.min.y * scale_factor).clamp(0.0, self.config.height as f32)).round();
+                let max_w = (self.config.width as f32 - v_vp_x).max(1.0);
+                v_vp_w = ((r.width() * scale_factor).clamp(1.0, max_w)).round();
+                let max_h = (self.config.height as f32 - v_vp_y).max(1.0);
+                v_vp_h = ((r.height() * scale_factor).clamp(1.0, max_h)).round();
+            }
+        }
+
+        if state.file_loaded {
+            let mode_idx = state
+                .current_visualizer_idx
+                .min(self.render_pipelines.len() - 1);
+            self.ensure_visualizer_pipeline(mode_idx);
+
+            let aspect = vp_w / vp_h.max(1.0);
+            self.last_aspect_ratio = aspect;
+
+            if let Some(mut uniforms) = self.pending_uniforms.take() {
+                uniforms.ui_meters_rect = self.meters_uv_rect;
+                uniforms.ui_heatmap_rect = self.heatmap_uv_rect;
+                uniforms.ui_fire_rect = self.fire_uv_rect;
+                uniforms.aspect_ratio = aspect;
+                self.queue
+                    .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+            }
+
+            let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
+            if matches!(
+                vis_def.pipeline_type,
+                crate::state::PipelineType::Mesh3D { .. }
+            ) {
+                // Adapt FOV when aspect ratio is square or portrait (< 1.0) so 3D scenes fit without horizontal clipping
+                let base_fov = if state.visualizer_mode == 22 {
+                    64.0_f32.to_radians()
+                } else {
+                    48.0_f32.to_radians()
+                };
+                let fov_y = if state.visualizer_mode == 19
+                    || state.visualizer_mode == 23
+                    || state.visualizer_mode == 29
+                {
+                    base_fov
+                } else if aspect < 1.0 {
+                    (base_fov / aspect.clamp(0.65, 1.0)).min(if state.visualizer_mode == 22 {
+                        85.0_f32.to_radians()
+                    } else {
+                        75.0_f32.to_radians()
+                    })
+                } else {
+                    base_fov
+                };
+                let proj = glam::Mat4::perspective_rh_gl(fov_y, aspect, 0.1, 1000.0);
+                let cam_view = if state.visualizer_mode == 20 && state.biolum_top_down {
+                    glam::Mat4::look_at_rh(
+                        glam::Vec3::new(0.0, 14.0, 0.0),
+                        glam::Vec3::new(0.0, 0.0, 0.0),
+                        glam::Vec3::new(0.0, 0.0, 1.0),
+                    )
+                } else if state.visualizer_mode == 14 {
+                    let cam_y = if aspect < 1.0 { 1.65 } else { 1.50 };
+                    let cam_z = if aspect < 1.0 { 0.2 } else { 0.6 };
+                    glam::Mat4::look_at_rh(
+                        glam::Vec3::new(0.0, cam_y, cam_z),
+                        glam::Vec3::new(0.0, 0.95, 14.0),
+                        glam::Vec3::new(0.0, 1.0, 0.0),
+                    )
+                } else if state.visualizer_mode == 19 {
+                    let cam_z = (13.5 / aspect).clamp(6.2, 22.0);
+                    glam::Mat4::look_at_rh(
+                        glam::Vec3::new(0.0, 0.0, cam_z),
+                        glam::Vec3::new(0.0, 0.0, 0.0),
+                        glam::Vec3::new(0.0, 1.0, 0.0),
+                    )
+                } else if state.visualizer_mode == 11 {
+                    glam::Mat4::look_at_rh(
+                        glam::Vec3::new(0.0, 2.1, -3.8),
+                        glam::Vec3::new(0.0, 1.8, 20.0),
+                        glam::Vec3::new(0.0, 1.0, 0.0),
+                    )
+                } else if state.visualizer_mode == 17 {
+                    glam::Mat4::look_at_rh(
+                        glam::Vec3::new(0.0, 8.0, 0.0),
+                        glam::Vec3::new(0.0, 14.0, 50.0),
+                        glam::Vec3::new(0.0, 1.0, 0.0),
+                    )
+                } else if state.visualizer_mode == 23 {
+                    let lyrics_scale = (2.2 / aspect).max(1.0);
+                    let eye_y = 0.45 + 0.95 * lyrics_scale;
+                    let eye_z = 4.2 * lyrics_scale;
+                    glam::Mat4::look_at_rh(
+                        glam::Vec3::new(0.0, eye_y, eye_z),
+                        glam::Vec3::new(0.0, 0.45, 0.0),
+                        glam::Vec3::new(0.0, 1.0, 0.0),
+                    )
+                } else if state.visualizer_mode == 22 {
+                    let t_cam = self.play_time as f32 * 0.18;
+                    let cam_radius = 9.8f32;
+                    let cam_h = 2.4f32 + (t_cam * 0.7).sin() * 0.6f32;
+                    let cam_x = t_cam.sin() * cam_radius * 0.55f32;
+                    let cam_z = -t_cam.cos() * cam_radius * 0.6f32 - 2.8f32;
+                    glam::Mat4::look_at_rh(
+                        glam::Vec3::new(cam_x, cam_h, cam_z),
+                        glam::Vec3::new(0.0, 0.4, 2.5),
+                        glam::Vec3::new(0.0, 1.0, 0.0),
+                    )
+                } else if state.visualizer_mode == 29 {
+                    glam::Mat4::look_at_rh(
+                        glam::Vec3::new(0.0, 0.0, -6.5),
+                        glam::Vec3::new(0.0, 0.0, 20.0),
+                        glam::Vec3::new(0.0, 1.0, 0.0),
+                    )
+                } else {
+                    glam::Mat4::look_at_rh(
+                        glam::Vec3::new(0.0, 1.5, -2.0),
+                        glam::Vec3::new(0.0, 1.5, 0.0),
+                        glam::Vec3::new(0.0, 1.0, 0.0),
+                    )
+                };
+                let camera_uniforms = CameraUniforms {
+                    view_matrix: cam_view.to_cols_array_2d(),
+                    proj_matrix: proj.to_cols_array_2d(),
+                };
+                self.queue.write_buffer(
+                    &self.camera_uniform_buffer,
+                    0,
+                    bytemuck::cast_slice(&[camera_uniforms]),
+                );
+            }
+
+            if is_video_active
+                && let Some(vs) = &self.video_state
+            {
+                let params = VideoParams {
+                    color_space: vs.color_space,
+                    color_range: vs.color_range,
+                    bit_depth: vs.bit_depth,
+                    color_trc: vs.color_trc,
+                    viewport_width: v_vp_w,
+                    viewport_height: v_vp_h,
+                    video_width: vs.width as f32,
+                    video_height: vs.height as f32,
+                    rotation: vs.rotation,
+                    _pad1: 0.0,
+                    _pad2: 0.0,
+                    _pad3: 0.0,
+                };
+                self.queue
+                    .write_buffer(&vs.params_buffer, 0, bytemuck::cast_slice(&[params]));
+            }
+        }
 
         let mut encoder = self
             .device
@@ -11373,9 +11756,14 @@ impl VulkanEngine {
             None
         };
 
-        // GPU heatmap & resynth compute (timed via query indices 0..1 when stats are visible)
+        // GPU compute passes (skipped when paused and idle so paused frames do minimal GPU work)
         if state.file_loaded {
-            {
+            let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
+            let need_heatmap_or_resynth = !state.is_paused
+                || self.last_steps_to_fill > 0
+                || vis_def.requires_resynth
+                || active_query_set.is_some();
+            if need_heatmap_or_resynth {
                 let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("Heatmap & Resynth Compute Pass"),
                     timestamp_writes: active_query_set.map(|qs| wgpu::ComputePassTimestampWrites {
@@ -11388,8 +11776,7 @@ impl VulkanEngine {
                 compute_pass.set_bind_group(0, Some(&self.heatmap_bind_group), &[]);
                 compute_pass.dispatch_workgroups(1, 1, 1); // 256x1x1 threads
 
-                let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
-                if vis_def.requires_resynth {
+                if vis_def.requires_resynth && !state.is_paused {
                     compute_pass.set_pipeline(&self.resynth_compute_pipeline);
                     compute_pass.set_bind_group(0, Some(&self.resynth_bind_group), &[]);
                     compute_pass.dispatch_workgroups(32, 2, 1); // 512/16=32, 32/16=2
@@ -11397,8 +11784,7 @@ impl VulkanEngine {
             }
 
             // GPU fire compute: dispatch simulation + copy result to texture
-            let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
-            if vis_def.requires_fire {
+            if vis_def.requires_fire && (!state.is_paused || self.fire_intensity > 0.001) {
                 if vis_def.id == 6 {
                     {
                         let mut compute_pass =
@@ -11421,7 +11807,6 @@ impl VulkanEngine {
                         compute_pass.set_bind_group(0, Some(bg), &[]);
                         compute_pass.dispatch_workgroups(64, 36, 1); // 1024/16=64, 576/16=36
                     }
-                    // Copy output buffer to fire_grid_texture
                     let output_buffer = if self.fire_ping {
                         &self.fire_buffer_b
                     } else {
@@ -11450,7 +11835,6 @@ impl VulkanEngine {
                     );
                     self.fire_ping = !self.fire_ping;
                 } else if let Some(qs) = active_query_set {
-                    // Retro Fire (ID 5) cellular automaton already ran on CPU and uploaded to fire_grid_texture.
                     encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                         label: Some("Dummy Fire Pass"),
                         timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
@@ -11471,456 +11855,327 @@ impl VulkanEngine {
                 });
             }
 
-            if vis_def.id == 11 {
-                // Neon Corridor
-                // Update params
-                let mut act = 0.0;
-                let count = state.channel_vus.len().min(8);
-                for i in 0..count {
-                    act += state.channel_vus[i];
+            if !state.is_paused {
+                if vis_def.id == 11 {
+                    let mut act = 0.0;
+                    let count = state.channel_vus.len().min(8);
+                    for i in 0..count {
+                        act += state.channel_vus[i];
+                    }
+                    if count > 0 {
+                        act /= count as f32;
+                    }
+                    self.queue.write_buffer(
+                        &self.smoke_params_buffer,
+                        0,
+                        bytemuck::cast_slice(&[state.current_seconds as f32, act, 0.0, 0.0]),
+                    );
+
+                    let mut compute_pass =
+                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("Neon Smoke Compute Pass"),
+                            timestamp_writes: None,
+                        });
+                    compute_pass.set_pipeline(&self.smoke_compute_pipeline);
+                    compute_pass.set_bind_group(0, Some(&self.smoke_compute_bind_group), &[]);
+                    compute_pass.dispatch_workgroups(16, 16, 16);
                 }
-                if count > 0 {
-                    act /= count as f32;
+
+                if vis_def.requires_ferrofluidsim {
+                    let mut compute_pass =
+                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("Ferrofluid Sim Compute"),
+                            timestamp_writes: None,
+                        });
+                    compute_pass.set_pipeline(&self.ferrofluidsim_clear_pipeline);
+                    compute_pass.set_bind_group(0, Some(&self.ferrofluidsim_bind_group), &[]);
+                    compute_pass.dispatch_workgroups(1024, 1, 1);
+
+                    compute_pass.set_pipeline(&self.ferrofluidsim_compute_pipeline);
+                    compute_pass.dispatch_workgroups(391, 1, 1);
                 }
-                self.queue.write_buffer(
-                    &self.smoke_params_buffer,
-                    0,
-                    bytemuck::cast_slice(&[
-                        state.current_seconds as f32,
-                        act,
-                        0.0,
-                        0.0, // padding
-                    ]),
-                );
 
-                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Neon Smoke Compute Pass"),
-                    timestamp_writes: None,
-                });
-                compute_pass.set_pipeline(&self.smoke_compute_pipeline);
-                compute_pass.set_bind_group(0, Some(&self.smoke_compute_bind_group), &[]);
-                compute_pass.dispatch_workgroups(16, 16, 16); // 64 / 4
-            }
-
-            if vis_def.requires_ferrofluidsim {
-                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Ferrofluid Sim Compute"),
-                    timestamp_writes: None,
-                });
-                compute_pass.set_pipeline(&self.ferrofluidsim_clear_pipeline);
-                compute_pass.set_bind_group(0, Some(&self.ferrofluidsim_bind_group), &[]);
-                compute_pass.dispatch_workgroups(1024, 1, 1);
-
-                compute_pass.set_pipeline(&self.ferrofluidsim_compute_pipeline);
-                compute_pass.dispatch_workgroups(391, 1, 1);
-            }
-
-            if vis_def.requires_flip_ferrofluid {
-                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Quantum FLIP Ferrofluid Compute"),
-                    timestamp_writes: None,
-                });
-                // 1. Clear grid accum and pressure buffers
-                compute_pass.set_pipeline(&self.flip_clear_pipeline);
-                compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
-                compute_pass.dispatch_workgroups(512, 1, 1);
-
-                // 2. Clear render heightfield grid
-                compute_pass.set_pipeline(&self.flip_clear_render_pipeline);
-                compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
-                compute_pass.dispatch_workgroups(1024, 1, 1);
-
-                // 3. P2G (Transfer particle momentum to grid)
-                compute_pass.set_pipeline(&self.flip_p2g_pipeline);
-                compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
-                compute_pass.dispatch_workgroups(96, 1, 1);
-
-                // 4. Grid forces (normalize, gravity, magnetic body forces, boundary walls)
-                compute_pass.set_pipeline(&self.flip_forces_pipeline);
-                compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
-                compute_pass.dispatch_workgroups(512, 1, 1);
-
-                // 5. Pressure solve (2 warm-started Jacobi iterations ping-ponging 0 -> 1 -> 0)
-                for _ in 0..1 {
-                    compute_pass.set_pipeline(&self.flip_pressure_0_to_1_pipeline);
+                if vis_def.requires_flip_ferrofluid {
+                    let mut compute_pass =
+                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("Quantum FLIP Ferrofluid Compute"),
+                            timestamp_writes: None,
+                        });
+                    compute_pass.set_pipeline(&self.flip_clear_pipeline);
                     compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
                     compute_pass.dispatch_workgroups(512, 1, 1);
 
-                    compute_pass.set_pipeline(&self.flip_pressure_1_to_0_pipeline);
+                    compute_pass.set_pipeline(&self.flip_clear_render_pipeline);
+                    compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                    compute_pass.dispatch_workgroups(1024, 1, 1);
+
+                    compute_pass.set_pipeline(&self.flip_p2g_pipeline);
+                    compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                    compute_pass.dispatch_workgroups(96, 1, 1);
+
+                    compute_pass.set_pipeline(&self.flip_forces_pipeline);
                     compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
                     compute_pass.dispatch_workgroups(512, 1, 1);
+
+                    for _ in 0..1 {
+                        compute_pass.set_pipeline(&self.flip_pressure_0_to_1_pipeline);
+                        compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                        compute_pass.dispatch_workgroups(512, 1, 1);
+
+                        compute_pass.set_pipeline(&self.flip_pressure_1_to_0_pipeline);
+                        compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                        compute_pass.dispatch_workgroups(512, 1, 1);
+                    }
+
+                    compute_pass.set_pipeline(&self.flip_project_pipeline);
+                    compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                    compute_pass.dispatch_workgroups(512, 1, 1);
+
+                    compute_pass.set_pipeline(&self.flip_g2p_advect_pipeline);
+                    compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                    compute_pass.dispatch_workgroups(96, 1, 1);
                 }
 
-                // 6. Velocity projection (subtract pressure gradient)
-                compute_pass.set_pipeline(&self.flip_project_pipeline);
-                compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
-                compute_pass.dispatch_workgroups(512, 1, 1);
-
-                // 7. G2P & Advection & Splat to Render Grid
-                compute_pass.set_pipeline(&self.flip_g2p_advect_pipeline);
-                compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
-                compute_pass.dispatch_workgroups(96, 1, 1);
-            }
-
-            if vis_def.requires_flip_water && vis_def.id != 28 {
-                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Acoustic FLIP Water Compute"),
-                    timestamp_writes: None,
-                });
-                // 1. Clear grid accum and pressure buffers
-                compute_pass.set_pipeline(&self.flip_water_clear_pipeline);
-                compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
-                compute_pass.dispatch_workgroups(512, 1, 1);
-
-                // 2. Clear render heightfield grid
-                compute_pass.set_pipeline(&self.flip_water_clear_render_pipeline);
-                compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
-                compute_pass.dispatch_workgroups(1024, 1, 1);
-
-                // 3. P2G (Transfer particle momentum to grid)
-                compute_pass.set_pipeline(&self.flip_water_p2g_pipeline);
-                compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
-                compute_pass.dispatch_workgroups(256, 1, 1);
-
-                // 4. Grid forces (normalize, gravity, acoustic sub-bass geyser forces, Faraday ripples, walls)
-                compute_pass.set_pipeline(&self.flip_water_forces_pipeline);
-                compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
-                compute_pass.dispatch_workgroups(512, 1, 1);
-
-                // 5. Pressure solve (16 Jacobi iterations ping-ponging 0 -> 1 -> 0 -> 1)
-                for _ in 0..8 {
-                    compute_pass.set_pipeline(&self.flip_water_pressure_0_to_1_pipeline);
+                if vis_def.requires_flip_water && vis_def.id != 28 {
+                    let mut compute_pass =
+                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("Acoustic FLIP Water Compute"),
+                            timestamp_writes: None,
+                        });
+                    compute_pass.set_pipeline(&self.flip_water_clear_pipeline);
                     compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
                     compute_pass.dispatch_workgroups(512, 1, 1);
 
-                    compute_pass.set_pipeline(&self.flip_water_pressure_1_to_0_pipeline);
+                    compute_pass.set_pipeline(&self.flip_water_clear_render_pipeline);
+                    compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                    compute_pass.dispatch_workgroups(1024, 1, 1);
+
+                    compute_pass.set_pipeline(&self.flip_water_p2g_pipeline);
+                    compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                    compute_pass.dispatch_workgroups(256, 1, 1);
+
+                    compute_pass.set_pipeline(&self.flip_water_forces_pipeline);
                     compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
                     compute_pass.dispatch_workgroups(512, 1, 1);
+
+                    for _ in 0..8 {
+                        compute_pass.set_pipeline(&self.flip_water_pressure_0_to_1_pipeline);
+                        compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                        compute_pass.dispatch_workgroups(512, 1, 1);
+
+                        compute_pass.set_pipeline(&self.flip_water_pressure_1_to_0_pipeline);
+                        compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                        compute_pass.dispatch_workgroups(512, 1, 1);
+                    }
+
+                    compute_pass.set_pipeline(&self.flip_water_project_pipeline);
+                    compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                    compute_pass.dispatch_workgroups(512, 1, 1);
+
+                    compute_pass.set_pipeline(&self.flip_water_g2p_advect_pipeline);
+                    compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                    compute_pass.dispatch_workgroups(256, 1, 1);
                 }
 
-                // 6. Velocity projection (subtract pressure gradient)
-                compute_pass.set_pipeline(&self.flip_water_project_pipeline);
-                compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
-                compute_pass.dispatch_workgroups(512, 1, 1);
-
-                // 7. G2P & Advection & Splat to Render Grid
-                compute_pass.set_pipeline(&self.flip_water_g2p_advect_pipeline);
-                compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
-                compute_pass.dispatch_workgroups(256, 1, 1);
+                if vis_def.id == 20 {
+                    let mut compute_pass =
+                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("Bioluminescence Waves Sim Compute"),
+                            timestamp_writes: None,
+                        });
+                    compute_pass.set_pipeline(&self.biolum_compute_pipeline);
+                    compute_pass.set_bind_group(0, Some(&self.biolum_compute_bind_group), &[]);
+                    compute_pass.dispatch_workgroups(144, 1, 1);
+                }
             }
+        }
+
+        let is_mesh_3d = state.file_loaded
+            && matches!(
+                crate::state::VISUALIZERS[state.current_visualizer_idx].pipeline_type,
+                crate::state::PipelineType::Mesh3D { .. }
+            );
+
+        // If a 3D mesh visualizer is active, run its depth-buffered pass first, then overlay 2D HUD + Egui
+        // without depth attachment. Otherwise (2D visualizers or Splash), execute a SINGLE swapchain render pass
+        // with no depth attachment for minimal GPU overhead.
+        if is_mesh_3d {
+            let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
+            let mode_idx = state
+                .current_visualizer_idx
+                .min(self.render_pipelines.len() - 1);
+            let mut render_pass_3d = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("3D Visualizer Render Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(APP_DEFAULT_BG_CLEAR_COLOR),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_texture_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: active_query_set.map(|qs| wgpu::RenderPassTimestampWrites {
+                    query_set: qs,
+                    beginning_of_pass_write_index: Some(4),
+                    end_of_pass_write_index: Some(5),
+                }),
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+
+            render_pass_3d.set_viewport(vp_x, vp_y, vp_w, vp_h, 0.0, 1.0);
+            render_pass_3d.set_scissor_rect(vp_x as u32, vp_y as u32, vp_w as u32, vp_h as u32);
 
             if vis_def.id == 20 {
-                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: Some("Bioluminescence Waves Sim Compute"),
-                    timestamp_writes: None,
-                });
-                compute_pass.set_pipeline(&self.biolum_compute_pipeline);
-                compute_pass.set_bind_group(0, Some(&self.biolum_compute_bind_group), &[]);
-                compute_pass.dispatch_workgroups(144, 1, 1);
+                render_pass_3d.set_pipeline(&self.biolum_bg_pipeline);
+                render_pass_3d.draw(0..3, 0..1);
+            } else if vis_def.id == 18 {
+                render_pass_3d.set_pipeline(&self.crt_background_pipeline);
+                render_pass_3d.set_bind_group(0, &self.uniform_bind_group, &[]);
+                render_pass_3d.set_bind_group(1, &self.smoke_render_bind_group, &[]);
+                render_pass_3d.draw(0..3, 0..1);
+            } else if vis_def.id == 14 {
+                render_pass_3d.set_pipeline(&self.synthwave_sky_pipeline);
+                render_pass_3d.set_bind_group(0, &self.uniform_bind_group, &[]);
+                render_pass_3d.set_bind_group(1, &self.smoke_render_bind_group, &[]);
+                render_pass_3d.draw(0..3, 0..1);
+            } else if vis_def.id == 19 {
+                render_pass_3d.set_pipeline(&self.vumeters_bg_pipeline);
+                render_pass_3d.set_bind_group(0, &self.uniform_bind_group, &[]);
+                render_pass_3d.set_bind_group(1, &self.smoke_render_bind_group, &[]);
+                render_pass_3d.draw(0..3, 0..1);
+            } else if vis_def.id == 11 {
+                render_pass_3d.set_pipeline(&self.neon_bg_pipeline);
+                render_pass_3d.set_bind_group(0, &self.uniform_bind_group, &[]);
+                render_pass_3d.set_bind_group(1, &self.smoke_render_bind_group, &[]);
+                render_pass_3d.draw(0..3, 0..1);
+            } else if vis_def.id == 17 {
+                render_pass_3d.set_pipeline(&self.storm_sky_pipeline);
+                render_pass_3d.set_bind_group(0, &self.uniform_bind_group, &[]);
+                render_pass_3d.set_bind_group(1, &self.smoke_render_bind_group, &[]);
+                render_pass_3d.draw(0..3, 0..1);
+            } else if vis_def.id != 13 && vis_def.id != 22 && vis_def.id != 29 {
+                render_pass_3d.set_pipeline(&self.clear_black_pipeline);
+                render_pass_3d.draw(0..3, 0..1);
             }
 
+            if let Some(vis_pipeline) = self.render_pipelines[mode_idx].as_ref() {
+                render_pass_3d.set_pipeline(vis_pipeline);
+            }
+            render_pass_3d.set_bind_group(0, &self.uniform_bind_group, &[]);
+            if vis_def.id == 27 || vis_def.id == 28 || vis_def.id == 23 {
+                render_pass_3d.set_bind_group(1, &self.flip_render_bind_group, &[]);
+            } else {
+                render_pass_3d.set_bind_group(1, &self.smoke_render_bind_group, &[]);
+            }
+
+            if let crate::state::PipelineType::Mesh3D {
+                geometry,
+                instances,
+            } = &vis_def.pipeline_type
             {
-                let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                render_pass_3d.set_bind_group(2, &self.camera_bind_group, &[]);
+                if vis_def.id == 20 {
+                    render_pass_3d.set_bind_group(3, &self.biolum_render_bind_group, &[]);
+                }
+                if let Some(mesh) = self.mesh_registry.get(geometry) {
+                    render_pass_3d.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                    render_pass_3d
+                        .set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    render_pass_3d.draw_indexed(0..mesh.index_count, 0, 0..*instances);
+                }
+
+                if vis_def.id == 23 {
+                    render_pass_3d.set_pipeline(&self.water_splash_pipeline);
+                    render_pass_3d.set_vertex_buffer(0, self.splash_quad_vertex_buffer.slice(..));
+                    render_pass_3d.set_index_buffer(
+                        self.splash_quad_index_buffer.slice(..),
+                        wgpu::IndexFormat::Uint32,
+                    );
+                    render_pass_3d.draw_indexed(0..6, 0, 0..65536);
+                }
+
+                if vis_def.id == 13 {
+                    render_pass_3d.set_pipeline(&self.lamp_pipeline);
+                    render_pass_3d.set_vertex_buffer(0, self.lamp_vertex_buffer.slice(..));
+                    render_pass_3d.set_index_buffer(
+                        self.lamp_index_buffer.slice(..),
+                        wgpu::IndexFormat::Uint32,
+                    );
+                    render_pass_3d.draw_indexed(0..self.lamp_index_count, 0, 0..16);
+                }
+            }
+        }
+
+        {
+            let mut render_pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("Main Render Pass"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                         view: &view,
                         resolve_target: None,
                         depth_slice: None,
                         ops: wgpu::Operations {
-                            // Must always clear to APP_DEFAULT_BG_CLEAR_COLOR (0.1, 0.1, 0.1) so the
-                            // transparent top HUD panel preserves its default grey background.
-                            load: wgpu::LoadOp::Clear(APP_DEFAULT_BG_CLEAR_COLOR),
+                            load: if is_mesh_3d {
+                                wgpu::LoadOp::Load
+                            } else {
+                                wgpu::LoadOp::Clear(APP_DEFAULT_BG_CLEAR_COLOR)
+                            },
                             store: wgpu::StoreOp::Store,
                         },
                     })],
-                    depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
-                        view: &self.depth_texture_view,
-                        depth_ops: Some(wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(1.0),
-                            store: wgpu::StoreOp::Discard,
-                        }),
-                        stencil_ops: None,
-                    }),
-                    timestamp_writes: active_query_set.map(|qs| wgpu::RenderPassTimestampWrites {
-                        query_set: qs,
-                        beginning_of_pass_write_index: Some(4),
-                        end_of_pass_write_index: Some(5),
-                    }),
+                    depth_stencil_attachment: None,
+                    timestamp_writes: if is_mesh_3d {
+                        None
+                    } else {
+                        active_query_set.map(|qs| wgpu::RenderPassTimestampWrites {
+                            query_set: qs,
+                            beginning_of_pass_write_index: Some(4),
+                            end_of_pass_write_index: Some(5),
+                        })
+                    },
                     occlusion_query_set: None,
                     multiview_mask: None,
-                });
+                })
+                .forget_lifetime();
 
-                let scale_factor = egui_ctx.pixels_per_point();
-                let vp_x = ((central_rect.min.x * scale_factor)
-                    .clamp(0.0, self.config.width as f32))
-                .round();
-                let vp_y = ((central_rect.min.y * scale_factor)
-                    .clamp(0.0, self.config.height as f32))
-                .round();
-                let max_w = (self.config.width as f32 - vp_x).max(1.0);
-                let vp_w = ((central_rect.width() * scale_factor).clamp(1.0, max_w)).round();
-                let max_h = (self.config.height as f32 - vp_y).max(1.0);
-                let vp_h = ((central_rect.height() * scale_factor).clamp(1.0, max_h)).round();
-
-                // --- 3D Engine Camera Math ---
-                let aspect = vp_w / vp_h.max(1.0);
-
-                // Update aspect_ratio uniform dynamically based on current viewport
-                const ASPECT_RATIO_OFFSET: wgpu::BufferAddress =
-                    std::mem::offset_of!(AudioUniforms, aspect_ratio) as wgpu::BufferAddress;
-                self.queue.write_buffer(
-                    &self.uniform_buffer,
-                    ASPECT_RATIO_OFFSET,
-                    bytemuck::cast_slice(&[aspect as f32]),
-                );
-
-                // Adapt FOV when aspect ratio is square or portrait (< 1.0) so 3D scenes fit without horizontal clipping
-                let base_fov = if state.visualizer_mode == 22 {
-                    64.0_f32.to_radians()
-                } else {
-                    48.0_f32.to_radians()
-                };
-                let fov_y = if state.visualizer_mode == 19
-                    || state.visualizer_mode == 23
-                    || state.visualizer_mode == 29
-                {
-                    base_fov
-                } else if aspect < 1.0 {
-                    (base_fov / aspect.clamp(0.65, 1.0)).min(if state.visualizer_mode == 22 {
-                        85.0_f32.to_radians()
-                    } else {
-                        75.0_f32.to_radians()
-                    })
-                } else {
-                    base_fov
-                };
-                let proj = glam::Mat4::perspective_rh_gl(fov_y, aspect, 0.1, 1000.0);
-                let view = if state.visualizer_mode == 20 && state.biolum_top_down {
-                    glam::Mat4::look_at_rh(
-                        glam::Vec3::new(0.0, 14.0, 0.0),
-                        glam::Vec3::new(0.0, 0.0, 0.0),
-                        glam::Vec3::new(0.0, 0.0, 1.0),
-                    )
-                } else if state.visualizer_mode == 14 {
-                    let cam_y = if aspect < 1.0 { 1.65 } else { 1.50 };
-                    let cam_z = if aspect < 1.0 { 0.2 } else { 0.6 };
-                    glam::Mat4::look_at_rh(
-                        glam::Vec3::new(0.0, cam_y, cam_z),
-                        glam::Vec3::new(0.0, 0.95, 14.0),
-                        glam::Vec3::new(0.0, 1.0, 0.0),
-                    )
-                } else if state.visualizer_mode == 19 {
-                    // 3D Vintage Hi-Fi Master Rack:
-                    // Scale camera distance so 11.5-wide rack fits completely in square/portrait viewports without clipping
-                    let cam_z = (13.5 / aspect).clamp(6.2, 22.0);
-                    glam::Mat4::look_at_rh(
-                        glam::Vec3::new(0.0, 0.0, cam_z),
-                        glam::Vec3::new(0.0, 0.0, 0.0),
-                        glam::Vec3::new(0.0, 1.0, 0.0),
-                    )
-                } else if state.visualizer_mode == 11 {
-                    // 3D Concentric Neon Audio Portal Frames Corridor
-                    glam::Mat4::look_at_rh(
-                        glam::Vec3::new(0.0, 2.1, -3.8),
-                        glam::Vec3::new(0.0, 1.8, 20.0),
-                        glam::Vec3::new(0.0, 1.0, 0.0),
-                    )
-                } else if state.visualizer_mode == 17 {
-                    // 3D Volumetric Falling Rain Storm
-                    glam::Mat4::look_at_rh(
-                        glam::Vec3::new(0.0, 8.0, 0.0),
-                        glam::Vec3::new(0.0, 14.0, 50.0),
-                        glam::Vec3::new(0.0, 1.0, 0.0),
-                    )
-                } else if state.visualizer_mode == 23 {
-                    // 3D Glass Water Lyrics: Low-angle studio camera
-                    // Scale camera distance and elevation so 7.5-wide text fits cleanly in square/portrait mobile viewport
-                    let lyrics_scale = (2.2 / aspect).max(1.0);
-                    let eye_y = 0.45 + 0.95 * lyrics_scale;
-                    let eye_z = 4.2 * lyrics_scale;
-                    glam::Mat4::look_at_rh(
-                        glam::Vec3::new(0.0, eye_y, eye_z),
-                        glam::Vec3::new(0.0, 0.45, 0.0),
-                        glam::Vec3::new(0.0, 1.0, 0.0),
-                    )
-                } else if state.visualizer_mode == 22 {
-                    // 3D Neon Spatial Listening Room: Orbiting camera focused on center stage
-                    let t_cam = self.play_time as f32 * 0.18;
-                    let cam_radius = 9.8f32;
-                    let cam_h = 2.4f32 + (t_cam * 0.7).sin() * 0.6f32;
-                    let cam_x = t_cam.sin() * cam_radius * 0.55f32;
-                    let cam_z = -t_cam.cos() * cam_radius * 0.6f32 - 2.8f32;
-                    glam::Mat4::look_at_rh(
-                        glam::Vec3::new(cam_x, cam_h, cam_z),
-                        glam::Vec3::new(0.0, 0.4, 2.5),
-                        glam::Vec3::new(0.0, 1.0, 0.0),
-                    )
-                } else if state.visualizer_mode == 29 {
-                    // 3D Prismatic Spectrum Canyon: Centered perspective camera looking down +Z canyon
-                    glam::Mat4::look_at_rh(
-                        glam::Vec3::new(0.0, 0.0, -6.5),
-                        glam::Vec3::new(0.0, 0.0, 20.0),
-                        glam::Vec3::new(0.0, 1.0, 0.0),
-                    )
-                } else {
-                    glam::Mat4::look_at_rh(
-                        glam::Vec3::new(0.0, 1.5, -2.0),
-                        glam::Vec3::new(0.0, 1.5, 0.0),
-                        glam::Vec3::new(0.0, 1.0, 0.0),
-                    )
-                };
-                let camera_uniforms = CameraUniforms {
-                    view_matrix: view.to_cols_array_2d(),
-                    proj_matrix: proj.to_cols_array_2d(),
-                };
-                self.queue.write_buffer(
-                    &self.camera_uniform_buffer,
-                    0,
-                    bytemuck::cast_slice(&[camera_uniforms]),
-                );
-
-                render_pass.set_viewport(vp_x, vp_y, vp_w, vp_h, 0.0, 1.0);
-                render_pass.set_scissor_rect(vp_x as u32, vp_y as u32, vp_w as u32, vp_h as u32);
-
-                if state.file_loaded {
+            if state.file_loaded {
+                if !is_mesh_3d {
+                    let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
                     let mode_idx = state
                         .current_visualizer_idx
                         .min(self.render_pipelines.len() - 1);
-                    let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
 
-                    if vis_def.id == 20 {
-                        render_pass.set_pipeline(&self.biolum_bg_pipeline);
-                        render_pass.draw(0..3, 0..1);
-                    } else if vis_def.id == 18 {
-                        render_pass.set_pipeline(&self.crt_background_pipeline);
-                        render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-                        render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
-                        render_pass.draw(0..3, 0..1);
-                    } else if vis_def.id == 14 {
-                        render_pass.set_pipeline(&self.synthwave_sky_pipeline);
-                        render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-                        render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
-                        render_pass.draw(0..3, 0..1);
-                    } else if vis_def.id == 19 {
-                        render_pass.set_pipeline(&self.vumeters_bg_pipeline);
-                        render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-                        render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
-                        render_pass.draw(0..3, 0..1);
-                    } else if vis_def.id == 11 {
-                        render_pass.set_pipeline(&self.neon_bg_pipeline);
-                        render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-                        render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
-                        render_pass.draw(0..3, 0..1);
-                    } else if vis_def.id == 17 {
-                        render_pass.set_pipeline(&self.storm_sky_pipeline);
-                        render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
-                        render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
-                        render_pass.draw(0..3, 0..1);
-                    } else if vis_def.id != 13
-                        && vis_def.id != 22
-                        && vis_def.id != 29
-                        && matches!(
-                            vis_def.pipeline_type,
-                            crate::state::PipelineType::Mesh3D { .. }
-                        )
-                    {
-                        // Automatically clear the 3D visualizer viewport to black for any Mesh3D visualizer
-                        // that does not use one of the dedicated sky pipelines above, while preserving
-                        // APP_DEFAULT_BG_CLEAR_COLOR in the surrounding application/HUD panels.
-                        render_pass.set_pipeline(&self.clear_black_pipeline);
-                        render_pass.draw(0..3, 0..1);
+                    render_pass.set_viewport(vp_x, vp_y, vp_w, vp_h, 0.0, 1.0);
+                    render_pass.set_scissor_rect(
+                        vp_x as u32,
+                        vp_y as u32,
+                        vp_w as u32,
+                        vp_h as u32,
+                    );
+
+                    if let Some(vis_pipeline) = self.render_pipelines[mode_idx].as_ref() {
+                        render_pass.set_pipeline(vis_pipeline);
                     }
-
-                    render_pass.set_pipeline(&self.render_pipelines[mode_idx]);
                     render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
                     if vis_def.id == 27 || vis_def.id == 28 || vis_def.id == 23 {
                         render_pass.set_bind_group(1, &self.flip_render_bind_group, &[]);
                     } else {
                         render_pass.set_bind_group(1, &self.smoke_render_bind_group, &[]);
                     }
-
-                    match &vis_def.pipeline_type {
-                        crate::state::PipelineType::FullscreenQuad => {
-                            render_pass.draw(0..3, 0..1);
-                        }
-                        crate::state::PipelineType::Mesh3D {
-                            geometry,
-                            instances,
-                        } => {
-                            render_pass.set_bind_group(2, &self.camera_bind_group, &[]);
-                            if vis_def.id == 20 {
-                                render_pass.set_bind_group(3, &self.biolum_render_bind_group, &[]);
-                            }
-                            if let Some(mesh) = self.mesh_registry.get(geometry) {
-                                render_pass.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
-                                render_pass.set_index_buffer(
-                                    mesh.index_buffer.slice(..),
-                                    wgpu::IndexFormat::Uint32,
-                                );
-                                render_pass.draw_indexed(0..mesh.index_count, 0, 0..*instances);
-                            }
-
-                            if vis_def.id == 23 {
-                                render_pass.set_pipeline(&self.water_splash_pipeline);
-                                render_pass
-                                    .set_vertex_buffer(0, self.splash_quad_vertex_buffer.slice(..));
-                                render_pass.set_index_buffer(
-                                    self.splash_quad_index_buffer.slice(..),
-                                    wgpu::IndexFormat::Uint32,
-                                );
-                                render_pass.draw_indexed(0..6, 0, 0..65536);
-                            }
-
-                            if vis_def.id == 13 {
-                                render_pass.set_pipeline(&self.lamp_pipeline);
-                                render_pass.set_vertex_buffer(0, self.lamp_vertex_buffer.slice(..));
-                                render_pass.set_index_buffer(
-                                    self.lamp_index_buffer.slice(..),
-                                    wgpu::IndexFormat::Uint32,
-                                );
-                                render_pass.draw_indexed(0..self.lamp_index_count, 0, 0..16);
-                            }
-                        }
-                    }
+                    render_pass.draw(0..3, 0..1);
                 }
 
-                let is_portrait = self.config.width < self.config.height;
-                let is_video_active = self.video_state.is_some()
-                    && (state.video_mode > 0
-                        || (is_portrait
-                            && state.mobile_hud_tab == crate::state::MobileHudTab::Video));
-
                 if is_video_active {
-                    let mut v_vp_x = 0.0;
-                    let mut v_vp_y = 0.0;
-                    let mut v_vp_w = self.config.width as f32;
-                    let mut v_vp_h = self.config.height as f32;
-
-                    let target_rect = if state.video_mode == 3 {
-                        None // mode 3: full screen
-                    } else if is_portrait
-                        && state.mobile_hud_tab == crate::state::MobileHudTab::Video
-                    {
-                        out_video_rect
-                    } else if state.video_mode == 1 {
-                        out_track_info_rect
-                    } else if state.video_mode == 2 {
-                        out_video_rect.or(out_top_panel_rect)
-                    } else {
-                        None // mode 3: full screen
-                    };
-
-                    if let Some(r) = target_rect {
-                        v_vp_x =
-                            ((r.min.x * scale_factor).clamp(0.0, self.config.width as f32)).round();
-                        v_vp_y = ((r.min.y * scale_factor).clamp(0.0, self.config.height as f32))
-                            .round();
-                        let max_w = (self.config.width as f32 - v_vp_x).max(1.0);
-                        v_vp_w = ((r.width() * scale_factor).clamp(1.0, max_w)).round();
-                        let max_h = (self.config.height as f32 - v_vp_y).max(1.0);
-                        v_vp_h = ((r.height() * scale_factor).clamp(1.0, max_h)).round();
-                    }
-
                     render_pass.set_viewport(v_vp_x, v_vp_y, v_vp_w, v_vp_h, 0.0, 1.0);
                     render_pass.set_scissor_rect(
                         v_vp_x as u32,
@@ -11930,25 +12185,6 @@ impl VulkanEngine {
                     );
 
                     if let Some(vs) = &self.video_state {
-                        let params = VideoParams {
-                            color_space: vs.color_space,
-                            color_range: vs.color_range,
-                            bit_depth: vs.bit_depth,
-                            color_trc: vs.color_trc,
-                            viewport_width: v_vp_w,
-                            viewport_height: v_vp_h,
-                            video_width: vs.width as f32,
-                            video_height: vs.height as f32,
-                            rotation: vs.rotation,
-                            _pad1: 0.0,
-                            _pad2: 0.0,
-                            _pad3: 0.0,
-                        };
-                        self.queue.write_buffer(
-                            &vs.params_buffer,
-                            0,
-                            bytemuck::cast_slice(&[params]),
-                        );
                         render_pass.set_pipeline(&self.video_pipeline);
                         render_pass.set_bind_group(0, &vs.bind_group, &[]);
                         render_pass.draw(0..3, 0..1);
@@ -12006,34 +12242,22 @@ impl VulkanEngine {
                     draw_rect(out_heatmap_rect);
                     draw_rect(out_fire_rect);
                 }
-            }
-        }
 
-        if !clipped_primitives.is_empty() {
-            let mut render_pass = encoder
-                .begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("Egui Render Pass"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &view,
-                        resolve_target: None,
-                        depth_slice: None,
-                        ops: wgpu::Operations {
-                            load: if state.file_loaded {
-                                wgpu::LoadOp::Load
-                            } else {
-                                wgpu::LoadOp::Clear(APP_DEFAULT_BG_CLEAR_COLOR)
-                            },
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                })
-                .forget_lifetime();
-            self.egui_renderer
-                .render(&mut render_pass, &clipped_primitives, &screen_descriptor);
+                render_pass.set_viewport(
+                    0.0,
+                    0.0,
+                    self.config.width as f32,
+                    self.config.height as f32,
+                    0.0,
+                    1.0,
+                );
+                render_pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
+            }
+
+            if !clipped_primitives.is_empty() {
+                self.egui_renderer
+                    .render(&mut render_pass, &clipped_primitives, &screen_descriptor);
+            }
         }
 
         // Resolve timestamp queries into the resolve buffer, then copy to the read buffer.
@@ -13839,5 +14063,121 @@ mod tests {
             stats_cache.fps_line, "FPS: 50.0 (20.00 ms)",
             "StatsDisplayCache must refresh after 100ms"
         );
+    }
+
+    #[test]
+    fn test_vu_meter_phosphor_ghosting_decay() {
+        // 1. Validate hud.wgsl compiles cleanly with naga
+        const SHADER_COMMON: &str = include_str!("shaders/_common.wgsl");
+        let hud_resolved =
+            include_str!("shaders/hud.wgsl").replace("// INCLUDE: common", SHADER_COMMON);
+        if let Err(e) = wgpu::naga::front::wgsl::parse_str(&hud_resolved) {
+            panic!("hud.wgsl WGSL parse error:\n{}", e.emit_to_string(&hud_resolved));
+        }
+
+        let mut prev_active = [0u32; 32];
+        let mut ghost1 = [0.0f32; 32];
+        let mut ghost2 = [0.0f32; 32];
+        let mut channels = [0.0f32; 32];
+
+        let unpack = |packed: f32| -> (f32, f32) {
+            let g1 = (packed.floor() / 1000.0).clamp(0.0, 1.0);
+            let g2 = (packed.fract() / 0.90).clamp(0.0, 1.0);
+            (g1, g2)
+        };
+
+        // 2. Rising from 0 to 20 segments must NOT trigger ghosting above the bar
+        channels[0] = 20.0 / 30.0;
+        let packed = VulkanEngine::step_vu_phosphor_ghosts(
+            &mut prev_active,
+            &mut ghost1,
+            &mut ghost2,
+            &channels,
+            2,
+            0.010,
+        );
+        let (g1, g2) = unpack(packed[0]);
+        assert_eq!(prev_active[0], 20);
+        assert_eq!(g1, 0.0, "Rising VU bar must not light 1st past block");
+        assert_eq!(g2, 0.0, "Rising VU bar must not light 2nd past block");
+
+        // 3. Drop by 1 block (20 -> 19): 1st past block ignites (1.0), 2nd past block stays 0.0
+        channels[0] = 19.0 / 30.0;
+        let packed = VulkanEngine::step_vu_phosphor_ghosts(
+            &mut prev_active,
+            &mut ghost1,
+            &mut ghost2,
+            &channels,
+            2,
+            0.010,
+        );
+        let (g1, g2) = unpack(packed[0]);
+        assert_eq!(prev_active[0], 19);
+        assert!((g1 - 1.0).abs() < 1e-3, "1st past block should start at 1.0");
+        assert_eq!(g2, 0.0, "2nd past block was never lit at peak + 1");
+
+        // 4. Advance 15 ms at segment 19, then drop 1 more block (19 -> 18):
+        // Now both 1st past block (seg 18) and 2nd past block (seg 19) are active!
+        let _ = VulkanEngine::step_vu_phosphor_ghosts(
+            &mut prev_active,
+            &mut ghost1,
+            &mut ghost2,
+            &channels,
+            2,
+            0.015,
+        );
+        channels[0] = 18.0 / 30.0;
+        let packed = VulkanEngine::step_vu_phosphor_ghosts(
+            &mut prev_active,
+            &mut ghost1,
+            &mut ghost2,
+            &channels,
+            2,
+            0.010,
+        );
+        let (g1, g2) = unpack(packed[0]);
+        assert_eq!(prev_active[0], 18);
+        assert!((g1 - 1.0).abs() < 1e-3, "1st past block should start at 1.0");
+        assert!((g2 - 1.0).abs() < 1e-3, "2nd past block should start at 1.0");
+
+        // 5. Hold at segment 18 and verify 25 ms drop-off for 2nd block and 50 ms drop-off for 1st block:
+        // After 12.5 ms: ghost1 ~ 0.75, ghost2 ~ 0.50
+        let packed = VulkanEngine::step_vu_phosphor_ghosts(
+            &mut prev_active,
+            &mut ghost1,
+            &mut ghost2,
+            &channels,
+            2,
+            0.0125,
+        );
+        let (g1, g2) = unpack(packed[0]);
+        assert!((g1 - 0.75).abs() < 0.01, "At 12.5 ms, 50 ms fade should be ~0.75 (got {})", g1);
+        assert!((g2 - 0.50).abs() < 0.01, "At 12.5 ms, 25 ms fade should be ~0.50 (got {})", g2);
+
+        // After another 12.5 ms (total 25 ms): ghost1 ~ 0.50, ghost2 == 0.0
+        let packed = VulkanEngine::step_vu_phosphor_ghosts(
+            &mut prev_active,
+            &mut ghost1,
+            &mut ghost2,
+            &channels,
+            2,
+            0.0125,
+        );
+        let (g1, g2) = unpack(packed[0]);
+        assert!((g1 - 0.50).abs() < 0.01, "At 25 ms, 50 ms fade should be ~0.50 (got {})", g1);
+        assert!(g2 < 1e-4, "At 25 ms, 25 ms fade must have dropped off to 0.0 (got {})", g2);
+
+        // After another 25 ms (total 50 ms): ghost1 == 0.0, ghost2 == 0.0
+        let packed = VulkanEngine::step_vu_phosphor_ghosts(
+            &mut prev_active,
+            &mut ghost1,
+            &mut ghost2,
+            &channels,
+            2,
+            0.025,
+        );
+        let (g1, g2) = unpack(packed[0]);
+        assert!(g1 < 1e-4, "At 50 ms, 50 ms fade must have dropped off to 0.0 (got {})", g1);
+        assert!(g2 < 1e-4, "At 50 ms, 25 ms fade must remain 0.0 (got {})", g2);
     }
 }

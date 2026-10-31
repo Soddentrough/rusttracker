@@ -73,22 +73,26 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                     
                     var vu = 0.0;
                     var peak = 0.0;
+                    var packed_ghost = 0.0;
                     
                     let ch_vec = uniforms.channels[vec_idx];
                     let peak_vec = uniforms.channel_peaks[vec_idx];
+                    let ghost_vec = uniforms.channel_phases[vec_idx];
                     
                     if component_idx == 0u {
-                        vu = ch_vec.x; peak = peak_vec.x;
+                        vu = ch_vec.x; peak = peak_vec.x; packed_ghost = ghost_vec.x;
                     } else if component_idx == 1u {
-                        vu = ch_vec.y; peak = peak_vec.y;
+                        vu = ch_vec.y; peak = peak_vec.y; packed_ghost = ghost_vec.y;
                     } else if component_idx == 2u {
-                        vu = ch_vec.z; peak = peak_vec.z;
+                        vu = ch_vec.z; peak = peak_vec.z; packed_ghost = ghost_vec.z;
                     } else {
-                        vu = ch_vec.w; peak = peak_vec.w;
+                        vu = ch_vec.w; peak = peak_vec.w; packed_ghost = ghost_vec.w;
                     }
                     
                     vu = clamp(vu, 0.0, 1.0);
                     peak = clamp(peak, 0.0, 1.0);
+                    let ghost1 = clamp(floor(packed_ghost) / 1000.0, 0.0, 1.0);
+                    let ghost2 = clamp(fract(packed_ghost) / 0.90, 0.0, 1.0);
                     
                     // Discretize into 30 segments
                     let num_segments = 30.0;
@@ -128,14 +132,18 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
                                 out_color = vec4<f32>(lit_color, 1.0);
                             }
                         } else {
-                            // Unlit LED appearance
+                            // Unlit LED appearance with subtle phosphor fade-out on the past two blocks
+                            // (1st trailing block: 50 ms drop-off; 2nd trailing block: 25 ms drop-off)
                             let unlit_base = 25.0 / 255.0;
-                            out_color = vec4<f32>(
-                                unlit_base + lit_color.r * 0.08,
-                                unlit_base + lit_color.g * 0.08,
-                                unlit_base + lit_color.b * 0.08,
-                                1.0
-                            );
+                            let unlit_color = vec3<f32>(unlit_base) + lit_color * 0.08;
+                            var phosphor_fade = 0.0;
+                            if (segment_idx == active_segments) {
+                                phosphor_fade = ghost1 * 0.48;
+                            } else if (segment_idx == active_segments + 1.0) {
+                                phosphor_fade = ghost2 * 0.24;
+                            }
+                            let seg_color = mix(unlit_color, lit_color, phosphor_fade);
+                            out_color = vec4<f32>(seg_color, 1.0);
                         }
                     } else {
                         // Background track for the meter

@@ -10060,7 +10060,39 @@ fn run_wasapi_exclusive_multichannel(
         WaitForSingleObject,
     };
     use windows::Win32::System::Variant::VT_LPWSTR;
-    use windows::core::GUID;
+    use windows::core::{GUID, Interface};
+
+    /// Returns `Some(pid)` if another process currently has an active audio session
+    /// (`AudioSessionStateActive`) on `device`.
+    fn device_has_other_active_audio_session(device: &IMMDevice) -> Option<u32> {
+        let self_pid = std::process::id();
+        unsafe {
+            let mgr: IAudioSessionManager2 = device.Activate(CLSCTX_ALL, None).ok()?;
+            let enumerator = mgr.GetSessionEnumerator().ok()?;
+            let count = enumerator.GetCount().ok()?;
+            for i in 0..count {
+                let Ok(ctrl) = enumerator.GetSession(i) else {
+                    continue;
+                };
+                let Ok(state) = ctrl.GetState() else {
+                    continue;
+                };
+                if state != AudioSessionStateActive {
+                    continue;
+                }
+                let Ok(ctrl2) = ctrl.cast::<IAudioSessionControl2>() else {
+                    continue;
+                };
+                let Ok(pid) = ctrl2.GetProcessId() else {
+                    continue;
+                };
+                if pid != 0 && pid != self_pid {
+                    return Some(pid);
+                }
+            }
+            None
+        }
+    }
 
     const WAIT_OBJECT_0: u32 = 0;
     const KSDATAFORMAT_SUBTYPE_PCM: GUID = GUID {
@@ -10900,8 +10932,9 @@ fn run_wasapi_exclusive_multichannel(
             {
                 push_unique_wasapi_dev(&mut candidate_devices, default_dev);
             }
-            if let Ok(collection) =
-                unsafe { enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) }
+            if candidate_devices.is_empty()
+                && let Ok(collection) =
+                    unsafe { enumerator.EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE) }
             {
                 let count = unsafe { collection.GetCount().unwrap_or(0) };
                 for i in 0..count {
@@ -10916,7 +10949,6 @@ fn run_wasapi_exclusive_multichannel(
             }
         }
 
-        let _ = surround_upmix_enabled;
         let channel_candidates: Vec<(u16, u32)> = vec![
             (12, 0x2D63F),
             (8, 0x63F),
@@ -10964,6 +10996,14 @@ fn run_wasapi_exclusive_multichannel(
             anyhow::anyhow!("No multichannel WASAPI support detected on candidate endpoints");
 
         'dev_loop: for (dev, dev_name) in candidate_devices {
+            let other_active_pid = device_has_other_active_audio_session(&dev);
+            if let Some(pid) = other_active_pid {
+                eprintln!(
+                    "[audio] Endpoint '{}' has an active audio session from PID {}; sharing via Windows Spatial Audio / WASAPI Shared Mode (skipping Exclusive Mode).",
+                    dev_name, pid
+                );
+            }
+
             let probe_client: Option<IAudioClient> = unsafe { dev.Activate(CLSCTX_ALL, None).ok() };
             let mix_channels = if let Some(ref pc) = probe_client {
                 unsafe {
@@ -10981,13 +11021,17 @@ fn run_wasapi_exclusive_multichannel(
             drop(probe_client);
 
             for &(ch, mask) in &channel_candidates {
-                if ch == 12 && !mpegh_bitstream && target_channels < 9 {
+                if ch == 12
+                    && (!mpegh_bitstream || (!surround_upmix_enabled && target_channels < 9))
+                {
                     continue;
                 }
                 // 0. When 12-channel (7.1.4 / 11.1) output is enabled (`ch == 12 && mpegh_bitstream`),
                 // first check if Windows Spatial Audio (`Dolby Atmos for Home Theater`, `GetMaxDynamicObjectCount() > 0`)
                 // is active on the endpoint BEFORE probing `AUDCLNT_SHAREMODE_EXCLUSIVE` (since exclusive-mode
                 // format/init calls can cause Windows `AudioDg.exe` to reset Spatial Sound to Off).
+                // `ISpatialAudioClient` runs in Shared Mode inside `AudioDg.exe` alongside other desktop
+                // apps (e.g. Chrome) without taking an Exclusive Mode hardware lock.
                 if ch == 12 && mpegh_bitstream {
                     match try_open_spatial_audio_714_client(&dev, mix_channels) {
                         Ok((spatial, ev, max_frames, spatial_rate)) => {
@@ -11060,8 +11104,12 @@ fn run_wasapi_exclusive_multichannel(
                     // 2. Fallback path: WASAPI Exclusive Mode LPCM (up to 8ch; standard HDMI LPCM maxes out
                     // at 8 channels, so skip `ch > 8` to avoid hammering the GPU HDMI driver with unsupported
                     // 12ch Exclusive LPCM probes). Only probe Exclusive Mode when `allow_exclusive` is true
-                    // (e.g. passthrough enabled, user-overridden surround/11.1, or discrete multichannel source).
-                    if allow_exclusive && mix_channels < ch && ch <= 8 {
+                    // and no other process has an active audio session on the endpoint.
+                    if allow_exclusive
+                        && other_active_pid.is_none()
+                        && mix_channels < ch
+                        && ch <= 8
+                    {
                         for &fmt in &exclusive_fmt_candidates {
                             match try_open_exclusive_client(&dev, ch, rate, mask, fmt) {
                                 Ok((ac, rc, ev, buf_frames)) => {
@@ -11100,7 +11148,11 @@ fn run_wasapi_exclusive_multichannel(
 
                 // 3. Direct HDMI AVR fallback: probe native EDID IEC 61937-13 MPEG-H 3D Audio (CICP Layout 19)
                 // when connected directly to an HDMI sink that advertises MPEG-H (`0x00000019` / `0x0000000f`).
-                if allow_exclusive && ch == 12 && mpegh_bitstream {
+                if allow_exclusive
+                    && other_active_pid.is_none()
+                    && ch == 12
+                    && mpegh_bitstream
+                {
                     match try_open_exclusive_mpegh_iec61937_client(&dev, false) {
                         Ok((ac, rc, ev, buf_frames, rate_factor, carrier_label)) => {
                             match crate::mpegh::Mpegh714Encoder::new(rate_factor as u8, true) {
@@ -11396,6 +11448,8 @@ fn run_wasapi_exclusive_multichannel(
                         }
                         stream_started = false;
                     }
+                    std::thread::sleep(std::time::Duration::from_millis(15));
+                    continue;
                 } else if is_exclusive {
                     if let Some((ac, rc)) = wasapi_clients.take() {
                         eprintln!(
@@ -11415,126 +11469,97 @@ fn run_wasapi_exclusive_multichannel(
                         }
                         stream_started = false;
                     }
-                } else if stream_started && let Some((ref ac, _)) = wasapi_clients {
-                    unsafe {
-                        let _ = ac.Stop();
-                        let _ = ac.Reset();
-                    }
-                    stream_started = false;
+                    std::thread::sleep(std::time::Duration::from_millis(15));
+                    continue;
                 }
-                std::thread::sleep(std::time::Duration::from_millis(15));
-                continue;
             }
 
-            // Resume from pause: restart Spatial Audio / Shared Mode stream or re-acquire Exclusive Mode lock.
-            if let Some(ref spatial) = spatial_state {
-                if !stream_started {
-                    startup_fade_pos = 0;
-                    unsafe {
-                        if let Err(e) = spatial.stream.Start() {
-                            eprintln!(
-                                "[audio] ISpatialAudioObjectRenderStream::Start() on resume failed: {:?}",
-                                e
-                            );
-                            if let Ok(mut state) = shared_state_thread.lock() {
-                                state.audio_device_lost = true;
-                            }
-                            break;
-                        }
-                    }
-                    stream_started = true;
-                }
-            } else if is_exclusive && wasapi_clients.is_none() {
-                eprintln!(
-                    "[audio] Playback resumed; re-acquiring WASAPI Exclusive Multichannel hardware lock..."
-                );
-                if is_mpegh_iec_bitstream {
-                    match try_open_exclusive_mpegh_iec61937_client(&active_device, false) {
-                        Ok((new_ac, new_rc, new_ev, new_frames, _, _)) => {
-                            buffer_frames = new_frames;
-                            event = new_ev;
-                            wasapi_clients = Some((new_ac, new_rc));
-                            iec_byte_queue.clear();
-                            if let Some((ref mut mpegh_encoder, _, _)) = mpegh_state {
-                                mpegh_encoder.clear_accumulator();
-                            }
-                            startup_fade_pos = 0;
-                            stream_started = false;
-                        }
-                        Err(e) => {
-                            eprintln!(
-                                "[audio] Waiting to re-acquire WASAPI Exclusive MPEG-H device: {:?}",
-                                e
-                            );
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                            continue;
-                        }
-                    }
-                } else {
-                    match try_open_exclusive_client(
-                        &active_device,
-                        negotiated_channels,
-                        negotiated_rate,
-                        negotiated_mask,
-                        negotiated_fmt,
-                    ) {
-                        Ok((new_ac, new_rc, new_ev, new_frames)) => {
-                            buffer_frames = new_frames;
-                            event = new_ev;
-                            startup_fade_pos = 0;
-                            warmup_silent_buffers = 1;
-                            unsafe {
-                                if let Ok(buf_ptr) = new_rc.GetBuffer(buffer_frames) {
-                                    std::ptr::write_bytes(
-                                        buf_ptr,
-                                        0,
-                                        (buffer_frames as usize) * frame_bytes,
-                                    );
-                                    let _ = new_rc.ReleaseBuffer(
-                                        buffer_frames,
-                                        AUDCLNT_BUFFERFLAGS_SILENT.0 as u32,
-                                    );
+            // Resume from pause: restart Spatial Audio stream or re-acquire Exclusive Mode lock.
+            if !is_paused {
+                if let Some(ref spatial) = spatial_state {
+                    if !stream_started {
+                        startup_fade_pos = 0;
+                        unsafe {
+                            if let Err(e) = spatial.stream.Start() {
+                                eprintln!(
+                                    "[audio] ISpatialAudioObjectRenderStream::Start() on resume failed: {:?}",
+                                    e
+                                );
+                                if let Ok(mut state) = shared_state_thread.lock() {
+                                    state.audio_device_lost = true;
                                 }
-                                let _ = new_ac.Start();
+                                break;
                             }
-                            wasapi_clients = Some((new_ac, new_rc));
-                            stream_started = true;
                         }
-                        Err(e) => {
-                            eprintln!(
-                                "[audio] Waiting to re-acquire WASAPI Exclusive LPCM device: {:?}",
-                                e
-                            );
-                            std::thread::sleep(std::time::Duration::from_millis(100));
-                            continue;
+                        stream_started = true;
+                    }
+                } else if is_exclusive && wasapi_clients.is_none() {
+                    eprintln!(
+                        "[audio] Playback resumed; re-acquiring WASAPI Exclusive Multichannel hardware lock..."
+                    );
+                    if is_mpegh_iec_bitstream {
+                        match try_open_exclusive_mpegh_iec61937_client(&active_device, false) {
+                            Ok((new_ac, new_rc, new_ev, new_frames, _, _)) => {
+                                buffer_frames = new_frames;
+                                event = new_ev;
+                                wasapi_clients = Some((new_ac, new_rc));
+                                iec_byte_queue.clear();
+                                if let Some((ref mut mpegh_encoder, _, _)) = mpegh_state {
+                                    mpegh_encoder.clear_accumulator();
+                                }
+                                startup_fade_pos = 0;
+                                stream_started = false;
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[audio] Waiting to re-acquire WASAPI Exclusive MPEG-H device: {:?}",
+                                    e
+                                );
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                                continue;
+                            }
+                        }
+                    } else {
+                        match try_open_exclusive_client(
+                            &active_device,
+                            negotiated_channels,
+                            negotiated_rate,
+                            negotiated_mask,
+                            negotiated_fmt,
+                        ) {
+                            Ok((new_ac, new_rc, new_ev, new_frames)) => {
+                                buffer_frames = new_frames;
+                                event = new_ev;
+                                startup_fade_pos = 0;
+                                warmup_silent_buffers = 1;
+                                unsafe {
+                                    if let Ok(buf_ptr) = new_rc.GetBuffer(buffer_frames) {
+                                        std::ptr::write_bytes(
+                                            buf_ptr,
+                                            0,
+                                            (buffer_frames as usize) * frame_bytes,
+                                        );
+                                        let _ = new_rc.ReleaseBuffer(
+                                            buffer_frames,
+                                            AUDCLNT_BUFFERFLAGS_SILENT.0 as u32,
+                                        );
+                                    }
+                                    let _ = new_ac.Start();
+                                }
+                                wasapi_clients = Some((new_ac, new_rc));
+                                stream_started = true;
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "[audio] Waiting to re-acquire WASAPI Exclusive LPCM device: {:?}",
+                                    e
+                                );
+                                std::thread::sleep(std::time::Duration::from_millis(100));
+                                continue;
+                            }
                         }
                     }
                 }
-            } else if !is_exclusive
-                && !stream_started
-                && !is_mpegh_iec_bitstream
-                && let Some((ref audio_client, ref render_client)) = wasapi_clients
-            {
-                startup_fade_pos = 0;
-                unsafe {
-                    let padding = audio_client.GetCurrentPadding().unwrap_or(0);
-                    let prime_frames = buffer_frames.saturating_sub(padding);
-                    if prime_frames > 0
-                        && let Ok(buf_ptr) = render_client.GetBuffer(prime_frames)
-                    {
-                        std::ptr::write_bytes(buf_ptr, 0, (prime_frames as usize) * frame_bytes);
-                        let _ = render_client
-                            .ReleaseBuffer(prime_frames, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32);
-                    }
-                    if let Err(e) = audio_client.Start() {
-                        eprintln!("[audio] WASAPI Shared Start() on resume failed: {:?}", e);
-                        if let Ok(mut state) = shared_state_thread.lock() {
-                            state.audio_device_lost = true;
-                        }
-                        break;
-                    }
-                }
-                stream_started = true;
             }
 
             if stream_started {
@@ -11794,8 +11819,12 @@ fn run_wasapi_exclusive_multichannel(
                     continue;
                 }
 
-                if warmup_silent_buffers > 0 {
-                    warmup_silent_buffers -= 1;
+                if is_paused || warmup_silent_buffers > 0 {
+                    if is_paused {
+                        startup_fade_pos = 0;
+                    } else {
+                        warmup_silent_buffers -= 1;
+                    }
                     if let Ok(buf_ptr) = unsafe { render_client.GetBuffer(avail_frames) } {
                         unsafe {
                             std::ptr::write_bytes(
@@ -11805,6 +11834,16 @@ fn run_wasapi_exclusive_multichannel(
                             );
                             let _ = render_client
                                 .ReleaseBuffer(avail_frames, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32);
+                            if !stream_started {
+                                if let Err(e) = audio_client.Start() {
+                                    eprintln!("[audio] WASAPI Start() failed: {:?}", e);
+                                    if let Ok(mut state) = shared_state_thread.lock() {
+                                        state.audio_device_lost = true;
+                                    }
+                                    break;
+                                }
+                                stream_started = true;
+                            }
                         }
                     }
                     continue;
@@ -14848,6 +14887,159 @@ Sink #105
                 st.audio_topology_reload_request,
                 spec_max,
                 vus.join(", ")
+            );
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_live_pause_and_resume_verification() {
+        let user_profile = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .unwrap_or_default();
+        let candidates = [
+            format!("{}\\Music\\2nd_pm.s3m", user_profile),
+            format!("{}\\Music\\2nd_skav.s3m", user_profile),
+        ];
+        let Some(track_path) = candidates
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists())
+        else {
+            eprintln!("Skipping live pause/resume test: module not found in ~/Music");
+            return;
+        };
+
+        for (label, mpegh_mode) in [("Spatial 7.1.4", true), ("WASAPI Shared 8ch", false)] {
+            eprintln!("=== Testing Play -> Pause -> Resume ({}) ===", label);
+            let shared_state = std::sync::Arc::new(std::sync::Mutex::new(
+                crate::state::AppState::new("PauseResumeTest".to_string()),
+            ));
+            {
+                let mut st = shared_state.lock().unwrap();
+                st.file_loaded = true;
+                st.is_paused = false;
+                st.set_mpegh_bitstream(mpegh_mode);
+                st.set_surround_upmix(true);
+                st.seek_request = Some(35.0);
+            }
+            let _handle = start_audio_thread(&track_path, false, shared_state.clone())
+                .expect("start_audio_thread");
+
+            // 1. Play for 1.5s
+            for step in 1..=3 {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let st = shared_state.lock().unwrap();
+                let vu_max = st.raw_channel_vus.iter().copied().fold(0.0f32, f32::max);
+                eprintln!(
+                    "  [{} PLAY  t={:.1}s] sec={:.3} vu_max={:.3} dev_lost={}",
+                    label,
+                    step as f32 * 0.5,
+                    st.current_seconds,
+                    vu_max,
+                    st.audio_device_lost
+                );
+                assert!(!st.audio_device_lost, "{} lost device during play", label);
+            }
+            let sec_before_pause = shared_state.lock().unwrap().current_seconds;
+            assert!(
+                sec_before_pause > 35.8,
+                "{} playback did not advance before pause (sec={:.3})",
+                label,
+                sec_before_pause
+            );
+
+            // 2. Pause for 1.5s while simulating 120 Hz GUI lock contention (~2ms hold per 8ms frame)
+            {
+                let mut st = shared_state.lock().unwrap();
+                st.is_paused = true;
+                st.raw_channel_vus.fill(0.0);
+                st.raw_spectrum_data.fill(0.0);
+                st.gpu_spectrum_data.fill(0.0);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            let sec_at_pause_start = {
+                let mut st = shared_state.lock().unwrap();
+                st.raw_channel_vus.fill(0.0);
+                st.raw_spectrum_data.fill(0.0);
+                st.gpu_spectrum_data.fill(0.0);
+                st.current_seconds
+            };
+            for step in 1..=3 {
+                let mut max_paused_vu = 0.0f32;
+                let mut max_paused_spec = 0.0f32;
+                for _frame in 0..60 {
+                    {
+                        let st = shared_state.lock().unwrap();
+                        let vu_max = st.raw_channel_vus.iter().copied().fold(0.0f32, f32::max);
+                        let spec_max = st.raw_spectrum_data.iter().copied().fold(0.0f32, f32::max);
+                        max_paused_vu = max_paused_vu.max(vu_max);
+                        max_paused_spec = max_paused_spec.max(spec_max);
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(6));
+                }
+                let st = shared_state.lock().unwrap();
+                eprintln!(
+                    "  [{} PAUSE t={:.1}s] sec={:.3} max_vu={:.4} max_spec={:.4} dev_lost={}",
+                    label,
+                    step as f32 * 0.5,
+                    st.current_seconds,
+                    max_paused_vu,
+                    max_paused_spec,
+                    st.audio_device_lost
+                );
+                assert!(!st.audio_device_lost, "{} lost device during pause", label);
+                assert_eq!(
+                    max_paused_vu, 0.0,
+                    "{} raw_channel_vus spiked while paused under GUI lock contention!",
+                    label
+                );
+                assert_eq!(
+                    max_paused_spec, 0.0,
+                    "{} raw_spectrum_data spiked while paused under GUI lock contention!",
+                    label
+                );
+                assert!(
+                    (st.current_seconds - sec_at_pause_start).abs() < 0.001,
+                    "{} current_seconds advanced while paused! ({:.3} -> {:.3})",
+                    label,
+                    sec_at_pause_start,
+                    st.current_seconds
+                );
+            }
+            let sec_during_pause = shared_state.lock().unwrap().current_seconds;
+
+            // 3. Resume for 2.0s
+            shared_state.lock().unwrap().is_paused = false;
+            let mut max_vu_after_resume = 0.0f32;
+            for step in 1..=4 {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                let st = shared_state.lock().unwrap();
+                let vu_max = st.raw_channel_vus.iter().copied().fold(0.0f32, f32::max);
+                max_vu_after_resume = max_vu_after_resume.max(vu_max);
+                eprintln!(
+                    "  [{} RESUME t={:.1}s] sec={:.3} vu_max={:.3} dev_lost={}",
+                    label,
+                    step as f32 * 0.5,
+                    st.current_seconds,
+                    vu_max,
+                    st.audio_device_lost
+                );
+                assert!(!st.audio_device_lost, "{} lost device on resume", label);
+            }
+            let sec_after_resume = shared_state.lock().unwrap().current_seconds;
+            assert!(
+                sec_after_resume > sec_during_pause + 1.0,
+                "{} playback failed to advance after resume! (paused_sec={:.3}, resumed_sec={:.3})",
+                label,
+                sec_during_pause,
+                sec_after_resume
+            );
+            assert!(
+                max_vu_after_resume > 0.01,
+                "{} produced no audio VUs after resume! (max_vu={:.4})",
+                label,
+                max_vu_after_resume
             );
         }
     }

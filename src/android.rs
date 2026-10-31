@@ -1078,6 +1078,9 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                             EngineAction::SetSurroundUpmix(cfg) => {
                                 self.app_state.lock().unwrap().surround_upmix = cfg;
                             }
+                            EngineAction::SetShowSurroundEq(val) => {
+                                self.app_state.lock().unwrap().set_show_surround_eq(val);
+                            }
                             EngineAction::None => {}
                         }
                     }

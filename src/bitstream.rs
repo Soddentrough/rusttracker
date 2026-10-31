@@ -2828,6 +2828,11 @@ mod wasapi_bitstream {
                         }
 
                         if is_paused {
+                            if let Ok(mut state) = shared_state_pump.try_lock() {
+                                state.raw_channel_vus.fill(0.0);
+                                state.raw_spectrum_data.fill(0.0);
+                                state.gpu_spectrum_data.fill(0.0);
+                            }
                             if playback_time.is_none() {
                                 let first_msg = if let Some(msg) = pending_vis_msg.take() {
                                     Some(msg)

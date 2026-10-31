@@ -923,6 +923,7 @@ pub struct AppState {
     pub track_info_rect: Option<[f32; 4]>,
     pub mobile_hud_tab: MobileHudTab,
     pub surround_upmix: SurroundUpmixConfig,
+    pub show_surround_eq: bool,
 }
 
 pub fn get_history_file_path() -> std::path::PathBuf {
@@ -1112,6 +1113,7 @@ impl AppState {
             track_info_rect: None,
             mobile_hud_tab: MobileHudTab::default(),
             surround_upmix: SurroundUpmixConfig::default(),
+            show_surround_eq: false,
         }
     }
 
@@ -1155,7 +1157,9 @@ impl AppState {
                 Vec::new()
             },
             raw_spectrum_data: Vec::new(),
-            spectrum_data: if self.file_loaded && self.surround_upmix.enabled {
+            spectrum_data: if self.file_loaded
+                && (self.surround_upmix.enabled || self.show_surround_eq)
+            {
                 self.spectrum_data.clone()
             } else {
                 Vec::new()
@@ -1259,6 +1263,7 @@ impl AppState {
             track_info_rect: self.track_info_rect,
             mobile_hud_tab: self.mobile_hud_tab,
             surround_upmix: self.surround_upmix,
+            show_surround_eq: self.show_surround_eq,
         }
     }
 
@@ -1485,6 +1490,7 @@ impl AppState {
                 self.peak_vus.resize(ch_count, 0.0);
             }
             self.osd_text = Some("🔊 Surround Upmix: OFF".to_string());
+            self.show_surround_eq = false;
         }
         self.osd_timer = 2.5;
     }
@@ -1493,6 +1499,17 @@ impl AppState {
     pub fn toggle_surround_upmix(&mut self) {
         let next = !self.surround_upmix.enabled;
         self.set_surround_upmix(next);
+    }
+
+    /// Sets whether the middle HUD panel displays the Surround Upmix EQ (`true`)
+    /// or the Piano Roll / Pattern Heatmap (`false`).
+    pub fn set_show_surround_eq(&mut self, show_eq: bool) {
+        self.show_surround_eq = show_eq;
+    }
+
+    /// Flips the middle HUD panel between the Piano Roll / Pattern Heatmap and the Surround Upmix EQ.
+    pub fn toggle_show_surround_eq(&mut self) {
+        self.show_surround_eq = !self.show_surround_eq;
     }
 
     /// Updates the OSD for a relative seek jump (`delta` in seconds).

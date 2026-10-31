@@ -1713,14 +1713,25 @@ async fn run_gui(
             }
             let window = Arc::new(window);
             let mut engine = pollster::block_on(VulkanEngine::new(window.clone()));
-            app_state_for_init
-                .lock()
-                .unwrap()
-                .apply_gpu_capability_profile(
+            let initial_refresh_hz = window
+                .current_monitor()
+                .or_else(|| window.primary_monitor())
+                .and_then(|m| m.refresh_rate_millihertz())
+                .map(|mhz| (mhz as f32 / 1000.0).clamp(30.0, 500.0));
+            if let Some(hz) = initial_refresh_hz {
+                engine.smooth_dt = 1.0 / (hz as f64);
+            }
+            {
+                let mut state = app_state_for_init.lock().unwrap();
+                if let Some(hz) = initial_refresh_hz {
+                    state.target_fps = hz.round() as u32;
+                }
+                state.apply_gpu_capability_profile(
                     &engine.adapter_info,
                     engine.config.width,
                     engine.config.height,
                 );
+            }
             let mut egui_state = egui_winit::State::new(
                 egui_ctx_for_init.clone(),
                 egui::ViewportId::ROOT,
@@ -1735,6 +1746,10 @@ async fn run_gui(
                 let state_snapshot = {
                     let mut state = app_state_for_init.lock().unwrap();
                     state.visual_width = engine.config.width / 2;
+                    let num_channels = state.channel_vus.len();
+                    if state.peak_vus.len() != num_channels {
+                        state.peak_vus.resize(num_channels, 0.0);
+                    }
                     engine.update(&state, 1.0 / 60.0);
                     state.render_snapshot()
                 };
@@ -1849,7 +1864,30 @@ async fn run_gui(
                     ref event,
                     window_id,
                 } if window_id == window.id() => {
-                    let response = egui_state.on_window_event(window, event);
+                    let is_typing = {
+                        let state = app_state.lock().unwrap();
+                        state.is_url_dialog_open || state.is_file_picker_open
+                    };
+
+                    // Do not forward keyboard events to egui unless a text input dialog is open;
+                    // otherwise clicking any HUD button leaves egui keyboard focus on that button
+                    // and pressing Space/Tab/Enter activates the focused HUD button instead of
+                    // running global hotkeys (like Space for Pause/Play).
+                    let response = if !is_typing
+                        && matches!(event, WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_))
+                    {
+                        egui_ctx.memory_mut(|m| {
+                            if let Some(id) = m.focused() {
+                                m.surrender_focus(id);
+                            }
+                        });
+                        egui_winit::EventResponse {
+                            consumed: false,
+                            repaint: false,
+                        }
+                    } else {
+                        egui_state.on_window_event(window, event)
+                    };
 
                     if let WindowEvent::CursorMoved { position, .. } = event {
                         last_mouse_move = Instant::now();
@@ -1889,11 +1927,6 @@ async fn run_gui(
                     if let WindowEvent::ModifiersChanged(m) = &event {
                         modifiers = m.state();
                     }
-
-                    let is_typing = {
-                        let state = app_state.lock().unwrap();
-                        state.is_url_dialog_open || state.is_file_picker_open
-                    };
 
                     // Process global hotkeys unless user is actively typing in a text dialog
                     if !is_typing
@@ -2290,6 +2323,8 @@ async fn run_gui(
                                                         .push_back(vec![0.0; 1024]);
                                                 }
                                                 state.is_paused = false;
+                                                state.osd_text = Some("Playing".to_string());
+                                                state.osd_timer = 2.0;
                                             } else if state.playlist_index >= state.playlist.len()
                                                 && !state.playlist.is_empty()
                                             {
@@ -2302,9 +2337,18 @@ async fn run_gui(
                                                     state.playlist[state.playlist_index].clone(),
                                                 );
                                                 state.is_paused = false;
+                                                state.osd_text = Some("Playing".to_string());
+                                                state.osd_timer = 2.0;
                                             } else {
                                                 state.is_paused = !state.is_paused;
+                                                state.osd_text = Some(if state.is_paused {
+                                                    "Paused".to_string()
+                                                } else {
+                                                    "Playing".to_string()
+                                                });
+                                                state.osd_timer = 2.0;
                                             }
+                                            window.request_redraw();
                                         }
                                         WinitKeyCode::KeyN => {
                                             let mut state = app_state.lock().unwrap();
@@ -2524,6 +2568,15 @@ async fn run_gui(
                     match event {
                         WindowEvent::CloseRequested => {
                             elwt.exit();
+                        }
+                        WindowEvent::Moved(_) => {
+                            if let Some(mhz) = window
+                                .current_monitor()
+                                .and_then(|m| m.refresh_rate_millihertz())
+                            {
+                                let hz = (mhz as f32 / 1000.0).clamp(30.0, 500.0);
+                                app_state.lock().unwrap().target_fps = hz.round() as u32;
+                            }
                         }
                         WindowEvent::ScaleFactorChanged { .. } => {
                             engine.resize(window.inner_size());
@@ -2880,26 +2933,43 @@ async fn run_gui(
                             let raw_dt = now.duration_since(last_update).as_secs_f32();
                             let dt = raw_dt.min(0.1);
                             last_update = now;
-                            let time_scale = dt * 60.0; // Decay logic built for 60fps
                             desktop_frame_count += 1;
-                            if desktop_frame_count > 2 && raw_dt > 0.0 && raw_dt < 0.25 {
+                            if desktop_frame_count == 1
+                                && let Some(mhz) = window
+                                    .current_monitor()
+                                    .or_else(|| window.primary_monitor())
+                                    .and_then(|m| m.refresh_rate_millihertz())
+                            {
+                                let hz = (mhz as f32 / 1000.0).clamp(30.0, 500.0);
+                                frame_dt_ring = [1.0 / hz; 60];
+                            } else if desktop_frame_count > 2 && raw_dt > 0.0 && raw_dt < 0.25 {
                                 frame_dt_ring[frame_dt_idx] = raw_dt;
                                 frame_dt_idx = (frame_dt_idx + 1) % frame_dt_ring.len();
                             }
                             let avg_dt =
                                 frame_dt_ring.iter().sum::<f32>() / (frame_dt_ring.len() as f32);
                             let fps = if avg_dt > 0.0 { 1.0 / avg_dt } else { 60.0 };
+                            let time_scale = (avg_dt * 60.0).clamp(0.15, 3.0); // Decay logic built for 60fps
 
                             let phase_timer = Instant::now();
                             {
                                 let mut state = app_state.lock().unwrap();
                                 state.current_fps = fps;
                                 if bench.is_none() {
-                                    state.update_visualizer_perf_guard(dt, 60.0);
+                                    state.update_visualizer_perf_guard(avg_dt, 60.0);
                                 }
                                 state.visual_width = engine.config.width / 2;
 
                                 if state.file_loaded {
+                                    if state.is_paused || state.track_ended {
+                                        state.raw_channel_vus.fill(0.0);
+                                        state.raw_spectrum_data.fill(0.0);
+                                        if state.gpu_spectrum_data.iter().any(|&v| v != 0.0) {
+                                            state.gpu_spectrum_data.fill(0.0);
+                                            state.waveform_history_push_count =
+                                                state.waveform_history_push_count.wrapping_add(1);
+                                        }
+                                    }
                                     if state.channel_vus.len() != state.raw_channel_vus.len() {
                                         state.channel_vus = vec![0.0; state.raw_channel_vus.len()];
                                     }
@@ -3338,6 +3408,9 @@ async fn run_gui(
                                     }
                                     EngineAction::SetSurroundUpmix(cfg) => {
                                         state.surround_upmix = cfg;
+                                    }
+                                    EngineAction::SetShowSurroundEq(val) => {
+                                        state.set_show_surround_eq(val);
                                     }
                                     EngineAction::SetPassthrough(val) => {
                                         state.passthrough_enabled = val;
@@ -4430,7 +4503,11 @@ async fn run_gui(
                         is_cursor_visible = true;
                     }
 
-                    window.request_redraw();
+                    if window.is_minimized() == Some(true) {
+                        std::thread::sleep(Duration::from_millis(16));
+                    } else {
+                        window.request_redraw();
+                    }
                 }
                 _ => {}
             }
@@ -4499,10 +4576,10 @@ where
                     state.load_request = Some(reload_path);
                     resume_pos_on_reload = Some(state.current_seconds);
                     if state.surround_upmix.enabled && !pt_enabled {
-                        state.osd_text = Some(
-                            "🔊 Auto Surround & Height Upmix: ON (7.1.4 + Crossover EQ)"
-                                .to_string(),
+                        let badge = crate::state::SurroundUpmixConfig::layout_badge(
+                            state.hardware_channels,
                         );
+                        state.osd_text = Some(format!("🔊 Surround Upmix: ON ({badge})"));
                     } else {
                         state.osd_text = Some(if pt_enabled {
                             "Bitstream Passthrough: ON (Exclusive)".to_string()
@@ -4683,6 +4760,12 @@ where
             let tui_dt = last_tick.elapsed().as_secs_f32().clamp(0.001, 0.1);
             let time_scale = tui_dt * 60.0;
             let mut state = app_state.lock().unwrap();
+
+            if state.is_paused || state.track_ended {
+                state.raw_channel_vus.fill(0.0);
+                state.raw_spectrum_data.fill(0.0);
+                state.gpu_spectrum_data.fill(0.0);
+            }
 
             // Smoothing physics for VUs (Inertia)
             if state.channel_vus.len() != state.raw_channel_vus.len() {
@@ -5276,5 +5359,44 @@ mod tests {
         assert!(state.surround_upmix.mpegh_user_overridden);
         assert!(state.surround_upmix.enabled);
         assert_eq!(state.passthrough_change_request, Some(false));
+    }
+
+    #[test]
+    fn test_middle_panel_defaults_to_pianoroll_and_flips_to_eq() {
+        let mut state = AppState::new("Test Tracker.mod".to_string());
+        state.file_loaded = true;
+        state.source_channels = 2;
+        state.hardware_channels = 8;
+
+        // Surround upmix is enabled and active by default on surround hardware,
+        // while the middle panel defaults to the Piano Roll / Pattern Heatmap (`show_surround_eq == false`).
+        assert!(state.surround_upmix.enabled);
+        assert!(state.surround_upmix.is_active_for(2, 8));
+        assert!(!state.show_surround_eq);
+        assert!(!state.render_snapshot().show_surround_eq);
+
+        // Flip middle panel to Surround EQ
+        state.toggle_show_surround_eq();
+        assert!(state.show_surround_eq);
+        assert!(state.render_snapshot().show_surround_eq);
+
+        // Flip back to Piano Roll / Pattern Heatmap
+        state.toggle_show_surround_eq();
+        assert!(!state.show_surround_eq);
+
+        // Disabling surround upmix while viewing EQ returns to Piano Roll
+        state.set_show_surround_eq(true);
+        assert!(state.show_surround_eq);
+        state.set_surround_upmix(false);
+        assert!(!state.show_surround_eq);
+
+        // Verify middle panel title bar buttons and consolidated upmix/layout labels in src/engine.rs
+        let engine_src = include_str!("engine.rs");
+        assert!(engine_src.contains("🎚 Surround EQ"));
+        assert!(engine_src.contains("🎹 Piano Roll"));
+        assert!(!engine_src.contains("🔊 SURROUND UPMIX: ON"));
+        assert!(!engine_src.contains("11.1 (7.1.4): ON"));
+        assert_eq!(crate::state::SurroundUpmixConfig::short_tag(8), "7.1");
+        assert!(!crate::state::SurroundUpmixConfig::has_height_channels(8));
     }
 }
