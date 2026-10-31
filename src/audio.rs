@@ -961,12 +961,10 @@ impl SurroundUpmixerDsp {
                     out[5] = sr;
                     return out;
                 }
-                let mut out = self.process_frame_for_hardware(
-                    ch_in[4],
-                    ch_in[5],
-                    &helper_cfg,
-                    hardware_channels,
-                );
+                let l_comb = (ch_in[4] + ch_in[0] * 0.55) * 0.75;
+                let r_comb = (ch_in[5] + ch_in[1] * 0.55) * 0.75;
+                let mut out =
+                    self.process_frame_for_hardware(l_comb, r_comb, &helper_cfg, hardware_channels);
                 out[0] = fl;
                 out[1] = fr;
                 out[2] = fc;
@@ -1000,11 +998,11 @@ impl SurroundUpmixerDsp {
                 }
                 out
             }
-            // >= 8 channels (e.g. 7.1 on 7.1 or 7.1 -> 7.1.2 / 7.1.4):
+            // >= 8 channels (e.g. 7.1 on 7.1, 7.1.4 on 7.1.4, or 7.1 -> 7.1.2 / 7.1.4):
             _ => {
                 let fc = Self::soft_limit(ch_in[2] * center_gain);
                 let lfe = Self::soft_limit((ch_in[3] + sub_trim) * lfe_gain);
-                if hardware_channels <= 8 {
+                if hardware_channels <= 8 || src_ch >= hardware_channels {
                     let mut out = [0.0f32; 12];
                     out[0] = fl;
                     out[1] = fr;
@@ -1012,6 +1010,9 @@ impl SurroundUpmixerDsp {
                     out[3] = lfe;
                     for c in 4..hardware_channels.min(8) {
                         out[c] = Self::soft_limit(ch_in[c] * surround_gain);
+                    }
+                    for c in 8..hardware_channels.min(12) {
+                        out[c] = Self::soft_limit(ch_in[c] * height_gain);
                     }
                     return out;
                 }
@@ -2563,6 +2564,9 @@ pub trait AudioSource: Send {
     fn has_video_stream(&self) -> bool {
         false
     }
+    fn is_native_atmos(&self) -> bool {
+        false
+    }
 }
 
 // ---------------------------------------------------------
@@ -3266,6 +3270,9 @@ struct ActiveSymphoniaTrack {
     volume: f32,
     enabled: bool,
     channels: u16,
+    sample_rate: u32,
+    resample_pos: f64,
+    prev_frame: Vec<f32>,
     time_base: f64,
     current_time: f64,
 }
@@ -3578,6 +3585,7 @@ struct SymphoniaSource {
     artist: String,
     ext_type: String,
     intrinsic_sample_rate: Option<u32>,
+    output_sample_rate: u32,
     video_info: Option<String>,
     audio_tracks: Vec<crate::state::AudioTrackInfo>,
     selected_track_idx: usize,
@@ -3590,9 +3598,23 @@ impl AudioSource for SymphoniaSource {
     fn read_frames(
         &mut self,
         hardware_channels: usize,
-        _sample_rate: u32,
+        sample_rate: u32,
         output: &mut [f32],
     ) -> usize {
+        let target_rate = if sample_rate > 0 {
+            sample_rate
+        } else {
+            self.output_sample_rate.max(44100)
+        };
+        if target_rate != self.output_sample_rate {
+            self.output_sample_rate = target_rate;
+            for track in self.active_tracks.values_mut() {
+                track.samples.clear();
+                track.buf_pos = 0;
+                track.resample_pos = 0.0;
+                track.prev_frame.clear();
+            }
+        }
         let mut frames_written = 0;
         let frames_needed = output.len() / hardware_channels;
         self.channel_vus.fill(0.0);
@@ -3678,6 +3700,7 @@ impl AudioSource for SymphoniaSource {
                                     || (need_t0 && track.track_idx == 0))
                                 && let Ok(decoded) = track.decoder.decode(&packet)
                             {
+                                let in_rate = decoded.spec().rate.max(1);
                                 if track.sample_buf.capacity() < decoded.capacity() {
                                     track.sample_buf = SampleBuffer::<f32>::new(
                                         decoded.capacity() as u64,
@@ -3690,7 +3713,44 @@ impl AudioSource for SymphoniaSource {
                                     track.samples.drain(0..track.buf_pos);
                                     track.buf_pos = 0;
                                 }
-                                track.samples.extend_from_slice(track.sample_buf.samples());
+                                track.sample_rate = in_rate;
+                                let out_rate = self.output_sample_rate.max(1);
+                                let src = track.sample_buf.samples();
+                                let ch = track.channels.max(1) as usize;
+                                if in_rate == out_rate {
+                                    track.samples.extend_from_slice(src);
+                                } else {
+                                    let in_frames = src.len() / ch;
+                                    if in_frames > 0 {
+                                        if track.prev_frame.len() != ch {
+                                            track.prev_frame.clear();
+                                            track.prev_frame.extend_from_slice(&src[0..ch]);
+                                        }
+                                        let step = in_rate as f64 / out_rate as f64;
+                                        while track.resample_pos < in_frames as f64 {
+                                            let idx = track.resample_pos.floor() as isize;
+                                            let frac = (track.resample_pos - idx as f64) as f32;
+                                            for c in 0..ch {
+                                                let s0 = if idx < 0 {
+                                                    track.prev_frame[c]
+                                                } else {
+                                                    src[(idx as usize) * ch + c]
+                                                };
+                                                let s1 = src[((idx + 1)
+                                                    .clamp(0, (in_frames - 1) as isize)
+                                                    as usize)
+                                                    * ch
+                                                    + c];
+                                                track.samples.push(s0 + (s1 - s0) * frac);
+                                            }
+                                            track.resample_pos += step;
+                                        }
+                                        track.resample_pos -= in_frames as f64;
+                                        track.prev_frame.copy_from_slice(
+                                            &src[(in_frames - 1) * ch..in_frames * ch],
+                                        );
+                                    }
+                                }
                             }
                         }
                         Err(_) => break, // EOF
@@ -3849,8 +3909,7 @@ impl AudioSource for SymphoniaSource {
                     / track.channels.max(1) as usize;
                 let consume = frames_to_copy.min(avail);
                 track.buf_pos += consume * track.channels as usize;
-                track.current_time +=
-                    consume as f64 / self.intrinsic_sample_rate.unwrap_or(44100) as f64;
+                track.current_time += consume as f64 / self.output_sample_rate.max(1) as f64;
             }
             if let Some(primary) = self.active_tracks.get(&self.primary_track_id) {
                 self.current_time = primary.current_time;
@@ -3884,6 +3943,8 @@ impl AudioSource for SymphoniaSource {
                 track.current_time = pos;
                 track.samples.clear();
                 track.buf_pos = 0;
+                track.resample_pos = 0.0;
+                track.prev_frame.clear();
             }
             self.current_time = pos;
         } else {
@@ -3900,6 +3961,8 @@ impl AudioSource for SymphoniaSource {
                     track.current_time = pos;
                     track.samples.clear();
                     track.buf_pos = 0;
+                    track.resample_pos = 0.0;
+                    track.prev_frame.clear();
                 }
                 self.current_time = pos;
             }
@@ -5766,6 +5829,12 @@ impl AudioSource for FfmpegSource {
     fn has_video_stream(&self) -> bool {
         self.video_stream_index.is_some()
     }
+
+    fn is_native_atmos(&self) -> bool {
+        self.audio_tracks
+            .get(self.selected_track_idx)
+            .is_some_and(|t| t.is_atmos)
+    }
 }
 
 // ---------------------------------------------------------
@@ -6304,6 +6373,7 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
             channels,
             sample_rate: rate,
             language: lang,
+            is_atmos: false,
         });
         audio_track_bitrates.push(if any_br { Some(total_br_kbps) } else { None });
         iamf_groups.push(Some(grp));
@@ -6335,6 +6405,7 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
             };
 
             let mut track_br = probe_stream_bitrate_kbps(&stream);
+            let mut dec_profile = unsafe { (*p.as_ptr()).profile };
             let (channels, rate) = if let Ok(ctx) =
                 ffmpeg_next::codec::context::Context::from_parameters(p.clone())
                 && let Ok(dec) = ctx.decoder().audio()
@@ -6342,22 +6413,16 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
                 if track_br.is_none() && dec.bit_rate() > 0 {
                     track_br = Some((dec.bit_rate() / 1000).max(1) as u32);
                 }
+                let p_val = unsafe { (*dec.as_ptr()).profile };
+                if p_val > 0 {
+                    dec_profile = p_val;
+                }
                 (
                     dec.channels().max(1),
                     if dec.rate() > 0 { dec.rate() } else { 48000 },
                 )
             } else {
                 (2, 48000)
-            };
-
-            let ch_desc = match channels {
-                1 => "Mono".to_string(),
-                2 => "Stereo".to_string(),
-                6 => "5.1".to_string(),
-                8 => "7.1".to_string(),
-                10 => "7.1.2".to_string(),
-                12 => "7.1.4".to_string(),
-                n => format!("{} ch", n),
             };
 
             let meta = stream.metadata();
@@ -6374,6 +6439,28 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
                 .or_else(|| meta.get("description"))
                 .map(|s| s.to_string())
                 .or_else(|| mp4_track_names.get(audio_tracks.len()).cloned());
+
+            // FF_PROFILE_TRUEHD_ATMOS = 30, FF_PROFILE_EAC3_DDP_ATMOS = 30
+            let is_atmos = ((codec_id == ffmpeg_next::codec::Id::TRUEHD
+                || codec_id == ffmpeg_next::codec::Id::EAC3)
+                && dec_profile == 30)
+                || title
+                    .as_deref()
+                    .is_some_and(|t| t.to_lowercase().contains("atmos"));
+
+            let ch_desc = if is_atmos {
+                "Dolby Atmos (7.1.4)".to_string()
+            } else {
+                match channels {
+                    1 => "Mono".to_string(),
+                    2 => "Stereo".to_string(),
+                    6 => "5.1".to_string(),
+                    8 => "7.1".to_string(),
+                    10 => "7.1.2".to_string(),
+                    12 => "7.1.4".to_string(),
+                    n => format!("{} ch", n),
+                }
+            };
 
             let mut desc_parts = Vec::new();
             desc_parts.push(codec_name.clone());
@@ -6407,6 +6494,7 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
                 channels,
                 sample_rate: rate,
                 language: lang,
+                is_atmos,
             });
             audio_track_bitrates.push(track_br);
             iamf_groups.push(None);
@@ -6821,6 +6909,7 @@ pub fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(
                 channels,
                 sample_rate: rate,
                 language: track.language.clone(),
+                is_atmos: false,
             });
         }
     }
@@ -6891,6 +6980,9 @@ pub fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(
                     volume: vol,
                     enabled,
                     channels: t_channels,
+                    sample_rate: t_sample_rate,
+                    resample_pos: 0.0,
+                    prev_frame: Vec::new(),
                     time_base: t_time_base,
                     current_time: 0.0,
                 },
@@ -6943,6 +7035,7 @@ pub fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(
         artist: "Unknown".to_string(),
         ext_type,
         intrinsic_sample_rate: Some(intrinsic_sample_rate),
+        output_sample_rate: intrinsic_sample_rate,
         video_info,
         audio_tracks,
         selected_track_idx,
@@ -7510,6 +7603,9 @@ pub fn start_audio_thread(
             s.surround_upmix.mpegh_user_overridden,
         )
     };
+    let is_native_atmos = audio_source_opt
+        .as_ref()
+        .is_some_and(|a| a.is_native_atmos());
     let source_channels = audio_source_opt
         .as_mut()
         .map(|a| a.get_num_channels() as u16)
@@ -7729,7 +7825,9 @@ pub fn start_audio_thread(
                         }
                     }
                 }
-                let effective_surround_upmix = if surround_upmix_user_overridden {
+                let effective_surround_upmix = if is_native_atmos {
+                    false
+                } else if surround_upmix_user_overridden {
                     surround_upmix_enabled
                 } else {
                     !force_stereo
@@ -7748,7 +7846,9 @@ pub fn start_audio_thread(
                 // Audio InfoFrame switches to multi-channel surround.
                 #[cfg(windows)]
                 if !mic && !force_stereo {
-                    let want_wasapi_upmix = if surround_upmix_user_overridden {
+                    let want_wasapi_upmix = if is_native_atmos {
+                        false
+                    } else if surround_upmix_user_overridden {
                         surround_upmix_enabled
                     } else {
                         true
@@ -8075,7 +8175,11 @@ fn populate_state_from_audio_source(
     state.hardware_channels = hardware_channels;
     let source_channels = audio_source.get_num_channels();
     state.source_channels = source_channels;
-    if hardware_channels <= 2 {
+    state.is_native_atmos = audio_source.is_native_atmos();
+    if hardware_channels <= 2
+        || state.is_native_atmos
+        || !crate::state::SurroundUpmixConfig::can_upmix(source_channels, hardware_channels)
+    {
         state.surround_upmix.enabled = false;
     } else if !state.surround_upmix.user_overridden {
         state.surround_upmix.enabled = !state.force_stereo_downmix
@@ -8425,7 +8529,14 @@ fn process_decoder_state_requests(
             }
             let source_channels = audio_source.get_num_channels();
             state.source_channels = source_channels;
-            if state.hardware_channels <= 2 {
+            state.is_native_atmos = audio_source.is_native_atmos();
+            if state.hardware_channels <= 2
+                || state.is_native_atmos
+                || !crate::state::SurroundUpmixConfig::can_upmix(
+                    source_channels,
+                    state.hardware_channels,
+                )
+            {
                 state.surround_upmix.enabled = false;
             } else if !state.surround_upmix.user_overridden {
                 state.surround_upmix.enabled = !state.force_stereo_downmix
@@ -8510,7 +8621,14 @@ fn process_decoder_state_requests(
             state.multi_track_mix_mode = false;
             let source_channels = audio_source.get_num_channels();
             state.source_channels = source_channels;
-            if state.hardware_channels <= 2 {
+            state.is_native_atmos = audio_source.is_native_atmos();
+            if state.hardware_channels <= 2
+                || state.is_native_atmos
+                || !crate::state::SurroundUpmixConfig::can_upmix(
+                    source_channels,
+                    state.hardware_channels,
+                )
+            {
                 state.surround_upmix.enabled = false;
             } else if !state.surround_upmix.user_overridden {
                 state.surround_upmix.enabled = !state.force_stereo_downmix
@@ -10046,8 +10164,8 @@ fn run_wasapi_exclusive_multichannel(
     audio_source_opt: &mut Option<Box<dyn AudioSource>>,
     shared_state: Arc<Mutex<AppState>>,
     target_rate: u32,
-    target_channels: u16,
-    surround_upmix_enabled: bool,
+    _target_channels: u16,
+    _surround_upmix_enabled: bool,
     mpegh_bitstream: bool,
     allow_exclusive: bool,
     file_path: &str,
@@ -11021,9 +11139,7 @@ fn run_wasapi_exclusive_multichannel(
             drop(probe_client);
 
             for &(ch, mask) in &channel_candidates {
-                if ch == 12
-                    && (!mpegh_bitstream || (!surround_upmix_enabled && target_channels < 9))
-                {
+                if ch == 12 && !mpegh_bitstream {
                     continue;
                 }
                 // 0. When 12-channel (7.1.4 / 11.1) output is enabled (`ch == 12 && mpegh_bitstream`),
@@ -11675,9 +11791,8 @@ fn run_wasapi_exclusive_multichannel(
 
                         let to_copy = std::cmp::min(frames_available, frames_needed);
                         let src_ch = (chunk.spatial_channels as usize).max(1);
-                        let target_upmix = upmix_active
-                            && hardware_channels > 2
-                            && (src_ch < hardware_channels || !upmix_cfg.is_flat_identity());
+                        let target_upmix =
+                            upmix_cfg.is_active_for(src_ch as i32, hardware_channels as i32);
 
                         if upmixer_dsp.is_blending_or_active(target_upmix) {
                             for i in 0..to_copy {
@@ -11932,9 +12047,8 @@ fn run_wasapi_exclusive_multichannel(
                             }
 
                             let src_ch = (chunk.spatial_channels as usize).max(1);
-                            let target_upmix = upmix_active
-                                && hardware_channels > 2
-                                && (src_ch < hardware_channels || !upmix_cfg.is_flat_identity());
+                            let target_upmix =
+                                upmix_cfg.is_active_for(src_ch as i32, hardware_channels as i32);
                             let use_upmixer = upmixer_dsp.is_blending_or_active(target_upmix);
 
                             for _ in 0..frames_available {
@@ -12075,9 +12189,8 @@ fn run_wasapi_exclusive_multichannel(
                             let to_copy = std::cmp::min(frames_available, frames_needed);
 
                             let src_ch = (chunk.spatial_channels as usize).max(1);
-                            let target_upmix = upmix_active
-                                && hardware_channels > 2
-                                && (src_ch < hardware_channels || !upmix_cfg.is_flat_identity());
+                            let target_upmix =
+                                upmix_cfg.is_active_for(src_ch as i32, hardware_channels as i32);
                             if upmixer_dsp.is_blending_or_active(target_upmix) {
                                 let active_ch = hardware_channels.min(12);
                                 for i in 0..to_copy {
@@ -12233,8 +12346,8 @@ fn run_wasapi_exclusive_multichannel(
                 frames_since_last_dsp_send = 0;
                 let play_time =
                     last_current_seconds + (chunk_frame_pos as f64 / negotiated_rate as f64);
-                let (dsp_channels, vu_slice): (usize, &[f32]) = if upmix_active
-                    && (last_spatial_channels < hardware_channels || !upmix_cfg.is_flat_identity())
+                let (dsp_channels, vu_slice): (usize, &[f32]) = if upmix_cfg
+                    .is_active_for(last_spatial_channels as i32, hardware_channels as i32)
                 {
                     let active_ch = hardware_channels.min(12);
                     (active_ch, &upmix_peak_vus[..active_ch])
@@ -12661,9 +12774,8 @@ where
                     let to_copy = std::cmp::min(frames_available, frames_needed);
 
                     let src_ch = (chunk.spatial_channels as usize).max(1);
-                    let target_upmix = upmix_active
-                        && hardware_channels > 2
-                        && (src_ch < hardware_channels || !upmix_cfg.is_flat_identity());
+                    let target_upmix =
+                        upmix_cfg.is_active_for(src_ch as i32, hardware_channels as i32);
                     if upmixer_dsp.is_blending_or_active(target_upmix) {
                         let active_ch = hardware_channels.min(12);
                         for i in 0..to_copy {
@@ -12758,8 +12870,8 @@ where
                 frames_since_last_dsp_send = 0;
                 let play_time =
                     last_current_seconds + (chunk_frame_pos as f64 / sample_rate as f64);
-                let (dsp_channels, vu_slice): (usize, &[f32]) = if upmix_active
-                    && (last_spatial_channels < hardware_channels || !upmix_cfg.is_flat_identity())
+                let (dsp_channels, vu_slice): (usize, &[f32]) = if upmix_cfg
+                    .is_active_for(last_spatial_channels as i32, hardware_channels as i32)
                 {
                     let active_ch = hardware_channels.min(12);
                     (active_ch, &upmix_peak_vus[..active_ch])
@@ -13875,9 +13987,30 @@ mod tests {
         state_8ch.surround_upmix.enabled = false;
         state_8ch.set_surround_upmix(true);
         assert!(
-            state_8ch.surround_upmix.enabled,
-            "User must always be able to re-enable Surround Upmix / EQ on an 8-channel source"
+            !state_8ch.surround_upmix.enabled,
+            "Upmix must remain bypassed when source_channels (8) == hardware_channels (8)"
         );
+
+        let mut state_atmos = AppState::new("Atmos Test".to_string());
+        state_atmos.file_loaded = true;
+        state_atmos.hardware_channels = 12;
+        state_atmos.source_channels = 8;
+        state_atmos.is_native_atmos = true;
+        state_atmos.surround_upmix.enabled = false;
+        state_atmos.set_surround_upmix(true);
+        assert!(
+            !state_atmos.surround_upmix.enabled,
+            "Upmix must remain bypassed for a native Dolby Atmos track"
+        );
+
+        // Verify 12ch source on 12ch hardware passes all 12 discrete channels 1:1 untouched.
+        assert!(!crate::state::SurroundUpmixConfig::can_upmix(12, 12));
+        let discrete_12ch = [
+            0.7f32, -0.6, 0.5, 0.4, -0.5, 0.5, -0.35, 0.35, 0.25, -0.25, 0.15, -0.15,
+        ];
+        let out_discrete_12 =
+            dsp_8ch.process_multichannel_frame_for_hardware(&discrete_12ch, 12, &cfg, 12);
+        assert_eq!(&out_discrete_12[..12], &discrete_12ch[..]);
 
         // Verify 7.1 (0x63F: [FL, FR, FC, LFE, BL, BR, SL, SR]) -> 7.1.4 (12ch) maps SL/SR to [4, 5]
         // and BL/BR to [6, 7], and responds to EQ bands and speaker level sliders.
@@ -15218,6 +15351,66 @@ Sink #105
                 }
             }
             CoUninitialize();
+        }
+    }
+
+    #[test]
+    fn test_atmos_detection_and_96khz_symphonia_resampling() {
+        let user_profile = std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .unwrap_or_default();
+
+        // 1. Verify native Dolby Atmos track detection ("01 - Major Tom (Coming Home).mkv")
+        let atmos_path = format!("{}\\Music\\01 - Major Tom (Coming Home).mkv", user_profile);
+        if std::path::Path::new(&atmos_path).exists() {
+            let mut src = load_audio_source(&atmos_path).expect("load Major Tom mkv");
+            assert!(
+                src.is_native_atmos(),
+                "01 - Major Tom (Coming Home).mkv must be detected as native Dolby Atmos"
+            );
+            let mut st = AppState::new("Major Tom".to_string());
+            st.surround_upmix.enabled = true;
+            st.surround_upmix.user_overridden = true;
+            populate_state_from_audio_source(&mut st, src.as_mut(), 12, 48000);
+            assert!(
+                st.is_native_atmos,
+                "AppState.is_native_atmos must be true for Major Tom"
+            );
+            assert!(
+                !st.surround_upmix.enabled,
+                "Surround Upmix must be automatically disabled for native Dolby Atmos"
+            );
+            eprintln!(
+                "Verified native Atmos track '{}': is_native_atmos={}, surround_upmix.enabled={}, tracks={:?}",
+                atmos_path, st.is_native_atmos, st.surround_upmix.enabled, st.audio_tracks
+            );
+        }
+
+        // 2. Verify 96,000 Hz 5.1 FLAC ("02 - What Is Love.flac") resamples to 48,000 Hz at 1.0x speed
+        let flac_path = format!(
+            "{}\\Music\\Howard Jones - Human's Lib\\02 - What Is Love.flac",
+            user_profile
+        );
+        if std::path::Path::new(&flac_path).exists() {
+            let mut src = load_audio_source(&flac_path).expect("load What Is Love flac");
+            assert_eq!(src.get_intrinsic_sample_rate(), Some(96000));
+            assert_eq!(src.get_num_channels(), 6);
+            assert!(!src.is_native_atmos());
+
+            // Read 48,000 output frames at output_sample_rate = 48,000 Hz (1.0 second of audio)
+            let mut buf = vec![0.0f32; 48000 * 12];
+            let frames = src.read_frames(12, 48000, &mut buf);
+            assert_eq!(frames, 48000);
+            let pos = src.get_position_seconds();
+            assert!(
+                (pos - 1.0).abs() < 0.01,
+                "After reading 48,000 frames at 48,000 Hz from a 96,000 Hz FLAC, position must be ~1.0s (got {:.4}s)",
+                pos
+            );
+            eprintln!(
+                "Verified 96kHz -> 48kHz resampling on '{}': read {} frames @ 48kHz, position={:.4}s",
+                flac_path, frames, pos
+            );
         }
     }
 }

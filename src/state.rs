@@ -567,6 +567,7 @@ pub struct AudioTrackInfo {
     pub channels: u16,
     pub sample_rate: u32,
     pub language: Option<String>,
+    pub is_atmos: bool,
 }
 
 /// Configuration for Automatic Surround & Height Upmixing and the 5-Band Crossover EQ.
@@ -719,11 +720,11 @@ impl SurroundUpmixConfig {
             && (self.surround_high_bleed - 0.25).abs() < 1e-4
     }
 
-    /// Returns `true` when surround upmixing / multichannel DSP is enabled on a multi-channel
-    /// output device (`hardware_channels > 2`).
+    /// Returns `true` when surround upmixing is enabled and applicable for `source_channels`
+    /// on a multi-channel output device (`hardware_channels > 2` and `source_channels < hardware_channels`).
     #[inline]
-    pub fn is_active_for(&self, _source_channels: i32, hardware_channels: i32) -> bool {
-        self.enabled && hardware_channels > 2
+    pub fn is_active_for(&self, source_channels: i32, hardware_channels: i32) -> bool {
+        self.enabled && Self::can_upmix(source_channels, hardware_channels)
     }
 
     /// Returns `true` when the output hardware layout includes overhead height channels
@@ -924,6 +925,7 @@ pub struct AppState {
     pub mobile_hud_tab: MobileHudTab,
     pub surround_upmix: SurroundUpmixConfig,
     pub show_surround_eq: bool,
+    pub is_native_atmos: bool,
 }
 
 pub fn get_history_file_path() -> std::path::PathBuf {
@@ -1114,6 +1116,7 @@ impl AppState {
             mobile_hud_tab: MobileHudTab::default(),
             surround_upmix: SurroundUpmixConfig::default(),
             show_surround_eq: false,
+            is_native_atmos: false,
         }
     }
 
@@ -1264,6 +1267,7 @@ impl AppState {
             mobile_hud_tab: self.mobile_hud_tab,
             surround_upmix: self.surround_upmix,
             show_surround_eq: self.show_surround_eq,
+            is_native_atmos: self.is_native_atmos,
         }
     }
 
@@ -1437,6 +1441,28 @@ impl AppState {
     /// Enables or disables automatic surround upmixing with configurable crossover routing.
     /// Only affects playback when connected to a multi-channel surround output device (`hardware_channels > 2`).
     pub fn set_surround_upmix(&mut self, enabled: bool) {
+        if enabled
+            && self.file_loaded
+            && (self.is_native_atmos
+                || (self.hardware_channels > 2
+                    && !SurroundUpmixConfig::can_upmix(
+                        self.source_channels,
+                        self.hardware_channels,
+                    )))
+        {
+            self.surround_upmix.enabled = false;
+            self.show_surround_eq = false;
+            self.osd_text = Some(if self.is_native_atmos {
+                "🔊 Surround Upmix: Bypassed (Native Dolby Atmos)".to_string()
+            } else {
+                format!(
+                    "🔊 Surround Upmix: Bypassed (Native {}ch Match)",
+                    self.source_channels
+                )
+            });
+            self.osd_timer = 2.5;
+            return;
+        }
         let prev_enabled = self.surround_upmix.enabled;
         self.surround_upmix.enabled = enabled;
         self.surround_upmix.user_overridden = true;

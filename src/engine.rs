@@ -8284,13 +8284,14 @@ impl VulkanEngine {
                                 );
                                 if state.file_loaded {
                                     ui.horizontal(|ui| {
+                                        let src_ch = state.source_channels.max(1);
                                         ui.label(
                                             egui::RichText::new(format!(
                                                 "Channels: {} hw / {} src",
-                                                state.hardware_channels, state.num_channels
+                                                state.hardware_channels, src_ch
                                             ))
                                             .color(
-                                                if state.hardware_channels != state.num_channels {
+                                                if state.hardware_channels != src_ch {
                                                     egui::Color32::YELLOW
                                                 } else {
                                                     egui::Color32::GRAY
@@ -10619,7 +10620,9 @@ impl VulkanEngine {
                                                         format_name
                                                     };
 
-                                                    let ch_info = if state.stats.mpegh_bitstream_active {
+                                                    let ch_info = if state.is_native_atmos {
+                                                        "Dolby Atmos (7.1.4)".to_string()
+                                                    } else if state.stats.mpegh_bitstream_active {
                                                         let is_atmos_spatial = state
                                                             .stats
                                                             .mpegh_carrier_info
@@ -10632,8 +10635,22 @@ impl VulkanEngine {
                                                         };
                                                         if let Some(tc) = state.tracker_channels {
                                                             format!("11.1 {} (12ch) / {} tracker", carrier_tag, tc)
-                                                        } else {
+                                                        } else if state.source_channels >= 12 {
                                                             format!("11.1 {} (7.1.4 / 12ch)", carrier_tag)
+                                                        } else {
+                                                            let src_label = match state.source_channels {
+                                                                1 => "Mono (1ch)".to_string(),
+                                                                2 => "Stereo (2ch)".to_string(),
+                                                                6 => "5.1 (6ch)".to_string(),
+                                                                8 => "7.1 (8ch)".to_string(),
+                                                                10 => "7.1.2 (10ch)".to_string(),
+                                                                n => format!("{}ch", n.max(1)),
+                                                            };
+                                                            if state.surround_upmix.is_active_for(state.source_channels, state.hardware_channels) {
+                                                                format!("{} -> 7.1.4 {} Upmix (12ch)", src_label, carrier_tag)
+                                                            } else {
+                                                                format!("{} via {} 7.1.4", src_label, carrier_tag)
+                                                            }
                                                         }
                                                     } else if let Some(tc) = state.tracker_channels {
                                                         format!("{} hw / {} tracker", state.hardware_channels, tc)
@@ -11043,9 +11060,17 @@ impl VulkanEngine {
                                             {
                                                 ui.horizontal(|ui| {
                                                     let upmix_enabled = state.surround_upmix.enabled;
-                                                    let upmix_active = state
-                                                        .surround_upmix
-                                                        .is_active_for(state.source_channels, state.hardware_channels);
+                                                    let is_native_bypass = state.file_loaded
+                                                        && (state.is_native_atmos
+                                                            || (state.hardware_channels > 2
+                                                                && !crate::state::SurroundUpmixConfig::can_upmix(
+                                                                    state.source_channels,
+                                                                    state.hardware_channels,
+                                                                )));
+                                                    let upmix_active = !is_native_bypass
+                                                        && state
+                                                            .surround_upmix
+                                                            .is_active_for(state.source_channels, state.hardware_channels);
                                                     let layout_tag =
                                                         crate::state::SurroundUpmixConfig::short_tag(
                                                             state.hardware_channels,
@@ -11056,6 +11081,13 @@ impl VulkanEngine {
                                                             egui::Color32::from_rgb(165, 85, 12),
                                                             egui::Color32::from_rgb(255, 175, 50),
                                                             egui::Color32::from_rgb(255, 240, 200),
+                                                        )
+                                                    } else if is_native_bypass {
+                                                        (
+                                                            "🔊 Surround Upmix: OFF (Native)".to_string(),
+                                                            egui::Color32::from_rgb(36, 34, 36),
+                                                            egui::Color32::from_rgb(90, 84, 76),
+                                                            egui::Color32::from_rgb(175, 170, 162),
                                                         )
                                                     } else if upmix_enabled {
                                                         (
