@@ -11710,9 +11710,7 @@ impl VulkanEngine {
                 );
             }
 
-            if is_video_active
-                && let Some(vs) = &self.video_state
-            {
+            if is_video_active && let Some(vs) = &self.video_state {
                 let params = VideoParams {
                     color_space: vs.color_space,
                     color_range: vs.color_range,
@@ -12255,8 +12253,11 @@ impl VulkanEngine {
             }
 
             if !clipped_primitives.is_empty() {
-                self.egui_renderer
-                    .render(&mut render_pass, &clipped_primitives, &screen_descriptor);
+                self.egui_renderer.render(
+                    &mut render_pass,
+                    &clipped_primitives,
+                    &screen_descriptor,
+                );
             }
         }
 
@@ -14072,7 +14073,10 @@ mod tests {
         let hud_resolved =
             include_str!("shaders/hud.wgsl").replace("// INCLUDE: common", SHADER_COMMON);
         if let Err(e) = wgpu::naga::front::wgsl::parse_str(&hud_resolved) {
-            panic!("hud.wgsl WGSL parse error:\n{}", e.emit_to_string(&hud_resolved));
+            panic!(
+                "hud.wgsl WGSL parse error:\n{}",
+                e.emit_to_string(&hud_resolved)
+            );
         }
 
         let mut prev_active = [0u32; 32];
@@ -14113,7 +14117,10 @@ mod tests {
         );
         let (g1, g2) = unpack(packed[0]);
         assert_eq!(prev_active[0], 19);
-        assert!((g1 - 1.0).abs() < 1e-3, "1st past block should start at 1.0");
+        assert!(
+            (g1 - 1.0).abs() < 1e-3,
+            "1st past block should start at 1.0"
+        );
         assert_eq!(g2, 0.0, "2nd past block was never lit at peak + 1");
 
         // 4. Advance 15 ms at segment 19, then drop 1 more block (19 -> 18):
@@ -14137,8 +14144,14 @@ mod tests {
         );
         let (g1, g2) = unpack(packed[0]);
         assert_eq!(prev_active[0], 18);
-        assert!((g1 - 1.0).abs() < 1e-3, "1st past block should start at 1.0");
-        assert!((g2 - 1.0).abs() < 1e-3, "2nd past block should start at 1.0");
+        assert!(
+            (g1 - 1.0).abs() < 1e-3,
+            "1st past block should start at 1.0"
+        );
+        assert!(
+            (g2 - 1.0).abs() < 1e-3,
+            "2nd past block should start at 1.0"
+        );
 
         // 5. Hold at segment 18 and verify 25 ms drop-off for 2nd block and 50 ms drop-off for 1st block:
         // After 12.5 ms: ghost1 ~ 0.75, ghost2 ~ 0.50
@@ -14151,8 +14164,16 @@ mod tests {
             0.0125,
         );
         let (g1, g2) = unpack(packed[0]);
-        assert!((g1 - 0.75).abs() < 0.01, "At 12.5 ms, 50 ms fade should be ~0.75 (got {})", g1);
-        assert!((g2 - 0.50).abs() < 0.01, "At 12.5 ms, 25 ms fade should be ~0.50 (got {})", g2);
+        assert!(
+            (g1 - 0.75).abs() < 0.01,
+            "At 12.5 ms, 50 ms fade should be ~0.75 (got {})",
+            g1
+        );
+        assert!(
+            (g2 - 0.50).abs() < 0.01,
+            "At 12.5 ms, 25 ms fade should be ~0.50 (got {})",
+            g2
+        );
 
         // After another 12.5 ms (total 25 ms): ghost1 ~ 0.50, ghost2 == 0.0
         let packed = VulkanEngine::step_vu_phosphor_ghosts(
@@ -14164,8 +14185,16 @@ mod tests {
             0.0125,
         );
         let (g1, g2) = unpack(packed[0]);
-        assert!((g1 - 0.50).abs() < 0.01, "At 25 ms, 50 ms fade should be ~0.50 (got {})", g1);
-        assert!(g2 < 1e-4, "At 25 ms, 25 ms fade must have dropped off to 0.0 (got {})", g2);
+        assert!(
+            (g1 - 0.50).abs() < 0.01,
+            "At 25 ms, 50 ms fade should be ~0.50 (got {})",
+            g1
+        );
+        assert!(
+            g2 < 1e-4,
+            "At 25 ms, 25 ms fade must have dropped off to 0.0 (got {})",
+            g2
+        );
 
         // After another 25 ms (total 50 ms): ghost1 == 0.0, ghost2 == 0.0
         let packed = VulkanEngine::step_vu_phosphor_ghosts(
@@ -14177,7 +14206,15 @@ mod tests {
             0.025,
         );
         let (g1, g2) = unpack(packed[0]);
-        assert!(g1 < 1e-4, "At 50 ms, 50 ms fade must have dropped off to 0.0 (got {})", g1);
-        assert!(g2 < 1e-4, "At 50 ms, 25 ms fade must remain 0.0 (got {})", g2);
+        assert!(
+            g1 < 1e-4,
+            "At 50 ms, 50 ms fade must have dropped off to 0.0 (got {})",
+            g1
+        );
+        assert!(
+            g2 < 1e-4,
+            "At 50 ms, 25 ms fade must remain 0.0 (got {})",
+            g2
+        );
     }
 }

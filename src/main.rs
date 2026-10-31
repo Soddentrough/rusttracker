@@ -1874,8 +1874,10 @@ async fn run_gui(
                     // and pressing Space/Tab/Enter activates the focused HUD button instead of
                     // running global hotkeys (like Space for Pause/Play).
                     let response = if !is_typing
-                        && matches!(event, WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_))
-                    {
+                        && matches!(
+                            event,
+                            WindowEvent::KeyboardInput { .. } | WindowEvent::Ime(_)
+                        ) {
                         egui_ctx.memory_mut(|m| {
                             if let Some(id) = m.focused() {
                                 m.surrender_focus(id);

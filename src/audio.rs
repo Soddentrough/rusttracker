@@ -11105,10 +11105,7 @@ fn run_wasapi_exclusive_multichannel(
                     // at 8 channels, so skip `ch > 8` to avoid hammering the GPU HDMI driver with unsupported
                     // 12ch Exclusive LPCM probes). Only probe Exclusive Mode when `allow_exclusive` is true
                     // and no other process has an active audio session on the endpoint.
-                    if allow_exclusive
-                        && other_active_pid.is_none()
-                        && mix_channels < ch
-                        && ch <= 8
+                    if allow_exclusive && other_active_pid.is_none() && mix_channels < ch && ch <= 8
                     {
                         for &fmt in &exclusive_fmt_candidates {
                             match try_open_exclusive_client(&dev, ch, rate, mask, fmt) {
@@ -11148,11 +11145,7 @@ fn run_wasapi_exclusive_multichannel(
 
                 // 3. Direct HDMI AVR fallback: probe native EDID IEC 61937-13 MPEG-H 3D Audio (CICP Layout 19)
                 // when connected directly to an HDMI sink that advertises MPEG-H (`0x00000019` / `0x0000000f`).
-                if allow_exclusive
-                    && other_active_pid.is_none()
-                    && ch == 12
-                    && mpegh_bitstream
-                {
+                if allow_exclusive && other_active_pid.is_none() && ch == 12 && mpegh_bitstream {
                     match try_open_exclusive_mpegh_iec61937_client(&dev, false) {
                         Ok((ac, rc, ev, buf_frames, rate_factor, carrier_label)) => {
                             match crate::mpegh::Mpegh714Encoder::new(rate_factor as u8, true) {
