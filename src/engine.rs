@@ -92,6 +92,7 @@ pub struct AudioUniforms {
     pub spatial_channels: [f32; 16],
     pub display_order: [u32; 16],
     pub channel_phases: [f32; 32],
+    pub vu_segment_glows: [u32; 256],
     pub num_channels: u32,
     pub mode: u32,
     pub time: f32,
@@ -1221,8 +1222,7 @@ pub struct VulkanEngine {
     vu_needle_velocities: Vec<f32>,
     channel_phases: [f32; 32],
     vu_prev_active_segments: [u32; 32],
-    vu_ghost1: [f32; 32],
-    vu_ghost2: [f32; 32],
+    vu_segment_glows: [[f32; 30]; 32],
     vu_prev_num_channels: u32,
     // Change detection for waveform history uploads (skip 1.2MB write when unchanged)
     last_uploaded_push_count: u64,
@@ -6259,8 +6259,7 @@ impl VulkanEngine {
             vu_needle_velocities: vec![0.0; 32],
             channel_phases: [0.0; 32],
             vu_prev_active_segments: [0; 32],
-            vu_ghost1: [0.0; 32],
-            vu_ghost2: [0.0; 32],
+            vu_segment_glows: [[0.0; 30]; 32],
             vu_prev_num_channels: 0,
             last_uploaded_push_count: u64::MAX,
             last_uploaded_vis_width: 0,
@@ -6562,76 +6561,67 @@ impl VulkanEngine {
         }
     }
 
+    pub const VU_PHOSPHOR_FADE_SECS: f32 = 0.35;
+
     pub fn clear_video_state(&mut self) {
         self.video_state = None;
         self.vu_prev_active_segments = [0; 32];
-        self.vu_ghost1 = [0.0; 32];
-        self.vu_ghost2 = [0.0; 32];
+        self.vu_segment_glows = [[0.0; 30]; 32];
         self.vu_prev_num_channels = 0;
         self.channel_phases = [0.0; 32];
         self.cached_meta_path.clear();
     }
 
-    /// Updates the phosphor ghosting / fade-out envelope for the past two blocks above each
-    /// channel's active VU meter bar (50 ms drop-off on the 1st trailing block, 25 ms drop-off
-    /// on the 2nd trailing block) and returns the packed values for `AudioUniforms::channel_phases`.
+    /// Updates the per-segment phosphor persistence / afterglow envelope for all 30 blocks across
+    /// up to 32 channels. Whenever a block ceases to be active (`segment_idx >= active_segments`),
+    /// it smoothly fades from `1.0` back to `0.0` (regular unlit background color) over
+    /// `VU_PHOSPHOR_FADE_SECS` (350 ms), packed at 8 bits per segment (`0..=255`) into
+    /// `AudioUniforms::vu_segment_glows` (8 `u32` words per channel).
     pub fn step_vu_phosphor_ghosts(
         prev_active: &mut [u32; 32],
-        ghost1: &mut [f32; 32],
-        ghost2: &mut [f32; 32],
+        segment_glows: &mut [[f32; 30]; 32],
         channels: &[f32; 32],
         num_channels: u32,
         dt: f32,
-    ) -> [f32; 32] {
-        let mut packed = [0.0f32; 32];
+    ) -> [u32; 256] {
+        let mut packed = [0u32; 256];
         let count = (num_channels as usize).min(32);
         let dt_clamped = dt.clamp(0.0, 0.1);
-        let decay_50ms = dt_clamped / 0.050;
-        let decay_25ms = dt_clamped / 0.025;
+        let decay = dt_clamped / Self::VU_PHOSPHOR_FADE_SECS;
 
         for i in 0..count {
             let vu = channels[i].clamp(0.0, 1.0);
-            let cur_active = (vu * 30.0).ceil() as u32;
-            let old_active = prev_active[i];
-            let prev_g1 = ghost1[i];
-            let prev_g2 = ghost2[i];
+            let cur_active = ((vu * 30.0).ceil() as usize).min(30);
+            let old_active = (prev_active[i] as usize).min(30);
 
-            if cur_active == old_active {
-                ghost1[i] = (prev_g1 - decay_50ms).max(0.0);
-                ghost2[i] = (prev_g2 - decay_25ms).max(0.0);
-            } else if cur_active < old_active {
-                let drop = old_active - cur_active;
-                if drop == 1 {
-                    // Block at cur_active + 1 was previously Past Block 1 (at old_active);
-                    // Block at cur_active was previously active (< old_active).
-                    ghost2[i] = if prev_g1 > 0.20 {
-                        1.0
-                    } else {
-                        (prev_g1 * 2.0).clamp(0.0, 1.0)
-                    };
-                    ghost1[i] = 1.0;
-                } else {
-                    // Dropped by 2 or more blocks: both cur_active and cur_active + 1 were active
-                    ghost1[i] = 1.0;
-                    ghost2[i] = 1.0;
+            for (s, glow) in segment_glows[i].iter_mut().enumerate() {
+                if s < cur_active {
+                    // Currently active block stays fully energized, but we keep stored glow at 0.0
+                    // while rising so only blocks that actually transition from active -> inactive fade.
+                    *glow = 0.0;
+                } else if s < old_active {
+                    // Block was active on the previous frame and just turned off: ignite afterglow at 1.0
+                    *glow = 1.0;
+                } else if *glow > 0.0 {
+                    // Recently active block: smoothly decay back toward unlit background (0.0)
+                    *glow = (*glow - decay).max(0.0);
                 }
-            } else {
-                // Rising bar: blocks above cur_active were not just turned off
-                ghost1[i] = 0.0;
-                ghost2[i] = 0.0;
             }
 
-            prev_active[i] = cur_active;
+            prev_active[i] = cur_active as u32;
 
-            let g1_int = (ghost1[i].clamp(0.0, 1.0) * 1000.0).round();
-            let g2_frac = ghost2[i].clamp(0.0, 1.0) * 0.90;
-            packed[i] = g1_int + g2_frac;
+            let base_word = i * 8;
+            for (s, &g) in segment_glows[i].iter().enumerate() {
+                if g > 0.0 && s >= cur_active {
+                    let byte_val = (g.clamp(0.0, 1.0) * 255.0).round() as u32;
+                    packed[base_word + (s >> 2)] |= byte_val << ((s & 3) * 8);
+                }
+            }
         }
 
         for i in count..32 {
             prev_active[i] = 0;
-            ghost1[i] = 0.0;
-            ghost2[i] = 0.0;
+            segment_glows[i] = [0.0; 30];
         }
 
         packed
@@ -6929,8 +6919,7 @@ impl VulkanEngine {
             self.last_raw_state_seconds = 0.0;
             self.fire_intensity = 0.0;
             self.vu_prev_active_segments = [0; 32];
-            self.vu_ghost1 = [0.0; 32];
-            self.vu_ghost2 = [0.0; 32];
+            self.vu_segment_glows = [[0.0; 30]; 32];
             self.vu_prev_num_channels = 0;
             self.channel_phases = [0.0; 32];
             return;
@@ -7036,6 +7025,7 @@ impl VulkanEngine {
             spatial_channels: [0.0; 16],
             display_order: [0; 16],
             channel_phases: self.channel_phases,
+            vu_segment_glows: [0; 256],
             num_channels: state.channel_vus.len().min(32) as u32,
             mode: state.visualizer_mode,
             time: self.smooth_audio_seconds as f32,
@@ -7193,19 +7183,16 @@ impl VulkanEngine {
 
         if uniforms.num_channels != self.vu_prev_num_channels {
             self.vu_prev_active_segments = [0; 32];
-            self.vu_ghost1 = [0.0; 32];
-            self.vu_ghost2 = [0.0; 32];
+            self.vu_segment_glows = [[0.0; 30]; 32];
             self.vu_prev_num_channels = uniforms.num_channels;
         }
-        self.channel_phases = Self::step_vu_phosphor_ghosts(
+        uniforms.vu_segment_glows = Self::step_vu_phosphor_ghosts(
             &mut self.vu_prev_active_segments,
-            &mut self.vu_ghost1,
-            &mut self.vu_ghost2,
+            &mut self.vu_segment_glows,
             &uniforms.channels,
             uniforms.num_channels,
             frame_dt,
         );
-        uniforms.channel_phases = self.channel_phases;
 
         if state.visualizer_mode == 23 {
             let display_secs = state.scrub_target_seconds.unwrap_or(state.current_seconds);
@@ -14112,141 +14099,123 @@ mod tests {
         }
 
         let mut prev_active = [0u32; 32];
-        let mut ghost1 = [0.0f32; 32];
-        let mut ghost2 = [0.0f32; 32];
+        let mut segment_glows = [[0.0f32; 30]; 32];
         let mut channels = [0.0f32; 32];
 
-        let unpack = |packed: f32| -> (f32, f32) {
-            let g1 = (packed.floor() / 1000.0).clamp(0.0, 1.0);
-            let g2 = (packed.fract() / 0.90).clamp(0.0, 1.0);
-            (g1, g2)
+        let unpack_seg = |packed: &[u32; 256], ch: usize, seg: usize| -> f32 {
+            let word = packed[ch * 8 + (seg >> 2)];
+            let byte = (word >> ((seg & 3) * 8)) & 0xFF;
+            byte as f32 / 255.0
         };
 
         // 2. Rising from 0 to 20 segments must NOT trigger ghosting above the bar
         channels[0] = 20.0 / 30.0;
         let packed = VulkanEngine::step_vu_phosphor_ghosts(
             &mut prev_active,
-            &mut ghost1,
-            &mut ghost2,
+            &mut segment_glows,
             &channels,
             2,
             0.010,
         );
-        let (g1, g2) = unpack(packed[0]);
         assert_eq!(prev_active[0], 20);
-        assert_eq!(g1, 0.0, "Rising VU bar must not light 1st past block");
-        assert_eq!(g2, 0.0, "Rising VU bar must not light 2nd past block");
+        for s in 0..30 {
+            assert_eq!(
+                unpack_seg(&packed, 0, s),
+                0.0,
+                "Rising VU bar must not light unlit blocks"
+            );
+        }
 
-        // 3. Drop by 1 block (20 -> 19): 1st past block ignites (1.0), 2nd past block stays 0.0
-        channels[0] = 19.0 / 30.0;
+        // 3. Drop by 4 blocks (20 -> 16): segments 16..20 ignite at 1.0, segments 20..30 stay 0.0
+        channels[0] = 16.0 / 30.0;
         let packed = VulkanEngine::step_vu_phosphor_ghosts(
             &mut prev_active,
-            &mut ghost1,
-            &mut ghost2,
+            &mut segment_glows,
             &channels,
             2,
             0.010,
         );
-        let (g1, g2) = unpack(packed[0]);
-        assert_eq!(prev_active[0], 19);
-        assert!(
-            (g1 - 1.0).abs() < 1e-3,
-            "1st past block should start at 1.0"
-        );
-        assert_eq!(g2, 0.0, "2nd past block was never lit at peak + 1");
+        assert_eq!(prev_active[0], 16);
+        for s in 16..20 {
+            assert!(
+                (unpack_seg(&packed, 0, s) - 1.0).abs() < 1e-3,
+                "Deactivated segment {} should start fade at 1.0",
+                s
+            );
+        }
+        assert_eq!(unpack_seg(&packed, 0, 20), 0.0);
 
-        // 4. Advance 15 ms at segment 19, then drop 1 more block (19 -> 18):
-        // Now both 1st past block (seg 18) and 2nd past block (seg 19) are active!
-        let _ = VulkanEngine::step_vu_phosphor_ghosts(
+        // 4. Advance by half the fade duration (175 ms of 350 ms): segments 16..20 should be at ~0.50
+        let half_dt = VulkanEngine::VU_PHOSPHOR_FADE_SECS * 0.5;
+        let packed = VulkanEngine::step_vu_phosphor_ghosts(
             &mut prev_active,
-            &mut ghost1,
-            &mut ghost2,
+            &mut segment_glows,
             &channels,
             2,
-            0.015,
+            0.100,
         );
+        let _ = packed;
+        let packed = VulkanEngine::step_vu_phosphor_ghosts(
+            &mut prev_active,
+            &mut segment_glows,
+            &channels,
+            2,
+            half_dt - 0.100,
+        );
+        for s in 16..20 {
+            let g = unpack_seg(&packed, 0, s);
+            assert!(
+                (g - 0.50).abs() < 0.02,
+                "At half fade duration, segment {} should be ~0.50 (got {})",
+                s,
+                g
+            );
+        }
+
+        // 5. Partial upward bounce (16 -> 18) must NOT wipe out still-fading segments 18..20 above it!
         channels[0] = 18.0 / 30.0;
         let packed = VulkanEngine::step_vu_phosphor_ghosts(
             &mut prev_active,
-            &mut ghost1,
-            &mut ghost2,
+            &mut segment_glows,
+            &channels,
+            2,
+            0.035,
+        );
+        assert_eq!(prev_active[0], 18);
+        assert_eq!(
+            unpack_seg(&packed, 0, 17),
+            0.0,
+            "Active segment 17 is drawn via is_active"
+        );
+        assert!(
+            (unpack_seg(&packed, 0, 18) - 0.40).abs() < 0.02,
+            "Segment 18 above bounce must continue fading smoothly (got {})",
+            unpack_seg(&packed, 0, 18)
+        );
+        assert!(
+            (unpack_seg(&packed, 0, 19) - 0.40).abs() < 0.02,
+            "Segment 19 above bounce must continue fading smoothly (got {})",
+            unpack_seg(&packed, 0, 19)
+        );
+
+        // 6. Advance remaining fade time: segments 18..20 reach 0.0
+        for _ in 0..3 {
+            let _ = VulkanEngine::step_vu_phosphor_ghosts(
+                &mut prev_active,
+                &mut segment_glows,
+                &channels,
+                2,
+                0.080,
+            );
+        }
+        let packed = VulkanEngine::step_vu_phosphor_ghosts(
+            &mut prev_active,
+            &mut segment_glows,
             &channels,
             2,
             0.010,
         );
-        let (g1, g2) = unpack(packed[0]);
-        assert_eq!(prev_active[0], 18);
-        assert!(
-            (g1 - 1.0).abs() < 1e-3,
-            "1st past block should start at 1.0"
-        );
-        assert!(
-            (g2 - 1.0).abs() < 1e-3,
-            "2nd past block should start at 1.0"
-        );
-
-        // 5. Hold at segment 18 and verify 25 ms drop-off for 2nd block and 50 ms drop-off for 1st block:
-        // After 12.5 ms: ghost1 ~ 0.75, ghost2 ~ 0.50
-        let packed = VulkanEngine::step_vu_phosphor_ghosts(
-            &mut prev_active,
-            &mut ghost1,
-            &mut ghost2,
-            &channels,
-            2,
-            0.0125,
-        );
-        let (g1, g2) = unpack(packed[0]);
-        assert!(
-            (g1 - 0.75).abs() < 0.01,
-            "At 12.5 ms, 50 ms fade should be ~0.75 (got {})",
-            g1
-        );
-        assert!(
-            (g2 - 0.50).abs() < 0.01,
-            "At 12.5 ms, 25 ms fade should be ~0.50 (got {})",
-            g2
-        );
-
-        // After another 12.5 ms (total 25 ms): ghost1 ~ 0.50, ghost2 == 0.0
-        let packed = VulkanEngine::step_vu_phosphor_ghosts(
-            &mut prev_active,
-            &mut ghost1,
-            &mut ghost2,
-            &channels,
-            2,
-            0.0125,
-        );
-        let (g1, g2) = unpack(packed[0]);
-        assert!(
-            (g1 - 0.50).abs() < 0.01,
-            "At 25 ms, 50 ms fade should be ~0.50 (got {})",
-            g1
-        );
-        assert!(
-            g2 < 1e-4,
-            "At 25 ms, 25 ms fade must have dropped off to 0.0 (got {})",
-            g2
-        );
-
-        // After another 25 ms (total 50 ms): ghost1 == 0.0, ghost2 == 0.0
-        let packed = VulkanEngine::step_vu_phosphor_ghosts(
-            &mut prev_active,
-            &mut ghost1,
-            &mut ghost2,
-            &channels,
-            2,
-            0.025,
-        );
-        let (g1, g2) = unpack(packed[0]);
-        assert!(
-            g1 < 1e-4,
-            "At 50 ms, 50 ms fade must have dropped off to 0.0 (got {})",
-            g1
-        );
-        assert!(
-            g2 < 1e-4,
-            "At 50 ms, 25 ms fade must remain 0.0 (got {})",
-            g2
-        );
+        assert!(unpack_seg(&packed, 0, 18) < 1e-4);
+        assert!(unpack_seg(&packed, 0, 19) < 1e-4);
     }
 }

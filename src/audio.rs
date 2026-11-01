@@ -348,6 +348,10 @@ pub struct SurroundUpmixerDsp {
     delay_tfr: HaasDelayLine<2048>,
     delay_trl: HaasDelayLine<2048>,
     delay_trr: HaasDelayLine<2048>,
+    mid_env: f32,
+    side_env: f32,
+    steer_gain: f32,
+    steer_alpha: f32,
     blend: f32,
     blend_initialized: bool,
 }
@@ -356,6 +360,7 @@ impl SurroundUpmixerDsp {
     pub fn new(sample_rate: u32) -> Self {
         let sr = sample_rate.max(8000);
         let default_cfg = crate::state::SurroundUpmixConfig::default();
+        let steer_alpha = 1.0 - (-1.0 / (sr as f32 * 0.012)).exp();
         let mut dsp = Self {
             sample_rate: sr,
             last_config: default_cfg,
@@ -373,14 +378,18 @@ impl SurroundUpmixerDsp {
             height_hp_r: BiquadFilter::default(),
             mc_height_lp: [BiquadFilter::default(); 4],
             mc_height_hp: [BiquadFilter::default(); 4],
-            delay_sl: HaasDelayLine::new(115),
-            delay_sr: HaasDelayLine::new(115),
-            delay_rl: HaasDelayLine::new(250),
-            delay_rr: HaasDelayLine::new(250),
-            delay_tfl: HaasDelayLine::new(158),
-            delay_tfr: HaasDelayLine::new(158),
-            delay_trl: HaasDelayLine::new(307),
-            delay_trr: HaasDelayLine::new(307),
+            delay_sl: HaasDelayLine::new(322),
+            delay_sr: HaasDelayLine::new(322),
+            delay_rl: HaasDelayLine::new(485),
+            delay_rr: HaasDelayLine::new(485),
+            delay_tfl: HaasDelayLine::new(226),
+            delay_tfr: HaasDelayLine::new(226),
+            delay_trl: HaasDelayLine::new(398),
+            delay_trr: HaasDelayLine::new(398),
+            mid_env: 0.0,
+            side_env: 0.0,
+            steer_gain: 0.0,
+            steer_alpha,
             blend: 1.0,
             blend_initialized: false,
         };
@@ -392,6 +401,7 @@ impl SurroundUpmixerDsp {
         let sr = sample_rate.max(8000) as f32;
         self.sample_rate = sample_rate.max(8000);
         self.last_config = *cfg;
+        self.steer_alpha = 1.0 - (-1.0 / (sr * 0.012)).exp();
 
         let freqs = crate::state::SurroundUpmixConfig::EQ_BAND_FREQS;
         let q_shelf = std::f32::consts::FRAC_1_SQRT_2;
@@ -441,14 +451,37 @@ impl SurroundUpmixerDsp {
             hp.update_coeffs(h_hp);
         }
 
-        self.delay_sl.set_delay_ms(self.sample_rate, 2.4);
-        self.delay_sr.set_delay_ms(self.sample_rate, 2.4);
-        self.delay_rl.set_delay_ms(self.sample_rate, 5.2);
-        self.delay_rr.set_delay_ms(self.sample_rate, 5.2);
-        self.delay_tfl.set_delay_ms(self.sample_rate, 3.3);
-        self.delay_tfr.set_delay_ms(self.sample_rate, 3.3);
-        self.delay_trl.set_delay_ms(self.sample_rate, 6.4);
-        self.delay_trr.set_delay_ms(self.sample_rate, 6.4);
+        self.delay_sl.set_delay_ms(self.sample_rate, 6.7);
+        self.delay_sr.set_delay_ms(self.sample_rate, 6.7);
+        self.delay_rl.set_delay_ms(self.sample_rate, 10.1);
+        self.delay_rr.set_delay_ms(self.sample_rate, 10.1);
+        self.delay_tfl.set_delay_ms(self.sample_rate, 4.7);
+        self.delay_tfr.set_delay_ms(self.sample_rate, 4.7);
+        self.delay_trl.set_delay_ms(self.sample_rate, 8.3);
+        self.delay_trr.set_delay_ms(self.sample_rate, 8.3);
+    }
+
+    /// Smooth envelope-follower Mid/Side center steering:
+    /// Tracks the short-term Mid and Side energy envelopes (`~12 ms` time constant) and derives a
+    /// smooth scalar steering gain `steer_gain in [0.0, 1.0]`. Multiplying `mid * self.steer_gain`
+    /// preserves linear waveform continuity across zero crossings without generating odd-harmonic
+    /// wave-rectifier / crossover hiss.
+    #[inline(always)]
+    fn update_center_steering(&mut self, mid: f32, diff: f32) -> f32 {
+        let a = self.steer_alpha;
+        let was_silent = (self.mid_env + self.side_env) <= 1e-9;
+        self.mid_env += a * (mid.abs() - self.mid_env);
+        self.side_env += a * (diff.abs() - self.side_env);
+        let total = self.mid_env + self.side_env;
+        if total > 1e-9 {
+            let target_ratio = ((self.mid_env - self.side_env).max(0.0) / total).clamp(0.0, 1.0);
+            if was_silent {
+                self.steer_gain = target_ratio;
+            } else {
+                self.steer_gain += a * (target_ratio - self.steer_gain);
+            }
+        }
+        mid * self.steer_gain
     }
 
     #[inline(always)]
@@ -526,14 +559,12 @@ impl SurroundUpmixerDsp {
 
         // ITU-R BS.775 / Dolby Surround center-steering: attenuate common-mode phantom center in surrounds
         // so correlated vocals/kick/bass stay anchored in the front stage while panned/stereo content envelops.
-        let common_center = (mid_routed.abs() - diff_routed.abs())
-            .max(0.0)
-            .copysign(mid_routed);
+        let common_center = self.update_center_steering(mid_routed, diff_routed);
         let l_bed = -self.sub_hp_l.process(l_routed - common_center * 0.60);
         let r_bed = -self.sub_hp_r.process(r_routed - common_center * 0.60);
-        let side = (l_routed - r_routed) * 0.5 * cfg.stereo_width.clamp(0.0, 2.0);
-        let l_surr = l_bed + side * 0.35;
-        let r_surr = r_bed - side * 0.35;
+        let side_bed = (l_bed - r_bed) * 0.5 * cfg.stereo_width.clamp(0.0, 2.0);
+        let l_surr = l_bed + side_bed * 0.35;
+        let r_surr = r_bed - side_bed * 0.35;
 
         let lfe_low = self.sub_lp.process(mid_routed);
 
@@ -544,8 +575,8 @@ impl SurroundUpmixerDsp {
         let sl = Self::soft_limit(sl_raw * cfg.side_rear_level);
         let sr = Self::soft_limit(sr_raw * cfg.side_rear_level);
 
-        let rl_raw = self.delay_rl.process(l_surr + side * 0.22);
-        let rr_raw = self.delay_rr.process(r_surr - side * 0.22);
+        let rl_raw = self.delay_rl.process(l_surr + side_bed * 0.22);
+        let rr_raw = self.delay_rr.process(r_surr - side_bed * 0.22);
         let rl = Self::soft_limit(rl_raw * (cfg.side_rear_level * 0.92));
         let rr = Self::soft_limit(rr_raw * (cfg.side_rear_level * 0.92));
 
@@ -572,10 +603,11 @@ impl SurroundUpmixerDsp {
         let fc_hp = -self.sub_hp_c.process(mid);
         let fc = Self::soft_limit(fc_hp * cfg.center_level * std::f32::consts::FRAC_1_SQRT_2);
 
-        let common_center = (mid.abs() - diff.abs()).max(0.0).copysign(mid);
+        let common_center = self.update_center_steering(mid, diff);
         let l_amb = l_eq - common_center * 0.60;
         let r_amb = r_eq - common_center * 0.60;
-        let side = (l_eq - r_eq) * 0.5 * cfg.stereo_width.clamp(0.0, 2.0);
+        let width = cfg.stereo_width.clamp(0.0, 2.0);
+        let side = diff * width;
         let l_wide = l_amb + side * 0.35;
         let r_wide = r_amb - side * 0.35;
 
@@ -595,6 +627,8 @@ impl SurroundUpmixerDsp {
 
         // 5. Left/Right Hemisphere Bed Routing (< height_crossover_hz + high_bleed) & Height Routing (> height_crossover_hz)
         let high_bleed = cfg.surround_high_bleed.clamp(0.0, 1.0);
+        let side_low = (l_low - r_low) * 0.5 * width;
+        let side_high = (l_high - r_high) * 0.5 * width;
 
         let sl_raw = self.delay_sl.process(l_low + l_high * high_bleed);
         let sr_raw = self.delay_sr.process(r_low + r_high * high_bleed);
@@ -603,10 +637,10 @@ impl SurroundUpmixerDsp {
 
         let rl_raw = self
             .delay_rl
-            .process((l_low + side * 0.22) + l_high * (high_bleed * 0.85));
+            .process((l_low + side_low * 0.22) + l_high * (high_bleed * 0.85));
         let rr_raw = self
             .delay_rr
-            .process((r_low - side * 0.22) + r_high * (high_bleed * 0.85));
+            .process((r_low - side_low * 0.22) + r_high * (high_bleed * 0.85));
         let rl = Self::soft_limit(rl_raw * (cfg.side_rear_level * 0.92));
         let rr = Self::soft_limit(rr_raw * (cfg.side_rear_level * 0.92));
 
@@ -615,8 +649,8 @@ impl SurroundUpmixerDsp {
         let tfl = Self::soft_limit(tfl_raw * cfg.height_level);
         let tfr = Self::soft_limit(tfr_raw * cfg.height_level);
 
-        let trl_raw = self.delay_trl.process(l_high + side * 0.28);
-        let trr_raw = self.delay_trr.process(r_high - side * 0.28);
+        let trl_raw = self.delay_trl.process(l_high + side_high * 0.16);
+        let trr_raw = self.delay_trr.process(r_high - side_high * 0.16);
         let trl = Self::soft_limit(trl_raw * (cfg.height_level * 0.92));
         let trr = Self::soft_limit(trr_raw * (cfg.height_level * 0.92));
 
@@ -653,8 +687,7 @@ impl SurroundUpmixerDsp {
             let [fl, fr, fc, lfe, sl, sr, rl, rr, tfl, tfr, trl, trr] =
                 self.process_stereo_to_7_1_4(l_in, r_in, cfg);
             let mid_f = (fl + fr) * 0.5;
-            let diff_f = (fl - fr) * 0.5;
-            let common_f = (mid_f.abs() - diff_f.abs()).max(0.0).copysign(mid_f);
+            let common_f = mid_f * self.steer_gain;
             let center_pull = common_f * (0.14 * cfg.center_level.clamp(0.0, 2.0));
             let fl_c = ((fl - center_pull) * k_s2).clamp(-1.0, 1.0);
             let fr_c = ((fr - center_pull) * k_s2).clamp(-1.0, 1.0);
@@ -711,8 +744,7 @@ impl SurroundUpmixerDsp {
             let [fl, fr, fc, lfe, sl, sr, rl, rr] =
                 self.process_stereo_to_bed_only(l_in, r_in, cfg);
             let mid_f = (fl + fr) * 0.5;
-            let diff_f = (fl - fr) * 0.5;
-            let common_f = (mid_f.abs() - diff_f.abs()).max(0.0).copysign(mid_f);
+            let common_f = mid_f * self.steer_gain;
             let center_pull = common_f * (0.14 * cfg.center_level.clamp(0.0, 2.0));
             let fl_c = ((fl - center_pull) * k_s2).clamp(-1.0, 1.0);
             let fr_c = ((fr - center_pull) * k_s2).clamp(-1.0, 1.0);
@@ -1040,7 +1072,7 @@ impl SurroundUpmixerDsp {
 
                 let f_mid = (ch_in[0] + ch_in[1]) * 0.5;
                 let f_diff = (ch_in[0] - ch_in[1]) * 0.5;
-                let f_common = (f_mid.abs() - f_diff.abs()).max(0.0).copysign(f_mid);
+                let f_common = self.update_center_steering(f_mid, f_diff);
                 let f_l_high = -self.height_hp_l.process(ch_in[0] - f_common * 0.60);
                 let f_r_high = -self.height_hp_r.process(ch_in[1] - f_common * 0.60);
 
@@ -1128,6 +1160,9 @@ impl SurroundUpmixerDsp {
         self.delay_tfr.clear();
         self.delay_trl.clear();
         self.delay_trr.clear();
+        self.mid_env = 0.0;
+        self.side_env = 0.0;
+        self.steer_gain = 0.0;
     }
 
     /// Returns `true` when upmixing is either actively enabled or in the middle of a smooth
@@ -3290,6 +3325,79 @@ where
     }
 }
 
+/// Resamples an interleaved multi-channel packet `src` from `in_rate` to `out_rate`
+/// using 4-point cubic Hermite (Catmull-Rom) interpolation with seamless $C^1$ continuity
+/// across packet boundaries via a 3-frame history buffer (`prev_frame`) and `resample_pos`.
+pub(crate) fn resample_interleaved_packet(
+    src: &[f32],
+    ch: usize,
+    in_rate: u32,
+    out_rate: u32,
+    resample_pos: &mut f64,
+    prev_frame: &mut Vec<f32>,
+    dst: &mut Vec<f32>,
+) {
+    let ch = ch.max(1);
+    let in_frames = src.len() / ch;
+    if in_frames == 0 {
+        return;
+    }
+    if in_rate == out_rate {
+        dst.extend_from_slice(&src[0..in_frames * ch]);
+        return;
+    }
+
+    let hist_len = 3 * ch;
+    if prev_frame.len() != hist_len {
+        prev_frame.clear();
+        prev_frame.reserve(hist_len);
+        for _ in 0..3 {
+            prev_frame.extend_from_slice(&src[0..ch]);
+        }
+        *resample_pos = 0.0;
+    }
+
+    let step = in_rate.max(1) as f64 / out_rate.max(1) as f64;
+    let limit = in_frames as f64 - 2.0;
+    let sample_at = |frame_idx: isize, c: usize, hist: &[f32]| -> f32 {
+        if frame_idx < 0 {
+            let h_idx = (frame_idx + 3).clamp(0, 2) as usize;
+            hist[h_idx * ch + c]
+        } else {
+            let s_idx = (frame_idx as usize).min(in_frames - 1);
+            src[s_idx * ch + c]
+        }
+    };
+
+    while *resample_pos < limit {
+        let idx = (*resample_pos).floor() as isize;
+        let frac = (*resample_pos - idx as f64) as f32;
+        for c in 0..ch {
+            let p0 = sample_at(idx - 1, c, prev_frame);
+            let p1 = sample_at(idx, c, prev_frame);
+            let p2 = sample_at(idx + 1, c, prev_frame);
+            let p3 = sample_at(idx + 2, c, prev_frame);
+            let c0 = p1;
+            let c1 = 0.5 * (p2 - p0);
+            let c2 = p0 - 2.5 * p1 + 2.0 * p2 - 0.5 * p3;
+            let c3 = 0.5 * (p3 - p0) + 1.5 * (p1 - p2);
+            dst.push(((c3 * frac + c2) * frac + c1) * frac + c0);
+        }
+        *resample_pos += step;
+    }
+
+    *resample_pos -= in_frames as f64;
+    if in_frames >= 3 {
+        prev_frame.copy_from_slice(&src[(in_frames - 3) * ch..in_frames * ch]);
+    } else if in_frames == 2 {
+        prev_frame.copy_within(2 * ch..3 * ch, 0);
+        prev_frame[ch..3 * ch].copy_from_slice(&src[0..2 * ch]);
+    } else {
+        prev_frame.copy_within(ch..3 * ch, 0);
+        prev_frame[2 * ch..3 * ch].copy_from_slice(&src[0..ch]);
+    }
+}
+
 #[inline(always)]
 pub fn get_downmixed_sample(
     track_channels: u16,
@@ -3720,36 +3828,15 @@ impl AudioSource for SymphoniaSource {
                                 if in_rate == out_rate {
                                     track.samples.extend_from_slice(src);
                                 } else {
-                                    let in_frames = src.len() / ch;
-                                    if in_frames > 0 {
-                                        if track.prev_frame.len() != ch {
-                                            track.prev_frame.clear();
-                                            track.prev_frame.extend_from_slice(&src[0..ch]);
-                                        }
-                                        let step = in_rate as f64 / out_rate as f64;
-                                        while track.resample_pos < in_frames as f64 {
-                                            let idx = track.resample_pos.floor() as isize;
-                                            let frac = (track.resample_pos - idx as f64) as f32;
-                                            for c in 0..ch {
-                                                let s0 = if idx < 0 {
-                                                    track.prev_frame[c]
-                                                } else {
-                                                    src[(idx as usize) * ch + c]
-                                                };
-                                                let s1 = src[((idx + 1)
-                                                    .clamp(0, (in_frames - 1) as isize)
-                                                    as usize)
-                                                    * ch
-                                                    + c];
-                                                track.samples.push(s0 + (s1 - s0) * frac);
-                                            }
-                                            track.resample_pos += step;
-                                        }
-                                        track.resample_pos -= in_frames as f64;
-                                        track.prev_frame.copy_from_slice(
-                                            &src[(in_frames - 1) * ch..in_frames * ch],
-                                        );
-                                    }
+                                    resample_interleaved_packet(
+                                        src,
+                                        ch,
+                                        in_rate,
+                                        out_rate,
+                                        &mut track.resample_pos,
+                                        &mut track.prev_frame,
+                                        &mut track.samples,
+                                    );
                                 }
                             }
                         }
@@ -14734,8 +14821,26 @@ Sink #105
         assert!(l_stereo > 0.4 && r_stereo < -0.2);
     }
 
+    static LIVE_AUDIO_TEST_MUTEX: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct LiveAudioTestGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
+
+    impl Drop for LiveAudioTestGuard {
+        fn drop(&mut self) {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
+
+    fn lock_live_audio_test() -> LiveAudioTestGuard {
+        let guard = LIVE_AUDIO_TEST_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        LiveAudioTestGuard(guard)
+    }
+
     #[test]
     fn test_smoke_2nd_pm_mpegh_714_upmix_and_live_playback() {
+        let _live_audio_guard = lock_live_audio_test();
         let user_profile = std::env::var("USERPROFILE")
             .or_else(|_| std::env::var("HOME"))
             .unwrap_or_default();
@@ -14990,7 +15095,7 @@ Sink #105
             st.seek_request = Some(42.0);
             st.audio_topology_reload_request = None;
         }
-        let _playback_handle_b2 = start_audio_thread(&track_path, false, shared_state.clone())
+        let playback_handle_b2 = start_audio_thread(&track_path, false, shared_state.clone())
             .expect("start_audio_thread B2");
         for step in 1..=14 {
             std::thread::sleep(std::time::Duration::from_millis(500));
@@ -15015,11 +15120,13 @@ Sink #105
                 vus.join(", ")
             );
         }
+        drop(playback_handle_b2);
     }
 
     #[cfg(windows)]
     #[test]
     fn test_live_pause_and_resume_verification() {
+        let _live_audio_guard = lock_live_audio_test();
         let user_profile = std::env::var("USERPROFILE")
             .or_else(|_| std::env::var("HOME"))
             .unwrap_or_default();
@@ -15048,7 +15155,7 @@ Sink #105
                 st.set_surround_upmix(true);
                 st.seek_request = Some(35.0);
             }
-            let _handle = start_audio_thread(&track_path, false, shared_state.clone())
+            let handle = start_audio_thread(&track_path, false, shared_state.clone())
                 .expect("start_audio_thread");
 
             // 1. Play for 1.5s
@@ -15167,12 +15274,15 @@ Sink #105
                 label,
                 max_vu_after_resume
             );
+            drop(handle);
+            std::thread::sleep(std::time::Duration::from_millis(200));
         }
     }
 
     #[cfg(windows)]
     #[test]
     fn test_spatial_audio_probe() {
+        let _live_audio_guard = lock_live_audio_test();
         use windows::Win32::Foundation::{CloseHandle, PROPERTYKEY};
         use windows::Win32::Media::Audio::*;
         use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
@@ -15412,5 +15522,116 @@ Sink #105
                 flac_path, frames, pos
             );
         }
+    }
+
+    #[test]
+    fn test_upmixer_smooth_center_steering_no_harmonic_hiss_and_packet_resampler_continuity() {
+        // 1. Verify that feeding low/mid stereo signals where |mid(t)| and |diff(t)| cross each
+        //    other every cycle (e.g. L = 220 Hz + 330 Hz, R = 220 Hz - 330 Hz) does NOT generate
+        //    synthetic >4 kHz harmonic/intermodulation hiss in the overhead height speakers.
+        let sr = 48_000;
+        let cfg = crate::state::SurroundUpmixConfig::default();
+        let mut dsp = SurroundUpmixerDsp::new(sr);
+        dsp.sync_config(&cfg, sr);
+
+        // High-pass diagnostic probe (2nd-order Butterworth at 6000 Hz) on TFL/TRL output:
+        // Since the input contains only 220 Hz and 330 Hz tones, any 6+ kHz energy in the output
+        // would be pure non-linear harmonic distortion (hiss).
+        let mut hiss_probe_tfl =
+            BiquadFilter::highpass(sr as f32, 6000.0, std::f32::consts::FRAC_1_SQRT_2);
+        let mut hiss_probe_trl =
+            BiquadFilter::highpass(sr as f32, 6000.0, std::f32::consts::FRAC_1_SQRT_2);
+        let mut max_hiss_tfl = 0.0f32;
+        let mut max_hiss_trl = 0.0f32;
+
+        for n in 0..9600 {
+            let t = n as f32 / sr as f32;
+            let two_pi = 2.0 * std::f32::consts::PI;
+            let mid_tone = (two_pi * 220.0 * t).sin() * 0.45;
+            let side_tone = (two_pi * 330.0 * t).sin() * 0.35;
+            let l_in = mid_tone + side_tone;
+            let r_in = mid_tone - side_tone;
+            let out = dsp.process_frame_for_hardware(l_in, r_in, &cfg, 12);
+            let h_tfl = hiss_probe_tfl.process(out[8]);
+            let h_trl = hiss_probe_trl.process(out[10]);
+            if n > 2048 {
+                max_hiss_tfl = max_hiss_tfl.max(h_tfl.abs());
+                max_hiss_trl = max_hiss_trl.max(h_trl.abs());
+            }
+        }
+        assert!(
+            max_hiss_tfl < 1e-3 && max_hiss_trl < 1e-3,
+            "Smooth center steering must not generate >6 kHz harmonic distortion hiss from 220/330 Hz tones (got TFL={:.6}, TRL={:.6})",
+            max_hiss_tfl,
+            max_hiss_trl
+        );
+
+        // 2. Verify that resampling 44,100 Hz -> 48,000 Hz across arbitrary packet boundaries
+        //    (e.g. 257-frame and 1-frame chunks) produces bit-for-bit identical output to resampling
+        //    a single contiguous buffer, with zero packet-boundary clicks or phase slips.
+        let in_rate = 44_100u32;
+        let out_rate = 48_000u32;
+        let ch = 2usize;
+        let total_in_frames = 8820usize; // 200 ms at 44.1 kHz
+        let mut full_src = Vec::with_capacity(total_in_frames * ch);
+        for n in 0..total_in_frames {
+            let t = n as f32 / in_rate as f32;
+            let two_pi = 2.0 * std::f32::consts::PI;
+            full_src.push((two_pi * 1000.0 * t).sin() * 0.8);
+            full_src.push((two_pi * 3500.0 * t).cos() * 0.8);
+        }
+
+        // Contiguous reference pass
+        let mut pos_ref = 0.0f64;
+        let mut prev_ref = Vec::new();
+        let mut out_ref = Vec::new();
+        resample_interleaved_packet(
+            &full_src,
+            ch,
+            in_rate,
+            out_rate,
+            &mut pos_ref,
+            &mut prev_ref,
+            &mut out_ref,
+        );
+
+        // Chunked packet pass with irregular packet sizes (1, 2, 17, 257, 1152 frames)
+        let mut pos_chunked = 0.0f64;
+        let mut prev_chunked = Vec::new();
+        let mut out_chunked = Vec::new();
+        let chunk_sizes = [1usize, 2, 17, 257, 1152];
+        let mut cursor = 0usize;
+        let mut step_idx = 0usize;
+        while cursor < total_in_frames {
+            let take = chunk_sizes[step_idx % chunk_sizes.len()].min(total_in_frames - cursor);
+            let slice = &full_src[cursor * ch..(cursor + take) * ch];
+            resample_interleaved_packet(
+                slice,
+                ch,
+                in_rate,
+                out_rate,
+                &mut pos_chunked,
+                &mut prev_chunked,
+                &mut out_chunked,
+            );
+            cursor += take;
+            step_idx += 1;
+        }
+
+        assert_eq!(
+            out_ref.len(),
+            out_chunked.len(),
+            "Chunked resampling must produce the exact same sample count as contiguous resampling"
+        );
+        let max_diff = out_ref
+            .iter()
+            .zip(out_chunked.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_diff < 1e-6,
+            "Chunked resampling across packet boundaries must match contiguous resampling (max_diff={})",
+            max_diff
+        );
     }
 }
