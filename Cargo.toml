@@ -92,6 +92,7 @@ ffmpeg-next = { version = "8.1.0", default-features = false, features = ["codec"
 android-activity = { version = "0.6", features = ["game-activity"] }
 winit = { version = "0.30.13", features = ["android-game-activity"] }
 jni = "0.21.1"
+ffmpeg-next = { version = "8.1.0", default-features = false, features = ["static", "codec", "format", "software-resampling", "software-scaling"] }
 
 
 
@@ -127,6 +128,7 @@ path = "src/main.rs"
 [profile.release]
 opt-level = 3
 lto = "thin"
+codegen-units = 1
 strip = false
 debug = 1
 

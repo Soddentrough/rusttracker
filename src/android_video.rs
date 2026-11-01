@@ -242,6 +242,9 @@ pub mod decoder {
 
                     if codec.is_null() || video_track_idx.is_none() {
                         crate::android::log_android(4, &format!("[RustTracker Video] No suitable hardware video decoder found for {}", path_string));
+                        if let Ok(mut state) = state_for_video.lock() {
+                            state.has_video_stream = false;
+                        }
                         AMediaExtractor_delete(extractor);
                         let _ = std::fs::File::from_raw_fd(raw_fd);
                         return;
@@ -256,6 +259,7 @@ pub mod decoder {
 
                     let mut local_epoch = 0;
                     let mut eos_input = false;
+                    let mut is_first_frame_after_seek = true;
                     let mut out_stride = vid_w as usize;
                     let mut out_slice_h = vid_h as usize;
 
@@ -269,6 +273,7 @@ pub mod decoder {
                                 AMediaCodec_flush(codec);
                                 local_epoch = state.seek_epoch;
                                 eos_input = false;
+                                is_first_frame_after_seek = true;
                             }
                         }
 
@@ -300,16 +305,53 @@ pub mod decoder {
                         if out_idx >= 0 {
                             let pts_sec = (info.presentation_time_us.max(0) as f64) / 1_000_000.0;
 
-                            // Audio-video sync: check current audio timestamp
-                            let current_audio_pts = state_for_video.lock().map(|s| s.current_seconds).unwrap_or(pts_sec);
-                            if pts_sec > current_audio_pts + 0.08 {
-                                let wait_ms = ((pts_sec - current_audio_pts) * 1000.0).min(50.0) as u64;
-                                if wait_ms > 0 {
-                                    std::thread::sleep(std::time::Duration::from_millis(wait_ms));
+                            let mut skip_push = false;
+                            if is_first_frame_after_seek {
+                                let (cached_seconds, current_epoch) = state_for_video
+                                    .lock()
+                                    .map(|s| (s.current_seconds, s.seek_epoch))
+                                    .unwrap_or((pts_sec, local_epoch));
+                                if current_epoch > local_epoch {
+                                    skip_push = true;
+                                } else if pts_sec < cached_seconds - 0.15 {
+                                    skip_push = true;
+                                } else {
+                                    is_first_frame_after_seek = false;
+                                }
+                            } else {
+                                loop {
+                                    if stop_token_for_video.load(Ordering::Relaxed) {
+                                        AMediaCodec_releaseOutputBuffer(codec, out_idx as usize, false);
+                                        AMediaCodec_stop(codec);
+                                        AMediaCodec_delete(codec);
+                                        AMediaExtractor_delete(extractor);
+                                        let _ = std::fs::File::from_raw_fd(raw_fd);
+                                        return;
+                                    }
+                                    let (current_audio_pts, current_epoch, is_paused, track_ended) = state_for_video
+                                        .lock()
+                                        .map(|s| (s.current_seconds, s.seek_epoch, s.is_paused, s.track_ended))
+                                        .unwrap_or((pts_sec, local_epoch, false, false));
+                                    if track_ended || current_epoch > local_epoch {
+                                        skip_push = true;
+                                        break;
+                                    }
+                                    if pts_sec < current_audio_pts - 0.15 {
+                                        skip_push = true;
+                                        break;
+                                    }
+                                    if !is_paused && pts_sec <= current_audio_pts + 0.05 {
+                                        break;
+                                    }
+                                    if pts_sec > current_audio_pts + 30.0 {
+                                        skip_push = true;
+                                        break;
+                                    }
+                                    std::thread::sleep(std::time::Duration::from_millis(if is_paused { 25 } else { 4 }));
                                 }
                             }
 
-                            if info.size > 0 {
+                            if info.size > 0 && !skip_push {
                                 let mut out_size: usize = 0;
                                 let out_buf = AMediaCodec_getOutputBuffer(codec, out_idx as usize, &mut out_size);
                                 let offset = info.offset.max(0) as usize;

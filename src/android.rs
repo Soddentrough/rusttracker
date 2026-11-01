@@ -126,11 +126,92 @@ pub extern "C" fn Java_com_rusttracker_app_MainActivity_nativeOnFileLoadingStart
             state.song_title = format!("Loading {}...", name_str);
             state.osd_text = Some(format!("Loading {}...", name_str));
             state.osd_timer = 15.0;
+            let prev_total = state.file_transfer.as_ref().and_then(|ft| ft.total_bytes);
+            let prev_elapsed = state
+                .file_transfer
+                .as_ref()
+                .map(|ft| ft.elapsed_secs)
+                .unwrap_or(0.0);
+            state.file_transfer = Some(crate::state::FileTransferState {
+                file_name: name_str.clone(),
+                status_text: format!("Loading {}...", name_str),
+                bytes_copied: 0,
+                total_bytes: prev_total,
+                elapsed_secs: prev_elapsed,
+            });
         }
         let (tx, _) = get_file_channel();
         let _ = tx.send(FilePickerEvent::LoadingStarted(name_str));
         wake_event_loop();
     }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn Java_com_rusttracker_app_MainActivity_nativeOnFileTransferProgress<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    display_name: JString<'local>,
+    status_text: JString<'local>,
+    bytes_copied: jni::sys::jlong,
+    total_bytes: jni::sys::jlong,
+    elapsed_ms: jni::sys::jlong,
+) {
+    let name_str: String = env
+        .get_string(&display_name)
+        .map(Into::into)
+        .unwrap_or_else(|_| "Media File".to_string());
+    let status_str: String = env
+        .get_string(&status_text)
+        .map(Into::into)
+        .unwrap_or_else(|_| format!("Loading {}...", name_str));
+    let copied = bytes_copied.max(0) as u64;
+    let total = if total_bytes > 0 {
+        Some(total_bytes as u64)
+    } else {
+        None
+    };
+    let elapsed_secs = (elapsed_ms.max(0) as f32) / 1000.0;
+
+    if let Some(app_state) = GLOBAL_APP_STATE.get()
+        && let Ok(mut state) = app_state.lock()
+    {
+        state.file_transfer = Some(crate::state::FileTransferState {
+            file_name: name_str.clone(),
+            status_text: status_str.clone(),
+            bytes_copied: copied,
+            total_bytes: total,
+            elapsed_secs,
+        });
+        let osd_summary = if let Some(tot) = total
+            && tot > 0
+            && copied > 0
+        {
+            let pct = ((copied as f64 / tot as f64) * 100.0).clamp(0.0, 100.0);
+            format!(
+                "{} {:.0}% ({:.1} / {:.1} MB)",
+                status_str,
+                pct,
+                copied as f64 / (1024.0 * 1024.0),
+                tot as f64 / (1024.0 * 1024.0)
+            )
+        } else if let Some(tot) = total
+            && tot >= 1024 * 1024
+        {
+            format!(
+                "{} ({:.1} MB, {:.1}s)",
+                status_str,
+                tot as f64 / (1024.0 * 1024.0),
+                elapsed_secs
+            )
+        } else if elapsed_secs >= 0.5 {
+            format!("{} ({:.1}s)", status_str, elapsed_secs)
+        } else {
+            status_str
+        };
+        state.osd_text = Some(osd_summary);
+        state.osd_timer = 10.0;
+    }
+    wake_event_loop();
 }
 
 #[unsafe(no_mangle)]
@@ -160,6 +241,11 @@ pub extern "C" fn Java_com_rusttracker_app_MainActivity_nativeOnFileStatus<'loca
         if let Some(app_state) = GLOBAL_APP_STATE.get()
             && let Ok(mut state) = app_state.lock()
         {
+            if msg_str.starts_with("Failed") || msg_str.contains("empty") {
+                state.file_transfer = None;
+            } else if let Some(ref mut ft) = state.file_transfer {
+                ft.status_text = msg_str.clone();
+            }
             state.osd_text = Some(msg_str);
             state.osd_timer = 8.0;
         }
@@ -351,6 +437,8 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                     );
                 }
             }
+        } else if let Some(ref win) = self.window {
+            win.request_redraw();
         }
     }
 
@@ -1105,7 +1193,16 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
             if let Some(ref win) = self.window {
                 win.request_redraw();
             }
-            event_loop.set_control_flow(ControlFlow::Wait);
+            let transfer_active = self
+                .app_state
+                .lock()
+                .map(|s| s.file_transfer.is_some())
+                .unwrap_or(false);
+            if transfer_active {
+                event_loop.set_control_flow(ControlFlow::Poll);
+            } else {
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
         } else {
             event_loop.set_control_flow(ControlFlow::Wait);
         }
@@ -1430,6 +1527,7 @@ impl AndroidRustTrackerApp {
                     path
                 );
                 let mut state = self.app_state.lock().unwrap();
+                state.file_transfer = None;
                 state.file_loaded = true;
                 state.is_paused = false;
                 state.track_ended = false;
@@ -1482,6 +1580,7 @@ impl AndroidRustTrackerApp {
                 log_android(6, &format!("Failed to start audio thread: {:?}", e));
                 eprintln!("[RustTracker] Failed to start audio thread: {:?}", e);
                 let mut state = self.app_state.lock().unwrap();
+                state.file_transfer = None;
                 state.osd_text = Some("Load Failed".to_string());
                 state.osd_timer = 3.0;
             }

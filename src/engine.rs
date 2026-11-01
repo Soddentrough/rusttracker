@@ -7170,14 +7170,21 @@ impl VulkanEngine {
         if state.visualizer_mode == 19 {
             let actual_ch = state.channel_vus.len().max(2);
             uniforms.num_channels = actual_ch as u32;
-            for i in 0..actual_ch {
-                if i < 32 {
-                    uniforms.channels[i] = if i < self.vu_needle_angles.len() {
-                        self.vu_needle_angles[i]
+            for (disp_idx, &src_idx) in display_order.iter().enumerate() {
+                if disp_idx < 32 {
+                    uniforms.channels[disp_idx] = if src_idx < self.vu_needle_angles.len() {
+                        self.vu_needle_angles[src_idx]
                     } else {
                         0.0
                     };
                 }
+            }
+            for i in 0..actual_ch.min(16) {
+                uniforms.spatial_channels[i] = if i < self.vu_needle_angles.len() {
+                    self.vu_needle_angles[i]
+                } else {
+                    0.0
+                };
             }
         }
 
@@ -8642,6 +8649,184 @@ impl VulkanEngine {
                 engine_action = EngineAction::LoadFiles(vec![path.display().to_string()], append);
             }
 
+            if state.file_transfer.is_some() {
+                ctx.request_repaint();
+            }
+
+            let render_file_transfer_panel =
+                |ui: &mut egui::Ui,
+                 transfer: &crate::state::FileTransferState,
+                 anim_time: f32,
+                 max_width: f32| {
+                    let panel_w = (max_width - 8.0).clamp(220.0, 560.0);
+                    egui::Frame::NONE
+                        .fill(egui::Color32::from_rgba_unmultiplied(12, 22, 42, 240))
+                        .stroke(egui::Stroke::new(
+                            1.5_f32,
+                            egui::Color32::from_rgb(0, 215, 255),
+                        ))
+                        .corner_radius(10.0)
+                        .inner_margin(egui::Margin::symmetric(14, 12))
+                        .show(ui, |ui| {
+                            ui.set_width(panel_w);
+                            ui.vertical_centered(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::Spinner::new()
+                                            .size(16.0)
+                                            .color(egui::Color32::from_rgb(0, 225, 255)),
+                                    );
+                                    ui.add_space(6.0);
+                                    ui.label(
+                                        egui::RichText::new(&transfer.status_text)
+                                            .size(14.5)
+                                            .color(egui::Color32::from_rgb(0, 225, 255))
+                                            .strong(),
+                                    );
+                                });
+
+                                ui.add_space(4.0);
+                                let short_name = if transfer.file_name.chars().count() > 44 {
+                                    let prefix: String =
+                                        transfer.file_name.chars().take(41).collect();
+                                    format!("{}…", prefix)
+                                } else {
+                                    transfer.file_name.clone()
+                                };
+                                ui.label(
+                                    egui::RichText::new(short_name)
+                                        .size(13.5)
+                                        .color(egui::Color32::WHITE)
+                                        .strong(),
+                                );
+
+                                ui.add_space(8.0);
+                                let bar_w = (panel_w - 16.0).max(160.0);
+                                let bar_h = 16.0;
+                                let (bar_rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(bar_w, bar_h),
+                                    egui::Sense::hover(),
+                                );
+                                let painter = ui.painter();
+                                painter.rect(
+                                    bar_rect,
+                                    8.0,
+                                    egui::Color32::from_rgba_unmultiplied(6, 10, 22, 235),
+                                    egui::Stroke::new(
+                                        1.0_f32,
+                                        egui::Color32::from_rgba_unmultiplied(0, 185, 255, 110),
+                                    ),
+                                    egui::StrokeKind::Inside,
+                                );
+
+                                if let Some(pct) = transfer.progress_fraction() {
+                                    let fill_w = (bar_rect.width() * pct.clamp(0.03, 1.0))
+                                        .clamp(8.0, bar_rect.width());
+                                    let fill_rect = egui::Rect::from_min_size(
+                                        bar_rect.min,
+                                        egui::vec2(fill_w, bar_rect.height()),
+                                    );
+                                    painter.rect_filled(
+                                        fill_rect,
+                                        8.0,
+                                        egui::Color32::from_rgb(0, 195, 255),
+                                    );
+                                    // Moving specular shimmer across determinate fill bar
+                                    let shimmer_phase = (anim_time * 1.4).rem_euclid(1.0);
+                                    let shimmer_w = (fill_w * 0.28).clamp(12.0, 64.0);
+                                    let shimmer_x = fill_rect.left()
+                                        + (fill_w - shimmer_w).max(0.0) * shimmer_phase;
+                                    let shimmer_rect = egui::Rect::from_min_size(
+                                        egui::pos2(shimmer_x, fill_rect.top()),
+                                        egui::vec2(
+                                            shimmer_w.min(fill_rect.right() - shimmer_x),
+                                            fill_rect.height(),
+                                        ),
+                                    );
+                                    painter.rect_filled(
+                                        shimmer_rect,
+                                        8.0,
+                                        egui::Color32::from_rgba_unmultiplied(180, 245, 255, 110),
+                                    );
+                                    painter.text(
+                                        bar_rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        format!("{:.0}%", pct * 100.0),
+                                        egui::FontId::proportional(11.5),
+                                        egui::Color32::WHITE,
+                                    );
+                                } else {
+                                    // Smooth bidirectional scanning neon bar during cloud download / openInputStream
+                                    let pulse_w = (bar_rect.width() * 0.34).clamp(40.0, 160.0);
+                                    let travel = (bar_rect.width() - pulse_w).max(0.0);
+                                    let t_osc = 0.5 - 0.5 * (anim_time * 2.8).cos();
+                                    let x0 = bar_rect.left() + travel * t_osc;
+                                    let scan_rect = egui::Rect::from_min_size(
+                                        egui::pos2(x0, bar_rect.top() + 1.0),
+                                        egui::vec2(pulse_w, bar_rect.height() - 2.0),
+                                    );
+                                    painter.rect_filled(
+                                        scan_rect,
+                                        7.0,
+                                        egui::Color32::from_rgb(0, 205, 255),
+                                    );
+                                    let core_rect = scan_rect.shrink2(egui::vec2(pulse_w * 0.22, 1.5));
+                                    painter.rect_filled(
+                                        core_rect,
+                                        6.0,
+                                        egui::Color32::from_rgb(165, 245, 255),
+                                    );
+                                }
+
+                                ui.add_space(6.0);
+                                let detail_line = if transfer.bytes_copied > 0 {
+                                    let copied_mb =
+                                        transfer.bytes_copied as f64 / (1024.0 * 1024.0);
+                                    let rate_str = if transfer.elapsed_secs > 0.15 {
+                                        let mb_per_s = copied_mb / (transfer.elapsed_secs as f64);
+                                        format!("  •  {:.1} MB/s", mb_per_s)
+                                    } else {
+                                        String::new()
+                                    };
+                                    if let Some(tot) = transfer.total_bytes
+                                        && tot > 0
+                                    {
+                                        let total_mb = tot as f64 / (1024.0 * 1024.0);
+                                        format!(
+                                            "{:.1} / {:.1} MB{}  •  {:.1}s",
+                                            copied_mb, total_mb, rate_str, transfer.elapsed_secs
+                                        )
+                                    } else {
+                                        format!(
+                                            "{:.1} MB cached{}  •  {:.1}s",
+                                            copied_mb, rate_str, transfer.elapsed_secs
+                                        )
+                                    }
+                                } else if let Some(tot) = transfer.total_bytes
+                                    && tot > 0
+                                {
+                                    let total_mb = tot as f64 / (1024.0 * 1024.0);
+                                    format!(
+                                        "Size: {:.1} MB  •  Elapsed: {:.1}s",
+                                        total_mb, transfer.elapsed_secs
+                                    )
+                                } else if transfer.elapsed_secs >= 0.1 {
+                                    format!(
+                                        "Elapsed: {:.1}s  •  Waiting for cloud stream…",
+                                        transfer.elapsed_secs
+                                    )
+                                } else {
+                                    "Requesting file stream…".to_string()
+                                };
+                                ui.label(
+                                    egui::RichText::new(detail_line)
+                                        .size(12.0)
+                                        .color(egui::Color32::from_rgb(195, 215, 235)),
+                                );
+                            });
+                        });
+                };
+
             if !state.file_loaded {
                 central_rect = ctx.content_rect();
                 let time = self.smooth_time as f32;
@@ -8964,7 +9149,9 @@ impl VulkanEngine {
                                 // leaving the sliced synthwave sun and mountain peaks unobstructed in the sky above.
                                 let is_narrow = real_avail_width < 600.0;
                                 let after_subtitle_y = ui.cursor().min.y;
-                                let est_card_h = if is_narrow { 255.0 } else { 222.0 };
+                                let transfer_extra_h =
+                                    if state.file_transfer.is_some() { 112.0 } else { 0.0 };
+                                let est_card_h = (if is_narrow { 255.0 } else { 222.0 }) + transfer_extra_h;
                                 let max_card_top_y = (rect.bottom() - bottom_reserved_h - est_card_h - 18.0)
                                     .max(after_subtitle_y + 10.0);
                                 let target_card_top_y =
@@ -8994,6 +9181,15 @@ impl VulkanEngine {
                                     .show(ui, |ui| {
                                         ui.set_max_width(card_max_w);
                                         ui.vertical_centered(|ui| {
+                                            if let Some(ref transfer) = state.file_transfer {
+                                                render_file_transfer_panel(
+                                                    ui,
+                                                    transfer,
+                                                    time,
+                                                    card_max_w - 24.0,
+                                                );
+                                                ui.add_space(12.0);
+                                            }
                                             let is_file_hovered =
                                                 !ui.input(|i| i.raw.hovered_files.is_empty())
                                                     || state.hovered_file.is_some();
@@ -9318,7 +9514,69 @@ impl VulkanEngine {
                         });
                     });
 
+                // Render OSD notifications on the splash screen when not superseded by the transfer panel
+                if state.file_transfer.is_none()
+                    && let Some(osd) = &state.osd_text
+                    && state.osd_timer > 0.0
+                {
+                    let painter = ctx.layer_painter(egui::LayerId::new(
+                        egui::Order::Foreground,
+                        egui::Id::new("splash_osd_notification"),
+                    ));
+                    let alpha = (state.osd_timer.min(0.5) * 2.0 * 255.0) as u8;
+                    let screen = ctx.viewport_rect();
+                    let is_portrait = screen.width() < screen.height();
+                    let max_width = if is_portrait {
+                        (screen.width() - 40.0).max(100.0)
+                    } else {
+                        (screen.width() * 0.85).max(200.0)
+                    };
+                    let font_size = if is_portrait { 18.0 } else { 22.0 };
+                    let text_color = egui::Color32::from_rgba_premultiplied(255, 255, 255, alpha);
+                    let galley = painter.layout(
+                        osd.clone(),
+                        egui::FontId::proportional(font_size),
+                        text_color,
+                        max_width,
+                    );
+                    let top_y = if is_portrait {
+                        screen.top() + 52.0
+                    } else {
+                        screen.top() + 32.0
+                    };
+                    let galley_pos = egui::pos2(
+                        screen.center().x - galley.rect.width() * 0.5,
+                        top_y,
+                    );
+                    let bg_rect = galley
+                        .rect
+                        .translate(galley_pos.to_vec2())
+                        .expand2(egui::vec2(14.0, 8.0));
+                    painter.rect_filled(
+                        bg_rect,
+                        8.0,
+                        egui::Color32::from_rgba_unmultiplied(10, 10, 20, (alpha as f32 * 0.8) as u8),
+                    );
+                    painter.galley(galley_pos, galley, text_color);
+                }
+
                 return;
+            }
+
+            if let Some(ref transfer) = state.file_transfer {
+                let anim_time = self.smooth_time as f32;
+                let viewport_w = ctx.viewport_rect().width();
+                egui::Area::new(egui::Id::new("active_file_transfer_overlay"))
+                    .order(egui::Order::Foreground)
+                    .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                    .show(ctx, |ui| {
+                        render_file_transfer_panel(
+                            ui,
+                            transfer,
+                            anim_time,
+                            (viewport_w - 32.0).clamp(240.0, 480.0),
+                        );
+                    });
             }
 
             let is_portrait = ctx.viewport_rect().width() < ctx.viewport_rect().height();
@@ -12461,8 +12719,8 @@ mod tests {
     fn test_uniform_size_alignment() {
         let rust_size = std::mem::size_of::<AudioUniforms>();
         assert_eq!(
-            rust_size, 8832,
-            "Rust AudioUniforms size is not 8832 bytes (actual: {})",
+            rust_size, 9856,
+            "Rust AudioUniforms size is not 9856 bytes (actual: {})",
             rust_size
         );
 
@@ -12518,8 +12776,8 @@ mod tests {
         // Align struct size to maximum alignment (16)
         let wgsl_size = offset.div_ceil(16) * 16;
         assert_eq!(
-            wgsl_size, 8832,
-            "WGSL AudioUniforms size is not 8832 bytes (actual: {})",
+            wgsl_size, 9856,
+            "WGSL AudioUniforms size is not 9856 bytes (actual: {})",
             wgsl_size
         );
         assert_eq!(
@@ -14217,5 +14475,40 @@ mod tests {
         );
         assert!(unpack_seg(&packed, 0, 18) < 1e-4);
         assert!(unpack_seg(&packed, 0, 19) < 1e-4);
+    }
+
+    #[test]
+    fn test_file_transfer_state_progress_and_snapshot() {
+        let mut state = AppState::new("Test".to_string());
+        assert!(state.file_transfer.is_none());
+
+        // Indeterminate phase (cloud download inside openInputStream before bytes stream)
+        state.file_transfer = Some(crate::state::FileTransferState {
+            file_name: "Atmos_Demo.mkv".to_string(),
+            status_text: "Downloading from Google Drive...".to_string(),
+            bytes_copied: 0,
+            total_bytes: Some(50 * 1024 * 1024),
+            elapsed_secs: 1.5,
+        });
+        let snap1 = state.render_snapshot();
+        let ft1 = snap1
+            .file_transfer
+            .as_ref()
+            .expect("render_snapshot must preserve active file_transfer");
+        assert_eq!(ft1.file_name, "Atmos_Demo.mkv");
+        assert_eq!(ft1.progress_fraction(), None);
+
+        // Determinate caching phase (25 MB of 50 MB copied)
+        if let Some(ref mut ft) = state.file_transfer {
+            ft.status_text = "Caching from Google Drive...".to_string();
+            ft.bytes_copied = 25 * 1024 * 1024;
+            ft.elapsed_secs = 3.0;
+        }
+        let snap2 = state.render_snapshot();
+        let ft2 = snap2.file_transfer.as_ref().unwrap();
+        let pct = ft2
+            .progress_fraction()
+            .expect("Expected determinate progress");
+        assert!((pct - 0.5).abs() < 1e-5);
     }
 }

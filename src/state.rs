@@ -570,6 +570,32 @@ pub struct AudioTrackInfo {
     pub is_atmos: bool,
 }
 
+/// Active cloud/storage file transfer and caching progress state.
+#[derive(Clone, Debug, PartialEq)]
+pub struct FileTransferState {
+    pub file_name: String,
+    pub status_text: String,
+    pub bytes_copied: u64,
+    pub total_bytes: Option<u64>,
+    pub elapsed_secs: f32,
+}
+
+impl FileTransferState {
+    /// Returns the determinate progress fraction in `0.0..=1.0` when `total_bytes > 0`
+    /// and bytes have started streaming, or `None` during indeterminate cloud fetch / open phases.
+    #[inline]
+    pub fn progress_fraction(&self) -> Option<f32> {
+        if let Some(total) = self.total_bytes
+            && total > 0
+            && self.bytes_copied > 0
+        {
+            Some((self.bytes_copied as f32 / total as f32).clamp(0.0, 1.0))
+        } else {
+            None
+        }
+    }
+}
+
 /// Configuration for Automatic Surround & Height Upmixing and the 5-Band Crossover EQ.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct SurroundUpmixConfig {
@@ -645,36 +671,57 @@ impl SurroundUpmixConfig {
 
     /// Evaluate the composite 5-band EQ gain in dB at a given frequency `freq_hz`.
     pub fn evaluate_eq_db(&self, freq_hz: f32) -> f32 {
+        let sr = 48_000.0f32;
         let f = freq_hz.clamp(20.0, 20000.0);
-        let log_f = f.log2();
+        let w = 2.0 * std::f32::consts::PI * f / sr;
+        let cos_w = w.cos();
+        let sin_w = w.sin();
+        let cos_2w = 2.0 * cos_w * cos_w - 1.0;
+        let sin_2w = 2.0 * sin_w * cos_w;
         let mut total_db = 0.0f32;
+
+        let eval_peaking_db = |f0: f32, q: f32, gain_db: f32| -> f32 {
+            let a = 10.0f32.powf(gain_db / 40.0);
+            let w0 = 2.0 * std::f32::consts::PI * f0 / sr;
+            let cos_w0 = w0.cos();
+            let alpha = w0.sin() / (2.0 * q.max(0.1));
+            let b0 = 1.0 + alpha * a;
+            let b1 = -2.0 * cos_w0;
+            let b2 = 1.0 - alpha * a;
+            let a0 = 1.0 + alpha / a;
+            let a1 = -2.0 * cos_w0;
+            let a2 = 1.0 - alpha / a;
+            let num_re = b0 + b1 * cos_w + b2 * cos_2w;
+            let num_im = b1 * sin_w + b2 * sin_2w;
+            let den_re = a0 + a1 * cos_w + a2 * cos_2w;
+            let den_im = a1 * sin_w + a2 * sin_2w;
+            let mag_sq = ((num_re * num_re + num_im * num_im)
+                / (den_re * den_re + den_im * den_im).max(1e-12))
+            .max(1e-12);
+            10.0 * mag_sq.log10()
+        };
 
         for (i, &center_f) in Self::EQ_BAND_FREQS.iter().enumerate() {
             let gain_db = self.band_gains_db[i].clamp(-12.0, 12.0);
             if gain_db.abs() < 1e-4 {
                 continue;
             }
-            let log_c = center_f.log2();
-            let oct_dist = log_f - log_c;
-            let weight = if i == 0 {
-                // Low-shelf with gentle bell transition above 60 Hz
-                if oct_dist <= 0.0 {
-                    1.0
+            let band_db = if i == 0 {
+                if f <= center_f {
+                    gain_db
                 } else {
-                    (-oct_dist * oct_dist * 1.15).exp()
+                    eval_peaking_db(center_f, std::f32::consts::FRAC_1_SQRT_2, gain_db)
                 }
             } else if i == 4 {
-                // High-shelf with gentle bell transition below 10 kHz
-                if oct_dist >= 0.0 {
-                    1.0
+                if f >= center_f {
+                    gain_db
                 } else {
-                    (-oct_dist * oct_dist * 1.15).exp()
+                    eval_peaking_db(center_f, std::f32::consts::FRAC_1_SQRT_2, gain_db)
                 }
             } else {
-                // Parametric peaking bell (~1.1 octave bandwidth)
-                (-oct_dist * oct_dist * 1.35).exp()
+                eval_peaking_db(center_f, 1.0, gain_db)
             };
-            total_db += gain_db * weight;
+            total_db += band_db;
         }
         total_db.clamp(-15.0, 15.0)
     }
@@ -785,6 +832,7 @@ impl SurroundUpmixConfig {
         let f_sub = self.sub_crossover_hz.clamp(40.0, 250.0);
         let sub_ratio_sq = (f / f_sub).powi(2);
         let lfe_lp = 1.0 / (1.0 + sub_ratio_sq);
+        let sub_hp = sub_ratio_sq / (1.0 + sub_ratio_sq);
         let lfe_mag = eq_gain * lfe_lp * self.lfe_level;
 
         if has_height {
@@ -794,13 +842,14 @@ impl SurroundUpmixConfig {
             let height_hp = height_ratio_sq / (1.0 + height_ratio_sq);
 
             let bed_mag = eq_gain
+                * sub_hp
                 * (height_lp + self.surround_high_bleed.clamp(0.0, 1.0) * height_hp)
                 * self.side_rear_level;
             let height_mag = eq_gain * height_hp * self.height_level;
             (eq_gain, lfe_mag, bed_mag, height_mag)
         } else {
-            // Bed-Only surround (4.0 / 5.1 / 7.1): full-bandwidth surround bed routing without height split
-            let bed_mag = eq_gain * self.side_rear_level;
+            // Bed-Only surround (4.0 / 5.1 / 7.1): high-passed above sub_crossover_hz without height split
+            let bed_mag = eq_gain * sub_hp * self.side_rear_level;
             (eq_gain, lfe_mag, bed_mag, 0.0)
         }
     }
@@ -926,6 +975,7 @@ pub struct AppState {
     pub surround_upmix: SurroundUpmixConfig,
     pub show_surround_eq: bool,
     pub is_native_atmos: bool,
+    pub file_transfer: Option<FileTransferState>,
 }
 
 pub fn get_history_file_path() -> std::path::PathBuf {
@@ -1117,6 +1167,7 @@ impl AppState {
             surround_upmix: SurroundUpmixConfig::default(),
             show_surround_eq: false,
             is_native_atmos: false,
+            file_transfer: None,
         }
     }
 
@@ -1268,6 +1319,7 @@ impl AppState {
             surround_upmix: self.surround_upmix,
             show_surround_eq: self.show_surround_eq,
             is_native_atmos: self.is_native_atmos,
+            file_transfer: self.file_transfer.clone(),
         }
     }
 

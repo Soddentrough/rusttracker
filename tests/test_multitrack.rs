@@ -384,9 +384,10 @@ fn test_itu_bs775_downmix_all_channel_layouts() {
     let r4 = audio::get_downmixed_sample(4, &ch4, 2, 1);
     let m4 = audio::get_downmixed_sample(4, &ch4, 1, 0);
     assert!(l4 > r4, "Expected left-heavy quad downmix to have L > R");
+    let expected_m4 = 0.35 * (0.5 + 0.1 + std::f32::consts::FRAC_1_SQRT_2 * (0.4 + 0.1));
     assert!(
-        (m4 - 0.275).abs() < 1e-4,
-        "Expected exact quad mono average"
+        (m4 - expected_m4).abs() < 1e-4,
+        "Expected exact ITU-R BS.775-3 quad mono folddown"
     );
 
     // 3. 5.0 (FL, FR, FC, BL, BR) -> Stereo & Mono

@@ -2043,7 +2043,11 @@ async fn run_gui(
                                         }
                                         WinitKeyCode::AudioVolumeUp => {
                                             let mut state = app_state.lock().unwrap();
-                                            let num_tracks = state.audio_tracks.len().max(1);
+                                            let sel = state.selected_audio_track;
+                                            if state.active_audio_tracks.is_empty() {
+                                                state.active_audio_tracks.push(sel);
+                                            }
+                                            let num_tracks = state.audio_tracks.len().max(sel + 1);
                                             if state.audio_track_volumes.len() != num_tracks {
                                                 state.audio_track_volumes = vec![1.0; num_tracks];
                                             }
@@ -2078,7 +2082,11 @@ async fn run_gui(
                                         }
                                         WinitKeyCode::AudioVolumeDown => {
                                             let mut state = app_state.lock().unwrap();
-                                            let num_tracks = state.audio_tracks.len().max(1);
+                                            let sel = state.selected_audio_track;
+                                            if state.active_audio_tracks.is_empty() {
+                                                state.active_audio_tracks.push(sel);
+                                            }
+                                            let num_tracks = state.audio_tracks.len().max(sel + 1);
                                             if state.audio_track_volumes.len() != num_tracks {
                                                 state.audio_track_volumes = vec![1.0; num_tracks];
                                             }
@@ -2113,7 +2121,11 @@ async fn run_gui(
                                         }
                                         WinitKeyCode::AudioVolumeMute => {
                                             let mut state = app_state.lock().unwrap();
-                                            let num_tracks = state.audio_tracks.len().max(1);
+                                            let sel = state.selected_audio_track;
+                                            if state.active_audio_tracks.is_empty() {
+                                                state.active_audio_tracks.push(sel);
+                                            }
+                                            let num_tracks = state.audio_tracks.len().max(sel + 1);
                                             if state.audio_track_volumes.len() != num_tracks {
                                                 state.audio_track_volumes = vec![1.0; num_tracks];
                                             }
@@ -2972,6 +2984,9 @@ async fn run_gui(
                                                 state.waveform_history_push_count.wrapping_add(1);
                                         }
                                     }
+                                    let dt_sec = avg_dt.clamp(0.002, 0.05);
+                                    let vu_decay = 10.0_f32.powf(-20.0 * dt_sec / 20.0);
+                                    let peak_decay = 10.0_f32.powf(-8.6 * dt_sec / 20.0);
                                     if state.channel_vus.len() != state.raw_channel_vus.len() {
                                         state.channel_vus = vec![0.0; state.raw_channel_vus.len()];
                                     }
@@ -2979,9 +2994,10 @@ async fn run_gui(
                                         if state.raw_channel_vus[i] > state.channel_vus[i] {
                                             state.channel_vus[i] = state.raw_channel_vus[i];
                                         } else {
-                                            state.channel_vus[i] = (state.channel_vus[i]
-                                                - (0.015 * time_scale))
-                                                .max(state.raw_channel_vus[i]);
+                                            let decayed = state.channel_vus[i] * vu_decay;
+                                            state.channel_vus[i] =
+                                                if decayed < 1e-4 { 0.0 } else { decayed }
+                                                    .max(state.raw_channel_vus[i]);
                                         }
                                     }
 
@@ -2989,8 +3005,12 @@ async fn run_gui(
                                         state.peak_vus = vec![0.0; state.channel_vus.len()];
                                     }
                                     for i in 0..state.channel_vus.len() {
-                                        state.peak_vus[i] =
-                                            (state.peak_vus[i] - (0.005 * time_scale)).max(0.0);
+                                        let decayed_peak = state.peak_vus[i] * peak_decay;
+                                        state.peak_vus[i] = if decayed_peak < 1e-4 {
+                                            0.0
+                                        } else {
+                                            decayed_peak
+                                        };
                                         if state.channel_vus[i] > state.peak_vus[i] {
                                             state.peak_vus[i] = state.channel_vus[i];
                                         }

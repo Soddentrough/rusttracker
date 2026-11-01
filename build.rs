@@ -90,11 +90,25 @@ fn main() {
             "cargo:rustc-link-search=native={}/local_lib/android/{}",
             manifest_dir, abi_dir
         );
+        println!(
+            "cargo:rustc-link-search=native={}/local_lib/android/{}/ffmpeg/lib",
+            manifest_dir, abi_dir
+        );
         println!("cargo:rustc-link-lib=static=openmpt");
         println!("cargo:rustc-link-lib=z");
+        println!("cargo:rustc-link-lib=android");
         println!("cargo:rustc-link-lib=mediandk");
+        println!("cargo:rustc-link-arg=-Wl,--start-group");
+        println!("cargo:rustc-link-arg=-lavformat");
+        println!("cargo:rustc-link-arg=-lavcodec");
+        println!("cargo:rustc-link-arg=-lswresample");
+        println!("cargo:rustc-link-arg=-lswscale");
+        println!("cargo:rustc-link-arg=-lavutil");
+        println!("cargo:rustc-link-arg=-Wl,--end-group");
         println!("cargo:rustc-link-arg=-lopenmpt");
         println!("cargo:rustc-link-arg=-lz");
+        println!("cargo:rustc-link-arg=-landroid");
+        println!("cargo:rustc-link-arg=-lmediandk");
         println!("cargo:rustc-link-arg=-lc++_static");
         println!("cargo:rustc-link-arg=-lc++abi");
     }

@@ -128,13 +128,32 @@ echo "  SDK:     $ANDROID_HOME"
 echo "  NDK:     ${ANDROID_NDK_HOME:-Not found yet}"
 echo "==================================================="
 
+export FFMPEG_DIR="$PROJECT_ROOT/local_lib/android/$TARGET_ABI/ffmpeg"
+export CC_x86_64_unknown_linux_gnu="${CC_x86_64_unknown_linux_gnu:-gcc}"
+export CXX_x86_64_unknown_linux_gnu="${CXX_x86_64_unknown_linux_gnu:-g++}"
+export CFLAGS_x86_64_unknown_linux_gnu=""
+export CXXFLAGS_x86_64_unknown_linux_gnu=""
+CARGO_BINDGEN_CONFIG=()
+if [[ -n "${ANDROID_NDK_HOME:-}" ]]; then
+    NDK_SYSROOT="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/sysroot"
+    if [[ -d "$NDK_SYSROOT" ]]; then
+        BINDGEN_ARGS="--target=${RUST_TARGET}29 --sysroot=$NDK_SYSROOT -D__ANDROID_MIN_SDK_VERSION__=29 -D__ANDROID_API__=29 -I$FFMPEG_DIR/include"
+        export BINDGEN_EXTRA_CLANG_ARGS="$BINDGEN_ARGS"
+        export "BINDGEN_EXTRA_CLANG_ARGS_${RUST_TARGET//-/_}=$BINDGEN_ARGS"
+        CARGO_BINDGEN_CONFIG=(
+            --config "env.BINDGEN_EXTRA_CLANG_ARGS_${RUST_TARGET//-/_}.value=\"$BINDGEN_ARGS\""
+            --config "env.BINDGEN_EXTRA_CLANG_ARGS_${RUST_TARGET//-/_}.force=true"
+        )
+    fi
+fi
+
 # 1. Build Rust cdylib with cargo-ndk
 if command -v cargo-ndk &> /dev/null; then
     echo "Building with cargo-ndk..."
-    cargo ndk --target "$RUST_TARGET" --platform 29 build $CARGO_FLAGS --lib
+    cargo ndk --target "$RUST_TARGET" --platform 29 build "${CARGO_BINDGEN_CONFIG[@]}" $CARGO_FLAGS --lib
 else
     echo "Building with standard cargo..."
-    cargo build --target "$RUST_TARGET" $CARGO_FLAGS --lib
+    cargo build --target "$RUST_TARGET" "${CARGO_BINDGEN_CONFIG[@]}" $CARGO_FLAGS --lib
 fi
 
 # 2. Deploy jniLibs
@@ -144,6 +163,12 @@ mkdir -p "$JNILIBS_DIR"
 SO_SOURCE="target/$RUST_TARGET/$BUILD_MODE/librusttracker.so"
 if [[ -f "$SO_SOURCE" ]]; then
     cp -v "$SO_SOURCE" "$JNILIBS_DIR/librusttracker.so"
+    if [[ "$BUILD_MODE" == "release" && -n "${ANDROID_NDK_HOME:-}" ]]; then
+        LLVM_STRIP="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+        if [[ -x "$LLVM_STRIP" ]]; then
+            "$LLVM_STRIP" --strip-debug "$JNILIBS_DIR/librusttracker.so"
+        fi
+    fi
     echo "Successfully copied librusttracker.so to $JNILIBS_DIR"
 else
     echo "Error: Built library not found at $SO_SOURCE" >&2

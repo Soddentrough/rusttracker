@@ -68,6 +68,7 @@ android/app/src/main/jniLibs/
 android/.cxx/
 android/.idea/
 android/.kotlin/
+local_lib/android/
 *.apk
 *.aab
 dist/

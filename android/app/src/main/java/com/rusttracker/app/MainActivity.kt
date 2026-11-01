@@ -170,11 +170,38 @@ class MainActivity : GameActivity() {
 
     private fun handleSelectedUri(uri: Uri) {
         val loadId = currentLoadId.incrementAndGet()
+        val transferStartMs = System.currentTimeMillis()
+        val authority = uri.authority?.lowercase(java.util.Locale.US) ?: ""
+        val isGoogleDrive = authority.contains("docs.storage") || authority.contains("google")
+        val providerLabel = if (isGoogleDrive) {
+            "Google Drive"
+        } else if (uri.scheme == "content") {
+            "Cloud / Storage"
+        } else {
+            "Local Storage"
+        }
+        val initialFallbackName = uri.lastPathSegment
+            ?.let { Uri.decode(it) }
+            ?.substringAfterLast('/')
+            ?.substringAfterLast(':')
+            ?.takeIf { it.isNotBlank() }
+            ?: "Selected Media File"
+
+        // Immediately notify Rust on the caller thread so UI shows transfer feedback on the very first frame
+        nativeOnFileLoadingStarted(initialFallbackName)
+        nativeOnFileTransferProgress(
+            initialFallbackName,
+            "Connecting to $providerLabel...",
+            0L,
+            -1L,
+            0L
+        )
+
         Thread {
             var tempFile: File? = null
             val isWaitingForProvider = java.util.concurrent.atomic.AtomicBoolean(false)
             try {
-                var displayName = "audio_track"
+                var displayName = initialFallbackName
                 var expectedSize = -1L
                 val decodedPath = uri.path?.let { Uri.decode(it) }
                 if (uri.scheme == "content") {
@@ -213,8 +240,15 @@ class MainActivity : GameActivity() {
 
                 if (currentLoadId.get() != loadId) return@Thread
 
-                // Immediately notify Rust so the previous track stops playing and UI reflects loading state
+                // Update Rust with resolved filename and expected byte size
                 nativeOnFileLoadingStarted(displayName)
+                nativeOnFileTransferProgress(
+                    displayName,
+                    "Fetching from $providerLabel...",
+                    0L,
+                    expectedSize,
+                    (System.currentTimeMillis() - transferStartMs).coerceAtLeast(0L)
+                )
 
                 val safeName = displayName.replace(Regex("[^a-zA-Z0-9._ -]"), "_")
 
@@ -230,32 +264,37 @@ class MainActivity : GameActivity() {
                     if (existing != null) {
                         existing.setLastModified(System.currentTimeMillis())
                         Log.i(TAG, "Reusing already-cached file: ${existing.absolutePath} ($expectedSize bytes)")
+                        nativeOnFileTransferProgress(
+                            displayName,
+                            "Opening cached file...",
+                            expectedSize,
+                            expectedSize,
+                            (System.currentTimeMillis() - transferStartMs).coerceAtLeast(0L)
+                        )
                         nativeOnFileSelected(existing.absolutePath)
                         return@Thread
                     }
                 }
 
-                val sizeMbStr = if (expectedSize >= 1024L * 1024L) {
-                    String.format(java.util.Locale.US, " (%.1f MB)", expectedSize / (1024.0 * 1024.0))
-                } else {
-                    ""
-                }
-                nativeOnFileStatus("Loading $displayName$sizeMbStr...")
-
                 // Cloud providers (e.g. Google Drive) often download the remote file inside openInputStream()
-                // before returning the stream. Run a 1s heartbeat so the user sees live elapsed cloud progress.
-                val openStartMs = System.currentTimeMillis()
+                // before returning the stream. Run a 150ms heartbeat so the user sees smooth live elapsed progress.
                 isWaitingForProvider.set(true)
                 Thread {
                     while (isWaitingForProvider.get() && currentLoadId.get() == loadId) {
                         try {
-                            Thread.sleep(1000L)
+                            Thread.sleep(150L)
                         } catch (_: InterruptedException) {
                             break
                         }
                         if (isWaitingForProvider.get() && currentLoadId.get() == loadId) {
-                            val elapsed = ((System.currentTimeMillis() - openStartMs) / 1000L).coerceAtLeast(1L)
-                            nativeOnFileStatus("Cloud download: $displayName$sizeMbStr (${elapsed}s)...")
+                            val elapsedMs = (System.currentTimeMillis() - transferStartMs).coerceAtLeast(100L)
+                            nativeOnFileTransferProgress(
+                                displayName,
+                                "Downloading from $providerLabel...",
+                                0L,
+                                expectedSize,
+                                elapsedMs
+                            )
                         }
                     }
                 }.apply { isDaemon = true }.start()
@@ -300,7 +339,7 @@ class MainActivity : GameActivity() {
                 val partFile = File(cacheDir, "track_${System.currentTimeMillis()}_${loadId}_$safeName.part")
                 tempFile = partFile
                 var bytesCopied = 0L
-                var lastProgressMs = System.currentTimeMillis()
+                var lastProgressMs = 0L
 
                 inputStream.use { input ->
                     FileOutputStream(partFile).use { output ->
@@ -315,32 +354,16 @@ class MainActivity : GameActivity() {
                             output.write(buffer, 0, read)
                             bytesCopied += read
                             val now = System.currentTimeMillis()
-                            if (now - lastProgressMs >= 250L) {
+                            if (now - lastProgressMs >= 80L) {
                                 lastProgressMs = now
-                                val copiedMb = bytesCopied / (1024.0 * 1024.0)
-                                if (expectedSize > 0L) {
-                                    val pct = ((bytesCopied * 100L) / expectedSize).coerceIn(0L, 100L)
-                                    val totalMb = expectedSize / (1024.0 * 1024.0)
-                                    nativeOnFileStatus(
-                                        String.format(
-                                            java.util.Locale.US,
-                                            "Caching %s... %d%% (%.1f / %.1f MB)",
-                                            displayName,
-                                            pct,
-                                            copiedMb,
-                                            totalMb
-                                        )
-                                    )
-                                } else {
-                                    nativeOnFileStatus(
-                                        String.format(
-                                            java.util.Locale.US,
-                                            "Caching %s... %.1f MB",
-                                            displayName,
-                                            copiedMb
-                                        )
-                                    )
-                                }
+                                val elapsedMs = (now - transferStartMs).coerceAtLeast(1L)
+                                nativeOnFileTransferProgress(
+                                    displayName,
+                                    "Caching from $providerLabel...",
+                                    bytesCopied,
+                                    expectedSize,
+                                    elapsedMs
+                                )
                             }
                         }
                         output.flush()
@@ -378,7 +401,15 @@ class MainActivity : GameActivity() {
                     }
                 } catch (_: Exception) {}
 
-                Log.i(TAG, "Selected file successfully saved to cache: ${finalFile.absolutePath} (${finalFile.length()} bytes)")
+                val finalBytes = finalFile.length()
+                nativeOnFileTransferProgress(
+                    displayName,
+                    "Starting playback...",
+                    finalBytes,
+                    finalBytes,
+                    (System.currentTimeMillis() - transferStartMs).coerceAtLeast(1L)
+                )
+                Log.i(TAG, "Selected file successfully saved to cache: ${finalFile.absolutePath} ($finalBytes bytes)")
                 nativeOnFileSelected(finalFile.absolutePath)
             } catch (e: Exception) {
                 isWaitingForProvider.set(false)
@@ -392,6 +423,13 @@ class MainActivity : GameActivity() {
     }
 
     private external fun nativeOnFileLoadingStarted(displayName: String)
+    private external fun nativeOnFileTransferProgress(
+        displayName: String,
+        statusText: String,
+        bytesCopied: Long,
+        totalBytes: Long,
+        elapsedMs: Long
+    )
     private external fun nativeOnFileSelected(filePath: String)
     private external fun nativeOnFileStatus(statusMsg: String)
     private external fun nativeOnBackPressed(): Boolean

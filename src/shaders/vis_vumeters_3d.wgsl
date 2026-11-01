@@ -46,8 +46,8 @@ fn paper_noise_fast(p: vec2<f32>) -> f32 {
 
 // Compute responsive Left/Right VU and Peak levels across stereo or multi-channel tracker audio
 fn get_stereo_vu_peak() -> vec4<f32> {
-    var vu_l = audio.channels[0].x;
-    var vu_r = audio.channels[0].y;
+    var vu_l = audio.spatial_channels[0].x;
+    var vu_r = audio.spatial_channels[0].y;
     var pk_l = audio.channel_peaks[0].x;
     var pk_r = audio.channel_peaks[0].y;
 
@@ -70,15 +70,15 @@ fn get_stereo_vu_peak() -> vec4<f32> {
             }
         }
         let half_ch = max(f32(n_ch) * 0.5, 1.0);
-        vu_l = max(vu_l, sqrt(sum_l / half_ch) * 1.45);
-        vu_r = max(vu_r, sqrt(sum_r / half_ch) * 1.45);
+        vu_l = max(vu_l, sqrt(sum_l / half_ch));
+        vu_r = max(vu_r, sqrt(sum_r / half_ch));
         pk_l = max(pk_l, max_l);
         pk_r = max(pk_r, max_r);
     }
 
     return vec4<f32>(
-        clamp(vu_l * 1.35, 0.0, 1.08),
-        clamp(vu_r * 1.35, 0.0, 1.08),
+        clamp(vu_l, 0.0, 1.08),
+        clamp(vu_r, 0.0, 1.08),
         clamp(pk_l, 0.0, 1.2),
         clamp(pk_r, 0.0, 1.2)
     );
@@ -500,7 +500,7 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
         }
 
         // === Percentage scale: smaller ticks and arc below the dB arc (0, 20, 40, 60, 80, 100%) ===
-        let pct_vals = array<f32, 6>(0.0, 0.20, 0.42, 0.62, 0.77, 0.91);
+        let pct_vals = array<f32, 6>(0.0, 0.15, 0.31, 0.46, 0.62, 0.77);
         let pct_outer = 0.96;
         let pct_inner = 0.90;
         let pct_arc_r = 0.93;
@@ -556,11 +556,11 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
         var pct_num_ink = 0.0;
         if (d_scale > 0.75 && d_scale < 0.89) {
             pct_num_ink = max(pct_num_ink, draw_arc_label_1(0u, q, pivot, theta, PHI_MIN, pct_label_r, pct_lbl_scale, lps));
-            pct_num_ink = max(pct_num_ink, draw_arc_label_2(array<u32, 2>(2u, 0u), q, pivot, theta, PHI_MIN + 0.20 * (PHI_MAX - PHI_MIN), pct_label_r, pct_lbl_scale, lps));
-            pct_num_ink = max(pct_num_ink, draw_arc_label_2(array<u32, 2>(4u, 0u), q, pivot, theta, PHI_MIN + 0.42 * (PHI_MAX - PHI_MIN), pct_label_r, pct_lbl_scale, lps));
-            pct_num_ink = max(pct_num_ink, draw_arc_label_2(array<u32, 2>(6u, 0u), q, pivot, theta, PHI_MIN + 0.62 * (PHI_MAX - PHI_MIN), pct_label_r, pct_lbl_scale, lps));
-            pct_num_ink = max(pct_num_ink, draw_arc_label_2(array<u32, 2>(8u, 0u), q, pivot, theta, PHI_MIN + 0.77 * (PHI_MAX - PHI_MIN), pct_label_r, pct_lbl_scale, lps));
-            pct_num_ink = max(pct_num_ink, draw_arc_label_3(array<u32, 3>(1u, 0u, 0u), q, pivot, theta, PHI_MIN + 0.91 * (PHI_MAX - PHI_MIN), pct_label_r, pct_lbl_scale, lps));
+            pct_num_ink = max(pct_num_ink, draw_arc_label_2(array<u32, 2>(2u, 0u), q, pivot, theta, PHI_MIN + 0.15 * (PHI_MAX - PHI_MIN), pct_label_r, pct_lbl_scale, lps));
+            pct_num_ink = max(pct_num_ink, draw_arc_label_2(array<u32, 2>(4u, 0u), q, pivot, theta, PHI_MIN + 0.31 * (PHI_MAX - PHI_MIN), pct_label_r, pct_lbl_scale, lps));
+            pct_num_ink = max(pct_num_ink, draw_arc_label_2(array<u32, 2>(6u, 0u), q, pivot, theta, PHI_MIN + 0.46 * (PHI_MAX - PHI_MIN), pct_label_r, pct_lbl_scale, lps));
+            pct_num_ink = max(pct_num_ink, draw_arc_label_2(array<u32, 2>(8u, 0u), q, pivot, theta, PHI_MIN + 0.62 * (PHI_MAX - PHI_MIN), pct_label_r, pct_lbl_scale, lps));
+            pct_num_ink = max(pct_num_ink, draw_arc_label_3(array<u32, 3>(1u, 0u, 0u), q, pivot, theta, PHI_MIN + 0.77 * (PHI_MAX - PHI_MIN), pct_label_r, pct_lbl_scale, lps));
             pct_num_ink = max(pct_num_ink, draw_arc_label_1(25u, q, pivot, theta, PHI_MAX, pct_label_r - 0.04, pct_lbl_scale, lps));
         }
 

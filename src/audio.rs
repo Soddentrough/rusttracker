@@ -500,13 +500,14 @@ impl SurroundUpmixerDsp {
 
     #[inline(always)]
     fn soft_limit(x: f32) -> f32 {
-        // Gentle cubic soft knee above |x| = 0.85 to prevent harsh digital clipping on +12dB EQ boosts
+        // Transparent safety ceiling above |x| = 0.98 (-0.17 dBFS) to prevent harsh digital clipping on +12dB EQ boosts
+        // while keeping normal mastered program peaks (up to -0.2 dBFS) 100% linear.
         let ax = x.abs();
-        if ax <= 0.85 {
+        if ax <= 0.98 {
             x
         } else {
-            let excess = (ax - 0.85) / 0.45;
-            let compressed = 0.85 + 0.15 * (excess / (1.0 + excess));
+            let excess = (ax - 0.98) / 0.10;
+            let compressed = 0.98 + 0.02 * (excess / (1.0 + excess));
             compressed.copysign(x).clamp(-1.0, 1.0)
         }
     }
@@ -554,14 +555,14 @@ impl SurroundUpmixerDsp {
 
         let fl = Self::soft_limit(l_routed * cfg.front_level);
         let fr = Self::soft_limit(r_routed * cfg.front_level);
-        let fc_hp = -self.sub_hp_c.process(mid_routed);
+        let fc_hp = self.sub_hp_c.process(mid_routed);
         let fc = Self::soft_limit(fc_hp * cfg.center_level * std::f32::consts::FRAC_1_SQRT_2);
 
         // ITU-R BS.775 / Dolby Surround center-steering: attenuate common-mode phantom center in surrounds
         // so correlated vocals/kick/bass stay anchored in the front stage while panned/stereo content envelops.
         let common_center = self.update_center_steering(mid_routed, diff_routed);
-        let l_bed = -self.sub_hp_l.process(l_routed - common_center * 0.60);
-        let r_bed = -self.sub_hp_r.process(r_routed - common_center * 0.60);
+        let l_bed = self.sub_hp_l.process(l_routed - common_center * 0.60);
+        let r_bed = self.sub_hp_r.process(r_routed - common_center * 0.60);
         let side_bed = (l_bed - r_bed) * 0.5 * cfg.stereo_width.clamp(0.0, 2.0);
         let l_surr = l_bed + side_bed * 0.35;
         let r_surr = r_bed - side_bed * 0.35;
@@ -600,7 +601,7 @@ impl SurroundUpmixerDsp {
 
         let fl = Self::soft_limit(l_eq * cfg.front_level);
         let fr = Self::soft_limit(r_eq * cfg.front_level);
-        let fc_hp = -self.sub_hp_c.process(mid);
+        let fc_hp = self.sub_hp_c.process(mid);
         let fc = Self::soft_limit(fc_hp * cfg.center_level * std::f32::consts::FRAC_1_SQRT_2);
 
         let common_center = self.update_center_steering(mid, diff);
@@ -617,9 +618,10 @@ impl SurroundUpmixerDsp {
         let lfe = Self::soft_limit(lfe_low * cfg.lfe_level * std::f32::consts::FRAC_1_SQRT_2);
 
         // 4. Linkwitz-Riley 2nd-order (Q = 0.5) crossover at height_crossover_hz splitting Bed vs. Height.
-        // Invert high-pass polarity (-height_hp) so LP and HP sum in phase at the crossover frequency.
-        let l_bed_hp = -self.sub_hp_l.process(l_amb);
-        let r_bed_hp = -self.sub_hp_r.process(r_amb);
+        // Keep sub_hp positive in the passband so FC and Bed remain in phase with full-range FL/FR;
+        // invert only height_hp (-height_hp) so height_lp and height_hp sum flat at height_crossover_hz.
+        let l_bed_hp = self.sub_hp_l.process(l_amb);
+        let r_bed_hp = self.sub_hp_r.process(r_amb);
         let l_low = self.height_lp_l.process(l_bed_hp);
         let l_high = -self.height_hp_l.process(l_wide);
         let r_low = self.height_lp_r.process(r_bed_hp);
@@ -1040,8 +1042,15 @@ impl SurroundUpmixerDsp {
                     out[1] = fr;
                     out[2] = fc;
                     out[3] = lfe;
-                    for c in 4..hardware_channels.min(8) {
-                        out[c] = Self::soft_limit(ch_in[c] * surround_gain);
+                    if src_ch >= 8 && hardware_channels > 8 {
+                        out[4] = Self::soft_limit(ch_in[6] * surround_gain);
+                        out[5] = Self::soft_limit(ch_in[7] * surround_gain);
+                        out[6] = Self::soft_limit(ch_in[4] * surround_gain);
+                        out[7] = Self::soft_limit(ch_in[5] * surround_gain);
+                    } else {
+                        for c in 4..hardware_channels.min(8) {
+                            out[c] = Self::soft_limit(ch_in[c] * surround_gain);
+                        }
                     }
                     for c in 8..hardware_channels.min(12) {
                         out[c] = Self::soft_limit(ch_in[c] * height_gain);
@@ -1049,10 +1058,10 @@ impl SurroundUpmixerDsp {
                     return out;
                 }
 
-                // Decoded 8-channel 7.1 frames follow WAVEFORMATEXTENSIBLE 0x63F order:
+                // Decoded 8+ channel (7.1 / 7.1.4) frames follow WAVEFORMATEXTENSIBLE 0x63F order in 0..8:
                 // [0:FL, 1:FR, 2:FC, 3:LFE, 4:BL, 5:BR, 6:SL, 7:SR].
                 // Map them to canonical Side (SL, SR) and Back/Rear (BL, BR) speaker pairs:
-                let (bl_in, br_in, sl_in, sr_in) = if src_ch == 8 {
+                let (bl_in, br_in, sl_in, sr_in) = if src_ch >= 8 {
                     (ch_in[4], ch_in[5], ch_in[6], ch_in[7])
                 } else {
                     (ch_in[6], ch_in[7], ch_in[4], ch_in[5])
@@ -1209,6 +1218,10 @@ impl SurroundUpmixerDsp {
             let mut out = [0.0f32; 12];
             let copy_len = frame_slice.len().min(hardware_channels).min(12);
             out[..copy_len].copy_from_slice(&frame_slice[..copy_len]);
+            if src_ch >= 8 && hardware_channels > 8 && frame_slice.len() >= 8 {
+                out.swap(4, 6);
+                out.swap(5, 7);
+            }
             return out;
         }
 
@@ -1223,7 +1236,7 @@ impl SurroundUpmixerDsp {
             let dry_w = 1.0 - w;
             for (c, sample_out) in upmixed.iter_mut().enumerate() {
                 let dry = if c < src_ch && c < hardware_channels {
-                    let src_c = if src_ch == 8 && hardware_channels > 8 {
+                    let src_c = if src_ch >= 8 && hardware_channels > 8 {
                         match c {
                             4 => 6,
                             5 => 7,
@@ -2099,7 +2112,10 @@ pub fn spawn_dsp_thread(
             });
         }
 
-        let n_sqrt = (window_size as f32).sqrt();
+        // Sample-rate-invariant normalization matching 1.0 / sqrt(8192) at 44.1/48 kHz (N=8192)
+        // and scaling proportionally at 96/192 kHz (N=16384/32768) so the Frequency Analysis
+        // Y-axis height is consistent across all sample rates.
+        let norm_factor = (8192.0_f32).sqrt() / (window_size as f32);
         let mut last_waveform_push = Instant::now();
         let recycle_tx = &dsp_recycle_channel().0;
 
@@ -2144,7 +2160,7 @@ pub fn spawn_dsp_thread(
 
                 // Compute magnitudes (only first half — up to Nyquist)
                 for i in 0..nyquist {
-                    magnitudes[i] = complex_buf[i].norm() / n_sqrt;
+                    magnitudes[i] = complex_buf[i].norm() * norm_factor;
                 }
 
                 // Logarithmic binning into 1024 display bins (mono) using precomputed ranges
@@ -2202,8 +2218,8 @@ pub fn spawn_dsp_thread(
                                     )
                                 };
 
-                                let norm_re = re / n_sqrt;
-                                let norm_im = im / n_sqrt;
+                                let norm_re = re * norm_factor;
+                                let norm_im = im * norm_factor;
 
                                 let out_idx = c * 1024 * 2 + i * 2;
                                 gpu_spectrum[out_idx] = norm_re;
@@ -2237,8 +2253,8 @@ pub fn spawn_dsp_thread(
                                 )
                             };
 
-                            let norm_re = re / n_sqrt;
-                            let norm_im = im / n_sqrt;
+                            let norm_re = re * norm_factor;
+                            let norm_im = im * norm_factor;
 
                             let out_idx = i * 2;
                             gpu_spectrum[out_idx] = norm_re;
@@ -2560,9 +2576,7 @@ pub trait AudioSource: Send {
     fn get_video_info(&mut self) -> Option<String> {
         None
     }
-    #[cfg(not(target_os = "android"))]
     fn attach_video_queue(&mut self, _tx: crossbeam_channel::Sender<(u64, ffmpeg_next::Packet)>) {}
-    #[cfg(not(target_os = "android"))]
     fn take_video_parameters(
         &mut self,
     ) -> Option<(ffmpeg_next::codec::Parameters, ffmpeg_next::Rational, u32)> {
@@ -2614,6 +2628,7 @@ struct OpenMptSource {
     module: SafeModule,
     left_buf: Vec<f32>,
     right_buf: Vec<f32>,
+    volume: f32,
 }
 
 impl AudioSource for OpenMptSource {
@@ -2638,12 +2653,15 @@ impl AudioSource for OpenMptSource {
             &mut self.right_buf,
         );
 
+        let vol = self.volume;
         for i in 0..frames_read {
-            let l = self.left_buf[i];
-            let r = self.right_buf[i];
+            let l = self.left_buf[i] * vol;
+            let r = self.right_buf[i] * vol;
 
-            output[i * hardware_channels] = l;
-            if hardware_channels > 1 {
+            if hardware_channels == 1 {
+                output[i] = (l + r) * 0.5;
+            } else {
+                output[i * hardware_channels] = l;
                 output[i * hardware_channels + 1] = r;
                 for j in 2..hardware_channels {
                     output[i * hardware_channels + j] = 0.0;
@@ -2667,7 +2685,15 @@ impl AudioSource for OpenMptSource {
         2
     }
     fn get_current_channel_vu_mono(&mut self, channel: i32) -> f32 {
-        self.module.0.get_current_channel_vu_mono(channel)
+        self.module.0.get_current_channel_vu_mono(channel) * self.volume
+    }
+    fn set_active_audio_tracks(&mut self, tracks: &[(usize, f32)]) -> Result<()> {
+        if let Some(&(_, vol)) = tracks.first() {
+            self.volume = vol.clamp(0.0, 2.0);
+        } else {
+            self.volume = 0.0;
+        }
+        Ok(())
     }
 
     fn get_artist(&mut self) -> String {
@@ -2779,6 +2805,9 @@ struct MidiEvent {
 
 struct MidiSource {
     sequencer: Option<MidiFileSequencer>,
+    sf2_arc: Option<Arc<SoundFont>>,
+    synth_sample_rate: u32,
+    volume: f32,
     pos_silent: f64,
     events: Vec<MidiEvent>,
     event_idx: usize,
@@ -2820,9 +2849,9 @@ impl MidiSource {
         };
 
         let mut artist_suffix = "";
-        let mut sequencer = if let Some(sf2) = sf2_arc_opt {
+        let mut sequencer = if let Some(ref sf2) = sf2_arc_opt {
             let settings = SynthesizerSettings::new(sample_rate);
-            if let Ok(synth) = Synthesizer::new(&sf2, &settings) {
+            if let Ok(synth) = Synthesizer::new(sf2, &settings) {
                 Some(MidiFileSequencer::new(synth))
             } else {
                 artist_suffix = " (No SoundFont)";
@@ -3086,6 +3115,9 @@ impl MidiSource {
 
         Ok(Self {
             sequencer,
+            sf2_arc: sf2_arc_opt,
+            synth_sample_rate: sample_rate.max(8000) as u32,
+            volume: 1.0,
             pos_silent: 0.0,
             events: parsed_events,
             event_idx: 0,
@@ -3108,11 +3140,30 @@ impl AudioSource for MidiSource {
     fn read_frames(
         &mut self,
         hardware_channels: usize,
-        _sample_rate: u32,
+        sample_rate: u32,
         output: &mut [f32],
     ) -> usize {
         let frames_to_render = output.len() / hardware_channels;
+        let target_sr = sample_rate.max(8000);
+        if target_sr != self.synth_sample_rate {
+            let cur_pos = self.get_position_seconds();
+            if let Some(ref sf2) = self.sf2_arc {
+                let settings = SynthesizerSettings::new(target_sr as i32);
+                if let Ok(synth) = Synthesizer::new(sf2, &settings) {
+                    let mut seq = MidiFileSequencer::new(synth);
+                    seq.play(&self.midi_file, false);
+                    let mut trash_left = vec![0.0; 8192];
+                    let mut trash_right = vec![0.0; 8192];
+                    while seq.get_position() < cur_pos && !seq.end_of_sequence() {
+                        seq.render(&mut trash_left, &mut trash_right);
+                    }
+                    self.sequencer = Some(seq);
+                }
+            }
+            self.synth_sample_rate = target_sr;
+        }
 
+        let vol = self.volume;
         let pos = if let Some(ref mut seq) = self.sequencer {
             if self.left_buf.len() < frames_to_render {
                 self.left_buf.resize(frames_to_render, 0.0);
@@ -3123,10 +3174,12 @@ impl AudioSource for MidiSource {
                 &mut self.right_buf[..frames_to_render],
             );
             for i in 0..frames_to_render {
-                let l = self.left_buf[i];
-                let r = self.right_buf[i];
-                output[i * hardware_channels] = l;
-                if hardware_channels > 1 {
+                let l = self.left_buf[i] * vol;
+                let r = self.right_buf[i] * vol;
+                if hardware_channels == 1 {
+                    output[i] = (l + r) * 0.5;
+                } else {
+                    output[i * hardware_channels] = l;
                     output[i * hardware_channels + 1] = r;
                     for j in 2..hardware_channels {
                         output[i * hardware_channels + j] = 0.0;
@@ -3136,13 +3189,18 @@ impl AudioSource for MidiSource {
             seq.get_position()
         } else {
             output.fill(0.0);
-            self.pos_silent = (self.pos_silent + frames_to_render as f64 / _sample_rate as f64)
-                .min(self.duration);
+            self.pos_silent =
+                (self.pos_silent + frames_to_render as f64 / target_sr as f64).min(self.duration);
             self.pos_silent
         };
 
+        let dt = frames_to_render as f32 / target_sr as f32;
+        let decay = 10.0_f32.powf(-13.3 * dt / 20.0);
         for c in 0..16 {
-            self.channel_vus[c] = (self.channel_vus[c] - 0.02).max(0.0);
+            self.channel_vus[c] *= decay;
+            if self.channel_vus[c] < 1e-4 {
+                self.channel_vus[c] = 0.0;
+            }
         }
 
         while self.event_idx < self.events.len() && self.events[self.event_idx].time_sec <= pos {
@@ -3150,7 +3208,8 @@ impl AudioSource for MidiSource {
             if ev.is_note_on {
                 let ch = ev.channel as usize;
                 if ch < 16 {
-                    self.channel_vus[ch] = (ev.velocity as f32 / 127.0).clamp(0.1, 1.0);
+                    self.channel_vus[ch] =
+                        ((ev.velocity as f32 / 127.0).clamp(0.1, 1.0) * vol).clamp(0.0, 1.0);
                 }
             }
             self.event_idx += 1;
@@ -3210,6 +3269,14 @@ impl AudioSource for MidiSource {
             0.0
         }
     }
+    fn set_active_audio_tracks(&mut self, tracks: &[(usize, f32)]) -> Result<()> {
+        if let Some(&(_, vol)) = tracks.first() {
+            self.volume = vol.clamp(0.0, 2.0);
+        } else {
+            self.volume = 0.0;
+        }
+        Ok(())
+    }
 
     fn get_artist(&mut self) -> String {
         if !self.title.is_empty() {
@@ -3239,7 +3306,7 @@ impl AudioSource for MidiSource {
         0
     }
     fn get_intrinsic_sample_rate(&mut self) -> Option<u32> {
-        Some(48000)
+        None
     }
     fn get_num_samples(&mut self) -> i32 {
         0
@@ -3412,13 +3479,13 @@ pub fn get_downmixed_sample(
     const SQRT2: f32 = std::f32::consts::SQRT_2;
 
     match (track_channels, hardware_channels, out_channel) {
+        // Mono to any channel (duplicate to left and right on stereo+, or mono on 1ch)
+        (1, _, c) if c < 2 => base_slice[0],
+        (1, _, _) => 0.0,
         // Direct 1-to-1 mapping if matching or enough channels
         (tc, hc, c) if c < tc as usize && hc >= tc as usize => {
             base_slice.get(c).copied().unwrap_or(0.0)
         }
-        // Mono to any channel (pan to left and right, or mono)
-        (1, _, c) if c < 2 => base_slice[0],
-        (1, _, _) => 0.0,
         // Stereo to mono
         (2, 1, 0) => {
             let l = base_slice.first().copied().unwrap_or(0.0);
@@ -3441,7 +3508,7 @@ pub fn get_downmixed_sample(
             let fl = base_slice.first().copied().unwrap_or(0.0);
             let fr = base_slice.get(1).copied().unwrap_or(0.0);
             let fc = base_slice.get(2).copied().unwrap_or(0.0);
-            (fl + fr + INV_SQRT2 * fc) * 0.4
+            (fl + fr + SQRT2 * fc) * 0.35
         }
         // Quad (FL, FR, BL, BR) to Stereo (L, R)
         (4, 2, 0) => {
@@ -3460,7 +3527,7 @@ pub fn get_downmixed_sample(
             let fr = base_slice.get(1).copied().unwrap_or(0.0);
             let bl = base_slice.get(2).copied().unwrap_or(0.0);
             let br = base_slice.get(3).copied().unwrap_or(0.0);
-            (fl + fr + bl + br) * 0.25
+            (fl + fr + INV_SQRT2 * (bl + br)) * 0.35
         }
         // 5.0 (FL, FR, FC, BL, BR) to Stereo (L, R)
         (5, 2, 0) => {
@@ -3482,60 +3549,54 @@ pub fn get_downmixed_sample(
             let fc = base_slice.get(2).copied().unwrap_or(0.0);
             let bl = base_slice.get(3).copied().unwrap_or(0.0);
             let br = base_slice.get(4).copied().unwrap_or(0.0);
-            (fl + fr + SQRT2 * fc + bl + br) * 0.35
+            (fl + fr + SQRT2 * fc + INV_SQRT2 * (bl + br)) * 0.35
         }
-        // 5.1 (FL, FR, FC, LFE, BL, BR) to Stereo (L, R)
+        // 5.1 (FL, FR, FC, LFE, BL, BR) to Stereo (L, R) — ITU-R BS.775-3 (exclude LFE)
         (6, 2, 0) => {
             let fl = base_slice.first().copied().unwrap_or(0.0);
             let fc = base_slice.get(2).copied().unwrap_or(0.0);
-            let lfe = base_slice.get(3).copied().unwrap_or(0.0);
             let bl = base_slice.get(4).copied().unwrap_or(0.0);
-            (fl + INV_SQRT2 * fc + INV_SQRT2 * bl + 0.5 * lfe) * INV_SQRT2
+            (fl + INV_SQRT2 * fc + INV_SQRT2 * bl) * INV_SQRT2
         }
         (6, 2, 1) => {
             let fr = base_slice.get(1).copied().unwrap_or(0.0);
             let fc = base_slice.get(2).copied().unwrap_or(0.0);
-            let lfe = base_slice.get(3).copied().unwrap_or(0.0);
             let br = base_slice.get(5).copied().unwrap_or(0.0);
-            (fr + INV_SQRT2 * fc + INV_SQRT2 * br + 0.5 * lfe) * INV_SQRT2
+            (fr + INV_SQRT2 * fc + INV_SQRT2 * br) * INV_SQRT2
         }
-        // 5.1 to Mono
+        // 5.1 to Mono — ITU-R BS.775-3 (exclude LFE)
         (6, 1, 0) => {
             let fl = base_slice.first().copied().unwrap_or(0.0);
             let fr = base_slice.get(1).copied().unwrap_or(0.0);
             let fc = base_slice.get(2).copied().unwrap_or(0.0);
-            let lfe = base_slice.get(3).copied().unwrap_or(0.0);
             let bl = base_slice.get(4).copied().unwrap_or(0.0);
             let br = base_slice.get(5).copied().unwrap_or(0.0);
-            (fl + fr + SQRT2 * fc + bl + br + lfe) * 0.35
+            (fl + fr + SQRT2 * fc + INV_SQRT2 * (bl + br)) * 0.35
         }
-        // 6.1 (FL, FR, FC, LFE, BC, SL, SR) to Stereo (L, R)
+        // 6.1 (FL, FR, FC, LFE, BC, SL, SR) to Stereo (L, R) — ITU-R BS.775-3 (exclude LFE)
         (7, 2, 0) => {
             let fl = base_slice.first().copied().unwrap_or(0.0);
             let fc = base_slice.get(2).copied().unwrap_or(0.0);
-            let lfe = base_slice.get(3).copied().unwrap_or(0.0);
             let bc = base_slice.get(4).copied().unwrap_or(0.0);
             let sl = base_slice.get(5).copied().unwrap_or(0.0);
-            (fl + INV_SQRT2 * fc + 0.5 * bc + INV_SQRT2 * sl + 0.5 * lfe) * 0.6
+            (fl + INV_SQRT2 * fc + 0.5 * bc + INV_SQRT2 * sl) * 0.65
         }
         (7, 2, 1) => {
             let fr = base_slice.get(1).copied().unwrap_or(0.0);
             let fc = base_slice.get(2).copied().unwrap_or(0.0);
-            let lfe = base_slice.get(3).copied().unwrap_or(0.0);
             let bc = base_slice.get(4).copied().unwrap_or(0.0);
             let sr = base_slice.get(6).copied().unwrap_or(0.0);
-            (fr + INV_SQRT2 * fc + 0.5 * bc + INV_SQRT2 * sr + 0.5 * lfe) * 0.6
+            (fr + INV_SQRT2 * fc + 0.5 * bc + INV_SQRT2 * sr) * 0.65
         }
-        // 6.1 to Mono
+        // 6.1 to Mono — ITU-R BS.775-3 (exclude LFE)
         (7, 1, 0) => {
             let fl = base_slice.first().copied().unwrap_or(0.0);
             let fr = base_slice.get(1).copied().unwrap_or(0.0);
             let fc = base_slice.get(2).copied().unwrap_or(0.0);
-            let lfe = base_slice.get(3).copied().unwrap_or(0.0);
             let bc = base_slice.get(4).copied().unwrap_or(0.0);
             let sl = base_slice.get(5).copied().unwrap_or(0.0);
             let sr = base_slice.get(6).copied().unwrap_or(0.0);
-            (fl + fr + SQRT2 * fc + bc + sl + sr + lfe) * 0.3
+            (fl + fr + SQRT2 * fc + INV_SQRT2 * (bc + sl + sr)) * 0.32
         }
         // 7.1 (FL, FR, FC, LFE, BL, BR, SL, SR) to 5.1 (FL, FR, FC, LFE, SL/BL, SR/BR)
         (8, 6, c @ 0..=3) => base_slice.get(c).copied().unwrap_or(0.0),
@@ -3549,34 +3610,31 @@ pub fn get_downmixed_sample(
             let sr = base_slice.get(7).copied().unwrap_or(0.0);
             (br + sr) * INV_SQRT2
         }
-        // 7.1 (FL, FR, FC, LFE, BL, BR, SL, SR) to Stereo
+        // 7.1 (FL, FR, FC, LFE, BL, BR, SL, SR) to Stereo — ITU-R BS.775-3 (exclude LFE)
         (8, 2, 0) => {
             let fl = base_slice.first().copied().unwrap_or(0.0);
             let fc = base_slice.get(2).copied().unwrap_or(0.0);
-            let lfe = base_slice.get(3).copied().unwrap_or(0.0);
             let bl = base_slice.get(4).copied().unwrap_or(0.0);
             let sl = base_slice.get(6).copied().unwrap_or(0.0);
-            (fl + INV_SQRT2 * fc + INV_SQRT2 * bl + INV_SQRT2 * sl + 0.5 * lfe) * 0.6
+            (fl + INV_SQRT2 * fc + INV_SQRT2 * bl + INV_SQRT2 * sl) * 0.65
         }
         (8, 2, 1) => {
             let fr = base_slice.get(1).copied().unwrap_or(0.0);
             let fc = base_slice.get(2).copied().unwrap_or(0.0);
-            let lfe = base_slice.get(3).copied().unwrap_or(0.0);
             let br = base_slice.get(5).copied().unwrap_or(0.0);
             let sr = base_slice.get(7).copied().unwrap_or(0.0);
-            (fr + INV_SQRT2 * fc + INV_SQRT2 * br + INV_SQRT2 * sr + 0.5 * lfe) * 0.6
+            (fr + INV_SQRT2 * fc + INV_SQRT2 * br + INV_SQRT2 * sr) * 0.65
         }
-        // 7.1 to Mono
+        // 7.1 to Mono — ITU-R BS.775-3 (exclude LFE)
         (8, 1, 0) => {
             let fl = base_slice.first().copied().unwrap_or(0.0);
             let fr = base_slice.get(1).copied().unwrap_or(0.0);
             let fc = base_slice.get(2).copied().unwrap_or(0.0);
-            let lfe = base_slice.get(3).copied().unwrap_or(0.0);
             let bl = base_slice.get(4).copied().unwrap_or(0.0);
             let br = base_slice.get(5).copied().unwrap_or(0.0);
             let sl = base_slice.get(6).copied().unwrap_or(0.0);
             let sr = base_slice.get(7).copied().unwrap_or(0.0);
-            (fl + fr + SQRT2 * fc + bl + br + sl + sr + lfe) * 0.28
+            (fl + fr + SQRT2 * fc + INV_SQRT2 * (bl + br + sl + sr)) * 0.30
         }
         // >8 channels (7.1.4, 7.1.2, 5.1.4, Ambisonics) to 7.1 (FL, FR, FC, LFE, BL, BR, SL, SR)
         (tc, 8, 0) if tc > 8 => {
@@ -3634,14 +3692,13 @@ pub fn get_downmixed_sample(
             let tbr = base_slice.get(11).copied().unwrap_or(0.0);
             (br + sr + INV_SQRT2 * tbr) * 0.65
         }
-        // >8 channels (7.1.4, Ambisonics, etc.) to Stereo
+        // >8 channels (7.1.4, Ambisonics, etc.) to Stereo — ITU-R BS.775-3 (exclude LFE)
         (tc, 2, 0) if tc > 8 => {
             let fl = base_slice.first().copied().unwrap_or(0.0);
             let fc = base_slice.get(2).copied().unwrap_or(0.0);
-            let lfe = base_slice.get(3).copied().unwrap_or(0.0);
             let bl = base_slice.get(4).copied().unwrap_or(0.0);
             let sl = base_slice.get(6).copied().unwrap_or(0.0);
-            let mut sum = fl + INV_SQRT2 * (fc + bl + sl) + 0.5 * lfe;
+            let mut sum = fl + INV_SQRT2 * (fc + bl + sl);
             for idx in (8..tc as usize).step_by(2) {
                 sum += INV_SQRT2 * base_slice.get(idx).copied().unwrap_or(0.0);
             }
@@ -3650,30 +3707,24 @@ pub fn get_downmixed_sample(
         (tc, 2, 1) if tc > 8 => {
             let fr = base_slice.get(1).copied().unwrap_or(0.0);
             let fc = base_slice.get(2).copied().unwrap_or(0.0);
-            let lfe = base_slice.get(3).copied().unwrap_or(0.0);
             let br = base_slice.get(5).copied().unwrap_or(0.0);
             let sr = base_slice.get(7).copied().unwrap_or(0.0);
-            let mut sum = fr + INV_SQRT2 * (fc + br + sr) + 0.5 * lfe;
+            let mut sum = fr + INV_SQRT2 * (fc + br + sr);
             for idx in (9..tc as usize).step_by(2) {
                 sum += INV_SQRT2 * base_slice.get(idx).copied().unwrap_or(0.0);
             }
             sum * (2.0 / (tc as f32).sqrt()).min(0.6)
         }
-        // >8 channels to Mono
+        // >8 channels to Mono — ITU-R BS.775-3 (exclude LFE at index 3)
         (tc, 1, 0) if tc > 8 => {
-            let sum: f32 = base_slice.iter().take(tc as usize).copied().sum();
-            sum / (tc as f32).sqrt()
-        }
-        // 7.1 / 7.1.4 (tc >= 8) to 5.1 (hc == 6): fold Back + Side surround pairs into 5.1 surround L/R
-        (tc, 6, 4) if tc >= 8 => {
-            let bl = base_slice.get(4).copied().unwrap_or(0.0);
-            let sl = base_slice.get(6).copied().unwrap_or(0.0);
-            (bl + sl) * INV_SQRT2
-        }
-        (tc, 6, 5) if tc >= 8 => {
-            let br = base_slice.get(5).copied().unwrap_or(0.0);
-            let sr = base_slice.get(7).copied().unwrap_or(0.0);
-            (br + sr) * INV_SQRT2
+            let fl = base_slice.first().copied().unwrap_or(0.0);
+            let fr = base_slice.get(1).copied().unwrap_or(0.0);
+            let fc = base_slice.get(2).copied().unwrap_or(0.0);
+            let mut sum = fl + fr + SQRT2 * fc;
+            for idx in 4..tc as usize {
+                sum += INV_SQRT2 * base_slice.get(idx).copied().unwrap_or(0.0);
+            }
+            sum * (1.0 / (tc as f32).sqrt()).min(0.30)
         }
         // General fallback: if channel index exists in source, take it
         (tc, _, c) if c < tc as usize => base_slice.get(c).copied().unwrap_or(0.0),
@@ -3729,37 +3780,44 @@ impl AudioSource for SymphoniaSource {
 
         let is_2track = self.audio_tracks.len() == 2;
 
-        // Dynamic energy-cancellation check for 2-track audio
+        // Dynamic energy-cancellation check for 2-track stereo audio (instrumental + full mix vocal guide)
         if !self.is_full_mix_guide && is_2track {
             let t0_opt = self.active_tracks.values().find(|t| t.track_idx == 0);
             let t1_opt = self.active_tracks.values().find(|t| t.track_idx == 1);
             if let (Some(t0), Some(t1)) = (t0_opt, t1_opt) {
                 let ch0 = t0.channels as usize;
                 let ch1 = t1.channels as usize;
-                let avail0 = (t0.samples.len().saturating_sub(t0.buf_pos)) / ch0.max(1);
-                let avail1 = (t1.samples.len().saturating_sub(t1.buf_pos)) / ch1.max(1);
-                let check_frames = avail0.min(avail1).min(512);
-                if check_frames >= 128 {
-                    let mut e0 = 0.0f32;
-                    let mut e1 = 0.0f32;
-                    let mut ediff = 0.0f32;
-                    for i in 0..check_frames {
-                        let s0 = t0.samples.get(t0.buf_pos + i * ch0).copied().unwrap_or(0.0);
-                        let s1 = t1.samples.get(t1.buf_pos + i * ch1).copied().unwrap_or(0.0);
-                        e0 += s0 * s0;
-                        e1 += s1 * s1;
-                        ediff += (s1 - s0) * (s1 - s0);
-                    }
-                    if e0 > 0.001 && e1 > 0.001 && ediff < 0.35 * e1 {
-                        self.is_full_mix_guide = true;
-                        eprintln!(
-                            "[RustTracker Audio] Detected Full Mix vocal guide stem - enabling phase cancellation"
-                        );
-                        #[cfg(target_os = "android")]
-                        crate::android::log_android(
-                            3,
-                            "[RustTracker Audio] Detected Full Mix vocal guide stem - enabling phase cancellation",
-                        );
+                if ch0 == ch1 && ch0 <= 2 {
+                    let avail0 = (t0.samples.len().saturating_sub(t0.buf_pos)) / ch0.max(1);
+                    let avail1 = (t1.samples.len().saturating_sub(t1.buf_pos)) / ch1.max(1);
+                    let check_frames = avail0.min(avail1).min(1024);
+                    if check_frames >= 512 {
+                        let mut e0 = 0.0f32;
+                        let mut e1 = 0.0f32;
+                        let mut ediff = 0.0f32;
+                        for i in 0..check_frames {
+                            let s0 = t0.samples.get(t0.buf_pos + i * ch0).copied().unwrap_or(0.0);
+                            let s1 = t1.samples.get(t1.buf_pos + i * ch1).copied().unwrap_or(0.0);
+                            e0 += s0 * s0;
+                            e1 += s1 * s1;
+                            ediff += (s1 - s0) * (s1 - s0);
+                        }
+                        let min_energy = 0.02 * (check_frames as f32);
+                        if e0 > min_energy
+                            && e1 > min_energy
+                            && ediff > 0.005 * e1
+                            && ediff < 0.30 * e1
+                        {
+                            self.is_full_mix_guide = true;
+                            eprintln!(
+                                "[RustTracker Audio] Detected Full Mix vocal guide stem - enabling phase cancellation"
+                            );
+                            #[cfg(target_os = "android")]
+                            crate::android::log_android(
+                                3,
+                                "[RustTracker Audio] Detected Full Mix vocal guide stem - enabling phase cancellation",
+                            );
+                        }
                     }
                 }
             }
@@ -3898,6 +3956,7 @@ impl AudioSource for SymphoniaSource {
             if is_full_mix && let (Some(t0), Some(t1)) = (t0_info, t1_info) {
                 let v0 = if t0.3 { t0.2 } else { 0.0 };
                 let v1 = if t1.3 { t1.2 } else { 0.0 };
+                let vocal_headroom = 1.0 / ((v0 - v1).abs() + v1.abs()).max(1.0);
 
                 let t0_samples = &self
                     .active_tracks
@@ -3932,7 +3991,7 @@ impl AudioSource for SymphoniaSource {
                         let s1 = get_downmixed_sample(t1.1, ch_slice_1, hardware_channels, c);
                         // Extracted Vocals V = s1 - s0
                         // Desired output: v0 * I + v1 * V = (v0 - v1) * s0 + v1 * s1
-                        let sum_val = (v0 - v1) * s0 + v1 * s1;
+                        let sum_val = ((v0 - v1) * s0 + v1 * s1) * vocal_headroom;
                         let final_val = sum_val.clamp(-1.0, 1.0);
                         output[out_base + c] = final_val;
 
@@ -3945,23 +4004,18 @@ impl AudioSource for SymphoniaSource {
                 for f in 0..frames_to_copy {
                     let out_base = (frames_written + f) * hardware_channels;
 
-                    // Update true channel VUs across all source channels for each active track
-                    for track in self.active_tracks.values() {
-                        if track.enabled && track.volume > 0.0 {
-                            let base_idx = track.buf_pos + f * track.channels as usize;
-                            for ch in 0..track.channels as usize {
-                                if ch < self.channel_vus.len() {
-                                    let s = track
-                                        .samples
-                                        .get(base_idx + ch)
-                                        .copied()
-                                        .unwrap_or(0.0)
-                                        .abs();
-                                    self.channel_vus[ch] =
-                                        self.channel_vus[ch].max(s * track.volume);
-                                }
+                    // Update true post-mix channel VUs across all source channels with headroom applied
+                    for ch in 0..self.channel_vus.len() {
+                        let mut ch_sum = 0.0f32;
+                        for track in self.active_tracks.values() {
+                            if track.enabled && track.volume > 0.0 && ch < track.channels as usize {
+                                let base_idx = track.buf_pos + f * track.channels as usize;
+                                let s = track.samples.get(base_idx + ch).copied().unwrap_or(0.0);
+                                ch_sum += s * track.volume;
                             }
                         }
+                        self.channel_vus[ch] =
+                            self.channel_vus[ch].max((ch_sum * headroom).abs().min(1.0));
                     }
 
                     for c in 0..hardware_channels {
@@ -4184,7 +4238,6 @@ impl AudioSource for SymphoniaSource {
 // ---------------------------------------------------------
 // FFmpeg Native Decoder (including AOMedia IAMF / Eclipsa Audio)
 // ---------------------------------------------------------
-#[cfg(not(target_os = "android"))]
 #[derive(Clone, Debug)]
 pub struct IamfSubstreamChannelMap {
     pub stream_index: usize,
@@ -4194,7 +4247,6 @@ pub struct IamfSubstreamChannelMap {
     pub targets: Vec<(usize, f32)>,
 }
 
-#[cfg(not(target_os = "android"))]
 #[derive(Clone, Debug)]
 pub struct IamfTrackGroup {
     pub substream_indices: Vec<usize>,
@@ -4205,7 +4257,6 @@ pub struct IamfTrackGroup {
     pub channel_mappings: Vec<IamfSubstreamChannelMap>,
 }
 
-#[cfg(not(target_os = "android"))]
 #[repr(C)]
 struct FfiIamfLayer {
     av_class: *const ffmpeg_next::ffi::AVClass,
@@ -4218,7 +4269,6 @@ struct FfiIamfLayer {
     nb_demixing_matrix: std::ffi::c_uint,
 }
 
-#[cfg(not(target_os = "android"))]
 #[repr(C)]
 struct FfiIamfAudioElement {
     av_class: *const ffmpeg_next::ffi::AVClass,
@@ -4230,7 +4280,6 @@ struct FfiIamfAudioElement {
     default_w: std::ffi::c_uint,
 }
 
-#[cfg(not(target_os = "android"))]
 #[repr(C)]
 struct FfiIamfSubmixElement {
     av_class: *const ffmpeg_next::ffi::AVClass,
@@ -4241,7 +4290,6 @@ struct FfiIamfSubmixElement {
     annotations: *mut ffmpeg_next::ffi::AVDictionary,
 }
 
-#[cfg(not(target_os = "android"))]
 #[repr(C)]
 struct FfiIamfSubmix {
     av_class: *const ffmpeg_next::ffi::AVClass,
@@ -4253,7 +4301,6 @@ struct FfiIamfSubmix {
     default_mix_gain: ffmpeg_next::ffi::AVRational,
 }
 
-#[cfg(not(target_os = "android"))]
 #[repr(C)]
 struct FfiIamfMixPresentation {
     av_class: *const ffmpeg_next::ffi::AVClass,
@@ -4262,7 +4309,6 @@ struct FfiIamfMixPresentation {
     annotations: *mut ffmpeg_next::ffi::AVDictionary,
 }
 
-#[cfg(not(target_os = "android"))]
 fn iamf_rational_db_to_linear(r: ffmpeg_next::ffi::AVRational) -> f32 {
     if r.den == 0 || r.num == 0 {
         return 1.0;
@@ -4271,7 +4317,6 @@ fn iamf_rational_db_to_linear(r: ffmpeg_next::ffi::AVRational) -> f32 {
     10.0f32.powf(db / 20.0)
 }
 
-#[cfg(not(target_os = "android"))]
 unsafe fn extract_first_av_dict_entry(
     dict: *const ffmpeg_next::ffi::AVDictionary,
 ) -> (Option<String>, Option<String>) {
@@ -4310,7 +4355,6 @@ unsafe fn extract_first_av_dict_entry(
     (key, val)
 }
 
-#[cfg(not(target_os = "android"))]
 pub fn map_iamf_av_channels_to_canonical(
     av_channels: &[i32],
     substreams: &[(usize, u16)],
@@ -4579,7 +4623,6 @@ pub fn map_iamf_av_channels_to_canonical(
     (recon_channels, layout_label, mappings)
 }
 
-#[cfg(not(target_os = "android"))]
 fn map_iamf_ambisonics_to_canonical(
     substreams: &[(usize, u16)],
     nb_acn_channels: usize,
@@ -4659,7 +4702,6 @@ fn map_iamf_ambisonics_to_canonical(
     (12, order_label, mappings)
 }
 
-#[cfg(not(target_os = "android"))]
 fn probe_iamf_stream_groups(ictx: &ffmpeg_next::format::context::Input) -> Vec<IamfTrackGroup> {
     let mut result = Vec::new();
 
@@ -4882,7 +4924,6 @@ fn probe_iamf_stream_groups(ictx: &ffmpeg_next::format::context::Input) -> Vec<I
 
 /// Estimates or scans the duration in seconds of a standalone `.iamf` OBU stream when
 /// container header duration is unavailable (`AV_NOPTS_VALUE`).
-#[cfg(not(target_os = "android"))]
 fn probe_iamf_duration_seconds(file_path: &str) -> Option<f64> {
     let file_len = std::fs::metadata(file_path).ok()?.len();
     if file_len == 0 {
@@ -4983,7 +5024,6 @@ pub fn is_iamf_container(file_path: &str) -> bool {
     false
 }
 
-#[cfg(not(target_os = "android"))]
 struct ActiveFfmpegTrack {
     track_idx: usize,
     stream_index: usize,
@@ -5000,7 +5040,6 @@ struct ActiveFfmpegTrack {
     substream_bitrate_kbps: Option<u32>,
 }
 
-#[cfg(not(target_os = "android"))]
 struct FfmpegSource {
     ictx: ffmpeg_next::format::context::Input,
     active_tracks: std::collections::HashMap<usize, ActiveFfmpegTrack>,
@@ -5034,7 +5073,6 @@ struct FfmpegSource {
     is_full_mix_guide: bool,
 }
 
-#[cfg(not(target_os = "android"))]
 fn safe_ffmpeg_channel_layout(
     layout: ffmpeg_next::channel_layout::ChannelLayout,
     channels: u16,
@@ -5047,7 +5085,6 @@ fn safe_ffmpeg_channel_layout(
     }
 }
 
-#[cfg(not(target_os = "android"))]
 impl FfmpegSource {
     fn fill_buffers(&mut self) -> bool {
         let mut progress = false;
@@ -5343,7 +5380,6 @@ impl FfmpegSource {
     }
 }
 
-#[cfg(not(target_os = "android"))]
 impl AudioSource for FfmpegSource {
     fn read_frames(
         &mut self,
@@ -5387,40 +5423,47 @@ impl AudioSource for FfmpegSource {
         let has_iamf = self.iamf_groups.iter().any(|g| g.is_some());
         let is_2track = self.audio_tracks.len() == 2 && !has_iamf;
 
-        // Dynamic energy-cancellation check for 2-track audio
+        // Dynamic energy-cancellation check for 2-track stereo audio (instrumental + full mix vocal guide)
         if !self.is_full_mix_guide && is_2track {
             let t0_opt = self.active_tracks.values().find(|t| t.track_idx == 0);
             let t1_opt = self.active_tracks.values().find(|t| t.track_idx == 1);
             if let (Some(t0), Some(t1)) = (t0_opt, t1_opt) {
                 let ch0 = t0.channels as usize;
                 let ch1 = t1.channels as usize;
-                let avail0 = (t0.sample_buf.len().saturating_sub(t0.buf_pos)) / ch0.max(1);
-                let avail1 = (t1.sample_buf.len().saturating_sub(t1.buf_pos)) / ch1.max(1);
-                let check_frames = avail0.min(avail1).min(512);
-                if check_frames >= 128 {
-                    let mut e0 = 0.0f32;
-                    let mut e1 = 0.0f32;
-                    let mut ediff = 0.0f32;
-                    for i in 0..check_frames {
-                        let s0 = t0
-                            .sample_buf
-                            .get(t0.buf_pos + i * ch0)
-                            .copied()
-                            .unwrap_or(0.0);
-                        let s1 = t1
-                            .sample_buf
-                            .get(t1.buf_pos + i * ch1)
-                            .copied()
-                            .unwrap_or(0.0);
-                        e0 += s0 * s0;
-                        e1 += s1 * s1;
-                        ediff += (s1 - s0) * (s1 - s0);
-                    }
-                    if e0 > 0.001 && e1 > 0.001 && ediff < 0.35 * e1 {
-                        self.is_full_mix_guide = true;
-                        eprintln!(
-                            "[RustTracker Audio] Detected Full Mix vocal guide stem in FFmpegSource - enabling phase cancellation"
-                        );
+                if ch0 == ch1 && ch0 <= 2 {
+                    let avail0 = (t0.sample_buf.len().saturating_sub(t0.buf_pos)) / ch0.max(1);
+                    let avail1 = (t1.sample_buf.len().saturating_sub(t1.buf_pos)) / ch1.max(1);
+                    let check_frames = avail0.min(avail1).min(1024);
+                    if check_frames >= 512 {
+                        let mut e0 = 0.0f32;
+                        let mut e1 = 0.0f32;
+                        let mut ediff = 0.0f32;
+                        for i in 0..check_frames {
+                            let s0 = t0
+                                .sample_buf
+                                .get(t0.buf_pos + i * ch0)
+                                .copied()
+                                .unwrap_or(0.0);
+                            let s1 = t1
+                                .sample_buf
+                                .get(t1.buf_pos + i * ch1)
+                                .copied()
+                                .unwrap_or(0.0);
+                            e0 += s0 * s0;
+                            e1 += s1 * s1;
+                            ediff += (s1 - s0) * (s1 - s0);
+                        }
+                        let min_energy = 0.02 * (check_frames as f32);
+                        if e0 > min_energy
+                            && e1 > min_energy
+                            && ediff > 0.005 * e1
+                            && ediff < 0.30 * e1
+                        {
+                            self.is_full_mix_guide = true;
+                            eprintln!(
+                                "[RustTracker Audio] Detected Full Mix vocal guide stem in FFmpegSource - enabling phase cancellation"
+                            );
+                        }
                     }
                 }
             }
@@ -5507,6 +5550,7 @@ impl AudioSource for FfmpegSource {
             if is_full_mix && let (Some(t0), Some(t1)) = (t0_info, t1_info) {
                 let v0 = if t0.3 { t0.2 } else { 0.0 };
                 let v1 = if t1.3 { t1.2 } else { 0.0 };
+                let vocal_headroom = 1.0 / ((v0 - v1).abs() + v1.abs()).max(1.0);
 
                 let t0_samples = &self
                     .active_tracks
@@ -5541,7 +5585,7 @@ impl AudioSource for FfmpegSource {
                         let s1 = get_downmixed_sample(t1.1, ch_slice_1, hardware_channels, c);
                         // Extracted Vocals V = s1 - s0
                         // Desired output: v0 * I + v1 * V = (v0 - v1) * s0 + v1 * s1
-                        let sum_val = (v0 - v1) * s0 + v1 * s1;
+                        let sum_val = ((v0 - v1) * s0 + v1 * s1) * vocal_headroom;
                         let final_val = sum_val.clamp(-1.0, 1.0);
                         output[out_base + c] = final_val;
 
@@ -5603,23 +5647,18 @@ impl AudioSource for FfmpegSource {
                 for f in 0..frames_to_copy {
                     let out_idx = (frames_written + f) * hardware_channels;
 
-                    // Update true channel VUs across all source channels for each active track
-                    for track in self.active_tracks.values() {
-                        if track.enabled && track.volume > 0.0 {
-                            let in_idx = track.buf_pos + f * track.channels as usize;
-                            for ch in 0..track.channels as usize {
-                                if ch < self.channel_vus.len() {
-                                    let s = track
-                                        .sample_buf
-                                        .get(in_idx + ch)
-                                        .copied()
-                                        .unwrap_or(0.0)
-                                        .abs();
-                                    self.channel_vus[ch] =
-                                        self.channel_vus[ch].max(s * track.volume);
-                                }
+                    // Update true post-mix channel VUs across all source channels with headroom applied
+                    for ch in 0..self.channel_vus.len() {
+                        let mut ch_sum = 0.0f32;
+                        for track in self.active_tracks.values() {
+                            if track.enabled && track.volume > 0.0 && ch < track.channels as usize {
+                                let in_idx = track.buf_pos + f * track.channels as usize;
+                                let s = track.sample_buf.get(in_idx + ch).copied().unwrap_or(0.0);
+                                ch_sum += s * track.volume;
                             }
                         }
+                        self.channel_vus[ch] =
+                            self.channel_vus[ch].max((ch_sum * headroom).abs().min(1.0));
                     }
 
                     for c in 0..hardware_channels {
@@ -5927,7 +5966,6 @@ impl AudioSource for FfmpegSource {
 // ---------------------------------------------------------
 // Video Only Source (No Audio)
 // ---------------------------------------------------------
-#[cfg(not(target_os = "android"))]
 struct VideoOnlySource {
     ictx: ffmpeg_next::format::context::Input,
     video_stream_index: usize,
@@ -5945,78 +5983,6 @@ struct VideoOnlySource {
     ext_type: String,
 }
 
-#[cfg(target_os = "android")]
-struct AndroidVideoOnlySource {
-    current_time: f64,
-    duration: f64,
-}
-
-#[cfg(target_os = "android")]
-impl AudioSource for AndroidVideoOnlySource {
-    fn read_frames(
-        &mut self,
-        hardware_channels: usize,
-        sample_rate: u32,
-        output: &mut [f32],
-    ) -> usize {
-        let frames_to_write = output.len() / hardware_channels;
-        for v in output.iter_mut() {
-            *v = 0.0;
-        }
-        self.current_time += frames_to_write as f64 / sample_rate as f64;
-        frames_to_write
-    }
-    fn get_duration_seconds(&mut self) -> f64 {
-        self.duration
-    }
-    fn get_position_seconds(&mut self) -> f64 {
-        self.current_time
-    }
-    fn set_position_seconds(&mut self, pos: f64) {
-        self.current_time = pos;
-    }
-    fn get_num_channels(&mut self) -> i32 {
-        2
-    }
-    fn get_current_channel_vu_mono(&mut self, _channel: i32) -> f32 {
-        0.0
-    }
-    fn get_artist(&mut self) -> String {
-        "Video Stream".to_string()
-    }
-    fn get_type(&mut self) -> String {
-        "Video".to_string()
-    }
-    fn get_tempo(&mut self) -> i32 {
-        0
-    }
-    fn get_speed(&mut self) -> i32 {
-        0
-    }
-    fn get_intrinsic_sample_rate(&mut self) -> Option<u32> {
-        Some(48000)
-    }
-    fn get_num_samples(&mut self) -> i32 {
-        0
-    }
-    fn get_num_instruments(&mut self) -> i32 {
-        0
-    }
-    fn get_num_patterns(&mut self) -> i32 {
-        0
-    }
-    fn get_current_order(&mut self) -> i32 {
-        0
-    }
-    fn get_current_row(&mut self) -> i32 {
-        0
-    }
-    fn has_video_stream(&self) -> bool {
-        true
-    }
-}
-
-#[cfg(not(target_os = "android"))]
 impl AudioSource for VideoOnlySource {
     fn read_frames(
         &mut self,
@@ -6029,30 +5995,33 @@ impl AudioSource for VideoOnlySource {
             *v = 0.0;
         }
 
-        let tb_f64 = self
-            .video_time_base
-            .map(|tb| tb.numerator() as f64 / tb.denominator().max(1) as f64)
-            .unwrap_or(1.0 / 30.0);
-        let target_pts = self.current_time + (frames_to_write as f64 / sample_rate as f64) + 0.25;
-        let mut packets_read = 0;
-        while packets_read < 16 && self.last_video_pts <= target_pts {
-            if let Some((stream, packet)) = self.ictx.packets().next() {
-                if stream.index() == self.video_stream_index {
-                    if let Some(ts) = packet.dts().or_else(|| packet.pts()) {
-                        let pkt_sec = ts as f64 * tb_f64;
-                        if pkt_sec > self.last_video_pts {
-                            self.last_video_pts = pkt_sec;
+        if self.video_tx.is_some() {
+            let tb_f64 = self
+                .video_time_base
+                .map(|tb| tb.numerator() as f64 / tb.denominator().max(1) as f64)
+                .unwrap_or(1.0 / 30.0);
+            let target_pts =
+                self.current_time + (frames_to_write as f64 / sample_rate as f64) + 0.25;
+            let mut packets_read = 0;
+            while packets_read < 16 && self.last_video_pts <= target_pts {
+                if let Some((stream, packet)) = self.ictx.packets().next() {
+                    if stream.index() == self.video_stream_index {
+                        if let Some(ts) = packet.dts().or_else(|| packet.pts()) {
+                            let pkt_sec = ts as f64 * tb_f64;
+                            if pkt_sec > self.last_video_pts {
+                                self.last_video_pts = pkt_sec;
+                            }
+                        } else {
+                            self.last_video_pts += 1.0 / 30.0;
                         }
-                    } else {
-                        self.last_video_pts += 1.0 / 30.0;
+                        if let Some(tx) = &self.video_tx {
+                            let _ = tx.try_send((self.video_epoch, packet.clone()));
+                        }
+                        packets_read += 1;
                     }
-                    if let Some(tx) = &self.video_tx {
-                        let _ = tx.try_send((self.video_epoch, packet.clone()));
-                    }
-                    packets_read += 1;
+                } else {
+                    break;
                 }
-            } else {
-                break;
             }
         }
 
@@ -6153,7 +6122,6 @@ impl AudioSource for VideoOnlySource {
     }
 }
 
-#[cfg(not(target_os = "android"))]
 #[derive(Clone)]
 pub struct VideoStreamSetup {
     pub stream_index: usize,
@@ -6165,7 +6133,6 @@ pub struct VideoStreamSetup {
     pub bitrate_kbps: Option<u32>,
 }
 
-#[cfg(not(target_os = "android"))]
 pub fn probe_stream_bitrate_kbps(stream: &ffmpeg_next::format::stream::Stream) -> Option<u32> {
     let raw_br = unsafe { (*stream.parameters().as_ptr()).bit_rate };
     if raw_br > 0 {
@@ -6184,9 +6151,22 @@ pub fn probe_stream_bitrate_kbps(stream: &ffmpeg_next::format::stream::Stream) -
     None
 }
 
-#[cfg(not(target_os = "android"))]
 pub fn probe_video_stream(ictx: &ffmpeg_next::format::context::Input) -> Option<VideoStreamSetup> {
-    let v_stream = ictx.streams().best(ffmpeg_next::media::Type::Video)?;
+    let v_stream = ictx
+        .streams()
+        .best(ffmpeg_next::media::Type::Video)
+        .filter(|s| {
+            !s.disposition()
+                .contains(ffmpeg_next::format::stream::Disposition::ATTACHED_PIC)
+        })
+        .or_else(|| {
+            ictx.streams().find(|s| {
+                s.parameters().medium() == ffmpeg_next::media::Type::Video
+                    && !s
+                        .disposition()
+                        .contains(ffmpeg_next::format::stream::Disposition::ATTACHED_PIC)
+            })
+        })?;
     let stream_index = v_stream.index();
     let params = v_stream.parameters();
     let time_base = v_stream.time_base();
@@ -6240,30 +6220,59 @@ pub fn probe_video_stream(ictx: &ffmpeg_next::format::context::Input) -> Option<
         }
     }
 
-    let info =
-        if let Ok(v_ctx) = ffmpeg_next::codec::context::Context::from_parameters(params.clone()) {
-            if let Ok(v_dec) = v_ctx.decoder().video() {
-                let (disp_w, disp_h) = if rotation == 90 || rotation == 270 {
-                    (v_dec.height(), v_dec.width())
-                } else {
-                    (v_dec.width(), v_dec.height())
-                };
-                format!(
-                    "{} ({}x{})",
-                    v_dec
-                        .codec()
-                        .map(|c| c.name().to_string())
-                        .unwrap_or("H264".to_string())
-                        .to_uppercase(),
-                    disp_w,
-                    disp_h
-                )
-            } else {
-                "Unsupported Codec".to_string()
-            }
+    let raw_w = unsafe { (*params.as_ptr()).width.max(0) as u32 };
+    let raw_h = unsafe { (*params.as_ptr()).height.max(0) as u32 };
+    let raw_codec_name = unsafe {
+        let name_ptr = ffmpeg_next::ffi::avcodec_get_name((*params.as_ptr()).codec_id);
+        if !name_ptr.is_null() {
+            std::ffi::CStr::from_ptr(name_ptr)
+                .to_str()
+                .unwrap_or("H264")
+                .to_uppercase()
         } else {
-            "Unsupported Codec".to_string()
+            "H264".to_string()
+        }
+    };
+
+    let info = if let Ok(v_ctx) =
+        ffmpeg_next::codec::context::Context::from_parameters(params.clone())
+        && let Ok(v_dec) = v_ctx.decoder().video()
+    {
+        let w = if v_dec.width() > 0 {
+            v_dec.width()
+        } else {
+            raw_w
         };
+        let h = if v_dec.height() > 0 {
+            v_dec.height()
+        } else {
+            raw_h
+        };
+        let (disp_w, disp_h) = if rotation == 90 || rotation == 270 {
+            (h, w)
+        } else {
+            (w, h)
+        };
+        format!(
+            "{} ({}x{})",
+            v_dec
+                .codec()
+                .map(|c| c.name().to_string())
+                .unwrap_or_else(|| raw_codec_name.clone())
+                .to_uppercase(),
+            disp_w,
+            disp_h
+        )
+    } else if raw_w > 0 && raw_h > 0 {
+        let (disp_w, disp_h) = if rotation == 90 || rotation == 270 {
+            (raw_h, raw_w)
+        } else {
+            (raw_w, raw_h)
+        };
+        format!("{} ({}x{})", raw_codec_name, disp_w, disp_h)
+    } else {
+        "Unsupported Codec".to_string()
+    };
 
     Some(VideoStreamSetup {
         stream_index,
@@ -6276,7 +6285,6 @@ pub fn probe_video_stream(ictx: &ffmpeg_next::format::context::Input) -> Option<
     })
 }
 
-#[cfg(not(target_os = "android"))]
 fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>> {
     let _ = ffmpeg_next::init();
     let mut dict = ffmpeg_next::Dictionary::new();
@@ -7133,13 +7141,10 @@ pub fn try_symphonia<R: symphonia::core::io::MediaSource + 'static>(
 }
 
 pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
-    #[cfg(not(target_os = "android"))]
-    {
-        unsafe {
-            ffmpeg_next::ffi::av_log_set_level(ffmpeg_next::ffi::AV_LOG_FATAL);
-        }
-        ffmpeg_next::format::network::init();
+    unsafe {
+        ffmpeg_next::ffi::av_log_set_level(ffmpeg_next::ffi::AV_LOG_FATAL);
     }
+    ffmpeg_next::format::network::init();
 
     if file_path.starts_with("http") {
         let mut actual_path = file_path.to_string();
@@ -7186,7 +7191,6 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
             }
         }
 
-        #[cfg(not(target_os = "android"))]
         if let Ok(source) = try_ffmpeg(&actual_path, true) {
             return Ok(source);
         }
@@ -7244,8 +7248,7 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
 
     let video_info = None; // Symphonia doesn't do video
 
-    // 1. Prioritize FFmpeg for video containers (MKV, MP4, WEBM, MOV, AVI) and raw surround bitstreams (IAMF, DTS-HD, DTS, AC3, E-AC3, TrueHD) on desktop.
-    #[cfg(not(target_os = "android"))]
+    // 1. Prioritize FFmpeg for video containers (MKV, MP4, WEBM, MOV, AVI) and raw surround bitstreams (IAMF, DTS-HD, DTS, AC3, E-AC3, TrueHD).
     if matches!(
         ext.as_str(),
         "mkv"
@@ -7278,6 +7281,14 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
             Ok(source) => return Ok(source),
             Err(err) => {
                 eprintln!("FFmpeg load failed for {}: {:?}", file_path, err);
+                #[cfg(target_os = "android")]
+                crate::android::log_android(
+                    4,
+                    &format!(
+                        "[RustTracker] FFmpeg primary load failed for {}: {:?}",
+                        file_path, err
+                    ),
+                );
             }
         }
     }
@@ -7328,6 +7339,7 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
                     module: SafeModule(module),
                     left_buf: Vec::with_capacity(8192),
                     right_buf: Vec::with_capacity(8192),
+                    volume: 1.0,
                 }));
             }
         }
@@ -7428,49 +7440,23 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
                     module: SafeModule(module),
                     left_buf: Vec::with_capacity(8192),
                     right_buf: Vec::with_capacity(8192),
+                    volume: 1.0,
                 }));
             }
         }
     }
 
-    // 5. Try FFmpeg native bindings on desktop as universal fallback
-    #[cfg(not(target_os = "android"))]
-    {
-        let ffmpeg_result = try_ffmpeg(file_path, false);
-        if let Ok(source) = ffmpeg_result {
-            return Ok(source);
-        } else if let Err(ref err) = ffmpeg_result {
-            if let Some(se) = symphonia_error {
-                eprintln!(
-                    "[RustTracker] Symphonia load failed for {}: {:?}",
-                    file_path, se
-                );
-            }
-            eprintln!("FFmpeg fallback load failed for {}: {:?}", file_path, err);
-        }
-
-        // If all failed, return the ffmpeg error since it's the most descriptive for standard media
-        ffmpeg_result
-    }
-
-    // 6. Fallback for Video-Only containers on Android (e.g. camera videos or silent MP4 clips)
-    #[cfg(target_os = "android")]
-    {
-        if ext == "mp4"
-            || ext == "mkv"
-            || ext == "mov"
-            || ext == "webm"
-            || ext == "3gp"
-            || ext == "m4v"
-            || ext == "avi"
-            || ext == "ts"
-        {
-            return Ok(Box::new(AndroidVideoOnlySource {
-                current_time: 0.0,
-                duration: 0.0,
-            }));
-        }
-        if let Some(se) = symphonia_error {
+    // 5. Try FFmpeg native bindings as universal fallback
+    let ffmpeg_result = try_ffmpeg(file_path, false);
+    if let Ok(source) = ffmpeg_result {
+        return Ok(source);
+    } else if let Err(ref err) = ffmpeg_result {
+        if let Some(ref se) = symphonia_error {
+            eprintln!(
+                "[RustTracker] Symphonia load failed for {}: {:?}",
+                file_path, se
+            );
+            #[cfg(target_os = "android")]
             crate::android::log_android(
                 5,
                 &format!(
@@ -7478,17 +7464,20 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
                     file_path, se
                 ),
             );
-            return Err(anyhow::anyhow!(
-                "Unsupported or unreadable audio format ({:?}): {}",
-                se,
-                file_path
-            ));
         }
-        Err(anyhow::anyhow!(
-            "Unsupported or unreadable audio format: {}",
-            file_path
-        ))
+        eprintln!("FFmpeg fallback load failed for {}: {:?}", file_path, err);
+        #[cfg(target_os = "android")]
+        crate::android::log_android(
+            5,
+            &format!(
+                "[RustTracker] FFmpeg fallback load failed for {}: {:?}",
+                file_path, err
+            ),
+        );
     }
+
+    // If all failed, return the ffmpeg error since it's the most descriptive for standard media
+    ffmpeg_result
 }
 
 pub fn start_audio_thread(
@@ -8597,7 +8586,6 @@ fn process_decoder_state_requests(
 ) -> bool {
     let mut seeked = false;
     if let Some(mix_req) = state.audio_mix_request.take()
-        && state.audio_tracks.len() > 1
         && !mix_req.is_empty()
     {
         let mut new_active: Vec<usize> = mix_req.iter().map(|&(idx, _)| idx).collect();
@@ -8649,8 +8637,9 @@ fn process_decoder_state_requests(
             state.stats.audio_bitrate_kbps = state.bitrate;
             state.multi_track_mix_mode = state.active_audio_tracks.len() > 1;
 
-            if state.audio_track_volumes.len() != state.audio_tracks.len() {
-                state.audio_track_volumes = vec![1.0; state.audio_tracks.len()];
+            let num_tracks = state.audio_tracks.len().max(1);
+            if state.audio_track_volumes.len() != num_tracks {
+                state.audio_track_volumes = vec![1.0; num_tracks];
             }
             for &(idx, vol) in &mix_req {
                 if idx < state.audio_track_volumes.len() {
@@ -9808,6 +9797,27 @@ fn spawn_media_decoder_threads(
     });
 }
 
+#[inline]
+fn compute_fft_mono_sample(frame_slice: &[f32], src_ch: usize) -> f32 {
+    let ch_count = src_ch.min(frame_slice.len()).max(1);
+    let mut mono = 0.0f32;
+    for (c, &s) in frame_slice.iter().enumerate().take(ch_count) {
+        let w = match c {
+            0 | 1 => {
+                if ch_count == 1 {
+                    1.0
+                } else {
+                    0.5
+                }
+            }
+            2 => std::f32::consts::FRAC_1_SQRT_2,
+            _ => 0.25,
+        };
+        mono += s * w;
+    }
+    mono.clamp(-1.0, 1.0)
+}
+
 fn run_dummy(
     audio_source: Box<dyn AudioSource>,
     shared_state: Arc<Mutex<AppState>>,
@@ -9909,8 +9919,8 @@ fn run_dummy(
                                 upmix_peak_vus[c] = upmix_peak_vus[c].max(s.abs());
                                 channel_fft_buffers[c][fft_index] = s;
                             }
-                            let mono = (out_channels[0] + out_channels[1]) * 0.5;
-                            fft_buffer[fft_index] = mono.clamp(-1.0, 1.0);
+                            let mono = compute_fft_mono_sample(frame_slice, src_ch);
+                            fft_buffer[fft_index] = mono;
                             fft_index = (fft_index + 1) % window_size;
                         }
                     } else {
@@ -10159,8 +10169,8 @@ fn run_linux_pipewire_mpegh_714(
                                 upmix_peak_vus[c] = upmix_peak_vus[c].max(s.abs());
                                 channel_fft_buffers[c][fft_index] = s;
                             }
-                            let mono = (out_channels[0] + out_channels[1]) * 0.5;
-                            fft_buffer[fft_index] = mono.clamp(-1.0, 1.0);
+                            let mono = compute_fft_mono_sample(frame_slice, src_ch);
+                            fft_buffer[fft_index] = mono;
                             fft_index = (fft_index + 1) % window_size;
 
                             if let Ok(true) = mpegh_encoder
@@ -10175,11 +10185,17 @@ fn run_linux_pipewire_mpegh_714(
                                 iec_byte_queue.clear();
                             }
                         } else {
-                            let mut cicp_frame = [0.0f32; 12];
+                            let mut rt_frame = [0.0f32; 12];
+                            for c in 0..12 {
+                                rt_frame[c] = frame_slice[c].clamp(-1.0, 1.0);
+                            }
+                            if src_ch >= 8 {
+                                rt_frame.swap(4, 6);
+                                rt_frame.swap(5, 7);
+                            }
                             let mut mono = 0.0f32;
                             for c in 0..12 {
-                                let s = frame_slice[c].clamp(-1.0, 1.0);
-                                cicp_frame[c] = s;
+                                let s = rt_frame[c];
                                 let ch_weight = match c {
                                     0 | 1 => 0.5,
                                     2 => std::f32::consts::FRAC_1_SQRT_2,
@@ -10191,8 +10207,8 @@ fn run_linux_pipewire_mpegh_714(
                             fft_buffer[fft_index] = mono.clamp(-1.0, 1.0);
                             fft_index = (fft_index + 1) % window_size;
 
-                            if let Ok(true) =
-                                mpegh_encoder.push_cicp19_frame(&cicp_frame, &mut iec_byte_queue)
+                            if let Ok(true) = mpegh_encoder
+                                .push_rusttracker_714_frame(&rt_frame, &mut iec_byte_queue)
                             {
                                 let (s1, s2) = iec_byte_queue.as_slices();
                                 if pw_stdin.write_all(s1).is_err()
@@ -11914,7 +11930,7 @@ fn run_wasapi_exclusive_multichannel(
                                     channel_fft_buffers[c][fft_index] = s;
                                 }
 
-                                let mono = (out_channels[0] + out_channels[1]) * 0.5 * fade_gain;
+                                let mono = compute_fft_mono_sample(frame_slice, src_ch) * fade_gain;
                                 fft_buffer[fft_index] = mono.clamp(-1.0, 1.0);
                                 fft_index = (fft_index + 1) % window_size;
                             }
@@ -11933,7 +11949,7 @@ fn run_wasapi_exclusive_multichannel(
                                 let mut mono = 0.0f32;
                                 for c in 0..12 {
                                     let sample = if c < src_ch && c < hardware_channels {
-                                        let src_c = if src_ch == 8 {
+                                        let src_c = if src_ch >= 8 {
                                             match c {
                                                 4 => 6, // Canonical SL <- 0x63F slot 6 (SL)
                                                 5 => 7, // Canonical SR <- 0x63F slot 7 (SR)
@@ -12167,7 +12183,8 @@ fn run_wasapi_exclusive_multichannel(
                                         upmix_peak_vus[c] = upmix_peak_vus[c].max(s.abs());
                                         channel_fft_buffers[c][fft_index] = s;
                                     }
-                                    let mono = (out_channels[0] + out_channels[1]) * 0.5;
+                                    let mono =
+                                        compute_fft_mono_sample(frame_slice, src_ch) * fade_gain;
                                     fft_buffer[fft_index] = mono.clamp(-1.0, 1.0);
                                     fft_index = (fft_index + 1) % window_size;
 
@@ -12176,15 +12193,22 @@ fn run_wasapi_exclusive_multichannel(
                                         &mut iec_byte_queue,
                                     );
                                 } else {
-                                    let mut cicp_frame = [0.0f32; 12];
-                                    let mut mono = 0.0f32;
+                                    let mut rt_frame = [0.0f32; 12];
                                     for c in 0..12 {
                                         let sample = if c < hardware_channels {
                                             (frame_slice[c] * fade_gain).clamp(-1.0, 1.0)
                                         } else {
                                             0.0
                                         };
-                                        cicp_frame[c] = sample;
+                                        rt_frame[c] = sample;
+                                    }
+                                    if src_ch >= 8 {
+                                        rt_frame.swap(4, 6);
+                                        rt_frame.swap(5, 7);
+                                    }
+                                    let mut mono = 0.0f32;
+                                    for c in 0..12 {
+                                        let sample = rt_frame[c];
                                         let ch_weight = match c {
                                             0 | 1 => 0.5,
                                             2 => std::f32::consts::FRAC_1_SQRT_2,
@@ -12197,7 +12221,7 @@ fn run_wasapi_exclusive_multichannel(
                                     fft_index = (fft_index + 1) % window_size;
 
                                     let _ = mpegh_encoder
-                                        .push_cicp19_frame(&cicp_frame, &mut iec_byte_queue);
+                                        .push_rusttracker_714_frame(&rt_frame, &mut iec_byte_queue);
                                 }
 
                                 chunk_frame_pos += 1;
@@ -12343,7 +12367,7 @@ fn run_wasapi_exclusive_multichannel(
                                     }
 
                                     let mono =
-                                        (out_channels[0] + out_channels[1]) * 0.5 * fade_gain;
+                                        compute_fft_mono_sample(frame_slice, src_ch) * fade_gain;
                                     fft_buffer[fft_index] = mono.clamp(-1.0, 1.0);
                                     fft_index = (fft_index + 1) % window_size;
                                 }
@@ -12901,7 +12925,7 @@ where
                                 channel_fft_buffers[c][fft_index] = s;
                             }
 
-                            let mono = (out_channels[0] + out_channels[1]) * 0.5 * fade_gain;
+                            let mono = compute_fft_mono_sample(frame_slice, src_ch) * fade_gain;
                             fft_buffer[fft_index] = mono.clamp(-1.0, 1.0);
                             fft_index = (fft_index + 1) % window_size;
                         }
@@ -13270,15 +13294,15 @@ mod tests {
 
     #[test]
     fn test_get_downmixed_sample_5_1_surround() {
-        // FL, FR, FC, LFE, BL, BR
+        // FL, FR, FC, LFE, BL, BR — ITU-R BS.775-3 excludes LFE from stereo downmix
         let surround_samples = [0.5f32, 0.5f32, 0.4f32, 0.2f32, 0.3f32, 0.3f32];
         const INV_SQRT2: f32 = std::f32::consts::FRAC_1_SQRT_2;
 
         let left = get_downmixed_sample(6, &surround_samples, 2, 0);
         let right = get_downmixed_sample(6, &surround_samples, 2, 1);
 
-        let expected_left = (0.5 + INV_SQRT2 * 0.4 + INV_SQRT2 * 0.3 + 0.5 * 0.2) * INV_SQRT2;
-        let expected_right = (0.5 + INV_SQRT2 * 0.4 + INV_SQRT2 * 0.3 + 0.5 * 0.2) * INV_SQRT2;
+        let expected_left = (0.5 + INV_SQRT2 * 0.4 + INV_SQRT2 * 0.3) * INV_SQRT2;
+        let expected_right = (0.5 + INV_SQRT2 * 0.4 + INV_SQRT2 * 0.3) * INV_SQRT2;
 
         assert!((left - expected_left).abs() < 1e-6);
         assert!((right - expected_right).abs() < 1e-6);
@@ -14869,6 +14893,7 @@ Sink #105
             module: SafeModule(module),
             left_buf: Vec::new(),
             right_buf: Vec::new(),
+            volume: 1.0,
         };
         let duration = src.get_duration_seconds();
         let tracker_ch = src.get_tracker_channels().unwrap_or(0);
@@ -15471,8 +15496,11 @@ Sink #105
             .unwrap_or_default();
 
         // 1. Verify native Dolby Atmos track detection ("01 - Major Tom (Coming Home).mkv")
-        let atmos_path = format!("{}\\Music\\01 - Major Tom (Coming Home).mkv", user_profile);
-        if std::path::Path::new(&atmos_path).exists() {
+        let atmos_path_buf = std::path::Path::new(&user_profile)
+            .join("Music")
+            .join("01 - Major Tom (Coming Home).mkv");
+        let atmos_path = atmos_path_buf.to_string_lossy().into_owned();
+        if atmos_path_buf.exists() {
             let mut src = load_audio_source(&atmos_path).expect("load Major Tom mkv");
             assert!(
                 src.is_native_atmos(),
@@ -15490,18 +15518,45 @@ Sink #105
                 !st.surround_upmix.enabled,
                 "Surround Upmix must be automatically disabled for native Dolby Atmos"
             );
+            let mut decode_buf = vec![0.0f32; 4800 * 2];
+            let frames = src.read_frames(2, 48000, &mut decode_buf);
+            assert_eq!(
+                frames, 4800,
+                "TrueHD Atmos MKV must decode 4800 stereo-downmixed frames"
+            );
+            src.set_position_seconds(30.0);
+            let frames_at_30s = src.read_frames(2, 48000, &mut decode_buf);
+            assert_eq!(frames_at_30s, 4800);
+            let peak = decode_buf.iter().fold(0.0f32, |acc, &x| acc.max(x.abs()));
+            assert!(
+                peak > 0.01,
+                "TrueHD Atmos MKV decoded at 30.0s must produce audible non-silent PCM (peak={})",
+                peak
+            );
+            assert_eq!(src.get_num_channels(), 8);
+            assert!(src.get_current_channel_vu_mono(0) > 0.01);
+            assert_eq!(
+                src.get_video_info().as_deref(),
+                Some("H264 (1920x1080)"),
+                "probe_video_stream must select primary 1920x1080 H.264 stream and skip MJPEG cover art"
+            );
             eprintln!(
-                "Verified native Atmos track '{}': is_native_atmos={}, surround_upmix.enabled={}, tracks={:?}",
-                atmos_path, st.is_native_atmos, st.surround_upmix.enabled, st.audio_tracks
+                "Verified native Atmos track '{}': is_native_atmos={}, peak@30s={:.4}, video_info={:?}, tracks={:?}",
+                atmos_path,
+                st.is_native_atmos,
+                peak,
+                src.get_video_info(),
+                st.audio_tracks
             );
         }
 
         // 2. Verify 96,000 Hz 5.1 FLAC ("02 - What Is Love.flac") resamples to 48,000 Hz at 1.0x speed
-        let flac_path = format!(
-            "{}\\Music\\Howard Jones - Human's Lib\\02 - What Is Love.flac",
-            user_profile
-        );
-        if std::path::Path::new(&flac_path).exists() {
+        let flac_path_buf = std::path::Path::new(&user_profile)
+            .join("Music")
+            .join("Howard Jones - Human's Lib")
+            .join("02 - What Is Love.flac");
+        let flac_path = flac_path_buf.to_string_lossy().into_owned();
+        if flac_path_buf.exists() {
             let mut src = load_audio_source(&flac_path).expect("load What Is Love flac");
             assert_eq!(src.get_intrinsic_sample_rate(), Some(96000));
             assert_eq!(src.get_num_channels(), 6);
@@ -15633,5 +15688,100 @@ Sink #105
             "Chunked resampling across packet boundaries must match contiguous resampling (max_diff={})",
             max_diff
         );
+    }
+
+    #[test]
+    fn test_itu_bs775_downmix_and_crossover_phase_coherence() {
+        // 1. Mono-to-multichannel (1 -> 6) must duplicate mono to FL/FR and keep FC/LFE/SL/SR silent
+        let mono_in = [0.75f32];
+        assert!((get_downmixed_sample(1, &mono_in, 6, 0) - 0.75).abs() < 1e-6);
+        assert!((get_downmixed_sample(1, &mono_in, 6, 1) - 0.75).abs() < 1e-6);
+        assert_eq!(get_downmixed_sample(1, &mono_in, 6, 2), 0.0);
+        assert_eq!(get_downmixed_sample(1, &mono_in, 6, 3), 0.0);
+
+        // 2. ITU-R BS.775-3 LFE exclusion: LFE (channel 3) in 5.1/7.1 must not bleed into stereo/mono downmix
+        let lfe_only_51 = [0.0f32, 0.0, 0.0, 1.0, 0.0, 0.0];
+        assert_eq!(get_downmixed_sample(6, &lfe_only_51, 2, 0), 0.0);
+        assert_eq!(get_downmixed_sample(6, &lfe_only_51, 2, 1), 0.0);
+        assert_eq!(get_downmixed_sample(6, &lfe_only_51, 1, 0), 0.0);
+
+        // 3. Soft limiter remains 100% linear up to 0.98 (-0.17 dBFS)
+        assert_eq!(SurroundUpmixerDsp::soft_limit(0.95), 0.95);
+        assert_eq!(SurroundUpmixerDsp::soft_limit(-0.95), -0.95);
+
+        // 4. Center channel (FC) in `process_stereo_to_7_1_4` and `process_stereo_to_bed_only`
+        //    must remain in-phase (positive correlation) with FL/FR in the vocal/midrange passband (1 kHz)
+        let sr = 48_000;
+        let cfg = crate::state::SurroundUpmixConfig::default();
+        let mut dsp = SurroundUpmixerDsp::new(sr);
+        dsp.sync_config(&cfg, sr);
+        let mut dot_fl_fc = 0.0f32;
+        for n in 0..4800 {
+            let t = n as f32 / sr as f32;
+            let s = (2.0 * std::f32::consts::PI * 1000.0 * t).sin() * 0.5;
+            let out = dsp.process_stereo_to_7_1_4(s, s, &cfg);
+            if n > 1000 {
+                dot_fl_fc += out[0] * out[2];
+            }
+        }
+        assert!(
+            dot_fl_fc > 100.0,
+            "FC must be in-phase with FL/FR at 1 kHz (got dot_fl_fc={})",
+            dot_fl_fc
+        );
+
+        // 5. Frequency Analysis Y-axis height: a narrow-band harmonic component with amplitude 0.035
+        //    must reach >75% of the [0..100] Y-axis display range at both 48 kHz (N=8192) and 96 kHz (N=16384),
+        //    and `compute_fft_mono_sample` must preserve full stereo-to-mono amplitude when upmixing.
+        for &(sr, win_size) in &[(48_000u32, 8192usize), (96_000u32, 16384usize)] {
+            let state = Arc::new(Mutex::new(AppState::new("SpectrumHeightTest".to_string())));
+            {
+                let mut s = state.lock().unwrap();
+                s.is_paused = false;
+                s.file_loaded = true;
+            }
+            let (tx, rx) = bounded::<DspMessage>(4);
+            spawn_dsp_thread(rx, state.clone(), sr, 20_000.0, win_size);
+
+            let freq = 1000.0f32;
+            let amp = 0.035f32;
+            let audio_data: Vec<f32> = (0..win_size)
+                .map(|i| (2.0 * std::f32::consts::PI * freq * (i as f32) / (sr as f32)).sin() * amp)
+                .collect();
+
+            tx.send(DspMessage {
+                audio_data: audio_data.clone(),
+                channel_audio_data: vec![audio_data],
+                channel_vus: vec![amp, amp],
+                current_order: 0,
+                current_row: 0,
+                bpm: 120,
+                speed: 6,
+                current_seconds: 1.0,
+                current_row_string: String::new(),
+                seek_epoch: 0,
+            })
+            .unwrap();
+            drop(tx);
+
+            std::thread::sleep(std::time::Duration::from_millis(60));
+            let peak_bin = state
+                .lock()
+                .unwrap()
+                .raw_spectrum_data
+                .iter()
+                .copied()
+                .fold(0.0f32, f32::max);
+            assert!(
+                peak_bin > 70.0,
+                "Frequency analysis Y-axis peak at {} Hz (N={}) for amp={} must exceed 70.0 (got {:.2})",
+                sr,
+                win_size,
+                amp,
+                peak_bin
+            );
+        }
+
+        assert!((compute_fft_mono_sample(&[0.8, 0.8], 2) - 0.8).abs() < 1e-6);
     }
 }
