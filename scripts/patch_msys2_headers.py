@@ -11,6 +11,8 @@ def find_include_dir():
         '/mingw64/include',
         'C:/msys64/mingw64/include',
         'D:/msys64/mingw64/include',
+        '/usr/include/ffmpeg',
+        '/usr/include',
     ]
     temp_dir = 'D:/a/_temp'
     if os.path.exists(temp_dir):

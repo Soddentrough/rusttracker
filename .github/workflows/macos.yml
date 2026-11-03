@@ -196,6 +196,9 @@ jobs:
                           <string>mpeg</string>
                           <string>ogv</string>
                           <string>3gp</string>
+                          <string>vob</string>
+                          <string>aob</string>
+                          <string>iso</string>
                       </array>
                   </dict>
                   <dict>

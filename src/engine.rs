@@ -13829,7 +13829,8 @@ mod tests {
     #[test]
     fn test_macos_bundle_and_entitlements_config() {
         let macos_yml = std::fs::read_to_string(".github/workflows/macos.yml")
-            .expect(".github/workflows/macos.yml must exist");
+            .expect(".github/workflows/macos.yml must exist")
+            .replace("\r\n", "\n");
         let entitlements =
             std::fs::read_to_string("entitlements.plist").expect("entitlements.plist must exist");
 
