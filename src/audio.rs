@@ -512,6 +512,18 @@ impl SurroundUpmixerDsp {
         }
     }
 
+    /// Scales a base/anchor channel linearly without soft-knee compression when `gain <= 1.0`
+    /// so that at unity gain (`1.0`) the base tone and transient peaks pass 100% untouched.
+    #[inline(always)]
+    fn scale_anchor(x: f32, gain: f32) -> f32 {
+        let y = x * gain;
+        if gain <= 1.0 + 1e-5 {
+            y.clamp(-1.0, 1.0)
+        } else {
+            Self::soft_limit(y)
+        }
+    }
+
     /// Apply the 5-band parametric/shelf routing contour cascade to a stereo `(L, R)` pair.
     /// This shapes only the signal extracted for the surround bed, height, and LFE channels;
     /// it is never applied as a master EQ on stereo/mono devices or on the Front L/R anchor channels.
@@ -538,8 +550,9 @@ impl SurroundUpmixerDsp {
     /// Returns 8 bed channels `[0:FL, 1:FR, 2:FC, 3:LFE, 4:SL, 5:SR, 6:RL, 7:RR]`.
     ///
     /// Because no overhead height speakers exist in a Bed-Only layout:
-    /// - Front L/R (`FL, FR`) and Center (`FC`) carry the uncolored front stage.
-    /// - LFE (`LFE`) carries sub-bass below `sub_crossover_hz`.
+    /// - Front L/R (`FL, FR`) pass the uncolored stereo anchor untouched at unity (`front_level == 1.0`).
+    /// - Center (`FC`) adds in-phase steered center reinforcement above `sub_crossover_hz`.
+    /// - LFE (`LFE`) adds sub-bass below `sub_crossover_hz`.
     /// - Side/Rear bed speakers (`SL, SR, RL, RR`) receive the full-bandwidth routing-shaped
     ///   and Haas-decorrelated surround signal without a `height_crossover_hz` split or height fold-down.
     #[inline(always)]
@@ -549,26 +562,27 @@ impl SurroundUpmixerDsp {
         r_in: f32,
         cfg: &crate::state::SurroundUpmixConfig,
     ) -> [f32; 8] {
+        // Keep Front L/R anchor uncolored by the surround routing EQ and free of soft-clipping at <=1.0 gain
+        let fl = Self::scale_anchor(l_in, cfg.front_level);
+        let fr = Self::scale_anchor(r_in, cfg.front_level);
+
         let (l_routed, r_routed) = self.process_routing_eq(l_in, r_in, cfg);
         let mid_routed = (l_routed + r_routed) * 0.5;
         let diff_routed = (l_routed - r_routed) * 0.5;
 
-        let fl = Self::soft_limit(l_routed * cfg.front_level);
-        let fr = Self::soft_limit(r_routed * cfg.front_level);
-        let fc_hp = self.sub_hp_c.process(mid_routed);
+        // Smooth center-steering: anchor correlated center in FC while rejecting it from surrounds
+        let common_center = self.update_center_steering(mid_routed, diff_routed);
+        let fc_in = mid_routed * (0.25 + 0.75 * self.steer_gain);
+        let fc_hp = self.sub_hp_c.process(fc_in);
         let fc = Self::soft_limit(fc_hp * cfg.center_level * std::f32::consts::FRAC_1_SQRT_2);
 
-        // ITU-R BS.775 / Dolby Surround center-steering: attenuate common-mode phantom center in surrounds
-        // so correlated vocals/kick/bass stay anchored in the front stage while panned/stereo content envelops.
-        let common_center = self.update_center_steering(mid_routed, diff_routed);
-        let l_bed = self.sub_hp_l.process(l_routed - common_center * 0.60);
-        let r_bed = self.sub_hp_r.process(r_routed - common_center * 0.60);
+        let l_bed = self.sub_hp_l.process(l_routed - common_center * 0.72);
+        let r_bed = self.sub_hp_r.process(r_routed - common_center * 0.72);
         let side_bed = (l_bed - r_bed) * 0.5 * cfg.stereo_width.clamp(0.0, 2.0);
         let l_surr = l_bed + side_bed * 0.35;
         let r_surr = r_bed - side_bed * 0.35;
 
         let lfe_low = self.sub_lp.process(mid_routed);
-
         let lfe = Self::soft_limit(lfe_low * cfg.lfe_level * std::f32::consts::FRAC_1_SQRT_2);
 
         let sl_raw = self.delay_sl.process(l_surr);
@@ -594,55 +608,58 @@ impl SurroundUpmixerDsp {
         r_in: f32,
         cfg: &crate::state::SurroundUpmixConfig,
     ) -> [f32; 12] {
-        // 1. 5-band parametric EQ & Mid/Side width shaping across Front, Surround Bed, Height, and LFE
+        // 1. Preserve uncolored Front L/R anchor so enabling upmixing never alters the base stereo tone
+        let fl = Self::scale_anchor(l_in, cfg.front_level);
+        let fr = Self::scale_anchor(r_in, cfg.front_level);
+
+        // 2. Apply 5-band routing EQ & Mid/Side width shaping to extracted surround/height/LFE stems
         let (l_eq, r_eq) = self.process_routing_eq(l_in, r_in, cfg);
         let mid = (l_eq + r_eq) * 0.5;
         let diff = (l_eq - r_eq) * 0.5;
 
-        let fl = Self::soft_limit(l_eq * cfg.front_level);
-        let fr = Self::soft_limit(r_eq * cfg.front_level);
-        let fc_hp = self.sub_hp_c.process(mid);
+        let common_center = self.update_center_steering(mid, diff);
+        let fc_in = mid * (0.25 + 0.75 * self.steer_gain);
+        let fc_hp = self.sub_hp_c.process(fc_in);
         let fc = Self::soft_limit(fc_hp * cfg.center_level * std::f32::consts::FRAC_1_SQRT_2);
 
-        let common_center = self.update_center_steering(mid, diff);
-        let l_amb = l_eq - common_center * 0.60;
-        let r_amb = r_eq - common_center * 0.60;
+        let l_amb = l_eq - common_center * 0.72;
+        let r_amb = r_eq - common_center * 0.72;
         let width = cfg.stereo_width.clamp(0.0, 2.0);
-        let side = diff * width;
-        let l_wide = l_amb + side * 0.35;
-        let r_wide = r_amb - side * 0.35;
 
         // 3. LFE Subwoofer low-pass extraction (< sub_crossover_hz)
         let lfe_low = self.sub_lp.process(mid);
-
         let lfe = Self::soft_limit(lfe_low * cfg.lfe_level * std::f32::consts::FRAC_1_SQRT_2);
 
-        // 4. Linkwitz-Riley 2nd-order (Q = 0.5) crossover at height_crossover_hz splitting Bed vs. Height.
-        // Keep sub_hp positive in the passband so FC and Bed remain in phase with full-range FL/FR;
-        // invert only height_hp (-height_hp) so height_lp and height_hp sum flat at height_crossover_hz.
+        // 4. High-pass ambient bed above sub_crossover_hz in positive polarity, then split Bed vs. Height
+        // at height_crossover_hz. Blending `l_low * (1 - bleed) + l_bed_hp * bleed` keeps passband polarity
+        // positive across all frequencies without a phase-cancellation notch at height_crossover_hz.
         let l_bed_hp = self.sub_hp_l.process(l_amb);
         let r_bed_hp = self.sub_hp_r.process(r_amb);
+        let side_bed = (l_bed_hp - r_bed_hp) * 0.5 * width;
+        let l_wide_hp = l_bed_hp + side_bed * 0.35;
+        let r_wide_hp = r_bed_hp - side_bed * 0.35;
         let l_low = self.height_lp_l.process(l_bed_hp);
-        let l_high = -self.height_hp_l.process(l_wide);
         let r_low = self.height_lp_r.process(r_bed_hp);
-        let r_high = -self.height_hp_r.process(r_wide);
+        let l_high = self.height_hp_l.process(l_wide_hp);
+        let r_high = self.height_hp_r.process(r_wide_hp);
 
         // 5. Left/Right Hemisphere Bed Routing (< height_crossover_hz + high_bleed) & Height Routing (> height_crossover_hz)
         let high_bleed = cfg.surround_high_bleed.clamp(0.0, 1.0);
-        let side_low = (l_low - r_low) * 0.5 * width;
+        let l_bed_band = l_low * (1.0 - high_bleed) + l_bed_hp * high_bleed;
+        let r_bed_band = r_low * (1.0 - high_bleed) + r_bed_hp * high_bleed;
+        let rl_bleed = high_bleed * 0.85;
+        let rl_bed_band = l_low * (1.0 - rl_bleed) + l_bed_hp * rl_bleed;
+        let rr_bed_band = r_low * (1.0 - rl_bleed) + r_bed_hp * rl_bleed;
+        let side_low = (l_bed_band - r_bed_band) * 0.5 * width;
         let side_high = (l_high - r_high) * 0.5 * width;
 
-        let sl_raw = self.delay_sl.process(l_low + l_high * high_bleed);
-        let sr_raw = self.delay_sr.process(r_low + r_high * high_bleed);
+        let sl_raw = self.delay_sl.process(l_bed_band);
+        let sr_raw = self.delay_sr.process(r_bed_band);
         let sl = Self::soft_limit(sl_raw * cfg.side_rear_level);
         let sr = Self::soft_limit(sr_raw * cfg.side_rear_level);
 
-        let rl_raw = self
-            .delay_rl
-            .process((l_low + side_low * 0.22) + l_high * (high_bleed * 0.85));
-        let rr_raw = self
-            .delay_rr
-            .process((r_low - side_low * 0.22) + r_high * (high_bleed * 0.85));
+        let rl_raw = self.delay_rl.process(rl_bed_band + side_low * 0.22);
+        let rr_raw = self.delay_rr.process(rr_bed_band - side_low * 0.22);
         let rl = Self::soft_limit(rl_raw * (cfg.side_rear_level * 0.92));
         let rr = Self::soft_limit(rr_raw * (cfg.side_rear_level * 0.92));
 
@@ -660,6 +677,9 @@ impl SurroundUpmixerDsp {
     }
 
     /// Upmix a stereo `(l_in, r_in)` frame to `hardware_channels` (up to 12 channels):
+    /// - Preserves the Front L/R anchor (`FL, FR`) untouched at unity gain (`front_level == 1.0`)
+    ///   so enabling upmixing never alters the base stereo tone, and adds the extracted Center,
+    ///   LFE, Surround Bed, and Height channels around the base mix.
     /// - For Bed + Height layouts (`> 8` channels, e.g. `10` = 7.1.2 or `12` = 7.1.4): runs the full
     ///   Linkwitz-Riley height crossover split (`process_stereo_to_7_1_4`).
     /// - For Bed-Only layouts (`3..=8` channels, e.g. `4` = 4.0, `6` = 5.1, `8` = 7.1): runs
@@ -680,24 +700,16 @@ impl SurroundUpmixerDsp {
         if hardware_channels <= 2 {
             return [l_in, r_in, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
         }
-        // ITU-R BS.775-3 / BS.1770-4 constant-power front/surround energy conservation:
-        // Redirect a fraction of common-mode phantom center from FL/FR when FC is active, and scale
-        // active front/bed/height speaker groups by 1/sqrt(N_pairs) so total acoustic power matches 2.0 stereo.
-        let k_s2 = 0.88_f32;
+        let k_bed_pair = 0.88_f32;
 
         if crate::state::SurroundUpmixConfig::has_height_channels(hardware_channels as i32) {
             let [fl, fr, fc, lfe, sl, sr, rl, rr, tfl, tfr, trl, trr] =
                 self.process_stereo_to_7_1_4(l_in, r_in, cfg);
-            let mid_f = (fl + fr) * 0.5;
-            let common_f = mid_f * self.steer_gain;
-            let center_pull = common_f * (0.14 * cfg.center_level.clamp(0.0, 2.0));
-            let fl_c = ((fl - center_pull) * k_s2).clamp(-1.0, 1.0);
-            let fr_c = ((fr - center_pull) * k_s2).clamp(-1.0, 1.0);
-            let fc_c = (fc * k_s2).clamp(-1.0, 1.0);
+            let fc_c = (fc * k_bed_pair).clamp(-1.0, 1.0);
             match hardware_channels {
                 9 => [
-                    fl_c,
-                    fr_c,
+                    fl,
+                    fr,
                     fc_c,
                     lfe,
                     (sl * 0.64).clamp(-1.0, 1.0),
@@ -710,11 +722,11 @@ impl SurroundUpmixerDsp {
                     0.0,
                 ],
                 10 => {
-                    let h_l = ((tfl + trl * 0.7) * 0.52).clamp(-1.0, 1.0);
-                    let h_r = ((tfr + trr * 0.7) * 0.52).clamp(-1.0, 1.0);
+                    let h_l = (tfl * 0.82).clamp(-1.0, 1.0);
+                    let h_r = (tfr * 0.82).clamp(-1.0, 1.0);
                     [
-                        fl_c,
-                        fr_c,
+                        fl,
+                        fr,
                         fc_c,
                         lfe,
                         (sl * 0.64).clamp(-1.0, 1.0),
@@ -728,8 +740,8 @@ impl SurroundUpmixerDsp {
                     ]
                 }
                 _ => [
-                    fl_c,
-                    fr_c,
+                    fl,
+                    fr,
                     fc_c,
                     lfe,
                     (sl * 0.64).clamp(-1.0, 1.0),
@@ -745,16 +757,11 @@ impl SurroundUpmixerDsp {
         } else {
             let [fl, fr, fc, lfe, sl, sr, rl, rr] =
                 self.process_stereo_to_bed_only(l_in, r_in, cfg);
-            let mid_f = (fl + fr) * 0.5;
-            let common_f = mid_f * self.steer_gain;
-            let center_pull = common_f * (0.14 * cfg.center_level.clamp(0.0, 2.0));
-            let fl_c = ((fl - center_pull) * k_s2).clamp(-1.0, 1.0);
-            let fr_c = ((fr - center_pull) * k_s2).clamp(-1.0, 1.0);
-            let fc_c = (fc * k_s2).clamp(-1.0, 1.0);
+            let fc_c = (fc * k_bed_pair).clamp(-1.0, 1.0);
             match hardware_channels {
                 3 => [
-                    ((fl - center_pull) * 0.94).clamp(-1.0, 1.0),
-                    ((fr - center_pull) * 0.94).clamp(-1.0, 1.0),
+                    fl,
+                    fr,
                     (fc * 0.94).clamp(-1.0, 1.0),
                     0.0,
                     0.0,
@@ -767,10 +774,10 @@ impl SurroundUpmixerDsp {
                     0.0,
                 ],
                 4 => [
-                    (fl * k_s2).clamp(-1.0, 1.0),
-                    (fr * k_s2).clamp(-1.0, 1.0),
-                    (sl * k_s2).clamp(-1.0, 1.0),
-                    (sr * k_s2).clamp(-1.0, 1.0),
+                    fl,
+                    fr,
+                    (sl * k_bed_pair).clamp(-1.0, 1.0),
+                    (sr * k_bed_pair).clamp(-1.0, 1.0),
                     0.0,
                     0.0,
                     0.0,
@@ -781,11 +788,11 @@ impl SurroundUpmixerDsp {
                     0.0,
                 ],
                 5 => [
-                    fl_c,
-                    fr_c,
+                    fl,
+                    fr,
                     fc_c,
-                    (sl * k_s2).clamp(-1.0, 1.0),
-                    (sr * k_s2).clamp(-1.0, 1.0),
+                    (sl * k_bed_pair).clamp(-1.0, 1.0),
+                    (sr * k_bed_pair).clamp(-1.0, 1.0),
                     0.0,
                     0.0,
                     0.0,
@@ -795,12 +802,12 @@ impl SurroundUpmixerDsp {
                     0.0,
                 ],
                 6 => [
-                    fl_c,
-                    fr_c,
+                    fl,
+                    fr,
                     fc_c,
                     lfe,
-                    (sl * k_s2).clamp(-1.0, 1.0),
-                    (sr * k_s2).clamp(-1.0, 1.0),
+                    (sl * k_bed_pair).clamp(-1.0, 1.0),
+                    (sr * k_bed_pair).clamp(-1.0, 1.0),
                     0.0,
                     0.0,
                     0.0,
@@ -811,8 +818,8 @@ impl SurroundUpmixerDsp {
                 7 => {
                     let rc = ((rl + rr) * 0.5).clamp(-1.0, 1.0);
                     [
-                        fl_c,
-                        fr_c,
+                        fl,
+                        fr,
                         fc_c,
                         lfe,
                         (sl * 0.62).clamp(-1.0, 1.0),
@@ -826,8 +833,8 @@ impl SurroundUpmixerDsp {
                     ]
                 }
                 _ => [
-                    fl_c,
-                    fr_c,
+                    fl,
+                    fr,
                     fc_c,
                     lfe,
                     (sl * 0.64).clamp(-1.0, 1.0),
@@ -847,12 +854,12 @@ impl SurroundUpmixerDsp {
     /// to `hardware_channels`:
     /// - When `hardware_channels <= 2` or `(source_channels >= hardware_channels && cfg.is_flat_identity())`:
     ///   passes all discrete channels through 1:1 untouched.
-    /// - When `source_channels <= 2`: performs full ITU-R BS.775 constant-power mono/stereo-to-surround upmixing
-    ///   across all `hardware_channels`.
-    /// - When `source_channels > 2`: applies the 5-band parametric EQ and speaker level trims to all discrete
-    ///   channels, maps 7.1 `WAVEFORMATEXTENSIBLE` `0x63F` (`[4:BL, 5:BR, 6:SL, 7:SR]`) into canonical
-    ///   `[4:SL, 5:SR, 6:BL, 7:BR]` when expanding to `> 8` channels, and uses complementary Linkwitz-Riley
-    ///   crossovers at `height_crossover_hz` to split discrete surrounds between the ear-level bed and heights.
+    /// - When `source_channels <= 2`: performs additive stereo-to-surround upmixing across all
+    ///   `hardware_channels` while preserving the uncolored Front L/R anchor (`FL, FR`).
+    /// - When `source_channels > 2`: preserves existing discrete base channels at full bandwidth and unity
+    ///   gain (at default sliders), maps 7.1 `WAVEFORMATEXTENSIBLE` `0x63F` (`[4:BL, 5:BR, 6:SL, 7:SR]`)
+    ///   into canonical `[4:SL, 5:SR, 6:BL, 7:BR]` when expanding to `> 8` channels, and synthesizes only
+    ///   the missing surround/height channels using the 5-band routing EQ and crossovers.
     #[inline]
     pub fn process_multichannel_frame_for_hardware(
         &mut self,
@@ -873,12 +880,15 @@ impl SurroundUpmixerDsp {
             return self.process_frame_for_hardware(l_in, r_in, cfg, hardware_channels);
         }
 
-        // Apply 5-band EQ to all discrete source channels when any band is non-zero
+        // Keep raw discrete channels for base preservation, and apply 5-band routing EQ for upmixed stems
         let eq_active = cfg.band_gains_db.iter().any(|&g| g.abs() >= 1e-3);
+        let mut ch_raw = [0.0f32; 12];
         let mut ch_in = [0.0f32; 12];
         let in_count = src_ch.min(frame_slice.len()).min(12);
         for c in 0..in_count {
-            let mut s = frame_slice[c];
+            let raw = frame_slice[c];
+            ch_raw[c] = raw;
+            let mut s = raw;
             if eq_active {
                 for bq in self.eq_mc[c].iter_mut() {
                     s = bq.process(s);
@@ -894,12 +904,11 @@ impl SurroundUpmixerDsp {
         let lfe_gain = (cfg.lfe_level / 0.85).clamp(0.0, 2.0);
         let surround_gain = (cfg.side_rear_level / 0.85).clamp(0.0, 2.0);
         let height_gain = (cfg.height_level / 0.95).clamp(0.0, 2.0);
-        let high_bleed = cfg.surround_high_bleed.clamp(0.0, 1.0);
 
-        let fl = Self::soft_limit(ch_in[0] * front_gain);
-        let fr = Self::soft_limit(ch_in[1] * front_gain);
+        let fl = Self::scale_anchor(ch_raw[0], front_gain);
+        let fr = Self::scale_anchor(ch_raw[1], front_gain);
         let sub_redirect = self.mc_sub_lp.process((ch_in[0] + ch_in[1]) * 0.5);
-        let sub_trim = if (cfg.sub_crossover_hz - 90.0).abs() > 0.5 {
+        let sub_trim = if cfg.sub_crossover_hz > 90.5 {
             sub_redirect * 0.25 * ((cfg.sub_crossover_hz - 90.0) / 160.0)
         } else {
             0.0
@@ -913,7 +922,7 @@ impl SurroundUpmixerDsp {
         match src_ch {
             // 3.0 (FL, FR, FC) -> 4.0 / 5.0 / 5.1 / 6.1 / 7.1 / 7.1.x:
             3 => {
-                let fc = Self::soft_limit(ch_in[2] * center_gain);
+                let fc = Self::scale_anchor(ch_raw[2], center_gain);
                 let mut out = self.process_frame_for_hardware(
                     ch_in[0],
                     ch_in[1],
@@ -932,8 +941,8 @@ impl SurroundUpmixerDsp {
             }
             // 4.0 Quad (FL, FR, SL, SR) -> 4.0 / 5.0 / 5.1 / 6.1 / 7.1 / 7.1.x:
             4 => {
-                let sl = Self::soft_limit(ch_in[2] * surround_gain);
-                let sr = Self::soft_limit(ch_in[3] * surround_gain);
+                let sl = Self::scale_anchor(ch_raw[2], surround_gain);
+                let sr = Self::scale_anchor(ch_raw[3], surround_gain);
                 let l_comb = (ch_in[0] + ch_in[2] * INV_SQRT2) * 0.75;
                 let r_comb = (ch_in[1] + ch_in[3] * INV_SQRT2) * 0.75;
                 let mut out =
@@ -946,20 +955,17 @@ impl SurroundUpmixerDsp {
                 } else if hardware_channels == 5 {
                     out[3] = sl;
                     out[4] = sr;
-                } else if hardware_channels == 6 {
+                } else {
                     out[4] = sl;
                     out[5] = sr;
-                } else {
-                    out[4] = (sl * INV_SQRT2).clamp(-1.0, 1.0);
-                    out[5] = (sr * INV_SQRT2).clamp(-1.0, 1.0);
                 }
                 out
             }
             // 5.0 (FL, FR, FC, SL, SR) -> 5.0 / 5.1 / 6.1 / 7.1 / 7.1.x:
             5 => {
-                let fc = Self::soft_limit(ch_in[2] * center_gain);
-                let sl = Self::soft_limit(ch_in[3] * surround_gain);
-                let sr = Self::soft_limit(ch_in[4] * surround_gain);
+                let fc = Self::scale_anchor(ch_raw[2], center_gain);
+                let sl = Self::scale_anchor(ch_raw[3], surround_gain);
+                let sr = Self::scale_anchor(ch_raw[4], surround_gain);
                 let l_comb = (ch_in[0] + ch_in[2] * 0.5 + ch_in[3] * INV_SQRT2) * 0.7;
                 let r_comb = (ch_in[1] + ch_in[2] * 0.5 + ch_in[4] * INV_SQRT2) * 0.7;
                 let mut out =
@@ -970,21 +976,18 @@ impl SurroundUpmixerDsp {
                 if hardware_channels <= 5 {
                     out[3] = sl;
                     out[4] = sr;
-                } else if hardware_channels == 6 {
+                } else {
                     out[4] = sl;
                     out[5] = sr;
-                } else {
-                    out[4] = (sl * INV_SQRT2).clamp(-1.0, 1.0);
-                    out[5] = (sr * INV_SQRT2).clamp(-1.0, 1.0);
                 }
                 out
             }
             // 5.1 (FL, FR, FC, LFE, SL, SR) -> 5.1 / 6.1 / 7.1 / 7.1.x:
             6 => {
-                let fc = Self::soft_limit(ch_in[2] * center_gain);
-                let lfe = Self::soft_limit((ch_in[3] + sub_trim) * lfe_gain);
-                let sl = Self::soft_limit(ch_in[4] * surround_gain);
-                let sr = Self::soft_limit(ch_in[5] * surround_gain);
+                let fc = Self::scale_anchor(ch_raw[2], center_gain);
+                let lfe = Self::scale_anchor(ch_raw[3] + sub_trim, lfe_gain);
+                let sl = Self::scale_anchor(ch_raw[4], surround_gain);
+                let sr = Self::scale_anchor(ch_raw[5], surround_gain);
                 if hardware_channels <= 6 {
                     let mut out = [0.0f32; 12];
                     out[0] = fl;
@@ -1003,17 +1006,17 @@ impl SurroundUpmixerDsp {
                 out[1] = fr;
                 out[2] = fc;
                 out[3] = lfe;
-                out[4] = (sl * INV_SQRT2).clamp(-1.0, 1.0);
-                out[5] = (sr * INV_SQRT2).clamp(-1.0, 1.0);
+                out[4] = sl;
+                out[5] = sr;
                 out
             }
             // 6.1 (FL, FR, FC, LFE, BC, SL, SR) -> 6.1 / 7.1 / 7.1.x:
             7 => {
-                let fc = Self::soft_limit(ch_in[2] * center_gain);
-                let lfe = Self::soft_limit((ch_in[3] + sub_trim) * lfe_gain);
+                let fc = Self::scale_anchor(ch_raw[2], center_gain);
+                let lfe = Self::scale_anchor(ch_raw[3] + sub_trim, lfe_gain);
                 let bc = ch_in[4] * surround_gain;
-                let sl = Self::soft_limit(ch_in[5] * surround_gain);
-                let sr = Self::soft_limit(ch_in[6] * surround_gain);
+                let sl = Self::scale_anchor(ch_raw[5], surround_gain);
+                let sr = Self::scale_anchor(ch_raw[6], surround_gain);
                 let mut out = self.process_frame_for_hardware(
                     (ch_in[5] + ch_in[4] * INV_SQRT2) * INV_SQRT2,
                     (ch_in[6] + ch_in[4] * INV_SQRT2) * INV_SQRT2,
@@ -1034,61 +1037,63 @@ impl SurroundUpmixerDsp {
             }
             // >= 8 channels (e.g. 7.1 on 7.1, 7.1.4 on 7.1.4, or 7.1 -> 7.1.2 / 7.1.4):
             _ => {
-                let fc = Self::soft_limit(ch_in[2] * center_gain);
-                let lfe = Self::soft_limit((ch_in[3] + sub_trim) * lfe_gain);
                 if hardware_channels <= 8 || src_ch >= hardware_channels {
                     let mut out = [0.0f32; 12];
-                    out[0] = fl;
-                    out[1] = fr;
-                    out[2] = fc;
-                    out[3] = lfe;
+                    out[0] = Self::scale_anchor(ch_in[0], front_gain);
+                    out[1] = Self::scale_anchor(ch_in[1], front_gain);
+                    out[2] = Self::scale_anchor(ch_in[2], center_gain);
+                    out[3] = Self::scale_anchor(ch_in[3] + sub_trim, lfe_gain);
                     if src_ch >= 8 && hardware_channels > 8 {
-                        out[4] = Self::soft_limit(ch_in[6] * surround_gain);
-                        out[5] = Self::soft_limit(ch_in[7] * surround_gain);
-                        out[6] = Self::soft_limit(ch_in[4] * surround_gain);
-                        out[7] = Self::soft_limit(ch_in[5] * surround_gain);
+                        out[4] = Self::scale_anchor(ch_in[6], surround_gain);
+                        out[5] = Self::scale_anchor(ch_in[7], surround_gain);
+                        out[6] = Self::scale_anchor(ch_in[4], surround_gain);
+                        out[7] = Self::scale_anchor(ch_in[5], surround_gain);
                     } else {
                         for c in 4..hardware_channels.min(8) {
-                            out[c] = Self::soft_limit(ch_in[c] * surround_gain);
+                            out[c] = Self::scale_anchor(ch_in[c], surround_gain);
                         }
                     }
                     for c in 8..hardware_channels.min(12) {
-                        out[c] = Self::soft_limit(ch_in[c] * height_gain);
+                        out[c] = Self::scale_anchor(ch_in[c], height_gain);
                     }
                     return out;
                 }
 
+                let fc = Self::scale_anchor(ch_raw[2], center_gain);
+                let lfe = Self::scale_anchor(ch_raw[3] + sub_trim, lfe_gain);
+
                 // Decoded 8+ channel (7.1 / 7.1.4) frames follow WAVEFORMATEXTENSIBLE 0x63F order in 0..8:
                 // [0:FL, 1:FR, 2:FC, 3:LFE, 4:BL, 5:BR, 6:SL, 7:SR].
                 // Map them to canonical Side (SL, SR) and Back/Rear (BL, BR) speaker pairs:
+                let (bl_raw, br_raw, sl_raw, sr_raw) = if src_ch >= 8 {
+                    (ch_raw[4], ch_raw[5], ch_raw[6], ch_raw[7])
+                } else {
+                    (ch_raw[6], ch_raw[7], ch_raw[4], ch_raw[5])
+                };
                 let (bl_in, br_in, sl_in, sr_in) = if src_ch >= 8 {
                     (ch_in[4], ch_in[5], ch_in[6], ch_in[7])
                 } else {
                     (ch_in[6], ch_in[7], ch_in[4], ch_in[5])
                 };
 
-                // Complementary Linkwitz-Riley 2nd-order (Q = 0.5) crossover at `height_crossover_hz`
-                // splitting discrete Side (SL/SR) and Rear (BL/BR) stems between ear-level bed and heights
-                // with zero Haas delay so Bed + Height sum in-phase without comb filtering.
-                let sl_low = self.mc_height_lp[0].process(sl_in);
-                let sl_high = -self.mc_height_hp[0].process(sl_in);
-                let sr_low = self.mc_height_lp[1].process(sr_in);
-                let sr_high = -self.mc_height_hp[1].process(sr_in);
-                let bl_low = self.mc_height_lp[2].process(bl_in);
-                let bl_high = -self.mc_height_hp[2].process(bl_in);
-                let br_low = self.mc_height_lp[3].process(br_in);
-                let br_high = -self.mc_height_hp[3].process(br_in);
+                // Preserve discrete 7.1 bed channels (SL, SR, BL, BR) at full bandwidth so enabling
+                // 7.1.4 upmixing never strips highs out of the ear-level 7.1 bed, and extract
+                // positive-polarity high-passed (> height_crossover_hz) stems for the overhead heights.
+                let sl_out = Self::scale_anchor(sl_raw, surround_gain);
+                let sr_out = Self::scale_anchor(sr_raw, surround_gain);
+                let bl_out = Self::scale_anchor(bl_raw, surround_gain);
+                let br_out = Self::scale_anchor(br_raw, surround_gain);
+
+                let sl_high = self.mc_height_hp[0].process(sl_in);
+                let sr_high = self.mc_height_hp[1].process(sr_in);
+                let bl_high = self.mc_height_hp[2].process(bl_in);
+                let br_high = self.mc_height_hp[3].process(br_in);
 
                 let f_mid = (ch_in[0] + ch_in[1]) * 0.5;
                 let f_diff = (ch_in[0] - ch_in[1]) * 0.5;
                 let f_common = self.update_center_steering(f_mid, f_diff);
-                let f_l_high = -self.height_hp_l.process(ch_in[0] - f_common * 0.60);
-                let f_r_high = -self.height_hp_r.process(ch_in[1] - f_common * 0.60);
-
-                let sl_out = Self::soft_limit((sl_low + sl_high * high_bleed) * surround_gain);
-                let sr_out = Self::soft_limit((sr_low + sr_high * high_bleed) * surround_gain);
-                let bl_out = Self::soft_limit((bl_low + bl_high * high_bleed) * surround_gain);
-                let br_out = Self::soft_limit((br_low + br_high * high_bleed) * surround_gain);
+                let f_l_high = self.height_hp_l.process(ch_in[0] - f_common * 0.78);
+                let f_r_high = self.height_hp_r.process(ch_in[1] - f_common * 0.78);
 
                 let tfl = Self::soft_limit((sl_high * 0.82 + f_l_high * 0.28) * height_gain);
                 let tfr = Self::soft_limit((sr_high * 0.82 + f_r_high * 0.28) * height_gain);
@@ -5042,6 +5047,7 @@ struct ActiveFfmpegTrack {
 
 struct FfmpegSource {
     ictx: ffmpeg_next::format::context::Input,
+    _custom_io: Option<crate::iso::CustomAvioGuard>,
     active_tracks: std::collections::HashMap<usize, ActiveFfmpegTrack>,
     primary_stream_index: usize,
     iamf_groups: Vec<Option<IamfTrackGroup>>,
@@ -5071,6 +5077,8 @@ struct FfmpegSource {
     is_eof: bool,
     target_seek_time: Option<f64>,
     is_full_mix_guide: bool,
+    iso_media: Option<crate::iso::ResolvedIsoMedia>,
+    video_pts_offset_ticks: Option<i64>,
 }
 
 fn safe_ffmpeg_channel_layout(
@@ -5090,7 +5098,12 @@ impl FfmpegSource {
         let mut progress = false;
         let target_pos_opt = self.target_seek_time;
         let has_iamf = self.iamf_groups.iter().any(|g| g.is_some());
-        let is_2track = self.audio_tracks.len() == 2 && !has_iamf;
+        let is_2track = self.audio_tracks.len() == 2
+            && !has_iamf
+            && self.iso_media.is_none()
+            && self.audio_tracks[0].channels == self.audio_tracks[1].channels
+            && self.audio_tracks[0].channels <= 2
+            && self.audio_tracks[0].codec == self.audio_tracks[1].codec;
         let need_t0 = is_2track && (self.is_full_mix_guide || self.current_time < 3.0);
 
         // 1. Drain any packets currently in the active decoders
@@ -5128,6 +5141,9 @@ impl FfmpegSource {
                 {
                     track.resampler = new_resamp;
                     track.channels = dec_ch;
+                }
+                if decoded.channel_layout() != dec_layout {
+                    decoded.set_channel_layout(dec_layout);
                 }
                 let mut resampled = ffmpeg_next::frame::Audio::empty();
                 if track.resampler.run(&decoded, &mut resampled).is_ok() {
@@ -5213,7 +5229,39 @@ impl FfmpegSource {
                     let s_idx = stream.index();
                     if Some(s_idx) == self.video_stream_index {
                         if let Some(tx) = &self.video_tx {
-                            let _ = tx.try_send((self.video_epoch, packet.clone()));
+                            let mut v_pkt = packet.clone();
+                            if self.iso_media.is_some()
+                                && let Some(tb) = self.video_time_base
+                            {
+                                let tb_f64 = tb.numerator() as f64 / tb.denominator().max(1) as f64;
+                                if tb_f64 > 0.0
+                                    && let Some(raw_ts) = v_pkt.pts().or_else(|| v_pkt.dts())
+                                {
+                                    let raw_sec = raw_ts as f64 * tb_f64;
+                                    let need_reanchor = match self.video_pts_offset_ticks {
+                                        None => true,
+                                        Some(off) => {
+                                            let adjusted_sec = (raw_ts + off) as f64 * tb_f64;
+                                            (adjusted_sec - self.current_time).abs() > 4.0
+                                        }
+                                    };
+                                    if need_reanchor {
+                                        let desired_ticks =
+                                            (self.current_time / tb_f64).round() as i64;
+                                        self.video_pts_offset_ticks = Some(desired_ticks - raw_ts);
+                                        let _ = raw_sec;
+                                    }
+                                    if let Some(off) = self.video_pts_offset_ticks {
+                                        if let Some(pts) = v_pkt.pts() {
+                                            v_pkt.set_pts(Some(pts + off));
+                                        }
+                                        if let Some(dts) = v_pkt.dts() {
+                                            v_pkt.set_dts(Some(dts + off));
+                                        }
+                                    }
+                                }
+                            }
+                            let _ = tx.try_send((self.video_epoch, v_pkt));
                         }
                     } else if let Some(track) = self.active_tracks.get_mut(&s_idx)
                         && (track.enabled
@@ -5283,6 +5331,9 @@ impl FfmpegSource {
                             {
                                 track.resampler = new_resamp;
                                 track.channels = dec_ch;
+                            }
+                            if decoded.channel_layout() != dec_layout {
+                                decoded.set_channel_layout(dec_layout);
                             }
                             let mut resampled = ffmpeg_next::frame::Audio::empty();
                             if track.resampler.run(&decoded, &mut resampled).is_ok() {
@@ -5421,7 +5472,12 @@ impl AudioSource for FfmpegSource {
         self.channel_vus.fill(0.0);
 
         let has_iamf = self.iamf_groups.iter().any(|g| g.is_some());
-        let is_2track = self.audio_tracks.len() == 2 && !has_iamf;
+        let is_2track = self.audio_tracks.len() == 2
+            && !has_iamf
+            && self.iso_media.is_none()
+            && self.audio_tracks[0].channels == self.audio_tracks[1].channels
+            && self.audio_tracks[0].channels <= 2
+            && self.audio_tracks[0].codec == self.audio_tracks[1].codec;
 
         // Dynamic energy-cancellation check for 2-track stereo audio (instrumental + full mix vocal guide)
         if !self.is_full_mix_guide && is_2track {
@@ -5715,6 +5771,29 @@ impl AudioSource for FfmpegSource {
 
     fn set_position_seconds(&mut self, pos: f64) {
         self.is_eof = false;
+        if let Some(ref iso_media) = self.iso_media {
+            let byte_pos = iso_media.time_to_logical_byte(pos, self.duration) as i64;
+            unsafe {
+                ffmpeg_next::ffi::av_seek_frame(
+                    self.ictx.as_mut_ptr(),
+                    -1,
+                    byte_pos,
+                    ffmpeg_next::ffi::AVSEEK_FLAG_BYTE,
+                );
+            }
+            self.target_seek_time = None;
+            self.video_pts_offset_ticks = None;
+            for track in self.active_tracks.values_mut() {
+                track.decoder.flush();
+                track.sample_buf.clear();
+                track.buf_pos = 0;
+                track.current_time = pos;
+                track.seek_in_progress = false;
+            }
+            self.current_time = pos;
+            self.video_epoch += 1;
+            return;
+        }
         let (stream_idx, pts) =
             if let (Some(v_idx), Some(tb)) = (self.video_stream_index, self.video_time_base) {
                 let tb_f64 = tb.numerator() as f64 / tb.denominator() as f64;
@@ -5968,6 +6047,7 @@ impl AudioSource for FfmpegSource {
 // ---------------------------------------------------------
 struct VideoOnlySource {
     ictx: ffmpeg_next::format::context::Input,
+    _custom_io: Option<crate::iso::CustomAvioGuard>,
     video_stream_index: usize,
     video_tx: Option<crossbeam_channel::Sender<(u64, ffmpeg_next::Packet)>>,
     video_epoch: u64,
@@ -6287,15 +6367,36 @@ pub fn probe_video_stream(ictx: &ffmpeg_next::format::context::Input) -> Option<
 
 fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>> {
     let _ = ffmpeg_next::init();
-    let mut dict = ffmpeg_next::Dictionary::new();
-    dict.set("probesize", "5000000");
-    dict.set("analyzeduration", "5000000");
-    let ictx = ffmpeg_next::format::input_with_dictionary(&file_path, dict)
-        .context("Failed to open file via libavformat")?;
+    let resolved_iso = if !is_network {
+        crate::iso::resolve_iso_or_vob_media(std::path::Path::new(file_path))
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+
+    let (ictx, custom_io) = if let Some(ref iso_info) = resolved_iso {
+        let (input, guard) = crate::iso::open_ffmpeg_input_from_iso(iso_info, file_path)
+            .context("Failed to open ISO/VOB virtual stream via libavformat")?;
+        (input, Some(guard))
+    } else {
+        let mut dict = ffmpeg_next::Dictionary::new();
+        dict.set("probesize", "5000000");
+        dict.set("analyzeduration", "5000000");
+        let input = ffmpeg_next::format::input_with_dictionary(&file_path, dict)
+            .context("Failed to open file via libavformat")?;
+        (input, None)
+    };
 
     let mut duration = ictx.duration() as f64 / ffmpeg_next::ffi::AV_TIME_BASE as f64;
     if is_network || duration < 0.0 {
         duration = 0.0;
+    }
+    if let Some(ref iso_info) = resolved_iso
+        && let Some(ifo_dur) = iso_info.ifo_duration_sec
+        && ifo_dur > 0.0
+    {
+        duration = ifo_dur;
     }
 
     if duration <= 0.0 {
@@ -6312,11 +6413,19 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
         }
     }
 
-    let ext = std::path::Path::new(file_path)
-        .extension()
-        .and_then(|s| s.to_str())
-        .unwrap_or("FFMPEG")
-        .to_uppercase();
+    let ext = if let Some(ref iso_info) = resolved_iso {
+        match &iso_info.media_kind {
+            crate::iso::IsoMediaKind::DvdVideo => "DVD-ISO".to_string(),
+            crate::iso::IsoMediaKind::DvdAudio => "DVDA-ISO".to_string(),
+            crate::iso::IsoMediaKind::DataFile { ext, .. } => format!("ISO/{}", ext.to_uppercase()),
+        }
+    } else {
+        std::path::Path::new(file_path)
+            .extension()
+            .and_then(|s| s.to_str())
+            .unwrap_or("FFMPEG")
+            .to_uppercase()
+    };
 
     let detected_iamf_groups = probe_iamf_stream_groups(&ictx);
     if duration <= 0.0
@@ -6496,6 +6605,11 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
                 | ffmpeg_next::codec::Id::PCM_S24LE
                 | ffmpeg_next::codec::Id::PCM_S32LE
                 | ffmpeg_next::codec::Id::PCM_F32LE => "PCM".to_string(),
+                ffmpeg_next::codec::Id::PCM_DVD
+                | ffmpeg_next::codec::Id::PCM_BLURAY
+                | ffmpeg_next::codec::Id::PCM_S16BE
+                | ffmpeg_next::codec::Id::PCM_S24BE => "LPCM".to_string(),
+                ffmpeg_next::codec::Id::MP2 => "MP2".to_string(),
                 _ => format!("{:?}", codec_id).to_uppercase(),
             };
 
@@ -6521,12 +6635,12 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
             };
 
             let meta = stream.metadata();
-            let lang = meta
+            let mut lang = meta
                 .get("language")
                 .or_else(|| meta.get("LANG"))
                 .map(|s| s.to_string())
                 .filter(|l| l.to_lowercase() != "und");
-            let title = meta
+            let mut title = meta
                 .get("name")
                 .or_else(|| meta.get("NAME"))
                 .or_else(|| meta.get("title"))
@@ -6534,6 +6648,24 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
                 .or_else(|| meta.get("description"))
                 .map(|s| s.to_string())
                 .or_else(|| mp4_track_names.get(audio_tracks.len()).cloned());
+
+            if let Some(ref iso_info) = resolved_iso
+                && let Some(ifo_aud) = iso_info.audio_streams.get(audio_tracks.len())
+            {
+                if lang.is_none() {
+                    lang = ifo_aud.language.clone();
+                }
+                if title.is_none() {
+                    if let Some(ref label) = ifo_aud.commentary_label {
+                        title = Some(label.clone());
+                    } else if let Some(bits) = ifo_aud.bit_depth
+                        && bits > 16
+                        && codec_name == "LPCM"
+                    {
+                        title = Some(format!("{}-bit", bits));
+                    }
+                }
+            }
 
             // FF_PROFILE_TRUEHD_ATMOS = 30, FF_PROFILE_EAC3_DDP_ATMOS = 30
             let is_atmos = ((codec_id == ffmpeg_next::codec::Id::TRUEHD
@@ -6598,12 +6730,18 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
 
     let container_kbps = if ictx.bit_rate() > 0 {
         Some((ictx.bit_rate() / 1000).max(1) as u32)
-    } else if !is_network
-        && duration > 0.0
-        && let Ok(meta) = std::fs::metadata(file_path)
-    {
-        let kbps = ((meta.len() as f64 * 8.0) / (duration * 1000.0)).round() as u32;
-        if kbps > 0 { Some(kbps) } else { None }
+    } else if !is_network && duration > 0.0 {
+        let byte_len = resolved_iso
+            .as_ref()
+            .map(|r| r.total_bytes)
+            .or_else(|| std::fs::metadata(file_path).ok().map(|m| m.len()))
+            .unwrap_or(0);
+        if byte_len > 0 {
+            let kbps = ((byte_len as f64 * 8.0) / (duration * 1000.0)).round() as u32;
+            if kbps > 0 { Some(kbps) } else { None }
+        } else {
+            None
+        }
     } else {
         None
     };
@@ -6639,6 +6777,7 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
         if let Some(v_idx) = video_stream_index {
             return Ok(Box::new(VideoOnlySource {
                 ictx,
+                _custom_io: custom_io,
                 video_stream_index: v_idx,
                 video_tx: None,
                 video_epoch: 0,
@@ -6687,11 +6826,17 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
     let time_base = stream.time_base();
     let tb = time_base.numerator() as f64 / time_base.denominator() as f64;
 
-    let initial_artist = ictx
+    let mut initial_artist = ictx
         .metadata()
         .get("artist")
         .map(|s| s.to_string())
         .unwrap_or_else(|| "Unknown".to_string());
+    if initial_artist == "Unknown"
+        && let Some(ref iso_info) = resolved_iso
+        && let Some(ref vol) = iso_info.volume_label
+    {
+        initial_artist = vol.clone();
+    }
 
     let mut active_tracks = std::collections::HashMap::new();
     for (t_idx, track_info) in audio_tracks.iter().enumerate() {
@@ -6761,7 +6906,8 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
                             channels: ch,
                             time_base: track_tb_f64,
                             current_time: 0.0,
-                            seek_in_progress: video_stream_index.is_some(),
+                            seek_in_progress: video_stream_index.is_some()
+                                && resolved_iso.is_none(),
                             substream_bitrate_kbps: sub_br,
                         },
                     );
@@ -6776,7 +6922,7 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
         ));
     }
 
-    let is_full_mix_guide = if audio_tracks.len() == 2 {
+    let is_full_mix_guide = if audio_tracks.len() == 2 && resolved_iso.is_none() {
         let t1_title = audio_tracks[1].title.to_lowercase();
         t1_title.contains("full mix") || t1_title.contains("fullmix")
     } else {
@@ -6785,6 +6931,7 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
 
     Ok(Box::new(FfmpegSource {
         ictx,
+        _custom_io: custom_io,
         active_tracks,
         primary_stream_index: stream_index,
         channels,
@@ -6815,6 +6962,8 @@ fn try_ffmpeg(file_path: &str, is_network: bool) -> Result<Box<dyn AudioSource>>
         target_seek_time: None,
         is_full_mix_guide,
         iamf_groups,
+        iso_media: resolved_iso,
+        video_pts_offset_ticks: None,
     }))
 }
 
@@ -7248,7 +7397,73 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
 
     let video_info = None; // Symphonia doesn't do video
 
-    // 1. Prioritize FFmpeg for video containers (MKV, MP4, WEBM, MOV, AVI) and raw surround bitstreams (IAMF, DTS-HD, DTS, AC3, E-AC3, TrueHD).
+    let resolved_iso_for_fallback = if matches!(ext.as_str(), "iso" | "vob" | "aob") {
+        crate::iso::resolve_iso_or_vob_media(std::path::Path::new(file_path))
+            .ok()
+            .flatten()
+    } else {
+        None
+    };
+
+    // 0. If this is an ISO containing a tracker module, load via OpenMptSource so full pattern data is available.
+    if let Some(ref iso_info) = resolved_iso_for_fallback
+        && let crate::iso::IsoMediaKind::DataFile {
+            ext: ref inner_ext, ..
+        } = iso_info.media_kind
+        && matches!(
+            inner_ext.as_str(),
+            "mod"
+                | "s3m"
+                | "xm"
+                | "it"
+                | "mptm"
+                | "stm"
+                | "med"
+                | "okt"
+                | "669"
+                | "mtm"
+                | "far"
+                | "ult"
+                | "amf"
+                | "dsm"
+                | "psm"
+                | "umx"
+                | "mo3"
+                | "ptm"
+                | "mdl"
+                | "ams"
+                | "dbm"
+                | "digi"
+                | "dmf"
+                | "dtm"
+                | "gdm"
+                | "imf"
+                | "j2b"
+                | "m15"
+                | "nst"
+                | "plm"
+                | "sfx"
+                | "stk"
+                | "wow"
+        )
+        && iso_info.total_bytes > 0
+        && iso_info.total_bytes <= 64 * 1024 * 1024
+        && let Ok(mut vstream) = crate::iso::IsoVirtualStream::new(iso_info.extents.clone())
+    {
+        let mut data = Vec::with_capacity(iso_info.total_bytes as usize);
+        if vstream.read_to_end(&mut data).is_ok() {
+            let mut module_cursor = Cursor::new(data);
+            if let Ok(module) = Module::create(&mut module_cursor, Logger::None, &[]) {
+                return Ok(Box::new(OpenMptSource {
+                    module: SafeModule(module),
+                    left_buf: Vec::with_capacity(8192),
+                    right_buf: Vec::with_capacity(8192),
+                }));
+            }
+        }
+    }
+
+    // 1. Prioritize FFmpeg for video containers (MKV, MP4, WEBM, MOV, AVI, ISO, VOB, AOB) and raw surround bitstreams (IAMF, DTS-HD, DTS, AC3, E-AC3, TrueHD).
     if matches!(
         ext.as_str(),
         "mkv"
@@ -7261,6 +7476,9 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
             | "wmv"
             | "mpg"
             | "mpeg"
+            | "vob"
+            | "aob"
+            | "iso"
             | "ogv"
             | "3gp"
             | "mka"
@@ -7412,7 +7630,27 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
 
     // 4. Try Symphonia for supported audio and container formats (FLAC, MP3, WAV, AAC, M4A, OGG, OPUS, etc.)
     let mut symphonia_error = None;
-    if let Ok(file) = File::open(file_path) {
+    if let Some(ref iso_info) = resolved_iso_for_fallback
+        && let Ok(vstream) = crate::iso::IsoVirtualStream::new(iso_info.extents.clone())
+    {
+        let probe_ext = match &iso_info.media_kind {
+            crate::iso::IsoMediaKind::DataFile { ext: inner_ext, .. } => inner_ext.as_str(),
+            _ => "mpg",
+        };
+        let display_ext = probe_ext.to_uppercase();
+        match try_symphonia(
+            vstream,
+            probe_ext,
+            &display_ext,
+            video_info.clone(),
+            Some(file_path),
+        ) {
+            Ok(source) => return Ok(source),
+            Err(e) => {
+                symphonia_error = Some(e);
+            }
+        }
+    } else if let Ok(file) = File::open(file_path) {
         match try_symphonia(file, &ext, &ext, video_info.clone(), Some(file_path)) {
             Ok(source) => return Ok(source),
             Err(e) => {
@@ -7504,6 +7742,9 @@ pub fn start_audio_thread(
                 | "mov"
                 | "avi"
                 | "mka"
+                | "vob"
+                | "aob"
+                | "iso"
                 | "dtshd"
                 | "dts"
                 | "ac3"
@@ -13793,16 +14034,18 @@ mod tests {
                 "Stereo 2ch Right output must be 100% untouched even when routing curve is non-flat"
             );
 
-            // And on 7.1.4 with flat EQ and front_gain = 1.0, FL/FR must remain uncolored and free of notches,
-            // while non-zero EQ bands actively shape FL/FR as well as the surround stage.
-            let flat_for_fl = crate::state::SurroundUpmixConfig {
-                band_gains_db: [0.0; 5],
-                ..cfg
-            };
-            let spatial = dsp_stereo.process_stereo_to_7_1_4(l_in, r_in, &flat_for_fl);
-            assert!(
-                (spatial[0] - l_in).abs() < 1e-6 && (spatial[1] - r_in).abs() < 1e-6,
-                "Flat EQ must leave Front L/R uncolored"
+            // And on 7.1.4 with front_gain = 1.0, FL/FR must remain 100% uncolored and bit-identical
+            // even when non-zero EQ bands actively shape the synthesized surround/height channels.
+            let spatial = dsp_stereo.process_stereo_to_7_1_4(l_in, r_in, &cfg);
+            assert_eq!(
+                spatial[0].to_bits(),
+                l_in.to_bits(),
+                "Front L must remain 100% uncolored (bit-identical) even with non-flat routing EQ"
+            );
+            assert_eq!(
+                spatial[1].to_bits(),
+                r_in.to_bits(),
+                "Front R must remain 100% uncolored (bit-identical) even with non-flat routing EQ"
             );
             if n > 512 {
                 crossover_peak_fl = crossover_peak_fl.max(spatial[0].abs());
@@ -14000,9 +14243,13 @@ mod tests {
         dsp_12ch.sync_config(&cfg, sr);
 
         let mut power_2ch = 0.0f64;
+        let mut front_power_6ch = 0.0f64;
+        let mut front_power_8ch = 0.0f64;
+        let mut front_power_12ch = 0.0f64;
         let mut power_6ch = 0.0f64;
         let mut power_8ch = 0.0f64;
         let mut power_12ch = 0.0f64;
+        let mut corr_fc_mid = 0.0f64;
         let total_samples = 9600;
         let warmup = 1024;
         for n in 0..total_samples {
@@ -14020,8 +14267,28 @@ mod tests {
             let out_8 = dsp_8ch.process_frame_for_hardware(l_in, r_in, &cfg, 8);
             let out_12 = dsp_12ch.process_frame_for_hardware(l_in, r_in, &cfg, 12);
 
+            // Base stereo pair (FL/FR) must be 100% bit-identical to input across all speaker layouts
+            assert_eq!(out_6[0].to_bits(), l_in.to_bits());
+            assert_eq!(out_6[1].to_bits(), r_in.to_bits());
+            assert_eq!(out_8[0].to_bits(), l_in.to_bits());
+            assert_eq!(out_8[1].to_bits(), r_in.to_bits());
+            assert_eq!(out_12[0].to_bits(), l_in.to_bits());
+            assert_eq!(out_12[1].to_bits(), r_in.to_bits());
+
             if n >= warmup {
                 power_2ch += out_2[..2]
+                    .iter()
+                    .map(|&x| (x as f64) * (x as f64))
+                    .sum::<f64>();
+                front_power_6ch += out_6[..2]
+                    .iter()
+                    .map(|&x| (x as f64) * (x as f64))
+                    .sum::<f64>();
+                front_power_8ch += out_8[..2]
+                    .iter()
+                    .map(|&x| (x as f64) * (x as f64))
+                    .sum::<f64>();
+                front_power_12ch += out_12[..2]
                     .iter()
                     .map(|&x| (x as f64) * (x as f64))
                     .sum::<f64>();
@@ -14037,24 +14304,34 @@ mod tests {
                     .iter()
                     .map(|&x| (x as f64) * (x as f64))
                     .sum::<f64>();
+                let mid = 0.5 * (l_in + r_in) as f64;
+                corr_fc_mid += (out_6[2] as f64) * mid;
             }
         }
+        assert!((front_power_6ch - power_2ch).abs() < 1e-9);
+        assert!((front_power_8ch - power_2ch).abs() < 1e-9);
+        assert!((front_power_12ch - power_2ch).abs() < 1e-9);
+        assert!(
+            corr_fc_mid > 0.0,
+            "Synthesized FC must be in-phase (positively correlated) with front mid signal (got {})",
+            corr_fc_mid
+        );
         let db_6ch = 10.0 * (power_6ch / power_2ch).log10();
         let db_8ch = 10.0 * (power_8ch / power_2ch).log10();
         let db_12ch = 10.0 * (power_12ch / power_2ch).log10();
         assert!(
-            db_6ch.abs() < 1.25,
-            "5.1 upmix total acoustic power must match 2.0 stereo within 1.25 dB (got {:+.2} dB)",
+            db_6ch > 0.2 && db_6ch < 3.0,
+            "5.1 additive upmix must preserve 0dB base FL/FR and add surround/center/LFE energy (got {:+.2} dB)",
             db_6ch
         );
         assert!(
-            db_8ch.abs() < 1.25,
-            "7.1 upmix total acoustic power must match 2.0 stereo within 1.25 dB (got {:+.2} dB)",
+            db_8ch > 0.2 && db_8ch < 3.0,
+            "7.1 additive upmix must preserve 0dB base FL/FR and add surround/center/LFE energy (got {:+.2} dB)",
             db_8ch
         );
         assert!(
-            db_12ch.abs() < 1.25,
-            "7.1.4 upmix total acoustic power must match 2.0 stereo within 1.25 dB (got {:+.2} dB)",
+            db_12ch > 0.2 && db_12ch < 3.5,
+            "7.1.4 additive upmix must preserve 0dB base FL/FR and add surround/height energy (got {:+.2} dB)",
             db_12ch
         );
 
@@ -14151,22 +14428,40 @@ mod tests {
             out_714[4].abs() > 0.05 && out_714[6].abs() < 1e-6,
             "0x63F slot 6 (SL) must map to canonical slot 4 (SL), not slot 6 (BL)"
         );
+        let mut peak_flat_tfl = 0.0f32;
+        for n in 0..512 {
+            let s = (2.0 * std::f32::consts::PI * 5000.0 * (n as f32 / sr as f32)).sin() * 0.25;
+            let frame_5khz = [s, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+            let out_flat =
+                dsp_714.process_multichannel_frame_for_hardware(&frame_5khz, 8, &cfg_714, 12);
+            if n > 128 {
+                peak_flat_tfl = peak_flat_tfl.max(out_flat[8].abs());
+            }
+        }
         cfg_714.band_gains_db = [10.0, 10.0, 10.0, 10.0, 10.0];
         dsp_714.sync_config(&cfg_714, sr);
         let mut peak_eq_fl = 0.0f32;
+        let mut peak_eq_tfl = 0.0f32;
         for n in 0..512 {
-            let s = (2.0 * std::f32::consts::PI * 1000.0 * (n as f32 / sr as f32)).sin() * 0.4;
-            let frame_1khz = [s, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+            let s = (2.0 * std::f32::consts::PI * 5000.0 * (n as f32 / sr as f32)).sin() * 0.25;
+            let frame_5khz = [s, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
             let out_eq =
-                dsp_714.process_multichannel_frame_for_hardware(&frame_1khz, 8, &cfg_714, 12);
+                dsp_714.process_multichannel_frame_for_hardware(&frame_5khz, 8, &cfg_714, 12);
             if n > 128 {
                 peak_eq_fl = peak_eq_fl.max(out_eq[0].abs());
+                peak_eq_tfl = peak_eq_tfl.max(out_eq[8].abs());
             }
         }
         assert!(
-            peak_eq_fl > 0.20 * 2.0,
-            "5-band EQ +10dB boost at 1kHz must more than double multichannel output (got peak {})",
+            (peak_eq_fl - 0.125).abs() < 1e-4,
+            "Discrete 7.1 bed channel FL must remain uncolored by 5-band routing EQ (got peak {})",
             peak_eq_fl
+        );
+        assert!(
+            peak_eq_tfl > peak_flat_tfl * 2.0,
+            "5-band routing EQ +10dB boost must more than double synthesized height TFL (flat {}, boosted {})",
+            peak_flat_tfl,
+            peak_eq_tfl
         );
 
         // 10. Verify toggling Upmix OFF/ON on a stereo track with 8ch hardware never requests

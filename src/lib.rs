@@ -2,6 +2,7 @@ pub mod audio;
 pub mod bitstream;
 pub mod engine;
 pub mod ipc;
+pub mod iso;
 pub mod lyrics;
 pub mod mpegh;
 pub mod playlist;

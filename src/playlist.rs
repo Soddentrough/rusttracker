@@ -52,6 +52,9 @@ pub const SUPPORTED_EXTENSIONS: &[&str] = &[
     "mpeg",
     "ogv",
     "3gp",
+    "vob",
+    "aob",
+    "iso",
     // Project files
     "dawproject",
     "aaf",
@@ -93,7 +96,7 @@ pub const FILE_DIALOG_EXTENSIONS: &[&str] = &[
     "truehd",
     "mlp",
     "iamf",
-    // Video containers
+    // Video containers & disc images
     "mp4",
     "m4v",
     "mkv",
@@ -109,6 +112,9 @@ pub const FILE_DIALOG_EXTENSIONS: &[&str] = &[
     "mpeg",
     "ogv",
     "3gp",
+    "vob",
+    "aob",
+    "iso",
     // Project & playlist files
     "dawproject",
     "aaf",
@@ -137,6 +143,36 @@ pub fn scan_directory(dir: &Path) -> Vec<String> {
     results
 }
 
+fn is_dvd_menu_or_continuation_vob(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    let upper = name.to_uppercase();
+    if upper == "VIDEO_TS.VOB" || upper == "AUDIO_TS.VOB" {
+        return true;
+    }
+    if let Some(stem) = upper
+        .strip_prefix("VTS_")
+        .and_then(|s| s.strip_suffix(".VOB"))
+        && let Some((vts_str, part_str)) = stem.split_once('_')
+        && let (Ok(vts_num), Ok(part_num)) = (vts_str.parse::<u8>(), part_str.parse::<u8>())
+    {
+        if part_num == 0 {
+            return true;
+        }
+        if part_num > 1
+            && let Some(parent) = path.parent()
+        {
+            let part1 = parent.join(format!("VTS_{:02}_1.VOB", vts_num));
+            let part1_lower = parent.join(format!("vts_{:02}_1.vob", vts_num));
+            if part1.exists() || part1_lower.exists() {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 fn collect_directory_files(dir: &Path, results: &mut Vec<String>) {
     let entries = match std::fs::read_dir(dir) {
         Ok(e) => e,
@@ -151,6 +187,7 @@ fn collect_directory_files(dir: &Path, results: &mut Vec<String>) {
             .extension()
             .and_then(|s| s.to_str())
             .is_some_and(is_supported_media_extension)
+            && !is_dvd_menu_or_continuation_vob(&path)
         {
             results.push(path.to_string_lossy().into_owned());
         }
@@ -262,6 +299,9 @@ mod tests {
         assert!(is_supported_media_extension("mp3"));
         assert!(is_supported_media_extension("FLAC"));
         assert!(is_supported_media_extension("mp4"));
+        assert!(is_supported_media_extension("iso"));
+        assert!(is_supported_media_extension("VOB"));
+        assert!(is_supported_media_extension("aob"));
         assert!(!is_supported_media_extension("txt"));
         assert!(!is_supported_media_extension("exe"));
     }

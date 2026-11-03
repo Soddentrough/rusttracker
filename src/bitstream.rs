@@ -31,11 +31,21 @@ pub fn start_bitstream_thread(
     ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Quiet);
     ffmpeg_next::init().context("Failed to initialize ffmpeg-next")?;
 
-    let mut dict = ffmpeg_next::Dictionary::new();
-    dict.set("probesize", "5000000");
-    dict.set("analyzeduration", "5000000");
-    let mut ictx = ffmpeg_next::format::input_with_dictionary(&file_path, dict)
-        .context("Failed to open input file")?;
+    let resolved_iso = crate::iso::resolve_iso_or_vob_media(std::path::Path::new(file_path))
+        .ok()
+        .flatten();
+    let (ictx, custom_io) = if let Some(ref iso_info) = resolved_iso {
+        let (input, guard) = crate::iso::open_ffmpeg_input_from_iso(iso_info, file_path)
+            .context("Failed to open ISO/VOB virtual stream")?;
+        (input, Some(guard))
+    } else {
+        let mut dict = ffmpeg_next::Dictionary::new();
+        dict.set("probesize", "5000000");
+        dict.set("analyzeduration", "5000000");
+        let input = ffmpeg_next::format::input_with_dictionary(&file_path, dict)
+            .context("Failed to open input file")?;
+        (input, None)
+    };
 
     let best_audio = ictx
         .streams()
@@ -57,11 +67,17 @@ pub fn start_bitstream_thread(
     }
     .to_string();
 
-    let meta_duration = if ictx.duration() > 0 {
+    let mut meta_duration = if ictx.duration() > 0 {
         ictx.duration() as f64 / ffmpeg_next::ffi::AV_TIME_BASE as f64
     } else {
         0.0
     };
+    if let Some(ref iso_info) = resolved_iso
+        && let Some(ifo_dur) = iso_info.ifo_duration_sec
+        && ifo_dur > 0.0
+    {
+        meta_duration = ifo_dur;
+    }
     let meta_artist = {
         let meta = ictx.metadata();
         meta.get("artist")
@@ -198,6 +214,8 @@ pub fn start_bitstream_thread(
     let pipe_path_clone = pipe_path.clone();
 
     let ffmpeg_thread = std::thread::spawn(move || {
+        let _custom_io = custom_io;
+        let mut ictx = ictx;
         println!("[bitstream] FFmpeg thread started on Linux.");
 
         struct SpdifItem {
@@ -1262,11 +1280,21 @@ mod wasapi_bitstream {
         ffmpeg_next::log::set_level(ffmpeg_next::log::Level::Quiet);
         ffmpeg_next::init().context("Failed to initialize ffmpeg-next")?;
 
-        let mut dict = ffmpeg_next::Dictionary::new();
-        dict.set("probesize", "5000000");
-        dict.set("analyzeduration", "5000000");
-        let mut ictx = ffmpeg_next::format::input_with_dictionary(&file_path, dict)
-            .context("Failed to open input file")?;
+        let resolved_iso = crate::iso::resolve_iso_or_vob_media(std::path::Path::new(file_path))
+            .ok()
+            .flatten();
+        let (ictx, custom_io) = if let Some(ref iso_info) = resolved_iso {
+            let (input, guard) = crate::iso::open_ffmpeg_input_from_iso(iso_info, file_path)
+                .context("Failed to open ISO/VOB virtual stream")?;
+            (input, Some(guard))
+        } else {
+            let mut dict = ffmpeg_next::Dictionary::new();
+            dict.set("probesize", "5000000");
+            dict.set("analyzeduration", "5000000");
+            let input = ffmpeg_next::format::input_with_dictionary(&file_path, dict)
+                .context("Failed to open input file")?;
+            (input, None)
+        };
 
         let (codec_id, best_audio_index, parameters, stream_time_base, mut audio_bitrate_kbps) = {
             let best_audio = ictx
@@ -1333,11 +1361,17 @@ mod wasapi_bitstream {
             state.stats.video_fps = video_fps;
             state.stats.video_bitrate_kbps = video_bitrate_kbps;
         }
-        let meta_duration = if ictx.duration() > 0 {
+        let mut meta_duration = if ictx.duration() > 0 {
             ictx.duration() as f64 / ffmpeg_next::ffi::AV_TIME_BASE as f64
         } else {
             0.0
         };
+        if let Some(ref iso_info) = resolved_iso
+            && let Some(ifo_dur) = iso_info.ifo_duration_sec
+            && ifo_dur > 0.0
+        {
+            meta_duration = ifo_dur;
+        }
         let meta_artist = {
             let meta = ictx.metadata();
             meta.get("artist")
@@ -1366,12 +1400,16 @@ mod wasapi_bitstream {
         let meta_duration_pump = meta_duration;
 
         let handle = std::thread::spawn(move || {
+            let custom_io = custom_io;
+            let ictx = ictx;
             // Initialize COM strictly on this dedicated thread
             unsafe {
                 let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
             }
 
             let setup_result: Result<_> = (|| {
+                let custom_io = custom_io;
+                let ictx = ictx;
                 let enumerator: IMMDeviceEnumerator =
                     unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
 
@@ -1607,6 +1645,8 @@ mod wasapi_bitstream {
                         let pipe_flushing_feeder = pipe_flushing.clone();
 
                         let ffmpeg_worker = std::thread::spawn(move || {
+                            let _custom_io = custom_io;
+                            let mut ictx = ictx;
                             println!(
                                 "[bitstream] Compressed bitstream FFmpeg worker thread started."
                             );
@@ -2196,6 +2236,8 @@ mod wasapi_bitstream {
                         let shared_state_lpcm = shared_state_pump.clone();
 
                         std::thread::spawn(move || {
+                            let _custom_io = custom_io;
+                            let mut ictx = ictx;
                             println!(
                                 "[bitstream] Multi-Channel LPCM FFmpeg worker thread started."
                             );
