@@ -45,7 +45,7 @@ jobs:
       - name: Clippy Lint Check
         run: |
           source "$HOME/.cargo/env"
-          cargo clippy --all-targets -- -D warnings
+          cargo clippy --message-format=github --all-targets -- -D warnings
 
       - name: Validate WGSL Shaders
         run: |

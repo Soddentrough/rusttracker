@@ -721,7 +721,7 @@ pub fn start_bitstream_thread(
 
     Ok((
         ffmpeg_thread,
-        decoder_sample_rate as u32,
+        decoder_sample_rate,
         8u16,
         codec_name,
         has_video,
