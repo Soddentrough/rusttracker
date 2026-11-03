@@ -1221,7 +1221,6 @@ unsafe extern "C" fn avio_seek_packet(
 
 /// Opens a `ResolvedIsoMedia` virtual stream as an `ffmpeg_next::format::context::Input`
 /// backed by a custom `AVIOContext`.
-
 pub fn open_ffmpeg_input_from_iso(
     resolved: &ResolvedIsoMedia,
     hint_url: &str,

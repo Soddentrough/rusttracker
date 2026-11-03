@@ -7458,6 +7458,7 @@ pub fn load_audio_source(file_path: &str) -> Result<Box<dyn AudioSource>> {
                     module: SafeModule(module),
                     left_buf: Vec::with_capacity(8192),
                     right_buf: Vec::with_capacity(8192),
+                    volume: 1.0,
                 }));
             }
         }

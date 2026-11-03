@@ -65,6 +65,11 @@
   <content_rating type="oars-1.1" />
   
   <releases>
+    <release version="0.9.37" date="2026-11-03">
+      <description>
+        <p>Added direct DVD-Video/DVD-Audio ISO and multi-segment VOB/AOB playback with IFO program-chain duration and cell-accurate seeking, and redesigned the surround/height upmixer to preserve the base front/discrete tone untouched while adding phase-coherent surround and height channels.</p>
+      </description>
+    </release>
     <release version="0.9.36" date="2026-10-31">
       <description>
         <p>Defaulted middle panel to piano roll, consolidated surround upmix controls, enabled Spatial Audio 7.1.4 alongside shared sessions, eliminated WASAPI Exclusive HDMI flicker and topology poll contention, and stopped streams cleanly on pause.</p>
