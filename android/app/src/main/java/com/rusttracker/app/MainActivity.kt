@@ -66,10 +66,27 @@ class MainActivity : GameActivity() {
     private val currentLoadId = java.util.concurrent.atomic.AtomicLong(0L)
     @Volatile private var isPickerOpen = false
     @Volatile private var lastPickerLaunchMs = 0L
+    @Volatile private var pendingMicUri: String? = null
 
     private val openDocumentLauncher = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri: Uri? ->
         isPickerOpen = false
         uri?.let { handleSelectedUri(it) }
+    }
+
+    private val requestRecordAudioLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { isGranted: Boolean ->
+        val uri = pendingMicUri
+        pendingMicUri = null
+        if (isGranted) {
+            Log.i(TAG, "RECORD_AUDIO permission granted; starting audio input: $uri")
+            if (!uri.isNullOrBlank()) {
+                nativeOnFileSelected(uri)
+            }
+        } else {
+            Log.w(TAG, "RECORD_AUDIO permission denied by user")
+            nativeOnFileStatus("Microphone permission denied")
+        }
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -151,6 +168,29 @@ class MainActivity : GameActivity() {
             } catch (e: Exception) {
                 isPickerOpen = false
                 Log.e(TAG, "Error launching openDocumentLauncher with media filters", e)
+            }
+        }
+    }
+
+    fun hasRecordAudioPermission(): Boolean {
+        return androidx.core.content.ContextCompat.checkSelfPermission(
+            this,
+            android.Manifest.permission.RECORD_AUDIO
+        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+    }
+
+    fun requestRecordAudioPermission(micUri: String) {
+        runOnUiThread {
+            if (hasRecordAudioPermission()) {
+                nativeOnFileSelected(micUri)
+                return@runOnUiThread
+            }
+            pendingMicUri = micUri
+            try {
+                requestRecordAudioLauncher.launch(android.Manifest.permission.RECORD_AUDIO)
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to launch RECORD_AUDIO permission request", e)
+                nativeOnFileStatus("Failed to request microphone permission")
             }
         }
     }

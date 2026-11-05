@@ -291,6 +291,41 @@ pub fn query_android_display_refresh_rate(app: &AndroidApp) -> f32 {
     60.0
 }
 
+pub fn ensure_android_record_audio_permission(app: &AndroidApp, mic_uri: &str) -> bool {
+    let vm = unsafe { jni::JavaVM::from_raw(app.vm_as_ptr() as *mut _) };
+    if let Ok(vm) = vm
+        && let Ok(mut env) = vm.attach_current_thread()
+    {
+        let activity_obj =
+            unsafe { jni::objects::JObject::from_raw(app.activity_as_ptr() as *mut _) };
+        if let Ok(val) = env.call_method(&activity_obj, "hasRecordAudioPermission", "()Z", &[])
+            && let Ok(granted) = val.z()
+        {
+            if granted {
+                return true;
+            }
+            log_android(
+                4,
+                &format!(
+                    "[RustTracker] RECORD_AUDIO permission not granted yet; requesting runtime permission for {}",
+                    mic_uri
+                ),
+            );
+            if let Ok(j_uri) = env.new_string(mic_uri) {
+                let j_obj: jni::objects::JObject = j_uri.into();
+                let _ = env.call_method(
+                    &activity_obj,
+                    "requestRecordAudioPermission",
+                    "(Ljava/lang/String;)V",
+                    &[jni::objects::JValue::Object(&j_obj)],
+                );
+            }
+            return false;
+        }
+    }
+    true
+}
+
 struct AndroidRustTrackerApp {
     android_app: AndroidApp,
     app_state: Arc<Mutex<AppState>>,
@@ -519,38 +554,46 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                 }
             }
             WindowEvent::Touch(touch) => {
-                let size = win.inner_size();
-                let scale_factor = (win.scale_factor() as f32).max(1.0);
-                self.touch_controller.set_scale_factor(scale_factor);
-                let is_portrait = size.width < size.height;
-                let split_ratio = self.app_state.lock().unwrap().panel_split_ratio;
-                let min_h_px = 220.0 * scale_factor;
-                let split_y = (size.height as f32 * split_ratio)
-                    .clamp(min_h_px, (size.height as f32 - min_h_px).max(min_h_px));
-                let has_video = self.app_state.lock().unwrap().has_video_stream
-                    || self
-                        .engine
-                        .as_ref()
-                        .map(|e| e.has_video_stream())
-                        .unwrap_or(false);
-                if let Some(gesture) = self.touch_controller.handle_touch(
-                    &touch,
-                    size.width as f32,
-                    size.height as f32,
-                    is_portrait,
-                    split_y,
-                ) {
-                    eprintln!("[RustTracker Touch] Detected gesture: {:?}", gesture);
-                    if let Some(EngineAction::OpenFile) = Self::handle_gesture_static(
-                        &self.app_state,
-                        gesture,
-                        has_video,
+                let modal_open = {
+                    let st = self.app_state.lock().unwrap();
+                    st.is_url_dialog_open || st.show_vis_picker
+                };
+                if modal_open {
+                    self.touch_controller.reset();
+                } else {
+                    let size = win.inner_size();
+                    let scale_factor = (win.scale_factor() as f32).max(1.0);
+                    self.touch_controller.set_scale_factor(scale_factor);
+                    let is_portrait = size.width < size.height;
+                    let split_ratio = self.app_state.lock().unwrap().panel_split_ratio;
+                    let min_h_px = 220.0 * scale_factor;
+                    let split_y = (size.height as f32 * split_ratio)
+                        .clamp(min_h_px, (size.height as f32 - min_h_px).max(min_h_px));
+                    let has_video = self.app_state.lock().unwrap().has_video_stream
+                        || self
+                            .engine
+                            .as_ref()
+                            .map(|e| e.has_video_stream())
+                            .unwrap_or(false);
+                    if let Some(gesture) = self.touch_controller.handle_touch(
+                        &touch,
                         size.width as f32,
                         size.height as f32,
-                        scale_factor,
+                        is_portrait,
+                        split_y,
                     ) {
-                        self.touch_controller.reset();
-                        trigger_android_file_picker(&self.android_app);
+                        eprintln!("[RustTracker Touch] Detected gesture: {:?}", gesture);
+                        if let Some(EngineAction::OpenFile) = Self::handle_gesture_static(
+                            &self.app_state,
+                            gesture,
+                            has_video,
+                            size.width as f32,
+                            size.height as f32,
+                            scale_factor,
+                        ) {
+                            self.touch_controller.reset();
+                            trigger_android_file_picker(&self.android_app);
+                        }
                     }
                 }
             }
@@ -577,9 +620,9 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                         let st = self.app_state.lock().unwrap();
                         let in_info_hdr = if is_portrait {
                             st.mobile_hud_tab == crate::state::MobileHudTab::Info
-                                && x > (size.width as f32 * 0.65)
+                                && x > (size.width as f32 * 0.76)
                         } else {
-                            st.show_hud && st.video_mode == 0 && x > (size.width as f32 * 0.82)
+                            st.show_hud && st.video_mode == 0 && x > (size.width as f32 * 0.88)
                         };
                         in_info_hdr && y < (115.0 * scale_factor)
                     } else {
@@ -674,15 +717,29 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                             state.osd_timer = 3.0;
                         }
                     }
-                    if let Some(new_dev) = state.audio_device_change_request.take()
-                        && state.playlist_index < state.playlist.len()
-                    {
-                        let reload = state.playlist[state.playlist_index].clone();
+                    if let Some(new_dev) = state.audio_device_change_request.take() {
+                        let is_mic = state.is_mic_input;
+                        let reload = if is_mic {
+                            crate::state::mic_uri_for_device(&new_dev)
+                        } else if state.playlist_index < state.playlist.len() {
+                            state.playlist[state.playlist_index].clone()
+                        } else {
+                            String::new()
+                        };
                         if !reload.is_empty() {
+                            if is_mic && !state.playlist.is_empty() {
+                                state.playlist[0] = reload.clone();
+                            }
                             state.load_request = Some(reload);
                             state.surround_upmix.user_overridden = false;
-                            resume_pos_on_reload = Some(state.current_seconds);
-                            state.osd_text = Some(format!("Audio Output: {}", new_dev));
+                            if !is_mic {
+                                resume_pos_on_reload = Some(state.current_seconds);
+                            }
+                            state.osd_text = Some(if is_mic {
+                                format!("🔊 Audio Input: {}", new_dev)
+                            } else {
+                                format!("Audio Output: {}", new_dev)
+                            });
                             state.osd_timer = 3.0;
                         }
                     }
@@ -1098,6 +1155,7 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                                 }
                             }
                             EngineAction::OpenUrlDialog => {
+                                self.touch_controller.reset();
                                 let mut state = self.app_state.lock().unwrap();
                                 state.available_input_devices =
                                     crate::audio::get_available_audio_devices(true);
@@ -1113,6 +1171,7 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                                 self.app_state.lock().unwrap().focus_url_input = false;
                             }
                             EngineAction::CloseUrlDialog => {
+                                self.touch_controller.reset();
                                 self.app_state.lock().unwrap().is_url_dialog_open = false;
                                 win.set_ime_allowed(false);
                             }
@@ -1126,6 +1185,7 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                                 win.set_ime_allowed(true);
                             }
                             EngineAction::LoadInputDevice(device_name) => {
+                                self.touch_controller.reset();
                                 let mic_uri = crate::state::mic_uri_for_device(&device_name);
                                 win.set_ime_allowed(false);
                                 {
@@ -1133,12 +1193,13 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                                     state.is_url_dialog_open = false;
                                     state.set_mic_input_mode(true, Some(device_name.clone()));
                                     state.osd_text =
-                                        Some(format!("🎙 Audio Input: {}", device_name));
+                                        Some(format!("🔊 Audio Input: {}", device_name));
                                     state.osd_timer = 3.0;
                                 }
                                 self.load_and_play_file(&mic_uri);
                             }
                             EngineAction::LoadUrl(url) => {
+                                self.touch_controller.reset();
                                 let mut final_url = url;
                                 win.set_ime_allowed(false);
                                 if crate::state::is_mic_uri(&final_url) {
@@ -1152,7 +1213,7 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                                         state.url_input_text.clear();
                                         state.set_mic_input_mode(true, Some(dev_name.clone()));
                                         state.osd_text =
-                                            Some(format!("🎙 Audio Input: {}", dev_name));
+                                            Some(format!("🔊 Audio Input: {}", dev_name));
                                         state.osd_timer = 3.0;
                                     }
                                     self.load_and_play_file(&mic_uri);
@@ -1198,7 +1259,12 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                                 let is_mic = {
                                     let mut state = self.app_state.lock().unwrap();
                                     state.selected_audio_device = Some(dev.clone());
-                                    state.audio_device_change_request = Some(dev.clone());
+                                    if !state.is_mic_input {
+                                        state.audio_device_change_request = Some(dev.clone());
+                                    } else {
+                                        state.osd_text = Some(format!("🔊 Audio Input: {}", dev));
+                                        state.osd_timer = 3.0;
+                                    }
                                     state.is_mic_input
                                 };
                                 if is_mic {
@@ -1420,9 +1486,9 @@ impl AndroidRustTrackerApp {
                 // Check if top right [📂 OPEN FILE] button was tapped in Track Info pane
                 let in_info_hdr = if is_portrait {
                     state.mobile_hud_tab == crate::state::MobileHudTab::Info
-                        && x > window_width * 0.65
+                        && x > window_width * 0.76
                 } else {
-                    state.show_hud && state.video_mode == 0 && x > window_width * 0.82
+                    state.show_hud && state.video_mode == 0 && x > window_width * 0.88
                 };
                 if in_info_hdr && y < (115.0 * sf) {
                     return Some(EngineAction::OpenFile);
@@ -1540,6 +1606,17 @@ impl AndroidRustTrackerApp {
 
     fn load_and_play_file(&mut self, path: &str) {
         log_android(3, &format!("Loading and playing file: {}", path));
+        let is_mic = crate::state::is_mic_uri(path);
+        if is_mic && !ensure_android_record_audio_permission(&self.android_app, path) {
+            let mut state = self.app_state.lock().unwrap();
+            let preferred_dev = crate::state::device_from_mic_uri(path).map(|s| s.to_string());
+            state.set_mic_input_mode(true, preferred_dev);
+            state.file_transfer = None;
+            state.osd_text = Some("Requesting Microphone Permission...".to_string());
+            state.osd_timer = 5.0;
+            return;
+        }
+
         self.active_stream = None;
         {
             let mut state = self.app_state.lock().unwrap();
@@ -1565,7 +1642,6 @@ impl AndroidRustTrackerApp {
             engine.clear_video_state();
         }
 
-        let is_mic = crate::state::is_mic_uri(path);
         {
             let mut state = self.app_state.lock().unwrap();
             let preferred_dev = crate::state::device_from_mic_uri(path).map(|s| s.to_string());

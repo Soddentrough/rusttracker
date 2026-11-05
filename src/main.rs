@@ -3648,7 +3648,7 @@ async fn run_gui(
                                         state.is_paused = false;
                                         state.track_ended = false;
                                         state.osd_text =
-                                            Some(format!("🎙 Audio Input: {}", device_name));
+                                            Some(format!("🔊 Audio Input: {}", device_name));
                                         state.osd_timer = 3.0;
                                     }
                                     EngineAction::LoadUrl(url) => {
@@ -3673,7 +3673,7 @@ async fn run_gui(
                                             state.is_paused = false;
                                             state.track_ended = false;
                                             state.osd_text =
-                                                Some(format!("🎙 Audio Input: {}", dev_name));
+                                                Some(format!("🔊 Audio Input: {}", dev_name));
                                             state.osd_timer = 3.0;
                                         } else {
                                             if !final_url.starts_with("http://")

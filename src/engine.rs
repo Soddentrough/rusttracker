@@ -8261,9 +8261,9 @@ impl VulkanEngine {
                                     let is_active_mic = state.is_mic_input
                                         && state.selected_audio_device.as_deref() == Some(dev.as_str());
                                     let btn_label = if is_active_mic {
-                                        format!("🎙 {} (Active)", dev)
+                                        format!("● {} (Active)", dev)
                                     } else {
-                                        format!("🎙 {}", dev)
+                                        format!("• {}", dev)
                                     };
                                     let width = ui.available_width();
                                     let mut btn = egui::Button::new(
@@ -10957,7 +10957,7 @@ impl VulkanEngine {
                                             }
                                             if ui.available_width() > 110.0 {
                                                 let stream_hdr_btn = egui::Button::new(
-                                                    egui::RichText::new("🎙 STREAM/DEV")
+                                                    egui::RichText::new("🔊 STREAM/DEV")
                                                         .size(11.5)
                                                         .strong()
                                                         .color(egui::Color32::WHITE)

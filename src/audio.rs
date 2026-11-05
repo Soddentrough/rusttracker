@@ -1999,6 +1999,43 @@ pub fn rank_output_config_key(
     )
 }
 
+pub fn is_usable_cpal_device_for_mode(desc: &cpal::DeviceDescription, mic: bool) -> bool {
+    if desc.name().eq_ignore_ascii_case("Default Device")
+        || desc.name().eq_ignore_ascii_case("default")
+    {
+        return true;
+    }
+    if mic {
+        if matches!(desc.direction(), cpal::DeviceDirection::Output) {
+            return false;
+        }
+        #[cfg(target_os = "android")]
+        {
+            let usable_type = matches!(
+                desc.device_type(),
+                cpal::DeviceType::Microphone
+                    | cpal::DeviceType::Headset
+                    | cpal::DeviceType::Headphones
+                    | cpal::DeviceType::HearingAid
+                    | cpal::DeviceType::Dock
+            );
+            let usable_iface = matches!(
+                desc.interface_type(),
+                cpal::InterfaceType::BuiltIn
+                    | cpal::InterfaceType::Usb
+                    | cpal::InterfaceType::Bluetooth
+                    | cpal::InterfaceType::Line
+            );
+            if !usable_type && !usable_iface {
+                return false;
+            }
+        }
+        true
+    } else {
+        !matches!(desc.direction(), cpal::DeviceDirection::Input)
+    }
+}
+
 pub fn get_available_audio_devices(mic: bool) -> Vec<String> {
     let host = cpal::default_host();
     let devices = if mic {
@@ -2011,6 +2048,9 @@ pub fn get_available_audio_devices(mic: bool) -> Vec<String> {
     if let Ok(devices) = devices {
         for d in devices {
             if let Ok(desc) = d.description() {
+                if !is_usable_cpal_device_for_mode(&desc, mic) {
+                    continue;
+                }
                 let name = format_cpal_device_name(&desc);
                 if is_relevant_audio_device(&name)
                     && !is_default_audio_device_selection(Some(&name))
@@ -8316,118 +8356,273 @@ pub fn start_audio_thread(
             let state = shared_state.lock().unwrap();
             state.selected_audio_device.clone()
         };
-        let mut dev = None;
+        let mut devices_to_try: Vec<cpal::Device> = Vec::new();
+        let push_unique_input_device = |list: &mut Vec<cpal::Device>, dev: cpal::Device| {
+            let dev_id = dev.id().ok();
+            let dev_name = dev
+                .description()
+                .ok()
+                .map(|desc| {
+                    format!(
+                        "{}:{:?}:{:?}",
+                        format_cpal_device_name(&desc),
+                        desc.device_type(),
+                        desc.address()
+                    )
+                })
+                .unwrap_or_default();
+            let already = list.iter().any(|existing| {
+                if let (Some(id_a), Ok(id_b)) = (dev_id.as_ref(), existing.id()) {
+                    return *id_a == id_b;
+                }
+                let ex_name = existing
+                    .description()
+                    .ok()
+                    .map(|desc| {
+                        format!(
+                            "{}:{:?}:{:?}",
+                            format_cpal_device_name(&desc),
+                            desc.device_type(),
+                            desc.address()
+                        )
+                    })
+                    .unwrap_or_default();
+                !dev_name.is_empty() && dev_name == ex_name
+            });
+            if !already {
+                list.push(dev);
+            }
+        };
+
+        let rank_input_device = |dev: &cpal::Device| -> u8 {
+            let Ok(desc) = dev.description() else {
+                return 2;
+            };
+            let is_mic_or_headset = matches!(
+                desc.device_type(),
+                cpal::DeviceType::Microphone
+                    | cpal::DeviceType::Headset
+                    | cpal::DeviceType::Headphones
+            );
+            let is_primary_addr = desc
+                .address()
+                .is_none_or(|a| a.eq_ignore_ascii_case("bottom") || a.is_empty());
+            match (is_mic_or_headset, is_primary_addr) {
+                (true, true) => 0,
+                (true, false) => 1,
+                (false, _) => 2,
+            }
+        };
+
         if !is_default_audio_device_selection(selected_device_name.as_deref())
             && let Some(ref name) = selected_device_name
         {
             if let Some(default_dev) = host.default_input_device()
                 && let Ok(desc) = default_dev.description()
+                && is_usable_cpal_device_for_mode(&desc, true)
                 && cpal_device_matches_name(&desc, name)
             {
-                dev = Some(default_dev);
-            } else if let Ok(devices) = host.input_devices() {
-                for d in devices {
-                    if let Ok(desc) = d.description()
-                        && cpal_device_matches_name(&desc, name)
+                push_unique_input_device(&mut devices_to_try, default_dev);
+            }
+            if let Ok(devices) = host.input_devices() {
+                let mut matched: Vec<cpal::Device> = devices
+                    .filter(|d| {
+                        d.description().is_ok_and(|desc| {
+                            is_usable_cpal_device_for_mode(&desc, true)
+                                && cpal_device_matches_name(&desc, name)
+                        })
+                    })
+                    .collect();
+                matched.sort_by_key(&rank_input_device);
+                for d in matched {
+                    push_unique_input_device(&mut devices_to_try, d);
+                }
+            }
+        }
+
+        if let Some(default_dev) = host.default_input_device() {
+            push_unique_input_device(&mut devices_to_try, default_dev);
+        }
+        if let Ok(devices) = host.input_devices() {
+            let mut others: Vec<cpal::Device> = devices
+                .filter(|d| {
+                    d.description().is_ok_and(|desc| {
+                        is_usable_cpal_device_for_mode(&desc, true)
+                            && is_relevant_audio_device(&format_cpal_device_name(&desc))
+                    })
+                })
+                .collect();
+            others.sort_by_key(&rank_input_device);
+            for d in others {
+                push_unique_input_device(&mut devices_to_try, d);
+            }
+        }
+
+        if devices_to_try.is_empty() {
+            return Err(anyhow::anyhow!("No input device available"));
+        }
+
+        let mut last_mic_err = anyhow::anyhow!("No candidate input device succeeded");
+        for device in devices_to_try {
+            let actual_device_name = device
+                .description()
+                .ok()
+                .map(|desc| format_cpal_device_name(&desc))
+                .filter(|n| {
+                    !n.eq_ignore_ascii_case("Default Device") && !n.eq_ignore_ascii_case("default")
+                })
+                .or_else(|| {
+                    selected_device_name
+                        .clone()
+                        .filter(|n| !is_default_audio_device_selection(Some(n)))
+                })
+                .unwrap_or_else(|| "Microphone".to_string());
+
+            let mut candidate_configs: Vec<cpal::SupportedStreamConfig> = Vec::new();
+            if let Ok(supported_configs_range) = device.supported_input_configs() {
+                let mut input_configs: Vec<_> = supported_configs_range
+                    .filter(|c| {
+                        c.sample_format() == cpal::SampleFormat::F32
+                            || c.sample_format() == cpal::SampleFormat::I16
+                    })
+                    .collect();
+                input_configs.sort_by_key(|c| {
+                    let rate_match =
+                        c.min_sample_rate() <= target_rate && c.max_sample_rate() >= target_rate;
+                    let is_f32 = c.sample_format() == cpal::SampleFormat::F32;
+                    let ch_pref = c.channels() == 2 || c.channels() == 1;
+                    (
+                        std::cmp::Reverse(rate_match),
+                        std::cmp::Reverse(is_f32),
+                        std::cmp::Reverse(ch_pref),
+                        std::cmp::Reverse(c.channels()),
+                    )
+                });
+                for c in input_configs {
+                    let rate = if c.min_sample_rate() <= target_rate
+                        && c.max_sample_rate() >= target_rate
                     {
-                        dev = Some(d);
-                        break;
+                        target_rate
+                    } else {
+                        c.max_sample_rate()
+                    };
+                    let resolved = c.with_sample_rate(rate);
+                    if !candidate_configs.iter().any(|existing| {
+                        existing.channels() == resolved.channels()
+                            && existing.sample_rate() == resolved.sample_rate()
+                            && existing.sample_format() == resolved.sample_format()
+                    }) {
+                        candidate_configs.push(resolved);
+                        if candidate_configs.len() >= 4 {
+                            break;
+                        }
+                    }
+                }
+            }
+            if let Ok(default_cfg) = device.default_input_config()
+                && matches!(
+                    default_cfg.sample_format(),
+                    cpal::SampleFormat::F32 | cpal::SampleFormat::I16 | cpal::SampleFormat::U16
+                )
+                && !candidate_configs.iter().any(|existing| {
+                    existing.channels() == default_cfg.channels()
+                        && existing.sample_rate() == default_cfg.sample_rate()
+                        && existing.sample_format() == default_cfg.sample_format()
+                })
+            {
+                candidate_configs.push(default_cfg);
+            }
+
+            if candidate_configs.is_empty() {
+                last_mic_err = anyhow::anyhow!(
+                    "No supported input config on device '{}'",
+                    actual_device_name
+                );
+                continue;
+            }
+
+            for supported_config in candidate_configs {
+                let config: cpal::StreamConfig = supported_config.clone().into();
+                let (tx, rx) = bounded::<DspMessage>(32);
+
+                let stream_res = match supported_config.sample_format() {
+                    cpal::SampleFormat::F32 => run_mic::<f32>(
+                        &device,
+                        &config,
+                        shared_state.clone(),
+                        tx,
+                        config.sample_rate,
+                    ),
+                    cpal::SampleFormat::I16 => run_mic::<i16>(
+                        &device,
+                        &config,
+                        shared_state.clone(),
+                        tx,
+                        config.sample_rate,
+                    ),
+                    cpal::SampleFormat::U16 => run_mic::<u16>(
+                        &device,
+                        &config,
+                        shared_state.clone(),
+                        tx,
+                        config.sample_rate,
+                    ),
+                    _ => Err(anyhow::anyhow!("Unsupported sample format")),
+                };
+
+                match stream_res {
+                    Ok(stream) => {
+                        let max_frequency = {
+                            let mut state = shared_state.lock().unwrap();
+                            state.artist = actual_device_name;
+                            state.module_type = "Hardware Input".to_string();
+                            state.duration_seconds = 0.0;
+                            state.current_seconds = 0.0;
+                            state.bitrate = None;
+                            state.audio_tracks.clear();
+                            state.selected_audio_track = 0;
+                            state.active_audio_tracks.clear();
+                            state.audio_track_volumes.clear();
+                            state.tracker_channels = None;
+                            state.tracker_patterns_by_order.clear();
+                            state.tracker_row_history.clear();
+                            state.current_tracker_row_string.clear();
+                            state.num_samples = 0;
+                            state.num_instruments = 0;
+                            state.num_patterns = 0;
+                            state.source_channels = config.channels as i32;
+                            state.hardware_channels = config.channels as i32;
+                            state.num_channels = config.channels as i32;
+                            state.raw_channel_vus = vec![0.0; state.num_channels as usize];
+                            state.channel_vus = vec![0.0; state.num_channels as usize];
+                            state.peak_vus = vec![0.0; state.num_channels as usize];
+                            state.bpm = 0;
+                            state.speed = 0;
+                            state.max_frequency = config.sample_rate as f32 / 2.0;
+                            state.current_sample_rate = config.sample_rate as f32;
+                            state.max_frequency
+                        };
+                        let window_size = calculate_power_of_two_window_size(config.sample_rate);
+                        spawn_dsp_thread(
+                            rx,
+                            shared_state,
+                            config.sample_rate,
+                            max_frequency,
+                            window_size,
+                        );
+                        return Ok(PlaybackHandle::Cpal(
+                            stream,
+                            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        ));
+                    }
+                    Err(e) => {
+                        last_mic_err = e;
                     }
                 }
             }
         }
-        let device = if let Some(d) = dev {
-            d
-        } else {
-            host.default_input_device()
-                .context("No input device available")?
-        };
-        let actual_device_name = device
-            .description()
-            .map(|desc| format_cpal_device_name(&desc))
-            .unwrap_or_else(|_| "Microphone".to_string());
 
-        let supported_config = {
-            let supported_configs_range = device
-                .supported_input_configs()
-                .context("error while querying input configs")?;
-            let mut input_configs: Vec<_> = supported_configs_range
-                .filter(|c| {
-                    c.max_sample_rate() >= target_rate
-                        && c.min_sample_rate() <= target_rate
-                        && (c.sample_format() == cpal::SampleFormat::F32
-                            || c.sample_format() == cpal::SampleFormat::I16)
-                })
-                .collect();
-            input_configs
-                .sort_by_key(|c| std::cmp::Reverse(c.sample_format() == cpal::SampleFormat::F32));
-            input_configs
-                .into_iter()
-                .next()
-                .map(|c| c.with_sample_rate(target_rate))
-                .or_else(|| device.default_input_config().ok())
-                .context("No supported config?!")?
-        };
-
-        let config: cpal::StreamConfig = supported_config.clone().into();
-        let (tx, rx) = bounded::<DspMessage>(32);
-
-        {
-            let mut state = shared_state.lock().unwrap();
-            state.artist = actual_device_name;
-            state.module_type = "Hardware Input".to_string();
-            state.duration_seconds = 0.0;
-            state.current_seconds = 0.0;
-            state.bitrate = None;
-            state.audio_tracks.clear();
-            state.selected_audio_track = 0;
-            state.active_audio_tracks.clear();
-            state.audio_track_volumes.clear();
-            state.tracker_channels = None;
-            state.tracker_patterns_by_order.clear();
-            state.tracker_row_history.clear();
-            state.current_tracker_row_string.clear();
-            state.num_samples = 0;
-            state.num_instruments = 0;
-            state.num_patterns = 0;
-            state.source_channels = config.channels as i32;
-            state.hardware_channels = config.channels as i32;
-            state.num_channels = config.channels as i32;
-            state.raw_channel_vus = vec![0.0; state.num_channels as usize];
-            state.channel_vus = vec![0.0; state.num_channels as usize];
-            state.peak_vus = vec![0.0; state.num_channels as usize];
-            state.bpm = 0;
-            state.speed = 0;
-            state.max_frequency = config.sample_rate as f32 / 2.0;
-            state.current_sample_rate = config.sample_rate as f32;
-        }
-
-        let max_frequency = { shared_state.lock().unwrap().max_frequency };
-        let window_size = calculate_power_of_two_window_size(config.sample_rate);
-        spawn_dsp_thread(
-            rx,
-            shared_state.clone(),
-            config.sample_rate,
-            max_frequency,
-            window_size,
-        );
-
-        let stream = match supported_config.sample_format() {
-            cpal::SampleFormat::F32 => {
-                run_mic::<f32>(&device, &config, shared_state, tx, config.sample_rate)
-            }
-            cpal::SampleFormat::I16 => {
-                run_mic::<i16>(&device, &config, shared_state, tx, config.sample_rate)
-            }
-            cpal::SampleFormat::U16 => {
-                run_mic::<u16>(&device, &config, shared_state, tx, config.sample_rate)
-            }
-            _ => return Err(anyhow::anyhow!("Unsupported sample format")),
-        }?;
-        return Ok(PlaybackHandle::Cpal(
-            stream,
-            Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        ));
+        return Err(last_mic_err);
     }
 
     let shared_state_closure = shared_state.clone();
@@ -8473,6 +8668,7 @@ pub fn start_audio_thread(
             if !is_default && let Ok(devices) = host.output_devices() {
                 for d in devices {
                     if let Ok(desc) = d.description()
+                        && is_usable_cpal_device_for_mode(&desc, false)
                         && cpal_device_matches_name(&desc, name)
                     {
                         push_unique_device(&mut devices_to_try, d);
@@ -8485,7 +8681,10 @@ pub fn start_audio_thread(
         if let Some(default_dev) = host.default_output_device() {
             let is_relevant = default_dev
                 .description()
-                .map(|desc| is_relevant_audio_device(&format_cpal_device_name(&desc)))
+                .map(|desc| {
+                    is_usable_cpal_device_for_mode(&desc, false)
+                        && is_relevant_audio_device(&format_cpal_device_name(&desc))
+                })
                 .unwrap_or(true);
             if is_relevant {
                 push_unique_device(&mut devices_to_try, default_dev);
@@ -8495,7 +8694,10 @@ pub fn start_audio_thread(
             for d in devices {
                 let is_relevant = d
                     .description()
-                    .map(|desc| is_relevant_audio_device(&format_cpal_device_name(&desc)))
+                    .map(|desc| {
+                        is_usable_cpal_device_for_mode(&desc, false)
+                            && is_relevant_audio_device(&format_cpal_device_name(&desc))
+                    })
                     .unwrap_or(true);
                 if is_relevant {
                     push_unique_device(&mut devices_to_try, d);
@@ -13752,6 +13954,7 @@ where
     let mut captured_frames: u64 = 0;
 
     let mut was_paused = false;
+    let mut latest_seek_epoch = shared_state.lock().map(|s| s.seek_epoch).unwrap_or(0);
 
     let shared_state_err = shared_state.clone();
     let stream = device.build_input_stream(
@@ -13759,6 +13962,7 @@ where
         move |data: &[T], _: &cpal::InputCallbackInfo| {
             if let Ok(state) = shared_state.try_lock() {
                 was_paused = state.is_paused;
+                latest_seek_epoch = state.seek_epoch;
             }
 
             if was_paused {
@@ -13812,7 +14016,7 @@ where
                     0,
                     current_secs,
                     "",
-                    0,
+                    latest_seek_epoch,
                     true,
                 );
 
