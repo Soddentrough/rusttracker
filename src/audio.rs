@@ -8319,14 +8319,20 @@ pub fn start_audio_thread(
         let mut dev = None;
         if !is_default_audio_device_selection(selected_device_name.as_deref())
             && let Some(ref name) = selected_device_name
-            && let Ok(devices) = host.input_devices()
         {
-            for d in devices {
-                if let Ok(desc) = d.description()
-                    && cpal_device_matches_name(&desc, name)
-                {
-                    dev = Some(d);
-                    break;
+            if let Some(default_dev) = host.default_input_device()
+                && let Ok(desc) = default_dev.description()
+                && cpal_device_matches_name(&desc, name)
+            {
+                dev = Some(default_dev);
+            } else if let Ok(devices) = host.input_devices() {
+                for d in devices {
+                    if let Ok(desc) = d.description()
+                        && cpal_device_matches_name(&desc, name)
+                    {
+                        dev = Some(d);
+                        break;
+                    }
                 }
             }
         }
@@ -8336,6 +8342,10 @@ pub fn start_audio_thread(
             host.default_input_device()
                 .context("No input device available")?
         };
+        let actual_device_name = device
+            .description()
+            .map(|desc| format_cpal_device_name(&desc))
+            .unwrap_or_else(|_| "Microphone".to_string());
 
         let supported_config = {
             let supported_configs_range = device
@@ -8364,11 +8374,28 @@ pub fn start_audio_thread(
 
         {
             let mut state = shared_state.lock().unwrap();
-            state.artist = "Microphone".to_string();
+            state.artist = actual_device_name;
             state.module_type = "Hardware Input".to_string();
             state.duration_seconds = 0.0;
+            state.current_seconds = 0.0;
+            state.bitrate = None;
+            state.audio_tracks.clear();
+            state.selected_audio_track = 0;
+            state.active_audio_tracks.clear();
+            state.audio_track_volumes.clear();
+            state.tracker_channels = None;
+            state.tracker_patterns_by_order.clear();
+            state.tracker_row_history.clear();
+            state.current_tracker_row_string.clear();
+            state.num_samples = 0;
+            state.num_instruments = 0;
+            state.num_patterns = 0;
+            state.source_channels = config.channels as i32;
+            state.hardware_channels = config.channels as i32;
             state.num_channels = config.channels as i32;
+            state.raw_channel_vus = vec![0.0; state.num_channels as usize];
             state.channel_vus = vec![0.0; state.num_channels as usize];
+            state.peak_vus = vec![0.0; state.num_channels as usize];
             state.bpm = 0;
             state.speed = 0;
             state.max_frequency = config.sample_rate as f32 / 2.0;
@@ -13712,14 +13739,17 @@ where
     T: cpal::Sample + cpal::FromSample<f32> + cpal::SizedSample + Into<f32>,
 {
     let channels = config.channels as usize;
+    let sample_rate = config.sample_rate.max(1);
     let window_size = calculate_power_of_two_window_size(config.sample_rate);
 
     let mut fft_buffer: Vec<f32> = vec![0.0; window_size];
     let mut channel_fft_buffers: Vec<Vec<f32>> = vec![vec![0.0; window_size]; channels];
+    let mut channel_peaks: Vec<f32> = vec![0.0; channels.max(1)];
     let mut fft_index = 0;
     let recycle_rx = dsp_recycle_channel().1.clone();
     let dsp_send_interval = (config.sample_rate as usize / 120).max(1);
     let mut frames_since_last_dsp_send = dsp_send_interval;
+    let mut captured_frames: u64 = 0;
 
     let mut was_paused = false;
 
@@ -13739,44 +13769,34 @@ where
                 return;
             }
 
-            let mut left_peak = 0.0_f32;
-            let mut right_peak = 0.0_f32;
+            channel_peaks.fill(0.0);
             let mut frames_written = 0;
 
-            for frame in data.chunks(channels) {
+            for frame in data.chunks(channels.max(1)) {
                 let left = frame[0].into();
                 let right = if channels >= 2 { frame[1].into() } else { left };
-
-                left_peak = left_peak.max(left.abs());
-                right_peak = right_peak.max(right.abs());
 
                 let mono = (left + right) / 2.0;
                 fft_buffer[fft_index] = mono;
                 for c in 0..channels {
-                    channel_fft_buffers[c][fft_index] = if c < frame.len() {
+                    let s: f32 = if c < frame.len() {
                         frame[c].into()
                     } else {
                         0.0
                     };
+                    channel_peaks[c] = channel_peaks[c].max(s.abs());
+                    channel_fft_buffers[c][fft_index] = s;
                 }
                 fft_index = (fft_index + 1) % window_size;
                 frames_written += 1;
             }
 
+            captured_frames = captured_frames.wrapping_add(frames_written as u64);
             frames_since_last_dsp_send += frames_written;
             if frames_since_last_dsp_send >= dsp_send_interval {
                 frames_since_last_dsp_send = 0;
-                let mut channel_vus = [0.0f32; 2];
-                let vu_slice = if channels >= 2 {
-                    channel_vus[0] = left_peak;
-                    channel_vus[1] = right_peak;
-                    &channel_vus[..2]
-                } else if channels == 1 {
-                    channel_vus[0] = left_peak;
-                    &channel_vus[..1]
-                } else {
-                    &channel_vus[..0]
-                };
+                let vu_slice = &channel_peaks[..channels];
+                let current_secs = captured_frames as f64 / sample_rate as f64;
 
                 let msg = build_recycled_dsp_message(
                     &recycle_rx,
@@ -13790,7 +13810,7 @@ where
                     0,
                     0,
                     0,
-                    0.0,
+                    current_secs,
                     "",
                     0,
                     true,
@@ -13819,6 +13839,8 @@ where
         },
         None,
     )?;
+
+    stream.play().context("Failed to play input stream")?;
 
     Ok(stream)
 }

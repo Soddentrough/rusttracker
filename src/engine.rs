@@ -69,6 +69,7 @@ pub enum EngineAction {
     CloseUrlDialog,
     SetUrlInput(String),
     LoadUrl(String),
+    LoadInputDevice(String),
     EditUrl(String),
     ClearFocusUrlInput,
     SetAudioDevice(String),
@@ -8204,12 +8205,17 @@ impl VulkanEngine {
         let full_output = egui_ctx.run_ui(raw_input, |ctx| {
             if state.is_url_dialog_open {
                 let url_modal_w = (ctx.viewport_rect().width() - 24.0).clamp(260.0, 600.0);
-                egui::Window::new("Open Network Stream")
+                let url_modal_max_h = (ctx.viewport_rect().height() - 32.0).clamp(240.0, 500.0);
+                egui::Window::new("Open Stream / Device")
                     .collapsible(false)
                     .resizable(false)
-                    .fixed_size([url_modal_w, 260.0])
+                    .default_width(url_modal_w)
+                    .min_width(url_modal_w)
+                    .max_width(url_modal_w)
+                    .max_height(url_modal_max_h)
                     .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
                     .show(ctx, |ui| {
+                        ui.label(egui::RichText::new("Network Stream / URL:").strong());
                         ui.label("Enter Stream URL (e.g. .pls, .m3u, or direct stream link):");
                         ui.add_space(4.0);
                         let mut url_text = state.url_input_text.clone();
@@ -8225,7 +8231,7 @@ impl VulkanEngine {
                         if text_resp.changed() {
                             engine_action = EngineAction::SetUrlInput(url_text.clone());
                         }
-                        ui.add_space(10.0);
+                        ui.add_space(8.0);
                         ui.horizontal(|ui| {
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if (ui.add_sized([80.0, 30.0], egui::Button::new("Open")).clicked() || (text_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))))
@@ -8238,23 +8244,70 @@ impl VulkanEngine {
                             });
                         });
 
+                        ui.separator();
+                        ui.label(egui::RichText::new("Audio Input Devices (Microphone / Line-In):").strong());
+                        ui.add_space(4.0);
+                        let fallback_devs = [crate::audio::SYSTEM_DEFAULT_AUDIO_DEVICE.to_string()];
+                        let input_devs: &[String] = if !state.available_input_devices.is_empty() {
+                            &state.available_input_devices
+                        } else {
+                            &fallback_devs
+                        };
+                        egui::ScrollArea::vertical()
+                            .id_salt("url_dialog_input_devices_scroll")
+                            .max_height(130.0)
+                            .show(ui, |ui| {
+                                for dev in input_devs {
+                                    let is_active_mic = state.is_mic_input
+                                        && state.selected_audio_device.as_deref() == Some(dev.as_str());
+                                    let btn_label = if is_active_mic {
+                                        format!("🎙 {} (Active)", dev)
+                                    } else {
+                                        format!("🎙 {}", dev)
+                                    };
+                                    let width = ui.available_width();
+                                    let mut btn = egui::Button::new(
+                                        egui::RichText::new(btn_label).color(if is_active_mic {
+                                            egui::Color32::from_rgb(220, 255, 230)
+                                        } else {
+                                            egui::Color32::from_rgb(230, 220, 250)
+                                        }),
+                                    )
+                                    .truncate();
+                                    if is_active_mic {
+                                        btn = btn
+                                            .fill(egui::Color32::from_rgb(30, 95, 60))
+                                            .stroke(egui::Stroke::new(
+                                                1.0_f32,
+                                                egui::Color32::from_rgb(80, 220, 130),
+                                            ));
+                                    }
+                                    if ui.add_sized([width.max(0.0), 30.0], btn).clicked() {
+                                        engine_action = EngineAction::LoadInputDevice(dev.clone());
+                                    }
+                                }
+                            });
+
                         if !state.url_history.is_empty() {
                             ui.separator();
                             ui.label(egui::RichText::new("Recent Streams:").strong());
-                            egui::ScrollArea::vertical().max_height(150.0).show(ui, |ui| {
-                                for (url, title) in state.url_history.iter().rev() {
-                                    ui.horizontal(|ui| {
-                                        let width = ui.available_width() - 38.0;
-                                        let btn = egui::Button::new(format!("{} ({})", title, url)).truncate();
-                                        if ui.add_sized([width.max(0.0), 30.0], btn).clicked() {
-                                            engine_action = EngineAction::LoadUrl(url.clone());
-                                        }
-                                        if ui.add_sized([30.0, 30.0], egui::Button::new("📝")).clicked() {
-                                            engine_action = EngineAction::EditUrl(url.clone());
-                                        }
-                                    });
-                                }
-                            });
+                            egui::ScrollArea::vertical()
+                                .id_salt("url_dialog_recent_streams_scroll")
+                                .max_height(120.0)
+                                .show(ui, |ui| {
+                                    for (url, title) in state.url_history.iter().rev() {
+                                        ui.horizontal(|ui| {
+                                            let width = ui.available_width() - 38.0;
+                                            let btn = egui::Button::new(format!("{} ({})", title, url)).truncate();
+                                            if ui.add_sized([width.max(0.0), 30.0], btn).clicked() {
+                                                engine_action = EngineAction::LoadUrl(url.clone());
+                                            }
+                                            if ui.add_sized([30.0, 30.0], egui::Button::new("📝")).clicked() {
+                                                engine_action = EngineAction::EditUrl(url.clone());
+                                            }
+                                        });
+                                    }
+                                });
                         }
                     });
             }
@@ -9486,7 +9539,7 @@ impl VulkanEngine {
                                             .corner_radius(8.0);
 
                                             let url_btn = egui::Button::new(
-                                                egui::RichText::new("OPEN URL / STREAM")
+                                                egui::RichText::new("OPEN STREAM/DEVICE")
                                                     .size(btn_font_size)
                                                     .color(egui::Color32::WHITE)
                                                     .strong(),
@@ -10888,6 +10941,7 @@ impl VulkanEngine {
                                     col.horizontal(|ui| {
                                         ui.heading(heading_text);
                                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            let btn_h = if is_portrait { 30.0 } else { 24.0 };
                                             let open_hdr_btn = egui::Button::new(
                                                 egui::RichText::new("📂 OPEN FILE")
                                                     .size(12.0)
@@ -10897,9 +10951,28 @@ impl VulkanEngine {
                                             .fill(egui::Color32::from_rgb(205, 95, 0))
                                             .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(255, 145, 30)))
                                             .corner_radius(4.0)
-                                            .min_size(egui::vec2(92.0, if is_portrait { 30.0 } else { 24.0 }));
+                                            .min_size(egui::vec2(92.0, btn_h));
                                             if ui.add(open_hdr_btn).clicked() {
                                                 *engine_action = EngineAction::OpenFile;
+                                            }
+                                            if ui.available_width() > 110.0 {
+                                                let stream_hdr_btn = egui::Button::new(
+                                                    egui::RichText::new("🎙 STREAM/DEV")
+                                                        .size(11.5)
+                                                        .strong()
+                                                        .color(egui::Color32::WHITE)
+                                                )
+                                                .fill(egui::Color32::from_rgb(100, 50, 150))
+                                                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(180, 80, 255)))
+                                                .corner_radius(4.0)
+                                                .min_size(egui::vec2(96.0, btn_h));
+                                                if ui
+                                                    .add(stream_hdr_btn)
+                                                    .on_hover_text("Open network stream URL or local audio input device (microphone)")
+                                                    .clicked()
+                                                {
+                                                    *engine_action = EngineAction::OpenUrlDialog;
+                                                }
                                             }
                                         });
                                     });
@@ -10970,9 +11043,12 @@ impl VulkanEngine {
                                     } else {
                                         state.song_title.clone()
                                     };
+                                    let is_mic_stream = crate::state::is_mic_uri(&current_path_str)
+                                        || crate::state::is_mic_uri(&state.song_title)
+                                        || state.is_mic_input;
                                     let is_network = current_path_str.starts_with("http://") || current_path_str.starts_with("https://");
                                     let file_path = std::path::Path::new(&current_path_str);
-                                    let file_name = if is_network {
+                                    let file_name = if is_network || is_mic_stream {
                                         display_title.clone()
                                     } else {
                                         let raw_fname = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
@@ -10980,7 +11056,7 @@ impl VulkanEngine {
                                     };
                                     if self.cached_meta_path != current_path_str {
                                         self.cached_meta_path = current_path_str.clone();
-                                        if is_network {
+                                        if is_network || is_mic_stream {
                                             self.cached_file_dir = current_path_str.clone();
                                             self.cached_file_len = None;
                                         } else {
@@ -11034,17 +11110,30 @@ impl VulkanEngine {
                                                     }
 
                                                     // 3. File Name
-                                                    ui.label(egui::RichText::new("File:").color(egui::Color32::from_rgb(160, 180, 200)));
-                                                    render_smooth_marquee(ui, &file_name, 14.0, false);
-                                                    ui.end_row();
-
-                                                    // 4. File Directory / URL (skip internal Android cache path)
-                                                    let is_android_cache_dir = file_dir.contains("com.rusttracker.app/cache");
-                                                    if !is_android_cache_dir {
-                                                        let folder_label = if is_network { "Stream:" } else { "Folder:" };
-                                                        ui.label(egui::RichText::new(folder_label).color(egui::Color32::from_rgb(160, 180, 200)));
-                                                        render_smooth_marquee(ui, &file_dir, 14.0, false);
+                                                    if !is_mic_stream {
+                                                        ui.label(egui::RichText::new("File:").color(egui::Color32::from_rgb(160, 180, 200)));
+                                                        render_smooth_marquee(ui, &file_name, 14.0, false);
                                                         ui.end_row();
+                                                    }
+
+                                                    // 4. File Directory / URL / Input Device (skip internal Android cache path)
+                                                    if is_mic_stream {
+                                                        let input_dev = state
+                                                            .selected_audio_device
+                                                            .as_deref()
+                                                            .or_else(|| crate::state::device_from_mic_uri(&current_path_str))
+                                                            .unwrap_or(crate::audio::SYSTEM_DEFAULT_AUDIO_DEVICE);
+                                                        ui.label(egui::RichText::new("Input:").color(egui::Color32::from_rgb(160, 180, 200)));
+                                                        render_smooth_marquee(ui, input_dev, 14.0, false);
+                                                        ui.end_row();
+                                                    } else {
+                                                        let is_android_cache_dir = file_dir.contains("com.rusttracker.app/cache");
+                                                        if !is_android_cache_dir {
+                                                            let folder_label = if is_network { "Stream:" } else { "Folder:" };
+                                                            ui.label(egui::RichText::new(folder_label).color(egui::Color32::from_rgb(160, 180, 200)));
+                                                            render_smooth_marquee(ui, &file_dir, 14.0, false);
+                                                            ui.end_row();
+                                                        }
                                                     }
 
                                                     // 5 & 6. Format, Bitrate & Channels
@@ -11149,7 +11238,9 @@ impl VulkanEngine {
 
                                                     // 7. Track Duration
                                                     ui.label(egui::RichText::new("Duration:").color(egui::Color32::from_rgb(160, 180, 200)));
-                                                    if state.duration_seconds <= 0.0 {
+                                                    if is_mic_stream {
+                                                        ui.label("Live Input");
+                                                    } else if state.duration_seconds <= 0.0 {
                                                         ui.label("Live Stream");
                                                     } else {
                                                         let formatted = crate::state::format_timeline_time(
@@ -14824,5 +14915,58 @@ mod tests {
             .progress_fraction()
             .expect("Expected determinate progress");
         assert!((pct - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_open_stream_device_dialog_and_mic_input_mode_transitions() {
+        let engine_src = include_str!("engine.rs");
+        assert!(engine_src.contains("OPEN STREAM/DEVICE"));
+        assert!(!engine_src.contains(concat!("OPEN URL", " / STREAM")));
+        assert!(engine_src.contains("Open Stream / Device"));
+        assert!(engine_src.contains("Audio Input Devices (Microphone / Line-In):"));
+
+        let uri = crate::state::mic_uri_for_device("USB Condenser Mic");
+        assert_eq!(uri, "mic://USB Condenser Mic");
+        assert!(crate::state::is_mic_uri(&uri));
+        assert_eq!(
+            crate::state::device_from_mic_uri(&uri),
+            Some("USB Condenser Mic")
+        );
+        assert!(!crate::state::is_mic_uri("https://example.com/stream.mp3"));
+
+        let mut state = AppState::new("Test".to_string());
+        assert!(!state.is_mic_input);
+        assert!(!state.available_input_devices.is_empty());
+
+        state.available_input_devices = vec![
+            crate::audio::SYSTEM_DEFAULT_AUDIO_DEVICE.to_string(),
+            "USB Condenser Mic".to_string(),
+        ];
+        state.set_mic_input_mode(true, Some("USB Condenser Mic".to_string()));
+        assert!(state.is_mic_input);
+        assert_eq!(
+            state.selected_audio_device.as_deref(),
+            Some("USB Condenser Mic")
+        );
+        assert_eq!(state.available_audio_devices, state.available_input_devices);
+
+        state.file_loaded = true;
+        state.playlist = vec![uri.clone()];
+        state.song_title = "Microphone Input".to_string();
+        assert!(
+            !state.has_active_playback(),
+            "Microphone capture mode must not be treated as active file playback for drop-to-queue"
+        );
+
+        let snap = state.render_snapshot();
+        assert!(snap.is_mic_input);
+        assert_eq!(snap.available_input_devices, state.available_input_devices);
+
+        // Dropping a file while in microphone mode replaces the mic input and switches back to output mode
+        state.track_info_rect = Some([0.0, 0.0, 400.0, 400.0]);
+        state.handle_dropped_files(vec!["song.flac".to_string()], Some([100.0, 100.0]));
+        assert!(!state.is_mic_input);
+        assert_eq!(state.playlist, vec!["song.flac".to_string()]);
+        assert_eq!(state.load_request.as_deref(), Some("song.flac"));
     }
 }

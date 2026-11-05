@@ -866,7 +866,8 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                             }
                             EngineAction::LoadFiles(files, append) => {
                                 if !files.is_empty() {
-                                    if append {
+                                    let is_mic = self.app_state.lock().unwrap().is_mic_input;
+                                    if append && !is_mic {
                                         let mut state = self.app_state.lock().unwrap();
                                         state.playlist.extend(files);
                                     } else {
@@ -1098,6 +1099,12 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                             }
                             EngineAction::OpenUrlDialog => {
                                 let mut state = self.app_state.lock().unwrap();
+                                state.available_input_devices =
+                                    crate::audio::get_available_audio_devices(true);
+                                if state.is_mic_input {
+                                    state.available_audio_devices =
+                                        state.available_input_devices.clone();
+                                }
                                 state.is_url_dialog_open = true;
                                 state.focus_url_input = true;
                                 win.set_ime_allowed(true);
@@ -1118,44 +1125,86 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                                 state.focus_url_input = true;
                                 win.set_ime_allowed(true);
                             }
-                            EngineAction::LoadUrl(url) => {
-                                let mut final_url = url;
-                                if !final_url.starts_with("http://")
-                                    && !final_url.starts_with("https://")
-                                {
-                                    final_url = format!("https://{}", final_url);
-                                }
+                            EngineAction::LoadInputDevice(device_name) => {
+                                let mic_uri = crate::state::mic_uri_for_device(&device_name);
                                 win.set_ime_allowed(false);
                                 {
                                     let mut state = self.app_state.lock().unwrap();
                                     state.is_url_dialog_open = false;
-                                    state.url_input_text.clear();
-                                    state.playlist = vec![final_url.clone()];
-                                    state.playlist_index = 0;
-                                    state.load_request = Some(final_url.clone());
-                                    state.file_loaded = true;
-                                    if let Some(idx) =
-                                        state.url_history.iter().position(|(u, _)| u == &final_url)
+                                    state.set_mic_input_mode(true, Some(device_name.clone()));
+                                    state.osd_text =
+                                        Some(format!("🎙 Audio Input: {}", device_name));
+                                    state.osd_timer = 3.0;
+                                }
+                                self.load_and_play_file(&mic_uri);
+                            }
+                            EngineAction::LoadUrl(url) => {
+                                let mut final_url = url;
+                                win.set_ime_allowed(false);
+                                if crate::state::is_mic_uri(&final_url) {
+                                    let dev_name = crate::state::device_from_mic_uri(&final_url)
+                                        .unwrap_or(crate::audio::SYSTEM_DEFAULT_AUDIO_DEVICE)
+                                        .to_string();
+                                    let mic_uri = crate::state::mic_uri_for_device(&dev_name);
                                     {
-                                        let item = state.url_history.remove(idx);
-                                        state.url_history.push(item);
-                                    } else {
-                                        state
+                                        let mut state = self.app_state.lock().unwrap();
+                                        state.is_url_dialog_open = false;
+                                        state.url_input_text.clear();
+                                        state.set_mic_input_mode(true, Some(dev_name.clone()));
+                                        state.osd_text =
+                                            Some(format!("🎙 Audio Input: {}", dev_name));
+                                        state.osd_timer = 3.0;
+                                    }
+                                    self.load_and_play_file(&mic_uri);
+                                } else {
+                                    if !final_url.starts_with("http://")
+                                        && !final_url.starts_with("https://")
+                                    {
+                                        final_url = format!("https://{}", final_url);
+                                    }
+                                    {
+                                        let mut state = self.app_state.lock().unwrap();
+                                        state.set_mic_input_mode(false, None);
+                                        state.is_url_dialog_open = false;
+                                        state.url_input_text.clear();
+                                        state.playlist = vec![final_url.clone()];
+                                        state.playlist_index = 0;
+                                        state.load_request = Some(final_url.clone());
+                                        state.file_loaded = true;
+                                        if let Some(idx) = state
                                             .url_history
-                                            .push((final_url, "Network Stream".to_string()));
+                                            .iter()
+                                            .position(|(u, _)| u == &final_url)
+                                        {
+                                            let item = state.url_history.remove(idx);
+                                            state.url_history.push(item);
+                                        } else {
+                                            state
+                                                .url_history
+                                                .push((final_url, "Network Stream".to_string()));
+                                        }
+                                        let mut out = String::new();
+                                        for (u, t) in &state.url_history {
+                                            out.push_str(&format!("{}|{}\n", u, t));
+                                        }
+                                        let _ = std::fs::write(
+                                            crate::state::get_history_file_path(),
+                                            out,
+                                        );
                                     }
-                                    let mut out = String::new();
-                                    for (u, t) in &state.url_history {
-                                        out.push_str(&format!("{}|{}\n", u, t));
-                                    }
-                                    let _ =
-                                        std::fs::write(crate::state::get_history_file_path(), out);
                                 }
                             }
                             EngineAction::SetAudioDevice(dev) => {
-                                let mut state = self.app_state.lock().unwrap();
-                                state.selected_audio_device = Some(dev.clone());
-                                state.audio_device_change_request = Some(dev);
+                                let is_mic = {
+                                    let mut state = self.app_state.lock().unwrap();
+                                    state.selected_audio_device = Some(dev.clone());
+                                    state.audio_device_change_request = Some(dev.clone());
+                                    state.is_mic_input
+                                };
+                                if is_mic {
+                                    let mic_uri = crate::state::mic_uri_for_device(&dev);
+                                    self.load_and_play_file(&mic_uri);
+                                }
                             }
                             EngineAction::ToggleSurroundUpmix(val) => {
                                 self.app_state.lock().unwrap().set_surround_upmix(val);
@@ -1516,7 +1565,14 @@ impl AndroidRustTrackerApp {
             engine.clear_video_state();
         }
 
-        match crate::audio::start_audio_thread(path, false, Arc::clone(&self.app_state)) {
+        let is_mic = crate::state::is_mic_uri(path);
+        {
+            let mut state = self.app_state.lock().unwrap();
+            let preferred_dev = crate::state::device_from_mic_uri(path).map(|s| s.to_string());
+            state.set_mic_input_mode(is_mic, preferred_dev);
+        }
+
+        match crate::audio::start_audio_thread(path, is_mic, Arc::clone(&self.app_state)) {
             Ok(stream) => {
                 log_android(
                     3,
@@ -1531,28 +1587,36 @@ impl AndroidRustTrackerApp {
                 state.file_loaded = true;
                 state.is_paused = false;
                 state.track_ended = false;
-                let raw_name = if path.starts_with("http://") || path.starts_with("https://") {
-                    path.to_string()
+                let clean_name = if is_mic {
+                    "Microphone Input".to_string()
                 } else {
-                    std::path::Path::new(path)
-                        .file_name()
-                        .unwrap_or_default()
-                        .to_string_lossy()
-                        .to_string()
-                };
-                let clean_name = if let Some(rest) = raw_name.strip_prefix("track_")
-                    && let Some(idx) = rest.find('_')
-                    && idx > 0
-                    && rest[..idx].chars().all(|c| c.is_ascii_digit())
-                {
-                    rest[idx + 1..].to_string()
-                } else {
-                    raw_name
+                    let raw_name = if path.starts_with("http://") || path.starts_with("https://") {
+                        path.to_string()
+                    } else {
+                        std::path::Path::new(path)
+                            .file_name()
+                            .unwrap_or_default()
+                            .to_string_lossy()
+                            .to_string()
+                    };
+                    if let Some(rest) = raw_name.strip_prefix("track_")
+                        && let Some(idx) = rest.find('_')
+                        && idx > 0
+                        && rest[..idx].chars().all(|c| c.is_ascii_digit())
+                    {
+                        rest[idx + 1..].to_string()
+                    } else {
+                        raw_name
+                    }
                 };
                 state.song_title = clean_name;
                 state.playlist = vec![path.to_string()];
                 state.playlist_index = 0;
-                state.lyrics = crate::lyrics::load_lyrics_for_file(path).map(std::sync::Arc::new);
+                state.lyrics = if is_mic {
+                    None
+                } else {
+                    crate::lyrics::load_lyrics_for_file(path).map(std::sync::Arc::new)
+                };
                 state.spectrum_history.clear();
                 for _ in 0..120 {
                     state.spectrum_history.push_back(vec![0.0; 1024]);

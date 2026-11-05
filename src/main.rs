@@ -2620,18 +2620,28 @@ async fn run_gui(
                             let (load_path, resume_pos_on_reload) = {
                                 let mut state = app_state.lock().unwrap();
                                 let mut resume_pos_on_reload: Option<f64> = None;
+                                let active_mic = is_mic_launch || state.is_mic_input;
+
+                                let resolve_reload_path =
+                                    |st: &AppState, mic_mode: bool| -> String {
+                                        if mic_mode {
+                                            if let Some(ref dev) = st.selected_audio_device {
+                                                crate::state::mic_uri_for_device(dev)
+                                            } else {
+                                                "".to_string()
+                                            }
+                                        } else if st.playlist_index < st.playlist.len() {
+                                            st.playlist[st.playlist_index].clone()
+                                        } else {
+                                            st.song_title.clone()
+                                        }
+                                    };
 
                                 if state.audio_device_lost {
                                     state.audio_device_lost = false;
-                                    let reload_path = if is_mic_launch {
-                                        "".to_string()
-                                    } else if state.playlist_index < state.playlist.len() {
-                                        state.playlist[state.playlist_index].clone()
-                                    } else {
-                                        state.song_title.clone()
-                                    };
+                                    let reload_path = resolve_reload_path(&state, active_mic);
 
-                                    if !reload_path.is_empty() || is_mic_launch {
+                                    if !reload_path.is_empty() || active_mic {
                                         state.load_request = Some(reload_path);
                                         state.surround_upmix.user_overridden = false;
                                         resume_pos_on_reload = Some(state.current_seconds);
@@ -2642,16 +2652,9 @@ async fn run_gui(
                                 }
 
                                 if let Some(osd_msg) = state.audio_topology_reload_request.take() {
-                                    let reload_path = if is_mic_launch {
-                                        "".to_string()
-                                    } else if state.playlist_index < state.playlist.len() {
-                                        state.playlist[state.playlist_index].clone()
-                                    } else {
-                                        state.song_title.clone()
-                                    };
+                                    let reload_path = resolve_reload_path(&state, active_mic);
 
-                                    if (!reload_path.is_empty() && state.file_loaded)
-                                        || is_mic_launch
+                                    if (!reload_path.is_empty() && state.file_loaded) || active_mic
                                     {
                                         state.load_request = Some(reload_path);
                                         state.surround_upmix.user_overridden = false;
@@ -2663,18 +2666,18 @@ async fn run_gui(
 
                                 let device_change = state.audio_device_change_request.take();
                                 if let Some(new_device) = device_change {
-                                    let reload_path = if is_mic_launch {
-                                        "".to_string()
-                                    } else if state.playlist_index < state.playlist.len() {
-                                        state.playlist[state.playlist_index].clone()
-                                    } else {
-                                        state.song_title.clone()
-                                    };
+                                    let reload_path = resolve_reload_path(&state, active_mic);
 
-                                    if !reload_path.is_empty() || is_mic_launch {
+                                    if !reload_path.is_empty() || active_mic {
+                                        if active_mic && !state.playlist.is_empty() {
+                                            state.playlist[0] = reload_path.clone();
+                                        }
                                         state.load_request = Some(reload_path);
-                                        state.osd_text =
-                                            Some(format!("Audio Output: {}", new_device));
+                                        state.osd_text = Some(if active_mic {
+                                            format!("Audio Input: {}", new_device)
+                                        } else {
+                                            format!("Audio Output: {}", new_device)
+                                        });
                                         state.surround_upmix.user_overridden = false;
                                         resume_pos_on_reload = Some(state.current_seconds);
                                         state.osd_timer = 3.0;
@@ -2682,16 +2685,9 @@ async fn run_gui(
                                 }
 
                                 if let Some(pt_enabled) = state.passthrough_change_request.take() {
-                                    let reload_path = if is_mic_launch {
-                                        "".to_string()
-                                    } else if state.playlist_index < state.playlist.len() {
-                                        state.playlist[state.playlist_index].clone()
-                                    } else {
-                                        state.song_title.clone()
-                                    };
+                                    let reload_path = resolve_reload_path(&state, active_mic);
 
-                                    if (!reload_path.is_empty() && state.file_loaded)
-                                        || is_mic_launch
+                                    if (!reload_path.is_empty() && state.file_loaded) || active_mic
                                     {
                                         state.load_request = Some(reload_path);
                                         resume_pos_on_reload = Some(state.current_seconds);
@@ -2747,7 +2743,15 @@ async fn run_gui(
                             };
 
                             if let Some(path) = load_path {
-                                let is_mic = is_mic_launch && path.is_empty();
+                                let is_mic = crate::state::is_mic_uri(&path)
+                                    || ((is_mic_launch || app_state.lock().unwrap().is_mic_input)
+                                        && path.is_empty());
+                                {
+                                    let mut state = app_state.lock().unwrap();
+                                    let preferred_dev = crate::state::device_from_mic_uri(&path)
+                                        .map(|s| s.to_string());
+                                    state.set_mic_input_mode(is_mic, preferred_dev);
+                                }
                                 // Check if the path exists first!
                                 let path_exists = if path.starts_with("http") || is_mic {
                                     true
@@ -2855,6 +2859,7 @@ async fn run_gui(
                                             let preserve_device_osd =
                                                 state.osd_text.as_ref().is_some_and(|s| {
                                                     s.contains("Audio Output:")
+                                                        || s.contains("Audio Input:")
                                                         || s.starts_with("Audio Device")
                                                 });
                                             if state.surround_upmix.enabled {
@@ -3376,7 +3381,10 @@ async fn run_gui(
                                     }
                                     EngineAction::LoadFiles(paths, append) => {
                                         let expanded = crate::playlist::expand_input_paths(&paths);
-                                        if append && !state.playlist.is_empty() && state.file_loaded
+                                        if append
+                                            && !state.playlist.is_empty()
+                                            && state.file_loaded
+                                            && !state.is_mic_input
                                         {
                                             if !expanded.is_empty() {
                                                 let count = expanded.len();
@@ -3400,6 +3408,7 @@ async fn run_gui(
                                                 state.playlist.extend(expanded);
                                             }
                                         } else if !expanded.is_empty() {
+                                            state.set_mic_input_mode(false, None);
                                             state.playlist = expanded;
                                             state.playlist_index = 0;
                                             state.load_request = Some(state.playlist[0].clone());
@@ -3601,6 +3610,12 @@ async fn run_gui(
                                         }
                                     }
                                     EngineAction::OpenUrlDialog => {
+                                        state.available_input_devices =
+                                            crate::audio::get_available_audio_devices(true);
+                                        if state.is_mic_input {
+                                            state.available_audio_devices =
+                                                state.available_input_devices.clone();
+                                        }
                                         state.is_url_dialog_open = true;
                                         state.focus_url_input = true;
                                         window.set_ime_allowed(true); // Hint to Wayland/SteamOS to show the virtual keyboard
@@ -3620,43 +3635,84 @@ async fn run_gui(
                                         state.focus_url_input = true;
                                         window.set_ime_allowed(true);
                                     }
-                                    EngineAction::LoadUrl(url) => {
-                                        let mut final_url = url.clone();
-                                        if !final_url.starts_with("http://")
-                                            && !final_url.starts_with("https://")
-                                        {
-                                            final_url = format!("https://{}", final_url);
-                                        }
+                                    EngineAction::LoadInputDevice(device_name) => {
+                                        let mic_uri =
+                                            crate::state::mic_uri_for_device(&device_name);
                                         state.is_url_dialog_open = false;
                                         window.set_ime_allowed(false);
-                                        state.url_input_text.clear();
-                                        state.playlist = vec![final_url.clone()];
+                                        state.set_mic_input_mode(true, Some(device_name.clone()));
+                                        state.playlist = vec![mic_uri.clone()];
                                         state.playlist_index = 0;
-                                        state.load_request = Some(final_url.clone());
+                                        state.load_request = Some(mic_uri);
                                         state.file_loaded = true;
-
-                                        if let Some(idx) = state
-                                            .url_history
-                                            .iter()
-                                            .position(|(u, _)| u == &final_url)
-                                        {
-                                            let item = state.url_history.remove(idx);
-                                            state.url_history.push(item);
+                                        state.is_paused = false;
+                                        state.track_ended = false;
+                                        state.osd_text =
+                                            Some(format!("🎙 Audio Input: {}", device_name));
+                                        state.osd_timer = 3.0;
+                                    }
+                                    EngineAction::LoadUrl(url) => {
+                                        let mut final_url = url.clone();
+                                        if crate::state::is_mic_uri(&final_url) {
+                                            let dev_name =
+                                                crate::state::device_from_mic_uri(&final_url)
+                                                    .unwrap_or(
+                                                        crate::audio::SYSTEM_DEFAULT_AUDIO_DEVICE,
+                                                    )
+                                                    .to_string();
+                                            state.is_url_dialog_open = false;
+                                            window.set_ime_allowed(false);
+                                            state.url_input_text.clear();
+                                            state.set_mic_input_mode(true, Some(dev_name.clone()));
+                                            let mic_uri =
+                                                crate::state::mic_uri_for_device(&dev_name);
+                                            state.playlist = vec![mic_uri.clone()];
+                                            state.playlist_index = 0;
+                                            state.load_request = Some(mic_uri);
+                                            state.file_loaded = true;
+                                            state.is_paused = false;
+                                            state.track_ended = false;
+                                            state.osd_text =
+                                                Some(format!("🎙 Audio Input: {}", dev_name));
+                                            state.osd_timer = 3.0;
                                         } else {
-                                            state.url_history.push((
-                                                final_url.clone(),
-                                                "Network Stream".to_string(),
-                                            ));
-                                        }
+                                            if !final_url.starts_with("http://")
+                                                && !final_url.starts_with("https://")
+                                            {
+                                                final_url = format!("https://{}", final_url);
+                                            }
+                                            state.set_mic_input_mode(false, None);
+                                            state.is_url_dialog_open = false;
+                                            window.set_ime_allowed(false);
+                                            state.url_input_text.clear();
+                                            state.playlist = vec![final_url.clone()];
+                                            state.playlist_index = 0;
+                                            state.load_request = Some(final_url.clone());
+                                            state.file_loaded = true;
 
-                                        let mut out = String::new();
-                                        for (u, t) in &state.url_history {
-                                            out.push_str(&format!("{}|{}\n", u, t));
+                                            if let Some(idx) = state
+                                                .url_history
+                                                .iter()
+                                                .position(|(u, _)| u == &final_url)
+                                            {
+                                                let item = state.url_history.remove(idx);
+                                                state.url_history.push(item);
+                                            } else {
+                                                state.url_history.push((
+                                                    final_url.clone(),
+                                                    "Network Stream".to_string(),
+                                                ));
+                                            }
+
+                                            let mut out = String::new();
+                                            for (u, t) in &state.url_history {
+                                                out.push_str(&format!("{}|{}\n", u, t));
+                                            }
+                                            let _ = std::fs::write(
+                                                crate::state::get_history_file_path(),
+                                                out,
+                                            );
                                         }
-                                        let _ = std::fs::write(
-                                            crate::state::get_history_file_path(),
-                                            out,
-                                        );
                                     }
                                     EngineAction::None => {}
                                 }
@@ -3710,9 +3766,13 @@ async fn run_gui(
                                         }
                                         let expanded = crate::playlist::expand_input_paths(&paths);
                                         let append = state.append_to_playlist;
-                                        if append && !state.playlist.is_empty() {
+                                        if append
+                                            && !state.playlist.is_empty()
+                                            && !state.is_mic_input
+                                        {
                                             state.playlist.extend(expanded);
                                         } else if !expanded.is_empty() {
+                                            state.set_mic_input_mode(false, None);
                                             state.playlist = expanded;
                                             state.playlist_index = 0;
                                             state.load_request = Some(state.playlist[0].clone());
@@ -3729,7 +3789,11 @@ async fn run_gui(
                                         let expanded =
                                             crate::playlist::expand_input_paths(&raw_paths);
                                         if !expanded.is_empty() {
-                                            if !state.file_loaded || state.playlist.is_empty() {
+                                            if !state.file_loaded
+                                                || state.playlist.is_empty()
+                                                || state.is_mic_input
+                                            {
+                                                state.set_mic_input_mode(false, None);
                                                 state.playlist = expanded.clone();
                                                 state.playlist_index = 0;
                                                 state.load_request =
@@ -4564,37 +4628,47 @@ where
         let (load_path, resume_pos_on_reload) = {
             let mut state = app_state.lock().unwrap();
             let mut resume_pos_on_reload: Option<f64> = None;
+            let active_mic = is_mic_launch || state.is_mic_input;
+
+            let resolve_reload_path = |st: &AppState, mic_mode: bool| -> String {
+                if mic_mode {
+                    if let Some(ref dev) = st.selected_audio_device {
+                        crate::state::mic_uri_for_device(dev)
+                    } else {
+                        "".to_string()
+                    }
+                } else if st.playlist_index < st.playlist.len() {
+                    st.playlist[st.playlist_index].clone()
+                } else {
+                    st.song_title.clone()
+                }
+            };
 
             let device_change = state.audio_device_change_request.take();
             if let Some(new_device) = device_change {
                 state.selected_audio_device = Some(new_device.clone());
-                let reload_path = if is_mic_launch {
-                    "".to_string()
-                } else if state.playlist_index < state.playlist.len() {
-                    state.playlist[state.playlist_index].clone()
-                } else {
-                    state.song_title.clone()
-                };
+                let reload_path = resolve_reload_path(&state, active_mic);
 
-                if !reload_path.is_empty() || is_mic_launch {
+                if !reload_path.is_empty() || active_mic {
+                    if active_mic && !state.playlist.is_empty() {
+                        state.playlist[0] = reload_path.clone();
+                    }
                     state.load_request = Some(reload_path);
                     resume_pos_on_reload = Some(state.current_seconds);
-                    state.osd_text = Some(format!("Audio Output: {}", new_device));
+                    state.osd_text = Some(if active_mic {
+                        format!("Audio Input: {}", new_device)
+                    } else {
+                        format!("Audio Output: {}", new_device)
+                    });
                     state.surround_upmix.user_overridden = false;
                     state.osd_timer = 3.0;
                 }
             }
 
             if let Some(pt_enabled) = state.passthrough_change_request.take() {
-                let reload_path = if is_mic_launch {
-                    "".to_string()
-                } else if state.playlist_index < state.playlist.len() {
-                    state.playlist[state.playlist_index].clone()
-                } else {
-                    state.song_title.clone()
-                };
+                let reload_path = resolve_reload_path(&state, active_mic);
 
-                if (!reload_path.is_empty() && state.file_loaded) || is_mic_launch {
+                if (!reload_path.is_empty() && state.file_loaded) || active_mic {
                     state.load_request = Some(reload_path);
                     resume_pos_on_reload = Some(state.current_seconds);
                     if state.surround_upmix.enabled && !pt_enabled {
@@ -4614,15 +4688,9 @@ where
             }
 
             if let Some(osd_msg) = state.audio_topology_reload_request.take() {
-                let reload_path = if is_mic_launch {
-                    "".to_string()
-                } else if state.playlist_index < state.playlist.len() {
-                    state.playlist[state.playlist_index].clone()
-                } else {
-                    state.song_title.clone()
-                };
+                let reload_path = resolve_reload_path(&state, active_mic);
 
-                if (!reload_path.is_empty() && state.file_loaded) || is_mic_launch {
+                if (!reload_path.is_empty() && state.file_loaded) || active_mic {
                     state.load_request = Some(reload_path);
                     resume_pos_on_reload = Some(state.current_seconds);
                     state.surround_upmix.user_overridden = false;
@@ -4633,15 +4701,9 @@ where
 
             if state.audio_device_lost {
                 state.audio_device_lost = false;
-                let reload_path = if is_mic_launch {
-                    "".to_string()
-                } else if state.playlist_index < state.playlist.len() {
-                    state.playlist[state.playlist_index].clone()
-                } else {
-                    state.song_title.clone()
-                };
+                let reload_path = resolve_reload_path(&state, active_mic);
 
-                if !reload_path.is_empty() || is_mic_launch {
+                if !reload_path.is_empty() || active_mic {
                     state.load_request = Some(reload_path);
                     resume_pos_on_reload = Some(state.current_seconds);
                     state.surround_upmix.user_overridden = false;
@@ -4667,7 +4729,13 @@ where
         };
 
         if let Some(path) = load_path {
-            let is_mic = is_mic_launch && path.is_empty();
+            let is_mic = crate::state::is_mic_uri(&path)
+                || ((is_mic_launch || app_state.lock().unwrap().is_mic_input) && path.is_empty());
+            {
+                let mut state = app_state.lock().unwrap();
+                let preferred_dev = crate::state::device_from_mic_uri(&path).map(|s| s.to_string());
+                state.set_mic_input_mode(is_mic, preferred_dev);
+            }
             // Check if the path exists first!
             let path_exists = if path.starts_with("http") || is_mic {
                 true

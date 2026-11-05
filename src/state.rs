@@ -958,6 +958,8 @@ pub struct AppState {
     pub biolum_top_down: bool,
     pub selected_audio_device: Option<String>,
     pub available_audio_devices: Vec<String>,
+    pub is_mic_input: bool,
+    pub available_input_devices: Vec<String>,
     pub audio_device_change_request: Option<String>,
     pub audio_topology_reload_request: Option<String>,
     pub active_audio_sink_id: Option<String>,
@@ -978,6 +980,20 @@ pub struct AppState {
     pub file_transfer: Option<FileTransferState>,
 }
 
+pub const MIC_URI_PREFIX: &str = "mic://";
+
+pub fn is_mic_uri(path: &str) -> bool {
+    path.starts_with(MIC_URI_PREFIX)
+}
+
+pub fn mic_uri_for_device(device: &str) -> String {
+    format!("{}{}", MIC_URI_PREFIX, device)
+}
+
+pub fn device_from_mic_uri(path: &str) -> Option<&str> {
+    path.strip_prefix(MIC_URI_PREFIX).filter(|s| !s.is_empty())
+}
+
 pub fn get_history_file_path() -> std::path::PathBuf {
     if let Some(proj_dirs) = directories::ProjectDirs::from("com", "RustTracker", "RustTracker") {
         let dir = proj_dirs.data_dir();
@@ -992,9 +1008,14 @@ pub fn get_history_file_path() -> std::path::PathBuf {
 
 impl AppState {
     pub fn new(title: String) -> Self {
-        let is_mic = title == "Microphone Input";
+        let is_mic = title == "Microphone Input" || is_mic_uri(&title);
         let default_audio_device = crate::audio::get_default_audio_device_name(is_mic);
         let available_audio_devices = crate::audio::get_available_audio_devices(is_mic);
+        let available_input_devices = if is_mic {
+            available_audio_devices.clone()
+        } else {
+            crate::audio::get_available_audio_devices(true)
+        };
 
         let mut history = VecDeque::new();
         for _ in 0..120 {
@@ -1150,6 +1171,8 @@ impl AppState {
             biolum_top_down: true,
             selected_audio_device: default_audio_device,
             available_audio_devices,
+            is_mic_input: is_mic,
+            available_input_devices,
             audio_device_change_request: None,
             audio_topology_reload_request: None,
             active_audio_sink_id: None,
@@ -1302,6 +1325,8 @@ impl AppState {
             biolum_top_down: self.biolum_top_down,
             selected_audio_device: self.selected_audio_device.clone(),
             available_audio_devices: self.available_audio_devices.clone(),
+            is_mic_input: self.is_mic_input,
+            available_input_devices: self.available_input_devices.clone(),
             audio_device_change_request: self.audio_device_change_request.clone(),
             audio_topology_reload_request: self.audio_topology_reload_request.clone(),
             active_audio_sink_id: self.active_audio_sink_id.clone(),
@@ -1328,8 +1353,35 @@ impl AppState {
     pub fn has_active_playback(&self) -> bool {
         self.file_loaded
             && !self.track_ended
+            && !self.is_mic_input
             && (!self.playlist.is_empty()
                 || (!self.song_title.is_empty() && self.song_title != "Microphone Input"))
+    }
+
+    /// Switches the audio device mode between microphone/input capture (`true`) and
+    /// playback output (`false`), refreshing `available_audio_devices` and `selected_audio_device`
+    /// when transitioning between modes.
+    pub fn set_mic_input_mode(&mut self, is_mic: bool, preferred_device: Option<String>) {
+        let mode_changed = self.is_mic_input != is_mic;
+        self.is_mic_input = is_mic;
+        if is_mic {
+            let input_devs = if self.available_input_devices.is_empty() {
+                crate::audio::get_available_audio_devices(true)
+            } else {
+                self.available_input_devices.clone()
+            };
+            self.available_input_devices = input_devs.clone();
+            self.available_audio_devices = input_devs;
+            if let Some(dev) = preferred_device {
+                self.selected_audio_device = Some(dev);
+            } else if mode_changed || self.selected_audio_device.is_none() {
+                self.selected_audio_device = crate::audio::get_default_audio_device_name(true);
+            }
+        } else if mode_changed {
+            self.available_audio_devices = crate::audio::get_available_audio_devices(false);
+            self.selected_audio_device =
+                preferred_device.or_else(|| crate::audio::get_default_audio_device_name(false));
+        }
     }
 
     /// Returns true if the given cursor position (or `self.drag_cursor_pos`) lies within
@@ -1381,6 +1433,7 @@ impl AppState {
             }
             self.osd_timer = 3.0;
         } else {
+            self.set_mic_input_mode(false, None);
             self.playlist = expanded;
             self.playlist_index = 0;
             self.load_request = Some(self.playlist[0].clone());
