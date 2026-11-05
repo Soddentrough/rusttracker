@@ -1093,8 +1093,8 @@ impl SplashCache {
             {
                 let nx0 = ((quad[0].pos.x - bounds.min.x) * inv_w).clamp(0.0, 1.0);
                 let nx1 = ((quad[1].pos.x - bounds.min.x) * inv_w).clamp(0.0, 1.0);
-                let mix0 = (nx0 * 3.14159 - time * 1.1).sin() * 0.5 + 0.5;
-                let mix1 = (nx1 * 3.14159 - time * 1.1).sin() * 0.5 + 0.5;
+                let mix0 = (nx0 * std::f32::consts::PI - time * 1.1).sin() * 0.5 + 0.5;
+                let mix1 = (nx1 * std::f32::consts::PI - time * 1.1).sin() * 0.5 + 0.5;
                 let c0 = egui::Color32::from_rgba_unmultiplied(
                     (225.0 * (1.0 - mix0) + 0.0 * mix0) as u8,
                     (40.0 * (1.0 - mix0) + 215.0 * mix0) as u8,

@@ -41,10 +41,17 @@ fn sample_joined_wave(line_idx: u32, u_coord: f32) -> f32 {
         get_resynthesized_wave_pair(line_idx, i1),
         frac
     );
-    // Left string on [0.0, 0.5] and Right string on [0.5, 1.0] satisfy exact standing-wave
-    // boundary nodes (y = 0 at u = 0.0, 0.5, 1.0) via integer sin(n * pi * s) eigenmodes.
-    let right_mask = smoothstep(0.494, 0.506, u_coord);
-    return mix(pair.x, pair.y, right_mask);
+    // Unbroken full-width guitar string from Left nut (u = 0.0) to Right bridge (u = 1.0):
+    // - Maximum standing-wave amplitude in the center (u = 0.5) via sin(pi * u), with zero center flat spot.
+    // - Smoothly blends Left channel (pair.x) on the left side into Right channel (pair.y) on the right side
+    //   while remaining 100% phase-coherent across the center.
+    let u_clamped = clamp(u_coord, 0.0, 1.0);
+    let stereo_blend = smoothstep(0.18, 0.82, u_clamped);
+    let wave_stereo = mix(pair.x, pair.y, stereo_blend);
+
+    let string_arch = pow(sin(u_clamped * 3.14159265), 0.78);
+    let end_pin = smoothstep(0.0, 0.035, u_clamped) * smoothstep(0.0, 0.035, 1.0 - u_clamped);
+    return wave_stereo * string_arch * end_pin;
 }
 
 @vertex
@@ -135,8 +142,8 @@ fn vs_main_3d(in: VertexInput, @builtin(instance_index) instance_idx: u32) -> Ve
     let ndc = clip_pos.xy / max(clip_pos.w, 0.0001);
 
     // Pass normalized spatial slope in ndc_pos.z so stationary standing-wave nodal pivots
-    // remain just as luminous as antinode crests when a string is actively vibrating.
-    let node_slope = clamp(abs(wave_next - wave_prev) * 28.0, 0.0, 1.0);
+    // remain smoothly illuminated alongside antinode crests when a string is active.
+    let node_slope = clamp(abs(wave_next - wave_prev) * 22.0, 0.0, 1.0);
 
     out.world_pos = p_cur;
     out.clip_position = clip_pos;
@@ -170,7 +177,7 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     // Front (treble 10kHz): bright golden-amber with subtle Left-to-Right stereo tint across the joined line
     let wave_height = clamp(abs(in.hit_val) * 1.35, 0.0, 1.0);
     let node_slope = clamp(in.ndc_pos.z, 0.0, 1.0);
-    let string_energy = max(wave_height, node_slope * 0.85);
+    let string_energy = max(wave_height, node_slope * 0.78);
     let nodal_pivot = clamp(node_slope * (1.0 - wave_height * 1.25), 0.0, 1.0);
 
     let bass_col = mix(vec3<f32>(0.86, 0.18, 0.03), vec3<f32>(0.76, 0.26, 0.05), lr_mix);
@@ -182,11 +189,11 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
         high_col,
         smoothstep(0.45, 1.0, band_norm)
     );
-    let line_col = mix(band_col, high_col, (wave_height * 0.42 + nodal_pivot * 0.28));
+    let line_col = mix(band_col, high_col, (wave_height * 0.40 + nodal_pivot * 0.22));
 
-    // Calm reference glow on idle strings (~0.36) surging to full incandescent brightness
-    // across the entire vibrating standing wave (both antinodes and nodal crossings).
-    let activity_gain = mix(0.36, 1.06, smoothstep(0.0, 0.48, string_energy));
+    // Calm reference glow on flat baselines (~0.36) surging to full incandescent brightness
+    // across the active standing wave (both antinodes and nodal zero-crossings).
+    let activity_gain = mix(0.36, 1.05, smoothstep(0.0, 0.50, string_energy));
     let depth_fade = mix(0.68, 0.98, pow(band_norm, 0.55));
     let end_fade = smoothstep(0.0, 0.02, u_coord) * smoothstep(0.0, 0.02, 1.0 - u_coord);
     let boundary_fade = depth_fade * end_fade * activity_gain;
@@ -197,7 +204,7 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     let core = exp(-d * d * core_sharpness) * edge_zero;
     let halo = exp(-d * 4.2) * edge_zero * (0.10 + string_energy * 0.16);
 
-    let hot_boost = wave_height * 0.36 + nodal_pivot * 0.26;
+    let hot_boost = wave_height * 0.36 + nodal_pivot * 0.20;
     let core_hot = vec3<f32>(1.00, 0.92, 0.65) * (core * core * (0.12 + hot_boost));
     var color = (line_col * (core * 0.74 + halo) + core_hot) * boundary_fade * bezel;
     color = color / (vec3<f32>(1.0) + color * 0.22);
