@@ -252,6 +252,8 @@ pub(crate) struct SplashCache {
     pub cached_font_tex_size: [usize; 2],
     pub title_base_mesh: egui::Mesh,
     pub title_slice_ranges: Vec<(usize, usize)>,
+    pub title_glyph_bounds: egui::Rect,
+    pub title_glow_range: (usize, usize),
 }
 
 impl Default for SplashCache {
@@ -269,6 +271,8 @@ impl Default for SplashCache {
             cached_font_tex_size: [0, 0],
             title_base_mesh: egui::Mesh::default(),
             title_slice_ranges: Vec::new(),
+            title_glyph_bounds: egui::Rect::NOTHING,
+            title_glow_range: (0, 0),
         }
     }
 }
@@ -709,11 +713,133 @@ impl SplashCache {
         }
     }
 
+    /// Evaluates the 80s synthwave airbrushed chrome reflection color at normalized title
+    /// coordinates `(nx, ny)` in `[0.0, 1.0]^2`, per-glyph horizontal facet `gx` in `[0.0, 1.0]`,
+    /// and animation timestamp `time` (seconds).
+    ///
+    /// Unlike a naive vertical wrap (`(ny + time * speed).fract()`), this anchors the reflection
+    /// horizon near the optical waist of the letters while animating:
+    /// 1. A multi-harmonic liquid-chrome horizon undulation across `nx` and `time` (zero wrap seam).
+    /// 2. Continuous scrolling atmospheric reflection bands in the upper sky and scrolling neon
+    ///    grid reflection ripples in the lower ground half.
+    /// 3. A traveling diagonal anamorphic specular light-bar sweep across `(nx, ny)`.
+    #[inline]
+    pub fn evaluate_chrome_color(nx: f32, ny: f32, gx: f32, time: f32) -> egui::Color32 {
+        let lerp = |a: f32, b: f32, t: f32| -> f32 { a + (b - a) * t };
+        let smoothstep = |t: f32| -> f32 {
+            let c = t.clamp(0.0, 1.0);
+            c * c * (3.0 - 2.0 * c)
+        };
+
+        // Liquid-metal horizon ripple + subtle per-glyph cylindrical bevel tilt
+        let horizon_wave = (nx * 5.2 - time * 1.45).sin() * 0.036
+            + (nx * 11.5 + time * 0.85).cos() * 0.015
+            + (time * 0.65).sin() * 0.018;
+        let env_y = (ny + horizon_wave + (gx - 0.5) * 0.026).clamp(0.0, 1.0);
+
+        let (mut r, mut g, mut b) = if env_y < 0.48 {
+            // Upper Sky Reflection: Deep cobalt -> electric cerulean -> ice cyan -> blazing white horizon
+            let sky_t = (env_y / 0.48).clamp(0.0, 1.0);
+            let (mut sr, mut sg, mut sb) = if sky_t < 0.48 {
+                let u = smoothstep(sky_t / 0.48);
+                (
+                    lerp(18.0, 0.0, u),
+                    lerp(42.0, 162.0, u),
+                    lerp(142.0, 250.0, u),
+                )
+            } else if sky_t < 0.84 {
+                let u = smoothstep((sky_t - 0.48) / 0.36);
+                (
+                    lerp(0.0, 145.0, u),
+                    lerp(162.0, 245.0, u),
+                    lerp(250.0, 255.0, u),
+                )
+            } else {
+                let u = smoothstep((sky_t - 0.84) / 0.16);
+                (
+                    lerp(145.0, 255.0, u),
+                    lerp(245.0, 255.0, u),
+                    lerp(255.0, 255.0, u),
+                )
+            };
+
+            // Continuous upward-scrolling sky sheen bands (attenuated near the white horizon core)
+            let sky_band = ((ny * 10.5 - time * 1.75 + nx * 2.4).sin() * 0.5 + 0.5).powi(2);
+            let band_mask = (1.0 - sky_t).powf(0.75) * 0.28;
+            sr = lerp(sr, 195.0, sky_band * band_mask);
+            sg = lerp(sg, 248.0, sky_band * band_mask);
+            sb = lerp(sb, 255.0, sky_band * band_mask);
+            (sr, sg, sb)
+        } else if env_y < 0.54 {
+            // High-contrast 80s Chrome Horizon Crease: Blazing White -> Deep Obsidian-Violet
+            let u = smoothstep((env_y - 0.48) / 0.06);
+            (
+                lerp(255.0, 22.0, u),
+                lerp(255.0, 8.0, u),
+                lerp(255.0, 48.0, u),
+            )
+        } else {
+            // Lower Sunset / Neon Grid Reflection: Obsidian -> Neon Magenta -> Sunset Coral -> Solar Gold
+            let gnd_t = ((env_y - 0.54) / 0.46).clamp(0.0, 1.0);
+            let (mut gr, mut gg, mut gb) = if gnd_t < 0.36 {
+                let u = smoothstep(gnd_t / 0.36);
+                (
+                    lerp(22.0, 210.0, u),
+                    lerp(8.0, 28.0, u),
+                    lerp(48.0, 152.0, u),
+                )
+            } else if gnd_t < 0.72 {
+                let u = smoothstep((gnd_t - 0.36) / 0.36);
+                (
+                    lerp(210.0, 255.0, u),
+                    lerp(28.0, 102.0, u),
+                    lerp(152.0, 88.0, u),
+                )
+            } else {
+                let u = smoothstep((gnd_t - 0.72) / 0.28);
+                (
+                    lerp(255.0, 255.0, u),
+                    lerp(102.0, 215.0, u),
+                    lerp(88.0, 92.0, u),
+                )
+            };
+
+            // Continuous downward-scrolling perspective neon grid reflection ripples
+            let grid_ripple =
+                ((gnd_t.powf(0.8) * 12.0 - time * 2.1 - nx * 1.8).sin() * 0.5 + 0.5).powi(2);
+            let ripple_mask = gnd_t * (1.0 - gnd_t * 0.45) * 0.30;
+            gr = lerp(gr, 255.0, grid_ripple * ripple_mask);
+            gg = lerp(gg, 185.0, grid_ripple * ripple_mask);
+            gb = lerp(gb, 230.0, grid_ripple * ripple_mask);
+            (gr, gg, gb)
+        };
+
+        // Traveling diagonal anamorphic specular light-bar sweep across the full title
+        // Period spans [-0.45, 1.55] so diag_coord in [-0.04, 1.06] has zero intensity at wrap ends.
+        let sweep_center = (time * 0.30).rem_euclid(2.0) - 0.45;
+        let diag_coord = nx * 0.82 + ny * 0.22 - gx * 0.04;
+        let d_main = (diag_coord - sweep_center).abs();
+        let glint_main = smoothstep(1.0 - (d_main / 0.14).clamp(0.0, 1.0)).powi(2);
+        let d_trail = (diag_coord - (sweep_center - 0.17)).abs();
+        let glint_trail = smoothstep(1.0 - (d_trail / 0.065).clamp(0.0, 1.0)).powi(2) * 0.50;
+        let glint = (glint_main * 0.68 + glint_trail).clamp(0.0, 1.0);
+
+        r = lerp(r, 248.0, glint);
+        g = lerp(g, 253.0, glint);
+        b = lerp(b, 255.0, glint);
+
+        egui::Color32::from_rgb(
+            r.round().clamp(0.0, 255.0) as u8,
+            g.round().clamp(0.0, 255.0) as u8,
+            b.round().clamp(0.0, 255.0) as u8,
+        )
+    }
+
     /// Builds or updates the cached `RustTracker` chrome title mesh in-place.
-    /// Full font layout and bevel/slice geometry construction happen only when `title_rect` or
-    /// `pixels_per_point` changes; on all subsequent frames only the 20 interior slice colors
-    /// are updated in-place on `self.title_base_mesh` and appended directly into the combined
-    /// Splash primitive after `egui_ctx.tessellate()`.
+    /// Full font layout, 3D extrusion, directional bevel, and 24-slice geometry construction
+    /// happen only when `title_rect` or `pixels_per_point` changes; on all subsequent frames
+    /// only the outer neon corona and interior chrome vertex colors are updated in-place on
+    /// `self.title_base_mesh` and appended directly into the combined Splash primitive.
     pub fn update_title_mesh(
         &mut self,
         ui: &egui::Ui,
@@ -724,7 +850,7 @@ impl SplashCache {
     ) {
         let ppp = ui.ctx().pixels_per_point().max(0.5);
         let current_font_tex_size = ui.ctx().fonts_mut(|f| f.font_image_size());
-        let steps = 20usize;
+        let steps = 24usize;
         let rect_same = (title_rect.min.x - self.cached_title_rect.min.x).abs() < 0.5
             && (title_rect.min.y - self.cached_title_rect.min.y).abs() < 0.5
             && (title_rect.max.x - self.cached_title_rect.max.x).abs() < 0.5
@@ -756,6 +882,11 @@ impl SplashCache {
             );
 
             let mut glyph_quads = Vec::with_capacity(16);
+            let mut gx_min = f32::INFINITY;
+            let mut gy_min = f32::INFINITY;
+            let mut gx_max = f32::NEG_INFINITY;
+            let mut gy_max = f32::NEG_INFINITY;
+
             for placed_row in &galley.rows {
                 let row_pos = snapped_pos + placed_row.pos.to_vec2();
                 for q in placed_row.row.visuals.mesh.vertices.as_chunks::<4>().0 {
@@ -771,55 +902,124 @@ impl SplashCache {
                     let u_max = q[0].uv.x.max(q[1].uv.x).max(q[2].uv.x).max(q[3].uv.x) * uv_norm.x;
                     let v_min = q[0].uv.y.min(q[1].uv.y).min(q[2].uv.y).min(q[3].uv.y) * uv_norm.y;
                     let v_max = q[0].uv.y.max(q[1].uv.y).max(q[2].uv.y).max(q[3].uv.y) * uv_norm.y;
+                    gx_min = gx_min.min(x_min);
+                    gy_min = gy_min.min(y_min);
+                    gx_max = gx_max.max(x_max);
+                    gy_max = gy_max.max(y_max);
                     glyph_quads.push((x_min, y_min, x_max, y_max, u_min, v_min, u_max, v_max));
                 }
             }
 
+            self.title_glyph_bounds = if gx_max > gx_min && gy_max > gy_min {
+                egui::Rect::from_min_max(egui::pos2(gx_min, gy_min), egui::pos2(gx_max, gy_max))
+            } else {
+                egui::Rect::from_center_size(
+                    title_rect.center(),
+                    egui::vec2(
+                        title_rect.width().max(1.0),
+                        (gradient_extent * 2.0).max(1.0),
+                    ),
+                )
+            };
+
+            // Scale all bevel, extrusion, and outline offsets proportionally with font_size
+            let s = (font_size / 66.0).clamp(0.42, 1.5);
+
             let mut title_mesh = egui::Mesh::with_texture(egui::TextureId::default());
-            title_mesh.reserve_vertices(glyph_quads.len() * (8 + steps) * 4);
-            title_mesh.reserve_triangles(glyph_quads.len() * (8 + steps) * 2);
+            title_mesh.reserve_vertices(glyph_quads.len() * (29 + steps) * 4);
+            title_mesh.reserve_triangles(glyph_quads.len() * (29 + steps) * 2);
 
-            // 1. Silver Outer Bevel (3px diagonal offsets)
-            let silver_color = egui::Color32::from_rgb(200, 220, 255);
-            for (dx, dy) in [(-3.0, -3.0), (3.0, -3.0), (-3.0, 3.0), (3.0, 3.0)] {
-                for &(x_min, y_min, x_max, y_max, u_min, v_min, u_max, v_max) in &glyph_quads {
-                    title_mesh.add_rect_with_uv(
-                        egui::Rect::from_min_max(
-                            egui::pos2(x_min + dx, y_min + dy),
-                            egui::pos2(x_max + dx, y_max + dy),
-                        ),
-                        egui::Rect::from_min_max(
-                            egui::pos2(u_min, v_min),
-                            egui::pos2(u_max, v_max),
-                        ),
-                        silver_color,
-                    );
-                }
+            let push_offset_layer =
+                |mesh: &mut egui::Mesh, dx: f32, dy: f32, color: egui::Color32| {
+                    for &(x_min, y_min, x_max, y_max, u_min, v_min, u_max, v_max) in &glyph_quads {
+                        mesh.add_rect_with_uv(
+                            egui::Rect::from_min_max(
+                                egui::pos2(x_min + dx, y_min + dy),
+                                egui::pos2(x_max + dx, y_max + dy),
+                            ),
+                            egui::Rect::from_min_max(
+                                egui::pos2(u_min, v_min),
+                                egui::pos2(u_max, v_max),
+                            ),
+                            color,
+                        );
+                    }
+                };
+
+            // 1. Deep Grounding Drop Shadow (lifts logo off the upper synthwave sky)
+            let drop_shadow = egui::Color32::from_rgba_unmultiplied(6, 3, 20, 185);
+            for (dx, dy) in [(2.4 * s, 4.4 * s), (0.8 * s, 4.2 * s), (3.8 * s, 3.6 * s)] {
+                push_offset_layer(&mut title_mesh, dx, dy, drop_shadow);
             }
 
-            // 2. Black Inner Outline (1px diagonal offsets)
-            for (dx, dy) in [(-1.0, -1.0), (1.0, -1.0), (-1.0, 1.0), (1.0, 1.0)] {
-                for &(x_min, y_min, x_max, y_max, u_min, v_min, u_max, v_max) in &glyph_quads {
-                    title_mesh.add_rect_with_uv(
-                        egui::Rect::from_min_max(
-                            egui::pos2(x_min + dx, y_min + dy),
-                            egui::pos2(x_max + dx, y_max + dy),
-                        ),
-                        egui::Rect::from_min_max(
-                            egui::pos2(u_min, v_min),
-                            egui::pos2(u_max, v_max),
-                        ),
-                        egui::Color32::BLACK,
-                    );
-                }
+            // 2. Animated Neon Corona / Outer Bloom Ring (updated in-place each frame)
+            let glow_start = title_mesh.vertices.len();
+            let base_glow = egui::Color32::from_rgba_unmultiplied(212, 34, 161, 48);
+            for (dx, dy) in [
+                (-3.8 * s, 0.0),
+                (3.8 * s, 0.0),
+                (0.0, -3.5 * s),
+                (0.0, 3.8 * s),
+                (-2.8 * s, -2.6 * s),
+                (2.8 * s, -2.6 * s),
+                (-2.8 * s, 2.8 * s),
+                (2.8 * s, 2.8 * s),
+            ] {
+                push_offset_layer(&mut title_mesh, dx, dy, base_glow);
+            }
+            self.title_glow_range = (glow_start, title_mesh.vertices.len());
+
+            // 3. 3D Metallic Block Extrusion (receding down-right in cosmic indigo/violet)
+            for (dx, dy, col) in [
+                (3.2 * s, 3.3 * s, egui::Color32::from_rgb(32, 14, 76)),
+                (2.5 * s, 2.6 * s, egui::Color32::from_rgb(52, 22, 108)),
+                (1.9 * s, 2.0 * s, egui::Color32::from_rgb(76, 32, 142)),
+            ] {
+                push_offset_layer(&mut title_mesh, dx, dy, col);
             }
 
-            // 3. Sliced Chrome Interior template
+            // 4. Directional Specular Bevel Rim (Icy Cyan-Silver top-left highlight vs. Neon Magenta bottom-right rim)
+            let bevel_highlight = egui::Color32::from_rgb(218, 246, 255);
+            for (dx, dy) in [
+                (-1.8 * s, -1.8 * s),
+                (0.0, -1.9 * s),
+                (-1.9 * s, 0.0),
+                (1.5 * s, -1.6 * s),
+            ] {
+                push_offset_layer(&mut title_mesh, dx, dy, bevel_highlight);
+            }
+            let bevel_rim = egui::Color32::from_rgb(245, 90, 200);
+            for (dx, dy) in [
+                (1.7 * s, 1.7 * s),
+                (0.0, 1.8 * s),
+                (1.8 * s, 0.0),
+                (-1.5 * s, 1.6 * s),
+            ] {
+                push_offset_layer(&mut title_mesh, dx, dy, bevel_rim);
+            }
+
+            // 5. Crisp 8-Direction Dark Obsidian Inner Crease (eliminates corner gaps on thin strokes)
+            let crease_color = egui::Color32::from_rgb(10, 6, 24);
+            let c = 0.92 * s;
+            for (dx, dy) in [
+                (-c, -c),
+                (0.0, -c),
+                (c, -c),
+                (-c, 0.0),
+                (c, 0.0),
+                (-c, c),
+                (0.0, c),
+                (c, c),
+            ] {
+                push_offset_layer(&mut title_mesh, dx, dy, crease_color);
+            }
+
+            // 6. 24-Slice Chrome Interior across exact tight glyph vertical bounds
             self.title_slice_ranges.clear();
             self.title_slice_ranges.reserve(steps);
-            let top_y = title_rect.center().y - gradient_extent;
-            let bottom_y = title_rect.center().y + gradient_extent;
-            let height = bottom_y - top_y;
+            let top_y = self.title_glyph_bounds.min.y;
+            let bottom_y = self.title_glyph_bounds.max.y;
+            let height = (bottom_y - top_y).max(1.0);
 
             for i in 0..steps {
                 let t = i as f32 / steps as f32;
@@ -877,43 +1077,59 @@ impl SplashCache {
             self.title_base_mesh = title_mesh;
         }
 
-        // Fast per-frame color update across the 20 chrome slices (zero glyph layout or tessellation)
-        let chrome_palette = |t_pos: f32| -> egui::Color32 {
-            let scroll_speed = 0.1;
-            let mut color_t = (t_pos + time * scroll_speed).fract();
-            if color_t < 0.0 {
-                color_t += 1.0;
-            }
-            if color_t < 0.48 {
-                let sky_t = color_t / 0.48;
-                let r = (0.0 * (1.0 - sky_t) + 10.0 * sky_t) as u8;
-                let g = (220.0 * (1.0 - sky_t) + 30.0 * sky_t) as u8;
-                let b = (255.0 * (1.0 - sky_t) + 120.0 * sky_t) as u8;
-                egui::Color32::from_rgb(r, g, b)
-            } else if color_t < 0.52 {
-                egui::Color32::WHITE
-            } else {
-                let ground_t = (color_t - 0.52) / 0.48;
-                let r = (50.0 * (1.0 - ground_t) + 255.0 * ground_t) as u8;
-                let g = (15.0 * (1.0 - ground_t) + 160.0 * ground_t) as u8;
-                let b = (0.0 * (1.0 - ground_t) + 50.0 * ground_t) as u8;
-                egui::Color32::from_rgb(r, g, b)
-            }
-        };
+        // Fast per-frame vertex color update (zero glyph layout or tessellation)
+        let bounds = self.title_glyph_bounds;
+        let inv_w = 1.0 / bounds.width().max(1.0);
+        let inv_h = 1.0 / bounds.height().max(1.0);
 
-        for (i, &(v_start, v_end)) in self.title_slice_ranges.iter().enumerate() {
-            let t = i as f32 / steps as f32;
-            let next_t = (i + 1) as f32 / steps as f32;
-            let color_top = chrome_palette(t);
-            let color_bot = chrome_palette((t + next_t) * 0.5);
+        // Update animated outer neon corona (cyan <-> magenta wave across the logo)
+        let (glow_start, glow_end) = self.title_glow_range;
+        if glow_end > glow_start && glow_end <= self.title_base_mesh.vertices.len() {
+            let pulse = (time * 1.8).sin() * 0.5 + 0.5;
+            let alpha = (38.0 + pulse * 22.0) as u8;
+            for quad in self.title_base_mesh.vertices[glow_start..glow_end]
+                .as_chunks_mut::<4>()
+                .0
+            {
+                let nx0 = ((quad[0].pos.x - bounds.min.x) * inv_w).clamp(0.0, 1.0);
+                let nx1 = ((quad[1].pos.x - bounds.min.x) * inv_w).clamp(0.0, 1.0);
+                let mix0 = (nx0 * 3.14159 - time * 1.1).sin() * 0.5 + 0.5;
+                let mix1 = (nx1 * 3.14159 - time * 1.1).sin() * 0.5 + 0.5;
+                let c0 = egui::Color32::from_rgba_unmultiplied(
+                    (225.0 * (1.0 - mix0) + 0.0 * mix0) as u8,
+                    (40.0 * (1.0 - mix0) + 215.0 * mix0) as u8,
+                    (175.0 * (1.0 - mix0) + 255.0 * mix0) as u8,
+                    alpha,
+                );
+                let c1 = egui::Color32::from_rgba_unmultiplied(
+                    (225.0 * (1.0 - mix1) + 0.0 * mix1) as u8,
+                    (40.0 * (1.0 - mix1) + 215.0 * mix1) as u8,
+                    (175.0 * (1.0 - mix1) + 255.0 * mix1) as u8,
+                    alpha,
+                );
+                quad[0].color = c0;
+                quad[1].color = c1;
+                quad[2].color = c1;
+                quad[3].color = c0;
+            }
+        }
+
+        // Update 24 interior chrome slices at exact per-vertex (nx, ny, gx) coordinates
+        // so adjacent slices share identical boundary colors with zero Mach banding.
+        for &(v_start, v_end) in &self.title_slice_ranges {
             for quad in self.title_base_mesh.vertices[v_start..v_end]
                 .as_chunks_mut::<4>()
                 .0
             {
-                quad[0].color = color_top;
-                quad[1].color = color_top;
-                quad[2].color = color_bot;
-                quad[3].color = color_bot;
+                let nx0 = ((quad[0].pos.x - bounds.min.x) * inv_w).clamp(0.0, 1.0);
+                let nx1 = ((quad[1].pos.x - bounds.min.x) * inv_w).clamp(0.0, 1.0);
+                let ny0 = ((quad[0].pos.y - bounds.min.y) * inv_h).clamp(0.0, 1.0);
+                let ny1 = ((quad[2].pos.y - bounds.min.y) * inv_h).clamp(0.0, 1.0);
+
+                quad[0].color = Self::evaluate_chrome_color(nx0, ny0, 0.0, time);
+                quad[1].color = Self::evaluate_chrome_color(nx1, ny0, 1.0, time);
+                quad[2].color = Self::evaluate_chrome_color(nx1, ny1, 1.0, time);
+                quad[3].color = Self::evaluate_chrome_color(nx0, ny1, 0.0, time);
             }
         }
     }
@@ -14320,6 +14536,85 @@ mod tests {
             dyn_mesh.vertices.len() >= 50 * 4,
             "Dynamic splash mesh must contain at least 50 star quads plus scrolling grid lines"
         );
+
+        // 2b. Title chrome mesh builds 24 slices over tight glyph bounds with C0 slice-boundary continuity
+        // and anchored sky->white-horizon->obsidian-crease->sunset-gold reflection (zero barber-pole wrap seam).
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            "Orbitron".to_owned(),
+            egui::FontData::from_static(EMBEDDED_GLASS_FONT).into(),
+        );
+        fonts.families.insert(
+            egui::FontFamily::Name("Orbitron".into()),
+            vec!["Orbitron".to_owned()],
+        );
+        ctx.set_fonts(fonts);
+
+        let title_rect =
+            egui::Rect::from_center_size(egui::pos2(640.0, 90.0), egui::vec2(550.0, 70.0));
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            egui::CentralPanel::default().show_inside(ui, |ui| {
+                splash_cache.update_title_mesh(ui, title_rect, 29.0, 66.0, 1.25);
+            });
+        });
+        assert_eq!(
+            splash_cache.title_slice_ranges.len(),
+            24,
+            "Splash title mesh must use 24 vertical chrome slices"
+        );
+        assert!(
+            splash_cache.title_glyph_bounds.width() > 100.0
+                && splash_cache.title_glyph_bounds.height() > 20.0,
+            "Splash title must compute tight glyph bounding box"
+        );
+
+        // Verify adjacent slices share identical vertex colors at their shared horizontal seam (y_bot == y_top)
+        let mut matched_seams = 0usize;
+        for w in splash_cache.title_slice_ranges.windows(2) {
+            let (s0, e0) = w[0];
+            let (s1, e1) = w[1];
+            let quads0 = splash_cache.title_base_mesh.vertices[s0..e0]
+                .as_chunks::<4>()
+                .0;
+            let quads1 = splash_cache.title_base_mesh.vertices[s1..e1]
+                .as_chunks::<4>()
+                .0;
+            for q0 in quads0 {
+                for q1 in quads1 {
+                    if (q0[0].pos.x - q1[0].pos.x).abs() < 1e-3
+                        && (q0[2].pos.y - q1[0].pos.y).abs() < 1e-3
+                    {
+                        assert_eq!(
+                            q0[3].color, q1[0].color,
+                            "Left vertex color at slice boundary must be C0 continuous"
+                        );
+                        assert_eq!(
+                            q0[2].color, q1[1].color,
+                            "Right vertex color at slice boundary must be C0 continuous"
+                        );
+                        matched_seams += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            matched_seams >= 100,
+            "All active glyph slice boundaries must match seamlessly"
+        );
+
+        // Verify chrome reflection remains anchored (sky on top, warm sunset on bottom) at all times
+        for &sample_t in &[0.0_f32, 1.7, 3.4, 5.1, 8.8] {
+            let top_col = SplashCache::evaluate_chrome_color(0.5, 0.02, 0.5, sample_t);
+            let bot_col = SplashCache::evaluate_chrome_color(0.5, 0.98, 0.5, sample_t);
+            assert!(
+                top_col.b() > top_col.r(),
+                "Top of chrome glyphs must reflect blue/cyan sky at t={sample_t}"
+            );
+            assert!(
+                bot_col.r() > bot_col.b(),
+                "Bottom of chrome glyphs must reflect warm sunset coral/gold at t={sample_t}"
+            );
+        }
 
         // 3. StatsDisplayCache throttles string formatting to 10 Hz (100ms) and separates CPU command recording from driver submit+present
         let mut stats_cache = StatsDisplayCache::default();

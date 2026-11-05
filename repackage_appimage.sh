@@ -98,6 +98,9 @@ find AppDir/usr/lib -maxdepth 1 \( \
     -name 'libdbus*' \
 \) -delete || true
 
+echo "Patching GLIBC_2.44 symbol versions for SteamOS (glibc 2.43) compatibility..."
+python3 scripts/patch_glibc_compat.py AppDir/usr/bin AppDir/usr/lib
+
 echo "Injecting custom AppRun wrapper..."
 rm -f AppDir/AppRun
 cp AppRun.template AppDir/AppRun
