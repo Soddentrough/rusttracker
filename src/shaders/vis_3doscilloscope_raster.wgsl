@@ -31,11 +31,19 @@ fn hash21_fast_crt(p: vec2<f32>) -> f32 {
     return fract((p3.x + p3.y) * p3.z);
 }
 
+fn sample_history_linear(row_offset: u32, sample_pos: f32, max_sample_f: f32) -> f32 {
+    let clamped = clamp(sample_pos, 0.0, max_sample_f);
+    let i0 = u32(floor(clamped));
+    let i1 = min(i0 + 1u, u32(max_sample_f));
+    let frac = fract(clamped);
+    return mix(waveform_history[row_offset + i0], waveform_history[row_offset + i1], frac);
+}
+
 @vertex
 fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
     var out: VertexOutput3D;
 
-    let res = max(audio.waveform_resolution, 128u);
+    let res = min(max(audio.waveform_resolution, 128u), 2048u);
     let history_size = max(audio.waveform_history_size, 2u);
     let max_hist_f = f32(history_size - 1u);
 
@@ -47,14 +55,26 @@ fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
     // Integer history index locked to its buffer row while scrolling smoothly in Z via step_fraction
     let hist_idx = u32(round(clamp(v_coord * max_hist_f, 0.0, max_hist_f)));
     let row_offset = hist_idx * 2048u;
-    let max_sample = i32(min(res, 2048u)) - 1i;
-    let center_idx = clamp(i32(round(u_coord * f32(res - 1u))), 0i, max_sample);
-    let center_val = waveform_history[row_offset + u32(center_idx)];
-    let prev_val = waveform_history[row_offset + u32(max(center_idx - 1i, 0i))];
-    let next_val = waveform_history[row_offset + u32(min(center_idx + 1i, max_sample))];
-    var peak_val = select(prev_val, center_val, abs(center_val) >= abs(prev_val));
-    peak_val = select(peak_val, next_val, abs(next_val) > abs(peak_val));
-    let wave_val = mix(center_val, peak_val, 0.65);
+    let max_sample_f = f32(res - 1u);
+    let center_pos = u_coord * max_sample_f;
+
+    // Cell-matched 5-tap linear filter across the 160-vertex grid spacing:
+    // eliminates Moire spatial aliasing when res >> 160 while preserving exact zero-crossing
+    // standing-wave nodes (avoiding abs-max sign jumps across nodes).
+    let cell_step = max(1.0, max_sample_f / 320.0);
+    let c0 = sample_history_linear(row_offset, center_pos, max_sample_f);
+    let tap_l1 = sample_history_linear(row_offset, center_pos - cell_step, max_sample_f);
+    let tap_r1 = sample_history_linear(row_offset, center_pos + cell_step, max_sample_f);
+    let tap_l2 = sample_history_linear(row_offset, center_pos - 2.0 * cell_step, max_sample_f);
+    let tap_r2 = sample_history_linear(row_offset, center_pos + 2.0 * cell_step, max_sample_f);
+    let smooth_val = c0 * 0.40 + (tap_l1 + tap_r1) * 0.22 + (tap_l2 + tap_r2) * 0.08;
+
+    // Only blend toward the local crest when all three central taps share the same sign,
+    // keeping standing-wave nodal valleys pinned smoothly at zero.
+    let same_sign = step(0.0, tap_l1 * tap_r1) * step(0.0, c0 * tap_l1);
+    var crest_val = select(tap_l1, c0, abs(c0) >= abs(tap_l1));
+    crest_val = select(crest_val, tap_r1, abs(tap_r1) > abs(crest_val));
+    let wave_val = mix(smooth_val, crest_val, 0.45 * same_sign);
 
     // Sub-row fractional Z glide eliminates stepped waterfall jumps between history pushes
     let v_scrolled = clamp(v_coord - audio.step_fraction / max_hist_f, 0.0, 1.0);

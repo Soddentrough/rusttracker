@@ -2054,12 +2054,15 @@ mod wasapi_bitstream {
                                                                     2 => std::f32::consts::FRAC_1_SQRT_2,
                                                                     _ => 0.25,
                                                                 };
+                                                                let off = window_size
+                                                                    .saturating_sub(acc.len());
                                                                 for (i, &sample) in acc
                                                                     .iter()
                                                                     .take(window_size)
                                                                     .enumerate()
                                                                 {
-                                                                    mono[i] += sample * ch_weight;
+                                                                    mono[off + i] +=
+                                                                        sample * ch_weight;
                                                                 }
                                                             }
                                                             for s in &mut mono {
@@ -2481,10 +2484,12 @@ mod wasapi_bitstream {
                                                             2 => std::f32::consts::FRAC_1_SQRT_2,
                                                             _ => 0.25,
                                                         };
+                                                        let off =
+                                                            window_size.saturating_sub(acc.len());
                                                         for (i, &sample) in
                                                             acc.iter().take(window_size).enumerate()
                                                         {
-                                                            mono[i] += sample * ch_weight;
+                                                            mono[off + i] += sample * ch_weight;
                                                         }
                                                     }
                                                     for s in &mut mono {

@@ -41,12 +41,10 @@ fn sample_joined_wave(line_idx: u32, u_coord: f32) -> f32 {
         get_resynthesized_wave_pair(line_idx, i1),
         frac
     );
-    // Single joined horizontal line across the full display width:
-    // Left channel (pair.x) on the left half, Right channel (pair.y) on the right half,
-    // joined cleanly across the center without opposite-slope kinks or a wide flat trough.
-    let env_left  = smoothstep(0.0, 0.06, u_coord) * (1.0 - smoothstep(0.42, 0.495, u_coord));
-    let env_right = smoothstep(0.505, 0.58, u_coord) * smoothstep(0.0, 0.06, 1.0 - u_coord);
-    return pair.x * env_left + pair.y * env_right;
+    // Left string on [0.0, 0.5] and Right string on [0.5, 1.0] satisfy exact standing-wave
+    // boundary nodes (y = 0 at u = 0.0, 0.5, 1.0) via integer sin(n * pi * s) eigenmodes.
+    let right_mask = smoothstep(0.494, 0.506, u_coord);
+    return mix(pair.x, pair.y, right_mask);
 }
 
 @vertex
@@ -136,9 +134,13 @@ fn vs_main_3d(in: VertexInput, @builtin(instance_index) instance_idx: u32) -> Ve
     // Keep straight unbent projection (no barrel distortion bowing the horizontal lines)
     let ndc = clip_pos.xy / max(clip_pos.w, 0.0001);
 
+    // Pass normalized spatial slope in ndc_pos.z so stationary standing-wave nodal pivots
+    // remain just as luminous as antinode crests when a string is actively vibrating.
+    let node_slope = clamp(abs(wave_next - wave_prev) * 28.0, 0.0, 1.0);
+
     out.world_pos = p_cur;
     out.clip_position = clip_pos;
-    out.ndc_pos = vec3<f32>(ndc, u_coord);
+    out.ndc_pos = vec3<f32>(ndc, node_slope);
     out.uv = vec2<f32>(u_coord, v_coord);
     out.band_norm = band_norm;
     out.hit_val = wave_val;
@@ -167,6 +169,10 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     // Middle (mids): rich warm amber-orange
     // Front (treble 10kHz): bright golden-amber with subtle Left-to-Right stereo tint across the joined line
     let wave_height = clamp(abs(in.hit_val) * 1.35, 0.0, 1.0);
+    let node_slope = clamp(in.ndc_pos.z, 0.0, 1.0);
+    let string_energy = max(wave_height, node_slope * 0.85);
+    let nodal_pivot = clamp(node_slope * (1.0 - wave_height * 1.25), 0.0, 1.0);
+
     let bass_col = mix(vec3<f32>(0.86, 0.18, 0.03), vec3<f32>(0.76, 0.26, 0.05), lr_mix);
     let mid_col  = mix(vec3<f32>(0.98, 0.42, 0.06), vec3<f32>(0.92, 0.54, 0.10), lr_mix);
     let high_col = mix(vec3<f32>(1.00, 0.70, 0.20), vec3<f32>(0.96, 0.82, 0.32), lr_mix);
@@ -176,10 +182,11 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
         high_col,
         smoothstep(0.45, 1.0, band_norm)
     );
-    let line_col = mix(band_col, high_col, wave_height * 0.40);
+    let line_col = mix(band_col, high_col, (wave_height * 0.42 + nodal_pivot * 0.28));
 
-    // Calm reference glow on flat baselines (~0.36) surging to full incandescent brightness on active peaks
-    let activity_gain = mix(0.36, 1.05, smoothstep(0.0, 0.50, wave_height));
+    // Calm reference glow on idle strings (~0.36) surging to full incandescent brightness
+    // across the entire vibrating standing wave (both antinodes and nodal crossings).
+    let activity_gain = mix(0.36, 1.06, smoothstep(0.0, 0.48, string_energy));
     let depth_fade = mix(0.68, 0.98, pow(band_norm, 0.55));
     let end_fade = smoothstep(0.0, 0.02, u_coord) * smoothstep(0.0, 0.02, 1.0 - u_coord);
     let boundary_fade = depth_fade * end_fade * activity_gain;
@@ -188,9 +195,10 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     let core_sharpness = mix(9.5, 16.0, band_norm);
     let edge_zero = (1.0 - d) * (1.0 - d);
     let core = exp(-d * d * core_sharpness) * edge_zero;
-    let halo = exp(-d * 4.2) * edge_zero * (0.10 + wave_height * 0.16);
+    let halo = exp(-d * 4.2) * edge_zero * (0.10 + string_energy * 0.16);
 
-    let core_hot = vec3<f32>(1.00, 0.92, 0.65) * (core * core * (0.12 + wave_height * 0.36));
+    let hot_boost = wave_height * 0.36 + nodal_pivot * 0.26;
+    let core_hot = vec3<f32>(1.00, 0.92, 0.65) * (core * core * (0.12 + hot_boost));
     var color = (line_col * (core * 0.74 + halo) + core_hot) * boundary_fade * bezel;
     color = color / (vec3<f32>(1.0) + color * 0.22);
 

@@ -13,45 +13,58 @@ fn get_waveform(hist_idx: u32, idx: u32) -> f32 {
     return waveform_history[hist_idx * 2048u + clamped_idx];
 }
 
-// Returns vec3(min_dist, screen_space_slope_dy_dx, y_at_u) with hoisted endpoint reads
-fn get_wave_dist_and_slope(hist_idx: u32, u_sweep: f32, uv: vec2<f32>, aspect: f32, search_radius: i32) -> vec3<f32> {
-    let res = f32(max(audio.waveform_resolution, 128u));
+// Returns vec3(min_dist, screen_space_slope_dy_dx, y_at_u) with resolution-invariant strided search
+fn get_wave_dist_and_slope(
+    hist_idx: u32,
+    u_sweep: f32,
+    uv: vec2<f32>,
+    aspect: f32,
+    search_steps: i32,
+    seg_step: i32,
+) -> vec3<f32> {
+    let res_u = max(audio.waveform_resolution, 128u);
+    let res = f32(res_u);
     let inv_res = 1.0 / (res - 1.0);
     let clamped_u = clamp(u_sweep, 0.0, 0.9999);
     let float_idx = clamped_u * (res - 1.0);
     let idx = u32(float_idx);
     let frac = fract(float_idx);
 
+    // Exact sub-sample vertical wave position at u_sweep for nodal convergence & inter-frame bridge
+    let y_at_u = mix(
+        get_waveform(hist_idx, idx),
+        get_waveform(hist_idx, min(idx + 1u, res_u - 1u)),
+        frac
+    ) * 0.38 + 0.5;
+
     var min_dist = 1000.0;
     var best_slope = 0.0;
 
-    let start_idx = max(0i, i32(idx) - search_radius);
-    let end_idx = min(i32(res) - 2i, i32(idx) + search_radius);
+    let step_i = max(1i, seg_step);
+    let radius_samples = search_steps * step_i;
+    let max_base = max(0i, i32(res_u) - 1i - step_i);
+    let start_idx = clamp(i32(idx) - radius_samples, 0i, max_base);
+    let end_idx = clamp(i32(idx) + radius_samples, 0i, max_base);
 
     let p = vec2<f32>(uv.x * aspect, uv.y);
 
     // Active sweep spans x in [0.03, 0.97] (width 0.94) and y amplitude 0.38 around 0.5
     let sweep_left = 0.03;
     let sweep_width = 0.94;
-    let dx_seg = inv_res * sweep_width * aspect;
+    let dx_seg = f32(step_i) * inv_res * sweep_width * aspect;
     let inv_dx_seg = 1.0 / max(dx_seg, 1e-5);
 
     let start_u = u32(start_idx);
     var v0 = get_waveform(hist_idx, start_u);
     var y0 = v0 * 0.38 + 0.5;
     var a = vec2<f32>((sweep_left + f32(start_u) * inv_res * sweep_width) * aspect, y0);
-    var y_at_u = y0;
 
-    for (var i = start_idx; i <= end_idx; i = i + 1) {
+    for (var i = start_idx; i <= end_idx; i = i + step_i) {
         let u_idx0 = u32(i);
-        let u_idx1 = u_idx0 + 1u;
+        let u_idx1 = min(u_idx0 + u32(step_i), res_u - 1u);
         let v1 = get_waveform(hist_idx, u_idx1);
         let y1 = v1 * 0.38 + 0.5;
         let b = vec2<f32>((sweep_left + f32(u_idx1) * inv_res * sweep_width) * aspect, y1);
-
-        if u_idx0 == idx {
-            y_at_u = mix(y0, y1, frac);
-        }
 
         let d = sd_line_segment(p, a, b);
         if d < min_dist {
@@ -169,80 +182,82 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var beam_light = 0.0;
 
     if sweep_blank > 0.0001 && hist_count > 0u {
-        var prev_y = 0.5;
-        var has_prev = false;
+        let res_i = i32(max(audio.waveform_resolution, 128u));
+        let step_live = max(1i, res_i / 1024i);
+        let step_hist = max(1i, res_i / 512i);
 
-        for (var i = start_frame; i < hist_count; i = i + 1u) {
-            let search_rad = select(1i, 5i, i + 2u >= hist_count);
-            let wave_info = get_wave_dist_and_slope(i, u_sweep, final_uv, aspect, search_rad);
+        // --- 1. Active Electron Beam Sweep (Prompt Fluorescence, Evaluated First for Nodal Reference) ---
+        let live_idx = hist_count - 1u;
+        let live_info = get_wave_dist_and_slope(live_idx, u_sweep, final_uv, aspect, 6i, step_live);
+        let live_dist = live_info.x;
+        let live_slope = live_info.y;
+        let live_y = live_info.z;
+
+        // Balanced analog electrostatic beam dwell: preserves continuous luminous standing-wave
+        // slopes through zero-crossing nodes while intensifying antinode crests and turning points.
+        let live_dwell = inverseSqrt(1.0 + live_slope * live_slope * 0.16);
+        let live_turn_boost = smoothstep_r(0.75, 0.0, live_slope) * 0.38;
+        let live_radius = spot_base * (0.78 + 0.54 * live_dwell);
+        let live_core = smoothstep_r(live_radius, 0.0, live_dist)
+                      * (0.42 + 1.32 * live_dwell + live_turn_boost);
+
+        let corona_sigma = spot_base * (1.85 + 1.35 * live_dwell);
+        let live_corona = exp(-(live_dist * live_dist) / (2.0 * corona_sigma * corona_sigma))
+                        * (0.28 + 0.72 * live_dwell) * 0.42;
+
+        let core_temp = clamp(live_dwell * 1.12, 0.0, 1.0);
+        let live_core_col = mix(amber_hot, amber_incandescent, core_temp * core_temp);
+
+        accum_phosphor += live_core_col * live_core + amber_hot * live_corona;
+        beam_light += live_core + live_corona * 1.5;
+
+        // --- 2. Long-Persistence Phosphorescence Afterglow & Standing-Wave Nodal Convergence ---
+        var prev_y = live_y;
+        for (var i = start_frame; i + 1u < hist_count; i = i + 1u) {
+            let search_steps = select(2i, 4i, i + 3u >= hist_count);
+            let wave_info = get_wave_dist_and_slope(i, u_sweep, final_uv, aspect, search_steps, step_hist);
             let true_dist = wave_info.x;
             let slope = wave_info.y;
             let curr_y = wave_info.z;
 
             let frames_old = max(0.0, f32(hist_count - 1u - i) + audio.step_fraction - 0.25);
+            let dwell = inverseSqrt(1.0 + slope * slope * 0.16);
 
-            // True analog electrostatic beam dwell: I = 1 / sqrt(1 + k * (dy/dx)^2)
-            // Horizontal crests/plateaus burn bright & slightly wider; fast vertical edges thin out
-            let dwell = inverseSqrt(1.0 + slope * slope * 0.95);
-            let turning_point_boost = smoothstep_r(0.65, 0.0, slope) * 0.40;
+            // Measure stationary standing-wave nodal convergence against the live trace:
+            // Stationary nodes & phase-locked harmonic cycles stay tightly focused and hot,
+            // while divergent inter-frame amplitude modulation forms a clean translucent envelope.
+            let node_convergence = exp(-abs(curr_y - live_y) * 42.0);
 
-            if i == hist_count - 1u {
-                // --- 1. Active Electron Beam Sweep (Prompt Fluorescence) ---
-                let live_radius = spot_base * (0.72 + 0.60 * dwell);
-                let core = smoothstep_r(live_radius, 0.0, true_dist) * (0.16 + 1.55 * dwell + turning_point_boost);
+            let prompt_decay = exp(-frames_old * 0.62);
+            let slow_decay = exp(-frames_old * 0.16);
 
-                // Tight phosphor scatter corona around the live beam (kept inside exact 2D search window)
-                let corona_sigma = spot_base * (1.8 + 1.4 * dwell);
-                let corona = exp(-(true_dist * true_dist) / (2.0 * corona_sigma * corona_sigma))
-                           * (0.20 + 0.80 * dwell) * 0.42;
+            let spread_scale = mix(1.0, 0.58, node_convergence);
+            let hist_radius = min(spot_base * (1.05 + frames_old * 0.12 * spread_scale), 0.0048);
+            let gaussian_trace = exp(-(true_dist * true_dist) / (2.0 * hist_radius * hist_radius))
+                               * (prompt_decay * 0.34 + slow_decay * 0.15)
+                               * mix(0.68, 1.28, node_convergence);
 
-                // High-dwell crests heat the phosphor to incandescent cream-gold; fast slews stay warm amber
-                let core_temp = clamp(dwell * 1.15, 0.0, 1.0);
-                let live_core_col = mix(amber_hot, amber_incandescent, core_temp * core_temp);
+            // Gentle inter-frame envelope bridge only on slow-moving horizontal antinode crests
+            let y_min = min(curr_y, prev_y);
+            let y_max = max(curr_y, prev_y);
+            let dy_span = max(0.0, max(y_min - final_uv.y, final_uv.y - y_max));
+            let bridge_mask = exp(-(dy_span * dy_span) / (2.0 * hist_radius * hist_radius))
+                            * exp(-(true_dist * true_dist) / (2.0 * 0.0045 * 0.0045));
+            let sweep_bridge = bridge_mask * (dwell * dwell * dwell) * slow_decay * 0.10;
 
-                accum_phosphor += live_core_col * core + amber_hot * corona;
-                beam_light += core + corona * 1.5;
-            } else {
-                // --- 2. Long-Persistence Phosphorescence Afterglow (P19 / P39 Decay) ---
-                // Bi-exponential phosphor decay:
-                // - Fast prompt decay over first ~3 frames
-                // - Slow, diffuse deep-amber phosphorescence tail over ~24 frames
-                let prompt_decay = exp(-frames_old * 0.65);
-                let slow_decay = exp(-frames_old * 0.16);
+            let persistence_dwell = 0.32 + 0.68 * dwell;
+            let trail_energy = gaussian_trace * persistence_dwell + sweep_bridge;
 
-                // Isotropic 2D Gaussian spot diffusion stays strictly inside the 2D segment search
-                // radius so it never clips into vertical columns
-                let hist_radius = min(spot_base * (1.15 + frames_old * 0.16), 0.0055);
-                let gaussian_trace = exp(-(true_dist * true_dist) / (2.0 * hist_radius * hist_radius))
-                                   * (prompt_decay * 0.36 + slow_decay * 0.16);
+            let cool_t = clamp((frames_old / 8.5) * mix(1.0, 0.65, node_convergence), 0.0, 1.0);
+            let trail_col = mix(amber_hot, mix(amber_mid, amber_afterglow, cool_t), cool_t);
 
-                // Gentle inter-frame bridge only on slow-moving horizontal segments (dwell^3 suppresses vertical edges)
-                var sweep_bridge = 0.0;
-                if has_prev {
-                    let y_min = min(curr_y, prev_y);
-                    let y_max = max(curr_y, prev_y);
-                    let dy_span = max(0.0, max(y_min - final_uv.y, final_uv.y - y_max));
-                    let bridge_mask = exp(-(dy_span * dy_span) / (2.0 * hist_radius * hist_radius))
-                                    * exp(-(true_dist * true_dist) / (2.0 * 0.005 * 0.005));
-                    sweep_bridge = bridge_mask * (dwell * dwell * dwell) * slow_decay * 0.12;
-                }
-
-                let persistence_dwell = 0.18 + 0.82 * dwell;
-                let trail_energy = gaussian_trace * persistence_dwell + sweep_bridge;
-
-                let cool_t = clamp(frames_old / 8.0, 0.0, 1.0);
-                let trail_col = mix(amber_hot, mix(amber_mid, amber_afterglow, cool_t), cool_t);
-
-                accum_phosphor += trail_col * trail_energy;
-                beam_light += trail_energy;
-            }
-
+            accum_phosphor += trail_col * trail_energy;
+            beam_light += trail_energy;
             prev_y = curr_y;
-            has_prev = true;
         }
 
         // True 2D radial internal glass faceplate halation from the active sweep
-        let glass_halo = eval_glass_halation(hist_count - 1u, u_sweep, final_uv, aspect);
+        let glass_halo = eval_glass_halation(live_idx, u_sweep, final_uv, aspect);
         accum_phosphor += amber_mid * glass_halo * 0.095;
         beam_light += glass_halo * 0.35;
     }

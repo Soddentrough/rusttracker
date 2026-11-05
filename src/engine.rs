@@ -13027,12 +13027,30 @@ mod tests {
             );
         }
 
+        let crt_scope_resolved =
+            resolve_shader_includes(include_str!("shaders/vis_oscilloscope.wgsl"));
+        if let Err(e) = wgpu::naga::front::wgsl::parse_str(&crt_scope_resolved) {
+            panic!(
+                "vis_oscilloscope WGSL error:\n{}",
+                e.emit_to_string(&crt_scope_resolved)
+            );
+        }
+
         let scope_resolved =
             resolve_shader_includes(include_str!("shaders/vis_3doscilloscope_raster.wgsl"));
         if let Err(e) = wgpu::naga::front::wgsl::parse_str(&scope_resolved) {
             panic!(
                 "vis_3doscilloscope_raster WGSL error:\n{}",
                 e.emit_to_string(&scope_resolved)
+            );
+        }
+
+        let resynth_resolved =
+            resolve_shader_includes(include_str!("shaders/resynth_compute.wgsl"));
+        if let Err(e) = wgpu::naga::front::wgsl::parse_str(&resynth_resolved) {
+            panic!(
+                "resynth_compute WGSL error:\n{}",
+                e.emit_to_string(&resynth_resolved)
             );
         }
 
