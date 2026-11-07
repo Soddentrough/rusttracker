@@ -4634,10 +4634,7 @@ fn adjust_tui_volume(state: &mut AppState, delta: f32) {
     state.osd_timer = 2.0;
 }
 
-pub(crate) fn handle_tui_key_event(
-    state: &mut AppState,
-    key: crossterm::event::KeyEvent,
-) -> bool {
+pub(crate) fn handle_tui_key_event(state: &mut AppState, key: crossterm::event::KeyEvent) -> bool {
     use crossterm::event::{KeyEventKind, KeyModifiers};
 
     if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
@@ -4868,8 +4865,7 @@ pub(crate) fn handle_tui_key_event(
                             .unwrap_or(1.0);
                         state.audio_track_request = Some(track_idx);
                         state.audio_mix_request = Some(vec![(track_idx, vol)]);
-                        state.osd_text =
-                            Some(format!("Audio Track {}/{}", track_num, num_tracks));
+                        state.osd_text = Some(format!("Audio Track {}/{}", track_num, num_tracks));
                         state.osd_timer = 2.0;
                     }
                 } else if track_num == num_tracks + 1 {
@@ -5898,10 +5894,7 @@ mod tests {
             state.effective_tui_center_view(),
             crate::state::TuiCenterView::SurroundEq
         );
-        let _ = handle_tui_key_event(
-            &mut state,
-            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
-        );
+        let _ = handle_tui_key_event(&mut state, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
         assert_eq!(
             state.effective_tui_center_view(),
             crate::state::TuiCenterView::Heatmap

@@ -130,9 +130,7 @@ fn surround_speaker_labels(num_channels: usize) -> Option<&'static [&'static str
         4 => Some(&["Ls", "L", "R", "Rs"]),
         6 => Some(&["Ls", "L", "C", "LFE", "R", "Rs"]),
         8 => Some(&["Lrs", "Ls", "L", "C", "LFE", "R", "Rs", "Rrs"]),
-        10 => Some(&[
-            "Ltf", "Lrs", "Ls", "L", "C", "LFE", "R", "Rs", "Rrs", "Rtf",
-        ]),
+        10 => Some(&["Ltf", "Lrs", "Ls", "L", "C", "LFE", "R", "Rs", "Rrs", "Rtf"]),
         12 => Some(&[
             "Ltr", "Ltf", "Ls", "L", "C", "LFE", "R", "Rs", "Rtf", "Rtr", "Lrs", "Rrs",
         ]),
@@ -177,7 +175,12 @@ fn align_text_to_bar(text: &str, slot_w: usize, bar_left: usize, bar_w: usize) -
     let ideal_left = bar_center_x2.saturating_sub(text_w) / 2;
     let left_pad = ideal_left.min(slot_w - text_w);
     let right_pad = slot_w - text_w - left_pad;
-    format!("{}{}{}", " ".repeat(left_pad), clipped, " ".repeat(right_pad))
+    format!(
+        "{}{}{}",
+        " ".repeat(left_pad),
+        clipped,
+        " ".repeat(right_pad)
+    )
 }
 
 pub fn build_track_info_lines(state: &AppState, inner_width: usize) -> Vec<Line<'static>> {
@@ -366,10 +369,7 @@ pub fn build_track_info_lines(state: &AppState, inner_width: usize) -> Vec<Line<
     } else {
         state.num_channels.to_string()
     };
-    lines.push(Line::from(vec![
-        Span::raw("Chans:  "),
-        Span::raw(chan_str),
-    ]));
+    lines.push(Line::from(vec![Span::raw("Chans:  "), Span::raw(chan_str)]));
 
     // 8. Sample Rate
     lines.push(Line::from(vec![
@@ -584,7 +584,8 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         }
     } else {
         // Reserve a 5-column dBFS ruler on the left when there is room for wide channel slots
-        let show_db_scale = vu_width >= num_ch.saturating_mul(3).saturating_add(5) && vu_height >= 5;
+        let show_db_scale =
+            vu_width >= num_ch.saturating_mul(3).saturating_add(5) && vu_height >= 5;
         let scale_w = if show_db_scale { 5 } else { 0 };
         let plot_w = vu_width.saturating_sub(scale_w).max(1);
         let num_cols = num_ch.min(plot_w.max(1));
@@ -615,7 +616,9 @@ pub fn draw(f: &mut Frame, state: &AppState) {
                 2 => 1,
                 3 => 2,
                 4 => 3,
-                _ => ((slot_w * 2) / 3).clamp(3, slot_w.saturating_sub(2)).min(12),
+                _ => ((slot_w * 2) / 3)
+                    .clamp(3, slot_w.saturating_sub(2))
+                    .min(12),
             };
             let left_pad = (slot_w - bar_w) / 2;
             let right_pad = slot_w - bar_w - left_pad;
@@ -651,7 +654,10 @@ pub fn draw(f: &mut Frame, state: &AppState) {
             }
             for c in &cols {
                 let (txt, style) = if c.peak <= 0.01 {
-                    (" -∞ ".to_string(), Style::default().fg(Color::Rgb(75, 75, 82)))
+                    (
+                        " -∞ ".to_string(),
+                        Style::default().fg(Color::Rgb(75, 75, 82)),
+                    )
                 } else {
                     let db = (c.peak.clamp(0.0, 1.0) * 60.0 - 60.0).min(0.0);
                     let formatted = if c.slot_w >= 6 && db > -10.0 {
@@ -715,7 +721,10 @@ pub fn draw(f: &mut Frame, state: &AppState) {
                         "█".repeat(c.bar_w),
                         Style::default().fg(val_to_color(c.vu * 100.0)),
                     )
-                } else if c.vu > threshold && c.vu > 0.01 && (c.peak <= next_threshold || c.peak <= 0.01) {
+                } else if c.vu > threshold
+                    && c.vu > 0.01
+                    && (c.peak <= next_threshold || c.peak <= 0.01)
+                {
                     let frac = ((c.vu - threshold) / (next_threshold - threshold).max(1e-5))
                         .clamp(0.0, 1.0);
                     let idx = ((frac * 8.0).round() as usize).clamp(1, 8) - 1;
@@ -817,11 +826,8 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         "Channels".to_string()
     };
 
-    let vu_paragraph = Paragraph::new(vu_lines).block(
-        Block::default()
-            .title(channels_title)
-            .borders(Borders::ALL),
-    );
+    let vu_paragraph = Paragraph::new(vu_lines)
+        .block(Block::default().title(channels_title).borders(Borders::ALL));
     f.render_widget(vu_paragraph, layout.channels_rect);
 
     // 2. Top-Center Panel: Lyrics / Tracker Pattern / Heatmap History / Surround EQ
@@ -1024,7 +1030,8 @@ pub fn draw(f: &mut Frame, state: &AppState) {
             }
             TuiCenterView::SurroundEq => {
                 let cfg = &state.surround_upmix;
-                let upmix_active = cfg.is_active_for(state.source_channels, state.hardware_channels);
+                let upmix_active =
+                    cfg.is_active_for(state.source_channels, state.hardware_channels);
                 let badge = SurroundUpmixConfig::layout_badge(state.hardware_channels);
                 let mut eq_lines = Vec::with_capacity(center_height);
 
@@ -1226,8 +1233,8 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         "Track Info".to_string()
     };
 
-    let meta_paragraph = Paragraph::new(meta_lines)
-        .block(Block::default().title(title_text).borders(Borders::ALL));
+    let meta_paragraph =
+        Paragraph::new(meta_lines).block(Block::default().title(title_text).borders(Borders::ALL));
     f.render_widget(meta_paragraph, layout.info_rect);
 
     // 4. Spectrum Analyzer
@@ -1421,9 +1428,10 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         f.render_widget(Clear, modal_area);
 
         let items: Vec<ListItem> = if state.available_audio_devices.is_empty() {
-            vec![ListItem::new("  (No audio devices detected)").style(
-                Style::default().fg(Color::DarkGray),
-            )]
+            vec![
+                ListItem::new("  (No audio devices detected)")
+                    .style(Style::default().fg(Color::DarkGray)),
+            ]
         } else {
             state
                 .available_audio_devices
@@ -1457,11 +1465,8 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         } else {
             "Select Audio Output Device"
         };
-        let list = List::new(items).block(
-            Block::default()
-                .title(modal_title)
-                .borders(Borders::ALL),
-        );
+        let list =
+            List::new(items).block(Block::default().title(modal_title).borders(Borders::ALL));
 
         let mut list_state = ListState::default();
         if !state.available_audio_devices.is_empty() {
@@ -1525,7 +1530,10 @@ mod tests {
         let screen = buffer_to_string(&terminal);
         assert!(screen.contains("Tracker Pattern (Ord 02/12"));
         assert!(screen.contains("D-4 02 64 F06"));
-        assert!(screen.contains("▄"), "0 dBFS full-scale peak cap must render");
+        assert!(
+            screen.contains("▄"),
+            "0 dBFS full-scale peak cap must render"
+        );
 
         // 2. Cycle to Heatmap History
         assert_eq!(state.cycle_tui_center_view(), TuiCenterView::Heatmap);
