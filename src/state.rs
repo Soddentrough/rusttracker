@@ -56,6 +56,25 @@ impl MobileHudTab {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TuiCenterView {
+    Heatmap,
+    Tracker,
+    Lyrics,
+    SurroundEq,
+}
+
+impl TuiCenterView {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Heatmap => "Spectrogram Heatmap",
+            Self::Tracker => "Tracker Pattern",
+            Self::Lyrics => "Synchronized Lyrics",
+            Self::SurroundEq => "Surround Upmix EQ",
+        }
+    }
+}
+
 #[derive(Clone, Default, Debug)]
 pub struct PerformanceStats {
     pub decode_us: f32,
@@ -969,6 +988,8 @@ pub struct AppState {
     pub passthrough_change_request: Option<bool>,
     pub show_tui_device_picker: bool,
     pub tui_device_picker_cursor: usize,
+    pub tui_center_view: Option<TuiCenterView>,
+    pub tui_uptime_seconds: f32,
     pub lyrics: Option<std::sync::Arc<crate::lyrics::Lyrics>>,
     pub hovered_file: Option<String>,
     pub drag_cursor_pos: Option<[f32; 2]>,
@@ -1182,6 +1203,8 @@ impl AppState {
             passthrough_change_request: None,
             show_tui_device_picker: false,
             tui_device_picker_cursor: 0,
+            tui_center_view: None,
+            tui_uptime_seconds: 0.0,
             lyrics: None,
             hovered_file: None,
             drag_cursor_pos: None,
@@ -1336,6 +1359,8 @@ impl AppState {
             passthrough_change_request: self.passthrough_change_request,
             show_tui_device_picker: self.show_tui_device_picker,
             tui_device_picker_cursor: self.tui_device_picker_cursor,
+            tui_center_view: self.tui_center_view,
+            tui_uptime_seconds: self.tui_uptime_seconds,
             lyrics: self.lyrics.clone(),
             hovered_file: self.hovered_file.clone(),
             drag_cursor_pos: self.drag_cursor_pos,
@@ -1622,6 +1647,9 @@ impl AppState {
             }
             self.osd_text = Some("🔊 Surround Upmix: OFF".to_string());
             self.show_surround_eq = false;
+            if self.tui_center_view == Some(TuiCenterView::SurroundEq) {
+                self.tui_center_view = None;
+            }
         }
         self.osd_timer = 2.5;
     }
@@ -1636,11 +1664,65 @@ impl AppState {
     /// or the Piano Roll / Pattern Heatmap (`false`).
     pub fn set_show_surround_eq(&mut self, show_eq: bool) {
         self.show_surround_eq = show_eq;
+        if show_eq {
+            self.tui_center_view = Some(TuiCenterView::SurroundEq);
+        } else if self.tui_center_view == Some(TuiCenterView::SurroundEq) {
+            self.tui_center_view = None;
+        }
     }
 
     /// Flips the middle HUD panel between the Piano Roll / Pattern Heatmap and the Surround Upmix EQ.
     pub fn toggle_show_surround_eq(&mut self) {
-        self.show_surround_eq = !self.show_surround_eq;
+        let next = !self.show_surround_eq;
+        self.set_show_surround_eq(next);
+    }
+
+    /// Resolves the active TUI top-center panel view, automatically choosing
+    /// `Lyrics` -> `Tracker` -> `Heatmap` when not manually overridden.
+    pub fn effective_tui_center_view(&self) -> TuiCenterView {
+        if self.show_surround_eq {
+            return TuiCenterView::SurroundEq;
+        }
+        if let Some(view) = self.tui_center_view {
+            match view {
+                TuiCenterView::Lyrics if self.lyrics.is_none() => {}
+                TuiCenterView::Tracker if self.tracker_patterns_by_order.is_empty() => {}
+                _ => return view,
+            }
+        }
+        if self.lyrics.is_some() {
+            TuiCenterView::Lyrics
+        } else if !self.tracker_patterns_by_order.is_empty() {
+            TuiCenterView::Tracker
+        } else {
+            TuiCenterView::Heatmap
+        }
+    }
+
+    /// Cycles the TUI top-center panel through available views (`Lyrics`, `Tracker`, `Heatmap`, `SurroundEq`).
+    pub fn cycle_tui_center_view(&mut self) -> TuiCenterView {
+        let mut available = Vec::with_capacity(4);
+        if self.lyrics.is_some() {
+            available.push(TuiCenterView::Lyrics);
+        }
+        if !self.tracker_patterns_by_order.is_empty() {
+            available.push(TuiCenterView::Tracker);
+        }
+        available.push(TuiCenterView::Heatmap);
+        available.push(TuiCenterView::SurroundEq);
+
+        let current = self.effective_tui_center_view();
+        let next_idx = available
+            .iter()
+            .position(|&v| v == current)
+            .map(|i| (i + 1) % available.len())
+            .unwrap_or(0);
+        let next = available[next_idx];
+        self.tui_center_view = Some(next);
+        self.show_surround_eq = next == TuiCenterView::SurroundEq;
+        self.osd_text = Some(format!("View: {}", next.label()));
+        self.osd_timer = 2.0;
+        next
     }
 
     /// Updates the OSD for a relative seek jump (`delta` in seconds).

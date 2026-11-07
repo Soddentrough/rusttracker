@@ -4606,6 +4606,424 @@ async fn run_gui(
     Ok(())
 }
 
+fn adjust_tui_volume(state: &mut AppState, delta: f32) {
+    let sel = state.selected_audio_track;
+    if state.active_audio_tracks.is_empty() {
+        state.active_audio_tracks.push(sel);
+    }
+    let num_tracks = state.audio_tracks.len().max(sel + 1);
+    if state.audio_track_volumes.len() != num_tracks {
+        state.audio_track_volumes = vec![1.0; num_tracks];
+    }
+    for vol in &mut state.audio_track_volumes {
+        *vol = (*vol + delta).clamp(0.0, 1.0);
+    }
+    let current_vol = state.audio_track_volumes.first().copied().unwrap_or(1.0);
+    let mix: Vec<(usize, f32)> = state
+        .active_audio_tracks
+        .iter()
+        .map(|&idx| {
+            (
+                idx,
+                state.audio_track_volumes.get(idx).copied().unwrap_or(1.0),
+            )
+        })
+        .collect();
+    state.audio_mix_request = Some(mix);
+    state.osd_text = Some(format!("Volume: {}%", (current_vol * 100.0).round() as u32));
+    state.osd_timer = 2.0;
+}
+
+pub(crate) fn handle_tui_key_event(
+    state: &mut AppState,
+    key: crossterm::event::KeyEvent,
+) -> bool {
+    use crossterm::event::{KeyEventKind, KeyModifiers};
+
+    if key.kind != KeyEventKind::Press && key.kind != KeyEventKind::Repeat {
+        return false;
+    }
+
+    if key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(
+            key.code,
+            KeyCode::Char('c') | KeyCode::Char('C') | KeyCode::Char('q') | KeyCode::Char('Q')
+        )
+    {
+        return true;
+    }
+
+    if state.show_tui_device_picker {
+        match key.code {
+            KeyCode::Esc
+            | KeyCode::Char('d')
+            | KeyCode::Char('D')
+            | KeyCode::Char('q')
+            | KeyCode::Char('Q') => {
+                state.show_tui_device_picker = false;
+            }
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Char('K') => {
+                let count = state.available_audio_devices.len();
+                if count > 0 {
+                    if state.tui_device_picker_cursor == 0 {
+                        state.tui_device_picker_cursor = count - 1;
+                    } else {
+                        state.tui_device_picker_cursor -= 1;
+                    }
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Char('J') => {
+                let count = state.available_audio_devices.len();
+                if count > 0 {
+                    state.tui_device_picker_cursor = (state.tui_device_picker_cursor + 1) % count;
+                }
+            }
+            KeyCode::Enter => {
+                let cursor = state.tui_device_picker_cursor;
+                if cursor < state.available_audio_devices.len() {
+                    let dev = state.available_audio_devices[cursor].clone();
+                    state.audio_device_change_request = Some(dev);
+                }
+                state.show_tui_device_picker = false;
+            }
+            _ => {}
+        }
+        return false;
+    }
+
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
+            return true;
+        }
+        KeyCode::Char('d') | KeyCode::Char('D') => {
+            let refreshed = crate::audio::get_available_audio_devices(state.is_mic_input);
+            if !refreshed.is_empty() {
+                state.available_audio_devices = refreshed;
+            }
+            state.show_tui_device_picker = true;
+            state.tui_device_picker_cursor = 0;
+            if let Some(ref current) = state.selected_audio_device
+                && let Some(idx) = state
+                    .available_audio_devices
+                    .iter()
+                    .position(|d| d == current)
+            {
+                state.tui_device_picker_cursor = idx;
+            }
+        }
+        KeyCode::Char('v') | KeyCode::Char('V') | KeyCode::Tab => {
+            state.cycle_tui_center_view();
+        }
+        KeyCode::Char('u') | KeyCode::Char('U') | KeyCode::Char('e') | KeyCode::Char('E') => {
+            state.toggle_surround_upmix();
+        }
+        KeyCode::Char('m') | KeyCode::Char('M') => {
+            if state.effective_tui_center_view() == crate::state::TuiCenterView::SurroundEq {
+                state.toggle_mpegh_bitstream();
+            } else {
+                let sel = state.selected_audio_track;
+                if state.active_audio_tracks.is_empty() {
+                    state.active_audio_tracks.push(sel);
+                }
+                let num_tracks = state.audio_tracks.len().max(sel + 1);
+                if state.audio_track_volumes.len() != num_tracks {
+                    state.audio_track_volumes = vec![1.0; num_tracks];
+                }
+                let is_currently_zero = state.audio_track_volumes.iter().all(|&v| v == 0.0);
+                let new_vol = if is_currently_zero { 1.0 } else { 0.0 };
+                state.audio_track_volumes.fill(new_vol);
+                let mix: Vec<(usize, f32)> = state
+                    .active_audio_tracks
+                    .iter()
+                    .map(|&idx| (idx, new_vol))
+                    .collect();
+                state.audio_mix_request = Some(mix);
+                state.osd_text = Some(if new_vol == 0.0 {
+                    "Muted".to_string()
+                } else {
+                    "Unmuted".to_string()
+                });
+                state.osd_timer = 2.0;
+            }
+        }
+        KeyCode::Char('r') | KeyCode::Char('R') => {
+            if state.effective_tui_center_view() == crate::state::TuiCenterView::SurroundEq {
+                state.surround_upmix.reset_tuning();
+                state.osd_text = Some("Surround EQ Reset to Defaults".to_string());
+                state.osd_timer = 2.0;
+            }
+        }
+        KeyCode::Char('b') | KeyCode::Char('B') => {
+            state.passthrough_enabled = !state.passthrough_enabled;
+            state.passthrough_change_request = Some(state.passthrough_enabled);
+        }
+        KeyCode::Char('[') => {
+            state.panel_split_ratio = (state.panel_split_ratio - 0.05)
+                .clamp(MIN_PANEL_SPLIT_RATIO, MAX_PANEL_SPLIT_RATIO);
+        }
+        KeyCode::Char(']') => {
+            state.panel_split_ratio = (state.panel_split_ratio + 0.05)
+                .clamp(MIN_PANEL_SPLIT_RATIO, MAX_PANEL_SPLIT_RATIO);
+        }
+        KeyCode::Char('+') | KeyCode::Char('=') => {
+            adjust_tui_volume(state, 0.05);
+        }
+        KeyCode::Char('-') | KeyCode::Char('_') => {
+            adjust_tui_volume(state, -0.05);
+        }
+        KeyCode::Char('n') | KeyCode::Char('N') => {
+            if !state.playlist.is_empty() && state.playlist_index + 1 < state.playlist.len() {
+                state.playlist_index += 1;
+                state.load_request = Some(state.playlist[state.playlist_index].clone());
+                state.is_paused = false;
+                state.osd_text = Some("Next Track".to_string());
+                state.osd_timer = 2.0;
+            }
+        }
+        KeyCode::Char('p') | KeyCode::Char('P') => {
+            if !state.playlist.is_empty() && state.playlist_index > 0 {
+                state.playlist_index -= 1;
+                state.load_request = Some(state.playlist[state.playlist_index].clone());
+                state.is_paused = false;
+                state.osd_text = Some("Previous Track".to_string());
+                state.osd_timer = 2.0;
+            }
+        }
+        KeyCode::Char(' ') => {
+            if state.track_ended
+                || (state.current_seconds >= state.duration_seconds - 0.1
+                    && state.duration_seconds > 0.0)
+            {
+                state.track_ended = false;
+                state.seek_request = Some(0.0);
+                for row in &mut state.spectrum_history {
+                    row.fill(0.0);
+                }
+                state.is_paused = false;
+                state.osd_text = Some("Playing".to_string());
+                state.osd_timer = 2.0;
+            } else if state.playlist_index >= state.playlist.len() && !state.playlist.is_empty() {
+                if state.duration_seconds == 0.0 {
+                    state.playlist_index = state.playlist.len() - 1;
+                } else {
+                    state.playlist_index = 0;
+                }
+                state.load_request = Some(state.playlist[state.playlist_index].clone());
+                state.is_paused = false;
+                state.osd_text = Some("Playing".to_string());
+                state.osd_timer = 2.0;
+            } else {
+                state.is_paused = !state.is_paused;
+                state.osd_text = Some(if state.is_paused {
+                    "Paused".to_string()
+                } else {
+                    "Playing".to_string()
+                });
+                state.osd_timer = 2.0;
+            }
+        }
+        KeyCode::Right | KeyCode::Left => {
+            if state.duration_seconds > 0.0 {
+                let duration = state.duration_seconds;
+                let step = if key.modifiers.contains(KeyModifiers::CONTROL) {
+                    60.0f64.min(duration).max(5.0)
+                } else if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    30.0f64.min(duration).max(1.0)
+                } else {
+                    5.0f64.min(duration).max(0.5)
+                };
+                let delta = if key.code == KeyCode::Right {
+                    step
+                } else {
+                    -step
+                };
+                let target = (state.current_seconds + delta).clamp(0.0, duration);
+                state.seek_request = Some(target);
+                state.current_seconds = target;
+                state.track_ended = false;
+                for row in &mut state.spectrum_history {
+                    row.fill(0.0);
+                }
+                state.record_seek_osd(delta);
+            }
+        }
+        KeyCode::Char(c @ '1'..='9') => {
+            let track_num = (c as u8 - b'0') as usize;
+            let num_tracks = state.audio_tracks.len();
+            if num_tracks > 1 {
+                if track_num <= num_tracks {
+                    let track_idx = track_num - 1;
+                    if state.active_audio_tracks != vec![track_idx]
+                        || state.selected_audio_track != track_idx
+                    {
+                        state.selected_audio_track = track_idx;
+                        state.active_audio_tracks = vec![track_idx];
+                        if state.audio_track_volumes.len() != num_tracks {
+                            state.audio_track_volumes = vec![1.0; num_tracks];
+                        }
+                        let vol = state
+                            .audio_track_volumes
+                            .get(track_idx)
+                            .copied()
+                            .unwrap_or(1.0);
+                        state.audio_track_request = Some(track_idx);
+                        state.audio_mix_request = Some(vec![(track_idx, vol)]);
+                        state.osd_text =
+                            Some(format!("Audio Track {}/{}", track_num, num_tracks));
+                        state.osd_timer = 2.0;
+                    }
+                } else if track_num == num_tracks + 1 {
+                    if state.audio_track_volumes.len() != num_tracks {
+                        state.audio_track_volumes = vec![1.0; num_tracks];
+                    }
+                    let mix: Vec<(usize, f32)> = (0..num_tracks)
+                        .map(|idx| {
+                            (
+                                idx,
+                                state.audio_track_volumes.get(idx).copied().unwrap_or(1.0),
+                            )
+                        })
+                        .collect();
+                    state.active_audio_tracks = (0..num_tracks).collect();
+                    state.audio_mix_request = Some(mix);
+                    state.osd_text = Some(format!("Multi-Track Mix (1-{})", num_tracks));
+                    state.osd_timer = 2.0;
+                }
+            }
+        }
+        _ => {}
+    }
+
+    false
+}
+
+pub(crate) fn handle_tui_mouse_event(
+    state: &mut AppState,
+    mouse: crossterm::event::MouseEvent,
+    term_area: ratatui::layout::Rect,
+) {
+    use crossterm::event::{MouseButton, MouseEventKind};
+
+    let meta_len = crate::ui::build_track_info_lines(state, 30).len();
+    let layout = crate::ui::compute_tui_layout(term_area, state, meta_len);
+    let col = mouse.column;
+    let row = mouse.row;
+    let contains = |r: ratatui::layout::Rect, x: u16, y: u16| -> bool {
+        x >= r.x && x < r.right() && y >= r.y && y < r.bottom()
+    };
+
+    if let Some(modal) = layout.device_picker_rect {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                let count = state.available_audio_devices.len();
+                if count > 0 {
+                    if state.tui_device_picker_cursor == 0 {
+                        state.tui_device_picker_cursor = count - 1;
+                    } else {
+                        state.tui_device_picker_cursor -= 1;
+                    }
+                }
+            }
+            MouseEventKind::ScrollDown => {
+                let count = state.available_audio_devices.len();
+                if count > 0 {
+                    state.tui_device_picker_cursor = (state.tui_device_picker_cursor + 1) % count;
+                }
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                if contains(modal, col, row) {
+                    let inner_h = modal.height.saturating_sub(2) as usize;
+                    let count = state.available_audio_devices.len();
+                    if row > modal.y && row + 1 < modal.bottom() && count > 0 && inner_h > 0 {
+                        let cursor = state.tui_device_picker_cursor.min(count - 1);
+                        let scroll_offset = if cursor >= inner_h {
+                            cursor + 1 - inner_h
+                        } else {
+                            0
+                        };
+                        let clicked_idx = scroll_offset + (row - modal.y - 1) as usize;
+                        if clicked_idx < count {
+                            state.tui_device_picker_cursor = clicked_idx;
+                            let dev = state.available_audio_devices[clicked_idx].clone();
+                            state.audio_device_change_request = Some(dev);
+                            state.show_tui_device_picker = false;
+                        }
+                    }
+                } else {
+                    state.show_tui_device_picker = false;
+                }
+            }
+            _ => {}
+        }
+        return;
+    }
+
+    match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) => {
+            if row == layout.timeline_rect.y
+                && col >= layout.timeline_rect.x
+                && col < layout.timeline_rect.right()
+                && state.duration_seconds > 0.0
+            {
+                let frac = ((col - layout.timeline_rect.x) as f64
+                    / (layout.timeline_rect.width.max(1) as f64))
+                    .clamp(0.0, 1.0);
+                let target = frac * state.duration_seconds;
+                state.seek_request = Some(target);
+                state.current_seconds = target;
+                state.track_ended = false;
+                for r in &mut state.spectrum_history {
+                    r.fill(0.0);
+                }
+                let force_h = state.duration_seconds >= 3600.0;
+                state.osd_text = Some(format!(
+                    "Seek: {}",
+                    crate::state::format_timeline_time(target, force_h)
+                ));
+                state.osd_timer = 1.5;
+            } else if contains(layout.center_rect, col, row) {
+                state.cycle_tui_center_view();
+            }
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if row == layout.timeline_rect.y
+                && col >= layout.timeline_rect.x
+                && col < layout.timeline_rect.right()
+                && state.duration_seconds > 0.0
+            {
+                let frac = ((col - layout.timeline_rect.x) as f64
+                    / (layout.timeline_rect.width.max(1) as f64))
+                    .clamp(0.0, 1.0);
+                let target = frac * state.duration_seconds;
+                state.seek_request = Some(target);
+                state.current_seconds = target;
+                state.track_ended = false;
+                for r in &mut state.spectrum_history {
+                    r.fill(0.0);
+                }
+                let force_h = state.duration_seconds >= 3600.0;
+                state.osd_text = Some(format!(
+                    "Seek: {}",
+                    crate::state::format_timeline_time(target, force_h)
+                ));
+                state.osd_timer = 1.5;
+            } else if row.abs_diff(layout.split_row_y) <= 2 && term_area.height > 12 {
+                let content_h = term_area.height.saturating_sub(4).max(1) as f32;
+                let rel_y = row.saturating_sub(1) as f32;
+                state.panel_split_ratio =
+                    (rel_y / content_h).clamp(MIN_PANEL_SPLIT_RATIO, MAX_PANEL_SPLIT_RATIO);
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            adjust_tui_volume(state, 0.05);
+        }
+        MouseEventKind::ScrollDown => {
+            adjust_tui_volume(state, -0.05);
+        }
+        _ => {}
+    }
+}
+
 fn run_tui<B: Backend>(
     terminal: &mut Terminal<B>,
     app_state: Arc<Mutex<AppState>>,
@@ -4617,6 +5035,7 @@ where
 {
     let tick_rate = Duration::from_millis(16); // ~60fps
     let mut last_tick = Instant::now();
+    let mut last_frame = Instant::now();
     let mut is_first_frame = true;
 
     loop {
@@ -4629,6 +5048,13 @@ where
             let mut state = app_state.lock().unwrap();
             let mut resume_pos_on_reload: Option<f64> = None;
             let active_mic = is_mic_launch || state.is_mic_input;
+
+            // Drain any decoded video frames so the video decoder thread never blocks in TUI mode
+            if let (Some(rx), Some(free_tx)) = (&state.video_frame_rx, &state.free_video_frame_tx) {
+                while let Ok(frame) = rx.try_recv() {
+                    let _ = free_tx.try_send(frame);
+                }
+            }
 
             let resolve_reload_path = |st: &AppState, mic_mode: bool| -> String {
                 if mic_mode {
@@ -4712,13 +5138,13 @@ where
                 }
             }
 
-            if state.track_ended {
-                state.track_ended = false;
-                if state.load_request.is_none() {
+            if state.track_ended && state.load_request.is_none() {
+                if state.playlist_index + 1 < state.playlist.len() {
+                    state.track_ended = false;
                     state.playlist_index += 1;
-                    if state.playlist_index < state.playlist.len() {
-                        state.load_request = Some(state.playlist[state.playlist_index].clone());
-                    }
+                    state.load_request = Some(state.playlist[state.playlist_index].clone());
+                } else {
+                    state.is_paused = true;
                 }
             }
 
@@ -4745,6 +5171,15 @@ where
 
             if !path_exists {
                 let mut state = app_state.lock().unwrap();
+                state.osd_text = Some(format!(
+                    "File Not Found: {}",
+                    std::path::Path::new(&path)
+                        .file_name()
+                        .unwrap_or_default()
+                        .to_string_lossy()
+                ));
+                state.osd_timer = 3.0;
+
                 state.playlist_index += 1;
                 if state.playlist_index < state.playlist.len() {
                     state.load_request = Some(state.playlist[state.playlist_index].clone());
@@ -4766,7 +5201,14 @@ where
                 let _ = active_stream.take(); // DROP OLD STREAM FIRST
                 {
                     let mut state = app_state.lock().unwrap();
+                    state.video_frame_rx = None;
+                    state.free_video_frame_tx = None;
+                    state.has_video_stream = false;
+                    state.video_info = None;
+                    state.video_mode = 0;
                     state.stats.bitstream_active = false;
+                    state.stats.mpegh_bitstream_active = false;
+                    state.stats.mpegh_carrier_info.clear();
                     state.stats.audio_buffer_fill_pct = 0.0;
                     state.stats.video_buffer_fill_pct = 0.0;
                     state.stats.video_hw_decoder.clear();
@@ -4774,6 +5216,9 @@ where
                     state.stats.video_bitrate_kbps = None;
                     state.stats.audio_bitrate_kbps = None;
                     state.track_ended = false;
+                    if !state.show_surround_eq {
+                        state.tui_center_view = None;
+                    }
                 }
 
                 let mut loaded_stream = None;
@@ -4846,10 +5291,19 @@ where
                 }
             }
         }
-        {
-            let tui_dt = last_tick.elapsed().as_secs_f32().clamp(0.001, 0.1);
-            let time_scale = tui_dt * 60.0;
+
+        let term_area = {
+            let now = Instant::now();
+            let tui_dt = now
+                .duration_since(last_frame)
+                .as_secs_f32()
+                .clamp(0.001, 0.1);
+            last_frame = now;
+            let time_scale = (tui_dt * 60.0).clamp(0.15, 3.0);
             let mut state = app_state.lock().unwrap();
+
+            state.tui_uptime_seconds += tui_dt;
+            state.tick_osd_timer(tui_dt);
 
             if state.is_paused || state.track_ended {
                 state.raw_channel_vus.fill(0.0);
@@ -4857,7 +5311,11 @@ where
                 state.gpu_spectrum_data.fill(0.0);
             }
 
-            // Smoothing physics for VUs (Inertia)
+            let dt_sec = tui_dt.clamp(0.002, 0.05);
+            let vu_decay = 10.0_f32.powf(-20.0 * dt_sec / 20.0);
+            let peak_decay = 10.0_f32.powf(-8.6 * dt_sec / 20.0);
+
+            // Smoothing physics for VUs (logarithmic dB inertia matching GUI)
             if state.channel_vus.len() != state.raw_channel_vus.len() {
                 state.channel_vus = vec![0.0; state.raw_channel_vus.len()];
             }
@@ -4865,8 +5323,9 @@ where
                 if state.raw_channel_vus[i] > state.channel_vus[i] {
                     state.channel_vus[i] = state.raw_channel_vus[i];
                 } else {
+                    let decayed = state.channel_vus[i] * vu_decay;
                     state.channel_vus[i] =
-                        (state.channel_vus[i] - 0.015 * time_scale).max(state.raw_channel_vus[i]);
+                        if decayed < 1e-4 { 0.0 } else { decayed }.max(state.raw_channel_vus[i]);
                 }
             }
 
@@ -4875,7 +5334,12 @@ where
                 state.peak_vus = vec![0.0; state.channel_vus.len()];
             }
             for i in 0..state.channel_vus.len() {
-                state.peak_vus[i] = (state.peak_vus[i] - 0.005 * time_scale).max(0.0);
+                let decayed_peak = state.peak_vus[i] * peak_decay;
+                state.peak_vus[i] = if decayed_peak < 1e-4 {
+                    0.0
+                } else {
+                    decayed_peak
+                };
                 if state.channel_vus[i] > state.peak_vus[i] {
                     state.peak_vus[i] = state.channel_vus[i];
                 }
@@ -4905,167 +5369,57 @@ where
                 }
             }
 
-            // Scroll spectrum history
-            state.spectrum_history.pop_front();
-            let cloned_data = state.spectrum_data.clone();
-            state.spectrum_history.push_back(cloned_data);
+            // Scroll spectrum history while active (reuse front allocation to avoid heap churn)
+            if state.file_loaded && !state.is_paused && !state.track_ended {
+                let mut recycled = if state.spectrum_history.len() >= 120 {
+                    state.spectrum_history.pop_front().unwrap_or_default()
+                } else {
+                    Vec::with_capacity(state.spectrum_data.len())
+                };
+                recycled.clear();
+                recycled.extend_from_slice(&state.spectrum_data);
+                state.spectrum_history.push_back(recycled);
+            }
 
-            terminal.draw(|f| ui::draw(f, &state))?;
-        }
+            let completed = terminal.draw(|f| ui::draw(f, &state))?;
+            completed.area
+        };
 
         let timeout = tick_rate
             .checked_sub(last_tick.elapsed())
             .unwrap_or_else(|| Duration::from_secs(0));
 
-        if crossterm::event::poll(timeout)?
-            && let CEvent::Key(key) = event::read()?
-        {
-            let show_picker = { app_state.lock().unwrap().show_tui_device_picker };
-            if show_picker {
-                match key.code {
-                    KeyCode::Esc => {
+        if crossterm::event::poll(timeout)? {
+            loop {
+                match event::read()? {
+                    CEvent::Key(key) => {
                         let mut state = app_state.lock().unwrap();
-                        state.show_tui_device_picker = false;
-                    }
-                    KeyCode::Up => {
-                        let mut state = app_state.lock().unwrap();
-                        let count = state.available_audio_devices.len();
-                        if count > 0 {
-                            if state.tui_device_picker_cursor == 0 {
-                                state.tui_device_picker_cursor = count - 1;
-                            } else {
-                                state.tui_device_picker_cursor -= 1;
-                            }
+                        if handle_tui_key_event(&mut state, key) {
+                            drop(state);
+                            drop(active_stream);
+                            return Ok(());
                         }
                     }
-                    KeyCode::Down => {
+                    CEvent::Mouse(mouse) => {
                         let mut state = app_state.lock().unwrap();
-                        let count = state.available_audio_devices.len();
-                        if count > 0 {
-                            state.tui_device_picker_cursor =
-                                (state.tui_device_picker_cursor + 1) % count;
-                        }
-                    }
-                    KeyCode::Enter => {
-                        let mut state = app_state.lock().unwrap();
-                        let cursor = state.tui_device_picker_cursor;
-                        if cursor < state.available_audio_devices.len() {
-                            let dev = state.available_audio_devices[cursor].clone();
-                            state.audio_device_change_request = Some(dev);
-                        }
-                        state.show_tui_device_picker = false;
+                        handle_tui_mouse_event(&mut state, mouse, term_area);
                     }
                     _ => {}
                 }
-            } else {
-                match key.code {
-                    KeyCode::Char('q') => {
-                        drop(active_stream);
-                        return Ok(());
-                    }
-                    KeyCode::Char('d') => {
-                        let mut state = app_state.lock().unwrap();
-                        state.show_tui_device_picker = true;
-                        state.tui_device_picker_cursor = 0;
-                        if let Some(ref current) = state.selected_audio_device
-                            && let Some(idx) = state
-                                .available_audio_devices
-                                .iter()
-                                .position(|d| d == current)
-                        {
-                            state.tui_device_picker_cursor = idx;
-                        }
-                    }
-                    KeyCode::Char('u') | KeyCode::Char('e') => {
-                        let mut state = app_state.lock().unwrap();
-                        state.toggle_surround_upmix();
-                    }
-                    KeyCode::Char('n') => {
-                        let mut state = app_state.lock().unwrap();
-                        if !state.playlist.is_empty()
-                            && state.playlist_index + 1 < state.playlist.len()
-                        {
-                            state.playlist_index += 1;
-                            state.load_request = Some(state.playlist[state.playlist_index].clone());
-                            state.is_paused = false;
-                        }
-                    }
-                    KeyCode::Char('p') => {
-                        let mut state = app_state.lock().unwrap();
-                        if !state.playlist.is_empty() && state.playlist_index > 0 {
-                            state.playlist_index -= 1;
-                            state.load_request = Some(state.playlist[state.playlist_index].clone());
-                            state.is_paused = false;
-                        }
-                    }
-                    KeyCode::Char(' ') => {
-                        let mut state = app_state.lock().unwrap();
-                        if state.track_ended
-                            || (state.current_seconds >= state.duration_seconds - 0.1
-                                && state.duration_seconds > 0.0)
-                        {
-                            state.track_ended = false;
-                            state.seek_request = Some(0.0);
-                            state.spectrum_history.clear();
-                            for _ in 0..120 {
-                                state.spectrum_history.push_back(vec![0.0; 1024]);
-                            }
-                            state.is_paused = false;
-                        } else if state.playlist_index >= state.playlist.len()
-                            && !state.playlist.is_empty()
-                        {
-                            if state.duration_seconds == 0.0 {
-                                state.playlist_index = state.playlist.len() - 1;
-                            } else {
-                                state.playlist_index = 0;
-                            }
-                            state.load_request = Some(state.playlist[state.playlist_index].clone());
-                            state.is_paused = false;
-                        } else {
-                            state.is_paused = !state.is_paused;
-                        }
-                    }
-                    KeyCode::Right => {
-                        let mut state = app_state.lock().unwrap();
-                        let target = (state.current_seconds + 5.0).min(state.duration_seconds);
-                        state.seek_request = Some(target);
-                        state.current_seconds = target;
-                        state.track_ended = false;
-                        state.spectrum_history.clear();
-                        for _ in 0..120 {
-                            state.spectrum_history.push_back(vec![0.0; 1024]);
-                        }
-                    }
-                    KeyCode::Left => {
-                        let mut state = app_state.lock().unwrap();
-                        let target = (state.current_seconds - 5.0).max(0.0);
-                        state.seek_request = Some(target);
-                        state.current_seconds = target;
-                        state.track_ended = false;
-                        state.spectrum_history.clear();
-                        for _ in 0..120 {
-                            state.spectrum_history.push_back(vec![0.0; 1024]);
-                        }
-                    }
-                    KeyCode::Char(c @ '1'..='9') => {
-                        let track_num = (c as u8 - b'0') as usize;
-                        let mut state = app_state.lock().unwrap();
-                        if state.audio_tracks.len() > 1 {
-                            let track_idx = track_num - 1;
-                            if track_idx < state.audio_tracks.len()
-                                && track_idx != state.selected_audio_track
-                            {
-                                state.audio_track_request = Some(track_idx);
-                            }
-                        }
-                    }
-                    _ => {}
+                if !crossterm::event::poll(Duration::ZERO)? {
+                    break;
                 }
             }
         }
 
         if last_tick.elapsed() >= tick_rate {
             last_tick = Instant::now();
+        } else {
+            // Wait out the remainder of the frame tick if woken up early by mouse movement
+            let rem = tick_rate.saturating_sub(last_tick.elapsed());
+            if !rem.is_zero() && !crossterm::event::poll(rem)? {
+                last_tick = Instant::now();
+            }
         }
     }
 }
@@ -5073,10 +5427,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::{
-        AppState, Args, Parser, apply_gamepad_stick_panel_resize, clamp_panel_split_ratio,
+        AppState, Args, KeyCode, Parser, apply_gamepad_stick_panel_resize, clamp_panel_split_ratio,
         clamp_window_geometry_to_monitor, extract_rusttracker_shortcut_appids,
-        provision_steam_shortcut_artwork_in_root, upsert_rusttracker_shortcut_in_vdf,
+        handle_tui_key_event, handle_tui_mouse_event, provision_steam_shortcut_artwork_in_root,
+        upsert_rusttracker_shortcut_in_vdf,
     };
+    use crossterm::event::{KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
     #[test]
     fn test_window_geometry_fits_1080p_at_150_percent_scale() {
@@ -5488,5 +5844,139 @@ mod tests {
         assert!(!engine_src.contains("11.1 (7.1.4): ON"));
         assert_eq!(crate::state::SurroundUpmixConfig::short_tag(8), "7.1");
         assert!(!crate::state::SurroundUpmixConfig::has_height_channels(8));
+    }
+
+    #[test]
+    fn test_tui_key_event_controls_and_multitrack_solo() {
+        let mut state = AppState::new("MultiTrack.mkv".to_string());
+        state.file_loaded = true;
+        state.duration_seconds = 100.0;
+        state.current_seconds = 20.0;
+        state.audio_tracks = (0..3)
+            .map(|id| crate::state::AudioTrackInfo {
+                id,
+                title: format!("Track {}", id + 1),
+                codec: "FLAC".to_string(),
+                channels: 2,
+                sample_rate: 48000,
+                language: None,
+                is_atmos: false,
+            })
+            .collect();
+        state.active_audio_tracks = vec![0, 1, 2];
+        state.selected_audio_track = 0;
+
+        // 1. Pressing '1' solos Track 1 from the initial full mix
+        let should_quit = handle_tui_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE),
+        );
+        assert!(!should_quit);
+        assert_eq!(state.selected_audio_track, 0);
+        assert_eq!(state.active_audio_tracks, vec![0]);
+        assert_eq!(state.audio_track_request, Some(0));
+
+        // 2. Pressing '4' (num_tracks + 1) restores the full multi-track mix
+        state.audio_mix_request = None;
+        let _ = handle_tui_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('4'), KeyModifiers::NONE),
+        );
+        assert_eq!(state.active_audio_tracks, vec![0, 1, 2]);
+        assert!(state.audio_mix_request.is_some());
+
+        // 3. View cycling with 'v' and Tab
+        assert_eq!(
+            state.effective_tui_center_view(),
+            crate::state::TuiCenterView::Heatmap
+        );
+        let _ = handle_tui_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        );
+        assert_eq!(
+            state.effective_tui_center_view(),
+            crate::state::TuiCenterView::SurroundEq
+        );
+        let _ = handle_tui_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE),
+        );
+        assert_eq!(
+            state.effective_tui_center_view(),
+            crate::state::TuiCenterView::Heatmap
+        );
+
+        // 4. Split ratio adjustment with '[' and ']'
+        let initial_ratio = state.panel_split_ratio;
+        let _ = handle_tui_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE),
+        );
+        assert!(state.panel_split_ratio > initial_ratio);
+        let _ = handle_tui_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('['), KeyModifiers::NONE),
+        );
+        assert!((state.panel_split_ratio - initial_ratio).abs() < 1e-4);
+
+        // 5. Quit with Esc, 'q', and Ctrl+C
+        assert!(handle_tui_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        ));
+        assert!(handle_tui_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE),
+        ));
+        assert!(handle_tui_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
+        ));
+    }
+
+    #[test]
+    fn test_tui_mouse_seek_and_center_panel_click() {
+        let mut state = AppState::new("MouseTest.flac".to_string());
+        state.file_loaded = true;
+        state.duration_seconds = 200.0;
+        let term_area = ratatui::layout::Rect::new(0, 0, 120, 40);
+        let meta_len = crate::ui::build_track_info_lines(&state, 30).len();
+        let layout = crate::ui::compute_tui_layout(term_area, &state, meta_len);
+
+        // Click at the midpoint of the timeline bar seeks to ~50% (100s)
+        let inner_x = layout.timeline_rect.x + layout.timeline_rect.width / 2;
+        let inner_y = layout.timeline_rect.y;
+        let click_seek = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: inner_x,
+            row: inner_y,
+            modifiers: KeyModifiers::NONE,
+        };
+        handle_tui_mouse_event(&mut state, click_seek, term_area);
+        let seek_target = state
+            .seek_request
+            .expect("Expected seek_request from timeline click");
+        assert!(
+            (seek_target - 100.0).abs() < 5.0,
+            "Expected seek near 100.0s, got {seek_target}"
+        );
+
+        // Click inside the top-center panel cycles the center view
+        let center_click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: layout.center_rect.x + 2,
+            row: layout.center_rect.y + 2,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            state.effective_tui_center_view(),
+            crate::state::TuiCenterView::Heatmap
+        );
+        handle_tui_mouse_event(&mut state, center_click, term_area);
+        assert_eq!(
+            state.effective_tui_center_view(),
+            crate::state::TuiCenterView::SurroundEq
+        );
     }
 }
