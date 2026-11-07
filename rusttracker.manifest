@@ -3,7 +3,7 @@
   <assemblyIdentity
     type="win32"
     name="com.soddentrough.rusttracker"
-    version="0.9.38.0"
+    version="0.9.39.0"
     processorArchitecture="*"
   />
   <description>RustTracker Vulkan Visualizer</description>

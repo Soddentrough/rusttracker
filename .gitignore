@@ -46,6 +46,7 @@ scratch.*
 test_load
 test_sort
 screenshot*
+!assets/screenshot*.png
 scratch/
 scratch_bitstream/
 scratch_bitstream_windows/

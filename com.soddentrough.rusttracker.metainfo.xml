@@ -60,11 +60,20 @@
       <caption>3D Multi-Channel Fire Visualizer</caption>
       <image>https://raw.githubusercontent.com/Soddentrough/rusttracker/master/assets/screenshot_3dfire.png</image>
     </screenshot>
+    <screenshot>
+      <caption>Terminal UI (--tui) Mode</caption>
+      <image>https://raw.githubusercontent.com/Soddentrough/rusttracker/master/assets/screenshot_tui.png</image>
+    </screenshot>
   </screenshots>
   
   <content_rating type="oars-1.1" />
   
   <releases>
+    <release version="0.9.39" date="2026-11-07">
+      <description>
+        <p>Overhauled the Terminal UI (--tui) with multi-column dBFS channel VU meters, interactive Tracker Pattern, Synced Lyrics, Spectrogram Heatmap, and Surround Upmix &amp; 5-Band EQ views, full mouse and keyboard controls, and local audio input device selection (including Android RECORD_AUDIO support).</p>
+      </description>
+    </release>
     <release version="0.9.38" date="2026-11-05">
       <description>
         <p>Improved standing-wave phase locking and rendering across the CRT Oscilloscope, 3D Oscilloscope, and Strings visualizers using zero-phase fundamental triggering, template cross-correlation, Catmull-Rom sub-sample resampling, and multi-mode integer eigenmode string resynthesis.</p>

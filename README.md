@@ -35,6 +35,31 @@ RustTracker leverages a **3-Thread DSP Architecture** and **Hardware-Accelerated
 
 ---
 
+## 🖥️ Terminal UI Mode (`--tui`)
+
+Launch RustTracker directly in any terminal with `--tui` for a headless, zero-GPU-overhead studio interface featuring multi-column dBFS channel VU meters, interactive tracker pattern / synced lyrics / spectrogram heatmap / surround EQ views, a 128-band logarithmic spectrum analyzer, and full keyboard + mouse controls:
+
+```bash
+rusttracker audio_tests/ive_got_the_power.mod --tui
+```
+
+![RustTracker TUI](assets/screenshot_tui.png)
+
+| Action | TUI Key / Mouse |
+| :--- | :--- |
+| **Play / Pause** | `Space` |
+| **Seek Backward / Forward** | `Left` / `Right` Arrow (`Shift` ±30s, `Ctrl` ±60s) or **Click / Drag Timeline** |
+| **Prev / Next Track** | `P` / `N` |
+| **Cycle Top-Center View** (`Lyrics` ➔ `Tracker Pattern` ➔ `Heatmap` ➔ `Surround EQ`) | `V` / `Tab` or **Click Center Panel** |
+| **Toggle Surround Upmix / 7.1.4 MPEG-H / Reset EQ** | `U` (or `E`) / `M` (in EQ view) / `R` (in EQ view) |
+| **Volume / Mute** | `+` / `-` (or **Mouse Scroll Wheel**) / `M` |
+| **Solo Audio Track / Restore Multi-Track Mix** | `1` – `9` |
+| **Audio Input / Output Device Picker** | `D` |
+| **Resize Top / Spectrum Split** | `[` / `]` or **Drag Horizontal Split Border** |
+| **Quit** | `Q` / `Esc` / `Ctrl+C` |
+
+---
+
 ## 📱 Mobile Gestures (Android)
 
 RustTracker features a specialized dual-pane interface optimized for mobile and tablet displays:
