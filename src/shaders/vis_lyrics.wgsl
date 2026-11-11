@@ -104,7 +104,7 @@ fn get_water_surface_height(pos_xz: vec2<f32>) -> f32 {
     }
 
     // 3. Multi-Octave Acoustic Faraday Surface Ripples
-    let t = audio.time;
+    let t = select(audio.time, audio.smooth_time, audio.smooth_time > 0.0);
     let rip1 = sin(pos_xz.x * 2.8 + t * 2.4) * cos(pos_xz.y * 3.0 - t * 1.8);
     let rip2 = sin(pos_xz.x * 6.2 - t * 3.6 + pos_xz.y * 4.5) * 0.32;
     h += (rip1 + rip2) * 0.009 * (1.0 + bass * 1.2);
@@ -155,9 +155,10 @@ fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
 
         // Subtle per-character fluid wave oscillation (individual floating glyphs)
         if (slam_elapsed > 0.28) {
+            let anim_t = select(audio.time, audio.smooth_time, audio.smooth_time > 0.0);
             let char_phase = char_id * 0.45;
-            let wave_bob = sin(audio.time * 2.2 + char_phase) * 0.016 * (1.0 + bass * 0.6);
-            let wave_tilt = cos(audio.time * 1.8 + char_phase) * 0.010;
+            let wave_bob = sin(anim_t * 2.2 + char_phase) * 0.016 * (1.0 + bass * 0.6);
+            let wave_tilt = cos(anim_t * 1.8 + char_phase) * 0.010;
             world_pos.y += wave_bob;
             world_pos.z += wave_tilt * (world_pos.y - 0.16);
         }

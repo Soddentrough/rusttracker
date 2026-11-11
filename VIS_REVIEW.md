@@ -1,9 +1,11 @@
 # RustTracker Visualization System Review
 
-Date: 2026-07-19. Scope: all 34 WGSL shaders in src/shaders/, the host-side
-visualization pipeline in src/engine.rs (update/render), and src/state.rs
-(visualizer registry). Review covers correctness, performance/overhead,
-audio-reactivity, aesthetics, and UX.
+> **Document Status Note:** Sections 1–6 below are the historical **`2026-07-19`** review snapshot (written when the codebase had `22` registered visualizers and `34` WGSL files). **Section 7 (`2026-11-11` Audit & Resolution Status)** at the bottom of this file reflects current ground truth: **`19` registered visualizers** (`16` enabled in default rotation) and **`32` `.wgsl` files** in `src/shaders/` (**`30` standalone Naga-validated shader modules** + `2` shared include headers `_common.wgsl` and `_glyph_font.wgsl`).
+
+Historical Review Date: 2026-07-19. Historical Scope: all 34 WGSL shaders in
+src/shaders/, the host-side visualization pipeline in src/engine.rs
+(update/render), and src/state.rs (visualizer registry). Review covers
+correctness, performance/overhead, audio-reactivity, aesthetics, and UX.
 
 =====================================================================
 1. ARCHITECTURE OVERVIEW
@@ -312,36 +314,38 @@ P3 (aesthetics/UX):
     label toggle; document VU stereo-pair design.
 
 =====================================================================
-7. AUDIT & RESOLUTION STATUS (2026-10-14)
+7. AUDIT & RESOLUTION STATUS (2026-11-11)
 =====================================================================
 
 Current Registry & Shader Counts:
-- 21 visualizers registered in state.rs::VISUALIZERS (IDs: 0, 25, 24, 1, 3, 4, 5, 6, 9, 10, 22, 11, 13, 14, 15, 16, 17, 18, 19, 23, 28).
-- 45 WGSL shaders in src/shaders/ (all 45 pass Naga validation).
+- 19 visualizers registered in state.rs::VISUALIZERS (16 enabled in default rotation; IDs: 0, 25, 24, 1, 3, 4, 5, 6, 7, 13, 14, 16, 19, 20, 22, 23, 27, 28, 29).
+- 30 standalone WGSL shader modules + 2 shared include headers (`_common.wgsl`, `_glyph_font.wgsl`) = 32 `.wgsl` files in `src/shaders/` (all 30 standalone modules pass Naga validation with `Capabilities::empty()`; 19 unreferenced/retired `.wgsl` shaders were purged).
 
 Critical Findings (Section 2):
-- [C1] Ferrofluidsim particle stride: RESOLVED (repacked to two vec4s = 32B, matches host).
+- [C1] Ferrofluidsim particle stride: RESOLVED (repacked to two vec4s = 32B; legacy `ferrofluidsim` shaders subsequently purged in favor of `flip_ferrofluid_compute.wgsl` / `vis_flip_ferrofluid.wgsl`).
 - [C2] Video viewport dimensions: RESOLVED (uses actual surface dimensions / config.width in engine.rs).
 - [C3] Video row alignment: RESOLVED (256-byte stride repack in engine.rs).
 - [C4] Framerate-dependent simulation: RESOLVED (play_time derived from real elapsed time; compute passes scale via frame_dt/dt_scale; idle spectrum animation uses monotonic elapsed time).
-- [C5] Dead GPU FFT pipeline: RESOLVED (removed dead GPU FFT dummy timestamp pass, relabeled HUD telemetry from "GPU FFT" to "Compute", and gated 32-channel CPU gpu_spectrum FFT and upload on active consumer).
+- [C5] Dead GPU FFT pipeline: RESOLVED (removed placebo `--gpu-fft` CLI flag, `G`/`R2` bindings, and `"GPU FFT"` HUD labels; renamed telemetry to `gpu_compute_us`; and capped CPU per-channel FFTs to active visual channels).
 
 Correctness & Spec Compliance Bugs (Section 3):
-- FLIP Water buffer collision (ID 23 vs ID 28): RESOLVED (separated `grid_color` layout in `flip_water_compute.wgsl` across `vis_lyrics.wgsl` and `vis_water_splash.wgsl`).
+- FLIP Water vs Analytic Ocean (ID 23 vs ID 28): RESOLVED (ID 23 uses `flip_water_compute.wgsl` across `vis_lyrics.wgsl` and `vis_water_splash.wgsl`; ID 28 `vis_glass_water.wgsl` is an honest pure analytic ocean/cymatic heightfield raymarcher with `requires_flip_water: false`).
 - Lamppost spacing in racer: RESOLVED (26.0 spacing with 3120.0 seamless wrapping).
 - Oscilloscope double amber tint: RESOLVED.
-- 3D-oscilloscope divide-by-zero: RESOLVED.
+- 3D-oscilloscope divide-by-zero: RESOLVED (legacy raymarched `vis_3doscilloscope.wgsl` subsequently purged in favor of `vis_3doscilloscope_raster.wgsl` and `vis_3doscilloscope_freq.wgsl`).
 - HUD peak segment full-scale clamp: RESOLVED (min(..., num_segments - 1.0)).
-- Reversed-edge smoothstep spec UB: RESOLVED (all ~30 inverted-edge calls across 10 shaders & engine migrated to smoothstep_r).
-- Hardcoded 1.7777 aspect fallbacks: RESOLVED (migrated to audio.aspect_ratio in vis_neon, vis_ferrofluidsim, and engine CRT background).
-- Unbounded time / cam_z: RESOLVED (wrapped modulo 6000.0 for cam_z, 3120.0 for racer travel, 86400.0 for play_time).
+- Reversed-edge smoothstep spec UB: RESOLVED (all inverted-edge calls across shaders & engine migrated to `smoothstep_r`).
+- Hardcoded 1.7777 aspect fallbacks: RESOLVED (migrated to `audio.aspect_ratio` in engine CRT background and shaders; legacy `vis_neon.wgsl` and `vis_ferrofluidsim.wgsl` subsequently purged).
+- Unbounded time / cam_z: RESOLVED (monotonic `f64` host phase accumulation wrapped cleanly into `[P, 2*P)` with `P = TAU * 1000.0` (~6283.19s, exact `2π` multiple for all 1..3-decimal shader frequencies while staying `> 0.0`) before casting to `f32` `smooth_time`, plus modulo 6000.0 for `cam_z` and 3120.0 for racer travel).
+- Fullscreen quad diagonal overdraw: RESOLVED (`PipelineType::FullscreenTriangle` 3-vertex oversized triangle across all fullscreen passes).
 
 Performance Wins (Section 4):
-- 3D Glass Lyrics font loading: RESOLVED (cached via `OnceLock<Option<Vec<u8>>>` in `generate_glass_lyrics_mesh`, eliminating per-change disk I/O).
-- FLIP Water Jacobi solver & particle splatting: RESOLVED (Successive Over-Relaxation $\omega = 1.5$ in `flip_pressure` and early frustum/alpha culling in `vis_water_splash.wgsl`).
-- Waveform history upload skipping: RESOLVED (gated by history_dirty).
-- GPU spectrum upload & 32-channel FFT skipping: RESOLVED (gated by active visualizer and history_dirty).
-- VU meter ray-AABB early reject: RESOLVED (box_hit pre-test cuts 80 march steps on background).
-- Ferrofluid containment AABB & sky early-out: RESOLVED (bound_min/max pre-test & rd.y > 0 sky break).
+- 3D Glass Lyrics font loading & indirect draws: RESOLVED (cached via `OnceLock<Option<Vec<u8>>>` in `generate_glass_lyrics_mesh`, reused GPU mesh buffers, and GPU-compacted active splash droplet `draw_indexed_indirect` instead of unconditional 65,536-instance draws).
+- FLIP Water Jacobi solver & particle splatting: RESOLVED (damped Jacobi over-relaxation `SOR_OMEGA = 1.28` ($\omega = 1.28$) in `cs_pressure_0_to_1` / `cs_pressure_1_to_0` of `flip_water_compute.wgsl`, active droplet compaction into `splash_compact.active_indices` in `cs_g2p_advect_splat`, and host `draw_indexed_indirect` rendering `vs_splash` in `vis_water_splash.wgsl`).
+- Waveform history upload skipping & `f16` compression: RESOLVED (gated by `history_dirty`, uploading only dirty ring rows compressed 2× via IEEE-754 `f16` packing + branchless dual-lane `unpack2x16float_compat` from 1.18 MB to 589 KB, 4 KB/row, with zero optional Naga capabilities required).
+- Video chroma upload & border blur: RESOLVED (native 2-plane `NV12`/`NV21` `Rg8Unorm` and 10-bit `P010` `Rg16Unorm` GPU uploads with zero CPU UV de-interleaving, plus a generation-gated quarter-resolution `Rgba8UnormSrgb` pre-blurred border pass replacing the per-pixel 93-fetch blur loop in `vis_video.wgsl`).
+- GPU spectrum upload & 32-channel FFT skipping: RESOLVED (gated by active visualizer and `history_dirty`).
+- VU meter ray-AABB early reject: RESOLVED (legacy raymarched `vis_vumeters.wgsl` subsequently purged in favor of 3D mesh `vis_vumeters_3d.wgsl` + `vis_vumeters_bg.wgsl`).
+- Ferrofluid containment & sky early-out: RESOLVED (`p_entry` radial pre-test & `rd.y > 0.0` sky break in `vis_flip_ferrofluid.wgsl`; legacy `vis_ferrofluid.wgsl` subsequently purged).
 - Firesim black early-out: RESOLVED (skips erosion fbm when base_heat <= 0.003).
-- Unused visualizer pipelines: RESOLVED (only active visualizers are instantiated).
+- Unused visualizer pipelines & dead shaders: RESOLVED (only the 19 registered visualizers in `VISUALIZERS` have pipelines instantiated; 19 retired `.wgsl` shaders and 7 dead GPU pipelines were purged).

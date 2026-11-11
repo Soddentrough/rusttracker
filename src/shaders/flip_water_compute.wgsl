@@ -18,6 +18,18 @@ struct CellAccum {
     weight: atomic<u32>,
 };
 
+struct SplashCompactBuffer {
+    index_count: u32,
+    instance_count: atomic<u32>,
+    first_index: u32,
+    base_vertex: i32,
+    first_instance: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+    active_indices: array<u32, 65536>,
+};
+
 // --- Constants ---
 const NUM_PARTICLES: u32 = 65536u;
 const GRID_X: u32 = 64u;
@@ -52,6 +64,7 @@ const SOR_OMEGA: f32 = 1.28; // Stable damped Jacobi over-relaxation factor (ome
 @group(0) @binding(5) var<storage, read_write> pressure_0: array<f32>;
 @group(0) @binding(6) var<storage, read_write> pressure_1: array<f32>;
 @group(0) @binding(7) var<storage, read_write> render_grid: array<atomic<u32>>;
+@group(0) @binding(8) var<storage, read_write> splash_compact: SplashCompactBuffer;
 
 // --- Utility Functions ---
 fn is_lyrics_mode() -> bool {
@@ -119,6 +132,13 @@ fn cs_clear(@builtin(global_invocation_id) global_id: vec3<u32>) {
 @compute @workgroup_size(256)
 fn cs_clear_render(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let idx = global_id.x;
+    if (idx == 0u) {
+        splash_compact.index_count = 6u;
+        atomicStore(&splash_compact.instance_count, 0u);
+        splash_compact.first_index = 0u;
+        splash_compact.base_vertex = 0;
+        splash_compact.first_instance = 0u;
+    }
     if (idx >= TOTAL_RENDER_CELLS) { return; }
     atomicStore(&render_grid[idx], 0u);
 }
@@ -273,7 +293,8 @@ fn cs_grid_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
                         force.x += sign(world_p.x) * 20.0 * impact_decay;
                     }
                 } else if (slam_elapsed >= 0.75) {
-                    let bob_v = cos(audio.time * 2.2) * 0.4 * (1.0 + bass * 0.5);
+                    let anim_t = select(audio.time, audio.smooth_time, audio.smooth_time > 0.0);
+                    let bob_v = cos(anim_t * 2.2) * 0.4 * (1.0 + bass * 0.5);
                     if (world_p.y < 0.05) {
                         force.y += bob_v * 3.5;
                         force.z += sign(world_p.z) * abs(bob_v) * 2.5;
@@ -296,7 +317,8 @@ fn cs_grid_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
             // --- 4. Faraday Acoustic Surface Wave Harmonics (normalized from [0, 100] scale) ---
             let mids = clamp((audio.spectrum[2].x + audio.spectrum[4].x) / 110.0, 0.0, 1.4);
             let highs = clamp((audio.spectrum[8].x + audio.spectrum[12].x) / 110.0, 0.0, 1.2);
-            let standing_wave = sin(world_p.x * 1.2 + audio.time * 3.5) * cos(world_p.z * 1.8 - audio.time * 2.8);
+            let anim_t_wave = select(audio.time, audio.smooth_time, audio.smooth_time > 0.0);
+            let standing_wave = sin(world_p.x * 1.2 + anim_t_wave * 3.5) * cos(world_p.z * 1.8 - anim_t_wave * 2.8);
             force.y += standing_wave * (mids * 1.8 + highs * 1.2) * smoothstep(-0.15, 0.05, world_p.y);
 
             // --- 5. Surface Tension & Equilibrium Level Restoring ---
@@ -347,8 +369,9 @@ fn cs_grid_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let mids = clamp(select(raw_m / 110.0, raw_m * 0.5, raw_m > 0.0 && raw_m <= 4.0) + audio.channels[0].y * 0.4, 0.0, 1.6);
             let highs = clamp(select(raw_h / 110.0, raw_h * 0.5, raw_h > 0.0 && raw_h <= 4.0) + audio.channels[0].x * 0.3, 0.0, 1.4);
 
-            let standing_wave = cos(r_xz * 3.8 - audio.time * 3.8) * cos(azimuth * 4.0)
-                              + 0.5 * sin(r_xz * 6.2 + audio.time * 2.9) * cos(azimuth * 6.0);
+            let anim_t = select(audio.time, audio.smooth_time, audio.smooth_time > 0.0);
+            let standing_wave = cos(r_xz * 3.8 - anim_t * 3.8) * cos(azimuth * 4.0)
+                              + 0.5 * sin(r_xz * 6.2 + anim_t * 2.9) * cos(azimuth * 6.0);
             let ripple_force = standing_wave * (mids * 14.0 + highs * 10.0) * smoothstep(0.14, 0.45, world_p.y);
             force.y += ripple_force;
 
@@ -686,6 +709,14 @@ fn cs_g2p_advect_splat(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
         particles[p_idx] = p;
 
+        // Compact active airborne splash droplets for GPU-driven draw_indexed_indirect
+        if (p.pos.y > 0.035 && abs(p.pos.x) <= 6.5 && abs(p.pos.z) <= 2.5) {
+            let slot = atomicAdd(&splash_compact.instance_count, 1u);
+            if (slot < NUM_PARTICLES) {
+                splash_compact.active_indices[slot] = p_idx;
+            }
+        }
+
         // Splat both FLIP surface elevation (upper 16 bits, millimeter height above floor)
         // and airborne splash density (lower 16 bits) into the 512x512 Render Grid
         let rx = ((p.pos.x + 16.0) / 32.0) * f32(RENDER_GRID_SIZE);
@@ -724,7 +755,8 @@ fn cs_g2p_advect_splat(@builtin(global_invocation_id) global_id: vec3<u32>) {
         let raw_h = audio.spectrum[32].x + audio.spectrum[48].x;
         let mids = clamp(select(raw_m / 110.0, raw_m * 0.5, raw_m > 0.0 && raw_m <= 4.0) + audio.channels[0].y * 0.4, 0.0, 1.6);
         let highs = clamp(select(raw_h / 110.0, raw_h * 0.5, raw_h > 0.0 && raw_h <= 4.0) + audio.channels[0].x * 0.3, 0.0, 1.4);
-        let standing_wave = cos(r_p * 3.8 - audio.time * 3.8) * cos(azimuth * 4.0);
+        let anim_t = select(audio.time, audio.smooth_time, audio.smooth_time > 0.0);
+        let standing_wave = cos(r_p * 3.8 - anim_t * 3.8) * cos(azimuth * 4.0);
         v_cur.y += standing_wave * (mids * 0.65 + highs * 0.45) * smoothstep(0.15, 0.48, p.pos.y) * (dt / 0.016);
 
         // Restoring gravity & equilibrium surface tension around resting level (0.42m)

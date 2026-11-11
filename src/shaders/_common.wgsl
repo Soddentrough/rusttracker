@@ -1,5 +1,5 @@
 // =====================================================
-// RustTracker Shared Shader Header — AudioUniforms + Fullscreen Quad Vertex
+// RustTracker Shared Shader Header — AudioUniforms + Oversized Fullscreen Triangle Vertex
 // This is the single source of truth for the AudioUniforms struct layout.
 // Any field changes MUST be made here — all shaders include this file.
 // =====================================================
@@ -50,7 +50,7 @@ struct AudioUniforms {
     // (push_count + step_fraction) * 0.5 — world Z locked to history rows
     history_cam_z: f32,
     fire_intensity: f32,
-    _pad1: f32,
+    waveform_history_ring_base: u32,
     _pad2: f32,
     _pad3: f32,
 };
@@ -226,4 +226,27 @@ fn apply_crt_effects(color: vec3<f32>, uv: vec2<f32>, clip_pos: vec2<f32>, time:
     final_color = final_color + static_noise;
     
     return final_color * settings.phosphor_tint;
+}
+
+// Branchless dual-lane IEEE-754 binary16 -> binary32 unpack matching `unpack2x16float` lane layout
+// while validating cleanly under `naga::valid::Capabilities::empty()` (Naga 29 gates `unpack2x16float`
+// behind `Capabilities::SHADER_FLOAT16_IN_FLOAT32` for baseline GLES 3.0 targets).
+fn unpack2x16float_compat(packed_word: u32) -> vec2<f32> {
+    let h = vec2<u32>(packed_word & 0xFFFFu, packed_word >> 16u);
+    let sign_bits = (h & vec2<u32>(0x8000u)) << vec2<u32>(16u);
+    let exp = (h >> vec2<u32>(10u)) & vec2<u32>(0x1Fu);
+    let mant_shifted = (h & vec2<u32>(0x03FFu)) << vec2<u32>(13u);
+    let norm_val = bitcast<vec2<f32>>(
+        sign_bits | ((exp + vec2<u32>(112u)) << vec2<u32>(23u)) | mant_shifted
+    );
+    let sub_mag =
+        bitcast<vec2<f32>>(vec2<u32>(0x38800000u) | mant_shifted) - vec2<f32>(6.103515625e-5);
+    let sub_val = bitcast<vec2<f32>>(bitcast<vec2<u32>>(sub_mag) | sign_bits);
+    let finite_val = select(norm_val, sub_val, exp == vec2<u32>(0u));
+    return select(finite_val, vec2<f32>(0.0), exp == vec2<u32>(31u));
+}
+
+fn read_waveform_f16_from_word(packed_word: u32, lane: u32) -> f32 {
+    let pair = unpack2x16float_compat(packed_word);
+    return select(pair.x, pair.y, lane != 0u);
 }

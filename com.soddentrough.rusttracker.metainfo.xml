@@ -4,14 +4,14 @@
   <metadata_license>CC0-1.0</metadata_license>
   <project_license>GPL-3.0-or-later</project_license>
   <name>RustTracker</name>
-  <summary>High-Performance Vulkan Tracker Module Visualizer</summary>
+  <summary>High-Performance WGPU Audio, Video &amp; Tracker Visualizer</summary>
   
   <description>
     <p>
       RustTracker is a high-performance, real-time audio visualizer, video player, and tracker module player built in Rust with Vulkan/WGPU hardware acceleration.
     </p>
     <p>
-      It features over 24 cinematic compute and fragment shader visualizers (Ferrofluid, 3D Fire, Synthwave Racer, CRT Oscilloscope, Bioluminescence, and more), low-latency 3-thread DSP architecture, support for classic tracker modules (.MOD, .XM, .S3M, .IT), lossless and compressed audio (FLAC, MP3, WAV, OGG, Opus), multi-track video playback, and real-time lyrics synchronization.
+      It features 19 cinematic compute and fragment shader visualizers (Quantum FLIP Ferrofluid, Acoustic Glass Water Chamber, 3D Glass Water Lyrics, Prismatic Spectrum Canyon, Synthwave 3D Racer, Retro VU Meters, Bioluminescent Waves, CRT Oscilloscope, and more), a low-latency multi-threaded audio/DSP pipeline, support for classic tracker modules (.MOD, .XM, .S3M, .IT) with a real-time pattern viewer, lossless and compressed audio (FLAC, MP3, WAV, OGG, Opus), multi-track video playback, and real-time lyrics synchronization.
     </p>
   </description>
   
@@ -71,7 +71,7 @@
   <releases>
     <release version="0.9.39" date="2026-11-07">
       <description>
-        <p>Overhauled the Terminal UI (--tui) with multi-column dBFS channel VU meters, interactive Tracker Pattern, Synced Lyrics, Spectrogram Heatmap, and Surround Upmix &amp; 5-Band EQ views, full mouse and keyboard controls, and local audio input device selection (including Android RECORD_AUDIO support).</p>
+        <p>Overhauled the Terminal UI (--tui) with multi-column dBFS channel VU meters, real-time Tracker Pattern viewer, Synced Lyrics, Spectrogram Heatmap, and interactive Surround Upmix &amp; 5-Band EQ views, full mouse and keyboard controls, and local audio input device selection (including Android RECORD_AUDIO support).</p>
       </description>
     </release>
     <release version="0.9.38" date="2026-11-05">

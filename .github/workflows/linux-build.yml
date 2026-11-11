@@ -28,8 +28,7 @@ jobs:
         # Enable RPMFusion for ffmpeg-devel
         dnf install -y https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm
         # Install build tools and library dependencies
-        dnf install -y gcc gcc-c++ binutils pkgconfig alsa-lib-devel wayland-devel libX11-devel libxkbcommon-devel systemd-devel ffmpeg-devel libopenmpt-devel clang clang-devel python3
-        python3 scripts/patch_msys2_headers.py /usr/include/ffmpeg
+        dnf install -y gcc gcc-c++ binutils pkgconfig alsa-lib-devel wayland-devel libX11-devel libxkbcommon-devel systemd-devel ffmpeg-devel libopenmpt-devel clang clang-devel
         
     - name: Install Rust
       run: |

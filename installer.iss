@@ -18,12 +18,14 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 Name: "assoc_tracker"; Description: "Associate Tracker Modules (.mod, .xm, .s3m, .it, .mptm, .stm, .669, .mtm, .med, .okt, .psm)"; GroupDescription: "File Associations:"; Flags: checkedonce
 Name: "assoc_audio"; Description: "Associate Audio Files (.flac, .mp3, .wav, .ogg, .opus, .aac, .m4a, .mid, .midi, .aif, .wma)"; GroupDescription: "File Associations:"; Flags: unchecked
 Name: "assoc_video"; Description: "Associate Video Containers (.mp4, .mkv, .webm, .avi, .mov)"; GroupDescription: "File Associations:"; Flags: unchecked
-Name: "assoc_playlist"; Description: "Associate Playlists & DAW Files (.pls, .m3u, .m3u8, .dawproject, .aaf)"; GroupDescription: "File Associations:"; Flags: unchecked
+Name: "assoc_playlist"; Description: "Associate Playlists (.pls, .m3u, .m3u8)"; GroupDescription: "File Associations:"; Flags: unchecked
 Name: "contextmenu"; Description: "Add 'Play with RustTracker' to Explorer context menu"; GroupDescription: "Explorer Integration:"; Flags: checkedonce
 
 [Files]
-Source: "release\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "release\*"; DestDir: "{app}"; Excludes: "LICENSE,THIRD_PARTY_NOTICES.txt"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "icon.ico"; DestDir: "{app}"; Flags: ignoreversion
+Source: "LICENSE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "THIRD_PARTY_NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\RustTracker"; Filename: "{app}\rusttracker.exe"; IconFilename: "{app}\icon.ico"; AppUserModelID: "Soddentrough.RustTracker"
@@ -75,8 +77,6 @@ Root: HKA; Subkey: "Software\Classes\Applications\rusttracker.exe\SupportedTypes
 Root: HKA; Subkey: "Software\Classes\Applications\rusttracker.exe\SupportedTypes"; ValueType: string; ValueName: ".pls"; ValueData: ""; Flags: uninsdeletevalue
 Root: HKA; Subkey: "Software\Classes\Applications\rusttracker.exe\SupportedTypes"; ValueType: string; ValueName: ".m3u"; ValueData: ""; Flags: uninsdeletevalue
 Root: HKA; Subkey: "Software\Classes\Applications\rusttracker.exe\SupportedTypes"; ValueType: string; ValueName: ".m3u8"; ValueData: ""; Flags: uninsdeletevalue
-Root: HKA; Subkey: "Software\Classes\Applications\rusttracker.exe\SupportedTypes"; ValueType: string; ValueName: ".dawproject"; ValueData: ""; Flags: uninsdeletevalue
-Root: HKA; Subkey: "Software\Classes\Applications\rusttracker.exe\SupportedTypes"; ValueType: string; ValueName: ".aaf"; ValueData: ""; Flags: uninsdeletevalue
 
 ; ProgIDs Definitions
 Root: HKA; Subkey: "Software\Classes\RustTracker.TrackerModule"; ValueType: string; ValueName: ""; ValueData: "Tracker Module"; Flags: uninsdeletekey
@@ -106,7 +106,7 @@ Root: HKA; Subkey: "Software\Classes\RustTracker.VideoFile\shell\open"; ValueTyp
 Root: HKA; Subkey: "Software\Classes\RustTracker.VideoFile\shell\open"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\rusttracker.exe"",0"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\RustTracker.VideoFile\shell\open\command"; ValueType: string; ValueName: ""; ValueData: """{app}\rusttracker.exe"" ""%1"""; Flags: uninsdeletekey
 
-Root: HKA; Subkey: "Software\Classes\RustTracker.PlaylistFile"; ValueType: string; ValueName: ""; ValueData: "Playlist / Project File"; Flags: uninsdeletekey
+Root: HKA; Subkey: "Software\Classes\RustTracker.PlaylistFile"; ValueType: string; ValueName: ""; ValueData: "Playlist File"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\RustTracker.PlaylistFile"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "RustTracker"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\RustTracker.PlaylistFile\Application"; ValueType: string; ValueName: "ApplicationName"; ValueData: "RustTracker"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\RustTracker.PlaylistFile\Application"; ValueType: string; ValueName: "ApplicationIcon"; ValueData: """{app}\rusttracker.exe"",0"; Flags: uninsdeletekey
@@ -177,17 +177,13 @@ Root: HKA; Subkey: "Software\Classes\.avi"; ValueType: string; ValueName: ""; Va
 Root: HKA; Subkey: "Software\Classes\.mov\OpenWithProgids"; ValueType: string; ValueName: "RustTracker.VideoFile"; ValueData: ""; Flags: uninsdeletevalue
 Root: HKA; Subkey: "Software\Classes\.mov"; ValueType: string; ValueName: ""; ValueData: "RustTracker.VideoFile"; Flags: uninsdeletevalue; Tasks: assoc_video
 
-; File Association Mappings - Playlists & Projects
+; File Association Mappings - Playlists
 Root: HKA; Subkey: "Software\Classes\.pls\OpenWithProgids"; ValueType: string; ValueName: "RustTracker.PlaylistFile"; ValueData: ""; Flags: uninsdeletevalue
 Root: HKA; Subkey: "Software\Classes\.pls"; ValueType: string; ValueName: ""; ValueData: "RustTracker.PlaylistFile"; Flags: uninsdeletevalue; Tasks: assoc_playlist
 Root: HKA; Subkey: "Software\Classes\.m3u\OpenWithProgids"; ValueType: string; ValueName: "RustTracker.PlaylistFile"; ValueData: ""; Flags: uninsdeletevalue
 Root: HKA; Subkey: "Software\Classes\.m3u"; ValueType: string; ValueName: ""; ValueData: "RustTracker.PlaylistFile"; Flags: uninsdeletevalue; Tasks: assoc_playlist
 Root: HKA; Subkey: "Software\Classes\.m3u8\OpenWithProgids"; ValueType: string; ValueName: "RustTracker.PlaylistFile"; ValueData: ""; Flags: uninsdeletevalue
 Root: HKA; Subkey: "Software\Classes\.m3u8"; ValueType: string; ValueName: ""; ValueData: "RustTracker.PlaylistFile"; Flags: uninsdeletevalue; Tasks: assoc_playlist
-Root: HKA; Subkey: "Software\Classes\.dawproject\OpenWithProgids"; ValueType: string; ValueName: "RustTracker.PlaylistFile"; ValueData: ""; Flags: uninsdeletevalue
-Root: HKA; Subkey: "Software\Classes\.dawproject"; ValueType: string; ValueName: ""; ValueData: "RustTracker.PlaylistFile"; Flags: uninsdeletevalue; Tasks: assoc_playlist
-Root: HKA; Subkey: "Software\Classes\.aaf\OpenWithProgids"; ValueType: string; ValueName: "RustTracker.PlaylistFile"; ValueData: ""; Flags: uninsdeletevalue
-Root: HKA; Subkey: "Software\Classes\.aaf"; ValueType: string; ValueName: ""; ValueData: "RustTracker.PlaylistFile"; Flags: uninsdeletevalue; Tasks: assoc_playlist
 
 ; Context Menu Integration ("Play with RustTracker")
 Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\audio\shell\RustTracker"; ValueType: string; ValueName: ""; ValueData: "Play with RustTracker"; Flags: uninsdeletekey; Tasks: contextmenu

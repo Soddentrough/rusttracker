@@ -105,10 +105,24 @@ async fn run_perf_test() {
 
     let waveform_storage_buffer = device.create_buffer(&BufferDescriptor {
         label: Some("Waveform History Storage"),
-        size: (2048 * 144 * 4) as u64,
+        size: (1024 * 144 * 4) as u64,
         usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
+    {
+        let mut wave_row = [0.0f32; 2048];
+        for (i, sample) in wave_row.iter_mut().enumerate() {
+            let phase = (i as f32 / 2048.0) * std::f32::consts::TAU * 4.0;
+            *sample = phase.sin() * 0.65;
+        }
+        let mut packed_row = [0u32; 1024];
+        engine::pack_wave_row_f16(&wave_row, &mut packed_row);
+        queue.write_buffer(
+            &waveform_storage_buffer,
+            0,
+            bytemuck::cast_slice(&packed_row),
+        );
+    }
 
     let history_texture = device.create_texture(&TextureDescriptor {
         label: Some("Heatmap History Texture"),
@@ -145,13 +159,6 @@ async fn run_perf_test() {
     let gpu_spectrum_buffer = device.create_buffer(&BufferDescriptor {
         label: Some("GPU FFT Spectrum Buffer"),
         size: 32 * 1024 * 8,
-        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-
-    let ferrofluidsim_grid = device.create_buffer(&BufferDescriptor {
-        label: Some("Ferrofluid Grid"),
-        size: (512 * 512 * 4) as u64,
         usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -208,16 +215,6 @@ async fn run_perf_test() {
                 },
                 count: None,
             },
-            BindGroupLayoutEntry {
-                binding: 5,
-                visibility: ShaderStages::FRAGMENT,
-                ty: BindingType::Buffer {
-                    ty: BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
         ],
         label: Some("audio_bind_group_layout"),
     });
@@ -245,82 +242,13 @@ async fn run_perf_test() {
                 binding: 4,
                 resource: gpu_spectrum_buffer.as_entire_binding(),
             },
-            BindGroupEntry {
-                binding: 5,
-                resource: ferrofluidsim_grid.as_entire_binding(),
-            },
         ],
         label: Some("audio_bind_group"),
     });
 
-    // Create smoke dummy bindings for the rendering layout
-    let smoke_texture = device.create_texture(&TextureDescriptor {
-        label: Some("Neon Smoke Texture"),
-        size: Extent3d {
-            width: 64,
-            height: 64,
-            depth_or_array_layers: 64,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: TextureDimension::D3,
-        format: TextureFormat::Rgba16Float,
-        usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    });
-    let smoke_texture_view = smoke_texture.create_view(&TextureViewDescriptor::default());
-
-    let smoke_sampler = device.create_sampler(&SamplerDescriptor {
-        label: Some("Neon Smoke Sampler"),
-        address_mode_u: AddressMode::ClampToEdge,
-        address_mode_v: AddressMode::ClampToEdge,
-        address_mode_w: AddressMode::ClampToEdge,
-        mag_filter: FilterMode::Linear,
-        min_filter: FilterMode::Linear,
-        mipmap_filter: MipmapFilterMode::Linear,
-        ..Default::default()
-    });
-
-    let smoke_render_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-        label: Some("Smoke Render Layout"),
-        entries: &[
-            BindGroupLayoutEntry {
-                binding: 0,
-                visibility: ShaderStages::FRAGMENT,
-                ty: BindingType::Texture {
-                    sample_type: TextureSampleType::Float { filterable: true },
-                    view_dimension: TextureViewDimension::D3,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            BindGroupLayoutEntry {
-                binding: 1,
-                visibility: ShaderStages::FRAGMENT,
-                ty: BindingType::Sampler(SamplerBindingType::Filtering),
-                count: None,
-            },
-        ],
-    });
-
-    let smoke_render_bind_group = device.create_bind_group(&BindGroupDescriptor {
-        label: Some("Smoke Render Bind Group"),
-        layout: &smoke_render_layout,
-        entries: &[
-            BindGroupEntry {
-                binding: 0,
-                resource: BindingResource::TextureView(&smoke_texture_view),
-            },
-            BindGroupEntry {
-                binding: 1,
-                resource: BindingResource::Sampler(&smoke_sampler),
-            },
-        ],
-    });
-
     let render_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
         label: Some("Render Pipeline Layout"),
-        bind_group_layouts: &[Some(&bind_group_layout), Some(&smoke_render_layout)],
+        bind_group_layouts: &[Some(&bind_group_layout)],
         immediate_size: 0,
     });
 
@@ -376,7 +304,6 @@ async fn run_perf_test() {
         usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    queue.write_buffer(&biolum_particles_buffer, 0, &vec![0u8; 65536 * 32]);
 
     let biolum_render_bind_group = device.create_bind_group(&BindGroupDescriptor {
         label: Some("Biolum Render Bind Group"),
@@ -389,11 +316,7 @@ async fn run_perf_test() {
 
     let render_pipeline_layout_3d = device.create_pipeline_layout(&PipelineLayoutDescriptor {
         label: Some("3D Render Pipeline Layout"),
-        bind_group_layouts: &[
-            Some(&bind_group_layout),
-            Some(&smoke_render_layout),
-            Some(&camera_bind_group_layout),
-        ],
+        bind_group_layouts: &[Some(&bind_group_layout), Some(&camera_bind_group_layout)],
         immediate_size: 0,
     });
 
@@ -401,7 +324,6 @@ async fn run_perf_test() {
         label: Some("Biolum Render Pipeline Layout"),
         bind_group_layouts: &[
             Some(&bind_group_layout),
-            Some(&smoke_render_layout),
             Some(&camera_bind_group_layout),
             Some(&biolum_render_bind_group_layout),
         ],
@@ -411,6 +333,13 @@ async fn run_perf_test() {
     let flip_particles_buf = device.create_buffer(&BufferDescriptor {
         label: Some("FLIP Particles Buffer"),
         size: (65536 * 32) as u64,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let splash_compact_buf = device.create_buffer(&BufferDescriptor {
+        label: Some("Splash Compact Buffer"),
+        size: ((8 + 65536) * 4) as u64,
         usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
@@ -439,6 +368,16 @@ async fn run_perf_test() {
                     },
                     count: None,
                 },
+                BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: ShaderStages::VERTEX,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
             ],
         });
 
@@ -460,6 +399,10 @@ async fn run_perf_test() {
             BindGroupEntry {
                 binding: 1,
                 resource: flip_particles_buf.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 2,
+                resource: splash_compact_buf.as_entire_binding(),
             },
         ],
     });
@@ -619,7 +562,7 @@ async fn run_perf_test() {
         frame_dt: 0.016,
         history_cam_z: 0.0,
         fire_intensity: 1.0,
-        _pad1: 0.0,
+        waveform_history_ring_base: 0,
         _pad2: 0.0,
         _pad3: 0.0,
     };
@@ -674,26 +617,16 @@ async fn run_perf_test() {
         match id {
             0 => include_str!("../src/shaders/vis_spectrum.wgsl"),
             1 => include_str!("../src/shaders/vis_oscilloscope.wgsl"),
-            2 => include_str!("../src/shaders/vis_3doscilloscope.wgsl"),
             3 => include_str!("../src/shaders/vis_3doscilloscope_raster.wgsl"),
             4 => include_str!("../src/shaders/vis_3doscilloscope_freq.wgsl"),
             5 => include_str!("../src/shaders/vis_flame.wgsl"),
             6 => include_str!("../src/shaders/vis_firesim.wgsl"),
             7 => include_str!("../src/shaders/vis_solar.wgsl"),
-            8 => include_str!("../src/shaders/vis_spatial.wgsl"),
-            9 => include_str!("../src/shaders/vis_ferrofluid.wgsl"),
-            10 => include_str!("../src/shaders/vis_ferrofluidsim.wgsl"),
-            11 => include_str!("../src/shaders/vis_neon_3d.wgsl"),
-            12 => include_str!("../src/shaders/vis_lissajous.wgsl"),
             13 => include_str!("../src/shaders/vis_synthwave.wgsl"),
             14 => include_str!("../src/shaders/vis_synthwave_racer_3d.wgsl"),
-            15 => include_str!("../src/shaders/vis_starfield.wgsl"),
             16 => include_str!("../src/shaders/vis_rain.wgsl"),
-            17 => include_str!("../src/shaders/vis_storm_3d.wgsl"),
-            18 => include_str!("../src/shaders/vis_cuboids.wgsl"),
             19 => include_str!("../src/shaders/vis_vumeters_3d.wgsl"),
             20 => include_str!("../src/shaders/vis_bioluminescence.wgsl"),
-            21 => include_str!("../src/shaders/vis_matrix.wgsl"),
             22 => include_str!("../src/shaders/vis_neon_room.wgsl"),
             23 => include_str!("../src/shaders/vis_lyrics.wgsl"),
             24 => include_str!("../src/shaders/vis_tape_head.wgsl"),
@@ -725,7 +658,7 @@ async fn run_perf_test() {
 
         let layout = if vis_def.id == 20 {
             &biolum_render_pipeline_layout
-        } else if vis_def.id == 27 || vis_def.id == 28 {
+        } else if vis_def.id == 27 {
             &flip_render_pipeline_layout
         } else if vis_def.id == 23 {
             &lyrics_render_pipeline_layout_3d
@@ -855,15 +788,18 @@ async fn run_perf_test() {
                 });
                 rp.set_pipeline(&pipeline);
                 rp.set_bind_group(0, &uniform_bind_group, &[]);
-                if vis_def.id == 27 || vis_def.id == 28 || vis_def.id == 23 {
+                if vis_def.id == 27 {
                     rp.set_bind_group(1, &flip_render_bind_group, &[]);
-                } else {
-                    rp.set_bind_group(1, &smoke_render_bind_group, &[]);
                 }
                 if is_3d {
-                    rp.set_bind_group(2, &camera_bind_group, &[]);
+                    if vis_def.id == 23 {
+                        rp.set_bind_group(1, &flip_render_bind_group, &[]);
+                        rp.set_bind_group(2, &camera_bind_group, &[]);
+                    } else {
+                        rp.set_bind_group(1, &camera_bind_group, &[]);
+                    }
                     if vis_def.id == 20 {
-                        rp.set_bind_group(3, &biolum_render_bind_group, &[]);
+                        rp.set_bind_group(2, &biolum_render_bind_group, &[]);
                         rp.set_vertex_buffer(0, quad_vertex_buffer.slice(..));
                         rp.set_index_buffer(quad_index_buffer.slice(..), IndexFormat::Uint32);
                         rp.draw_indexed(0..quad_index_count, 0, 0..65536);
@@ -950,15 +886,18 @@ async fn run_perf_test() {
                 });
                 rp.set_pipeline(&pipeline);
                 rp.set_bind_group(0, &uniform_bind_group, &[]);
-                if vis_def.id == 27 || vis_def.id == 28 || vis_def.id == 23 {
+                if vis_def.id == 27 {
                     rp.set_bind_group(1, &flip_render_bind_group, &[]);
-                } else {
-                    rp.set_bind_group(1, &smoke_render_bind_group, &[]);
                 }
                 if is_3d {
-                    rp.set_bind_group(2, &camera_bind_group, &[]);
+                    if vis_def.id == 23 {
+                        rp.set_bind_group(1, &flip_render_bind_group, &[]);
+                        rp.set_bind_group(2, &camera_bind_group, &[]);
+                    } else {
+                        rp.set_bind_group(1, &camera_bind_group, &[]);
+                    }
                     if vis_def.id == 20 {
-                        rp.set_bind_group(3, &biolum_render_bind_group, &[]);
+                        rp.set_bind_group(2, &biolum_render_bind_group, &[]);
                         rp.set_vertex_buffer(0, quad_vertex_buffer.slice(..));
                         rp.set_index_buffer(quad_index_buffer.slice(..), IndexFormat::Uint32);
                         rp.draw_indexed(0..quad_index_count, 0, 0..65536);
@@ -1412,7 +1351,7 @@ async fn run_flip_snapshot() {
         frame_dt: 0.016,
         history_cam_z: 0.0,
         fire_intensity: 1.0,
-        _pad1: 0.0,
+        waveform_history_ring_base: 0,
         _pad2: 0.0,
         _pad3: 0.0,
     };
@@ -1513,16 +1452,6 @@ async fn run_flip_snapshot() {
                 },
                 count: None,
             },
-            BindGroupLayoutEntry {
-                binding: 5,
-                visibility: ShaderStages::FRAGMENT,
-                ty: BindingType::Buffer {
-                    ty: BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
         ],
         label: Some("audio_bind_group_layout"),
     });
@@ -1548,10 +1477,6 @@ async fn run_flip_snapshot() {
             },
             BindGroupEntry {
                 binding: 4,
-                resource: dummy_storage.as_entire_binding(),
-            },
-            BindGroupEntry {
-                binding: 5,
                 resource: dummy_storage.as_entire_binding(),
             },
         ],
@@ -2089,141 +2014,8 @@ async fn run_flip_snapshot() {
         ])
         .output();
 
-    // Render Legacy Visualizer #9 (Chrome Ferrofluid) for comparison
-    let legacy_src = resolve_shader_includes(include_str!("../src/shaders/vis_ferrofluid.wgsl"));
-    let legacy_module = device.create_shader_module(ShaderModuleDescriptor {
-        label: Some("Legacy Ferrofluid"),
-        source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&legacy_src)),
-    });
-    let legacy_pipe_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-        label: Some("Legacy Pipe Layout"),
-        bind_group_layouts: &[Some(&bind_group_layout)],
-        immediate_size: 0,
-    });
-    let legacy_pipe = device.create_render_pipeline(&RenderPipelineDescriptor {
-        label: Some("Legacy Pipe"),
-        layout: Some(&legacy_pipe_layout),
-        vertex: VertexState {
-            module: &legacy_module,
-            entry_point: Some("vs_main"),
-            buffers: &[],
-            compilation_options: Default::default(),
-        },
-        fragment: Some(FragmentState {
-            module: &legacy_module,
-            entry_point: Some("fs_main"),
-            targets: &[Some(ColorTargetState {
-                format: color_format,
-                blend: Some(BlendState::REPLACE),
-                write_mask: ColorWrites::ALL,
-            })],
-            compilation_options: Default::default(),
-        }),
-        primitive: PrimitiveState::default(),
-        depth_stencil: Some(DepthStencilState {
-            format: TextureFormat::Depth32Float,
-            depth_write_enabled: Some(true),
-            depth_compare: Some(CompareFunction::LessEqual),
-            stencil: StencilState::default(),
-            bias: DepthBiasState::default(),
-        }),
-        multisample: MultisampleState::default(),
-        multiview_mask: None,
-        cache: None,
-    });
-
-    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
-        label: Some("Legacy Render Encoder"),
-    });
-    {
-        let mut rp = encoder.begin_render_pass(&RenderPassDescriptor {
-            label: Some("Legacy Render Pass"),
-            color_attachments: &[Some(RenderPassColorAttachment {
-                view: &color_view,
-                resolve_target: None,
-                ops: Operations {
-                    load: LoadOp::Clear(Color::BLACK),
-                    store: StoreOp::Store,
-                },
-                depth_slice: None,
-            })],
-            depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
-                view: &depth_view,
-                depth_ops: Some(Operations {
-                    load: LoadOp::Clear(1.0),
-                    store: StoreOp::Store,
-                }),
-                stencil_ops: None,
-            }),
-            timestamp_writes: None,
-            occlusion_query_set: None,
-            multiview_mask: None,
-        });
-        rp.set_pipeline(&legacy_pipe);
-        rp.set_bind_group(0, &uniform_bind_group, &[]);
-        rp.draw(0..3, 0..1);
-    }
-
-    let output_buffer = device.create_buffer(&BufferDescriptor {
-        label: Some("Legacy Readback Buffer"),
-        size: (bytes_per_row * height) as u64,
-        usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
-        mapped_at_creation: false,
-    });
-
-    encoder.copy_texture_to_buffer(
-        TexelCopyTextureInfo {
-            texture: &render_target,
-            mip_level: 0,
-            origin: Origin3d::ZERO,
-            aspect: TextureAspect::All,
-        },
-        TexelCopyBufferInfo {
-            buffer: &output_buffer,
-            layout: TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(bytes_per_row),
-                rows_per_image: Some(height),
-            },
-        },
-        Extent3d {
-            width,
-            height,
-            depth_or_array_layers: 1,
-        },
-    );
-    queue.submit(Some(encoder.finish()));
-
-    let buffer_slice = output_buffer.slice(..);
-    let (tx, rx) = std::sync::mpsc::channel();
-    buffer_slice.map_async(MapMode::Read, move |result| {
-        tx.send(result).unwrap();
-    });
-    let _ = device.poll(PollType::Wait {
-        submission_index: None,
-        timeout: None,
-    });
-    rx.recv().unwrap().unwrap();
-
-    let data = buffer_slice.get_mapped_range();
-    let mut img = image::ImageBuffer::<image::Rgba<u8>, _>::new(width, height);
-    for y in 0..height {
-        let row_start = (y * bytes_per_row) as usize;
-        for x in 0..width {
-            let px_start = row_start + (x * bytes_per_pixel) as usize;
-            let r = data[px_start];
-            let g = data[px_start + 1];
-            let b = data[px_start + 2];
-            let a = data[px_start + 3];
-            img.put_pixel(x, y, image::Rgba([r, g, b, a]));
-        }
-    }
-    drop(data);
-    output_buffer.unmap();
-    img.save("test_legacy_ferrofluid.png").unwrap();
-
     println!(
-        "Saved test_flip_ferrofluid.png, test_legacy_ferrofluid.png, test_flip_ferrofluid.webp, and test_flip_ferrofluid.gif successfully!"
+        "Saved test_flip_ferrofluid.png, test_flip_ferrofluid.webp, and test_flip_ferrofluid.gif successfully!"
     );
 }
 
@@ -2326,7 +2118,7 @@ async fn run_glass_water_snapshot() {
         frame_dt: 0.016,
         history_cam_z: 0.0,
         fire_intensity: 1.0,
-        _pad1: 0.0,
+        waveform_history_ring_base: 0,
         _pad2: 0.0,
         _pad3: 0.0,
     };
@@ -2427,16 +2219,6 @@ async fn run_glass_water_snapshot() {
                 },
                 count: None,
             },
-            BindGroupLayoutEntry {
-                binding: 5,
-                visibility: ShaderStages::FRAGMENT,
-                ty: BindingType::Buffer {
-                    ty: BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
         ],
         label: Some("audio_bind_group_layout"),
     });
@@ -2462,10 +2244,6 @@ async fn run_glass_water_snapshot() {
             },
             BindGroupEntry {
                 binding: 4,
-                resource: dummy_storage.as_entire_binding(),
-            },
-            BindGroupEntry {
-                binding: 5,
                 resource: dummy_storage.as_entire_binding(),
             },
         ],
@@ -2600,7 +2378,24 @@ async fn run_glass_water_snapshot() {
                 },
                 count: None,
             },
+            BindGroupLayoutEntry {
+                binding: 8,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
+    });
+
+    let water_splash_compact = device.create_buffer(&BufferDescriptor {
+        label: Some("Water Splash Compact"),
+        size: ((8 + 65536) * 4) as u64,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
     });
 
     let flip_compute_bg = device.create_bind_group(&BindGroupDescriptor {
@@ -2638,6 +2433,10 @@ async fn run_glass_water_snapshot() {
             BindGroupEntry {
                 binding: 7,
                 resource: flip_render_grid.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 8,
+                resource: water_splash_compact.as_entire_binding(),
             },
         ],
     });
@@ -3370,7 +3169,7 @@ async fn run_flip_lyrics_animation() {
         aspect_ratio: (width as f32) / (height as f32),
         history_cam_z: 0.0,
         fire_intensity: 1.0,
-        _pad1: 0.0,
+        waveform_history_ring_base: 0,
         _pad2: 0.0,
         _pad3: 0.0,
     };
@@ -3463,16 +3262,6 @@ async fn run_flip_lyrics_animation() {
                 },
                 count: None,
             },
-            BindGroupLayoutEntry {
-                binding: 5,
-                visibility: ShaderStages::FRAGMENT,
-                ty: BindingType::Buffer {
-                    ty: BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
         ],
         label: Some("audio_bind_group_layout"),
     });
@@ -3498,10 +3287,6 @@ async fn run_flip_lyrics_animation() {
             },
             BindGroupEntry {
                 binding: 4,
-                resource: dummy_storage.as_entire_binding(),
-            },
-            BindGroupEntry {
-                binding: 5,
                 resource: dummy_storage.as_entire_binding(),
             },
         ],
@@ -3683,8 +3468,36 @@ async fn run_flip_lyrics_animation() {
                 },
                 count: None,
             },
+            BindGroupLayoutEntry {
+                binding: 8,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     });
+
+    let splash_compact_buf = device.create_buffer(&BufferDescriptor {
+        label: Some("Splash Compact Buffer"),
+        size: ((8 + 65536) * 4) as u64,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let splash_indirect_buf = device.create_buffer(&BufferDescriptor {
+        label: Some("Splash Indirect Args"),
+        size: 20,
+        usage: BufferUsages::INDIRECT | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(
+        &splash_indirect_buf,
+        0,
+        bytemuck::cast_slice(&[6u32, 0, 0, 0, 0]),
+    );
 
     let flip_compute_bg = device.create_bind_group(&BindGroupDescriptor {
         label: Some("FLIP Compute BG"),
@@ -3721,6 +3534,10 @@ async fn run_flip_lyrics_animation() {
             BindGroupEntry {
                 binding: 7,
                 resource: flip_render_grid.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 8,
+                resource: splash_compact_buf.as_entire_binding(),
             },
         ],
     });
@@ -3827,6 +3644,16 @@ async fn run_flip_lyrics_animation() {
                 },
                 count: None,
             },
+            BindGroupLayoutEntry {
+                binding: 2,
+                visibility: ShaderStages::VERTEX,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
         ],
     });
     let flip_render_bg = device.create_bind_group(&BindGroupDescriptor {
@@ -3840,6 +3667,10 @@ async fn run_flip_lyrics_animation() {
             BindGroupEntry {
                 binding: 1,
                 resource: flip_particles.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 2,
+                resource: splash_compact_buf.as_entire_binding(),
             },
         ],
     });
@@ -4076,6 +3907,8 @@ async fn run_flip_lyrics_animation() {
             cp.dispatch_workgroups(256, 1, 1);
         }
 
+        encoder.copy_buffer_to_buffer(&splash_compact_buf, 0, &splash_indirect_buf, 0, 20);
+
         // 2. Render Pass: Lyrics Scene + Airborne Splash Droplets
         {
             let mut rp = encoder.begin_render_pass(&RenderPassDescriptor {
@@ -4111,11 +3944,11 @@ async fn run_flip_lyrics_animation() {
             rp.set_index_buffer(mesh_ib.slice(..), IndexFormat::Uint32);
             rp.draw_indexed(0..(mesh_inds.len() as u32), 0, 0..1);
 
-            // 2B. 3D Airborne Water Splash Droplets
+            // 2B. 3D Airborne Water Splash Droplets (GPU-compacted draw_indexed_indirect)
             rp.set_pipeline(&splash_pipeline);
             rp.set_vertex_buffer(0, splash_vb.slice(..));
             rp.set_index_buffer(splash_ib.slice(..), IndexFormat::Uint32);
-            rp.draw_indexed(0..6, 0, 0..65536);
+            rp.draw_indexed_indirect(&splash_indirect_buf, 0);
         }
 
         // 3. Readback Frame
@@ -4322,7 +4155,7 @@ async fn run_3d_freq_oscilloscope_snapshot() {
         frame_dt: 0.016,
         history_cam_z: 15.0,
         fire_intensity: 1.0,
-        _pad1: 0.0,
+        waveform_history_ring_base: 0,
         _pad2: 0.0,
         _pad3: 0.0,
     };
@@ -4472,12 +4305,6 @@ async fn run_3d_freq_oscilloscope_snapshot() {
         view_formats: &[],
     });
     let dummy_view = dummy_tex.create_view(&TextureViewDescriptor::default());
-    let dummy_storage = device.create_buffer(&BufferDescriptor {
-        label: Some("Dummy Storage"),
-        size: 1024,
-        usage: BufferUsages::STORAGE,
-        mapped_at_creation: false,
-    });
 
     let bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
         label: Some("audio_bind_group_layout"),
@@ -4532,16 +4359,6 @@ async fn run_3d_freq_oscilloscope_snapshot() {
                 },
                 count: None,
             },
-            BindGroupLayoutEntry {
-                binding: 5,
-                visibility: ShaderStages::FRAGMENT,
-                ty: BindingType::Buffer {
-                    ty: BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
         ],
     });
 
@@ -4568,62 +4385,6 @@ async fn run_3d_freq_oscilloscope_snapshot() {
             BindGroupEntry {
                 binding: 4,
                 resource: gpu_spectrum_buffer.as_entire_binding(),
-            },
-            BindGroupEntry {
-                binding: 5,
-                resource: dummy_storage.as_entire_binding(),
-            },
-        ],
-    });
-
-    let smoke_texture = device.create_texture(&TextureDescriptor {
-        label: Some("Neon Smoke Texture"),
-        size: Extent3d {
-            width: 64,
-            height: 64,
-            depth_or_array_layers: 64,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: TextureDimension::D3,
-        format: TextureFormat::Rgba16Float,
-        usage: TextureUsages::STORAGE_BINDING | TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    });
-    let smoke_texture_view = smoke_texture.create_view(&TextureViewDescriptor::default());
-    let smoke_sampler = device.create_sampler(&SamplerDescriptor::default());
-    let smoke_render_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-        label: Some("Smoke Render Layout"),
-        entries: &[
-            BindGroupLayoutEntry {
-                binding: 0,
-                visibility: ShaderStages::FRAGMENT,
-                ty: BindingType::Texture {
-                    sample_type: TextureSampleType::Float { filterable: true },
-                    view_dimension: TextureViewDimension::D3,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            BindGroupLayoutEntry {
-                binding: 1,
-                visibility: ShaderStages::FRAGMENT,
-                ty: BindingType::Sampler(SamplerBindingType::Filtering),
-                count: None,
-            },
-        ],
-    });
-    let smoke_render_bind_group = device.create_bind_group(&BindGroupDescriptor {
-        label: Some("Smoke Render Bind Group"),
-        layout: &smoke_render_layout,
-        entries: &[
-            BindGroupEntry {
-                binding: 0,
-                resource: BindingResource::TextureView(&smoke_texture_view),
-            },
-            BindGroupEntry {
-                binding: 1,
-                resource: BindingResource::Sampler(&smoke_sampler),
             },
         ],
     });
@@ -4667,11 +4428,7 @@ async fn run_3d_freq_oscilloscope_snapshot() {
 
     let render_pipeline_layout_3d = device.create_pipeline_layout(&PipelineLayoutDescriptor {
         label: Some("3D Render Pipeline Layout"),
-        bind_group_layouts: &[
-            Some(&bind_group_layout),
-            Some(&smoke_render_layout),
-            Some(&camera_bind_group_layout),
-        ],
+        bind_group_layouts: &[Some(&bind_group_layout), Some(&camera_bind_group_layout)],
         immediate_size: 0,
     });
 
@@ -4810,8 +4567,7 @@ async fn run_3d_freq_oscilloscope_snapshot() {
         });
         rp.set_pipeline(&pipeline);
         rp.set_bind_group(0, &uniform_bind_group, &[]);
-        rp.set_bind_group(1, &smoke_render_bind_group, &[]);
-        rp.set_bind_group(2, &camera_bind_group, &[]);
+        rp.set_bind_group(1, &camera_bind_group, &[]);
         rp.set_vertex_buffer(0, grid_vertex_buffer.slice(..));
         rp.set_index_buffer(grid_index_buffer.slice(..), IndexFormat::Uint32);
         rp.draw_indexed(0..grid_index_count, 0, 0..32);
@@ -4980,7 +4736,7 @@ fn test_vis_spectrum_canyon_snapshot() {
         frame_dt: 0.016,
         history_cam_z: 32.0,
         fire_intensity: 1.0,
-        _pad1: 0.0,
+        waveform_history_ring_base: 0,
         _pad2: 0.0,
         _pad3: 0.0,
     };
@@ -5115,16 +4871,6 @@ fn test_vis_spectrum_canyon_snapshot() {
                 },
                 count: None,
             },
-            BindGroupLayoutEntry {
-                binding: 5,
-                visibility: ShaderStages::FRAGMENT,
-                ty: BindingType::Buffer {
-                    ty: BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
         ],
     });
 
@@ -5151,62 +4897,6 @@ fn test_vis_spectrum_canyon_snapshot() {
             BindGroupEntry {
                 binding: 4,
                 resource: dummy_storage.as_entire_binding(),
-            },
-            BindGroupEntry {
-                binding: 5,
-                resource: dummy_storage.as_entire_binding(),
-            },
-        ],
-    });
-
-    let smoke_texture = device.create_texture(&TextureDescriptor {
-        label: Some("Smoke Texture"),
-        size: Extent3d {
-            width: 4,
-            height: 4,
-            depth_or_array_layers: 4,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: TextureDimension::D3,
-        format: TextureFormat::Rgba16Float,
-        usage: TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    });
-    let smoke_view = smoke_texture.create_view(&TextureViewDescriptor::default());
-    let smoke_sampler = device.create_sampler(&SamplerDescriptor::default());
-    let smoke_render_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-        label: Some("Smoke Layout"),
-        entries: &[
-            BindGroupLayoutEntry {
-                binding: 0,
-                visibility: ShaderStages::FRAGMENT,
-                ty: BindingType::Texture {
-                    sample_type: TextureSampleType::Float { filterable: true },
-                    view_dimension: TextureViewDimension::D3,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            BindGroupLayoutEntry {
-                binding: 1,
-                visibility: ShaderStages::FRAGMENT,
-                ty: BindingType::Sampler(SamplerBindingType::Filtering),
-                count: None,
-            },
-        ],
-    });
-    let smoke_bind_group = device.create_bind_group(&BindGroupDescriptor {
-        label: Some("Smoke BG"),
-        layout: &smoke_render_layout,
-        entries: &[
-            BindGroupEntry {
-                binding: 0,
-                resource: BindingResource::TextureView(&smoke_view),
-            },
-            BindGroupEntry {
-                binding: 1,
-                resource: BindingResource::Sampler(&smoke_sampler),
             },
         ],
     });
@@ -5257,11 +4947,7 @@ fn test_vis_spectrum_canyon_snapshot() {
 
     let render_pipeline_layout_3d = device.create_pipeline_layout(&PipelineLayoutDescriptor {
         label: Some("3D Render Pipeline Layout"),
-        bind_group_layouts: &[
-            Some(&bind_group_layout),
-            Some(&smoke_render_layout),
-            Some(&camera_bind_group_layout),
-        ],
+        bind_group_layouts: &[Some(&bind_group_layout), Some(&camera_bind_group_layout)],
         immediate_size: 0,
     });
 
@@ -5428,8 +5114,7 @@ fn test_vis_spectrum_canyon_snapshot() {
         });
         rp.set_pipeline(&pipeline);
         rp.set_bind_group(0, &uniform_bind_group, &[]);
-        rp.set_bind_group(1, &smoke_bind_group, &[]);
-        rp.set_bind_group(2, &camera_bind_group, &[]);
+        rp.set_bind_group(1, &camera_bind_group, &[]);
         rp.set_vertex_buffer(0, box_vertex_buffer.slice(..));
         rp.set_index_buffer(box_index_buffer.slice(..), IndexFormat::Uint32);
         rp.draw_indexed(0..box_index_count, 0, 0..8193);
@@ -5542,8 +5227,7 @@ fn test_vis_spectrum_canyon_snapshot() {
         });
         rp.set_pipeline(&pipeline);
         rp.set_bind_group(0, &uniform_bind_group, &[]);
-        rp.set_bind_group(1, &smoke_bind_group, &[]);
-        rp.set_bind_group(2, &camera_bind_group, &[]);
+        rp.set_bind_group(1, &camera_bind_group, &[]);
         rp.set_vertex_buffer(0, box_vertex_buffer.slice(..));
         rp.set_index_buffer(box_index_buffer.slice(..), IndexFormat::Uint32);
         rp.draw_indexed(0..box_index_count, 0, 0..8193);
@@ -5686,7 +5370,7 @@ fn test_vis_midnight_storm_snapshot() {
         frame_dt: 0.016,
         history_cam_z: 32.0,
         fire_intensity: 1.0,
-        _pad1: 0.0,
+        waveform_history_ring_base: 0,
         _pad2: 0.0,
         _pad3: 0.0,
     };
@@ -5869,4 +5553,787 @@ fn test_vis_midnight_storm_snapshot() {
         "Expected active lightning plasma cores, got only {} bright pixels",
         bright_bolt_pixels
     );
+}
+
+#[test]
+fn test_gpu_video_two_plane_nv12_p010_and_quarter_res_border_blur() {
+    pollster::block_on(async {
+        let instance = Instance::new(InstanceDescriptor {
+            backends: Backends::PRIMARY,
+            flags: InstanceFlags::default(),
+            backend_options: BackendOptions::default(),
+            display: None,
+            memory_budget_thresholds: MemoryBudgetThresholds::default(),
+        });
+        let adapter = instance
+            .request_adapter(&RequestAdapterOptions {
+                power_preference: PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            })
+            .await
+            .expect("GPU adapter required for video test");
+
+        let has_16bit_norm = adapter
+            .features()
+            .contains(Features::TEXTURE_FORMAT_16BIT_NORM);
+        let required_features = if has_16bit_norm {
+            Features::TEXTURE_FORMAT_16BIT_NORM
+        } else {
+            Features::empty()
+        };
+        let (device, queue) = adapter
+            .request_device(&DeviceDescriptor {
+                label: Some("Video 2-Plane GPU Test Device"),
+                required_features,
+                required_limits: Limits::default(),
+                memory_hints: MemoryHints::default(),
+                ..Default::default()
+            })
+            .await
+            .expect("request_device");
+
+        #[repr(C)]
+        #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+        struct TestVideoParams {
+            color_space: u32,
+            color_range: u32,
+            bit_depth: u32,
+            color_trc: u32,
+            viewport_width: f32,
+            viewport_height: f32,
+            video_width: f32,
+            video_height: f32,
+            rotation: u32,
+            chroma_layout: u32,
+            _pad2: f32,
+            _pad3: f32,
+        }
+
+        let video_src = include_str!("../src/shaders/vis_video.wgsl");
+        let shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("vis_video.wgsl"),
+            source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(video_src)),
+        });
+
+        // Bind group layout for quarter-res blur pass (bindings 0..=4)
+        let blur_bgl = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("Blur BGL"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        // Bind group layout for main video pass (bindings 0..=5)
+        let main_bgl = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("Main Video BGL"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 5,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let blur_pl = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Blur PL"),
+            bind_group_layouts: &[Some(&blur_bgl)],
+            immediate_size: 0,
+        });
+        let main_pl = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Main PL"),
+            bind_group_layouts: &[Some(&main_bgl)],
+            immediate_size: 0,
+        });
+
+        let blur_pipe = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("Quarter-Res Border Blur Pipe"),
+            layout: Some(&blur_pl),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(FragmentState {
+                module: &shader,
+                entry_point: Some("fs_border_blur"),
+                targets: &[Some(ColorTargetState {
+                    format: TextureFormat::Rgba8UnormSrgb,
+                    blend: Some(BlendState::REPLACE),
+                    write_mask: ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let main_pipe = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("Main Video Pipe"),
+            layout: Some(&main_pl),
+            vertex: VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(ColorTargetState {
+                    format: TextureFormat::Rgba8UnormSrgb,
+                    blend: Some(BlendState::REPLACE),
+                    write_mask: ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let sampler = device.create_sampler(&SamplerDescriptor {
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            address_mode_u: AddressMode::ClampToEdge,
+            address_mode_v: AddressMode::ClampToEdge,
+            ..Default::default()
+        });
+
+        // Viewport 320x180 (16:9), video 160x160 (1:1 pillarboxed inside 16:9!)
+        let vp_w = 320u32;
+        let vp_h = 180u32;
+        let vid_w = 160u32;
+        let vid_h = 160u32;
+
+        let out_tex = device.create_texture(&TextureDescriptor {
+            label: Some("Video Out"),
+            size: Extent3d {
+                width: vp_w,
+                height: vp_h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8UnormSrgb,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let out_view = out_tex.create_view(&TextureViewDescriptor::default());
+
+        let blur_tex = device.create_texture(&TextureDescriptor {
+            label: Some("Quarter Blur Tex"),
+            size: Extent3d {
+                width: 40,
+                height: 40,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8UnormSrgb,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let blur_view = blur_tex.create_view(&TextureViewDescriptor::default());
+
+        let dummy_v = device.create_texture(&TextureDescriptor {
+            label: Some("Dummy V"),
+            size: Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::R8Unorm,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let dummy_v_view = dummy_v.create_view(&TextureViewDescriptor::default());
+
+        // Helper closure to read back a single RGBA pixel from out_tex
+        let readback_pixel = |px_x: u32, px_y: u32| -> [u8; 4] {
+            let bpr = 320u32.div_ceil(64) * 256; // 1280 (multiple of 256)
+            let rb = device.create_buffer(&BufferDescriptor {
+                label: Some("Video RB"),
+                size: (bpr * vp_h) as u64,
+                usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+            let mut enc = device.create_command_encoder(&CommandEncoderDescriptor::default());
+            enc.copy_texture_to_buffer(
+                TexelCopyTextureInfo {
+                    texture: &out_tex,
+                    mip_level: 0,
+                    origin: Origin3d::ZERO,
+                    aspect: TextureAspect::All,
+                },
+                TexelCopyBufferInfo {
+                    buffer: &rb,
+                    layout: TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(bpr),
+                        rows_per_image: Some(vp_h),
+                    },
+                },
+                Extent3d {
+                    width: vp_w,
+                    height: vp_h,
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.submit(Some(enc.finish()));
+            let sl = rb.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            sl.map_async(MapMode::Read, move |r| tx.send(r).unwrap());
+            let _ = device.poll(PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            });
+            rx.recv().unwrap().unwrap();
+            let mapped = sl.get_mapped_range();
+            let off = (px_y * bpr + px_x * 4) as usize;
+            let rgba = [
+                mapped[off],
+                mapped[off + 1],
+                mapped[off + 2],
+                mapped[off + 3],
+            ];
+            drop(mapped);
+            rb.unmap();
+            rgba
+        };
+
+        // --- CASE A: 2-Plane 8-bit NV12 (R8Unorm + Rg8Unorm, chroma_layout = 1) ---
+        let nv12_y = device.create_texture(&TextureDescriptor {
+            label: Some("NV12 Y"),
+            size: Extent3d {
+                width: vid_w,
+                height: vid_h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::R8Unorm,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let nv12_uv = device.create_texture(&TextureDescriptor {
+            label: Some("NV12 UV"),
+            size: Extent3d {
+                width: vid_w / 2,
+                height: vid_h / 2,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rg8Unorm,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        // Bright saturated cyan-ish video: Y=180, U=170, V=80
+        queue.write_texture(
+            TexelCopyTextureInfo {
+                texture: &nv12_y,
+                mip_level: 0,
+                origin: Origin3d::ZERO,
+                aspect: TextureAspect::All,
+            },
+            &vec![180u8; (256 * vid_h) as usize],
+            TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(256),
+                rows_per_image: Some(vid_h),
+            },
+            Extent3d {
+                width: vid_w,
+                height: vid_h,
+                depth_or_array_layers: 1,
+            },
+        );
+        let mut uv_data = vec![0u8; (256 * (vid_h / 2)) as usize];
+        for pair in uv_data.as_chunks_mut::<2>().0 {
+            *pair = [170, 80];
+        }
+        queue.write_texture(
+            TexelCopyTextureInfo {
+                texture: &nv12_uv,
+                mip_level: 0,
+                origin: Origin3d::ZERO,
+                aspect: TextureAspect::All,
+            },
+            &uv_data,
+            TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(256),
+                rows_per_image: Some(vid_h / 2),
+            },
+            Extent3d {
+                width: vid_w / 2,
+                height: vid_h / 2,
+                depth_or_array_layers: 1,
+            },
+        );
+
+        let params_nv12 = TestVideoParams {
+            color_space: 0, // BT.709
+            color_range: 0, // Limited
+            bit_depth: 8,
+            color_trc: 0,
+            viewport_width: vp_w as f32,
+            viewport_height: vp_h as f32,
+            video_width: vid_w as f32,
+            video_height: vid_h as f32,
+            rotation: 0,
+            chroma_layout: 1, // SemiPlanar420
+            _pad2: 0.0,
+            _pad3: 0.0,
+        };
+        let params_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("VideoParams"),
+            size: std::mem::size_of::<TestVideoParams>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&params_buf, 0, bytemuck::bytes_of(&params_nv12));
+
+        let nv12_y_view = nv12_y.create_view(&TextureViewDescriptor::default());
+        let nv12_uv_view = nv12_uv.create_view(&TextureViewDescriptor::default());
+
+        let blur_bg = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("NV12 Blur BG"),
+            layout: &blur_bgl,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: BindingResource::TextureView(&nv12_y_view),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: BindingResource::TextureView(&nv12_uv_view),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: BindingResource::TextureView(&dummy_v_view),
+                },
+                BindGroupEntry {
+                    binding: 3,
+                    resource: BindingResource::Sampler(&sampler),
+                },
+                BindGroupEntry {
+                    binding: 4,
+                    resource: params_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let main_bg = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("NV12 Main BG"),
+            layout: &main_bgl,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: BindingResource::TextureView(&nv12_y_view),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: BindingResource::TextureView(&nv12_uv_view),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: BindingResource::TextureView(&dummy_v_view),
+                },
+                BindGroupEntry {
+                    binding: 3,
+                    resource: BindingResource::Sampler(&sampler),
+                },
+                BindGroupEntry {
+                    binding: 4,
+                    resource: params_buf.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 5,
+                    resource: BindingResource::TextureView(&blur_view),
+                },
+            ],
+        });
+
+        let mut enc = device.create_command_encoder(&CommandEncoderDescriptor::default());
+        {
+            let mut bp = enc.begin_render_pass(&RenderPassDescriptor {
+                label: Some("Blur Pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &blur_view,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Clear(Color::BLACK),
+                        store: StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            bp.set_pipeline(&blur_pipe);
+            bp.set_bind_group(0, &blur_bg, &[]);
+            bp.draw(0..3, 0..1);
+        }
+        {
+            let mut mp = enc.begin_render_pass(&RenderPassDescriptor {
+                label: Some("Main Pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &out_view,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Clear(Color::BLACK),
+                        store: StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            mp.set_pipeline(&main_pipe);
+            mp.set_bind_group(0, &main_bg, &[]);
+            mp.draw(0..3, 0..1);
+        }
+        queue.submit(Some(enc.finish()));
+
+        let center_nv12 = readback_pixel(160, 90);
+        let pillarbox_nv12 = readback_pixel(20, 90);
+        // Active cyan video center: B > G > R, bright; pillarbox border: dimmed blurred version (>0, <center)!
+        assert!(
+            center_nv12[2] > center_nv12[0] + 40 && center_nv12[1] > 150,
+            "2-Plane NV12 center pixel must decode cyan-ish Rec.709 color, got {center_nv12:?}"
+        );
+        assert!(
+            pillarbox_nv12[1] > 20 && pillarbox_nv12[1] < center_nv12[1],
+            "Quarter-res pre-blurred pillarbox border must be non-black and dimmed relative to active video, got border={pillarbox_nv12:?} vs center={center_nv12:?}"
+        );
+
+        // --- CASE A2: 2-Plane 8-bit NV21 (Rg8Unorm VU, chroma_layout = 2) with 90° rotation ---
+        // Swapping chroma_layout to 2u on the exact same [170, 80] texture interprets V=170, U=80 (warm orange/red: R > B)!
+        let params_nv21_rot90 = TestVideoParams {
+            rotation: 90,
+            chroma_layout: 2, // SemiPlanarVu420 (NV21)
+            ..params_nv12
+        };
+        queue.write_buffer(&params_buf, 0, bytemuck::bytes_of(&params_nv21_rot90));
+        let mut enc_nv21 = device.create_command_encoder(&CommandEncoderDescriptor::default());
+        {
+            let mut bp = enc_nv21.begin_render_pass(&RenderPassDescriptor {
+                label: Some("NV21 Blur Pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &blur_view,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Clear(Color::BLACK),
+                        store: StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            bp.set_pipeline(&blur_pipe);
+            bp.set_bind_group(0, &blur_bg, &[]);
+            bp.draw(0..3, 0..1);
+        }
+        {
+            let mut mp = enc_nv21.begin_render_pass(&RenderPassDescriptor {
+                label: Some("NV21 Main Pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &out_view,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Clear(Color::BLACK),
+                        store: StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            mp.set_pipeline(&main_pipe);
+            mp.set_bind_group(0, &main_bg, &[]);
+            mp.draw(0..3, 0..1);
+        }
+        queue.submit(Some(enc_nv21.finish()));
+        let center_nv21 = readback_pixel(160, 90);
+        let pillarbox_nv21 = readback_pixel(60, 90);
+        assert!(
+            center_nv21[0] > center_nv21[2] + 40,
+            "2-Plane NV21 (chroma_layout=2) must decode VU pair (R > B), got {center_nv21:?}"
+        );
+        assert!(
+            pillarbox_nv21[0] > pillarbox_nv21[2] && pillarbox_nv21[0] < center_nv21[0],
+            "90°-rotated NV21 pre-blurred pillarbox border must preserve warm hue and dim cleanly, got border={pillarbox_nv21:?} vs center={center_nv21:?}"
+        );
+
+        // --- CASE B: 2-Plane 10-bit P010 (R16Unorm + Rg16Unorm, bit_depth = 16, neutral 512<<6 chroma) ---
+        if has_16bit_norm {
+            let p010_y = device.create_texture(&TextureDescriptor {
+                label: Some("P010 Y"),
+                size: Extent3d {
+                    width: vid_w,
+                    height: vid_h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: TextureFormat::R16Unorm,
+                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let p010_uv = device.create_texture(&TextureDescriptor {
+                label: Some("P010 UV"),
+                size: Extent3d {
+                    width: vid_w / 2,
+                    height: vid_h / 2,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: TextureFormat::Rg16Unorm,
+                usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let mut y16 = vec![0u8; (512 * vid_h) as usize];
+            for w in y16.as_chunks_mut::<2>().0 {
+                *w = (512u16 << 6).to_le_bytes();
+            }
+            let mut uv16 = vec![0u8; (512 * (vid_h / 2)) as usize];
+            for uv in uv16.as_chunks_mut::<4>().0 {
+                let neutral = (512u16 << 6).to_le_bytes();
+                uv[0..2].copy_from_slice(&neutral);
+                uv[2..4].copy_from_slice(&neutral);
+            }
+            queue.write_texture(
+                TexelCopyTextureInfo {
+                    texture: &p010_y,
+                    mip_level: 0,
+                    origin: Origin3d::ZERO,
+                    aspect: TextureAspect::All,
+                },
+                &y16,
+                TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(512),
+                    rows_per_image: Some(vid_h),
+                },
+                Extent3d {
+                    width: vid_w,
+                    height: vid_h,
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.write_texture(
+                TexelCopyTextureInfo {
+                    texture: &p010_uv,
+                    mip_level: 0,
+                    origin: Origin3d::ZERO,
+                    aspect: TextureAspect::All,
+                },
+                &uv16,
+                TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(512),
+                    rows_per_image: Some(vid_h / 2),
+                },
+                Extent3d {
+                    width: vid_w / 2,
+                    height: vid_h / 2,
+                    depth_or_array_layers: 1,
+                },
+            );
+
+            let params_p010 = TestVideoParams {
+                bit_depth: 16,
+                ..params_nv12
+            };
+            queue.write_buffer(&params_buf, 0, bytemuck::bytes_of(&params_p010));
+
+            let p010_y_view = p010_y.create_view(&TextureViewDescriptor::default());
+            let p010_uv_view = p010_uv.create_view(&TextureViewDescriptor::default());
+            let p010_main_bg = device.create_bind_group(&BindGroupDescriptor {
+                label: Some("P010 Main BG"),
+                layout: &main_bgl,
+                entries: &[
+                    BindGroupEntry {
+                        binding: 0,
+                        resource: BindingResource::TextureView(&p010_y_view),
+                    },
+                    BindGroupEntry {
+                        binding: 1,
+                        resource: BindingResource::TextureView(&p010_uv_view),
+                    },
+                    BindGroupEntry {
+                        binding: 2,
+                        resource: BindingResource::TextureView(&dummy_v_view),
+                    },
+                    BindGroupEntry {
+                        binding: 3,
+                        resource: BindingResource::Sampler(&sampler),
+                    },
+                    BindGroupEntry {
+                        binding: 4,
+                        resource: params_buf.as_entire_binding(),
+                    },
+                    BindGroupEntry {
+                        binding: 5,
+                        resource: BindingResource::TextureView(&blur_view),
+                    },
+                ],
+            });
+            let mut enc = device.create_command_encoder(&CommandEncoderDescriptor::default());
+            {
+                let mut mp = enc.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("P010 Main Pass"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view: &out_view,
+                        resolve_target: None,
+                        ops: Operations {
+                            load: LoadOp::Clear(Color::BLACK),
+                            store: StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                mp.set_pipeline(&main_pipe);
+                mp.set_bind_group(0, &p010_main_bg, &[]);
+                mp.draw(0..3, 0..1);
+            }
+            queue.submit(Some(enc.finish()));
+
+            let center_p010 = readback_pixel(160, 90);
+            // Neutral 10-bit (512<<6) chroma must render neutral grey (|R-G| <= 2, |G-B| <= 2) with zero green/magenta bias!
+            assert!(
+                center_p010[0].abs_diff(center_p010[1]) <= 2
+                    && center_p010[1].abs_diff(center_p010[2]) <= 2
+                    && center_p010[0] > 100,
+                "2-Plane 10-bit P010 neutral (512<<6) chroma must render neutral grey without tint, got {center_p010:?}"
+            );
+        }
+    });
 }

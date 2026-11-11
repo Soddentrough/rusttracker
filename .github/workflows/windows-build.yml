@@ -34,7 +34,6 @@ jobs:
           mingw-w64-x86_64-ffmpeg
           mingw-w64-x86_64-clang
           mingw-w64-x86_64-pkgconf
-          mingw-w64-x86_64-python
           
     - name: Build RustTracker
       env:
@@ -46,7 +45,6 @@ jobs:
         CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
         CARGO_PROFILE_RELEASE_STRIP: "true"
       run: |
-        python3 scripts/patch_msys2_headers.py "$MINGW_PREFIX/include"
         cargo build --release
         objdump -h target/release/rusttracker.exe | grep -q '\.rsrc'
         
@@ -54,6 +52,7 @@ jobs:
       run: |
         mkdir release
         cp target/release/rusttracker.exe release/rusttracker.exe
+        cp LICENSE THIRD_PARTY_NOTICES.txt release/
         mkdir -p release/assets
         cp assets/soundfont.sf2 release/assets/soundfont.sf2
         # Automatically resolve and copy all required MSYS2 DLLs (including FFmpeg transitive dependencies)

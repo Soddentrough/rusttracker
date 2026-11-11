@@ -1,17 +1,15 @@
-pub mod audio;
-pub mod bitstream;
-pub mod engine;
-pub mod ipc;
-pub mod iso;
-pub mod lyrics;
-pub mod mpegh;
-pub mod playlist;
-pub mod state;
-pub mod touch;
+#[cfg(target_os = "android")]
+pub use rt_core::android_log;
+pub use rt_core::{biquad, devices, ipc, lyrics, playlist, state, touch};
+
+pub use rt_decode::{android_video, iso, mpegh, openmpt_ffi};
+
+pub use rt_audio::{audio, bitstream};
+
+pub use rt_render::engine;
+
 #[cfg(not(target_os = "android"))]
-pub mod ui;
+pub use rt_tui::ui;
 
 #[cfg(target_os = "android")]
 pub mod android;
-#[cfg(target_os = "android")]
-pub mod android_video;

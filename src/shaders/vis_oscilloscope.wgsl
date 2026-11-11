@@ -4,13 +4,18 @@
 var<uniform> audio: AudioUniforms;
 
 @group(0) @binding(1)
-var<storage, read> waveform_history: array<f32>;
+var<storage, read> waveform_history: array<u32>;
+
+fn read_waveform_f16(flat_idx: u32) -> f32 {
+    return read_waveform_f16_from_word(waveform_history[flat_idx >> 1u], flat_idx & 1u);
+}
 
 // Waveforms are pre-smoothed on CPU, so we can read directly
 fn get_waveform(hist_idx: u32, idx: u32) -> f32 {
     let res = max(audio.waveform_resolution, 128u);
     let clamped_idx = min(idx, res - 1u);
-    return waveform_history[hist_idx * 2048u + clamped_idx];
+    let phys_row = (audio.waveform_history_ring_base + hist_idx) % 144u;
+    return read_waveform_f16(phys_row * 2048u + clamped_idx);
 }
 
 // Returns vec3(min_dist, screen_space_slope_dy_dx, y_at_u) with resolution-invariant strided search

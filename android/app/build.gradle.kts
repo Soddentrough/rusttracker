@@ -3,6 +3,29 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
+@DisableCachingByDefault(because = "Syncing two small text files locally is faster than cache lookup")
+abstract class SyncLicenseAssetsTask : DefaultTask() {
+    @get:InputFiles
+    @get:PathSensitive(PathSensitivity.RELATIVE)
+    abstract val licenseFiles: ConfigurableFileCollection
+
+    @get:OutputDirectory
+    abstract val outputDir: DirectoryProperty
+
+    @get:Inject
+    abstract val fileSystemOperations: FileSystemOperations
+
+    @TaskAction
+    fun sync() {
+        fileSystemOperations.sync {
+            from(licenseFiles)
+            into(outputDir)
+        }
+    }
+}
+
+val syncLicenseAssets = tasks.register("syncLicenseAssets")
+
 android {
     namespace = "com.rusttracker.app"
     compileSdk = 35
@@ -50,6 +73,23 @@ android {
             jniLibs.srcDirs("src/main/jniLibs")
             assets.srcDirs("src/main/assets")
         }
+    }
+}
+
+androidComponents {
+    onVariants { variant ->
+        val capName = variant.name.replaceFirstChar { it.uppercase() }
+        val variantSyncTask = tasks.register<SyncLicenseAssetsTask>("sync${capName}LicenseAssets") {
+            val rootDir = rootProject.projectDir.parentFile
+            licenseFiles.from(File(rootDir, "LICENSE"), File(rootDir, "THIRD_PARTY_NOTICES.txt"))
+        }
+        syncLicenseAssets.configure {
+            dependsOn(variantSyncTask)
+        }
+        variant.sources.assets?.addGeneratedSourceDirectory(
+            variantSyncTask,
+            SyncLicenseAssetsTask::outputDir
+        )
     }
 }
 

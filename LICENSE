@@ -235,3 +235,23 @@ You should also get your employer (if you work as a programmer) or school, if an
 
 The GNU General Public License does not permit incorporating your program into proprietary programs. If your program is a subroutine library, you may consider it more useful to permit linking proprietary applications with the library. If this is what you want to do, use the GNU Lesser General Public License instead of this License. But first, please read <https://www.gnu.org/philosophy/why-not-lgpl.html>.
 
+===============================================================================
+Additional Permission Under GNU GPL Version 3 Section 7 (`libmpeghe` Exception)
+===============================================================================
+
+As a special exception under Section 7 of the GNU General Public License
+version 3, the copyright holders of RustTracker grant you additional permission
+to compile, link (statically or dynamically), and convey the Program in
+combination with the `libmpeghe` MPEG-H 3D Audio encoder library located in
+`third_party/libmpeghe` (licensed by Ittiam Systems Pvt. Ltd. under the
+BSD-3-Clause-Clear license and `LICENSE2` notice), and to convey the resulting
+executable works, provided that:
+  1. All other components of the Corresponding Source are conveyed in
+     compliance with the GNU General Public License version 3 (or later); and
+  2. Binary distributions reproduce the `libmpeghe` `LICENSE` and `LICENSE2`
+     notices (as provided in `THIRD_PARTY_NOTICES.txt`).
+
+If you modify RustTracker, you may extend this Additional Permission to your
+version of the Program, but you are not obligated to do so. If you do not wish
+to do so, delete this Additional Permission statement from your version (and
+remove `third_party/libmpeghe` if distributing combined binaries).

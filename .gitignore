@@ -36,6 +36,7 @@ audio_tests/
 *.log
 gdb_output.txt
 *.txt
+!THIRD_PARTY_NOTICES.txt
 gpubench_results_*.json
 
 # Scratch / Temp files

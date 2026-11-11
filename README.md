@@ -4,22 +4,22 @@
 
 A high-performance, real-time audio visualizer, video player, and tracker module player built in Rust with Vulkan/WGPU hardware acceleration.
 
-RustTracker leverages a **3-Thread DSP Architecture** and **Hardware-Accelerated Compute Shaders** to deliver ultra-low-latency playback and multi-channel spatial audio analysis at **2,000+ FPS**.
+RustTracker pairs a **multi-threaded audio/video/DSP pipeline** (dedicated demux/audio decode, optional video decode, lock-free real-time audio output, FFT/DSP analysis, and WGPU render threads) with **hardware-accelerated compute and fragment shaders**, pacing cleanly to your display refresh rate by default (with `--uncapped` available for uncapped GPU benchmarking).
 
 ---
 
 ## 🚀 Features
 
-* **21 Hardware Visualizers:** Cinematic WGPU compute and fragment shaders mapped tightly to acoustic frequencies (Ferrofluid, 3D Fire, 3D Synthwave Racer, 3D VU Meter Rack, 3D Glass Water Lyrics, Water Splash, CRT Oscilloscope, Bioluminescence, Neon Corridor, Matrix Rain, and more).
+* **19 Hardware Visualizers (16 in Default Rotation):** Cinematic WGPU compute and fragment shaders mapped to real-time acoustic frequencies (`Quantum FLIP Ferrofluid`, `Acoustic Glass Water Chamber`, `3D Glass Water Lyrics`, `Prismatic Spectrum Canyon`, `Synthwave 3D Racer`, `Synthwave Terrain`, `Retro VU Meters`, `Bioluminescent Waves`, `Neon Spatial Room`, `Midnight Storm`, `Solar Flare`, `Fire Simulation`, `Retro Fire`, `CRT Oscilloscope`, `3D Oscilloscope`, `Strings`, `Retro Tape Head`, `Studio LED Spectrum`, and `Frequency Spectrum`).
 * **Multi-Platform Support:** Native support for **Linux (Fedora/RHEL & Ubuntu/Debian)**, **Android (Mobile & Tablet)**, **Windows 10/11**, **macOS**, and **Steam Deck (Gaming Mode)**.
 * **Universal Media Playback:**
-  * **Tracker Modules:** `.MOD`, `.S3M`, `.IT`, `.XM` with real-time piano-roll pattern editor and synchronized channel VU meters.
+  * **Tracker Modules:** `.MOD`, `.S3M`, `.IT`, `.XM` with real-time tracker pattern viewer and synchronized channel VU meters.
   * **Lossless & Compressed Audio:** FLAC, WAV, MP3, AAC, OGG, Opus, AIFF.
-  * **Video Playback & Multi-Track Audio:** MP4, MKV, AVI, WebM with hardware-accelerated video decoding, HDR color spaces, and instant switching between multiple audio tracks (e.g., Vocals, Instrumental, Stems, Dubs).
-  * **Bitstream Passthrough:** Real-time SPDIF/HDMI bitstream passthrough for Dolby Atmos, DTS-HD, and TrueHD.
+  * **Video Playback & Multi-Track Audio:** MP4, MKV, AVI, WebM with hardware-accelerated video decoding, HDR10/HLG tonemapping to SDR, and instant switching between multiple audio tracks (e.g., Vocals, Instrumental, Stems, Dubs).
+  * **Bitstream Passthrough:** Real-time SPDIF/HDMI bitstream passthrough for Dolby Atmos, DTS-HD, and TrueHD on Linux (PipeWire/ALSA) and Windows (WASAPI Exclusive).
   * **Live Microphone Input:** Instant audio-reactive capture via `--mic`.
 * **Synchronized Lyrics & Heatmap:** Embedded and LRC synchronized lyrics with real-time heatmaps and 3D vector TrueType glyph extrusion.
-* **Intuitive Touch & Gamepad Controls:** Tailored touch gestures for mobile screens and native controller mapping for Steam Deck / Gamepads.
+* **Intuitive Touch & Gamepad Controls:** Tailored touch gestures for mobile and touchscreen displays, plus native controller mapping for Steam Deck / Gamepads.
 
 ---
 
@@ -37,7 +37,7 @@ RustTracker leverages a **3-Thread DSP Architecture** and **Hardware-Accelerated
 
 ## 🖥️ Terminal UI Mode (`--tui`)
 
-Launch RustTracker directly in any terminal with `--tui` for a headless, zero-GPU-overhead studio interface featuring multi-column dBFS channel VU meters, interactive tracker pattern / synced lyrics / spectrogram heatmap / surround EQ views, a 128-band logarithmic spectrum analyzer, and full keyboard + mouse controls:
+Launch RustTracker directly in any terminal with `--tui` for a headless, zero-GPU-overhead studio interface featuring multi-column dBFS channel VU meters, real-time tracker pattern viewer, synced lyrics, spectrogram heatmap, interactive surround EQ controls, a 128-band logarithmic spectrum analyzer, and full keyboard + mouse controls:
 
 ```bash
 rusttracker audio_tests/ive_got_the_power.mod --tui
@@ -52,6 +52,7 @@ rusttracker audio_tests/ive_got_the_power.mod --tui
 | **Prev / Next Track** | `P` / `N` |
 | **Cycle Top-Center View** (`Lyrics` ➔ `Tracker Pattern` ➔ `Heatmap` ➔ `Surround EQ`) | `V` / `Tab` or **Click Center Panel** |
 | **Toggle Surround Upmix / 7.1.4 MPEG-H / Reset EQ** | `U` (or `E`) / `M` (in EQ view) / `R` (in EQ view) |
+| **Toggle Bitstream Passthrough** *(Linux / Windows)* | `B` |
 | **Volume / Mute** | `+` / `-` (or **Mouse Scroll Wheel**) / `M` |
 | **Solo Audio Track / Restore Multi-Track Mix** | `1` – `9` |
 | **Audio Input / Output Device Picker** | `D` |
@@ -60,9 +61,9 @@ rusttracker audio_tests/ive_got_the_power.mod --tui
 
 ---
 
-## 📱 Mobile Gestures (Android)
+## 📱 Touch Gestures (Android & Touchscreens)
 
-RustTracker features a specialized dual-pane interface optimized for mobile and tablet displays:
+RustTracker features a specialized dual-pane touch interface optimized for mobile and tablet displays, with bottom-edge timeline touch-scrubbing also active on desktop and Steam Deck touchscreens:
 
 ### Portrait Mode (Two-Pane Layout)
 * **Top Pane (Upper 50% — HUD / Track / Video):**
@@ -72,16 +73,17 @@ RustTracker features a specialized dual-pane interface optimized for mobile and 
 * **Bottom Pane (Lower 50% — Real-Time Visualizer):**
   * **Swipe Left / Right:** Switch to next / previous visualizer module.
 * **Bottom Scrubber Edge (Bottom 12%):**
-  * **Touch & Drag:** Real-time interactive timeline seeking across track duration.
+  * **Touch & Drag:** Real-time timeline seeking across track duration *(Android, Steam Deck, and desktop touchscreens)*.
 
 ### Landscape Mode (Full-Screen Visualizer)
 * **Swipe Left / Right:** Switch visualizers.
 * **Swipe Up / Down:** Rotate HUD overlays (`Channels`, `Heatmap / Lyrics`, `Track Info`, `Video`).
 
-### Universal Gestures (Both Orientations)
+### Universal Gestures (Android, Both Orientations)
 * **Single Tap:** **Play / Pause** toggle *(or tap top-right `[📂 OPEN]` for system file picker)*.
 * **Double Tap:** Toggle **HUD Visibility** (`HUD: Visible` / `HUD: Hidden`).
 * **Two-Finger Tap:** **Cycle Audio Track** on multi-track media files.
+* **Three-Finger Tap:** Toggle **Engine Performance Stats** (`Engine Stats: Visible` / `Hidden`).
 
 ---
 
@@ -89,19 +91,20 @@ RustTracker features a specialized dual-pane interface optimized for mobile and 
 
 | Action | Desktop Key | Gamepad (Xbox / Steam Deck) |
 | :--- | :--- | :--- |
-| **Play / Pause** *(or Open File on Splash)* | `Space` | `A` (`South`) |
+| **Play / Pause** | `Space` | `A` (`South`) *(or Open File on Splash)* |
 | **Open File Dialog** | `O` | `Y` (`North`) *(or `A` on Splash Screen)* |
 | **Toggle Performance Stats** | `S` | `B` (`East`) *(also closes modals)* |
 | **Toggle Video / Cycle View Mode** | `V` | `X` (`West`) |
-| **Prev / Next Track** *(or ±60s seek)* | `P` / `N` | `L1` / `R1` (`Left / Right Bumper`) |
-| **Seek Backward / Forward** | `Left` / `Right` Arrow (`Shift` ±30s, `Ctrl`/`⌘` ±60s) | `D-Pad Left` / `D-Pad Right` (±10s) or `L2` / `R2` (analog scrub) |
+| **Prev / Next Track** | `P` / `N` | `L1` / `R1` (`Left / Right Bumper`, or ±60s seek) |
+| **Seek Backward / Forward** | `Left` / `Right` Arrow (±5s, `Shift` ±30s, `Ctrl`/`⌘` ±60s) | `D-Pad Left` / `D-Pad Right` (±10s) or `L2` / `R2` (analog scrub) |
 | **Step Frame Backward / Forward** | `,` / `.` | — |
-| **Prev / Next Visualizer** | `Up` / `Down` Arrow | `D-Pad Up` / `D-Pad Down` |
+| **Cycle Visualizer** | `Up` / `Down` Arrow | `D-Pad Up` / `D-Pad Down` |
 | **Visualizer Picker Popup** | `M` | — |
-| **Toggle HUD Visibility** | `Tab` | `L2` (`Left Trigger`) |
-| **Toggle GPU Compute FFT** | `G` | `R2` (`Right Trigger`) |
+| **Toggle HUD Visibility** | `Tab` | `L3` (`Left Stick Click`) |
+| **Toggle Surround Upmix** | `U` (or `E`) | `R3` (`Right Stick Click`) |
 | **Resize HUD / Visualizer Split** | `[` / `]` | `Left Stick` or `Right Stick` (Up / Down) |
-| **Select Audio Track (1–9)** | `1` – `9` | — |
+| **Select / Solo Audio Track or Restore Mix (1–9)** | `1` – `9` | — |
+| **Toggle Camera Mode** *(Bioluminescent Waves)* | `C` | — |
 | **Toggle Keyboard / Gamepad Help** | `H` | — |
 | **Fullscreen Toggle** | `F` | `Start` |
 | **Quit** | `Ctrl+Q` / `⌘Q` or `Escape` | `Select / View` |
@@ -111,19 +114,26 @@ RustTracker features a specialized dual-pane interface optimized for mobile and 
 ## ⚙️ Command-Line Options & Environment Variables
 
 ### Command-Line Flags
-* **`--tui`**: Launch in terminal UI (TUI) spectrum analyzer and tracker mode.
-* **`--mic`**: Capture live microphone input instead of playing a file.
-* **`--vis <id>`**: Start directly on the specified hardware visualizer ID.
-* **`--uncapped`**: Disable VSync/refresh-rate pacing and run at uncapped hardware frame rates (`Immediate` present mode).
-* **`--bench [frames]`**: Run automated benchmark loop for a given frame count (default `300`) with GPU timestamp profiling enabled.
-* **`--fullscreen` / `--windowed`**: Force fullscreen or windowed startup mode.
+* **`--tui`**: Launch in terminal UI (TUI) spectrum analyzer and tracker viewer mode.
+* **`--mic`**: Capture live microphone/line-in audio instead of playing a file.
+* **`--vis <id|name>`**: Start directly on the specified hardware visualizer ID or name (or pass bare `--vis` / `--vis list` to list visualizers and exit).
+* **`--list-vis`**: List all 19 available hardware visualizers (IDs, names, and descriptions) and exit.
+* **`--stereo`**: Force 2.0 stereo downmix output even on multi-channel hardware endpoints.
+* **`--passthrough`**: Enable compressed SPDIF/HDMI bitstream passthrough (AC-3, E-AC-3/Atmos, DTS-HD, TrueHD) on Linux and Windows.
+* **`--surround-upmix`** / **`--no-surround-upmix`** *(aliases `--upmix` / `--no-upmix`)*: Enable (default) or disable automatic surround/height upmixing when >2ch hardware output is available.
+* **`--mpegh`** / **`--no-mpegh`** *(alias `--mpegh-714`)*: Enable (default) or disable 7.1.4 (11.1) MPEG-H 3D Audio HDMI bitstream encoding on >8ch capable Linux (PipeWire) and Windows (WASAPI Exclusive fallback) endpoints.
+* **`--fullscreen`** / **`--windowed`**: Force fullscreen or windowed startup mode (mutually exclusive).
+* **`--uncapped`**: Disable VSync/refresh-rate pacing and run at uncapped hardware frame rates (`AutoNoVsync` / `Immediate` present mode).
+* **`--bench [frames]`**: Run automated benchmark loop for a given frame count (default `300` when omitted) with GPU timestamp profiling enabled.
 * **`--register-steam`**: Headlessly register or update **RustTracker** in Steam's `shortcuts.vdf`, provision all SteamOS Home Screen & Library artwork (`config/grid/` and `appcache/librarycache/`), restart `steam-launcher.service` if active, and exit (ideal for one-step SSH deployment).
 
 ### Environment Variables
 * **`RUSTTRACKER_FPS_LIMIT=<fps>`**: Set an explicit software framerate cap (e.g. `RUSTTRACKER_FPS_LIMIT=120`). By default, RustTracker paces to the active display refresh rate (or VSync).
 * **`RUSTTRACKER_PROFILE=1`**: Enables GPU hardware timestamp profiling (`wgpu::Features::TIMESTAMP_QUERY`) in the Stats overlay (`S` key) to measure exact per-shader microsecond timings.
-* **`RUSTTRACKER_PRESENT_MODE=<fifo|mailbox|immediate>`**: Override the WGPU surface present mode.
+* **`RUSTTRACKER_PRESENT_MODE=<fifo|fiforelaxed|mailbox|immediate>`**: Override the WGPU surface present mode.
 * **`RUSTTRACKER_PIPELINE_CACHE=0`**: Disable on-disk Vulkan/WGPU pipeline cache loading and saving.
+* **`RUSTTRACKER_CACHE_DIR=<path>`**: Override the directory where compiled WGPU pipeline caches (`pipeline_cache_<key>.bin`) are stored.
+* **`RUSTTRACKER_WAYLAND=0`** / **`RUSTTRACKER_X11=1`**: Force the X11/XWayland display backend on Linux. By default, RustTracker uses the native **Wayland** backend whenever `WAYLAND_DISPLAY` is active and falls back to X11 when `WAYLAND_DISPLAY` is absent (set `RUSTTRACKER_X11=1` or `RUSTTRACKER_WAYLAND=0` if you specifically need X11/XWayland windowing).
 
 ---
 
@@ -205,5 +215,7 @@ cd android && ./gradlew assembleRelease
 
 ## 📜 License
 
-This project is licensed under the [GNU General Public License v3.0](LICENSE) (GPLv3).
+This project is licensed under the **[GNU General Public License v3.0 or later](LICENSE)** (`GPL-3.0-or-later`) with a **GNU GPLv3 Section 7 Additional Permission (Linking Exception)** for `libmpeghe`:
 
+* **`libmpeghe` (`third_party/libmpeghe`):** Licensed by Ittiam Systems Pvt. Ltd. under `BSD-3-Clause-Clear` ([`LICENSE`](third_party/libmpeghe/LICENSE) and [`LICENSE2`](third_party/libmpeghe/LICENSE2)). Under Section 7 of GNU GPLv3, RustTracker's copyright holders grant explicit additional permission to link and convey RustTracker alongside `libmpeghe`, provided binary distributions include [`THIRD_PARTY_NOTICES.txt`](THIRD_PARTY_NOTICES.txt) reproducing Ittiam's `LICENSE` and `LICENSE2` notices. Note that `libmpeghe` explicitly grants no third-party patent licenses; commercial or patent-restricted deployments should evaluate applicable MPEG-H 3D Audio patent licensing independently.
+* **Third-Party Bundled Libraries (`FFmpeg`, `libopenmpt`):** Standalone redistributables (Windows installer, macOS `.dmg`, SteamOS `.AppImage`, and Android `.apk`) bundle [`THIRD_PARTY_NOTICES.txt`](THIRD_PARTY_NOTICES.txt). When redistributing standalone bundles containing FFmpeg (`LGPL-2.1-or-later`, or `GPL-3.0-or-later` if built with `--enable-gpl`), retain [`LICENSE`](LICENSE) and [`THIRD_PARTY_NOTICES.txt`](THIRD_PARTY_NOTICES.txt), avoid `--enable-nonfree` FFmpeg builds, and preserve dynamic library replaceability (or provide corresponding FFmpeg source archives matching the bundled version).

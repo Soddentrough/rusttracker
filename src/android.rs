@@ -337,6 +337,7 @@ struct AndroidRustTrackerApp {
     touch_controller: TouchGestureController,
     active_stream: Option<crate::audio::PlaybackHandle>,
     last_frame_time: Instant,
+    last_touch_scrub_seek: Instant,
     frame_dt_ring: [f32; 60],
     frame_dt_idx: usize,
     display_refresh_hz: f32,
@@ -481,6 +482,7 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
         eprintln!("[RustTracker] Android Lifecycle: Suspended");
         self.is_suspended = true;
         self.touch_controller.reset();
+        self.app_state.lock().unwrap().cancel_touch_scrub();
         if let Some(ref mut eng) = self.engine {
             eng.suspend_surface();
         }
@@ -554,12 +556,17 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                 }
             }
             WindowEvent::Touch(touch) => {
-                let modal_open = {
+                let (modal_open, already_touch_scrubbing) = {
                     let st = self.app_state.lock().unwrap();
-                    st.is_url_dialog_open || st.show_vis_picker
+                    (
+                        st.is_url_dialog_open || st.show_vis_picker,
+                        st.is_touch_scrubbing,
+                    )
                 };
-                if modal_open {
+                if modal_open || (self.egui_ctx.egui_is_using_pointer() && !already_touch_scrubbing)
+                {
                     self.touch_controller.reset();
+                    self.app_state.lock().unwrap().cancel_touch_scrub();
                 } else {
                     let size = win.inner_size();
                     let scale_factor = (win.scale_factor() as f32).max(1.0);
@@ -582,7 +589,15 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                         is_portrait,
                         split_y,
                     ) {
-                        eprintln!("[RustTracker Touch] Detected gesture: {:?}", gesture);
+                        if !matches!(gesture, TouchGesture::Scrub { .. }) {
+                            eprintln!("[RustTracker Touch] Detected gesture: {:?}", gesture);
+                        }
+                        let redraw_needed = matches!(
+                            gesture,
+                            TouchGesture::Scrub { .. }
+                                | TouchGesture::ScrubEnd
+                                | TouchGesture::ScrubCancel
+                        );
                         if let Some(EngineAction::OpenFile) = Self::handle_gesture_static(
                             &self.app_state,
                             gesture,
@@ -590,9 +605,12 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                             size.width as f32,
                             size.height as f32,
                             scale_factor,
+                            &mut self.last_touch_scrub_seek,
                         ) {
                             self.touch_controller.reset();
                             trigger_android_file_picker(&self.android_app);
+                        } else if redraw_needed {
+                            win.request_redraw();
                         }
                     }
                 }
@@ -639,6 +657,7 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                             size.width as f32,
                             size.height as f32,
                             scale_factor,
+                            &mut self.last_touch_scrub_seek,
                         )
                     {
                         self.touch_controller.reset();
@@ -673,6 +692,7 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                                 state.raw_spectrum_data.fill(0.0);
                                 state.spectrum_data.fill(0.0);
                                 state.fire_heat.fill(0.0);
+                                state.sync_rt_control();
                             }
                             FilePickerEvent::Selected(path) => {
                                 latest_selected_path = Some(path);
@@ -691,6 +711,7 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                 // Check for audio device reconnect / track ended / playlist auto-advance / pending load requests
                 let (pending_load, resume_pos_on_reload) = {
                     let mut state = self.app_state.lock().unwrap();
+                    state.sync_rt_control();
                     let mut resume_pos_on_reload: Option<f64> = None;
                     if state.audio_device_lost {
                         state.audio_device_lost = false;
@@ -728,7 +749,7 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                         };
                         if !reload.is_empty() {
                             if is_mic && !state.playlist.is_empty() {
-                                state.playlist[0] = reload.clone();
+                                std::sync::Arc::make_mut(&mut state.playlist)[0] = reload.clone();
                             }
                             state.load_request = Some(reload);
                             state.surround_upmix.user_overridden = false;
@@ -755,6 +776,7 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                     if resume_pos_on_reload.is_none() && state.load_request.is_some() {
                         state.surround_upmix.user_overridden = false;
                     }
+                    state.sync_rt_control();
                     (state.load_request.take(), resume_pos_on_reload)
                 };
                 if let Some(load_path) = pending_load {
@@ -766,6 +788,7 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                         state.current_seconds = pos;
                         state.seek_request = Some(pos);
                         state.seek_epoch += 1;
+                        state.sync_rt_control();
                     }
                 }
 
@@ -795,6 +818,15 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                     let time_scale = (dt * 60.0).clamp(0.2, 5.0);
 
                     if state.file_loaded {
+                        if state.is_paused || state.track_ended {
+                            state.raw_channel_vus.fill(0.0);
+                            state.raw_spectrum_data.fill(0.0);
+                            if state.gpu_spectrum_data.iter().any(|&v| v != 0.0) {
+                                state.gpu_spectrum_data.fill(0.0);
+                                state.waveform_history_push_count =
+                                    state.waveform_history_push_count.wrapping_add(1);
+                            }
+                        }
                         // VU decay
                         if state.channel_vus.len() != state.raw_channel_vus.len() {
                             state.channel_vus = vec![0.0; state.raw_channel_vus.len()];
@@ -853,6 +885,7 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
 
                     // OSD timer
                     state.tick_osd_timer(dt);
+                    state.sync_rt_control();
 
                     // Upload GPU uniforms
                     eng.update(&state, dt);
@@ -897,7 +930,8 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                                 state.stats.shader_us = state.stats.shader_us * 0.9 + vis * 0.1;
                             }
                             if let Some(ft) = fft_time {
-                                state.stats.gpu_fft_us = state.stats.gpu_fft_us * 0.9 + ft * 0.1;
+                                state.stats.gpu_compute_us =
+                                    state.stats.gpu_compute_us * 0.9 + ft * 0.1;
                             }
                             let post_us = post_timer.elapsed().as_micros() as f32;
                             state.stats.phase_lock_update_us =
@@ -926,11 +960,11 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                                     let is_mic = self.app_state.lock().unwrap().is_mic_input;
                                     if append && !is_mic {
                                         let mut state = self.app_state.lock().unwrap();
-                                        state.playlist.extend(files);
+                                        std::sync::Arc::make_mut(&mut state.playlist).extend(files);
                                     } else {
                                         self.load_and_play_file(&files[0]);
                                         let mut state = self.app_state.lock().unwrap();
-                                        state.playlist = files;
+                                        state.playlist = std::sync::Arc::new(files);
                                         state.playlist_index = 0;
                                     }
                                 }
@@ -949,6 +983,17 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                                 let target = (state.duration_seconds * pct as f64)
                                     .clamp(0.0, state.duration_seconds);
                                 state.scrub_target_seconds = Some(target);
+                                if delta == 0.0
+                                    && state.duration_seconds > 0.0
+                                    && self.last_touch_scrub_seek.elapsed()
+                                        >= std::time::Duration::from_millis(80)
+                                    && (target - state.current_seconds).abs() > 0.25
+                                {
+                                    state.seek_request = Some(target);
+                                    state.current_seconds = target;
+                                    state.track_ended = false;
+                                    self.last_touch_scrub_seek = Instant::now();
+                                }
                                 if delta != 0.0 {
                                     if state.osd_timer > 0.0
                                         && state
@@ -975,18 +1020,23 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                             }
                             EngineAction::ScrubEnd => {
                                 let mut state = self.app_state.lock().unwrap();
-                                state.scrub_target_seconds = None;
+                                state.finish_touch_scrub();
                             }
                             EngineAction::Seek(pct) => {
                                 let mut state = self.app_state.lock().unwrap();
                                 let target = (pct as f64 * state.duration_seconds)
                                     .clamp(0.0, state.duration_seconds);
                                 state.seek_request = Some(target);
+                                state.current_seconds = target;
                                 state.scrub_target_seconds = None;
+                                state.is_touch_scrubbing = false;
                                 state.track_ended = false;
                             }
                             EngineAction::SetForceStereo(force) => {
-                                self.app_state.lock().unwrap().force_stereo_downmix = force;
+                                self.app_state
+                                    .lock()
+                                    .unwrap()
+                                    .set_force_stereo_downmix(force);
                             }
                             EngineAction::ToggleAudioTrackInMix(track_idx) => {
                                 let mut state = self.app_state.lock().unwrap();
@@ -1141,12 +1191,8 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                             }
                             EngineAction::VisPickerEnableAll => {
                                 let mut state = self.app_state.lock().unwrap();
-                                for enabled in &mut state.vis_enabled {
-                                    *enabled = true;
-                                }
-                                for overridden in &mut state.vis_user_overridden {
-                                    *overridden = true;
-                                }
+                                state.vis_enabled.fill(true);
+                                state.vis_user_overridden.fill(true);
                             }
                             EngineAction::VisPickerEnableNone => {
                                 let mut state = self.app_state.lock().unwrap();
@@ -1228,7 +1274,8 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                                         state.set_mic_input_mode(false, None);
                                         state.is_url_dialog_open = false;
                                         state.url_input_text.clear();
-                                        state.playlist = vec![final_url.clone()];
+                                        state.playlist =
+                                            std::sync::Arc::new(vec![final_url.clone()]);
                                         state.playlist_index = 0;
                                         state.load_request = Some(final_url.clone());
                                         state.file_loaded = true;
@@ -1286,6 +1333,7 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                             }
                             EngineAction::None => {}
                         }
+                        self.app_state.lock().unwrap().sync_rt_control();
                     }
                     Err(wgpu::SurfaceStatus::Lost | wgpu::SurfaceStatus::Outdated) => {
                         eprintln!("[RustTracker] Surface lost or outdated, resizing...");
@@ -1332,10 +1380,11 @@ impl AndroidRustTrackerApp {
         window_width: f32,
         window_height: f32,
         scale_factor: f32,
+        last_touch_scrub_seek: &mut Instant,
     ) -> Option<EngineAction> {
         let mut state = app_state.lock().unwrap();
         let sf = scale_factor.max(1.0);
-        match gesture {
+        let res = match gesture {
             // Top pane swipe in portrait: cycle HUD tabs (Channels -> Heatmap/Lyrics -> Info -> Video)
             TouchGesture::TopPaneSwipeLeft => {
                 if state.video_mode == 3 {
@@ -1590,18 +1639,24 @@ impl AndroidRustTrackerApp {
                 None
             }
             TouchGesture::Scrub { pct } => {
-                let target =
-                    (pct as f64 * state.duration_seconds).clamp(0.0, state.duration_seconds);
-                state.seek_request = Some(target);
-                state.scrub_target_seconds = Some(target);
-                state.track_ended = false;
+                let allow_live_seek =
+                    last_touch_scrub_seek.elapsed() >= std::time::Duration::from_millis(80);
+                if state.apply_touch_scrub(pct, allow_live_seek) {
+                    *last_touch_scrub_seek = Instant::now();
+                }
                 None
             }
             TouchGesture::ScrubEnd => {
-                state.scrub_target_seconds = None;
+                state.finish_touch_scrub();
                 None
             }
-        }
+            TouchGesture::ScrubCancel => {
+                state.cancel_touch_scrub();
+                None
+            }
+        };
+        state.sync_rt_control();
+        res
     }
 
     fn load_and_play_file(&mut self, path: &str) {
@@ -1624,6 +1679,8 @@ impl AndroidRustTrackerApp {
             state.video_frame_rx = None;
             state.free_video_frame_tx = None;
             state.video_info = None;
+            state.stats.video_buffer_fill_pct = 0.0;
+            state.stats.video_decode_us = 0.0;
             state.audio_tracks.clear();
             state.selected_audio_track = 0;
             state.lyrics = None;
@@ -1637,6 +1694,8 @@ impl AndroidRustTrackerApp {
             state.raw_spectrum_data.fill(0.0);
             state.spectrum_data.fill(0.0);
             state.fire_heat.fill(0.0);
+            let _ = state.rt_control.take_track_ended();
+            state.sync_rt_control();
         }
         if let Some(engine) = self.engine.as_mut() {
             engine.clear_video_state();
@@ -1663,6 +1722,8 @@ impl AndroidRustTrackerApp {
                 state.file_loaded = true;
                 state.is_paused = false;
                 state.track_ended = false;
+                let _ = state.rt_control.take_track_ended();
+                state.sync_rt_control();
                 let clean_name = if is_mic {
                     "Microphone Input".to_string()
                 } else {
@@ -1686,7 +1747,7 @@ impl AndroidRustTrackerApp {
                     }
                 };
                 state.song_title = clean_name;
-                state.playlist = vec![path.to_string()];
+                state.playlist = std::sync::Arc::new(vec![path.to_string()]);
                 state.playlist_index = 0;
                 state.lyrics = if is_mic {
                     None
@@ -1728,24 +1789,12 @@ impl AndroidRustTrackerApp {
     }
 }
 
-#[link(name = "log")]
+pub use rt_core::android_log::log_android;
+
 unsafe extern "C" {
-    fn __android_log_write(
-        prio: i32,
-        tag: *const std::ffi::c_char,
-        text: *const std::ffi::c_char,
-    ) -> i32;
     fn pipe(pipefd: *mut i32) -> i32;
     fn dup2(oldfd: i32, newfd: i32) -> i32;
     fn close(fd: i32) -> i32;
-}
-
-pub fn log_android(prio: i32, msg: &str) {
-    if let Ok(c_msg) = std::ffi::CString::new(msg) {
-        unsafe {
-            __android_log_write(prio, c"RustTracker".as_ptr(), c_msg.as_ptr());
-        }
-    }
 }
 
 static STDIO_REDIRECTED: std::sync::Once = std::sync::Once::new();
@@ -1832,6 +1881,7 @@ fn android_main(app: AndroidApp) {
         touch_controller: TouchGestureController::new(),
         active_stream: None,
         last_frame_time: Instant::now(),
+        last_touch_scrub_seek: Instant::now(),
         frame_dt_ring: [1.0 / 60.0; 60],
         frame_dt_idx: 0,
         display_refresh_hz: 60.0,

@@ -29,7 +29,7 @@ use winit::{
     keyboard::{KeyCode as WinitKeyCode, PhysicalKey},
 };
 
-use rusttracker::{audio, engine, ipc, lyrics, playlist, state, ui};
+use rusttracker::{audio, engine, ipc, lyrics, playlist, state, touch, ui};
 
 use crate::engine::{EngineAction, VulkanEngine};
 use crate::state::AppState;
@@ -37,27 +37,65 @@ use crate::state::AppState;
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
+    #[arg(
+        value_name = "FILE_OR_URL",
+        help = "Media file(s), tracker module(s), playlist(s), folder(s), or stream URL(s) to open"
+    )]
     file: Vec<String>,
 
-    #[arg(long, default_value_t = false)]
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Launch in terminal user interface (TUI) mode instead of the Vulkan/wgpu GUI"
+    )]
     tui: bool,
 
-    #[arg(long, default_value_t = false)]
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "Capture live audio from the system microphone / loopback input device"
+    )]
     mic: bool,
 
-    #[arg(long, default_value_t = false)]
+    #[arg(
+        long,
+        default_value_t = false,
+        conflicts_with = "windowed",
+        help = "Launch in borderless fullscreen mode"
+    )]
     fullscreen: bool,
 
-    #[arg(long, num_args = 0..=1, default_missing_value = "")]
+    #[arg(
+        long,
+        default_value_t = false,
+        conflicts_with = "fullscreen",
+        help = "Force windowed mode (overrides automatic fullscreen under Gamescope)"
+    )]
+    windowed: bool,
+
+    #[arg(
+        long,
+        value_name = "ID_OR_NAME",
+        num_args = 0..=1,
+        default_missing_value = "",
+        help = "Start directly on the specified visualizer ID or short name (pass empty or 'list' to list visualizers)"
+    )]
     vis: Option<String>,
 
-    #[arg(long, default_value_t = false)]
+    #[arg(
+        long,
+        default_value_t = false,
+        help = "List all available visualizers with their IDs, short names, and descriptions, then exit"
+    )]
     list_vis: bool,
 
-    #[arg(long, default_value_t = false)]
-    gpu_fft: bool,
-
-    #[arg(long)]
+    #[arg(
+        long,
+        value_name = "FRAMES",
+        num_args = 0..=1,
+        default_missing_value = "300",
+        help = "Run automated benchmark for FRAMES frames (default: 300) and print telemetry"
+    )]
     bench: Option<u32>,
 
     #[arg(
@@ -70,6 +108,15 @@ struct Args {
     #[arg(
         long,
         default_value_t = false,
+        conflicts_with_all = ["passthrough", "surround_upmix", "mpegh"],
+        help = "Force 2.0 stereo downmix output even on multi-channel hardware endpoints"
+    )]
+    stereo: bool,
+
+    #[arg(
+        long,
+        default_value_t = false,
+        conflicts_with_all = ["stereo", "surround_upmix", "mpegh"],
         help = "Enable hardware bitstream passthrough (WASAPI Exclusive / PipeWire) for compressed surround formats"
     )]
     passthrough: bool,
@@ -78,14 +125,25 @@ struct Args {
         long,
         visible_alias = "upmix",
         default_value_t = false,
+        conflicts_with_all = ["no_surround_upmix", "stereo", "passthrough"],
         help = "Enable automatic 7.1.4 surround & height upmixing with configurable crossover EQ"
     )]
     surround_upmix: bool,
 
     #[arg(
         long,
+        visible_alias = "no-upmix",
+        default_value_t = false,
+        conflicts_with = "surround_upmix",
+        help = "Disable automatic surround & height upmixing on multi-channel hardware endpoints"
+    )]
+    no_surround_upmix: bool,
+
+    #[arg(
+        long,
         visible_alias = "mpegh-714",
         default_value_t = false,
+        conflicts_with_all = ["no_mpegh", "stereo", "passthrough"],
         help = "Encode 7.1.4 (11.1, CICP Layout 19) output as an MPEG-H 3D Audio IEC 61937-13 HDMI bitstream"
     )]
     mpegh: bool,
@@ -93,6 +151,7 @@ struct Args {
     #[arg(
         long,
         default_value_t = false,
+        conflicts_with = "mpegh",
         help = "Disable MPEG-H 3D Audio 7.1.4 (11.1) HDMI bitstreaming and use uncompressed LPCM only"
     )]
     no_mpegh: bool,
@@ -103,6 +162,268 @@ struct Args {
         help = "Headlessly register RustTracker as a Non-Steam shortcut with SteamOS Home Screen artwork and exit (ideal for SSH deployment)"
     )]
     register_steam: bool,
+}
+
+pub(crate) fn env_flag_enabled(val: Option<&str>) -> bool {
+    val.is_some_and(|v| {
+        let trimmed = v.trim();
+        !trimmed.is_empty() && trimmed != "0" && !trimmed.eq_ignore_ascii_case("false")
+    })
+}
+
+pub(crate) fn should_prefer_x11_backend(
+    wayland_env: Option<&str>,
+    x11_env: Option<&str>,
+    has_wayland_display: bool,
+    has_x11_display: bool,
+) -> bool {
+    let force_x11 = env_flag_enabled(x11_env);
+    let disable_wayland = wayland_env.is_some_and(|v| {
+        let trimmed = v.trim();
+        trimmed == "0" || trimmed.eq_ignore_ascii_case("false")
+    });
+    let use_wayland = !force_x11 && !disable_wayland && has_wayland_display;
+    !use_wayland && (has_x11_display || force_x11)
+}
+
+pub(crate) fn has_cli_upmix_override(args: &Args) -> bool {
+    args.surround_upmix
+        || args.no_surround_upmix
+        || args.stereo
+        || (args.mpegh && !args.no_surround_upmix)
+}
+
+fn apply_cli_audio_flags(state: &mut AppState, args: &Args) {
+    if args.stereo {
+        state.set_force_stereo_downmix(true);
+    }
+    if args.passthrough {
+        if cfg!(any(target_os = "windows", target_os = "linux")) {
+            state.passthrough_enabled = true;
+            state.surround_upmix.enabled = false;
+            state.force_stereo_downmix = false;
+        } else {
+            state.passthrough_enabled = false;
+            state.osd_text = Some("Bitstream Passthrough requires Linux or Windows".to_string());
+            state.osd_timer = 2.5;
+        }
+    }
+    if !args.stereo {
+        if args.no_surround_upmix {
+            state.set_surround_upmix(false);
+        } else if args.surround_upmix {
+            state.set_surround_upmix(true);
+        }
+    }
+    if args.no_mpegh {
+        state.set_mpegh_bitstream(false);
+    } else if args.mpegh {
+        if !args.no_surround_upmix && !args.stereo {
+            state.set_surround_upmix(true);
+        }
+        state.set_mpegh_bitstream(true);
+    }
+    if args.stereo {
+        // Ensure combinable flags like `--stereo --no-mpegh` or `--stereo --no-surround-upmix`
+        // never overwrite the forced-stereo OSD with LPCM/upmix messages.
+        state.osd_text = Some("🎧 Stereo Downmix (2.0): Forced".to_string());
+        state.osd_timer = 2.5;
+    }
+}
+
+/// Updates startup OSD after `audio::start_audio_thread` probes real hardware channels
+/// (`apply_cli_audio_flags` runs before stream open while `hardware_channels` is still 2).
+pub(crate) fn reconcile_post_load_cli_audio_osd(state: &mut AppState, args: &Args) {
+    if args.stereo {
+        state.osd_text = Some("🎧 Stereo Downmix (2.0): Forced".to_string());
+        state.osd_timer = 2.5;
+    } else if args.surround_upmix && !args.mpegh && state.hardware_channels > 2 {
+        if state.surround_upmix.enabled {
+            let badge = crate::state::SurroundUpmixConfig::layout_badge(state.hardware_channels);
+            state.osd_text = Some(format!("🔊 Surround Upmix: ON ({badge})"));
+            state.osd_timer = 2.5;
+        } else if state.is_native_atmos {
+            state.osd_text = Some("🔊 Surround Upmix: Bypassed (Native Dolby Atmos)".to_string());
+            state.osd_timer = 2.5;
+        } else if !crate::state::SurroundUpmixConfig::can_upmix(
+            state.source_channels,
+            state.hardware_channels,
+        ) {
+            state.osd_text = Some(format!(
+                "🔊 Surround Upmix: Bypassed (Native {}ch Match)",
+                state.source_channels
+            ));
+            state.osd_timer = 2.5;
+        }
+    }
+}
+
+pub(crate) fn reconcile_passthrough_change_osd(state: &mut AppState, pt_enabled: bool) {
+    let existing = state.osd_text.as_deref().unwrap_or_default();
+    if state.force_stereo_downmix || existing.contains("Stereo Downmix") {
+        if state.force_stereo_downmix {
+            state.osd_text = Some("🎧 Stereo Downmix (2.0): Forced".to_string());
+        }
+        return;
+    }
+    if state.surround_upmix.enabled && !pt_enabled {
+        if !existing.contains("MPEG-H") && !existing.contains("11.1") {
+            if state.hardware_channels > 2 {
+                let badge =
+                    crate::state::SurroundUpmixConfig::layout_badge(state.hardware_channels);
+                state.osd_text = Some(format!("🔊 Surround Upmix: ON ({badge})"));
+            } else {
+                state.osd_text =
+                    Some("🔊 Surround Upmix: Armed (Stereo/Mono Output — No Change)".to_string());
+            }
+        }
+    } else if !pt_enabled && (existing.contains("Surround Upmix") || existing.contains("11.1")) {
+        // Preserve explicit Surround Upmix OFF or 11.1 MPEG-H OFF OSD across shared-mode reload
+    } else {
+        state.osd_text = Some(if pt_enabled {
+            "Bitstream Passthrough: ON (Exclusive)".to_string()
+        } else {
+            "Bitstream Passthrough: OFF (Shared Mode)".to_string()
+        });
+    }
+}
+
+pub(crate) fn matches_visualizer_spec(vis: &str) -> Option<usize> {
+    let vis_lower = vis.trim().to_lowercase();
+    if vis_lower.is_empty() {
+        return None;
+    }
+    let normalize = |s: &str| -> String {
+        s.chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect::<String>()
+            .to_lowercase()
+    };
+    let vis_norm = normalize(&vis_lower);
+    crate::state::VISUALIZERS
+        .iter()
+        .enumerate()
+        .position(|(i, v)| {
+            let short_name = v
+                .filename
+                .strip_prefix("vis_")
+                .unwrap_or(v.filename)
+                .strip_suffix(".wgsl")
+                .unwrap_or(v.filename)
+                .to_lowercase();
+            let name_norm = normalize(v.name);
+            let short_norm = normalize(&short_name);
+
+            v.id.to_string() == vis_lower
+                || i.to_string() == vis_lower
+                || v.name.to_lowercase() == vis_lower
+                || short_name == vis_lower
+                || (!vis_norm.is_empty() && (name_norm == vis_norm || short_norm == vis_norm))
+                || (v.id == 5
+                    && matches!(
+                        vis_norm.as_str(),
+                        "retrofire"
+                            | "retro_fire"
+                            | "flame"
+                            | "fire"
+                            | "doom"
+                            | "doomfire"
+                            | "doom_fire"
+                            | "psxfire"
+                    ))
+                || (v.id == 6 && matches!(vis_norm.as_str(), "firesim" | "firesimulation"))
+        })
+}
+
+fn looks_like_media_or_path_arg(arg: &std::ffi::OsStr) -> bool {
+    let bytes = arg.as_encoded_bytes();
+    if bytes == b"--" {
+        return true;
+    }
+    if bytes.is_empty() || bytes[0] == b'-' {
+        return false;
+    }
+    let Some(s) = arg.to_str() else {
+        // Non-UTF-8 OS strings cannot be visualizer identifiers; treat as filesystem paths.
+        return true;
+    };
+    if matches!(s.to_ascii_lowercase().as_str(), "list" | "help")
+        || matches_visualizer_spec(s).is_some()
+    {
+        return false;
+    }
+    if s.contains('/')
+        || s.contains('\\')
+        || s.starts_with("http://")
+        || s.starts_with("https://")
+        || s.starts_with("file://")
+    {
+        return true;
+    }
+    let path = std::path::Path::new(s);
+    if let Some(ext) = path.extension().and_then(|e| e.to_str())
+        && (crate::playlist::is_supported_media_extension(ext)
+            || crate::playlist::is_playlist_extension(ext))
+    {
+        return true;
+    }
+    path.exists()
+}
+
+/// Normalizes bare `--bench` and bare `--vis` when immediately followed by `--` or a positional
+/// file/URL argument (e.g. `rusttracker --bench song.mod` -> `--bench=300`, `rusttracker --vis song.mod`
+/// -> `--vis=`) so `clap` does not swallow the media filename as the optional flag value.
+fn normalize_cli_args<I>(raw_args: I) -> Vec<std::ffi::OsString>
+where
+    I: IntoIterator<Item = std::ffi::OsString>,
+{
+    let raw: Vec<std::ffi::OsString> = raw_args.into_iter().collect();
+    if raw.is_empty() {
+        return raw;
+    }
+    let mut out = Vec::with_capacity(raw.len());
+    out.push(raw[0].clone());
+    let mut passthrough_positional = false;
+    let mut i = 1;
+    while i < raw.len() {
+        let arg = &raw[i];
+        if !passthrough_positional && arg.as_encoded_bytes() == b"--" {
+            passthrough_positional = true;
+            out.push(arg.clone());
+            i += 1;
+            continue;
+        }
+        if !passthrough_positional && arg.as_encoded_bytes() == b"--bench" {
+            let next_is_non_numeric_pos = raw.get(i + 1).is_some_and(|n| {
+                let bytes = n.as_encoded_bytes();
+                if bytes == b"--" {
+                    return true;
+                }
+                !bytes.is_empty()
+                    && bytes[0] != b'-'
+                    && !bytes.iter().all(|b| b.is_ascii_digit())
+                    && n.to_str().is_none_or(|s| s.parse::<u32>().is_err())
+            });
+            if next_is_non_numeric_pos {
+                out.push(std::ffi::OsString::from("--bench=300"));
+                i += 1;
+                continue;
+            }
+        }
+        if !passthrough_positional
+            && arg.as_encoded_bytes() == b"--vis"
+            && raw
+                .get(i + 1)
+                .is_some_and(|n| looks_like_media_or_path_arg(n))
+        {
+            out.push(std::ffi::OsString::from("--vis="));
+            i += 1;
+            continue;
+        }
+        out.push(arg.clone());
+        i += 1;
+    }
+    out
 }
 
 struct Tui {
@@ -151,21 +472,25 @@ fn main() -> Result<(), Box<dyn Error>> {
             "RustTracker Panic at {}:\n{}\n\nBacktrace:\n{}",
             location, msg, backtrace
         );
-        if std::fs::write("rusttracker_crash.log", &crash_report).is_err() {
-            let fallback_path = directories::ProjectDirs::from("com", "RustTracker", "RustTracker")
-                .map(|proj| {
-                    let dir = proj.data_local_dir();
-                    let _ = std::fs::create_dir_all(dir);
-                    dir.join("rusttracker_crash.log")
-                })
-                .unwrap_or_else(|| std::env::temp_dir().join("rusttracker_crash.log"));
-            let _ = std::fs::write(fallback_path, &crash_report);
+        let crash_path = directories::ProjectDirs::from("com", "RustTracker", "RustTracker")
+            .and_then(|proj| {
+                let dir = proj.data_local_dir();
+                std::fs::create_dir_all(dir)
+                    .ok()
+                    .map(|()| dir.join("rusttracker_crash.log"))
+            })
+            .unwrap_or_else(|| std::env::temp_dir().join("rusttracker_crash.log"));
+        if std::fs::write(&crash_path, &crash_report).is_err() {
+            let _ = std::fs::write(
+                std::env::temp_dir().join("rusttracker_crash.log"),
+                &crash_report,
+            );
         }
     }));
 
     let filtered_args =
         std::env::args_os().filter(|arg| !arg.to_str().is_some_and(|s| s.starts_with("-psn_")));
-    let mut args = Args::parse_from(filtered_args);
+    let mut args = Args::parse_from(normalize_cli_args(filtered_args));
     if args.uncapped {
         crate::state::UNCAPPED_PRESENT_MODE.store(true, std::sync::atomic::Ordering::Relaxed);
     }
@@ -228,19 +553,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     {
         let mut state = app_state.lock().unwrap();
-        state.playlist = args.file.clone();
-        if args.passthrough {
-            state.passthrough_enabled = true;
-        }
-        if args.surround_upmix {
-            state.set_surround_upmix(true);
-        }
-        if args.no_mpegh {
-            state.set_mpegh_bitstream(false);
-        } else if args.mpegh {
-            state.set_mpegh_bitstream(true);
-            state.set_surround_upmix(true);
-        }
+        state.playlist = std::sync::Arc::new(args.file.clone());
+        apply_cli_audio_flags(&mut state, &args);
         state.playlist_index = 0;
 
         let mut history_changed = false;
@@ -261,47 +575,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
 
         if let Some(vis) = &args.vis {
-            let vis_lower = vis.to_lowercase();
-            let normalize = |s: &str| -> String {
-                s.chars()
-                    .filter(|c| c.is_alphanumeric())
-                    .collect::<String>()
-                    .to_lowercase()
-            };
-            let vis_norm = normalize(&vis_lower);
-            let matched_idx = crate::state::VISUALIZERS
-                .iter()
-                .enumerate()
-                .position(|(i, v)| {
-                    let short_name = v
-                        .filename
-                        .strip_prefix("vis_")
-                        .unwrap_or(v.filename)
-                        .strip_suffix(".wgsl")
-                        .unwrap_or(v.filename)
-                        .to_lowercase();
-                    let name_norm = normalize(v.name);
-                    let short_norm = normalize(&short_name);
-
-                    v.id.to_string() == vis_lower
-                        || i.to_string() == vis_lower
-                        || v.name.to_lowercase() == vis_lower
-                        || short_name == vis_lower
-                        || name_norm == vis_norm
-                        || short_norm == vis_norm
-                        || (v.id == 5
-                            && (vis_norm == "retrofire"
-                                || vis_norm == "retro_fire"
-                                || vis_norm == "flame"
-                                || vis_norm == "fire"
-                                || vis_norm == "doom"
-                                || vis_norm == "doomfire"
-                                || vis_norm == "doom_fire"
-                                || vis_norm == "psxfire"))
-                        || (v.id == 6 && (vis_norm == "firesim" || vis_norm == "firesimulation"))
-                });
-
-            if let Some(idx) = matched_idx {
+            if let Some(idx) = matches_visualizer_spec(vis) {
                 state.current_visualizer_idx = idx;
                 state.visualizer_mode = crate::state::VISUALIZERS[idx].id;
                 state.vis_enabled[idx] = true;
@@ -327,6 +601,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let mut state = app_state.lock().unwrap();
                 state.file_loaded = true;
                 state.lyrics = lyrics;
+                reconcile_post_load_cli_audio_osd(&mut state, &args);
                 Some(stream)
             }
             Err(e) => {
@@ -340,6 +615,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     audio::spawn_audio_topology_watcher(Arc::clone(&app_state), args.mic);
 
+    let cli_upmix_override = has_cli_upmix_override(&args);
     if args.tui {
         let original_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |panic_info| {
@@ -354,7 +630,13 @@ fn main() -> Result<(), Box<dyn Error>> {
         }));
 
         let mut tui = Tui::new()?;
-        if let Err(err) = run_tui(&mut tui.terminal, app_state, initial_stream, args.mic) {
+        if let Err(err) = run_tui(
+            &mut tui.terminal,
+            app_state,
+            initial_stream,
+            args.mic,
+            cli_upmix_override,
+        ) {
             eprintln!("App error: {:?}", err);
         }
     } else {
@@ -583,6 +865,269 @@ pub(crate) fn apply_gamepad_stick_panel_resize(
     }
 }
 
+fn clear_spectrum_history_in_place(state: &mut AppState) {
+    if state.spectrum_history.len() == 120
+        && state.spectrum_history.iter().all(|row| row.len() == 1024)
+    {
+        for row in &mut state.spectrum_history {
+            row.fill(0.0);
+        }
+    } else {
+        state.spectrum_history.clear();
+        for _ in 0..120 {
+            state.spectrum_history.push_back(vec![0.0; 1024]);
+        }
+    }
+}
+
+pub(crate) fn apply_gamepad_trigger_scrub(state: &mut AppState, lt: f32, rt: f32, dt: f32) -> bool {
+    if !state.file_loaded
+        || state.duration_seconds <= 0.0
+        || state.show_vis_picker
+        || state.is_file_picker_open
+        || state.is_url_dialog_open
+    {
+        return false;
+    }
+    let scrub_delta = rt - lt;
+    if scrub_delta.abs() > 0.05 {
+        let scrub_amount =
+            (scrub_delta * dt) as f64 * (state.duration_seconds * 0.1).clamp(2.0, 30.0);
+        let target = (state.current_seconds + scrub_amount).clamp(0.0, state.duration_seconds);
+        state.seek_request = Some(target);
+        state.current_seconds = target;
+        state.track_ended = false;
+        clear_spectrum_history_in_place(state);
+
+        let sign = if scrub_delta > 0.0 { "+" } else { "" };
+        state.osd_text = Some(format!("Scrubbing {}{:.1}x", sign, scrub_delta * 10.0));
+        state.osd_timer = 0.5;
+        true
+    } else {
+        false
+    }
+}
+
+pub(crate) fn apply_gamepad_playback_button(state: &mut AppState, button: gilrs::Button) -> bool {
+    match button {
+        gilrs::Button::LeftTrigger => {
+            // L1 Bumper: Previous Track (or -60s seek)
+            if !state.playlist.is_empty() && state.playlist.len() > 1 && state.playlist_index > 0 {
+                state.playlist_index -= 1;
+                state.load_request = Some(state.playlist[state.playlist_index].clone());
+                state.is_paused = false;
+                state.osd_text = Some("Previous Track".to_string());
+                state.osd_timer = 2.0;
+                true
+            } else if state.file_loaded && state.duration_seconds > 0.0 {
+                let target = (state.current_seconds - 60.0).max(0.0);
+                state.seek_request = Some(target);
+                state.current_seconds = target;
+                state.track_ended = false;
+                clear_spectrum_history_in_place(state);
+                state.record_seek_osd(-60.0);
+                true
+            } else {
+                false
+            }
+        }
+        gilrs::Button::RightTrigger => {
+            // R1 Bumper: Next Track (or +60s seek)
+            if !state.playlist.is_empty()
+                && state.playlist.len() > 1
+                && state.playlist_index + 1 < state.playlist.len()
+            {
+                state.playlist_index += 1;
+                state.load_request = Some(state.playlist[state.playlist_index].clone());
+                state.is_paused = false;
+                state.osd_text = Some("Next Track".to_string());
+                state.osd_timer = 2.0;
+                true
+            } else if state.file_loaded && state.duration_seconds > 0.0 {
+                let target = (state.current_seconds + 60.0).clamp(0.0, state.duration_seconds);
+                state.seek_request = Some(target);
+                state.current_seconds = target;
+                state.track_ended = false;
+                clear_spectrum_history_in_place(state);
+                state.record_seek_osd(60.0);
+                true
+            } else {
+                false
+            }
+        }
+        gilrs::Button::LeftThumb => {
+            // L3 thumbstick click -> Toggle HUD Visibility (no collision with L2/R2 analog scrubbing)
+            state.show_hud = !state.show_hud;
+            state.video_mode = 0;
+            state.osd_text = Some(format!(
+                "HUD: {}",
+                if state.show_hud { "Visible" } else { "Hidden" }
+            ));
+            state.osd_timer = 2.0;
+            true
+        }
+        gilrs::Button::RightThumb => {
+            // R3 thumbstick click -> Toggle Auto Surround & Height Upmix
+            state.toggle_surround_upmix();
+            true
+        }
+        gilrs::Button::North => {
+            // 'Y' or Triangle -> Open File
+            state.open_file_request = true;
+            true
+        }
+        gilrs::Button::West => {
+            // 'X' or Square -> Toggle Video / View Mode (or rotation in Visualizer Picker)
+            if state.show_vis_picker {
+                let cursor = state.vis_picker_cursor;
+                if cursor != 0 && cursor < state.vis_enabled.len() {
+                    state.vis_enabled[cursor] = !state.vis_enabled[cursor];
+                    state.vis_user_overridden[cursor] = true;
+                }
+            } else if state.video_frame_rx.is_some() || state.has_video_stream {
+                state.video_mode = (state.video_mode + 1) % 4;
+                let mode_name = match state.video_mode {
+                    0 => "Standard View",
+                    1 => "Video in Track Info",
+                    2 => "Video in Top Panel",
+                    3 => "Full Screen Video",
+                    _ => "Video",
+                };
+                state.osd_text = Some(format!("View: {}", mode_name));
+                state.osd_timer = 2.0;
+            } else {
+                state.show_hud = !state.show_hud;
+                state.video_mode = 0;
+                let mode_name = if state.show_hud {
+                    "Standard View"
+                } else {
+                    "Full Screen Visualizer"
+                };
+                state.osd_text = Some(format!("View: {}", mode_name));
+                state.osd_timer = 2.0;
+            }
+            true
+        }
+        gilrs::Button::East => {
+            // 'B' or Circle -> Close Visualizer Picker or Toggle Stats
+            if state.show_vis_picker {
+                state.show_vis_picker = false;
+            } else {
+                state.show_stats = !state.show_stats;
+            }
+            true
+        }
+        gilrs::Button::DPadRight => {
+            if !state.show_vis_picker && state.file_loaded && state.duration_seconds > 0.0 {
+                let target = (state.current_seconds + 10.0).clamp(0.0, state.duration_seconds);
+                state.seek_request = Some(target);
+                state.current_seconds = target;
+                state.track_ended = false;
+                clear_spectrum_history_in_place(state);
+                state.record_seek_osd(10.0);
+                true
+            } else {
+                false
+            }
+        }
+        gilrs::Button::DPadLeft => {
+            if !state.show_vis_picker && state.file_loaded && state.duration_seconds > 0.0 {
+                let target = (state.current_seconds - 10.0).max(0.0);
+                state.seek_request = Some(target);
+                state.current_seconds = target;
+                state.track_ended = false;
+                clear_spectrum_history_in_place(state);
+                state.record_seek_osd(-10.0);
+                true
+            } else {
+                false
+            }
+        }
+        gilrs::Button::DPadUp => {
+            if state.show_vis_picker {
+                if state.vis_picker_cursor == 0 {
+                    state.vis_picker_cursor = crate::state::VISUALIZERS.len() - 1;
+                } else {
+                    state.vis_picker_cursor -= 1;
+                }
+                state.vis_picker_scroll_to_cursor = true;
+            } else {
+                let len = crate::state::VISUALIZERS.len();
+                let mut idx = state.current_visualizer_idx;
+                for _ in 0..len {
+                    idx = (idx + 1) % len;
+                    if state.vis_enabled[idx] {
+                        break;
+                    }
+                }
+                state.current_visualizer_idx = idx;
+                state.visualizer_mode = crate::state::VISUALIZERS[idx].id;
+                state.osd_text = Some(crate::state::VISUALIZERS[idx].name.to_string());
+                state.osd_timer = 2.0;
+            }
+            true
+        }
+        gilrs::Button::DPadDown => {
+            if state.show_vis_picker {
+                state.vis_picker_cursor =
+                    (state.vis_picker_cursor + 1) % crate::state::VISUALIZERS.len();
+                state.vis_picker_scroll_to_cursor = true;
+            } else {
+                let len = crate::state::VISUALIZERS.len();
+                let mut idx = state.current_visualizer_idx;
+                for _ in 0..len {
+                    idx = if idx == 0 { len - 1 } else { idx - 1 };
+                    if state.vis_enabled[idx] {
+                        break;
+                    }
+                }
+                state.current_visualizer_idx = idx;
+                state.visualizer_mode = crate::state::VISUALIZERS[idx].id;
+                state.osd_text = Some(crate::state::VISUALIZERS[idx].name.to_string());
+                state.osd_timer = 2.0;
+            }
+            true
+        }
+        gilrs::Button::South => {
+            if state.show_vis_picker {
+                let cursor = state.vis_picker_cursor;
+                if cursor < state.vis_user_overridden.len() {
+                    state.vis_user_overridden[cursor] = true;
+                }
+                state.current_visualizer_idx = cursor;
+                state.visualizer_mode = crate::state::VISUALIZERS[cursor].id;
+                state.osd_text = Some(crate::state::VISUALIZERS[cursor].name.to_string());
+                state.osd_timer = 2.0;
+                state.show_vis_picker = false;
+            } else if state.track_ended
+                || (state.current_seconds >= state.duration_seconds - 0.1
+                    && state.duration_seconds > 0.0)
+            {
+                state.track_ended = false;
+                let _ = state.rt_control.take_track_ended();
+                state.seek_request = Some(0.0);
+                clear_spectrum_history_in_place(state);
+                state.is_paused = false;
+            } else if state.playlist_index >= state.playlist.len() && !state.playlist.is_empty() {
+                if state.duration_seconds == 0.0 {
+                    state.playlist_index = state.playlist.len() - 1;
+                } else {
+                    state.playlist_index = 0;
+                }
+                state.load_request = Some(state.playlist[state.playlist_index].clone());
+                state.is_paused = false;
+            } else {
+                state.is_paused = !state.is_paused;
+            }
+            state.sync_rt_control();
+            true
+        }
+        // Note: LeftTrigger2 (L2) and RightTrigger2 (R2) are strictly analog timeline scrubbers
+        // handled in `apply_gamepad_trigger_scrub` so pulling L2 never toggles the HUD mid-scrub.
+        _ => false,
+    }
+}
+
 /// Parses a binary Steam `shortcuts.vdf` buffer and returns all unsigned 32-bit `appid`s
 /// for shortcut entries whose `AppName` or `Exe` references `rusttracker` (case-insensitive).
 pub(crate) fn extract_rusttracker_shortcut_appids(vdf_bytes: &[u8]) -> Vec<u32> {
@@ -665,7 +1210,7 @@ pub(crate) fn extract_rusttracker_shortcut_appids(vdf_bytes: &[u8]) -> Vec<u32> 
 /// Normalizes any RustTracker shortcut entry in a binary `shortcuts.vdf` buffer so that
 /// filename-based `AppName` values (e.g. `"RustTracker-SteamDeck-GamePad.AppImage"`) become
 /// `"RustTracker"` and an empty `icon` field is populated with `default_icon_path`.
-#[allow(dead_code)]
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn normalize_rusttracker_shortcuts_vdf(
     vdf_bytes: &[u8],
     default_icon_path: Option<&str>,
@@ -1079,7 +1624,7 @@ fn register_steam_shortcut_cli() -> Result<(), Box<dyn Error>> {
 
 /// Copies Steam Grid (`userdata/<id>/config/grid/`) and LibraryCache (`appcache/librarycache/`)
 /// artwork for all discovered RustTracker non-Steam shortcuts under `steam_root`.
-#[allow(dead_code)]
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn provision_steam_shortcut_artwork_in_root(
     steam_root: &std::path::Path,
     steamgrid_dir: &std::path::Path,
@@ -1245,20 +1790,42 @@ fn auto_provision_steam_artwork() {
     }
 }
 
+#[inline]
+fn effective_window_scale(window: &winit::window::Window, force_unit_scale: bool) -> f64 {
+    if force_unit_scale {
+        1.0
+    } else {
+        window.scale_factor().max(1.0)
+    }
+}
+
 fn compute_initial_window_geometry(
     monitor: Option<winit::monitor::MonitorHandle>,
     desired_logical_w: f64,
     desired_logical_h: f64,
+    force_unit_scale: bool,
 ) -> (
-    winit::dpi::LogicalSize<f64>,
-    winit::dpi::LogicalSize<f64>,
+    winit::dpi::Size,
+    winit::dpi::Size,
     Option<winit::dpi::PhysicalPosition<i32>>,
 ) {
+    let to_size = |w: f64, h: f64| -> winit::dpi::Size {
+        if force_unit_scale {
+            winit::dpi::PhysicalSize::new(w.round().max(1.0) as u32, h.round().max(1.0) as u32)
+                .into()
+        } else {
+            winit::dpi::LogicalSize::new(w, h).into()
+        }
+    };
     if let Some(mon) = monitor {
         let mon_phys = mon.size();
         if mon_phys.width > 0 && mon_phys.height > 0 {
             let mon_pos = mon.position();
-            let scale = mon.scale_factor();
+            let scale = if force_unit_scale {
+                1.0
+            } else {
+                mon.scale_factor()
+            };
             let ((target_w, target_h), (min_w, min_h), (pos_x, pos_y)) =
                 clamp_window_geometry_to_monitor(
                     mon_phys.width,
@@ -1270,15 +1837,15 @@ fn compute_initial_window_geometry(
                     desired_logical_h,
                 );
             return (
-                winit::dpi::LogicalSize::new(target_w, target_h),
-                winit::dpi::LogicalSize::new(min_w, min_h),
+                to_size(target_w, target_h),
+                to_size(min_w, min_h),
                 Some(winit::dpi::PhysicalPosition::new(pos_x, pos_y)),
             );
         }
     }
     (
-        winit::dpi::LogicalSize::new(desired_logical_w, desired_logical_h),
-        winit::dpi::LogicalSize::new(
+        to_size(desired_logical_w, desired_logical_h),
+        to_size(
             1024.0_f64.min(desired_logical_w),
             600.0_f64.min(desired_logical_h),
         ),
@@ -1291,6 +1858,7 @@ fn constrain_window_to_monitor(
     desired_logical_w: Option<f64>,
     desired_logical_h: Option<f64>,
     center: bool,
+    force_unit_scale: bool,
 ) {
     let Some(mon) = window
         .current_monitor()
@@ -1300,7 +1868,7 @@ fn constrain_window_to_monitor(
         return;
     };
 
-    let scale = window.scale_factor().max(1.0);
+    let scale = effective_window_scale(window, force_unit_scale);
     let mon_phys = mon.size();
     let mon_pos = mon.position();
     if mon_phys.width == 0 || mon_phys.height == 0 {
@@ -1354,10 +1922,16 @@ fn constrain_window_to_monitor(
 
     let min_logical_w = 1024.0_f64.min(new_inner_w as f64 / scale);
     let min_logical_h = 600.0_f64.min(new_inner_h as f64 / scale);
-    window.set_min_inner_size(Some(winit::dpi::LogicalSize::new(
-        min_logical_w,
-        min_logical_h,
-    )));
+    let min_size: winit::dpi::Size = if force_unit_scale {
+        winit::dpi::PhysicalSize::new(
+            min_logical_w.round().max(1.0) as u32,
+            min_logical_h.round().max(1.0) as u32,
+        )
+        .into()
+    } else {
+        winit::dpi::LogicalSize::new(min_logical_w, min_logical_h).into()
+    };
+    window.set_min_inner_size(Some(min_size));
 
     if new_inner_w != inner.width || new_inner_h != inner.height {
         let _ = window.request_inner_size(winit::dpi::PhysicalSize::new(new_inner_w, new_inner_h));
@@ -1387,7 +1961,10 @@ fn constrain_window_to_monitor(
 /// During external OS file drag-and-drop, winit 0.30 does not emit `WindowEvent::CursorMoved`
 /// (and `CursorLeft` clears egui's pointer state when leaving the window to grab a file),
 /// so we query the windowing system directly during `HoveredFile` / `DroppedFile`.
-fn query_window_cursor_pos(window: &winit::window::Window) -> Option<egui::Pos2> {
+fn query_window_cursor_pos(
+    window: &winit::window::Window,
+    force_unit_scale: bool,
+) -> Option<egui::Pos2> {
     #[cfg(target_os = "linux")]
     {
         use winit::raw_window_handle::{
@@ -1460,7 +2037,7 @@ fn query_window_cursor_pos(window: &winit::window::Window) -> Option<egui::Pos2>
             )
         };
         if ok != 0 {
-            let sf = window.scale_factor().max(1.0) as f32;
+            let sf = effective_window_scale(window, force_unit_scale) as f32;
             Some(egui::pos2(win_x as f32 / sf, win_y as f32 / sf))
         } else {
             None
@@ -1468,6 +2045,7 @@ fn query_window_cursor_pos(window: &winit::window::Window) -> Option<egui::Pos2>
     }
     #[cfg(windows)]
     {
+        let _ = force_unit_scale;
         #[link(name = "user32")]
         unsafe extern "system" {
             fn GetCursorPos(lpPoint: *mut [i32; 2]) -> i32;
@@ -1487,6 +2065,7 @@ fn query_window_cursor_pos(window: &winit::window::Window) -> Option<egui::Pos2>
     }
     #[cfg(target_os = "macos")]
     {
+        let _ = force_unit_scale;
         use objc2::encode::{Encode, Encoding};
         use objc2::msg_send;
         use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -1522,7 +2101,7 @@ fn query_window_cursor_pos(window: &winit::window::Window) -> Option<egui::Pos2>
     }
     #[cfg(not(any(target_os = "linux", windows, target_os = "macos")))]
     {
-        let _ = window;
+        let _ = (window, force_unit_scale);
         None
     }
 }
@@ -1549,25 +2128,20 @@ async fn run_gui(
 
     // Gamescope's XWayland server advertises a 1280x800 display with 100mm x 150mm physical
     // dimensions (~212 DPI), which causes winit's X11 backend to compute a 2.208x scale factor.
-    // Force a 1.0 scale factor before initializing the EventLoop on Steam Deck / Gamescope.
-    #[cfg(target_os = "linux")]
-    if is_game_mode && std::env::var("WINIT_X11_SCALE_FACTOR").is_err() {
-        unsafe {
-            std::env::set_var("WINIT_X11_SCALE_FACTOR", "1");
-        }
-    }
+    // Instead of calling `unsafe { std::env::set_var(...) }` in a multi-threaded process (which is
+    // UB under Rust 2024 when background IPC/audio threads are active), enforce a 1.0 effective
+    // pixel-per-point ratio via PhysicalSize window geometry + egui zoom compensation.
+    let force_unit_scale = cfg!(target_os = "linux")
+        && is_game_mode
+        && std::env::var("WINIT_X11_SCALE_FACTOR").is_err();
 
-    let is_fullscreen =
-        args.fullscreen || (is_gamescope && std::env::var("CAPTURE_FRAME").is_err());
-    let use_gpu_fft = args.gpu_fft;
+    let is_fullscreen = !args.windowed
+        && (args.fullscreen || (is_gamescope && std::env::var("CAPTURE_FRAME").is_err()));
     let bench = args.bench;
     let is_mic_launch = args.mic;
     let is_uncapped = args.uncapped;
+    let cli_upmix_override = has_cli_upmix_override(&args);
 
-    if use_gpu_fft {
-        let mut state = app_state.lock().unwrap();
-        state.gpu_fft = true;
-    }
     if let Some(bf) = bench {
         crate::state::BENCH_FRAMES_OVERRIDE.store(bf, std::sync::atomic::Ordering::Relaxed);
     }
@@ -1575,15 +2149,15 @@ async fn run_gui(
     let mut event_loop_builder = EventLoop::builder();
     #[cfg(target_os = "linux")]
     {
-        // winit 0.30's native Wayland backend does not implement wl_data_device
-        // file drag-and-drop (HoveredFile / DroppedFile). Prefer X11/XWayland when
-        // DISPLAY is available (unless RUSTTRACKER_WAYLAND is explicitly set and
-        // WAYLAND_DISPLAY is active), with automatic fallback below.
-        let use_wayland = std::env::var("RUSTTRACKER_WAYLAND").is_ok()
-            && std::env::var("WAYLAND_DISPLAY").is_ok();
-        if !use_wayland
-            && (std::env::var("DISPLAY").is_ok() || std::env::var("RUSTTRACKER_X11").is_ok())
-        {
+        // Default to native Wayland when WAYLAND_DISPLAY is active, falling back to
+        // X11/XWayland when only DISPLAY is present, or when explicitly requested via
+        // RUSTTRACKER_X11=1 or RUSTTRACKER_WAYLAND=0/false.
+        if should_prefer_x11_backend(
+            std::env::var("RUSTTRACKER_WAYLAND").ok().as_deref(),
+            std::env::var("RUSTTRACKER_X11").ok().as_deref(),
+            std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty()),
+            std::env::var_os("DISPLAY").is_some_and(|v| !v.is_empty()),
+        ) {
             event_loop_builder.with_x11();
         }
     }
@@ -1629,19 +2203,32 @@ async fn run_gui(
         let _ = SetCurrentProcessExplicitAppUserModelID(w!("Soddentrough.RustTracker"));
     }
 
-    let (desired_logical_w, desired_logical_h) = if is_game_mode {
+    let (desired_logical_w, desired_logical_h): (f64, f64) = if is_game_mode {
         (1280.0, 800.0)
     } else {
         (1440.0, 840.0)
     };
-    let initial_size = winit::dpi::LogicalSize::new(desired_logical_w, desired_logical_h);
+    let initial_size: winit::dpi::Size = if force_unit_scale {
+        winit::dpi::PhysicalSize::new(
+            desired_logical_w.round() as u32,
+            desired_logical_h.round() as u32,
+        )
+        .into()
+    } else {
+        winit::dpi::LogicalSize::new(desired_logical_w, desired_logical_h).into()
+    };
+    let min_initial_size: winit::dpi::Size = if force_unit_scale {
+        winit::dpi::PhysicalSize::new(1024, 600).into()
+    } else {
+        winit::dpi::LogicalSize::new(1024.0, 600.0).into()
+    };
 
     let mut attrs = winit::window::Window::default_attributes()
         .with_title("RustTracker Vulkan Visualizer")
         .with_theme(Some(winit::window::Theme::Dark))
         .with_visible(false)
         .with_inner_size(initial_size)
-        .with_min_inner_size(winit::dpi::LogicalSize::new(1024.0, 600.0))
+        .with_min_inner_size(min_initial_size)
         .with_window_icon(Some(window_icon));
 
     if is_fullscreen {
@@ -1687,8 +2274,12 @@ async fn run_gui(
                 let monitor = elwt
                     .primary_monitor()
                     .or_else(|| elwt.available_monitors().next());
-                let (init_size, min_size, init_pos) =
-                    compute_initial_window_geometry(monitor, desired_logical_w, desired_logical_h);
+                let (init_size, min_size, init_pos) = compute_initial_window_geometry(
+                    monitor,
+                    desired_logical_w,
+                    desired_logical_h,
+                    force_unit_scale,
+                );
                 attrs = attrs
                     .with_inner_size(init_size)
                     .with_min_inner_size(min_size);
@@ -1709,9 +2300,13 @@ async fn run_gui(
                     Some(desired_logical_w),
                     Some(desired_logical_h),
                     true,
+                    force_unit_scale,
                 );
             }
             let window = Arc::new(window);
+            if force_unit_scale {
+                egui_ctx_for_init.set_zoom_factor(1.0 / (window.scale_factor() as f32).max(0.1));
+            }
             let mut engine = pollster::block_on(VulkanEngine::new(window.clone()));
             let initial_refresh_hz = window
                 .current_monitor()
@@ -1806,6 +2401,8 @@ async fn run_gui(
     }
     let mut is_first_frame = true;
     let mut last_mouse_scrub_seek = Instant::now();
+    let mut touch_controller = crate::touch::TouchGestureController::new();
+    let mut last_touch_scrub_seek = Instant::now();
 
     let mut gilrs =
         gilrs::Gilrs::new().unwrap_or_else(|_| gilrs::GilrsBuilder::new().build().unwrap());
@@ -1846,6 +2443,8 @@ async fn run_gui(
     let mut desktop_frame_count = 0u64;
     let mut frame_left_stick_y = 0.0f32;
     let mut frame_right_stick_y = 0.0f32;
+    let mut frame_left_trigger = 0.0f32;
+    let mut frame_right_trigger = 0.0f32;
 
     let mut app = DesktopApp {
         runtime: None,
@@ -1893,7 +2492,7 @@ async fn run_gui(
 
                     if let WindowEvent::CursorMoved { position, .. } = event {
                         last_mouse_move = Instant::now();
-                        let sf = window.scale_factor() as f32;
+                        let sf = effective_window_scale(window, force_unit_scale) as f32;
                         let pos = egui::pos2(position.x as f32 / sf, position.y as f32 / sf);
                         last_cursor_pos = Some(pos);
                         {
@@ -1908,8 +2507,69 @@ async fn run_gui(
                         }
                     }
 
+                    if let WindowEvent::Touch(touch) = event {
+                        last_mouse_move = Instant::now();
+                        let (modal_open, already_touch_scrubbing, split_ratio) = {
+                            let st = app_state.lock().unwrap();
+                            (
+                                st.is_url_dialog_open
+                                    || st.is_file_picker_open
+                                    || st.show_vis_picker
+                                    || st.show_help,
+                                st.is_touch_scrubbing,
+                                st.panel_split_ratio,
+                            )
+                        };
+                        if modal_open
+                            || ((response.consumed || egui_ctx.egui_is_using_pointer())
+                                && !already_touch_scrubbing)
+                        {
+                            touch_controller.reset();
+                            app_state.lock().unwrap().cancel_touch_scrub();
+                        } else {
+                            let size = window.inner_size();
+                            let scale_factor =
+                                (effective_window_scale(window, force_unit_scale) as f32).max(1.0);
+                            touch_controller.set_scale_factor(scale_factor);
+                            let is_portrait = size.width < size.height;
+                            let min_h_px = 220.0 * scale_factor;
+                            let split_y = (size.height as f32 * split_ratio)
+                                .clamp(min_h_px, (size.height as f32 - min_h_px).max(min_h_px));
+                            if let Some(gesture) = touch_controller.handle_touch(
+                                touch,
+                                size.width as f32,
+                                size.height as f32,
+                                is_portrait,
+                                split_y,
+                            ) {
+                                match gesture {
+                                    crate::touch::TouchGesture::Scrub { pct } => {
+                                        let mut st = app_state.lock().unwrap();
+                                        let allow_live_seek = last_touch_scrub_seek.elapsed()
+                                            >= Duration::from_millis(80);
+                                        if st.apply_touch_scrub(pct, allow_live_seek) {
+                                            last_touch_scrub_seek = Instant::now();
+                                        }
+                                        window.request_redraw();
+                                    }
+                                    crate::touch::TouchGesture::ScrubEnd => {
+                                        let mut st = app_state.lock().unwrap();
+                                        st.finish_touch_scrub();
+                                        window.request_redraw();
+                                    }
+                                    crate::touch::TouchGesture::ScrubCancel => {
+                                        let mut st = app_state.lock().unwrap();
+                                        st.cancel_touch_scrub();
+                                        window.request_redraw();
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    }
+
                     if let WindowEvent::HoveredFile(path) = event {
-                        if let Some(live_pos) = query_window_cursor_pos(window) {
+                        if let Some(live_pos) = query_window_cursor_pos(window, force_unit_scale) {
                             last_cursor_pos = Some(live_pos);
                         }
                         let mut state = app_state.lock().unwrap();
@@ -1944,39 +2604,38 @@ async fn run_gui(
                             | WinitKeyCode::Comma
                             | WinitKeyCode::Period => {
                                 let mut state = app_state.lock().unwrap();
-                                let duration = state.duration_seconds.max(0.1);
-                                let mut delta = 0.0;
-                                let step = if modifiers.control_key() || modifiers.super_key() {
-                                    60.0f64.min(duration).max(5.0)
-                                } else if modifiers.shift_key() {
-                                    30.0f64.min(duration).max(1.0)
-                                } else {
-                                    5.0f64.min(duration).max(0.5)
-                                };
+                                if state.file_loaded && state.duration_seconds > 0.0 {
+                                    let duration = state.duration_seconds;
+                                    let mut delta = 0.0;
+                                    let step = if modifiers.control_key() || modifiers.super_key() {
+                                        60.0f64.min(duration).max(5.0)
+                                    } else if modifiers.shift_key() {
+                                        30.0f64.min(duration).max(1.0)
+                                    } else {
+                                        5.0f64.min(duration).max(0.5)
+                                    };
 
-                                match keycode {
-                                    WinitKeyCode::ArrowRight => {
-                                        delta = step;
+                                    match keycode {
+                                        WinitKeyCode::ArrowRight => {
+                                            delta = step;
+                                        }
+                                        WinitKeyCode::ArrowLeft => {
+                                            delta = -step;
+                                        }
+                                        WinitKeyCode::Comma => delta = -1.0 / 60.0, // ~1 frame at 60fps
+                                        WinitKeyCode::Period => delta = 1.0 / 60.0,
+                                        _ => {}
                                     }
-                                    WinitKeyCode::ArrowLeft => {
-                                        delta = -step;
-                                    }
-                                    WinitKeyCode::Comma => delta = -1.0 / 60.0, // ~1 frame at 60fps
-                                    WinitKeyCode::Period => delta = 1.0 / 60.0,
-                                    _ => {}
-                                }
 
-                                let target = (state.current_seconds + delta)
-                                    .clamp(0.0, state.duration_seconds);
-                                state.seek_request = Some(target);
-                                state.current_seconds = target;
-                                state.track_ended = false;
-                                state.spectrum_history.clear();
-                                for _ in 0..120 {
-                                    state.spectrum_history.push_back(vec![0.0; 1024]);
-                                }
+                                    let target = (state.current_seconds + delta)
+                                        .clamp(0.0, state.duration_seconds);
+                                    state.seek_request = Some(target);
+                                    state.current_seconds = target;
+                                    state.track_ended = false;
+                                    clear_spectrum_history_in_place(&mut state);
 
-                                state.record_seek_osd(delta);
+                                    state.record_seek_osd(delta);
+                                }
                             }
                             _ => {
                                 if !kb_event.repeat {
@@ -2212,13 +2871,10 @@ async fn run_gui(
                                                     Some(desired_logical_w),
                                                     Some(desired_logical_h),
                                                     true,
+                                                    force_unit_scale,
                                                 );
                                                 keep_awake = None;
                                             }
-                                        }
-                                        WinitKeyCode::KeyG => {
-                                            let mut state = app_state.lock().unwrap();
-                                            state.gpu_fft = !state.gpu_fft;
                                         }
                                         WinitKeyCode::KeyU | WinitKeyCode::KeyE => {
                                             let mut state = app_state.lock().unwrap();
@@ -2353,7 +3009,7 @@ async fn run_gui(
                                                 state.is_paused = false;
                                                 state.osd_text = Some("Playing".to_string());
                                                 state.osd_timer = 2.0;
-                                            } else {
+                                            } else if state.file_loaded {
                                                 state.is_paused = !state.is_paused;
                                                 state.osd_text = Some(if state.is_paused {
                                                     "Paused".to_string()
@@ -2514,10 +3170,15 @@ async fn run_gui(
                                                                 state.audio_track_volumes =
                                                                     vec![1.0; num_tracks];
                                                             }
+                                                            let vol = state
+                                                                .audio_track_volumes
+                                                                .get(track_idx)
+                                                                .copied()
+                                                                .unwrap_or(1.0);
                                                             state.audio_track_request =
                                                                 Some(track_idx);
                                                             state.audio_mix_request =
-                                                                Some(vec![(track_idx, 1.0)]);
+                                                                Some(vec![(track_idx, vol)]);
                                                         }
                                                     } else if track_num == num_tracks + 1 {
                                                         // Shortcut for mixing tracks: <number of tracks + 1>
@@ -2550,13 +3211,14 @@ async fn run_gui(
                                         }
                                         _ => {}
                                     }
+                                    app_state.lock().unwrap().sync_rt_control();
                                 }
                             }
                         }
                     }
 
                     if let WindowEvent::DroppedFile(path) = &event {
-                        if let Some(live_pos) = query_window_cursor_pos(window) {
+                        if let Some(live_pos) = query_window_cursor_pos(window, force_unit_scale) {
                             last_cursor_pos = Some(live_pos);
                         }
                         if drop_cursor_pos.is_none() {
@@ -2593,6 +3255,10 @@ async fn run_gui(
                             }
                         }
                         WindowEvent::ScaleFactorChanged { .. } => {
+                            if force_unit_scale {
+                                egui_ctx
+                                    .set_zoom_factor(1.0 / (window.scale_factor() as f32).max(0.1));
+                            }
                             engine.resize(window.inner_size());
                         }
                         WindowEvent::Resized(physical_size) => {
@@ -2601,7 +3267,9 @@ async fn run_gui(
                         WindowEvent::RedrawRequested => {
                             if is_first_frame {
                                 is_first_frame = false;
-                                app_state.lock().unwrap().is_paused = false;
+                                let mut state = app_state.lock().unwrap();
+                                state.is_paused = false;
+                                state.sync_rt_control();
                             }
 
                             if !pending_dropped_files.is_empty() {
@@ -2619,6 +3287,7 @@ async fn run_gui(
 
                             let (load_path, resume_pos_on_reload) = {
                                 let mut state = app_state.lock().unwrap();
+                                state.sync_rt_control();
                                 let mut resume_pos_on_reload: Option<f64> = None;
                                 let active_mic = is_mic_launch || state.is_mic_input;
 
@@ -2643,7 +3312,9 @@ async fn run_gui(
 
                                     if !reload_path.is_empty() || active_mic {
                                         state.load_request = Some(reload_path);
-                                        state.surround_upmix.user_overridden = false;
+                                        if !cli_upmix_override {
+                                            state.surround_upmix.user_overridden = false;
+                                        }
                                         resume_pos_on_reload = Some(state.current_seconds);
                                         state.osd_text =
                                             Some("Audio Device Reconnected".to_string());
@@ -2657,7 +3328,9 @@ async fn run_gui(
                                     if (!reload_path.is_empty() && state.file_loaded) || active_mic
                                     {
                                         state.load_request = Some(reload_path);
-                                        state.surround_upmix.user_overridden = false;
+                                        if !cli_upmix_override {
+                                            state.surround_upmix.user_overridden = false;
+                                        }
                                         resume_pos_on_reload = Some(state.current_seconds);
                                         state.osd_text = Some(osd_msg);
                                         state.osd_timer = 3.0;
@@ -2670,7 +3343,8 @@ async fn run_gui(
 
                                     if !reload_path.is_empty() || active_mic {
                                         if active_mic && !state.playlist.is_empty() {
-                                            state.playlist[0] = reload_path.clone();
+                                            std::sync::Arc::make_mut(&mut state.playlist)[0] =
+                                                reload_path.clone();
                                         }
                                         state.load_request = Some(reload_path);
                                         state.osd_text = Some(if active_mic {
@@ -2678,7 +3352,9 @@ async fn run_gui(
                                         } else {
                                             format!("Audio Output: {}", new_device)
                                         });
-                                        state.surround_upmix.user_overridden = false;
+                                        if !cli_upmix_override {
+                                            state.surround_upmix.user_overridden = false;
+                                        }
                                         resume_pos_on_reload = Some(state.current_seconds);
                                         state.osd_timer = 3.0;
                                     }
@@ -2691,36 +3367,7 @@ async fn run_gui(
                                     {
                                         state.load_request = Some(reload_path);
                                         resume_pos_on_reload = Some(state.current_seconds);
-                                        if state.surround_upmix.enabled && !pt_enabled {
-                                            let hw_ch = state.hardware_channels;
-                                            let badge =
-                                                crate::state::SurroundUpmixConfig::layout_badge(
-                                                    hw_ch,
-                                                );
-                                            if !state
-                                                .osd_text
-                                                .as_ref()
-                                                .is_some_and(|s| s.contains("MPEG-H 3D Audio"))
-                                            {
-                                                state.osd_text = Some(format!(
-                                                    "🔊 Surround Upmix: ON ({badge})"
-                                                ));
-                                            }
-                                        } else if !state.surround_upmix.enabled
-                                            && state
-                                                .osd_text
-                                                .as_ref()
-                                                .is_some_and(|s| s.contains("Surround Upmix"))
-                                        {
-                                            // Preserve "🔊 Auto Surround Upmix: OFF" OSD message
-                                        } else {
-                                            state.osd_text = Some(if pt_enabled {
-                                                "Bitstream Passthrough: ON (Exclusive)".to_string()
-                                            } else {
-                                                "Bitstream Passthrough: OFF (Shared Mode)"
-                                                    .to_string()
-                                            });
-                                        }
+                                        reconcile_passthrough_change_osd(&mut state, pt_enabled);
                                         state.osd_timer = 3.0;
                                     }
                                 }
@@ -2736,9 +3383,13 @@ async fn run_gui(
                                     }
                                 }
 
-                                if resume_pos_on_reload.is_none() && state.load_request.is_some() {
+                                if resume_pos_on_reload.is_none()
+                                    && state.load_request.is_some()
+                                    && !cli_upmix_override
+                                {
                                     state.surround_upmix.user_overridden = false;
                                 }
+                                state.sync_rt_control();
                                 (state.load_request.take(), resume_pos_on_reload)
                             };
 
@@ -2808,11 +3459,14 @@ async fn run_gui(
                                         state.stats.mpegh_carrier_info.clear();
                                         state.stats.audio_buffer_fill_pct = 0.0;
                                         state.stats.video_buffer_fill_pct = 0.0;
+                                        state.stats.video_decode_us = 0.0;
                                         state.stats.video_hw_decoder.clear();
                                         state.stats.video_fps = 0.0;
                                         state.stats.video_bitrate_kbps = None;
                                         state.stats.audio_bitrate_kbps = None;
                                         state.track_ended = false;
+                                        let _ = state.rt_control.take_track_ended();
+                                        state.sync_rt_control();
                                     }
 
                                     // We rely entirely on DSP thread messages to update tracker string state
@@ -2850,6 +3504,7 @@ async fn run_gui(
                                                 .map(std::sync::Arc::new)
                                         };
                                         state.track_ended = false;
+                                        let _ = state.rt_control.take_track_ended();
                                         if let Some(pos) = resume_pos_on_reload {
                                             if pos > 0.1 {
                                                 state.current_seconds = pos;
@@ -2975,7 +3630,8 @@ async fn run_gui(
                                 let mut state = app_state.lock().unwrap();
                                 state.current_fps = fps;
                                 if bench.is_none() {
-                                    state.update_visualizer_perf_guard(avg_dt, 60.0);
+                                    let target_fps = state.target_fps.max(1) as f32;
+                                    state.update_visualizer_perf_guard(avg_dt, target_fps);
                                 }
                                 state.visual_width = engine.config.width / 2;
 
@@ -3067,6 +3723,8 @@ async fn run_gui(
                                 // Gamepad analog panel scaling (Left Stick Y or Right Stick Y) and trigger scrubbing
                                 let mut max_left_y = std::mem::take(&mut frame_left_stick_y);
                                 let mut max_right_y = std::mem::take(&mut frame_right_stick_y);
+                                let mut max_lt = std::mem::take(&mut frame_left_trigger);
+                                let mut max_rt = std::mem::take(&mut frame_right_trigger);
                                 for (_id, gamepad) in gilrs.gamepads() {
                                     let left_y = gamepad.value(gilrs::Axis::LeftStickY);
                                     if left_y.abs() > max_left_y.abs() {
@@ -3077,38 +3735,34 @@ async fn run_gui(
                                         max_right_y = right_y;
                                     }
 
-                                    // Analog trigger scrubbing
                                     let lt = gamepad
                                         .button_data(gilrs::Button::LeftTrigger2)
                                         .map(|d| d.value())
-                                        .unwrap_or(0.0);
+                                        .unwrap_or_else(|| {
+                                            if gamepad.is_pressed(gilrs::Button::LeftTrigger2) {
+                                                1.0
+                                            } else {
+                                                0.0
+                                            }
+                                        });
+                                    if lt > max_lt {
+                                        max_lt = lt;
+                                    }
                                     let rt = gamepad
                                         .button_data(gilrs::Button::RightTrigger2)
                                         .map(|d| d.value())
-                                        .unwrap_or(0.0);
-                                    let scrub_delta = rt - lt;
-                                    if scrub_delta.abs() > 0.05 {
-                                        let scrub_amount = (scrub_delta * dt) as f64
-                                            * (state.duration_seconds * 0.1).clamp(2.0, 30.0);
-                                        let target = (state.current_seconds + scrub_amount)
-                                            .clamp(0.0, state.duration_seconds);
-                                        state.seek_request = Some(target);
-                                        state.current_seconds = target;
-                                        state.track_ended = false;
-                                        state.spectrum_history.clear();
-                                        for _ in 0..120 {
-                                            state.spectrum_history.push_back(vec![0.0; 1024]);
-                                        }
-
-                                        let sign = if scrub_delta > 0.0 { "+" } else { "" };
-                                        state.osd_text = Some(format!(
-                                            "Scrubbing {}{:.1}x",
-                                            sign,
-                                            scrub_delta * 10.0
-                                        ));
-                                        state.osd_timer = 0.5;
+                                        .unwrap_or_else(|| {
+                                            if gamepad.is_pressed(gilrs::Button::RightTrigger2) {
+                                                1.0
+                                            } else {
+                                                0.0
+                                            }
+                                        });
+                                    if rt > max_rt {
+                                        max_rt = rt;
                                     }
                                 }
+                                apply_gamepad_trigger_scrub(&mut state, max_lt, max_rt, dt);
                                 apply_gamepad_stick_panel_resize(
                                     &mut state,
                                     max_left_y,
@@ -3119,11 +3773,12 @@ async fn run_gui(
                                 state.tick_osd_timer(dt);
 
                                 // Clamp panel split ratio to ensure both top and bottom panels have at least MIN_PANEL_HEIGHT_PX height
-                                let total_h =
-                                    engine.config.height as f32 / window.scale_factor() as f32;
+                                let total_h = engine.config.height as f32
+                                    / effective_window_scale(window, force_unit_scale) as f32;
                                 state.panel_split_ratio =
                                     clamp_panel_split_ratio(state.panel_split_ratio, total_h);
 
+                                state.sync_rt_control();
                                 engine.update(&state, dt);
                             }
                             let phase_lock_update_us = phase_timer.elapsed().as_micros() as f32;
@@ -3135,7 +3790,8 @@ async fn run_gui(
                                 let is_hovering_file =
                                     app_state.lock().unwrap().hovered_file.is_some();
                                 if is_hovering_file
-                                    && let Some(live_pos) = query_window_cursor_pos(window)
+                                    && let Some(live_pos) =
+                                        query_window_cursor_pos(window, force_unit_scale)
                                 {
                                     last_cursor_pos = Some(live_pos);
                                 }
@@ -3238,8 +3894,8 @@ async fn run_gui(
                                             state.stats.shader_us * 0.9 + vis * 0.1;
                                     }
                                     if let Some(ft) = fft_time {
-                                        state.stats.gpu_fft_us =
-                                            state.stats.gpu_fft_us * 0.9 + ft * 0.1;
+                                        state.stats.gpu_compute_us =
+                                            state.stats.gpu_compute_us * 0.9 + ft * 0.1;
                                     }
                                 }
 
@@ -3271,8 +3927,8 @@ async fn run_gui(
                                             state.stats.fft_us
                                         );
                                         println!(
-                                            "BENCHMARK_RESULT_GPU_FFT_US: {:.2}",
-                                            state.stats.gpu_fft_us
+                                            "BENCHMARK_RESULT_GPU_COMPUTE_US: {:.2}",
+                                            state.stats.gpu_compute_us
                                         );
                                         println!(
                                             "BENCHMARK_RESULT_FIRE_US: {:.2}",
@@ -3327,14 +3983,12 @@ async fn run_gui(
                                         }
                                     }
                                     EngineAction::ScrubEnd => {
+                                        state.is_touch_scrubbing = false;
                                         if let Some(target) = state.scrub_target_seconds.take() {
                                             state.seek_request = Some(target);
                                             state.current_seconds = target;
                                             state.track_ended = false;
-                                            state.spectrum_history.clear();
-                                            for _ in 0..120 {
-                                                state.spectrum_history.push_back(vec![0.0; 1024]);
-                                            }
+                                            clear_spectrum_history_in_place(&mut state);
                                         }
                                     }
                                     EngineAction::Seek(pct) => {
@@ -3343,11 +3997,9 @@ async fn run_gui(
                                         state.seek_request = Some(target);
                                         state.current_seconds = target;
                                         state.track_ended = false;
+                                        state.is_touch_scrubbing = false;
                                         state.scrub_target_seconds = None;
-                                        state.spectrum_history.clear();
-                                        for _ in 0..120 {
-                                            state.spectrum_history.push_back(vec![0.0; 1024]);
-                                        }
+                                        clear_spectrum_history_in_place(&mut state);
                                     }
                                     EngineAction::OpenFile => {
                                         if is_game_mode {
@@ -3405,11 +4057,12 @@ async fn run_gui(
                                                     ));
                                                 }
                                                 state.osd_timer = 3.0;
-                                                state.playlist.extend(expanded);
+                                                std::sync::Arc::make_mut(&mut state.playlist)
+                                                    .extend(expanded);
                                             }
                                         } else if !expanded.is_empty() {
                                             state.set_mic_input_mode(false, None);
-                                            state.playlist = expanded;
+                                            state.playlist = std::sync::Arc::new(expanded);
                                             state.playlist_index = 0;
                                             state.load_request = Some(state.playlist[0].clone());
                                             state.file_loaded = true;
@@ -3422,14 +4075,7 @@ async fn run_gui(
                                         state.append_to_playlist = val;
                                     }
                                     EngineAction::SetForceStereo(val) => {
-                                        state.force_stereo_downmix = val;
-                                        if val {
-                                            state.surround_upmix.enabled = false;
-                                        }
-                                        if state.file_loaded {
-                                            state.passthrough_change_request =
-                                                Some(state.passthrough_enabled);
-                                        }
+                                        state.set_force_stereo_downmix(val);
                                     }
                                     EngineAction::ToggleSurroundUpmix(val) => {
                                         state.set_surround_upmix(val);
@@ -3444,12 +4090,29 @@ async fn run_gui(
                                         state.set_show_surround_eq(val);
                                     }
                                     EngineAction::SetPassthrough(val) => {
-                                        state.passthrough_enabled = val;
-                                        if val {
-                                            state.surround_upmix.enabled = false;
-                                            state.force_stereo_downmix = false;
+                                        if cfg!(any(target_os = "windows", target_os = "linux")) {
+                                            state.passthrough_enabled = val;
+                                            if val {
+                                                state.surround_upmix.enabled = false;
+                                                state.force_stereo_downmix = false;
+                                                state.show_surround_eq = false;
+                                            }
+                                            state.osd_text = Some(if val {
+                                                "Bitstream Passthrough: ON (Exclusive)".to_string()
+                                            } else {
+                                                "Bitstream Passthrough: OFF (Shared Mode)"
+                                                    .to_string()
+                                            });
+                                            state.osd_timer = 3.0;
+                                            state.passthrough_change_request = Some(val);
+                                        } else {
+                                            state.passthrough_enabled = false;
+                                            state.osd_text = Some(
+                                                "Bitstream Passthrough requires Linux or Windows"
+                                                    .to_string(),
+                                            );
+                                            state.osd_timer = 2.5;
                                         }
-                                        state.passthrough_change_request = Some(val);
                                     }
                                     EngineAction::SetSplitRatio(val) => {
                                         state.panel_split_ratio = val;
@@ -3641,7 +4304,7 @@ async fn run_gui(
                                         state.is_url_dialog_open = false;
                                         window.set_ime_allowed(false);
                                         state.set_mic_input_mode(true, Some(device_name.clone()));
-                                        state.playlist = vec![mic_uri.clone()];
+                                        state.playlist = std::sync::Arc::new(vec![mic_uri.clone()]);
                                         state.playlist_index = 0;
                                         state.load_request = Some(mic_uri);
                                         state.file_loaded = true;
@@ -3666,7 +4329,8 @@ async fn run_gui(
                                             state.set_mic_input_mode(true, Some(dev_name.clone()));
                                             let mic_uri =
                                                 crate::state::mic_uri_for_device(&dev_name);
-                                            state.playlist = vec![mic_uri.clone()];
+                                            state.playlist =
+                                                std::sync::Arc::new(vec![mic_uri.clone()]);
                                             state.playlist_index = 0;
                                             state.load_request = Some(mic_uri);
                                             state.file_loaded = true;
@@ -3685,7 +4349,8 @@ async fn run_gui(
                                             state.is_url_dialog_open = false;
                                             window.set_ime_allowed(false);
                                             state.url_input_text.clear();
-                                            state.playlist = vec![final_url.clone()];
+                                            state.playlist =
+                                                std::sync::Arc::new(vec![final_url.clone()]);
                                             state.playlist_index = 0;
                                             state.load_request = Some(final_url.clone());
                                             state.file_loaded = true;
@@ -3770,10 +4435,11 @@ async fn run_gui(
                                             && !state.playlist.is_empty()
                                             && !state.is_mic_input
                                         {
-                                            state.playlist.extend(expanded);
+                                            std::sync::Arc::make_mut(&mut state.playlist)
+                                                .extend(expanded);
                                         } else if !expanded.is_empty() {
                                             state.set_mic_input_mode(false, None);
-                                            state.playlist = expanded;
+                                            state.playlist = std::sync::Arc::new(expanded);
                                             state.playlist_index = 0;
                                             state.load_request = Some(state.playlist[0].clone());
                                             state.file_loaded = true;
@@ -3794,14 +4460,16 @@ async fn run_gui(
                                                 || state.is_mic_input
                                             {
                                                 state.set_mic_input_mode(false, None);
-                                                state.playlist = expanded.clone();
+                                                state.playlist =
+                                                    std::sync::Arc::new(expanded.clone());
                                                 state.playlist_index = 0;
                                                 state.load_request =
                                                     Some(state.playlist[0].clone());
                                                 state.file_loaded = true;
                                             } else {
                                                 let first_new_idx = state.playlist.len();
-                                                state.playlist.extend(expanded.clone());
+                                                std::sync::Arc::make_mut(&mut state.playlist)
+                                                    .extend(expanded.clone());
                                                 state.playlist_index = first_new_idx;
                                                 state.load_request =
                                                     Some(state.playlist[first_new_idx].clone());
@@ -3833,6 +4501,7 @@ async fn run_gui(
                                         window.request_redraw();
                                     }
                                 }
+                                state.sync_rt_control();
                             }
 
                             if trigger_picker {
@@ -3867,8 +4536,8 @@ async fn run_gui(
                             let fps_limit = if !is_uncapped && bench.is_none() {
                                 std::env::var("RUSTTRACKER_FPS_LIMIT")
                                     .ok()
-                                    .and_then(|s| s.parse::<f32>().ok())
-                                    .filter(|&fps| fps > 0.0)
+                                    .and_then(|s| s.trim().parse::<f32>().ok())
+                                    .filter(|&fps| fps.is_finite() && fps > 0.0)
                             } else {
                                 None
                             };
@@ -3918,9 +4587,9 @@ async fn run_gui(
                             let mut state = app_state.lock().unwrap();
                             let append = state.append_to_playlist;
                             if append && !state.playlist.is_empty() {
-                                state.playlist.extend(expanded);
+                                std::sync::Arc::make_mut(&mut state.playlist).extend(expanded);
                             } else if !expanded.is_empty() {
-                                state.playlist = expanded;
+                                state.playlist = std::sync::Arc::new(expanded);
                                 state.playlist_index = 0;
                                 state.load_request = Some(state.playlist[0].clone());
                                 state.file_loaded = true;
@@ -3937,13 +4606,14 @@ async fn run_gui(
                             if !expanded.is_empty() {
                                 let mut state = app_state.lock().unwrap();
                                 if !state.file_loaded || state.playlist.is_empty() {
-                                    state.playlist = expanded.clone();
+                                    state.playlist = std::sync::Arc::new(expanded.clone());
                                     state.playlist_index = 0;
                                     state.load_request = Some(state.playlist[0].clone());
                                     state.file_loaded = true;
                                 } else {
                                     let first_new_idx = state.playlist.len();
-                                    state.playlist.extend(expanded.clone());
+                                    std::sync::Arc::make_mut(&mut state.playlist)
+                                        .extend(expanded.clone());
                                     state.playlist_index = first_new_idx;
                                     state.load_request =
                                         Some(state.playlist[first_new_idx].clone());
@@ -4020,8 +4690,8 @@ async fn run_gui(
                     }
 
                     while let Some(gilrs::Event { event: g_event, .. }) = gilrs.next_event() {
-                        if let gilrs::EventType::AxisChanged(axis, val, _) = g_event {
-                            match axis {
+                        match g_event {
+                            gilrs::EventType::AxisChanged(axis, val, _) => match axis {
                                 gilrs::Axis::LeftStickY if val.abs() > frame_left_stick_y.abs() => {
                                     frame_left_stick_y = val;
                                 }
@@ -4031,7 +4701,17 @@ async fn run_gui(
                                     frame_right_stick_y = val;
                                 }
                                 _ => {}
-                            }
+                            },
+                            gilrs::EventType::ButtonChanged(btn, val, _) => match btn {
+                                gilrs::Button::LeftTrigger2 if val > frame_left_trigger => {
+                                    frame_left_trigger = val;
+                                }
+                                gilrs::Button::RightTrigger2 if val > frame_right_trigger => {
+                                    frame_right_trigger = val;
+                                }
+                                _ => {}
+                            },
+                            _ => {}
                         }
                         let is_pressed = matches!(g_event, gilrs::EventType::ButtonPressed(_, _));
                         let is_repeated = matches!(g_event, gilrs::EventType::ButtonRepeated(_, _));
@@ -4043,33 +4723,14 @@ async fn run_gui(
                             };
 
                             if is_repeated {
-                                match button {
-                                    gilrs::Button::DPadRight => {
-                                        let mut state = app_state.lock().unwrap();
-                                        let target = (state.current_seconds + 10.0)
-                                            .clamp(0.0, state.duration_seconds);
-                                        state.seek_request = Some(target);
-                                        state.current_seconds = target;
-                                        state.track_ended = false;
-                                        state.spectrum_history.clear();
-                                        for _ in 0..120 {
-                                            state.spectrum_history.push_back(vec![0.0; 1024]);
-                                        }
-                                        state.record_seek_osd(10.0);
-                                    }
-                                    gilrs::Button::DPadLeft => {
-                                        let mut state = app_state.lock().unwrap();
-                                        let target = (state.current_seconds - 10.0).max(0.0);
-                                        state.seek_request = Some(target);
-                                        state.current_seconds = target;
-                                        state.track_ended = false;
-                                        state.spectrum_history.clear();
-                                        for _ in 0..120 {
-                                            state.spectrum_history.push_back(vec![0.0; 1024]);
-                                        }
-                                        state.record_seek_osd(-10.0);
-                                    }
-                                    _ => {}
+                                if !is_dialog_open
+                                    && matches!(
+                                        button,
+                                        gilrs::Button::DPadLeft | gilrs::Button::DPadRight
+                                    )
+                                {
+                                    let mut state = app_state.lock().unwrap();
+                                    let _ = apply_gamepad_playback_button(&mut state, button);
                                 }
                                 continue;
                             }
@@ -4098,6 +4759,7 @@ async fn run_gui(
                                             Some(desired_logical_w),
                                             Some(desired_logical_h),
                                             true,
+                                            force_unit_scale,
                                         );
                                         keep_awake = None;
                                     }
@@ -4328,253 +4990,9 @@ async fn run_gui(
                                 }
                             }
 
-                            match button {
-                                gilrs::Button::LeftTrigger => {
-                                    // L1 Bumper
-                                    let mut state = app_state.lock().unwrap();
-                                    if !state.playlist.is_empty()
-                                        && state.playlist.len() > 1
-                                        && state.playlist_index > 0
-                                    {
-                                        state.playlist_index -= 1;
-                                        state.load_request =
-                                            Some(state.playlist[state.playlist_index].clone());
-                                        state.is_paused = false;
-                                        state.osd_text = Some("Previous Track".to_string());
-                                        state.osd_timer = 2.0;
-                                    } else {
-                                        let target = (state.current_seconds - 60.0).max(0.0);
-                                        state.seek_request = Some(target);
-                                        state.current_seconds = target;
-                                        state.track_ended = false;
-                                        state.spectrum_history.clear();
-                                        for _ in 0..120 {
-                                            state.spectrum_history.push_back(vec![0.0; 1024]);
-                                        }
-                                        state.record_seek_osd(-60.0);
-                                    }
-                                }
-                                gilrs::Button::RightTrigger => {
-                                    // R1 Bumper
-                                    let mut state = app_state.lock().unwrap();
-                                    if !state.playlist.is_empty()
-                                        && state.playlist.len() > 1
-                                        && state.playlist_index + 1 < state.playlist.len()
-                                    {
-                                        state.playlist_index += 1;
-                                        state.load_request =
-                                            Some(state.playlist[state.playlist_index].clone());
-                                        state.is_paused = false;
-                                        state.osd_text = Some("Next Track".to_string());
-                                        state.osd_timer = 2.0;
-                                    } else {
-                                        let target = (state.current_seconds + 60.0)
-                                            .clamp(0.0, state.duration_seconds);
-                                        state.seek_request = Some(target);
-                                        state.current_seconds = target;
-                                        state.track_ended = false;
-                                        state.spectrum_history.clear();
-                                        for _ in 0..120 {
-                                            state.spectrum_history.push_back(vec![0.0; 1024]);
-                                        }
-                                        state.record_seek_osd(60.0);
-                                    }
-                                }
-                                gilrs::Button::LeftTrigger2 => {
-                                    // L2 Trigger -> Toggle HUD
-                                    let mut state = app_state.lock().unwrap();
-                                    state.show_hud = !state.show_hud;
-                                    state.video_mode = 0;
-                                    let mode_name = if state.show_hud {
-                                        "Standard View"
-                                    } else {
-                                        "Full Screen Visualizer"
-                                    };
-                                    state.osd_text = Some(format!("View: {}", mode_name));
-                                    state.osd_timer = 2.0;
-                                }
-                                gilrs::Button::RightTrigger2 => {
-                                    // R2 Trigger -> Toggle GPU FFT
-                                    let mut state = app_state.lock().unwrap();
-                                    state.gpu_fft = !state.gpu_fft;
-                                    let mode_name = if state.gpu_fft {
-                                        "GPU FFT: ON"
-                                    } else {
-                                        "GPU FFT: OFF"
-                                    };
-                                    state.osd_text = Some(mode_name.to_string());
-                                    state.osd_timer = 2.0;
-                                }
-                                gilrs::Button::LeftThumb | gilrs::Button::RightThumb => {
-                                    // L3 / R3 thumbstick click: toggle Auto Surround & Height Upmix + Crossover EQ
-                                    let mut state = app_state.lock().unwrap();
-                                    state.toggle_surround_upmix();
-                                }
-                                gilrs::Button::North => {
-                                    // 'Y' or Triangle
-                                    let mut state = app_state.lock().unwrap();
-                                    state.open_file_request = true;
-                                }
-                                gilrs::Button::West => {
-                                    // 'X' or Square
-                                    let mut state = app_state.lock().unwrap();
-                                    if state.show_vis_picker {
-                                        let cursor = state.vis_picker_cursor;
-                                        if cursor != 0 && cursor < state.vis_enabled.len() {
-                                            state.vis_enabled[cursor] = !state.vis_enabled[cursor];
-                                            state.vis_user_overridden[cursor] = true;
-                                        }
-                                    } else if state.video_frame_rx.is_some()
-                                        || state.has_video_stream
-                                    {
-                                        state.video_mode = (state.video_mode + 1) % 4;
-                                        let mode_name = match state.video_mode {
-                                            0 => "Standard View",
-                                            1 => "Video in Track Info",
-                                            2 => "Video in Top Panel",
-                                            3 => "Full Screen Video",
-                                            _ => "Video",
-                                        };
-                                        state.osd_text = Some(format!("View: {}", mode_name));
-                                        state.osd_timer = 2.0;
-                                    } else {
-                                        state.show_hud = !state.show_hud;
-                                        state.video_mode = 0;
-                                        let mode_name = if state.show_hud {
-                                            "Standard View"
-                                        } else {
-                                            "Full Screen Visualizer"
-                                        };
-                                        state.osd_text = Some(format!("View: {}", mode_name));
-                                        state.osd_timer = 2.0;
-                                    }
-                                }
-                                gilrs::Button::East => {
-                                    // 'B' or Circle
-                                    let mut state = app_state.lock().unwrap();
-                                    if state.show_vis_picker {
-                                        state.show_vis_picker = false;
-                                    } else {
-                                        state.show_stats = !state.show_stats;
-                                    }
-                                }
-                                gilrs::Button::DPadRight => {
-                                    let mut state = app_state.lock().unwrap();
-                                    if !state.show_vis_picker {
-                                        let target = (state.current_seconds + 10.0)
-                                            .clamp(0.0, state.duration_seconds);
-                                        state.seek_request = Some(target);
-                                        state.current_seconds = target;
-                                        state.track_ended = false;
-                                        state.spectrum_history.clear();
-                                        for _ in 0..120 {
-                                            state.spectrum_history.push_back(vec![0.0; 1024]);
-                                        }
-                                        state.record_seek_osd(10.0);
-                                    }
-                                }
-                                gilrs::Button::DPadLeft => {
-                                    let mut state = app_state.lock().unwrap();
-                                    if !state.show_vis_picker {
-                                        let target = (state.current_seconds - 10.0).max(0.0);
-                                        state.seek_request = Some(target);
-                                        state.current_seconds = target;
-                                        state.track_ended = false;
-                                        state.spectrum_history.clear();
-                                        for _ in 0..120 {
-                                            state.spectrum_history.push_back(vec![0.0; 1024]);
-                                        }
-                                        state.record_seek_osd(-10.0);
-                                    }
-                                }
-                                gilrs::Button::DPadUp => {
-                                    let mut state = app_state.lock().unwrap();
-                                    if state.show_vis_picker {
-                                        if state.vis_picker_cursor == 0 {
-                                            state.vis_picker_cursor =
-                                                crate::state::VISUALIZERS.len() - 1;
-                                        } else {
-                                            state.vis_picker_cursor -= 1;
-                                        }
-                                        state.vis_picker_scroll_to_cursor = true;
-                                    } else {
-                                        let len = crate::state::VISUALIZERS.len();
-                                        let mut idx = state.current_visualizer_idx;
-                                        for _ in 0..len {
-                                            idx = (idx + 1) % len;
-                                            if state.vis_enabled[idx] {
-                                                break;
-                                            }
-                                        }
-                                        state.current_visualizer_idx = idx;
-                                        state.visualizer_mode = crate::state::VISUALIZERS[idx].id;
-                                        state.osd_text =
-                                            Some(crate::state::VISUALIZERS[idx].name.to_string());
-                                        state.osd_timer = 2.0;
-                                    }
-                                }
-                                gilrs::Button::DPadDown => {
-                                    let mut state = app_state.lock().unwrap();
-                                    if state.show_vis_picker {
-                                        state.vis_picker_cursor = (state.vis_picker_cursor + 1)
-                                            % crate::state::VISUALIZERS.len();
-                                        state.vis_picker_scroll_to_cursor = true;
-                                    } else {
-                                        let len = crate::state::VISUALIZERS.len();
-                                        let mut idx = state.current_visualizer_idx;
-                                        for _ in 0..len {
-                                            idx = if idx == 0 { len - 1 } else { idx - 1 };
-                                            if state.vis_enabled[idx] {
-                                                break;
-                                            }
-                                        }
-                                        state.current_visualizer_idx = idx;
-                                        state.visualizer_mode = crate::state::VISUALIZERS[idx].id;
-                                        state.osd_text =
-                                            Some(crate::state::VISUALIZERS[idx].name.to_string());
-                                        state.osd_timer = 2.0;
-                                    }
-                                }
-                                gilrs::Button::South => {
-                                    let mut state = app_state.lock().unwrap();
-                                    if state.show_vis_picker {
-                                        state.current_visualizer_idx = state.vis_picker_cursor;
-                                        state.visualizer_mode =
-                                            crate::state::VISUALIZERS[state.vis_picker_cursor].id;
-                                        state.osd_text = Some(
-                                            crate::state::VISUALIZERS[state.vis_picker_cursor]
-                                                .name
-                                                .to_string(),
-                                        );
-                                        state.osd_timer = 2.0;
-                                        state.show_vis_picker = false;
-                                    } else if state.track_ended
-                                        || (state.current_seconds >= state.duration_seconds - 0.1
-                                            && state.duration_seconds > 0.0)
-                                    {
-                                        state.track_ended = false;
-                                        state.seek_request = Some(0.0);
-                                        state.spectrum_history.clear();
-                                        for _ in 0..120 {
-                                            state.spectrum_history.push_back(vec![0.0; 1024]);
-                                        }
-                                        state.is_paused = false;
-                                    } else if state.playlist_index >= state.playlist.len()
-                                        && !state.playlist.is_empty()
-                                    {
-                                        if state.duration_seconds == 0.0 {
-                                            state.playlist_index = state.playlist.len() - 1;
-                                        } else {
-                                            state.playlist_index = 0;
-                                        }
-                                        state.load_request =
-                                            Some(state.playlist[state.playlist_index].clone());
-                                        state.is_paused = false;
-                                    } else {
-                                        state.is_paused = !state.is_paused;
-                                    }
-                                }
-                                _ => {}
+                            {
+                                let mut state = app_state.lock().unwrap();
+                                apply_gamepad_playback_button(&mut state, button);
                             }
                         }
                     }
@@ -4751,8 +5169,29 @@ pub(crate) fn handle_tui_key_event(state: &mut AppState, key: crossterm::event::
             }
         }
         KeyCode::Char('b') | KeyCode::Char('B') => {
-            state.passthrough_enabled = !state.passthrough_enabled;
-            state.passthrough_change_request = Some(state.passthrough_enabled);
+            if cfg!(any(target_os = "windows", target_os = "linux")) {
+                state.passthrough_enabled = !state.passthrough_enabled;
+                if state.passthrough_enabled {
+                    state.surround_upmix.enabled = false;
+                    state.force_stereo_downmix = false;
+                    state.show_surround_eq = false;
+                    if state.tui_center_view == Some(crate::state::TuiCenterView::SurroundEq) {
+                        state.tui_center_view = Some(crate::state::TuiCenterView::Heatmap);
+                    }
+                }
+                state.osd_text = Some(if state.passthrough_enabled {
+                    "Bitstream Passthrough: ON (Exclusive)".to_string()
+                } else {
+                    "Bitstream Passthrough: OFF (Shared Mode)".to_string()
+                });
+                state.osd_timer = 3.0;
+                state.passthrough_change_request = Some(state.passthrough_enabled);
+            } else {
+                state.passthrough_enabled = false;
+                state.osd_text =
+                    Some("Bitstream Passthrough requires Linux or Windows".to_string());
+                state.osd_timer = 2.5;
+            }
         }
         KeyCode::Char('[') => {
             state.panel_split_ratio = (state.panel_split_ratio - 0.05)
@@ -5025,6 +5464,7 @@ fn run_tui<B: Backend>(
     app_state: Arc<Mutex<AppState>>,
     mut active_stream: Option<audio::PlaybackHandle>,
     is_mic_launch: bool,
+    cli_upmix_override: bool,
 ) -> io::Result<()>
 where
     std::io::Error: From<<B as Backend>::Error>,
@@ -5037,11 +5477,14 @@ where
     loop {
         if is_first_frame {
             is_first_frame = false;
-            app_state.lock().unwrap().is_paused = false;
+            let mut state = app_state.lock().unwrap();
+            state.is_paused = false;
+            state.sync_rt_control();
         }
 
         let (load_path, resume_pos_on_reload) = {
             let mut state = app_state.lock().unwrap();
+            state.sync_rt_control();
             let mut resume_pos_on_reload: Option<f64> = None;
             let active_mic = is_mic_launch || state.is_mic_input;
 
@@ -5073,7 +5516,7 @@ where
 
                 if !reload_path.is_empty() || active_mic {
                     if active_mic && !state.playlist.is_empty() {
-                        state.playlist[0] = reload_path.clone();
+                        std::sync::Arc::make_mut(&mut state.playlist)[0] = reload_path.clone();
                     }
                     state.load_request = Some(reload_path);
                     resume_pos_on_reload = Some(state.current_seconds);
@@ -5082,7 +5525,9 @@ where
                     } else {
                         format!("Audio Output: {}", new_device)
                     });
-                    state.surround_upmix.user_overridden = false;
+                    if !cli_upmix_override {
+                        state.surround_upmix.user_overridden = false;
+                    }
                     state.osd_timer = 3.0;
                 }
             }
@@ -5093,18 +5538,7 @@ where
                 if (!reload_path.is_empty() && state.file_loaded) || active_mic {
                     state.load_request = Some(reload_path);
                     resume_pos_on_reload = Some(state.current_seconds);
-                    if state.surround_upmix.enabled && !pt_enabled {
-                        let badge = crate::state::SurroundUpmixConfig::layout_badge(
-                            state.hardware_channels,
-                        );
-                        state.osd_text = Some(format!("🔊 Surround Upmix: ON ({badge})"));
-                    } else {
-                        state.osd_text = Some(if pt_enabled {
-                            "Bitstream Passthrough: ON (Exclusive)".to_string()
-                        } else {
-                            "Bitstream Passthrough: OFF (Shared Mode)".to_string()
-                        });
-                    }
+                    reconcile_passthrough_change_osd(&mut state, pt_enabled);
                     state.osd_timer = 3.0;
                 }
             }
@@ -5115,7 +5549,9 @@ where
                 if (!reload_path.is_empty() && state.file_loaded) || active_mic {
                     state.load_request = Some(reload_path);
                     resume_pos_on_reload = Some(state.current_seconds);
-                    state.surround_upmix.user_overridden = false;
+                    if !cli_upmix_override {
+                        state.surround_upmix.user_overridden = false;
+                    }
                     state.osd_text = Some(osd_msg);
                     state.osd_timer = 3.0;
                 }
@@ -5128,7 +5564,9 @@ where
                 if !reload_path.is_empty() || active_mic {
                     state.load_request = Some(reload_path);
                     resume_pos_on_reload = Some(state.current_seconds);
-                    state.surround_upmix.user_overridden = false;
+                    if !cli_upmix_override {
+                        state.surround_upmix.user_overridden = false;
+                    }
                     state.osd_text = Some("Audio Device Reconnected".to_string());
                     state.osd_timer = 3.0;
                 }
@@ -5144,9 +5582,11 @@ where
                 }
             }
 
-            if resume_pos_on_reload.is_none() && state.load_request.is_some() {
+            if resume_pos_on_reload.is_none() && state.load_request.is_some() && !cli_upmix_override
+            {
                 state.surround_upmix.user_overridden = false;
             }
+            state.sync_rt_control();
             (state.load_request.take(), resume_pos_on_reload)
         };
 
@@ -5207,14 +5647,17 @@ where
                     state.stats.mpegh_carrier_info.clear();
                     state.stats.audio_buffer_fill_pct = 0.0;
                     state.stats.video_buffer_fill_pct = 0.0;
+                    state.stats.video_decode_us = 0.0;
                     state.stats.video_hw_decoder.clear();
                     state.stats.video_fps = 0.0;
                     state.stats.video_bitrate_kbps = None;
                     state.stats.audio_bitrate_kbps = None;
                     state.track_ended = false;
+                    let _ = state.rt_control.take_track_ended();
                     if !state.show_surround_eq {
                         state.tui_center_view = None;
                     }
+                    state.sync_rt_control();
                 }
 
                 let mut loaded_stream = None;
@@ -5246,6 +5689,7 @@ where
                         crate::lyrics::load_lyrics_for_file(&path).map(std::sync::Arc::new)
                     };
                     state.track_ended = false;
+                    let _ = state.rt_control.take_track_ended();
                     if let Some(pos) = resume_pos_on_reload
                         && pos > 0.1
                     {
@@ -5253,6 +5697,7 @@ where
                         state.seek_request = Some(pos);
                         state.seek_epoch += 1;
                     }
+                    state.sync_rt_control();
                     active_stream = Some(stream);
                 } else {
                     let mut state = app_state.lock().unwrap();
@@ -5395,10 +5840,12 @@ where
                             drop(active_stream);
                             return Ok(());
                         }
+                        state.sync_rt_control();
                     }
                     CEvent::Mouse(mouse) => {
                         let mut state = app_state.lock().unwrap();
                         handle_tui_mouse_event(&mut state, mouse, term_area);
+                        state.sync_rt_control();
                     }
                     _ => {}
                 }
@@ -5804,14 +6251,14 @@ mod tests {
     }
 
     #[test]
-    fn test_middle_panel_defaults_to_pianoroll_and_flips_to_eq() {
+    fn test_middle_panel_defaults_to_pattern_view_and_flips_to_eq() {
         let mut state = AppState::new("Test Tracker.mod".to_string());
         state.file_loaded = true;
         state.source_channels = 2;
         state.hardware_channels = 8;
 
         // Surround upmix is enabled and active by default on surround hardware,
-        // while the middle panel defaults to the Piano Roll / Pattern Heatmap (`show_surround_eq == false`).
+        // while the middle panel defaults to the Tracker Pattern / Heatmap viewer (`show_surround_eq == false`).
         assert!(state.surround_upmix.enabled);
         assert!(state.surround_upmix.is_active_for(2, 8));
         assert!(!state.show_surround_eq);
@@ -5822,20 +6269,21 @@ mod tests {
         assert!(state.show_surround_eq);
         assert!(state.render_snapshot().show_surround_eq);
 
-        // Flip back to Piano Roll / Pattern Heatmap
+        // Flip back to Tracker Pattern / Heatmap viewer
         state.toggle_show_surround_eq();
         assert!(!state.show_surround_eq);
 
-        // Disabling surround upmix while viewing EQ returns to Piano Roll
+        // Disabling surround upmix while viewing EQ returns to Pattern View
         state.set_show_surround_eq(true);
         assert!(state.show_surround_eq);
         state.set_surround_upmix(false);
         assert!(!state.show_surround_eq);
 
-        // Verify middle panel title bar buttons and consolidated upmix/layout labels in src/engine.rs
-        let engine_src = include_str!("engine.rs");
+        // Verify middle panel title bar buttons and consolidated upmix/layout labels in crates/rt-render/src/engine.rs
+        let engine_src = include_str!("../crates/rt-render/src/engine.rs");
         assert!(engine_src.contains("🎚 Surround EQ"));
-        assert!(engine_src.contains("🎹 Piano Roll"));
+        assert!(engine_src.contains("📊 Pattern View"));
+        assert!(!engine_src.contains("🎹 Piano Roll"));
         assert!(!engine_src.contains("🔊 SURROUND UPMIX: ON"));
         assert!(!engine_src.contains("11.1 (7.1.4): ON"));
         assert_eq!(crate::state::SurroundUpmixConfig::short_tag(8), "7.1");
@@ -5900,7 +6348,33 @@ mod tests {
             crate::state::TuiCenterView::Heatmap
         );
 
-        // 4. Split ratio adjustment with '[' and ']'
+        // 4. Bitstream passthrough shortcut ('b') resets SurroundEq/upmix on Linux/Windows and stays honest elsewhere
+        let _ = handle_tui_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('v'), KeyModifiers::NONE),
+        );
+        assert_eq!(
+            state.effective_tui_center_view(),
+            crate::state::TuiCenterView::SurroundEq
+        );
+        let _ = handle_tui_key_event(
+            &mut state,
+            KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE),
+        );
+        if cfg!(any(target_os = "windows", target_os = "linux")) {
+            assert!(state.passthrough_enabled);
+            assert!(!state.surround_upmix.enabled);
+            assert_eq!(
+                state.effective_tui_center_view(),
+                crate::state::TuiCenterView::Heatmap
+            );
+            assert_eq!(state.passthrough_change_request, Some(true));
+        } else {
+            assert!(!state.passthrough_enabled);
+            assert!(state.passthrough_change_request.is_none());
+        }
+
+        // 5. Split ratio adjustment with '[' and ']'
         let initial_ratio = state.panel_split_ratio;
         let _ = handle_tui_key_event(
             &mut state,
@@ -5913,7 +6387,7 @@ mod tests {
         );
         assert!((state.panel_split_ratio - initial_ratio).abs() < 1e-4);
 
-        // 5. Quit with Esc, 'q', and Ctrl+C
+        // 6. Quit with Esc, 'q', and Ctrl+C
         assert!(handle_tui_key_event(
             &mut state,
             KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
@@ -5970,6 +6444,936 @@ mod tests {
         assert_eq!(
             state.effective_tui_center_view(),
             crate::state::TuiCenterView::SurroundEq
+        );
+    }
+
+    #[test]
+    fn test_cli_args_bench_windowed_fullscreen_and_help() {
+        use clap::CommandFactory;
+
+        // Bare --bench (alone or after positional file) defaults to Some(300)
+        let bare_only = Args::try_parse_from(["rusttracker", "--bench"])
+            .expect("Bare --bench alone must parse");
+        assert_eq!(bare_only.bench, Some(300));
+
+        let bare_trailing = Args::try_parse_from(["rusttracker", "song.mod", "--bench"])
+            .expect("Trailing bare --bench must parse");
+        assert_eq!(bare_trailing.bench, Some(300));
+        assert_eq!(bare_trailing.file, vec!["song.mod".to_string()]);
+
+        // Normalized CLI args also allow `--bench song.mod` without swallowing the filename
+        let bare_leading = Args::try_parse_from(super::normalize_cli_args([
+            std::ffi::OsString::from("rusttracker"),
+            std::ffi::OsString::from("--bench"),
+            std::ffi::OsString::from("song.mod"),
+        ]))
+        .expect("Normalized `--bench song.mod` must parse");
+        assert_eq!(bare_leading.bench, Some(300));
+        assert_eq!(bare_leading.file, vec!["song.mod".to_string()]);
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let non_utf8_path = std::ffi::OsString::from_vec(vec![
+                b's', b'o', b'n', b'g', 0xff, b'.', b'm', b'o', b'd',
+            ]);
+            let normalized = super::normalize_cli_args([
+                std::ffi::OsString::from("rusttracker"),
+                std::ffi::OsString::from("--bench"),
+                non_utf8_path.clone(),
+            ]);
+            assert_eq!(normalized[1], std::ffi::OsString::from("--bench=300"));
+            assert_eq!(normalized[2], non_utf8_path);
+        }
+
+        // Explicit --bench <N> parses N
+        let explicit_bench = Args::try_parse_from(super::normalize_cli_args([
+            std::ffi::OsString::from("rusttracker"),
+            std::ffi::OsString::from("--bench"),
+            std::ffi::OsString::from("120"),
+            std::ffi::OsString::from("song.mod"),
+        ]))
+        .expect("Explicit --bench 120 must parse");
+        assert_eq!(explicit_bench.bench, Some(120));
+        assert_eq!(explicit_bench.file, vec!["song.mod".to_string()]);
+
+        // --windowed parses cleanly alone, and conflicts with --fullscreen
+        let win_args =
+            Args::try_parse_from(["rusttracker", "--windowed"]).expect("--windowed must parse");
+        assert!(win_args.windowed);
+        assert!(!win_args.fullscreen);
+        assert!(
+            Args::try_parse_from(["rusttracker", "--windowed", "--fullscreen"]).is_err(),
+            "--windowed and --fullscreen must conflict"
+        );
+
+        // Removed placebo --gpu-fft flag must be rejected
+        assert!(
+            Args::try_parse_from(["rusttracker", "--gpu-fft"]).is_err(),
+            "Removed placebo --gpu-fft flag must be rejected"
+        );
+
+        // Every flag in --help must have a non-empty description
+        let mut cmd = Args::command();
+        let help_text = cmd.render_help().to_string();
+        for flag in [
+            "--tui",
+            "--mic",
+            "--fullscreen",
+            "--windowed",
+            "--vis",
+            "--list-vis",
+            "--bench",
+            "--uncapped",
+            "--stereo",
+            "--passthrough",
+            "--surround-upmix",
+            "--no-surround-upmix",
+            "--mpegh",
+            "--no-mpegh",
+            "--register-steam",
+        ] {
+            assert!(
+                help_text.contains(flag),
+                "Help output missing expected flag {flag}"
+            );
+        }
+        assert!(!help_text.contains("--gpu-fft"));
+    }
+
+    #[test]
+    fn test_readme_cli_flags_and_env_vars_match_args_parser() {
+        use clap::CommandFactory;
+
+        let readme = include_str!("../README.md");
+        let flags_header = "### Command-Line Flags";
+        let env_header = "### Environment Variables";
+        let after_flags = readme
+            .split_once(flags_header)
+            .expect("README.md must contain `### Command-Line Flags`")
+            .1;
+        let (flags_section, after_env_split) = after_flags
+            .split_once(env_header)
+            .expect("README.md must contain `### Environment Variables` after Command-Line Flags");
+        let env_section = after_env_split
+            .split_once("\n---")
+            .map(|(s, _)| s)
+            .unwrap_or(after_env_split);
+
+        let sample_for_placeholder = |token: &str| -> &'static str {
+            match token.trim() {
+                "id" | "frames" => "120",
+                "name" => "spectrum",
+                "true" => "true",
+                "false" => "false",
+                _ => "test_value",
+            }
+        };
+
+        let run_normalized_parse = |argv: &[&str]| -> Result<Args, clap::Error> {
+            let os_args: Vec<std::ffi::OsString> =
+                argv.iter().map(std::ffi::OsString::from).collect();
+            Args::try_parse_from(super::normalize_cli_args(os_args))
+        };
+
+        // Extract every backticked `--...` span in `### Command-Line Flags`
+        let mut documented_spans: Vec<String> = Vec::new();
+        for line in flags_section.lines() {
+            let mut rest = line;
+            while let Some(start) = rest.find('`') {
+                let after_open = &rest[start + 1..];
+                let Some(end) = after_open.find('`') else {
+                    break;
+                };
+                let span = after_open[..end].trim();
+                if span.starts_with("--") {
+                    documented_spans.push(span.to_string());
+                }
+                rest = &after_open[end + 1..];
+            }
+        }
+
+        assert!(
+            documented_spans.len() >= 14,
+            "Expected at least 14 documented CLI flag spans in README.md, found {}",
+            documented_spans.len()
+        );
+
+        let mut seen_flag_names = std::collections::HashSet::new();
+        for span in &documented_spans {
+            let parts: Vec<&str> = span.split_whitespace().collect();
+            let flag_name = parts[0];
+            seen_flag_names.insert(flag_name.to_string());
+
+            match parts.get(1).copied() {
+                None => {
+                    // Bare `--flag` invocation must always parse cleanly alone
+                    let parsed_alone = run_normalized_parse(&["rusttracker", flag_name])
+                        .unwrap_or_else(|e| {
+                            panic!("Documented flag `{span}` failed standalone parse: {e}")
+                        });
+                    assert!(parsed_alone.file.is_empty());
+
+                    // Every bare flag (including bare `--vis`) with no value placeholder must NOT
+                    // swallow a trailing positional media filename.
+                    let parsed_with_file =
+                        run_normalized_parse(&["rusttracker", flag_name, "song.mod"])
+                            .unwrap_or_else(|e| {
+                                panic!("Documented flag `{span}` failed parse before filename: {e}")
+                            });
+                    assert_eq!(
+                        parsed_with_file.file,
+                        vec!["song.mod".to_string()],
+                        "Documented flag `{span}` swallowed `song.mod` instead of leaving it as sole positional file"
+                    );
+                }
+                Some(arg_spec) if arg_spec.starts_with('<') && arg_spec.ends_with('>') => {
+                    let inner = &arg_spec[1..arg_spec.len() - 1];
+                    for alt in inner.split('|') {
+                        let sample = sample_for_placeholder(alt);
+                        let parsed = run_normalized_parse(&[
+                            "rusttracker",
+                            flag_name,
+                            sample,
+                            "song.mod",
+                        ])
+                        .unwrap_or_else(|e| {
+                            panic!(
+                                "Documented flag `{span}` with value `{sample}` failed parse: {e}"
+                            )
+                        });
+                        assert_eq!(
+                            parsed.file,
+                            vec!["song.mod".to_string()],
+                            "Documented flag `{span}` with value `{sample}` treated value as positional file! (got {:?})",
+                            parsed.file
+                        );
+                    }
+                }
+                Some(arg_spec) if arg_spec.starts_with('[') && arg_spec.ends_with(']') => {
+                    let inner = &arg_spec[1..arg_spec.len() - 1];
+                    // Optional value omitted (both standalone and followed by positional filename)
+                    let parsed_bare = run_normalized_parse(&["rusttracker", flag_name])
+                        .unwrap_or_else(|e| {
+                            panic!("Documented optional flag `{span}` failed bare parse: {e}")
+                        });
+                    assert!(parsed_bare.file.is_empty());
+
+                    let parsed_omitted_with_file =
+                        run_normalized_parse(&["rusttracker", flag_name, "song.mod"])
+                            .unwrap_or_else(|e| {
+                                panic!(
+                                    "Documented optional flag `{span}` failed bare parse before filename: {e}"
+                                )
+                            });
+                    assert_eq!(
+                        parsed_omitted_with_file.file,
+                        vec!["song.mod".to_string()],
+                        "Documented optional flag `{span}` swallowed `song.mod` when value omitted"
+                    );
+
+                    // Optional value provided explicitly
+                    for alt in inner.split('|') {
+                        let sample = sample_for_placeholder(alt);
+                        let parsed_explicit =
+                            run_normalized_parse(&["rusttracker", flag_name, sample, "song.mod"])
+                                .unwrap_or_else(|e| {
+                                    panic!(
+                                        "Documented optional flag `{span}` with `{sample}` failed parse: {e}"
+                                    )
+                                });
+                        assert_eq!(parsed_explicit.file, vec!["song.mod".to_string()]);
+                    }
+                }
+                Some(literal_val) => {
+                    // Literal example such as `--vis list`
+                    let parsed = run_normalized_parse(&["rusttracker", flag_name, literal_val])
+                        .unwrap_or_else(|e| {
+                            panic!("Documented invocation `{span}` failed parse: {e}")
+                        });
+                    assert!(parsed.file.is_empty());
+                }
+            }
+        }
+
+        // Reverse check: every `--long` flag and visible alias in `Args` must have non-empty
+        // `--help` text and be documented in README.md
+        let cmd = Args::command();
+        for arg in cmd.get_arguments() {
+            if arg.get_id() != "help" && arg.get_id() != "version" {
+                assert!(
+                    arg.get_help()
+                        .is_some_and(|h| !h.to_string().trim().is_empty()),
+                    "CLI argument `{}` in `struct Args` is missing `--help` description",
+                    arg.get_id()
+                );
+            }
+            let Some(long) = arg.get_long() else {
+                continue;
+            };
+            if long == "help" || long == "version" {
+                continue;
+            }
+            let expected = format!("--{long}");
+            assert!(
+                seen_flag_names.contains(&expected),
+                "CLI flag `{expected}` exists in `struct Args` (`src/main.rs`) but is missing from `README.md` Command-Line Flags"
+            );
+            if let Some(aliases) = arg.get_visible_aliases() {
+                for alias in aliases {
+                    let expected_alias = format!("--{alias}");
+                    assert!(
+                        seen_flag_names.contains(&expected_alias),
+                        "Visible CLI alias `{expected_alias}` exists in `struct Args` but is missing from `README.md` Command-Line Flags"
+                    );
+                }
+            }
+        }
+
+        // Verify all user-facing RUSTTRACKER_* environment variables are documented in README.md,
+        // and scan source files so no undocumented RUSTTRACKER_* env var can sneak in.
+        for env_var in [
+            "RUSTTRACKER_FPS_LIMIT",
+            "RUSTTRACKER_PROFILE",
+            "RUSTTRACKER_PRESENT_MODE",
+            "RUSTTRACKER_PIPELINE_CACHE",
+            "RUSTTRACKER_CACHE_DIR",
+            "RUSTTRACKER_WAYLAND",
+            "RUSTTRACKER_X11",
+        ] {
+            assert!(
+                env_section.contains(env_var),
+                "Environment variable `{env_var}` missing from `README.md` Environment Variables section"
+            );
+        }
+
+        for (file_label, src_text) in [
+            ("src/main.rs", include_str!("main.rs")),
+            (
+                "crates/rt-render/src/engine.rs",
+                include_str!("../crates/rt-render/src/engine.rs"),
+            ),
+        ] {
+            for needle in ["env::var(\"RUSTTRACKER_", "env::var_os(\"RUSTTRACKER_"] {
+                let mut search = src_text;
+                while let Some(pos) = search.find(needle) {
+                    let after_quote = &search[pos + needle.len() - "RUSTTRACKER_".len()..];
+                    if let Some(end_q) = after_quote.find('"') {
+                        let var_name = &after_quote[..end_q];
+                        // `RUSTTRACKER_APPDIR` is an internal AppImage mount path set by AppRun
+                        if var_name != "RUSTTRACKER_APPDIR" {
+                            assert!(
+                                env_section.contains(var_name),
+                                "Undocumented `{var_name}` read in `{file_label}` but missing from `README.md` Environment Variables"
+                            );
+                        }
+                        search = &after_quote[end_q + 1..];
+                    } else {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_cli_stereo_and_no_surround_upmix_flags() {
+        // 1. `--stereo` forces 2.0 downmix, disables surround upmix + passthrough, and marks user_overridden
+        let stereo_args =
+            Args::try_parse_from(["rusttracker", "--stereo", "track.mkv"]).expect("--stereo");
+        assert!(stereo_args.stereo);
+        assert!(super::has_cli_upmix_override(&stereo_args));
+        assert_eq!(stereo_args.file, vec!["track.mkv".to_string()]);
+        let mut stereo_state = AppState::new("track.mkv".to_string());
+        stereo_state.passthrough_enabled = true;
+        super::apply_cli_audio_flags(&mut stereo_state, &stereo_args);
+        assert!(stereo_state.force_stereo_downmix);
+        assert!(!stereo_state.surround_upmix.enabled);
+        assert!(stereo_state.surround_upmix.user_overridden);
+        assert!(!stereo_state.passthrough_enabled);
+        assert_eq!(
+            stereo_state.osd_text.as_deref(),
+            Some("🎧 Stereo Downmix (2.0): Forced")
+        );
+
+        // `--stereo --no-mpegh` and `--stereo --no-surround-upmix` must keep the stereo OSD
+        let stereo_no_mpegh =
+            Args::try_parse_from(["rusttracker", "--stereo", "--no-mpegh", "track.mkv"])
+                .expect("--stereo --no-mpegh");
+        let mut stereo_no_mpegh_state = AppState::new("track.mkv".to_string());
+        super::apply_cli_audio_flags(&mut stereo_no_mpegh_state, &stereo_no_mpegh);
+        assert!(stereo_no_mpegh_state.force_stereo_downmix);
+        assert!(!stereo_no_mpegh_state.surround_upmix.mpegh_bitstream);
+        assert_eq!(
+            stereo_no_mpegh_state.osd_text.as_deref(),
+            Some("🎧 Stereo Downmix (2.0): Forced")
+        );
+
+        // Runtime `set_force_stereo_downmix` preserves stereo OSD across `reconcile_passthrough_change_osd`
+        let mut runtime_stereo = AppState::new("track.mkv".to_string());
+        runtime_stereo.file_loaded = true;
+        runtime_stereo.hardware_channels = 8;
+        runtime_stereo.passthrough_enabled = true;
+        runtime_stereo.set_force_stereo_downmix(true);
+        assert!(runtime_stereo.force_stereo_downmix);
+        assert!(!runtime_stereo.passthrough_enabled);
+        assert!(!runtime_stereo.surround_upmix.enabled);
+        assert!(runtime_stereo.surround_upmix.user_overridden);
+        assert_eq!(runtime_stereo.passthrough_change_request, Some(false));
+        super::reconcile_passthrough_change_osd(&mut runtime_stereo, false);
+        assert_eq!(
+            runtime_stereo.osd_text.as_deref(),
+            Some("🎧 Stereo Downmix (2.0): Forced")
+        );
+        runtime_stereo.set_force_stereo_downmix(false);
+        assert!(!runtime_stereo.force_stereo_downmix);
+        assert!(!runtime_stereo.surround_upmix.user_overridden);
+        super::reconcile_passthrough_change_osd(&mut runtime_stereo, false);
+        assert_eq!(
+            runtime_stereo.osd_text.as_deref(),
+            Some("🎧 Stereo Downmix: OFF")
+        );
+
+        // 2. `--no-surround-upmix` and `--no-upmix` disable automatic upmixing cleanly
+        let no_upmix_args =
+            Args::try_parse_from(["rusttracker", "--no-surround-upmix", "song.flac"])
+                .expect("--no-surround-upmix");
+        assert!(no_upmix_args.no_surround_upmix);
+        assert!(!no_upmix_args.surround_upmix);
+        assert!(super::has_cli_upmix_override(&no_upmix_args));
+        assert_eq!(no_upmix_args.file, vec!["song.flac".to_string()]);
+
+        let no_upmix_alias =
+            Args::try_parse_from(["rusttracker", "--no-upmix", "song.flac"]).expect("--no-upmix");
+        assert!(no_upmix_alias.no_surround_upmix);
+
+        let mut no_upmix_state = AppState::new("song.flac".to_string());
+        assert!(no_upmix_state.surround_upmix.enabled);
+        super::apply_cli_audio_flags(&mut no_upmix_state, &no_upmix_args);
+        assert!(!no_upmix_state.surround_upmix.enabled);
+        assert!(no_upmix_state.surround_upmix.user_overridden);
+        assert!(!no_upmix_state.force_stereo_downmix);
+
+        // 3. `--mpegh` preserves `has_cli_upmix_override` and keeps 11.1 OSD; `--no-surround-upmix --mpegh`
+        // allows native >8ch MPEG-H bitstreaming without re-enabling upmix
+        let mpegh_only_args =
+            Args::try_parse_from(["rusttracker", "--mpegh", "song.flac"]).expect("--mpegh");
+        assert!(super::has_cli_upmix_override(&mpegh_only_args));
+        let mut mpegh_only_state = AppState::new("song.flac".to_string());
+        super::apply_cli_audio_flags(&mut mpegh_only_state, &mpegh_only_args);
+        if cfg!(any(target_os = "windows", target_os = "linux")) {
+            assert_eq!(
+                mpegh_only_state.osd_text.as_deref(),
+                Some("🔊 11.1 (7.1.4 Spatial Audio / MPEG-H 3D): ON")
+            );
+        }
+
+        // `--surround-upmix` updates pre-load "Armed" OSD to "ON (<badge>)" once >2ch stream opens
+        let upmix_args = Args::try_parse_from(["rusttracker", "--surround-upmix", "song.flac"])
+            .expect("--surround-upmix");
+        let mut upmix_state = AppState::new("song.flac".to_string());
+        super::apply_cli_audio_flags(&mut upmix_state, &upmix_args);
+        upmix_state.hardware_channels = 8;
+        upmix_state.source_channels = 2;
+        super::reconcile_post_load_cli_audio_osd(&mut upmix_state, &upmix_args);
+        assert_eq!(
+            upmix_state.osd_text.as_deref(),
+            Some("🔊 Surround Upmix: ON (7.1 Surround — Bed Only)")
+        );
+
+        let native_mpegh_args = Args::try_parse_from([
+            "rusttracker",
+            "--no-surround-upmix",
+            "--mpegh",
+            "bed714.wav",
+        ])
+        .expect("--no-surround-upmix --mpegh");
+        assert!(super::has_cli_upmix_override(&native_mpegh_args));
+        let mut native_mpegh_state = AppState::new("bed714.wav".to_string());
+        super::apply_cli_audio_flags(&mut native_mpegh_state, &native_mpegh_args);
+        assert!(!native_mpegh_state.surround_upmix.enabled);
+        if cfg!(any(target_os = "windows", target_os = "linux")) {
+            assert!(native_mpegh_state.surround_upmix.mpegh_bitstream);
+        }
+
+        // 4. Mutually contradictory audio mode flags are rejected by clap
+        for conflicting in [
+            &["rusttracker", "--stereo", "--passthrough"][..],
+            &["rusttracker", "--stereo", "--surround-upmix"][..],
+            &["rusttracker", "--stereo", "--upmix"][..],
+            &["rusttracker", "--stereo", "--mpegh"][..],
+            &["rusttracker", "--surround-upmix", "--no-surround-upmix"][..],
+            &["rusttracker", "--upmix", "--no-upmix"][..],
+            &["rusttracker", "--mpegh", "--no-mpegh"][..],
+            &["rusttracker", "--passthrough", "--surround-upmix"][..],
+            &["rusttracker", "--passthrough", "--mpegh"][..],
+        ] {
+            assert!(
+                Args::try_parse_from(conflicting).is_err(),
+                "Expected conflicting flags {conflicting:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cli_vis_and_bench_normalization_and_x11_wayland_precedence() {
+        let parse_norm = |argv: &[&str]| -> Result<Args, clap::Error> {
+            let os_args: Vec<std::ffi::OsString> =
+                argv.iter().map(std::ffi::OsString::from).collect();
+            Args::try_parse_from(super::normalize_cli_args(os_args))
+        };
+
+        // Bare `--vis` before a media path, URL, or `--` lists visualizers without swallowing the file
+        for (argv, expected_file) in [
+            (&["rusttracker", "--vis", "song.mod"][..], "song.mod"),
+            (
+                &["rusttracker", "--vis", "audio_tests/ive_got_the_power.mod"][..],
+                "audio_tests/ive_got_the_power.mod",
+            ),
+            (
+                &["rusttracker", "--vis", "https://example.com/live.ogg"][..],
+                "https://example.com/live.ogg",
+            ),
+            (
+                &["rusttracker", "--vis", "--", "-song.mod"][..],
+                "-song.mod",
+            ),
+        ] {
+            let parsed = parse_norm(argv).unwrap_or_else(|e| panic!("{argv:?} failed: {e}"));
+            assert_eq!(parsed.vis.as_deref(), Some(""));
+            assert_eq!(parsed.file, vec![expected_file.to_string()]);
+        }
+
+        // Explicit visualizer names/IDs and unknown non-path tokens still bind to `--vis`
+        let vis_named = parse_norm(&["rusttracker", "--vis", "spectrum", "song.mod"]).unwrap();
+        assert_eq!(vis_named.vis.as_deref(), Some("spectrum"));
+        assert_eq!(vis_named.file, vec!["song.mod".to_string()]);
+
+        let vis_unknown = parse_norm(&["rusttracker", "--vis", "nonexistent_vis", "song.mod"])
+            .expect("unknown vis token");
+        assert_eq!(vis_unknown.vis.as_deref(), Some("nonexistent_vis"));
+        assert_eq!(vis_unknown.file, vec!["song.mod".to_string()]);
+
+        // `--bench` before `--` defaults to 300, whereas overflowing numeric frame counts fail cleanly
+        let bench_sep = parse_norm(&["rusttracker", "--bench", "--", "-song.mod"]).unwrap();
+        assert_eq!(bench_sep.bench, Some(300));
+        assert_eq!(bench_sep.file, vec!["-song.mod".to_string()]);
+        assert!(
+            parse_norm(&["rusttracker", "--bench", "99999999999999999999", "song.mod"]).is_err(),
+            "Overflowing numeric `--bench` count must fail clap u32 validation instead of becoming a filename"
+        );
+
+        // `RUSTTRACKER_X11=1` always overrides `RUSTTRACKER_WAYLAND=1`
+        assert!(super::should_prefer_x11_backend(
+            Some("1"),
+            Some("1"),
+            true,
+            true
+        ));
+        // Explicit `RUSTTRACKER_WAYLAND=1` or default with active `WAYLAND_DISPLAY` uses native Wayland
+        assert!(!super::should_prefer_x11_backend(
+            Some("1"),
+            None,
+            true,
+            true
+        ));
+        assert!(!super::should_prefer_x11_backend(None, None, true, true));
+        assert!(!super::should_prefer_x11_backend(None, None, true, false));
+        // `RUSTTRACKER_WAYLAND=0` / `false` forces X11 when DISPLAY is available
+        assert!(super::should_prefer_x11_backend(
+            Some("0"),
+            None,
+            true,
+            true
+        ));
+        assert!(super::should_prefer_x11_backend(
+            Some("false"),
+            None,
+            true,
+            true
+        ));
+        // Falls back to X11 when WAYLAND_DISPLAY is absent and DISPLAY is present
+        assert!(super::should_prefer_x11_backend(None, None, false, true));
+        assert!(!super::should_prefer_x11_backend(None, None, false, false));
+    }
+
+    #[test]
+    fn test_gamepad_l2_r2_scrub_no_hud_collision_and_l3_r3_bindings() {
+        let mut state = AppState::new("ScrubTest.mod".to_string());
+        state.file_loaded = true;
+        state.duration_seconds = 120.0;
+        state.current_seconds = 60.0;
+        state.show_hud = true;
+        state.hardware_channels = 8;
+        state.source_channels = 2;
+
+        // 1. Pulling L2 (analog + digital LeftTrigger2 event from gilrs) scrubs backward and NEVER hides HUD
+        assert!(
+            !super::apply_gamepad_playback_button(&mut state, gilrs::Button::LeftTrigger2),
+            "Digital LeftTrigger2 must not trigger a button action"
+        );
+        assert!(state.show_hud, "LeftTrigger2 must never toggle HUD");
+        assert!(super::apply_gamepad_trigger_scrub(
+            &mut state,
+            0.8,
+            0.0,
+            1.0 / 60.0
+        ));
+        assert!(
+            state.current_seconds < 60.0,
+            "L2 analog pull must scrub backward"
+        );
+        assert!(state.seek_request.is_some());
+        assert!(state.show_hud, "L2 analog scrub must leave HUD visible");
+
+        // 2. Pulling R2 (analog + digital RightTrigger2 event) scrubs forward and NEVER hides HUD
+        let after_l2 = state.current_seconds;
+        assert!(!super::apply_gamepad_playback_button(
+            &mut state,
+            gilrs::Button::RightTrigger2
+        ));
+        assert!(super::apply_gamepad_trigger_scrub(
+            &mut state,
+            0.0,
+            1.0,
+            1.0 / 60.0
+        ));
+        assert!(state.current_seconds > after_l2);
+        assert!(state.show_hud);
+
+        // 3. Deadzone and modal/unloaded guards prevent spurious scrubbing or seek OSDs
+        state.seek_request = None;
+        assert!(!super::apply_gamepad_trigger_scrub(
+            &mut state,
+            0.02,
+            0.0,
+            1.0 / 60.0
+        ));
+        assert!(state.seek_request.is_none());
+        state.show_vis_picker = true;
+        assert!(!super::apply_gamepad_trigger_scrub(
+            &mut state,
+            1.0,
+            0.0,
+            1.0 / 60.0
+        ));
+        assert!(!super::apply_gamepad_playback_button(
+            &mut state,
+            gilrs::Button::DPadRight
+        ));
+        state.show_vis_picker = false;
+
+        let mut unloaded = AppState::new(String::new());
+        for seek_btn in [
+            gilrs::Button::DPadLeft,
+            gilrs::Button::DPadRight,
+            gilrs::Button::LeftTrigger,
+            gilrs::Button::RightTrigger,
+        ] {
+            assert!(
+                !super::apply_gamepad_playback_button(&mut unloaded, seek_btn),
+                "Unloaded state must ignore {seek_btn:?} seek without false OSD"
+            );
+            assert!(unloaded.seek_request.is_none());
+            assert!(unloaded.osd_text.is_none());
+        }
+
+        // 4. L3 (LeftThumb) toggles HUD visibility cleanly
+        state.video_mode = 3;
+        assert!(super::apply_gamepad_playback_button(
+            &mut state,
+            gilrs::Button::LeftThumb
+        ));
+        assert!(!state.show_hud);
+        assert_eq!(state.video_mode, 0);
+        assert!(super::apply_gamepad_playback_button(
+            &mut state,
+            gilrs::Button::LeftThumb
+        ));
+        assert!(state.show_hud);
+
+        // 5. R3 (RightThumb) toggles Surround Upmix cleanly without affecting L3 HUD role
+        let initial_upmix = state.surround_upmix.enabled;
+        assert!(super::apply_gamepad_playback_button(
+            &mut state,
+            gilrs::Button::RightThumb
+        ));
+        assert_eq!(state.surround_upmix.enabled, !initial_upmix);
+        assert!(super::apply_gamepad_playback_button(
+            &mut state,
+            gilrs::Button::RightThumb
+        ));
+        assert_eq!(state.surround_upmix.enabled, initial_upmix);
+
+        // 6. Verify env_flag_enabled handles truthy/falsy/empty values accurately
+        assert!(super::env_flag_enabled(Some("1")));
+        assert!(super::env_flag_enabled(Some("true")));
+        assert!(super::env_flag_enabled(Some("TRUE")));
+        assert!(super::env_flag_enabled(Some(" 1 ")));
+        assert!(!super::env_flag_enabled(Some("0")));
+        assert!(!super::env_flag_enabled(Some("false")));
+        assert!(!super::env_flag_enabled(Some("FALSE")));
+        assert!(!super::env_flag_enabled(Some("")));
+        assert!(!super::env_flag_enabled(Some("   ")));
+        assert!(!super::env_flag_enabled(None));
+
+        // 7. Verify UI overlays, README, VIS_REVIEW, and THIRD_PARTY_NOTICES match live ground truth
+        let engine_src = include_str!("../crates/rt-render/src/engine.rs");
+        assert!(!engine_src.contains("\"L2\", \"Toggle HUD\""));
+        assert!(!engine_src.contains("Some(\"L2\"), \"Toggle HUD\""));
+        assert!(!engine_src.contains("\"q / esc\""));
+        assert!(!engine_src.contains("Surround Upmix & EQ"));
+
+        let state_src = include_str!("../crates/rt-core/src/state.rs");
+        let shader_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/shaders");
+        let mut total_wgsl = 0usize;
+        let mut standalone_wgsl = 0usize;
+        for entry in std::fs::read_dir(&shader_dir).expect("read src/shaders") {
+            let path = entry.expect("dir entry").path();
+            if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("wgsl") {
+                total_wgsl += 1;
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                if !name.starts_with('_') {
+                    standalone_wgsl += 1;
+                    assert!(
+                        engine_src.contains(name) || state_src.contains(name),
+                        "Standalone shader {name} in src/shaders/ is not referenced in engine.rs or state.rs"
+                    );
+                }
+            }
+        }
+        let shared_wgsl = total_wgsl - standalone_wgsl;
+        assert_eq!(shared_wgsl, 2);
+        assert_eq!(standalone_wgsl, 30);
+        assert_eq!(total_wgsl, 32);
+
+        let vis_count = crate::state::VISUALIZERS.len();
+        let vis_review = include_str!("../VIS_REVIEW.md");
+        assert!(vis_review.contains("Document Status Note:"));
+        assert!(vis_review.contains(&format!("{vis_count}` registered visualizers")));
+        assert!(vis_review.contains(&format!("{total_wgsl}` `.wgsl` files")));
+        assert!(vis_review.contains(&format!(
+            "{standalone_wgsl}` standalone Naga-validated shader modules"
+        )));
+        assert!(vis_review.contains(&format!(
+            "- {standalone_wgsl} standalone WGSL shader modules + {shared_wgsl} shared include headers (`_common.wgsl`, `_glyph_font.wgsl`) = {total_wgsl} `.wgsl` files"
+        )));
+        assert!(!vis_review.contains("51` `.wgsl` files"));
+        assert!(!vis_review.contains("49 standalone WGSL"));
+
+        let notices = include_str!("../THIRD_PARTY_NOTICES.txt");
+        assert!(notices.contains("MPEG-H 3D Audio Low Complexity Profile Encoder"));
+        assert!(!notices.contains("Baseline Profile Encoder"));
+        assert!(notices.contains("[third_party/libmpeghe/LICENSE]"));
+        assert!(notices.contains("[third_party/libmpeghe/LICENSE2]"));
+    }
+
+    #[test]
+    fn test_license_notices_and_packaging_manifests_invariants() {
+        let root_license = include_str!("../LICENSE").replace("\r\n", "\n");
+        let notices = include_str!("../THIRD_PARTY_NOTICES.txt").replace("\r\n", "\n");
+        let libmpeghe_license =
+            include_str!("../third_party/libmpeghe/LICENSE").replace("\r\n", "\n");
+        let libmpeghe_license2 =
+            include_str!("../third_party/libmpeghe/LICENSE2").replace("\r\n", "\n");
+
+        // 1. Verify GPLv3 §7 Additional Permission and verbatim Ittiam LICENSE + LICENSE2 reproduction
+        assert!(root_license.contains(
+            "Additional Permission Under GNU GPL Version 3 Section 7 (`libmpeghe` Exception)"
+        ));
+        assert!(root_license.contains("THIRD_PARTY_NOTICES.txt"));
+        assert!(notices.contains("MPEG-H 3D Audio Low Complexity Profile Encoder"));
+        assert!(!notices.contains("Baseline Profile Encoder"));
+        assert!(
+            notices.contains(libmpeghe_license.trim()),
+            "THIRD_PARTY_NOTICES.txt must reproduce third_party/libmpeghe/LICENSE verbatim"
+        );
+        assert!(
+            notices.contains(libmpeghe_license2.trim()),
+            "THIRD_PARTY_NOTICES.txt must reproduce third_party/libmpeghe/LICENSE2 verbatim"
+        );
+
+        // 2. Verify all 6 distribution manifests bundle LICENSE and THIRD_PARTY_NOTICES.txt
+        let cargo_toml = include_str!("../Cargo.toml");
+        assert!(
+            cargo_toml.contains(r#"dest = "/usr/share/licenses/rusttracker/LICENSE""#)
+                && cargo_toml.contains(
+                    r#"dest = "/usr/share/licenses/rusttracker/THIRD_PARTY_NOTICES.txt""#
+                ),
+            "Cargo.toml [package.metadata.generate-rpm] must bundle LICENSE and THIRD_PARTY_NOTICES.txt"
+        );
+        assert!(
+            cargo_toml.contains(r#"["LICENSE", "usr/share/doc/rusttracker/", "644"]"#)
+                && cargo_toml.contains(
+                    r#"["THIRD_PARTY_NOTICES.txt", "usr/share/doc/rusttracker/", "644"]"#
+                ),
+            "Cargo.toml [package.metadata.deb] must bundle LICENSE and THIRD_PARTY_NOTICES.txt"
+        );
+
+        let repackage = include_str!("../repackage_appimage.sh");
+        assert!(
+            repackage
+                .contains("cp LICENSE THIRD_PARTY_NOTICES.txt AppDir/usr/share/doc/rusttracker/")
+                && repackage.contains(
+                    "cp LICENSE THIRD_PARTY_NOTICES.txt AppDir/usr/share/licenses/rusttracker/"
+                ),
+            "repackage_appimage.sh must install LICENSE and THIRD_PARTY_NOTICES.txt into AppDir"
+        );
+
+        let installer_iss = include_str!("../installer.iss");
+        assert!(
+            installer_iss.contains(r#"Excludes: "LICENSE,THIRD_PARTY_NOTICES.txt""#),
+            "installer.iss must exclude LICENSE and THIRD_PARTY_NOTICES.txt from release\\* wildcard to prevent duplicate entries"
+        );
+        assert!(
+            installer_iss.contains(r#"Source: "LICENSE"; DestDir: "{app}""#)
+                && installer_iss.contains(r#"Source: "THIRD_PARTY_NOTICES.txt"; DestDir: "{app}""#),
+            "installer.iss must bundle LICENSE and THIRD_PARTY_NOTICES.txt into {{app}}"
+        );
+
+        let win_yml = include_str!("../.github/workflows/windows-build.yml");
+        assert!(
+            win_yml.contains("cp LICENSE THIRD_PARTY_NOTICES.txt release/"),
+            "windows-build.yml must stage LICENSE and THIRD_PARTY_NOTICES.txt into release/"
+        );
+
+        let macos_yml = include_str!("../.github/workflows/macos.yml");
+        assert!(
+            macos_yml.contains(
+                "cp assets/soundfont.sf2 LICENSE THIRD_PARTY_NOTICES.txt RustTracker.app/Contents/Resources/"
+            ),
+            "macos.yml must bundle LICENSE and THIRD_PARTY_NOTICES.txt into RustTracker.app/Contents/Resources/"
+        );
+
+        let android_gradle = include_str!("../android/app/build.gradle.kts");
+        assert!(
+            android_gradle
+                .contains(r#"File(rootDir, "LICENSE"), File(rootDir, "THIRD_PARTY_NOTICES.txt")"#)
+                && android_gradle.contains("addGeneratedSourceDirectory(")
+                && android_gradle.contains("SyncLicenseAssetsTask::outputDir"),
+            "android/app/build.gradle.kts must wire SyncLicenseAssetsTask via AGP addGeneratedSourceDirectory"
+        );
+    }
+
+    #[test]
+    fn test_phase3_workspace_crates_and_openmpt_direct_ffi_invariants() {
+        let root_toml = include_str!("../Cargo.toml");
+        assert!(
+            root_toml.contains("[workspace]"),
+            "Root Cargo.toml must define [workspace]"
+        );
+        for member in [
+            "crates/rt-core",
+            "crates/rt-decode",
+            "crates/rt-audio",
+            "crates/rt-render",
+            "crates/rt-tui",
+        ] {
+            assert!(
+                root_toml.contains(member),
+                "Workspace member {member} missing from root Cargo.toml"
+            );
+            let sub_toml_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(member)
+                .join("Cargo.toml");
+            let sub_toml = std::fs::read_to_string(&sub_toml_path)
+                .unwrap_or_else(|e| panic!("Failed to read {}: {e}", sub_toml_path.display()));
+            assert!(
+                !sub_toml.contains("openmpt =") && !sub_toml.contains("openmpt-sys"),
+                "{} must not depend on unmaintained openmpt / openmpt-sys crates",
+                sub_toml_path.display()
+            );
+        }
+        assert!(
+            !root_toml.contains("openmpt =") && !root_toml.contains("openmpt-sys"),
+            "Root Cargo.toml must not depend on unmaintained openmpt / openmpt-sys crates"
+        );
+
+        // Ensure Linux active-sink monitoring in rt-audio never spawns wpctl/pactl subprocesses
+        let audio_src = include_str!("../crates/rt-audio/src/audio.rs");
+        let audio_prod = audio_src.split("#[cfg(test)]").next().unwrap_or(audio_src);
+        assert!(
+            !audio_prod.contains("Command::new(\"wpctl\")")
+                && !audio_prod.contains("Command::new(\"pactl\")"),
+            "crates/rt-audio/src/audio.rs must use non-spawning in-process Linux audio topology monitoring"
+        );
+
+        // Ensure zero hidden dead_code/unused/deprecated allow attributes across workspace Rust files
+        for rel_file in [
+            "src/lib.rs",
+            "src/main.rs",
+            "src/android.rs",
+            "crates/rt-core/src/state.rs",
+            "crates/rt-core/src/biquad.rs",
+            "crates/rt-core/src/devices.rs",
+            "crates/rt-core/src/ipc.rs",
+            "crates/rt-core/src/lyrics.rs",
+            "crates/rt-core/src/playlist.rs",
+            "crates/rt-core/src/touch.rs",
+            "crates/rt-decode/src/openmpt_ffi.rs",
+            "crates/rt-decode/src/android_video.rs",
+            "crates/rt-decode/src/iso.rs",
+            "crates/rt-decode/src/mpegh.rs",
+            "crates/rt-audio/src/audio.rs",
+            "crates/rt-audio/src/bitstream.rs",
+            "crates/rt-render/src/engine.rs",
+            "crates/rt-tui/src/ui.rs",
+        ] {
+            let full_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join(rel_file);
+            let content = std::fs::read_to_string(&full_path)
+                .unwrap_or_else(|e| panic!("Failed to read {}: {e}", full_path.display()));
+            let prod = content.split("#[cfg(test)]").next().unwrap_or(&content);
+            for forbidden in ["allow(dead_code", "allow(unused", "allow(deprecated"] {
+                assert!(
+                    !prod.contains(forbidden),
+                    "Forbidden warning suppression `{forbidden}` found in {rel_file}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_vis_review_flip_water_and_package_metadata_truthfulness() {
+        let vis_review = include_str!("../VIS_REVIEW.md");
+        let flip_water_wgsl = include_str!("shaders/flip_water_compute.wgsl");
+        let water_splash_wgsl = include_str!("shaders/vis_water_splash.wgsl");
+
+        assert!(flip_water_wgsl.contains("const SOR_OMEGA: f32 = 1.28;"));
+        assert!(flip_water_wgsl.contains("fn cs_pressure_0_to_1("));
+        assert!(flip_water_wgsl.contains("fn cs_pressure_1_to_0("));
+        assert!(flip_water_wgsl.contains("fn cs_g2p_advect_splat("));
+        assert!(flip_water_wgsl.contains("splash_compact.active_indices[slot] = p_idx;"));
+        assert!(water_splash_wgsl.contains("fn vs_splash("));
+        assert!(water_splash_wgsl.contains("splash_compact.active_indices[inst_id]"));
+
+        assert!(vis_review.contains("`SOR_OMEGA = 1.28`"));
+        assert!(vis_review.contains("`cs_pressure_0_to_1` / `cs_pressure_1_to_0`"));
+        assert!(vis_review.contains("`cs_g2p_advect_splat`"));
+        assert!(vis_review.contains("`splash_compact.active_indices`"));
+        assert!(vis_review.contains("`vs_splash`"));
+        assert!(!vis_review.contains("`flip_pressure`"));
+        assert!(!vis_review.contains(r"$\omega = 1.5$"));
+
+        let cargo_toml = include_str!("../Cargo.toml");
+        assert!(cargo_toml.contains(r#"authors = ["Soddentrough"]"#));
+        assert!(cargo_toml.contains(r#"copyright = "2026, Soddentrough""#));
+        assert!(cargo_toml.contains(
+            r#"description = "High-Performance WGPU Audio, Video & Tracker Visualizer""#
+        ));
+        assert!(cargo_toml.contains(
+            r#"extended-description = "A high-performance, real-time audio visualizer, video player, and tracker module player.""#
+        ));
+        assert!(!cargo_toml.contains("Vulkan Tracker Module Visualizer"));
+
+        let metainfo = include_str!("../com.soddentrough.rusttracker.metainfo.xml");
+        assert!(metainfo.contains(
+            "<summary>High-Performance WGPU Audio, Video &amp; Tracker Visualizer</summary>"
+        ));
+        assert!(!metainfo.contains("Vulkan Tracker Module Visualizer"));
+
+        let desktop = include_str!("../rusttracker.desktop");
+        assert!(
+            desktop.contains("Comment=High-Performance WGPU Audio, Video & Tracker Visualizer")
         );
     }
 }

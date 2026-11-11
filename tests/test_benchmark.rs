@@ -11,26 +11,17 @@ fn test_visualizer_benchmark() {
         return;
     }
 
-    let visualizers = vec!["3doscilloscope", "3doscilloscope_freq"];
+    let visualizers = vec!["spectrum", "glass_water"];
 
     println!("\n==================================================");
-    println!("RUNNING VISUALIZER BENCHMARKS (500 FRAMES)...");
+    println!("RUNNING VISUALIZER BENCHMARKS (60 FRAMES)...");
     println!("==================================================");
 
     for vis in visualizers {
-        let output = Command::new("cargo")
-            .args([
-                "run",
-                "--release",
-                "--",
-                "test_sine.wav",
-                "--vis",
-                vis,
-                "--bench",
-                "500",
-            ])
+        let output = Command::new(env!("CARGO_BIN_EXE_rusttracker"))
+            .args(["test_sine.wav", "--windowed", "--vis", vis, "--bench", "60"])
             .output()
-            .expect("Failed to execute cargo run");
+            .expect("Failed to execute rusttracker benchmark binary");
 
         let stdout = str::from_utf8(&output.stdout).unwrap();
         let stderr = str::from_utf8(&output.stderr).unwrap();
@@ -38,9 +29,8 @@ fn test_visualizer_benchmark() {
         if !output.status.success() {
             if stderr.contains("Authorization required")
                 || stderr.contains("snd_pcm_open")
-                || stderr.contains("X11")
-                || stderr.contains("Wayland")
-                || stderr.contains("panicked at")
+                || stderr.contains("Failed to initialize EventLoop")
+                || stderr.contains("Failed to find an appropriate graphic adapter")
             {
                 println!(
                     "Skipping windowed benchmark for {} due to display/audio server access restrictions in sandbox/CI environment.",
@@ -62,15 +52,27 @@ fn test_visualizer_benchmark() {
 
         for line in stdout.lines() {
             if let Some(val) = line.strip_prefix("BENCHMARK_RESULT_VISUALIZER: ") {
-                parsed_name = val.to_string();
+                parsed_name = val.trim().to_string();
             } else if let Some(val) = line.strip_prefix("BENCHMARK_RESULT_FPS: ") {
-                parsed_fps = val.to_string();
+                parsed_fps = val.trim().to_string();
             } else if let Some(val) = line.strip_prefix("BENCHMARK_RESULT_SHADER_US: ") {
-                parsed_shader_us = val.to_string();
+                parsed_shader_us = val.trim().to_string();
             } else if let Some(val) = line.strip_prefix("BENCHMARK_RESULT_RENDER_US: ") {
-                parsed_render_us = val.to_string();
+                parsed_render_us = val.trim().to_string();
             }
         }
+
+        assert!(
+            !parsed_name.is_empty(),
+            "Benchmark output missing BENCHMARK_RESULT_VISUALIZER for {vis}\nSTDOUT:\n{stdout}\nSTDERR:\n{stderr}"
+        );
+        let fps_val: f32 = parsed_fps.parse().unwrap_or_else(|e| {
+            panic!("Invalid BENCHMARK_RESULT_FPS '{parsed_fps}' for {vis}: {e}\nSTDOUT:\n{stdout}")
+        });
+        assert!(
+            fps_val > 0.0,
+            "Expected positive FPS for {vis}, got {fps_val}"
+        );
 
         println!("Visualizer:   {}", parsed_name);
         println!("FPS:          {}", parsed_fps);

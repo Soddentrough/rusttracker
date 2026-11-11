@@ -27,8 +27,7 @@ jobs:
       - name: Install System Dependencies
         run: |
           dnf install -y https://mirrors.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm
-          dnf install -y gcc gcc-c++ binutils pkgconfig alsa-lib-devel wayland-devel libX11-devel libxkbcommon-devel systemd-devel ffmpeg-devel libopenmpt-devel clang clang-devel python3
-          python3 scripts/patch_msys2_headers.py /usr/include/ffmpeg
+          dnf install -y gcc gcc-c++ binutils pkgconfig alsa-lib-devel wayland-devel libX11-devel libxkbcommon-devel systemd-devel ffmpeg-devel libopenmpt-devel clang clang-devel
 
       - name: Install Rust
         run: |
@@ -45,7 +44,7 @@ jobs:
       - name: Clippy Lint Check
         run: |
           source "$HOME/.cargo/env"
-          if ! cargo clippy --all-targets -- -D warnings 2>clippy_err.log; then
+          if ! cargo clippy --workspace --all-targets -- -D warnings 2>clippy_err.log; then
             cat clippy_err.log >&2
             grep -E "^error|-->" clippy_err.log | head -n 10 | while IFS= read -r line; do echo "::error::$line"; done
             exit 1
@@ -60,7 +59,9 @@ jobs:
       - name: Run Unit & Integration Tests
         run: |
           source "$HOME/.cargo/env"
-          cargo test --lib
+          cargo test --workspace --lib
+          cargo test --bins
           cargo test --test test_audio_rs
+          cargo test --test test_ffmpeg
           cargo test --test test_multitrack
           cargo test --test test_symphonia

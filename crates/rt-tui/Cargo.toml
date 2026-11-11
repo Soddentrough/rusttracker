@@ -1,0 +1,13 @@
+[package]
+name = "rt-tui"
+version = "0.9.39"
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+rt-core = { path = "../rt-core" }
+anyhow = "1.0.102"
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+crossterm = "0.29.0"
+ratatui = "0.30.0"

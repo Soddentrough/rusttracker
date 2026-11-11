@@ -3,10 +3,6 @@
 @group(0) @binding(0)
 var<uniform> audio: AudioUniforms;
 
-
-@group(0) @binding(1)
-var<storage, read> waveform_history: array<f32>;
-
 fn val_to_color(val: f32) -> vec3<f32> {
     let v = clamp(val, 0.0, 100.0);
     if v < 5.0 {

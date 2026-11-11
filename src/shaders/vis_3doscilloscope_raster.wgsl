@@ -1,8 +1,8 @@
 // INCLUDE: common
 
 @group(0) @binding(0) var<uniform> audio: AudioUniforms;
-@group(0) @binding(1) var<storage, read> waveform_history: array<f32>;
-@group(2) @binding(0) var<uniform> camera: CameraUniforms;
+@group(0) @binding(1) var<storage, read> waveform_history: array<u32>;
+@group(1) @binding(0) var<uniform> camera: CameraUniforms;
 
 struct CameraUniforms {
     view_matrix: mat4x4<f32>,
@@ -31,12 +31,24 @@ fn hash21_fast_crt(p: vec2<f32>) -> f32 {
     return fract((p3.x + p3.y) * p3.z);
 }
 
+fn read_waveform_f16(flat_idx: u32) -> f32 {
+    return read_waveform_f16_from_word(waveform_history[flat_idx >> 1u], flat_idx & 1u);
+}
+
 fn sample_history_linear(row_offset: u32, sample_pos: f32, max_sample_f: f32) -> f32 {
     let clamped = clamp(sample_pos, 0.0, max_sample_f);
     let i0 = u32(floor(clamped));
     let i1 = min(i0 + 1u, u32(max_sample_f));
     let frac = fract(clamped);
-    return mix(waveform_history[row_offset + i0], waveform_history[row_offset + i1], frac);
+    let f0 = row_offset + i0;
+    let f1 = row_offset + i1;
+    if ((f0 >> 1u) == (f1 >> 1u)) {
+        let pair = unpack2x16float_compat(waveform_history[f0 >> 1u]);
+        let s0 = select(pair.x, pair.y, (f0 & 1u) != 0u);
+        let s1 = select(pair.x, pair.y, (f1 & 1u) != 0u);
+        return mix(s0, s1, frac);
+    }
+    return mix(read_waveform_f16(f0), read_waveform_f16(f1), frac);
 }
 
 @vertex
@@ -54,7 +66,8 @@ fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
 
     // Integer history index locked to its buffer row while scrolling smoothly in Z via step_fraction
     let hist_idx = u32(round(clamp(v_coord * max_hist_f, 0.0, max_hist_f)));
-    let row_offset = hist_idx * 2048u;
+    let phys_row = (audio.waveform_history_ring_base + hist_idx) % 144u;
+    let row_offset = phys_row * 2048u;
     let max_sample_f = f32(res - 1u);
     let center_pos = u_coord * max_sample_f;
 

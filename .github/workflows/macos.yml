@@ -33,7 +33,7 @@ jobs:
           CARGO_PROFILE_RELEASE_DEBUG: "0"
         run: |
           cargo run --bin validate_wgsl
-          cargo test --lib
+          cargo test --workspace --lib
           cargo build --release --bin rusttracker
 
       - name: Import Apple Certificate
@@ -203,7 +203,7 @@ jobs:
                   </dict>
                   <dict>
                       <key>CFBundleTypeName</key>
-                      <string>Playlist / Project File</string>
+                      <string>Playlist File</string>
                       <key>CFBundleTypeRole</key>
                       <string>Viewer</string>
                       <key>LSHandlerRank</key>
@@ -215,8 +215,6 @@ jobs:
                           <string>pls</string>
                           <string>m3u</string>
                           <string>m3u8</string>
-                          <string>dawproject</string>
-                          <string>aaf</string>
                       </array>
                   </dict>
               </array>
@@ -224,9 +222,9 @@ jobs:
           </plist>
           EOF
           
-          # Copy binary, soundfont asset, and bundle libraries
+          # Copy binary, soundfont asset, license notices, and bundle libraries
           cp target/release/rusttracker RustTracker.app/Contents/MacOS/
-          cp assets/soundfont.sf2 RustTracker.app/Contents/Resources/
+          cp assets/soundfont.sf2 LICENSE THIRD_PARTY_NOTICES.txt RustTracker.app/Contents/Resources/
           dylibbundler -od -b -x RustTracker.app/Contents/MacOS/rusttracker -d RustTracker.app/Contents/Frameworks/ -p @executable_path/../Frameworks/ -s /opt/homebrew/opt/ffmpeg@7/lib -s /opt/homebrew/lib
           
           # Codesign the application (sign inner Frameworks first, then main executable and bundle with entitlements)

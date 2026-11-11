@@ -1,16 +1,14 @@
 // INCLUDE: common
 
 // ============================================================================
-// Visualizer ID 28: Acoustic Water & Ocean Surface
-// Navier-Stokes FLIP Hydrodynamic Ocean with Audio-Reactive Swells
+// Visualizer ID 28: Acoustic Glass Water Chamber
+// Analytic Hydrodynamic Ocean & Cymatic Surface Raymarcher
 // Refractive Water (IOR 1.333), Ridged Cellular Caustics,
-// Multi-Directional Gravity Waves, Cymatic Harmonics & Acoustic Plume
+// Multi-Directional Gravity Waves, Faraday Ripples & Acoustic Plume
 // ============================================================================
 
 @group(0) @binding(0) var<uniform> audio: AudioUniforms;
-@group(1) @binding(0) var<storage, read> render_grid: array<u32>;
 
-const RENDER_GRID_SIZE: i32 = 512;
 const BASIN_FLOOR_Y: f32 = -0.35;
 const MIN_WATER_Y: f32 = 0.22;
 const BASE_WATER_Y: f32 = 0.42;
@@ -26,37 +24,21 @@ var<private> g_sub_bass: f32 = 0.0;
 var<private> g_lowmids: f32 = 0.0;
 var<private> g_mids: f32 = 0.0;
 var<private> g_highs: f32 = 0.0;
-var<private> g_flip_energy: f32 = 0.0;
+var<private> g_bass_energy: f32 = 0.0;
 var<private> g_plume_pulse: f32 = 1.0;
 var<private> g_collar1_r: f32 = 0.85;
 
-fn get_grid_height(gx: i32, gz: i32) -> f32 {
-    if (gx < 0 || gx >= RENDER_GRID_SIZE || gz < 0 || gz >= RENDER_GRID_SIZE) {
-        return 0.0;
-    }
-    let cell = u32(gz) * u32(RENDER_GRID_SIZE) + u32(gx);
-    return f32(render_grid[cell]) * 0.001;
-}
-
-// Sample macro hydrodynamic energy from the FLIP simulation grid
-// so the FLIP solver drives inertial fluid swell without discrete particle noise
-fn sample_macro_flip_energy() -> f32 {
-    let c = RENDER_GRID_SIZE / 2;
-    let h0 = get_grid_height(c, c);
-    let h1 = get_grid_height(c + 12, c) + get_grid_height(c - 12, c)
-           + get_grid_height(c, c + 12) + get_grid_height(c, c - 12);
-    let h2 = get_grid_height(c + 28, c + 28) + get_grid_height(c - 28, c + 28)
-           + get_grid_height(c + 28, c - 28) + get_grid_height(c - 28, c - 28);
-    let grid_e = clamp((h0 * 2.0 + h1 + h2 * 0.5) * 0.35, 0.0, 0.45);
-    return max(grid_e, clamp(g_sub_bass * 0.28 + g_lowmids * 0.12, 0.0, 0.45));
+// Analytic macro acoustic swell energy derived from sub-bass and low-mid bands
+fn sample_macro_acoustic_energy() -> f32 {
+    return clamp(g_sub_bass * 0.28 + g_lowmids * 0.12, 0.0, 0.45);
 }
 
 // Fast macro heightfield used during coarse raymarch stepping (pure ALU rational attenuation + 3 primary swells)
 fn sample_water_height_march(p: vec2<f32>) -> f32 {
     let r2 = dot(p, p);
 
-    let flip_boost = g_flip_energy * 0.28;
-    let bass_drive = g_sub_bass + flip_boost;
+    let swell_boost = g_bass_energy * 0.28;
+    let bass_drive = g_sub_bass + swell_boost;
 
     var central_plume = 0.0;
     if (r2 < 2.8) {
@@ -90,8 +72,8 @@ fn sample_water_height(p: vec2<f32>) -> f32 {
     let r = r2 * inv_r;
     let u = p * inv_r;
 
-    let flip_boost = g_flip_energy * 0.28;
-    let bass_drive = g_sub_bass + flip_boost;
+    let swell_boost = g_bass_energy * 0.28;
+    let bass_drive = g_sub_bass + swell_boost;
 
     // 1. Central Sub-Bass Acoustic Fountain Plume & Concentric Rayleigh Collars (pure ALU rational Gaussian)
     var central_plume = 0.0;
@@ -338,7 +320,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     g_lowmids = lowmids;
     g_mids = mids;
     g_highs = highs;
-    g_flip_energy = sample_macro_flip_energy();
+    g_bass_energy = sample_macro_acoustic_energy();
     g_plume_pulse = 0.90 + 0.10 * sin(time * 6.4);
     g_collar1_r = 0.85 + 0.08 * sin(time * 3.0);
 

@@ -30,7 +30,7 @@ Icon=$USER_ICON_PATH
 Terminal=false
 Type=Application
 Categories=AudioVideo;Audio;Player;
-StartupWMClass=RustTracker
+StartupWMClass=rusttracker
 EOF
     fi
 fi
@@ -45,12 +45,12 @@ fi
 if [ "$XDG_CURRENT_DESKTOP" = "gamescope" ] || [ "$XDG_SESSION_DESKTOP" = "gamescope" ] || [ -n "$STEAM_DECK" ] || [ -n "$SteamDeck" ] || [ -n "$SteamOS" ]; then
     # Gamescope's XWayland server advertises a 1280x800 screen with 100mm x 150mm physical
     # dimensions (~212 DPI), which causes winit's X11 backend to compute a 2.208x scale factor.
-    # Force 1:1 scale factor so the 1280x800 layout renders at native pixel resolution.
-    export WINIT_X11_SCALE_FACTOR="${WINIT_X11_SCALE_FACTOR:-1}"
-    export RUSTTRACKER_WAYLAND="${RUSTTRACKER_WAYLAND:-1}"
-    if [ -n "$WAYLAND_DISPLAY" ]; then
-        export WINIT_UNIX_BACKEND="${WINIT_UNIX_BACKEND:-wayland}"
+    # Use native Wayland by default (overridable via RUSTTRACKER_WAYLAND=0 or RUSTTRACKER_X11=1)
+    # and force 1:1 X11 scale factor if falling back to X11 so 1280x800 renders at native pixels.
+    if [ -n "$WAYLAND_DISPLAY" ] && [ -z "$RUSTTRACKER_X11" ]; then
+        export RUSTTRACKER_WAYLAND="${RUSTTRACKER_WAYLAND:-1}"
     fi
+    export WINIT_X11_SCALE_FACTOR="${WINIT_X11_SCALE_FACTOR:-1}"
 fi
 
 # Execute the actual binary directly from the mounted AppDir

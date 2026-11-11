@@ -8,7 +8,7 @@
 // INCLUDE: common
 
 @group(0) @binding(0) var<uniform> audio: AudioUniforms;
-@group(2) @binding(0) var<uniform> camera: CameraUniforms;
+@group(1) @binding(0) var<uniform> camera: CameraUniforms;
 
 struct CameraUniforms {
     view_matrix: mat4x4<f32>,

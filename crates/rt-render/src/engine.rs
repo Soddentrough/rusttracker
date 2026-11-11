@@ -1,0 +1,15402 @@
+use crate::state::AppState;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use winit::window::Window;
+
+fn gamepad_icon(g_type: crate::state::GamepadType, action: &str) -> String {
+    match action {
+        "A" => match g_type {
+            crate::state::GamepadType::PlayStation => "\u{e997}",
+            crate::state::GamepadType::Nintendo => "\u{e974}",
+            _ => "\u{e994}",
+        },
+        "B" => match g_type {
+            crate::state::GamepadType::PlayStation => "\u{e999}",
+            crate::state::GamepadType::Nintendo => "\u{e994}",
+            _ => "\u{e974}",
+        },
+        "X" => match g_type {
+            crate::state::GamepadType::PlayStation => "\u{e998}",
+            crate::state::GamepadType::Nintendo => "\u{e996}",
+            _ => "\u{e995}",
+        },
+        "Y" => match g_type {
+            crate::state::GamepadType::PlayStation => "\u{e99a}",
+            crate::state::GamepadType::Nintendo => "\u{e995}",
+            _ => "\u{e996}",
+        },
+        "L1" => match g_type {
+            crate::state::GamepadType::Nintendo => "\u{e99c}",
+            _ => "\u{e99d}",
+        },
+        "R1" => match g_type {
+            crate::state::GamepadType::Nintendo => "\u{e9a5}",
+            _ => "\u{e9a4}",
+        },
+        "L2" => "\u{e99e}",
+        "R2" => "\u{e9a3}",
+        "L2 / R2" => "\u{e99e} \u{e9a3}",
+        "L1 / R1" => match g_type {
+            crate::state::GamepadType::Nintendo => "\u{e99c} \u{e9a5}",
+            _ => "\u{e99d} \u{e9a4}",
+        },
+        "Select" => "\u{e9a9}",
+        "Start" => "\u{e9a8}",
+        "D-Pad L/R" => "\u{e9af} \u{e9ad}",
+        "D-Pad U/D" => "\u{e9ac} \u{e9ae}",
+        _ => action,
+    }
+    .to_string()
+}
+
+#[derive(Clone, PartialEq)]
+pub enum EngineAction {
+    None,
+    OpenFile,
+    LoadFiles(Vec<String>, bool),
+    Seek(f32),
+    ScrubPreview(f32, f64),
+    ScrubEnd,
+    SetForceStereo(bool),
+    SetPassthrough(bool),
+    SetSplitRatio(f32),
+    SetAppendToPlaylist(bool),
+    VisPickerSelect(usize),
+    VisPickerToggleEnabled(usize),
+    VisPickerSetCursor(usize),
+    VisPickerEnableAll,
+    VisPickerEnableNone,
+    OpenUrlDialog,
+    CloseUrlDialog,
+    SetUrlInput(String),
+    LoadUrl(String),
+    LoadInputDevice(String),
+    EditUrl(String),
+    ClearFocusUrlInput,
+    SetAudioDevice(String),
+    ToggleAudioTrackInMix(usize),
+    SetAudioTrackVolume(usize, f32),
+    SetAudioMixTracks(Vec<(usize, f32)>),
+    ToggleVisPicker,
+    ToggleSurroundUpmix(bool),
+    ToggleMpeghBitstream(bool),
+    SetSurroundUpmix(crate::state::SurroundUpmixConfig),
+    SetShowSurroundEq(bool),
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct AudioUniforms {
+    pub spectrum: [f32; 1024],
+    pub fire_heat: [f32; 1024],
+    pub channels: [f32; 32],
+    pub channel_peaks: [f32; 32],
+    pub spatial_channels: [f32; 16],
+    pub display_order: [u32; 16],
+    pub channel_phases: [f32; 32],
+    pub vu_segment_glows: [u32; 256],
+    pub num_channels: u32,
+    pub mode: u32,
+    pub time: f32,
+    pub duration: f32,
+    pub smooth_time: f32,
+    pub heatmap_row: u32,
+    pub fft_channels: u32,
+    pub num_spatial_channels: u32,
+    pub ui_meters_rect: [f32; 4],
+    pub ui_heatmap_rect: [f32; 4],
+    pub ui_fire_rect: [f32; 4],
+    pub waveform_resolution: u32,
+    pub waveform_history_size: u32,
+    pub frame_count: u32,
+    pub step_fraction: f32,
+    pub steps_to_fill: u32,
+    pub aspect_ratio: f32,
+    pub frame_dt: f32,
+    pub history_cam_z: f32,
+    pub fire_intensity: f32,
+    pub waveform_history_ring_base: u32,
+    pub _pad2: f32,
+    pub _pad3: f32,
+}
+
+pub const WAVEFORM_HISTORY_RING_CAP: usize = 144;
+
+#[inline]
+pub fn compute_waveform_ring_base(ring_head: usize, logical_rows: usize) -> u32 {
+    if logical_rows == 0 {
+        0
+    } else {
+        ((ring_head + WAVEFORM_HISTORY_RING_CAP - (logical_rows % WAVEFORM_HISTORY_RING_CAP))
+            % WAVEFORM_HISTORY_RING_CAP) as u32
+    }
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+pub fn is_waveform_history_dirty(
+    push_count: u64,
+    last_push_count: u64,
+    hist_len: usize,
+    last_hist_len: usize,
+    vis_width: u32,
+    last_vis_width: u32,
+    vis_id: u32,
+    last_vis_id: u32,
+) -> bool {
+    push_count != last_push_count
+        || hist_len != last_hist_len
+        || vis_width != last_vis_width
+        || vis_id != last_vis_id
+}
+
+/// Default linear-space clear color for the application window and transparent top HUD panel.
+/// In sRGB surface formats, `(0.1, 0.1, 0.1)` encodes to the standard `#595959` dark grey UI background.
+///
+/// IMPORTANT: Do NOT change this to black/dark-blue for 3D visualizers or startup; visualizer viewports
+/// are cleared independently via `clear_black_pipeline` (or custom sky pipelines) within their scissor rect.
+pub const APP_DEFAULT_BG_CLEAR_COLOR: wgpu::Color = wgpu::Color {
+    r: 0.1,
+    g: 0.1,
+    b: 0.1,
+    a: 1.0,
+};
+
+pub fn is_vsync_present_mode(present_mode: wgpu::PresentMode) -> bool {
+    matches!(
+        present_mode,
+        wgpu::PresentMode::Fifo | wgpu::PresentMode::FifoRelaxed | wgpu::PresentMode::AutoVsync
+    )
+}
+
+pub fn format_vsync_status(present_mode: wgpu::PresentMode) -> &'static str {
+    if is_vsync_present_mode(present_mode) {
+        "VSYNC: ON"
+    } else {
+        "VSYNC: OFF"
+    }
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct FireParams {
+    pub bass: f32,
+    pub mids: f32,
+    pub highs: f32,
+    pub time: f32,
+    pub cooling_factor: f32,
+    pub turb_spread_f: f32,
+    pub width: u32,
+    pub height: u32,
+    pub num_channels: u32,
+    pub lfe_idx: u32,
+    pub fft_channels: u32,
+    pub dt: f32,
+    pub display_order: [u32; 16],
+    pub channels: [[f32; 4]; 8],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct VideoParams {
+    pub color_space: u32,
+    pub color_range: u32,
+    pub bit_depth: u32,
+    pub color_trc: u32,
+    pub viewport_width: f32,
+    pub viewport_height: f32,
+    pub video_width: f32,
+    pub video_height: f32,
+    pub rotation: u32,
+    pub chroma_layout: u32,
+    pub _pad2: f32,
+    pub _pad3: f32,
+}
+
+pub struct VideoState {
+    pub y_texture: wgpu::Texture,
+    pub u_texture: wgpu::Texture,
+    pub v_texture: wgpu::Texture,
+    pub border_blur_texture: wgpu::Texture,
+    pub border_blur_view: wgpu::TextureView,
+    pub blur_bind_group: wgpu::BindGroup,
+    pub bind_group: wgpu::BindGroup,
+    pub params_buffer: wgpu::Buffer,
+    pub last_uploaded_params: Option<[u8; std::mem::size_of::<VideoParams>()]>,
+    pub width: u32,
+    pub height: u32,
+    pub rotation: u32,
+    pub color_space: u32,
+    pub color_range: u32,
+    pub bit_depth: u32,
+    pub color_trc: u32,
+    pub chroma_layout: crate::state::VideoChromaLayout,
+    pub use_16bit_textures: bool,
+    pub frame_generation: u64,
+    pub blurred_generation: u64,
+    pub blurred_color_key: (u32, u32, u32, u32, u32),
+}
+
+/// Optional modern `wgpu::Features` negotiated cleanly against adapter support with
+/// graceful baseline fallback across Vulkan, Metal, DX12, and Android GPUs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NegotiatedGpuFeatures {
+    pub required_features: wgpu::Features,
+    pub shader_f16: bool,
+    pub subgroup: bool,
+    pub subgroup_barrier: bool,
+    pub indirect_first_instance: bool,
+    pub multi_draw_indirect_count: bool,
+    pub texture_format_16bit_norm: bool,
+    pub pipeline_cache: bool,
+    pub timestamp_query: bool,
+}
+
+pub fn negotiate_optional_gpu_features(
+    adapter_features: wgpu::Features,
+    enable_timestamps: bool,
+    enable_pipeline_cache: bool,
+) -> NegotiatedGpuFeatures {
+    let mut required_features = wgpu::Features::empty();
+    let mut try_enable = |feat: wgpu::Features, cond: bool| -> bool {
+        if cond && adapter_features.contains(feat) {
+            required_features |= feat;
+            true
+        } else {
+            false
+        }
+    };
+
+    let _ = try_enable(
+        wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES,
+        true,
+    );
+    let texture_format_16bit_norm = try_enable(wgpu::Features::TEXTURE_FORMAT_16BIT_NORM, true);
+    let shader_f16 = try_enable(wgpu::Features::SHADER_F16, true);
+    let subgroup = try_enable(wgpu::Features::SUBGROUP, true);
+    let subgroup_barrier = try_enable(wgpu::Features::SUBGROUP_BARRIER, subgroup);
+    let indirect_first_instance = try_enable(wgpu::Features::INDIRECT_FIRST_INSTANCE, true);
+    let multi_draw_indirect_count = try_enable(wgpu::Features::MULTI_DRAW_INDIRECT_COUNT, true);
+    let pipeline_cache = try_enable(wgpu::Features::PIPELINE_CACHE, enable_pipeline_cache);
+    let timestamp_query = try_enable(wgpu::Features::TIMESTAMP_QUERY, enable_timestamps);
+
+    NegotiatedGpuFeatures {
+        required_features,
+        shader_f16,
+        subgroup,
+        subgroup_barrier,
+        indirect_first_instance,
+        multi_draw_indirect_count,
+        texture_format_16bit_norm,
+        pipeline_cache,
+        timestamp_query,
+    }
+}
+
+/// Exact `2π * 1000` (`2000π` ≈ 6283.185307179586s) host phase-wrapping period:
+/// - Every 1-, 2-, and 3-decimal-place shader frequency (`0.18`, `0.225`, `0.35`, `0.45`, `0.86`,
+///   `0.92`, `1.2`, `3.2`, etc.) completes an exact integer multiple of `2π` cycles across `P`.
+/// - Values `>= P` wrap into `[P, 2*P)` (`max < 12,567s`, `< 1 ms` `f32` ULP) so `smooth_time > 0.0`
+///   never dips back to `0.0` across wrap boundaries in shaders gating `select(audio.time, audio.smooth_time, audio.smooth_time > 0.0)`.
+pub const HOST_TIME_WRAP_PERIOD_SECS: f64 = std::f64::consts::TAU * 1000.0;
+
+#[inline]
+pub fn wrap_host_phase_time(time_secs: f64) -> f32 {
+    if !time_secs.is_finite() || time_secs <= 0.0 {
+        return 0.0;
+    }
+    if time_secs < HOST_TIME_WRAP_PERIOD_SECS {
+        time_secs as f32
+    } else {
+        (HOST_TIME_WRAP_PERIOD_SECS
+            + (time_secs - HOST_TIME_WRAP_PERIOD_SECS).rem_euclid(HOST_TIME_WRAP_PERIOD_SECS))
+            as f32
+    }
+}
+
+/// IEEE 754 binary32 -> binary16 (`f16`) round-to-nearest-even bit conversion matching
+/// WGSL `pack2x16float` / `unpack2x16float` without requiring `enable f16;`.
+#[inline]
+pub fn f32_to_f16_bits(val: f32) -> u16 {
+    let bits = val.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let mant = bits & 0x007F_FFFF;
+
+    if exp == 255 {
+        return if mant != 0 {
+            sign | 0x7E00
+        } else {
+            sign | 0x7C00
+        };
+    }
+
+    let unbiased = exp - 127 + 15;
+    if unbiased >= 31 {
+        return sign | 0x7C00;
+    }
+    if unbiased <= 0 {
+        if unbiased < -10 {
+            return sign;
+        }
+        let full_mant = mant | 0x0080_0000;
+        let shift = (14 - unbiased) as u32;
+        let half_mant = (full_mant >> shift) as u16;
+        let round_mask = 1u32 << (shift - 1);
+        let rem_mask = round_mask - 1;
+        let round_up =
+            (full_mant & round_mask) != 0 && ((full_mant & rem_mask) != 0 || (half_mant & 1) != 0);
+        return sign | half_mant.wrapping_add(u16::from(round_up));
+    }
+
+    let half_exp = (unbiased as u16) << 10;
+    let half_mant = (mant >> 13) as u16;
+    let round_bit = (mant & 0x1000) != 0;
+    let sticky = (mant & 0x0FFF) != 0;
+    let round_up = round_bit && (sticky || (half_mant & 1) != 0);
+    sign | (half_exp + half_mant).wrapping_add(u16::from(round_up))
+}
+
+/// IEEE 754 binary16 (`f16`) -> binary32 exact conversion matching WGSL `unpack2x16float`.
+#[inline]
+pub fn f16_bits_to_f32(bits: u16) -> f32 {
+    let sign = ((bits & 0x8000) as u32) << 16;
+    let exp = ((bits >> 10) & 0x1F) as u32;
+    let mant = (bits & 0x03FF) as u32;
+
+    if exp == 0 {
+        if mant == 0 {
+            return f32::from_bits(sign);
+        }
+        let mut m = mant;
+        let mut e = 127u32 - 14;
+        while (m & 0x0400) == 0 {
+            m <<= 1;
+            e -= 1;
+        }
+        m &= 0x03FF;
+        return f32::from_bits(sign | (e << 23) | (m << 13));
+    }
+    if exp == 31 {
+        let f_mant = if mant != 0 { 0x0040_0000 } else { 0 };
+        return f32::from_bits(sign | 0x7F80_0000 | f_mant);
+    }
+    let f_exp = (exp + 127 - 15) << 23;
+    f32::from_bits(sign | f_exp | (mant << 13))
+}
+
+#[inline]
+pub fn pack_f32_pair_to_u32(even: f32, odd: f32) -> u32 {
+    (f32_to_f16_bits(even) as u32) | ((f32_to_f16_bits(odd) as u32) << 16)
+}
+
+#[inline]
+pub fn pack_wave_row_f16(src_row: &[f32], dst_packed: &mut [u32]) {
+    debug_assert_eq!(src_row.len(), dst_packed.len() * 2);
+    for (word, pair) in dst_packed.iter_mut().zip(src_row.as_chunks::<2>().0) {
+        *word = pack_f32_pair_to_u32(pair[0], pair[1]);
+    }
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct CameraUniforms {
+    pub view_matrix: [[f32; 4]; 4],
+    pub proj_matrix: [[f32; 4]; 4],
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+pub struct Vertex {
+    pub position: [f32; 3],
+    pub normal: [f32; 3],
+    pub tex_coords: [f32; 2],
+}
+
+impl Vertex {
+    pub const ATTRIBUTES: [wgpu::VertexAttribute; 3] =
+        wgpu::vertex_attr_array![0 => Float32x3, 1 => Float32x3, 2 => Float32x2];
+
+    pub fn desc<'a>() -> wgpu::VertexBufferLayout<'a> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<Vertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBUTES,
+        }
+    }
+}
+
+struct MeshBuffers {
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    vertex_capacity: u64,
+    index_capacity: u64,
+    index_count: u32,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct SplashStar {
+    pub x: f32,
+    pub y: f32,
+    pub radius: f32,
+    pub speed: f32,
+    pub phase: f32,
+}
+
+pub(crate) struct SplashCache {
+    pub cached_rect: egui::Rect,
+    pub cached_ppp: f32,
+    pub static_bg_mesh: std::sync::Arc<egui::Mesh>,
+    pub stars: Vec<SplashStar>,
+    pub horizon_y: f32,
+    pub grid_color: egui::Color32,
+    pub star_base: egui::Color32,
+    pub cached_title_rect: egui::Rect,
+    pub cached_title_ppp: f32,
+    pub cached_font_tex_size: [usize; 2],
+    pub title_base_mesh: egui::Mesh,
+    pub title_slice_ranges: Vec<(usize, usize)>,
+    pub title_glyph_bounds: egui::Rect,
+    pub title_glow_range: (usize, usize),
+}
+
+impl Default for SplashCache {
+    fn default() -> Self {
+        Self {
+            cached_rect: egui::Rect::NOTHING,
+            cached_ppp: 0.0,
+            static_bg_mesh: std::sync::Arc::new(egui::Mesh::default()),
+            stars: Vec::new(),
+            horizon_y: 0.0,
+            grid_color: egui::Color32::TRANSPARENT,
+            star_base: egui::Color32::WHITE,
+            cached_title_rect: egui::Rect::NOTHING,
+            cached_title_ppp: 0.0,
+            cached_font_tex_size: [0, 0],
+            title_base_mesh: egui::Mesh::default(),
+            title_slice_ranges: Vec::new(),
+            title_glyph_bounds: egui::Rect::NOTHING,
+            title_glow_range: (0, 0),
+        }
+    }
+}
+
+impl SplashCache {
+    #[inline]
+    pub fn tint_rgb(r: u8, g: u8, b: u8) -> egui::Color32 {
+        let nr = ((r as u32 * 75 + 10 * 180 + 127) / 255) as u8;
+        let ng = ((g as u32 * 75 + 10 * 180 + 127) / 255) as u8;
+        let nb = ((b as u32 * 75 + 15 * 180 + 127) / 255) as u8;
+        egui::Color32::from_rgb(nr, ng, nb)
+    }
+
+    #[inline]
+    fn pseudo_rand(seed: u32) -> f32 {
+        let mut x = seed.wrapping_mul(136453);
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        (x % 1000) as f32 / 1000.0
+    }
+
+    pub fn ensure_background(&mut self, ctx: &egui::Context, rect: egui::Rect) {
+        let ppp = ctx.pixels_per_point().max(0.5);
+        let rect_same = (rect.min.x - self.cached_rect.min.x).abs() < 0.5
+            && (rect.min.y - self.cached_rect.min.y).abs() < 0.5
+            && (rect.max.x - self.cached_rect.max.x).abs() < 0.5
+            && (rect.max.y - self.cached_rect.max.y).abs() < 0.5
+            && (ppp - self.cached_ppp).abs() < 0.01
+            && !self.static_bg_mesh.is_empty();
+        if rect_same {
+            return;
+        }
+
+        self.cached_rect = rect;
+        self.cached_ppp = ppp;
+        let horizon_y = rect.top() + rect.height() * 0.45;
+        self.horizon_y = horizon_y;
+        let center_x = rect.center().x;
+        let sky_height = (horizon_y - rect.top()).max(1.0);
+
+        self.star_base = Self::tint_rgb(255, 255, 255);
+        self.grid_color = Self::tint_rgb(212, 34, 161);
+
+        let mut static_shapes: Vec<egui::epaint::ClippedShape> = Vec::with_capacity(128);
+        let mut push_shape = |shape: egui::Shape| {
+            static_shapes.push(egui::epaint::ClippedShape {
+                clip_rect: rect,
+                shape,
+            });
+        };
+
+        // 1. Multi-stop Synthwave Sky Gradient + Horizon Bloom + Floor Base (single hardware-interpolated Mesh)
+        let c_sky_top = Self::tint_rgb(34, 12, 74);
+        let c_sky_upper = Self::tint_rgb(98, 16, 112);
+        let c_sky_mid = Self::tint_rgb(186, 30, 128);
+        let c_sky_bot = Self::tint_rgb(255, 126, 103);
+        let c_floor_top = Self::tint_rgb(24, 14, 60);
+        let c_floor_bot = Self::tint_rgb(40, 22, 92);
+
+        let mut base_mesh = egui::Mesh::default();
+        let white_uv = egui::pos2(0.0, 0.0);
+        let sky_stops = [
+            (rect.top(), c_sky_top),
+            (rect.top() + 0.45 * sky_height, c_sky_upper),
+            (rect.top() + 0.78 * sky_height, c_sky_mid),
+            (horizon_y, c_sky_bot),
+        ];
+        for &(y_pos, col) in &sky_stops {
+            base_mesh.vertices.push(egui::epaint::Vertex {
+                pos: egui::pos2(rect.left(), y_pos),
+                uv: white_uv,
+                color: col,
+            });
+            base_mesh.vertices.push(egui::epaint::Vertex {
+                pos: egui::pos2(rect.right(), y_pos),
+                uv: white_uv,
+                color: col,
+            });
+        }
+        base_mesh.indices.extend_from_slice(&[
+            0, 1, 2, 1, 3, 2, // top -> upper
+            2, 3, 4, 3, 5, 4, // upper -> mid
+            4, 5, 6, 5, 7, 6, // mid -> horizon
+        ]);
+        // Floor gradient quad (vertices 8..11)
+        let f_base = base_mesh.vertices.len() as u32;
+        for &(y_pos, col) in &[(horizon_y, c_floor_top), (rect.bottom(), c_floor_bot)] {
+            base_mesh.vertices.push(egui::epaint::Vertex {
+                pos: egui::pos2(rect.left(), y_pos),
+                uv: white_uv,
+                color: col,
+            });
+            base_mesh.vertices.push(egui::epaint::Vertex {
+                pos: egui::pos2(rect.right(), y_pos),
+                uv: white_uv,
+                color: col,
+            });
+        }
+        base_mesh.indices.extend_from_slice(&[
+            f_base,
+            f_base + 1,
+            f_base + 2,
+            f_base + 1,
+            f_base + 3,
+            f_base + 2,
+        ]);
+        push_shape(egui::Shape::mesh(base_mesh));
+
+        // 2. Precompute Starfield coordinates & twinkle parameters (confined to upper sky above sun/mountains)
+        self.stars.clear();
+        self.stars.reserve(56);
+        for i in 0..56 {
+            let rx = Self::pseudo_rand(i * 31);
+            let ry = Self::pseudo_rand(i * 31 + 1);
+            let rr = Self::pseudo_rand(i * 31 + 2);
+            let rt = Self::pseudo_rand(i * 31 + 3);
+            self.stars.push(SplashStar {
+                x: rect.left() + rx * rect.width(),
+                y: rect.top() + ry * sky_height * 0.52,
+                radius: rr * 1.4 + 0.6,
+                speed: 1.0 + rt * 2.2,
+                phase: rx * 100.0,
+            });
+        }
+
+        // 3. Retro Sliced Sun
+        let sun_radius = rect.width().min(rect.height()) * 0.19;
+        let sun_center = egui::pos2(center_x, horizon_y - sun_radius * 0.30);
+        let sun_steps = 40usize;
+        let is_sun_slice_drawn = |idx: usize| -> bool {
+            if idx >= sun_steps {
+                return false;
+            }
+            let st = idx as f32 / sun_steps as f32;
+            if st > 0.45 {
+                let slice_t = (st - 0.45) / 0.55;
+                let slice_val = (slice_t * 15.0).fract();
+                let gap_threshold = 0.2 + slice_t * 0.6;
+                if slice_val < gap_threshold {
+                    return false;
+                }
+            }
+            true
+        };
+
+        for i in 0..sun_steps {
+            if !is_sun_slice_drawn(i) {
+                continue;
+            }
+            let t = i as f32 / sun_steps as f32;
+            let next_t = (i + 1) as f32 / sun_steps as f32;
+
+            let y_min = sun_center.y - sun_radius + t * sun_radius * 2.0;
+            let mut y_max = sun_center.y - sun_radius + next_t * sun_radius * 2.0;
+            if is_sun_slice_drawn(i + 1) {
+                y_max = (y_max + 0.6).min(sun_center.y + sun_radius);
+            }
+            if y_min >= horizon_y {
+                continue;
+            }
+            y_max = y_max.min(horizon_y);
+            if y_max <= y_min {
+                continue;
+            }
+
+            let r = (225.0 * (1.0 - t) + 195.0 * t) as u8;
+            let g = (175.0 * (1.0 - t) + 42.0 * t) as u8;
+            let b = (32.0 * (1.0 - t) + 112.0 * t) as u8;
+            let color = egui::Color32::from_rgb(r, g, b);
+
+            let sub_steps = 2usize;
+            let mut pts = Vec::with_capacity((sub_steps + 1) * 2);
+            for k in 0..=sub_steps {
+                let frac = k as f32 / sub_steps as f32;
+                let yk = y_min + (y_max - y_min) * frac;
+                let dy = (yk - sun_center.y).clamp(-sun_radius, sun_radius);
+                let dx = (sun_radius * sun_radius - dy * dy).max(0.0).sqrt();
+                pts.push(egui::pos2(sun_center.x + dx, yk));
+            }
+            for k in (0..=sub_steps).rev() {
+                let frac = k as f32 / sub_steps as f32;
+                let yk = y_min + (y_max - y_min) * frac;
+                let dy = (yk - sun_center.y).clamp(-sun_radius, sun_radius);
+                let dx = (sun_radius * sun_radius - dy * dy).max(0.0).sqrt();
+                if dx > 0.5 {
+                    pts.push(egui::pos2(sun_center.x - dx, yk));
+                }
+            }
+            if pts.len() >= 3 {
+                push_shape(egui::Shape::convex_polygon(pts, color, egui::Stroke::NONE));
+            }
+        }
+
+        // 4. Layered Wireframe Mountains (sculpted lower across the central sun valley so the sun remains iconic)
+        let mtn_fill = Self::tint_rgb(24, 22, 54);
+        let mtn_stroke = egui::Stroke::new(1.1_f32, Self::tint_rgb(105, 58, 225));
+        for i in 0..25 {
+            let h1 = Self::pseudo_rand(i * 17);
+            let h2 = Self::pseudo_rand(i * 17 + 1);
+            let h3 = Self::pseudo_rand(i * 17 + 2);
+
+            let cx = rect.left() + h1 * rect.width();
+            let cy = horizon_y;
+            let center_dist = ((cx - center_x).abs() / (rect.width() * 0.5)).clamp(0.0, 1.0);
+            let valley_half_span = (sun_radius / (rect.width() * 0.5).max(1.0)).clamp(0.38, 0.72);
+            let valley_scale = (center_dist / valley_half_span).clamp(0.16, 1.0);
+            let width = rect.width() * (0.09 + h2 * 0.20);
+            let height = sky_height * (0.11 + h3 * 0.42) * valley_scale;
+
+            let p1 = egui::pos2(cx - width, cy);
+            let p2 = egui::pos2(cx + width, cy);
+            let p3 = egui::pos2(cx, cy - height);
+
+            push_shape(egui::Shape::convex_polygon(
+                vec![p1, p2, p3],
+                mtn_fill,
+                mtn_stroke,
+            ));
+
+            let ridge_offset = (Self::pseudo_rand(i * 17 + 3) - 0.5) * 0.4;
+            push_shape(egui::Shape::line_segment(
+                [p3, egui::pos2(cx + width * ridge_offset, cy)],
+                mtn_stroke,
+            ));
+        }
+
+        // 5. Vertical Radiating Perspective Grid Lines + Horizon Laser Line
+        let num_v_lines = 40;
+        for i in 0..=num_v_lines {
+            let t = i as f32 / num_v_lines as f32;
+            let bottom_x = rect.left() + (t - 0.5) * rect.width() * 8.0;
+            let dx = bottom_x - center_x;
+            let dy = rect.bottom() - horizon_y;
+            let end_pt = if bottom_x < rect.left() && dx.abs() > 1e-3 {
+                let clip_t = (rect.left() - center_x) / dx;
+                egui::pos2(rect.left(), horizon_y + clip_t * dy)
+            } else if bottom_x > rect.right() && dx.abs() > 1e-3 {
+                let clip_t = (rect.right() - center_x) / dx;
+                egui::pos2(rect.right(), horizon_y + clip_t * dy)
+            } else {
+                egui::pos2(bottom_x, rect.bottom())
+            };
+
+            push_shape(egui::Shape::line_segment(
+                [egui::pos2(center_x, horizon_y), end_pt],
+                egui::Stroke::new(1.0_f32, self.grid_color),
+            ));
+        }
+        push_shape(egui::Shape::line_segment(
+            [
+                egui::pos2(rect.left(), horizon_y),
+                egui::pos2(rect.right(), horizon_y),
+            ],
+            egui::Stroke::new(1.5_f32, Self::tint_rgb(255, 95, 205)),
+        ));
+
+        // Pre-tessellate all static background primitives once and merge into a single cached Mesh
+        let mut tessellator = egui::epaint::Tessellator::new(
+            ppp,
+            egui::epaint::TessellationOptions::default(),
+            [1, 1],
+            Vec::new(),
+        );
+        let primitives = tessellator.tessellate_shapes(static_shapes);
+        let mut merged = egui::Mesh::default();
+        for prim in primitives {
+            if let egui::epaint::Primitive::Mesh(m) = prim.primitive
+                && m.texture_id == egui::TextureId::default()
+            {
+                merged.append(m);
+            }
+        }
+        self.static_bg_mesh = std::sync::Arc::new(merged);
+    }
+
+    /// Appends the animated elements of the Splash background (twinkling starfield + scrolling
+    /// perspective horizontal grid lines) directly into `mesh`, bypassing `epaint::Tessellator`.
+    pub fn append_dynamic_bg(&self, mesh: &mut egui::Mesh, rect: egui::Rect, time: f32, ppp: f32) {
+        let num_h_lines = 30usize;
+        mesh.reserve_vertices(self.stars.len() * 8 + num_h_lines * 8);
+        mesh.reserve_triangles(self.stars.len() * 6 + num_h_lines * 6);
+        let white_uv = egui::pos2(0.0, 0.0);
+        let feather = (1.0 / ppp.max(1.0)).clamp(0.4, 1.0);
+
+        for star in &self.stars {
+            let twinkle = ((time * star.speed + star.phase).sin() * 0.5 + 0.5) * 205.0 + 50.0;
+            let core_col = egui::Color32::from_rgba_unmultiplied(
+                self.star_base.r(),
+                self.star_base.g(),
+                self.star_base.b(),
+                twinkle as u8,
+            );
+            let r = star.radius;
+            let rf = r + feather;
+            let base = mesh.vertices.len() as u32;
+            for &(dx, dy, col) in &[
+                (0.0, -r, core_col),
+                (r, 0.0, core_col),
+                (0.0, r, core_col),
+                (-r, 0.0, core_col),
+                (0.0, -rf, egui::Color32::TRANSPARENT),
+                (rf, 0.0, egui::Color32::TRANSPARENT),
+                (0.0, rf, egui::Color32::TRANSPARENT),
+                (-rf, 0.0, egui::Color32::TRANSPARENT),
+            ] {
+                mesh.vertices.push(egui::epaint::Vertex {
+                    pos: egui::pos2(star.x + dx, star.y + dy),
+                    uv: white_uv,
+                    color: col,
+                });
+            }
+            mesh.indices.extend_from_slice(&[
+                base,
+                base + 1,
+                base + 2,
+                base,
+                base + 2,
+                base + 3,
+                base,
+                base + 4,
+                base + 5,
+                base,
+                base + 5,
+                base + 1,
+                base + 1,
+                base + 5,
+                base + 6,
+                base + 1,
+                base + 6,
+                base + 2,
+                base + 2,
+                base + 6,
+                base + 7,
+                base + 2,
+                base + 7,
+                base + 3,
+                base + 3,
+                base + 7,
+                base + 4,
+                base + 3,
+                base + 4,
+                base,
+            ]);
+        }
+
+        let horizon_y = self.horizon_y;
+        let floor_h = (rect.bottom() - horizon_y).max(1.0);
+        let frac_t = (time * 1.5).fract();
+        for i in 0..num_h_lines {
+            let offset = (i as f32 - frac_t) / num_h_lines as f32;
+            if offset <= 0.0 {
+                continue;
+            }
+            let depth = offset.powf(3.0);
+            let y = horizon_y + floor_h * depth;
+            if y >= rect.bottom() {
+                continue;
+            }
+            let thickness = 1.0 + offset * 2.0;
+            let half_t = thickness * 0.5;
+            let alpha = (offset * 3.2).clamp(0.15, 1.0);
+            let col = egui::Color32::from_rgba_unmultiplied(
+                self.grid_color.r(),
+                self.grid_color.g(),
+                self.grid_color.b(),
+                (255.0 * alpha) as u8,
+            );
+
+            let y0_out = (y - half_t - feather).max(horizon_y);
+            let y0_in = (y - half_t).max(horizon_y);
+            let y1_in = (y + half_t).min(rect.bottom());
+            let y1_out = (y + half_t + feather).min(rect.bottom());
+
+            let base = mesh.vertices.len() as u32;
+            for &(yv, c) in &[
+                (y0_out, egui::Color32::TRANSPARENT),
+                (y0_in, col),
+                (y1_in, col),
+                (y1_out, egui::Color32::TRANSPARENT),
+            ] {
+                mesh.vertices.push(egui::epaint::Vertex {
+                    pos: egui::pos2(rect.left(), yv),
+                    uv: white_uv,
+                    color: c,
+                });
+                mesh.vertices.push(egui::epaint::Vertex {
+                    pos: egui::pos2(rect.right(), yv),
+                    uv: white_uv,
+                    color: c,
+                });
+            }
+            mesh.indices.extend_from_slice(&[
+                base,
+                base + 1,
+                base + 2,
+                base + 1,
+                base + 3,
+                base + 2,
+                base + 2,
+                base + 3,
+                base + 4,
+                base + 3,
+                base + 5,
+                base + 4,
+                base + 4,
+                base + 5,
+                base + 6,
+                base + 5,
+                base + 7,
+                base + 6,
+            ]);
+        }
+    }
+
+    pub fn build_combined_bg_primitive(
+        &mut self,
+        ctx: &egui::Context,
+        rect: egui::Rect,
+        time: f32,
+    ) -> egui::ClippedPrimitive {
+        self.ensure_background(ctx, rect);
+        let mut mesh = (*self.static_bg_mesh).clone();
+        self.append_dynamic_bg(&mut mesh, rect, time, ctx.pixels_per_point());
+        if !self.title_base_mesh.is_empty() {
+            mesh.append_ref(&self.title_base_mesh);
+        }
+        egui::ClippedPrimitive {
+            clip_rect: rect,
+            primitive: egui::epaint::Primitive::Mesh(mesh),
+        }
+    }
+
+    /// Evaluates the 80s synthwave airbrushed chrome reflection color at normalized title
+    /// coordinates `(nx, ny)` in `[0.0, 1.0]^2`, per-glyph horizontal facet `gx` in `[0.0, 1.0]`,
+    /// and animation timestamp `time` (seconds).
+    ///
+    /// Unlike a naive vertical wrap (`(ny + time * speed).fract()`), this anchors the reflection
+    /// horizon near the optical waist of the letters while animating:
+    /// 1. A multi-harmonic liquid-chrome horizon undulation across `nx` and `time` (zero wrap seam).
+    /// 2. Continuous scrolling atmospheric reflection bands in the upper sky and scrolling neon
+    ///    grid reflection ripples in the lower ground half.
+    /// 3. A traveling diagonal anamorphic specular light-bar sweep across `(nx, ny)`.
+    #[inline]
+    pub fn evaluate_chrome_color(nx: f32, ny: f32, gx: f32, time: f32) -> egui::Color32 {
+        let lerp = |a: f32, b: f32, t: f32| -> f32 { a + (b - a) * t };
+        let smoothstep = |t: f32| -> f32 {
+            let c = t.clamp(0.0, 1.0);
+            c * c * (3.0 - 2.0 * c)
+        };
+
+        // Liquid-metal horizon ripple + subtle per-glyph cylindrical bevel tilt
+        let horizon_wave = (nx * 5.2 - time * 1.45).sin() * 0.036
+            + (nx * 11.5 + time * 0.85).cos() * 0.015
+            + (time * 0.65).sin() * 0.018;
+        let env_y = (ny + horizon_wave + (gx - 0.5) * 0.026).clamp(0.0, 1.0);
+
+        let (mut r, mut g, mut b) = if env_y < 0.48 {
+            // Upper Sky Reflection: Deep cobalt -> electric cerulean -> ice cyan -> blazing white horizon
+            let sky_t = (env_y / 0.48).clamp(0.0, 1.0);
+            let (mut sr, mut sg, mut sb) = if sky_t < 0.48 {
+                let u = smoothstep(sky_t / 0.48);
+                (
+                    lerp(18.0, 0.0, u),
+                    lerp(42.0, 162.0, u),
+                    lerp(142.0, 250.0, u),
+                )
+            } else if sky_t < 0.84 {
+                let u = smoothstep((sky_t - 0.48) / 0.36);
+                (
+                    lerp(0.0, 145.0, u),
+                    lerp(162.0, 245.0, u),
+                    lerp(250.0, 255.0, u),
+                )
+            } else {
+                let u = smoothstep((sky_t - 0.84) / 0.16);
+                (
+                    lerp(145.0, 255.0, u),
+                    lerp(245.0, 255.0, u),
+                    lerp(255.0, 255.0, u),
+                )
+            };
+
+            // Continuous upward-scrolling sky sheen bands (attenuated near the white horizon core)
+            let sky_band = ((ny * 10.5 - time * 1.75 + nx * 2.4).sin() * 0.5 + 0.5).powi(2);
+            let band_mask = (1.0 - sky_t).powf(0.75) * 0.28;
+            sr = lerp(sr, 195.0, sky_band * band_mask);
+            sg = lerp(sg, 248.0, sky_band * band_mask);
+            sb = lerp(sb, 255.0, sky_band * band_mask);
+            (sr, sg, sb)
+        } else if env_y < 0.54 {
+            // High-contrast 80s Chrome Horizon Crease: Blazing White -> Deep Obsidian-Violet
+            let u = smoothstep((env_y - 0.48) / 0.06);
+            (
+                lerp(255.0, 22.0, u),
+                lerp(255.0, 8.0, u),
+                lerp(255.0, 48.0, u),
+            )
+        } else {
+            // Lower Sunset / Neon Grid Reflection: Obsidian -> Neon Magenta -> Sunset Coral -> Solar Gold
+            let gnd_t = ((env_y - 0.54) / 0.46).clamp(0.0, 1.0);
+            let (mut gr, mut gg, mut gb) = if gnd_t < 0.36 {
+                let u = smoothstep(gnd_t / 0.36);
+                (
+                    lerp(22.0, 210.0, u),
+                    lerp(8.0, 28.0, u),
+                    lerp(48.0, 152.0, u),
+                )
+            } else if gnd_t < 0.72 {
+                let u = smoothstep((gnd_t - 0.36) / 0.36);
+                (
+                    lerp(210.0, 255.0, u),
+                    lerp(28.0, 102.0, u),
+                    lerp(152.0, 88.0, u),
+                )
+            } else {
+                let u = smoothstep((gnd_t - 0.72) / 0.28);
+                (
+                    lerp(255.0, 255.0, u),
+                    lerp(102.0, 215.0, u),
+                    lerp(88.0, 92.0, u),
+                )
+            };
+
+            // Continuous downward-scrolling perspective neon grid reflection ripples
+            let grid_ripple =
+                ((gnd_t.powf(0.8) * 12.0 - time * 2.1 - nx * 1.8).sin() * 0.5 + 0.5).powi(2);
+            let ripple_mask = gnd_t * (1.0 - gnd_t * 0.45) * 0.30;
+            gr = lerp(gr, 255.0, grid_ripple * ripple_mask);
+            gg = lerp(gg, 185.0, grid_ripple * ripple_mask);
+            gb = lerp(gb, 230.0, grid_ripple * ripple_mask);
+            (gr, gg, gb)
+        };
+
+        // Traveling diagonal anamorphic specular light-bar sweep across the full title
+        // Period spans [-0.45, 1.55] so diag_coord in [-0.04, 1.06] has zero intensity at wrap ends.
+        let sweep_center = (time * 0.30).rem_euclid(2.0) - 0.45;
+        let diag_coord = nx * 0.82 + ny * 0.22 - gx * 0.04;
+        let d_main = (diag_coord - sweep_center).abs();
+        let glint_main = smoothstep(1.0 - (d_main / 0.14).clamp(0.0, 1.0)).powi(2);
+        let d_trail = (diag_coord - (sweep_center - 0.17)).abs();
+        let glint_trail = smoothstep(1.0 - (d_trail / 0.065).clamp(0.0, 1.0)).powi(2) * 0.50;
+        let glint = (glint_main * 0.68 + glint_trail).clamp(0.0, 1.0);
+
+        r = lerp(r, 248.0, glint);
+        g = lerp(g, 253.0, glint);
+        b = lerp(b, 255.0, glint);
+
+        egui::Color32::from_rgb(
+            r.round().clamp(0.0, 255.0) as u8,
+            g.round().clamp(0.0, 255.0) as u8,
+            b.round().clamp(0.0, 255.0) as u8,
+        )
+    }
+
+    /// Builds or updates the cached `RustTracker` chrome title mesh in-place.
+    /// Full font layout, 3D extrusion, directional bevel, and 24-slice geometry construction
+    /// happen only when `title_rect` or `pixels_per_point` changes; on all subsequent frames
+    /// only the outer neon corona and interior chrome vertex colors are updated in-place on
+    /// `self.title_base_mesh` and appended directly into the combined Splash primitive.
+    pub fn update_title_mesh(
+        &mut self,
+        ui: &egui::Ui,
+        title_rect: egui::Rect,
+        gradient_extent: f32,
+        font_size: f32,
+        time: f32,
+    ) {
+        let ppp = ui.ctx().pixels_per_point().max(0.5);
+        let current_font_tex_size = ui.ctx().fonts_mut(|f| f.font_image_size());
+        let steps = 24usize;
+        let rect_same = (title_rect.min.x - self.cached_title_rect.min.x).abs() < 0.5
+            && (title_rect.min.y - self.cached_title_rect.min.y).abs() < 0.5
+            && (title_rect.max.x - self.cached_title_rect.max.x).abs() < 0.5
+            && (title_rect.max.y - self.cached_title_rect.max.y).abs() < 0.5
+            && (ppp - self.cached_title_ppp).abs() < 0.01
+            && self.cached_font_tex_size == current_font_tex_size
+            && !self.title_base_mesh.is_empty();
+
+        if !rect_same {
+            self.cached_title_rect = title_rect;
+            self.cached_title_ppp = ppp;
+
+            let painter = ui.painter();
+            let font_id = egui::FontId::new(font_size, egui::FontFamily::Name("Orbitron".into()));
+            let galley =
+                painter.layout_no_wrap("RustTracker".to_string(), font_id, egui::Color32::WHITE);
+            let base_pos = egui::Align2::CENTER_CENTER
+                .anchor_size(title_rect.center(), galley.size())
+                .min;
+            let snapped_pos = egui::pos2(
+                (base_pos.x * ppp).round() / ppp,
+                (base_pos.y * ppp).round() / ppp,
+            );
+            let font_tex_size = ui.ctx().fonts_mut(|f| f.font_image_size());
+            self.cached_font_tex_size = font_tex_size;
+            let uv_norm = egui::vec2(
+                1.0 / (font_tex_size[0].max(1) as f32),
+                1.0 / (font_tex_size[1].max(1) as f32),
+            );
+
+            let mut glyph_quads = Vec::with_capacity(16);
+            let mut gx_min = f32::INFINITY;
+            let mut gy_min = f32::INFINITY;
+            let mut gx_max = f32::NEG_INFINITY;
+            let mut gy_max = f32::NEG_INFINITY;
+
+            for placed_row in &galley.rows {
+                let row_pos = snapped_pos + placed_row.pos.to_vec2();
+                for q in placed_row.row.visuals.mesh.vertices.as_chunks::<4>().0 {
+                    let x_min =
+                        q[0].pos.x.min(q[1].pos.x).min(q[2].pos.x).min(q[3].pos.x) + row_pos.x;
+                    let x_max =
+                        q[0].pos.x.max(q[1].pos.x).max(q[2].pos.x).max(q[3].pos.x) + row_pos.x;
+                    let y_min =
+                        q[0].pos.y.min(q[1].pos.y).min(q[2].pos.y).min(q[3].pos.y) + row_pos.y;
+                    let y_max =
+                        q[0].pos.y.max(q[1].pos.y).max(q[2].pos.y).max(q[3].pos.y) + row_pos.y;
+                    let u_min = q[0].uv.x.min(q[1].uv.x).min(q[2].uv.x).min(q[3].uv.x) * uv_norm.x;
+                    let u_max = q[0].uv.x.max(q[1].uv.x).max(q[2].uv.x).max(q[3].uv.x) * uv_norm.x;
+                    let v_min = q[0].uv.y.min(q[1].uv.y).min(q[2].uv.y).min(q[3].uv.y) * uv_norm.y;
+                    let v_max = q[0].uv.y.max(q[1].uv.y).max(q[2].uv.y).max(q[3].uv.y) * uv_norm.y;
+                    gx_min = gx_min.min(x_min);
+                    gy_min = gy_min.min(y_min);
+                    gx_max = gx_max.max(x_max);
+                    gy_max = gy_max.max(y_max);
+                    glyph_quads.push((x_min, y_min, x_max, y_max, u_min, v_min, u_max, v_max));
+                }
+            }
+
+            self.title_glyph_bounds = if gx_max > gx_min && gy_max > gy_min {
+                egui::Rect::from_min_max(egui::pos2(gx_min, gy_min), egui::pos2(gx_max, gy_max))
+            } else {
+                egui::Rect::from_center_size(
+                    title_rect.center(),
+                    egui::vec2(
+                        title_rect.width().max(1.0),
+                        (gradient_extent * 2.0).max(1.0),
+                    ),
+                )
+            };
+
+            // Scale all bevel, extrusion, and outline offsets proportionally with font_size
+            let s = (font_size / 66.0).clamp(0.42, 1.5);
+
+            let mut title_mesh = egui::Mesh::with_texture(egui::TextureId::default());
+            title_mesh.reserve_vertices(glyph_quads.len() * (29 + steps) * 4);
+            title_mesh.reserve_triangles(glyph_quads.len() * (29 + steps) * 2);
+
+            let push_offset_layer =
+                |mesh: &mut egui::Mesh, dx: f32, dy: f32, color: egui::Color32| {
+                    for &(x_min, y_min, x_max, y_max, u_min, v_min, u_max, v_max) in &glyph_quads {
+                        mesh.add_rect_with_uv(
+                            egui::Rect::from_min_max(
+                                egui::pos2(x_min + dx, y_min + dy),
+                                egui::pos2(x_max + dx, y_max + dy),
+                            ),
+                            egui::Rect::from_min_max(
+                                egui::pos2(u_min, v_min),
+                                egui::pos2(u_max, v_max),
+                            ),
+                            color,
+                        );
+                    }
+                };
+
+            // 1. Deep Grounding Drop Shadow (lifts logo off the upper synthwave sky)
+            let drop_shadow = egui::Color32::from_rgba_unmultiplied(6, 3, 20, 185);
+            for (dx, dy) in [(2.4 * s, 4.4 * s), (0.8 * s, 4.2 * s), (3.8 * s, 3.6 * s)] {
+                push_offset_layer(&mut title_mesh, dx, dy, drop_shadow);
+            }
+
+            // 2. Animated Neon Corona / Outer Bloom Ring (updated in-place each frame)
+            let glow_start = title_mesh.vertices.len();
+            let base_glow = egui::Color32::from_rgba_unmultiplied(212, 34, 161, 48);
+            for (dx, dy) in [
+                (-3.8 * s, 0.0),
+                (3.8 * s, 0.0),
+                (0.0, -3.5 * s),
+                (0.0, 3.8 * s),
+                (-2.8 * s, -2.6 * s),
+                (2.8 * s, -2.6 * s),
+                (-2.8 * s, 2.8 * s),
+                (2.8 * s, 2.8 * s),
+            ] {
+                push_offset_layer(&mut title_mesh, dx, dy, base_glow);
+            }
+            self.title_glow_range = (glow_start, title_mesh.vertices.len());
+
+            // 3. 3D Metallic Block Extrusion (receding down-right in cosmic indigo/violet)
+            for (dx, dy, col) in [
+                (3.2 * s, 3.3 * s, egui::Color32::from_rgb(32, 14, 76)),
+                (2.5 * s, 2.6 * s, egui::Color32::from_rgb(52, 22, 108)),
+                (1.9 * s, 2.0 * s, egui::Color32::from_rgb(76, 32, 142)),
+            ] {
+                push_offset_layer(&mut title_mesh, dx, dy, col);
+            }
+
+            // 4. Directional Specular Bevel Rim (Icy Cyan-Silver top-left highlight vs. Neon Magenta bottom-right rim)
+            let bevel_highlight = egui::Color32::from_rgb(218, 246, 255);
+            for (dx, dy) in [
+                (-1.8 * s, -1.8 * s),
+                (0.0, -1.9 * s),
+                (-1.9 * s, 0.0),
+                (1.5 * s, -1.6 * s),
+            ] {
+                push_offset_layer(&mut title_mesh, dx, dy, bevel_highlight);
+            }
+            let bevel_rim = egui::Color32::from_rgb(245, 90, 200);
+            for (dx, dy) in [
+                (1.7 * s, 1.7 * s),
+                (0.0, 1.8 * s),
+                (1.8 * s, 0.0),
+                (-1.5 * s, 1.6 * s),
+            ] {
+                push_offset_layer(&mut title_mesh, dx, dy, bevel_rim);
+            }
+
+            // 5. Crisp 8-Direction Dark Obsidian Inner Crease (eliminates corner gaps on thin strokes)
+            let crease_color = egui::Color32::from_rgb(10, 6, 24);
+            let c = 0.92 * s;
+            for (dx, dy) in [
+                (-c, -c),
+                (0.0, -c),
+                (c, -c),
+                (-c, 0.0),
+                (c, 0.0),
+                (-c, c),
+                (0.0, c),
+                (c, c),
+            ] {
+                push_offset_layer(&mut title_mesh, dx, dy, crease_color);
+            }
+
+            // 6. 24-Slice Chrome Interior across exact tight glyph vertical bounds
+            self.title_slice_ranges.clear();
+            self.title_slice_ranges.reserve(steps);
+            let top_y = self.title_glyph_bounds.min.y;
+            let bottom_y = self.title_glyph_bounds.max.y;
+            let height = (bottom_y - top_y).max(1.0);
+
+            for i in 0..steps {
+                let t = i as f32 / steps as f32;
+                let next_t = (i + 1) as f32 / steps as f32;
+                let min_y = top_y + t * height;
+                let max_y = top_y + next_t * height;
+                let v_start = title_mesh.vertices.len();
+
+                for &(x_min, y_min, x_max, y_max, u_min, v_min, u_max, v_max) in &glyph_quads {
+                    let sy0 = min_y.max(y_min);
+                    let sy1 = max_y.min(y_max);
+                    let gh = y_max - y_min;
+                    if sy1 > sy0 && gh > 0.0 {
+                        let f0 = (sy0 - y_min) / gh;
+                        let f1 = (sy1 - y_min) / gh;
+                        let sv0 = v_min + (v_max - v_min) * f0;
+                        let sv1 = v_min + (v_max - v_min) * f1;
+                        let idx = title_mesh.vertices.len() as u32;
+                        title_mesh.vertices.extend_from_slice(&[
+                            egui::epaint::Vertex {
+                                pos: egui::pos2(x_min, sy0),
+                                uv: egui::pos2(u_min, sv0),
+                                color: egui::Color32::WHITE,
+                            },
+                            egui::epaint::Vertex {
+                                pos: egui::pos2(x_max, sy0),
+                                uv: egui::pos2(u_max, sv0),
+                                color: egui::Color32::WHITE,
+                            },
+                            egui::epaint::Vertex {
+                                pos: egui::pos2(x_max, sy1),
+                                uv: egui::pos2(u_max, sv1),
+                                color: egui::Color32::WHITE,
+                            },
+                            egui::epaint::Vertex {
+                                pos: egui::pos2(x_min, sy1),
+                                uv: egui::pos2(u_min, sv1),
+                                color: egui::Color32::WHITE,
+                            },
+                        ]);
+                        title_mesh.indices.extend_from_slice(&[
+                            idx,
+                            idx + 1,
+                            idx + 2,
+                            idx,
+                            idx + 2,
+                            idx + 3,
+                        ]);
+                    }
+                }
+                let v_end = title_mesh.vertices.len();
+                self.title_slice_ranges.push((v_start, v_end));
+            }
+
+            self.title_base_mesh = title_mesh;
+        }
+
+        // Fast per-frame vertex color update (zero glyph layout or tessellation)
+        let bounds = self.title_glyph_bounds;
+        let inv_w = 1.0 / bounds.width().max(1.0);
+        let inv_h = 1.0 / bounds.height().max(1.0);
+
+        // Update animated outer neon corona (cyan <-> magenta wave across the logo)
+        let (glow_start, glow_end) = self.title_glow_range;
+        if glow_end > glow_start && glow_end <= self.title_base_mesh.vertices.len() {
+            let pulse = (time * 1.8).sin() * 0.5 + 0.5;
+            let alpha = (38.0 + pulse * 22.0) as u8;
+            for quad in self.title_base_mesh.vertices[glow_start..glow_end]
+                .as_chunks_mut::<4>()
+                .0
+            {
+                let nx0 = ((quad[0].pos.x - bounds.min.x) * inv_w).clamp(0.0, 1.0);
+                let nx1 = ((quad[1].pos.x - bounds.min.x) * inv_w).clamp(0.0, 1.0);
+                let mix0 = (nx0 * std::f32::consts::PI - time * 1.1).sin() * 0.5 + 0.5;
+                let mix1 = (nx1 * std::f32::consts::PI - time * 1.1).sin() * 0.5 + 0.5;
+                let c0 = egui::Color32::from_rgba_unmultiplied(
+                    (225.0 * (1.0 - mix0) + 0.0 * mix0) as u8,
+                    (40.0 * (1.0 - mix0) + 215.0 * mix0) as u8,
+                    (175.0 * (1.0 - mix0) + 255.0 * mix0) as u8,
+                    alpha,
+                );
+                let c1 = egui::Color32::from_rgba_unmultiplied(
+                    (225.0 * (1.0 - mix1) + 0.0 * mix1) as u8,
+                    (40.0 * (1.0 - mix1) + 215.0 * mix1) as u8,
+                    (175.0 * (1.0 - mix1) + 255.0 * mix1) as u8,
+                    alpha,
+                );
+                quad[0].color = c0;
+                quad[1].color = c1;
+                quad[2].color = c1;
+                quad[3].color = c0;
+            }
+        }
+
+        // Update 24 interior chrome slices at exact per-vertex (nx, ny, gx) coordinates
+        // so adjacent slices share identical boundary colors with zero Mach banding.
+        for &(v_start, v_end) in &self.title_slice_ranges {
+            for quad in self.title_base_mesh.vertices[v_start..v_end]
+                .as_chunks_mut::<4>()
+                .0
+            {
+                let nx0 = ((quad[0].pos.x - bounds.min.x) * inv_w).clamp(0.0, 1.0);
+                let nx1 = ((quad[1].pos.x - bounds.min.x) * inv_w).clamp(0.0, 1.0);
+                let ny0 = ((quad[0].pos.y - bounds.min.y) * inv_h).clamp(0.0, 1.0);
+                let ny1 = ((quad[2].pos.y - bounds.min.y) * inv_h).clamp(0.0, 1.0);
+
+                quad[0].color = Self::evaluate_chrome_color(nx0, ny0, 0.0, time);
+                quad[1].color = Self::evaluate_chrome_color(nx1, ny0, 1.0, time);
+                quad[2].color = Self::evaluate_chrome_color(nx1, ny1, 1.0, time);
+                quad[3].color = Self::evaluate_chrome_color(nx0, ny1, 0.0, time);
+            }
+        }
+    }
+}
+
+/// Throttles formatted telemetry strings in the Stats panel to ~10 Hz (every 100 ms)
+/// so `egui`'s `GalleyCache` achieves a >90% cache hit rate while making numbers
+/// steady and readable for human eyes.
+#[derive(Default)]
+pub(crate) struct StatsDisplayCache {
+    pub last_update_time: f64,
+    pub initialized: bool,
+    pub last_file_loaded: bool,
+    pub fps_line: String,
+    pub cpu_active_line: String,
+    pub cpu_fft_line: String,
+    pub gpu_compute_line: Option<String>,
+    pub cpu_decode_line: String,
+    pub video_decode_line: Option<String>,
+    pub vis_shader_line: Option<String>,
+    pub audio_buffer_line: String,
+    pub audio_buffer_color: egui::Color32,
+    pub video_buffer_line: Option<(String, egui::Color32)>,
+    pub phase_lines: [(String, egui::Color32); 7],
+    pub total_phases_line: String,
+}
+
+impl StatsDisplayCache {
+    pub fn update_if_needed(
+        &mut self,
+        state: &crate::state::AppState,
+        has_video_state: bool,
+        now_time: f64,
+    ) {
+        if self.initialized
+            && self.last_file_loaded == state.file_loaded
+            && (now_time - self.last_update_time).abs() < 0.10
+        {
+            return;
+        }
+        self.initialized = true;
+        self.last_file_loaded = state.file_loaded;
+        self.last_update_time = now_time;
+
+        self.fps_line = format!(
+            "FPS: {:.1} ({:.2} ms)",
+            state.current_fps,
+            1000.0 / state.current_fps.max(1.0)
+        );
+        let cpu_active_us = state.stats.phase_lock_update_us
+            + state.stats.phase_snapshot_us
+            + state.stats.phase_egui_layout_us
+            + state.stats.phase_encode_us
+            + state.stats.phase_post_us;
+        self.cpu_active_line = format!("CPU Active Total: {:.2} ms", cpu_active_us / 1000.0);
+        self.cpu_fft_line = if state.video_mode == 3
+            && (state.has_video_stream || state.video_frame_rx.is_some() || has_video_state)
+        {
+            "CPU FFT: Off (Fullscreen Video)".to_string()
+        } else {
+            format!("CPU FFT: {:.2} ms", state.stats.fft_us / 1000.0)
+        };
+        self.gpu_compute_line = if state.file_loaded && state.stats.gpu_compute_us > 0.0 {
+            Some(format!(
+                "GPU Compute: {:.2} ms",
+                state.stats.gpu_compute_us / 1000.0
+            ))
+        } else {
+            None
+        };
+        self.cpu_decode_line = format!("CPU Decode: {:.2} ms", state.stats.decode_us / 1000.0);
+        self.video_decode_line = if state.file_loaded && state.stats.video_decode_us > 0.0 {
+            Some(format!(
+                "Video Decode: {:.2} ms",
+                state.stats.video_decode_us / 1000.0
+            ))
+        } else {
+            None
+        };
+
+        let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
+        let mut total_vis_us = state.stats.shader_us;
+        let has_sim_pass = vis_def.requires_fire
+            || vis_def.id == 20
+            || vis_def.requires_flip_ferrofluid
+            || vis_def.requires_flip_water;
+        if has_sim_pass {
+            total_vis_us += state.stats.fire_us;
+        }
+        self.vis_shader_line = if state.file_loaded && total_vis_us > 0.0 {
+            Some(format!(
+                "Visualization Shader (GPU): {:.2} ms",
+                total_vis_us / 1000.0
+            ))
+        } else {
+            None
+        };
+
+        if !state.file_loaded {
+            self.audio_buffer_line = "Audio Buffer: Idle".to_string();
+            self.audio_buffer_color = egui::Color32::GRAY;
+        } else {
+            let buffer_label = if state.duration_seconds <= 0.0 {
+                "Network Buffer"
+            } else {
+                "Audio Buffer"
+            };
+            self.audio_buffer_line = format!(
+                "{}: {:.1}%",
+                buffer_label, state.stats.audio_buffer_fill_pct
+            );
+            self.audio_buffer_color = if state.stats.audio_buffer_fill_pct < 5.0 {
+                egui::Color32::RED
+            } else if state.stats.audio_buffer_fill_pct > 95.0 {
+                egui::Color32::YELLOW
+            } else {
+                egui::Color32::GREEN
+            };
+        }
+
+        self.video_buffer_line = if state.file_loaded && state.video_frame_rx.is_some() {
+            let col = if state.stats.video_buffer_fill_pct < 1.0 {
+                egui::Color32::RED
+            } else {
+                egui::Color32::YELLOW
+            };
+            Some((
+                format!("Video Buffer: {:.1}%", state.stats.video_buffer_fill_pct),
+                col,
+            ))
+        } else {
+            None
+        };
+
+        let phases = [
+            ("  Lock+Update", state.stats.phase_lock_update_us),
+            ("  Snapshot", state.stats.phase_snapshot_us),
+            ("  Surface Acq (VSync Wait)", state.stats.phase_surface_us),
+            ("  UI Layout + Tess", state.stats.phase_egui_layout_us),
+            ("  Cmd Record (CPU)", state.stats.phase_encode_us),
+            ("  Submit + Present", state.stats.phase_submit_us),
+            ("  Post Write", state.stats.phase_post_us),
+        ];
+        let total_phases: f32 = phases.iter().map(|(_, v)| v).sum();
+        for (idx, (name, val)) in phases.iter().enumerate() {
+            let color = if *name == "  Surface Acq (VSync Wait)" {
+                egui::Color32::from_rgb(160, 160, 160)
+            } else if *name == "  Submit + Present" {
+                if *val > 4000.0 {
+                    egui::Color32::YELLOW
+                } else {
+                    egui::Color32::from_rgb(160, 160, 160)
+                }
+            } else if *val > 2500.0 {
+                egui::Color32::RED
+            } else if *val > 1500.0 {
+                egui::Color32::YELLOW
+            } else {
+                egui::Color32::from_rgb(160, 160, 160)
+            };
+            self.phase_lines[idx] = (format!("{}: {:.2} ms", name, val / 1000.0), color);
+        }
+        self.total_phases_line = format!("  Total Frame Loop: {:.2} ms", total_phases / 1000.0);
+    }
+}
+
+pub struct VulkanEngine {
+    instance: wgpu::Instance,
+    surface: Option<wgpu::Surface<'static>>,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    pub adapter_info: wgpu::AdapterInfo,
+    pub negotiated_features: NegotiatedGpuFeatures,
+    pub config: wgpu::SurfaceConfiguration,
+    pub size: winit::dpi::PhysicalSize<u32>,
+    render_pipelines: Vec<Option<wgpu::RenderPipeline>>,
+    shader_sources: Vec<String>,
+    fallback_pipeline: wgpu::RenderPipeline,
+    fallback_pipeline_3d: wgpu::RenderPipeline,
+    render_pipeline_layout: wgpu::PipelineLayout,
+    render_pipeline_layout_3d: wgpu::PipelineLayout,
+    flip_render_pipeline_layout: wgpu::PipelineLayout,
+    lyrics_render_pipeline_layout_3d: wgpu::PipelineLayout,
+    pipeline_cache: Option<wgpu::PipelineCache>,
+    pipeline_cache_path: Option<std::path::PathBuf>,
+    hud_pipeline: wgpu::RenderPipeline,
+    uniform_buffer: wgpu::Buffer,
+    waveform_storage_buffer: wgpu::Buffer,
+    _history_texture: wgpu::Texture,
+    fire_grid_texture: wgpu::Texture,
+    uniform_bind_group: wgpu::BindGroup,
+    pub egui_renderer: egui_wgpu::Renderer,
+    timestamp_period: f32,
+    timestamp_mapping_active: bool,
+    timestamp_map_complete: Arc<AtomicBool>,
+    cached_fft_us: Option<f32>,
+    cached_fire_us: Option<f32>,
+    cached_vis_us: Option<f32>,
+    query_set: Option<wgpu::QuerySet>,
+    query_resolve_buffer: Option<wgpu::Buffer>,
+    query_read_buffer: Option<wgpu::Buffer>,
+
+    pub meters_uv_rect: [f32; 4],
+    pub heatmap_uv_rect: [f32; 4],
+    pub fire_uv_rect: [f32; 4],
+    pub track_info_rect: Option<[f32; 4]>,
+
+    // GPU compute fire simulation
+    firesim_compute_pipeline: wgpu::ComputePipeline,
+    fire_buffer_a: wgpu::Buffer,
+    fire_buffer_b: wgpu::Buffer,
+    _fire_coal_buffer: wgpu::Buffer,
+    fire_params_buffer: wgpu::Buffer,
+    fire_bind_group_a: wgpu::BindGroup, // reads A, writes B
+    fire_bind_group_b: wgpu::BindGroup, // reads B, writes A
+    fire_ping: bool,
+
+    // Authentic DOOM Fire simulation state (visualizer ID 5: Retro Fire)
+    retro_fire_cells: Box<[u8; 320 * 180]>,
+    retro_fire_upload: Vec<f32>,
+    retro_fire_rng: u32,
+    retro_fire_accum: f32,
+    retro_fire_cold_uploaded: bool,
+
+    pub heatmap_row: u32,
+    heatmap_compute_pipeline: wgpu::ComputePipeline,
+    heatmap_bind_group: wgpu::BindGroup,
+
+    // GPU Quantum FLIP Ferrofluid simulation
+    flip_clear_pipeline: wgpu::ComputePipeline,
+    flip_clear_render_pipeline: wgpu::ComputePipeline,
+    flip_p2g_pipeline: wgpu::ComputePipeline,
+    flip_forces_pipeline: wgpu::ComputePipeline,
+    flip_pressure_0_to_1_pipeline: wgpu::ComputePipeline,
+    flip_pressure_1_to_0_pipeline: wgpu::ComputePipeline,
+    flip_project_pipeline: wgpu::ComputePipeline,
+    flip_g2p_advect_pipeline: wgpu::ComputePipeline,
+    flip_compute_bind_group: wgpu::BindGroup,
+    flip_render_bind_group: wgpu::BindGroup,
+
+    // GPU FLIP Acoustic Water simulation
+    flip_water_clear_pipeline: wgpu::ComputePipeline,
+    flip_water_clear_render_pipeline: wgpu::ComputePipeline,
+    flip_water_p2g_pipeline: wgpu::ComputePipeline,
+    flip_water_forces_pipeline: wgpu::ComputePipeline,
+    flip_water_pressure_0_to_1_pipeline: wgpu::ComputePipeline,
+    flip_water_pressure_1_to_0_pipeline: wgpu::ComputePipeline,
+    flip_water_project_pipeline: wgpu::ComputePipeline,
+    flip_water_g2p_advect_pipeline: wgpu::ComputePipeline,
+    water_splash_pipeline: wgpu::RenderPipeline,
+    splash_quad_vertex_buffer: wgpu::Buffer,
+    splash_quad_index_buffer: wgpu::Buffer,
+    splash_compact_buffer: wgpu::Buffer,
+    splash_indirect_args_buffer: wgpu::Buffer,
+    lyrics_indirect_args_buffer: wgpu::Buffer,
+
+    // GPU compute bioluminescent waves simulation
+    _biolum_particles_buffer: wgpu::Buffer,
+    biolum_compute_pipeline: wgpu::ComputePipeline,
+    biolum_compute_bind_group: wgpu::BindGroup,
+    biolum_render_bind_group: wgpu::BindGroup,
+    _biolum_render_pipeline_layout: wgpu::PipelineLayout,
+
+    // GPU FFT was removed (FFT is computed on the CPU); the dummy timestamp
+    // pass in render() keeps the query-slot layout intact.
+    resynth_compute_pipeline: wgpu::ComputePipeline,
+    resynth_bind_group: wgpu::BindGroup,
+    _gpu_spectrum_buffer: wgpu::Buffer,
+
+    depth_texture_view: wgpu::TextureView,
+
+    // Pre-allocated buffers to avoid per-frame heap allocations
+    waveform_history_flat: Vec<f32>,
+    waveform_history_packed: Vec<u32>,
+    tape_timeline_scratch: Vec<f32>,
+
+    // Video
+    video_blur_bind_group_layout: wgpu::BindGroupLayout,
+    video_bind_group_layout: wgpu::BindGroupLayout,
+    video_border_blur_pipeline: wgpu::RenderPipeline,
+    video_pipeline: wgpu::RenderPipeline,
+    video_state: Option<VideoState>,
+    video_repack_scratch: Vec<u8>,
+    clear_black_pipeline: wgpu::RenderPipeline,
+    biolum_bg_pipeline: wgpu::RenderPipeline,
+    synthwave_sky_pipeline: wgpu::RenderPipeline,
+    vumeters_bg_pipeline: wgpu::RenderPipeline,
+
+    pending_uniforms: Option<AudioUniforms>,
+    cached_meta_path: String,
+    cached_file_dir: String,
+    cached_file_len: Option<u64>,
+    last_acquire_instant: Option<std::time::Instant>,
+
+    // 3D Engine Extensions
+    camera_uniform_buffer: wgpu::Buffer,
+    camera_bind_group: wgpu::BindGroup,
+    mesh_registry: std::collections::HashMap<crate::state::Geometry, MeshBuffers>,
+    lamp_vertex_buffer: wgpu::Buffer,
+    lamp_index_buffer: wgpu::Buffer,
+    lamp_index_count: u32,
+    lamp_pipeline: wgpu::RenderPipeline,
+    frame_count: u32,
+    last_history_cam_z: f64,
+    smooth_time: f64,
+    play_time: f64,
+    smooth_audio_seconds: f64,
+    last_raw_state_seconds: f64,
+    pub smooth_dt: f64,
+    last_history_push_count: u64,
+    time_since_last_push: f64,
+    measured_push_interval: f64,
+    vu_needle_angles: Vec<f32>,
+    vu_needle_velocities: Vec<f32>,
+    channel_phases: [f32; 32],
+    vu_prev_active_segments: [u32; 32],
+    vu_segment_glows: [[f32; 30]; 32],
+    vu_prev_num_channels: u32,
+    // Change detection & GPU ring-buffer state for waveform history uploads
+    last_uploaded_push_count: u64,
+    last_uploaded_vis_width: u32,
+    last_uploaded_vis_id: u32,
+    last_uploaded_hist_len: usize,
+    waveform_ring_head: usize,
+    waveform_ring_base: u32,
+    pub lyric_slam_timer: f64,
+    pub last_lyric_line_idx: Option<usize>,
+    pub current_lyric_mesh_text: String,
+    pub fire_intensity: f32,
+    pub(crate) splash_cache: SplashCache,
+    pub(crate) stats_cache: StatsDisplayCache,
+    pub(crate) is_game_mode: bool,
+    pub(crate) last_steps_to_fill: u32,
+    pub(crate) last_aspect_ratio: f32,
+}
+
+pub fn generate_lamp_mesh() -> (Vec<Vertex>, Vec<u32>) {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+
+    // Helper to add a box
+    let mut add_box = |center: [f32; 3], size: [f32; 3], color_flag: f32| {
+        let half_x = size[0] / 2.0;
+        let half_y = size[1] / 2.0;
+        let half_z = size[2] / 2.0;
+
+        let local_verts = [
+            // front
+            [-half_x, -half_y, half_z],
+            [half_x, -half_y, half_z],
+            [half_x, half_y, half_z],
+            [-half_x, half_y, half_z],
+            // back
+            [-half_x, -half_y, -half_z],
+            [-half_x, half_y, -half_z],
+            [half_x, half_y, -half_z],
+            [half_x, -half_y, -half_z],
+        ];
+
+        let normals = [
+            [0.0, 0.0, 1.0],  // front
+            [0.0, 0.0, -1.0], // back
+            [-1.0, 0.0, 0.0], // left
+            [1.0, 0.0, 0.0],  // right
+            [0.0, 1.0, 0.0],  // top
+            [0.0, -1.0, 0.0], // bottom
+        ];
+
+        let face_indices = [
+            [0, 1, 2, 0, 2, 3], // front
+            [4, 5, 6, 4, 6, 7], // back
+            [4, 0, 3, 4, 3, 5], // left
+            [1, 7, 6, 1, 6, 2], // right
+            [3, 2, 6, 3, 6, 5], // top
+            [4, 7, 1, 4, 1, 0], // bottom
+        ];
+
+        // Add vertices and indices for each face to have clean normals
+        for (face_idx, &_indices_map) in face_indices.iter().enumerate() {
+            let start_v = vertices.len() as u32;
+            let normal = normals[face_idx];
+
+            let unique_vert_indices = match face_idx {
+                0 => [0, 1, 2, 3], // front
+                1 => [4, 5, 6, 7], // back
+                2 => [4, 0, 3, 5], // left
+                3 => [1, 7, 6, 2], // right
+                4 => [3, 2, 6, 5], // top
+                5 => [4, 7, 1, 0], // bottom
+                _ => unreachable!(),
+            };
+
+            for &vi in &unique_vert_indices {
+                let p = local_verts[vi];
+                vertices.push(Vertex {
+                    position: [p[0] + center[0], p[1] + center[1], p[2] + center[2]],
+                    normal,
+                    tex_coords: [color_flag, (p[1] + center[1]) / 11.0],
+                });
+            }
+
+            indices.push(start_v);
+            indices.push(start_v + 1);
+            indices.push(start_v + 2);
+            indices.push(start_v);
+            indices.push(start_v + 2);
+            indices.push(start_v + 3);
+        }
+    };
+
+    // 1. Pole: Vertical box
+    add_box([0.0, 5.5, 0.0], [0.24, 11.0, 0.24], 0.0);
+
+    // 2. Overhang arm: Horizontal box
+    // Extends by 2.0 units in +X direction (towards road)
+    add_box([1.0, 11.0, 0.0], [2.0, 0.2, 0.2], 0.0);
+
+    // 3. Lamp Fitting/Head: Box at the end of overhang
+    add_box([2.0, 10.8, 0.0], [0.8, 0.3, 0.5], 2.0); // Flag 2.0 for fixture
+
+    // 4. Lamp Bulb/Emissive source: Smaller glowing box underneath the fitting
+    add_box([2.0, 10.6, 0.0], [0.4, 0.1, 0.3], 1.0); // Flag 1.0 for emissive bulb
+
+    (vertices, indices)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn room_add_quad(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    p0: [f32; 3],
+    p1: [f32; 3],
+    p2: [f32; 3],
+    p3: [f32; 3],
+    normal: [f32; 3],
+    ch: f32,
+    mat: f32,
+) {
+    let start = vertices.len() as u32;
+    vertices.push(Vertex {
+        position: p0,
+        normal,
+        tex_coords: [ch, mat],
+    });
+    vertices.push(Vertex {
+        position: p1,
+        normal,
+        tex_coords: [ch, mat],
+    });
+    vertices.push(Vertex {
+        position: p2,
+        normal,
+        tex_coords: [ch, mat],
+    });
+    vertices.push(Vertex {
+        position: p3,
+        normal,
+        tex_coords: [ch, mat],
+    });
+    indices.extend_from_slice(&[start, start + 1, start + 2, start, start + 2, start + 3]);
+}
+
+fn room_add_box(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    center: [f32; 3],
+    size: [f32; 3],
+    rot_y: f32,
+    ch: f32,
+    mat: f32,
+) {
+    let hx = size[0] / 2.0;
+    let hy = size[1] / 2.0;
+    let hz = size[2] / 2.0;
+    let cos_r = rot_y.cos();
+    let sin_r = rot_y.sin();
+
+    let rotate_pt = |p: [f32; 3]| -> [f32; 3] {
+        let rx = p[0] * cos_r + p[2] * sin_r;
+        let rz = -p[0] * sin_r + p[2] * cos_r;
+        [rx + center[0], p[1] + center[1], rz + center[2]]
+    };
+    let rotate_norm = |n: [f32; 3]| -> [f32; 3] {
+        let rx = n[0] * cos_r + n[2] * sin_r;
+        let rz = -n[0] * sin_r + n[2] * cos_r;
+        [rx, n[1], rz]
+    };
+
+    // Front face (+z)
+    room_add_quad(
+        vertices,
+        indices,
+        rotate_pt([-hx, -hy, hz]),
+        rotate_pt([hx, -hy, hz]),
+        rotate_pt([hx, hy, hz]),
+        rotate_pt([-hx, hy, hz]),
+        rotate_norm([0.0, 0.0, 1.0]),
+        ch,
+        mat,
+    );
+    // Back face (-z)
+    room_add_quad(
+        vertices,
+        indices,
+        rotate_pt([hx, -hy, -hz]),
+        rotate_pt([-hx, -hy, -hz]),
+        rotate_pt([-hx, hy, -hz]),
+        rotate_pt([hx, hy, -hz]),
+        rotate_norm([0.0, 0.0, -1.0]),
+        ch,
+        mat,
+    );
+    // Left face (-x)
+    room_add_quad(
+        vertices,
+        indices,
+        rotate_pt([-hx, -hy, -hz]),
+        rotate_pt([-hx, -hy, hz]),
+        rotate_pt([-hx, hy, hz]),
+        rotate_pt([-hx, hy, -hz]),
+        rotate_norm([-1.0, 0.0, 0.0]),
+        ch,
+        mat,
+    );
+    // Right face (+x)
+    room_add_quad(
+        vertices,
+        indices,
+        rotate_pt([hx, -hy, hz]),
+        rotate_pt([hx, -hy, -hz]),
+        rotate_pt([hx, hy, -hz]),
+        rotate_pt([hx, hy, hz]),
+        rotate_norm([1.0, 0.0, 0.0]),
+        ch,
+        mat,
+    );
+    // Top face (+y)
+    room_add_quad(
+        vertices,
+        indices,
+        rotate_pt([-hx, hy, hz]),
+        rotate_pt([hx, hy, hz]),
+        rotate_pt([hx, hy, -hz]),
+        rotate_pt([-hx, hy, -hz]),
+        rotate_norm([0.0, 1.0, 0.0]),
+        ch,
+        mat,
+    );
+    // Bottom face (-y)
+    room_add_quad(
+        vertices,
+        indices,
+        rotate_pt([-hx, -hy, -hz]),
+        rotate_pt([hx, -hy, -hz]),
+        rotate_pt([hx, -hy, hz]),
+        rotate_pt([-hx, -hy, hz]),
+        rotate_norm([0.0, -1.0, 0.0]),
+        ch,
+        mat,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn room_add_cone(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    center: [f32; 3],
+    radius: f32,
+    depth: f32,
+    rot_y: f32,
+    ch: f32,
+    mat: f32,
+) {
+    let segs = 18;
+    let cos_r = rot_y.cos();
+    let sin_r = rot_y.sin();
+    let rotate_pt = |p: [f32; 3]| -> [f32; 3] {
+        let rx = p[0] * cos_r + p[2] * sin_r;
+        let rz = -p[0] * sin_r + p[2] * cos_r;
+        [rx + center[0], p[1] + center[1], rz + center[2]]
+    };
+    let rotate_norm = |n: [f32; 3]| -> [f32; 3] {
+        let rx = n[0] * cos_r + n[2] * sin_r;
+        let rz = -n[0] * sin_r + n[2] * cos_r;
+        [rx, n[1], rz]
+    };
+
+    let n = rotate_norm([0.0, 0.0, 1.0]);
+    let apex = rotate_pt([0.0, 0.0, 0.02]);
+    let r_cap = radius * 0.40;
+    let z_throat = -depth;
+
+    for i in 0..segs {
+        let a0 = (i as f32) / (segs as f32) * std::f32::consts::TAU;
+        let a1 = ((i + 1) as f32) / (segs as f32) * std::f32::consts::TAU;
+        let c0 = a0.cos();
+        let s0 = a0.sin();
+        let c1 = a1.cos();
+        let s1 = a1.sin();
+
+        // 1. Inner protruding dustcap dome (high excursion weight: 0.72..1.0)
+        let cap0 = rotate_pt([c0 * r_cap, s0 * r_cap, z_throat]);
+        let cap1 = rotate_pt([c1 * r_cap, s1 * r_cap, z_throat]);
+        let start = vertices.len() as u32;
+        vertices.push(Vertex {
+            position: apex,
+            normal: n,
+            tex_coords: [ch, mat + 0.25],
+        });
+        vertices.push(Vertex {
+            position: cap0,
+            normal: n,
+            tex_coords: [ch, mat + 0.18],
+        });
+        vertices.push(Vertex {
+            position: cap1,
+            normal: n,
+            tex_coords: [ch, mat + 0.18],
+        });
+        indices.extend_from_slice(&[start, start + 1, start + 2]);
+
+        // 2. Conical ribbed diaphragm from dustcap throat out to surround rim (weight: 0.72 -> 0.0)
+        let p0 = rotate_pt([c0 * radius, s0 * radius, 0.0]);
+        let p1 = rotate_pt([c1 * radius, s1 * radius, 0.0]);
+        let d_start = vertices.len() as u32;
+        vertices.push(Vertex {
+            position: cap0,
+            normal: n,
+            tex_coords: [ch, mat + 0.18],
+        });
+        vertices.push(Vertex {
+            position: p0,
+            normal: n,
+            tex_coords: [ch, mat],
+        });
+        vertices.push(Vertex {
+            position: p1,
+            normal: n,
+            tex_coords: [ch, mat],
+        });
+        vertices.push(Vertex {
+            position: cap1,
+            normal: n,
+            tex_coords: [ch, mat + 0.18],
+        });
+        indices.extend_from_slice(&[
+            d_start,
+            d_start + 1,
+            d_start + 2,
+            d_start,
+            d_start + 2,
+            d_start + 3,
+        ]);
+
+        // 3. Bold emissive neon basket bezel ring (mat = 5.2)
+        let r_out = radius * 1.22;
+        let p0_out = rotate_pt([c0 * r_out, s0 * r_out, 0.015]);
+        let p1_out = rotate_pt([c1 * r_out, s1 * r_out, 0.015]);
+        room_add_quad(vertices, indices, p0, p1, p1_out, p0_out, n, ch, 5.2);
+    }
+}
+
+fn room_add_ceiling_cone(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    center: [f32; 3],
+    radius: f32,
+    depth: f32,
+    ch: f32,
+    mat: f32,
+) {
+    let segs = 16;
+    let n = [0.0, -1.0, 0.0];
+    let apex = [center[0], center[1] - 0.02, center[2]];
+    let r_cap = radius * 0.40;
+    for i in 0..segs {
+        let a0 = (i as f32) / (segs as f32) * std::f32::consts::TAU;
+        let a1 = ((i + 1) as f32) / (segs as f32) * std::f32::consts::TAU;
+        let c0 = a0.cos();
+        let s0 = a0.sin();
+        let c1 = a1.cos();
+        let s1 = a1.sin();
+
+        let cap0 = [
+            center[0] + c0 * r_cap,
+            center[1] + depth,
+            center[2] + s0 * r_cap,
+        ];
+        let cap1 = [
+            center[0] + c1 * r_cap,
+            center[1] + depth,
+            center[2] + s1 * r_cap,
+        ];
+        let start = vertices.len() as u32;
+        vertices.push(Vertex {
+            position: apex,
+            normal: n,
+            tex_coords: [ch, mat + 0.25],
+        });
+        vertices.push(Vertex {
+            position: cap0,
+            normal: n,
+            tex_coords: [ch, mat + 0.18],
+        });
+        vertices.push(Vertex {
+            position: cap1,
+            normal: n,
+            tex_coords: [ch, mat + 0.18],
+        });
+        indices.extend_from_slice(&[start, start + 1, start + 2]);
+
+        let p0 = [center[0] + c0 * radius, center[1], center[2] + s0 * radius];
+        let p1 = [center[0] + c1 * radius, center[1], center[2] + s1 * radius];
+        let d_start = vertices.len() as u32;
+        vertices.push(Vertex {
+            position: cap0,
+            normal: n,
+            tex_coords: [ch, mat + 0.18],
+        });
+        vertices.push(Vertex {
+            position: p0,
+            normal: n,
+            tex_coords: [ch, mat],
+        });
+        vertices.push(Vertex {
+            position: p1,
+            normal: n,
+            tex_coords: [ch, mat],
+        });
+        vertices.push(Vertex {
+            position: cap1,
+            normal: n,
+            tex_coords: [ch, mat + 0.18],
+        });
+        indices.extend_from_slice(&[
+            d_start,
+            d_start + 1,
+            d_start + 2,
+            d_start,
+            d_start + 2,
+            d_start + 3,
+        ]);
+
+        let r_out = radius * 1.24;
+        let p0_out = [
+            center[0] + c0 * r_out,
+            center[1] - 0.01,
+            center[2] + s0 * r_out,
+        ];
+        let p1_out = [
+            center[0] + c1 * r_out,
+            center[1] - 0.01,
+            center[2] + s1 * r_out,
+        ];
+        room_add_quad(vertices, indices, p0, p1, p1_out, p0_out, n, ch, 5.2);
+    }
+}
+
+fn room_add_speaker_tower(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    pos: [f32; 3],
+    rot_y: f32,
+    ch: f32,
+    is_tower: bool,
+) {
+    let cos_r = rot_y.cos();
+    let sin_r = rot_y.sin();
+    let local_to_world = |lx: f32, ly: f32, lz: f32| -> [f32; 3] {
+        let rx = lx * cos_r + lz * sin_r;
+        let rz = -lx * sin_r + lz * cos_r;
+        [rx + pos[0], ly + pos[1], rz + pos[2]]
+    };
+
+    if is_tower {
+        // Pedestal base & Cabinet (mat = 1.2 for active speaker cabinet)
+        room_add_box(
+            vertices,
+            indices,
+            [pos[0], pos[1] - 1.12, pos[2]],
+            [0.98, 0.12, 1.05],
+            rot_y,
+            ch,
+            1.2,
+        );
+        room_add_box(vertices, indices, pos, [0.84, 2.2, 0.90], rot_y, ch, 1.2);
+
+        // Bipolar Front (+0.46) and Rear (-0.46) Driver Arrays so cones are visible from all camera orbit angles
+        for &(face_z, face_rot) in &[(0.46f32, rot_y), (-0.46f32, rot_y + std::f32::consts::PI)] {
+            // Lower Bass Woofer (mat = 2.0)
+            room_add_cone(
+                vertices,
+                indices,
+                local_to_world(0.0, -0.52, face_z),
+                0.31,
+                0.13,
+                face_rot,
+                ch,
+                2.0,
+            );
+            // Midrange Cone (mat = 3.0)
+            room_add_cone(
+                vertices,
+                indices,
+                local_to_world(0.0, 0.22, face_z),
+                0.22,
+                0.09,
+                face_rot,
+                ch,
+                3.0,
+            );
+            // Tweeter Dome (mat = 4.0)
+            room_add_cone(
+                vertices,
+                indices,
+                local_to_world(0.0, 0.76, face_z),
+                0.11,
+                0.04,
+                face_rot,
+                ch,
+                4.0,
+            );
+        }
+
+        // Emissive vertical neon accent rails on all 4 vertical cabinet corners & base halo (mat = 5.2)
+        for &sx in &[-0.43f32, 0.43f32] {
+            for &sz in &[-0.43f32, 0.43f32] {
+                room_add_box(
+                    vertices,
+                    indices,
+                    local_to_world(sx, 0.0, sz),
+                    [0.04, 2.18, 0.04],
+                    rot_y,
+                    ch,
+                    5.2,
+                );
+            }
+        }
+        room_add_box(
+            vertices,
+            indices,
+            local_to_world(0.0, -1.08, 0.0),
+            [1.02, 0.04, 1.08],
+            rot_y,
+            ch,
+            5.2,
+        );
+    } else {
+        // Stand-mounted surround monitor
+        room_add_box(
+            vertices,
+            indices,
+            [pos[0], pos[1] - 0.9, pos[2]],
+            [0.10, 1.6, 0.10],
+            rot_y,
+            ch,
+            1.2,
+        );
+        room_add_box(
+            vertices,
+            indices,
+            [pos[0], pos[1] - 1.7, pos[2]],
+            [0.75, 0.06, 0.75],
+            rot_y,
+            ch,
+            1.2,
+        );
+        // Monitor box (mat = 1.2)
+        room_add_box(vertices, indices, pos, [0.72, 1.18, 0.68], rot_y, ch, 1.2);
+
+        // Bipolar Front (+0.35) and Rear (-0.35) drivers
+        for &(face_z, face_rot) in &[(0.35f32, rot_y), (-0.35f32, rot_y + std::f32::consts::PI)] {
+            // Woofer
+            room_add_cone(
+                vertices,
+                indices,
+                local_to_world(0.0, -0.16, face_z),
+                0.25,
+                0.10,
+                face_rot,
+                ch,
+                2.0,
+            );
+            // Tweeter
+            room_add_cone(
+                vertices,
+                indices,
+                local_to_world(0.0, 0.34, face_z),
+                0.10,
+                0.04,
+                face_rot,
+                ch,
+                4.0,
+            );
+        }
+        // Neon perimeter halos & corner strips (mat = 5.2)
+        room_add_box(
+            vertices,
+            indices,
+            local_to_world(0.0, -0.60, 0.0),
+            [0.76, 0.04, 0.72],
+            rot_y,
+            ch,
+            5.2,
+        );
+        room_add_box(
+            vertices,
+            indices,
+            local_to_world(0.0, 0.60, 0.0),
+            [0.76, 0.04, 0.72],
+            rot_y,
+            ch,
+            5.2,
+        );
+    }
+}
+
+pub(crate) fn generate_neon_room_mesh() -> (Vec<Vertex>, Vec<u32>) {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+
+    // Front-to-back draw order for Early-Z culling: draw interior stage riser, speakers,
+    // acoustic diffuser slats, and observation window BEFORE the enclosing room floor/walls/ceiling.
+    // Front stage platform riser
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, -1.48, 6.2],
+        [10.5, 0.24, 4.8],
+        0.0,
+        0.0,
+        1.0,
+    );
+    // Neon edge along stage riser
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, -1.35, 3.8],
+        [10.6, 0.04, 0.04],
+        0.0,
+        3.0,
+        5.0,
+    );
+
+    // 3. ACOUSTIC DIFFUSER SLATS (mat = 6.0) on back wall
+    for i in 0..14 {
+        let x = -6.5 + (i as f32) * 1.0;
+        let depth_offset = ((i * 7 + 3) % 5) as f32 * 0.06;
+        room_add_box(
+            &mut vertices,
+            &mut indices,
+            [x, 1.6, 8.8 - depth_offset],
+            [0.55, 4.2, 0.15 + depth_offset],
+            0.0,
+            0.0,
+            6.0,
+        );
+    }
+
+    // Rear studio control room observation window & diffusers
+    // Soundproof glass observation pane (mat = 7.0)
+    room_add_quad(
+        &mut vertices,
+        &mut indices,
+        [-4.5, 0.4, -8.85],
+        [-4.5, 3.4, -8.85],
+        [4.5, 3.4, -8.85],
+        [4.5, 0.4, -8.85],
+        [0.0, 0.0, 1.0],
+        6.0,
+        7.0,
+    );
+    // Window neon illuminated perimeter frame
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, 3.45, -8.82],
+        [9.2, 0.08, 0.08],
+        0.0,
+        6.0,
+        5.0,
+    );
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, 0.35, -8.82],
+        [9.2, 0.08, 0.08],
+        0.0,
+        7.0,
+        5.0,
+    );
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [-4.55, 1.9, -8.82],
+        [0.08, 3.1, 0.08],
+        0.0,
+        6.0,
+        5.0,
+    );
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [4.55, 1.9, -8.82],
+        [0.08, 3.1, 0.08],
+        0.0,
+        7.0,
+        5.0,
+    );
+
+    // Rear flank acoustic diffuser panels
+    for i in 0..4 {
+        let x_left = -8.8 + (i as f32) * 0.9;
+        let x_right = 6.1 + (i as f32) * 0.9;
+        let depth_offset = ((i * 5 + 2) % 4) as f32 * 0.05;
+        room_add_box(
+            &mut vertices,
+            &mut indices,
+            [x_left, 1.6, -8.8 + depth_offset],
+            [0.5, 3.6, 0.12 + depth_offset],
+            0.0,
+            6.0,
+            6.0,
+        );
+        room_add_box(
+            &mut vertices,
+            &mut indices,
+            [x_right, 1.6, -8.8 + depth_offset],
+            [0.5, 3.6, 0.12 + depth_offset],
+            0.0,
+            7.0,
+            6.0,
+        );
+    }
+
+    // Side acoustic panels with illuminated neon perimeter backlights
+    for i in 0..4 {
+        let z = -4.5 + (i as f32) * 3.0;
+        // Left side panel + halo
+        room_add_box(
+            &mut vertices,
+            &mut indices,
+            [-10.8, 1.2, z],
+            [0.18, 2.4, 1.8],
+            0.0,
+            4.0,
+            6.0,
+        );
+        room_add_box(
+            &mut vertices,
+            &mut indices,
+            [-10.85, 1.2, z],
+            [0.06, 2.5, 1.9],
+            0.0,
+            4.0,
+            5.0,
+        );
+
+        // Right side panel + halo
+        room_add_box(
+            &mut vertices,
+            &mut indices,
+            [10.8, 1.2, z],
+            [0.18, 2.4, 1.8],
+            0.0,
+            5.0,
+            6.0,
+        );
+        room_add_box(
+            &mut vertices,
+            &mut indices,
+            [10.85, 1.2, z],
+            [0.06, 2.5, 1.9],
+            0.0,
+            5.0,
+            5.0,
+        );
+    }
+
+    // Overhead neon rail trusses
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, 4.8, 4.0],
+        [21.0, 0.08, 0.08],
+        0.0,
+        0.0,
+        5.0,
+    );
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, 4.8, -3.0],
+        [21.0, 0.08, 0.08],
+        0.0,
+        6.0,
+        5.0,
+    );
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [-8.0, 4.8, 0.0],
+        [0.08, 0.08, 16.0],
+        0.0,
+        4.0,
+        5.0,
+    );
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [8.0, 4.8, 0.0],
+        [0.08, 0.08, 16.0],
+        0.0,
+        5.0,
+        5.0,
+    );
+
+    // 4. SPATIAL SPEAKERS (7.1.4 Surround Placement — all oriented inward toward the listening sweet spot / camera)
+    // Channel 0: Front Left (Tower) — angled toward room center & camera (-Z, +X)
+    room_add_speaker_tower(
+        &mut vertices,
+        &mut indices,
+        [-3.8, -0.25, 5.5],
+        std::f32::consts::PI - 0.38,
+        0.0,
+        true,
+    );
+    // Channel 1: Front Right (Tower) — angled toward room center & camera (-Z, -X)
+    room_add_speaker_tower(
+        &mut vertices,
+        &mut indices,
+        [3.8, -0.25, 5.5],
+        -std::f32::consts::PI + 0.38,
+        1.0,
+        true,
+    );
+
+    // Channel 2: Center Channel (Horizontal Cabinet on Riser, front baffle at Z = 6.46 facing -Z)
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, -0.85, 6.8],
+        [1.8, 0.60, 0.66],
+        0.0,
+        2.0,
+        1.2,
+    );
+    room_add_cone(
+        &mut vertices,
+        &mut indices,
+        [-0.54, -0.85, 6.46],
+        0.21,
+        0.08,
+        std::f32::consts::PI,
+        2.0,
+        3.0,
+    );
+    room_add_cone(
+        &mut vertices,
+        &mut indices,
+        [0.54, -0.85, 6.46],
+        0.21,
+        0.08,
+        std::f32::consts::PI,
+        2.0,
+        3.0,
+    );
+    room_add_cone(
+        &mut vertices,
+        &mut indices,
+        [0.0, -0.85, 6.46],
+        0.11,
+        0.04,
+        std::f32::consts::PI,
+        2.0,
+        4.0,
+    );
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, -1.16, 6.8],
+        [1.86, 0.04, 0.70],
+        0.0,
+        2.0,
+        5.2,
+    );
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, -0.54, 6.8],
+        [1.86, 0.04, 0.70],
+        0.0,
+        2.0,
+        5.2,
+    );
+
+    // Channel 3: Massive LFE Dual Subwoofer (front baffle at Z = 4.64 facing -Z toward camera)
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, -1.05, 5.2],
+        [2.5, 0.92, 1.1],
+        0.0,
+        3.0,
+        1.2,
+    );
+    room_add_cone(
+        &mut vertices,
+        &mut indices,
+        [-0.64, -1.05, 4.64],
+        0.38,
+        0.17,
+        std::f32::consts::PI,
+        3.0,
+        2.0,
+    );
+    room_add_cone(
+        &mut vertices,
+        &mut indices,
+        [0.64, -1.05, 4.64],
+        0.38,
+        0.17,
+        std::f32::consts::PI,
+        3.0,
+        2.0,
+    );
+    // Subwoofer bass reflex port & neon trim on front face (Z = 4.64)
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, -0.72, 4.64],
+        [0.42, 0.08, 0.05],
+        0.0,
+        3.0,
+        5.2,
+    );
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, -1.50, 5.2],
+        [2.56, 0.05, 1.16],
+        0.0,
+        3.0,
+        5.2,
+    );
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, -0.58, 5.2],
+        [2.56, 0.05, 1.16],
+        0.0,
+        3.0,
+        5.2,
+    );
+
+    // Channel 4: Surround Left (Stand Monitor) — angled inward (+X) and toward camera (-Z)
+    room_add_speaker_tower(
+        &mut vertices,
+        &mut indices,
+        [-6.2, 0.5, 0.5],
+        2.05,
+        4.0,
+        false,
+    );
+    // Channel 5: Surround Right (Stand Monitor) — angled inward (-X) and toward camera (-Z)
+    room_add_speaker_tower(
+        &mut vertices,
+        &mut indices,
+        [6.2, 0.5, 0.5],
+        -2.05,
+        5.0,
+        false,
+    );
+
+    // Channel 6: Rear Left (Rear Surround Bipolar Tower) — angled inward (+X, -Z / +Z)
+    room_add_speaker_tower(
+        &mut vertices,
+        &mut indices,
+        [-4.2, 0.1, -4.8],
+        2.25,
+        6.0,
+        true,
+    );
+    // Channel 7: Rear Right (Rear Surround Bipolar Tower) — angled inward (-X, -Z / +Z)
+    room_add_speaker_tower(
+        &mut vertices,
+        &mut indices,
+        [4.2, 0.1, -4.8],
+        -2.25,
+        7.0,
+        true,
+    );
+
+    // Channels 8..11: Overhead Ceiling Atmos Height Speakers (downward-firing cones + neon trim)
+    for &(ch_id, cx, cz) in &[
+        (8.0f32, -3.2f32, 3.5f32),
+        (9.0f32, 3.2f32, 3.5f32),
+        (10.0f32, -3.2f32, -2.5f32),
+        (11.0f32, 3.2f32, -2.5f32),
+    ] {
+        room_add_box(
+            &mut vertices,
+            &mut indices,
+            [cx, 4.32, cz],
+            [0.72, 0.46, 0.72],
+            0.0,
+            ch_id,
+            1.2,
+        );
+        room_add_box(
+            &mut vertices,
+            &mut indices,
+            [cx, 4.09, cz],
+            [0.76, 0.04, 0.76],
+            0.0,
+            ch_id,
+            5.2,
+        );
+        room_add_ceiling_cone(
+            &mut vertices,
+            &mut indices,
+            [cx, 4.07, cz],
+            0.25,
+            0.09,
+            ch_id,
+            2.0,
+        );
+    }
+
+    // 5. ENCLOSING ROOM SHELL (drawn last so foreground objects occlude via Early-Z,
+    // subdivided into 8x8 patches so per-vertex 12-speaker lighting captures smooth localized pools)
+    let mut room_add_subdivided_quad = |p0: [f32; 3],
+                                        p1: [f32; 3],
+                                        p2: [f32; 3],
+                                        p3: [f32; 3],
+                                        normal: [f32; 3],
+                                        ch: f32,
+                                        mat: f32| {
+        const SUB: usize = 8;
+        let lerp3 = |a: [f32; 3], b: [f32; 3], t: f32| -> [f32; 3] {
+            [
+                a[0] + (b[0] - a[0]) * t,
+                a[1] + (b[1] - a[1]) * t,
+                a[2] + (b[2] - a[2]) * t,
+            ]
+        };
+        let bilerp = |u: f32, v: f32| -> [f32; 3] {
+            let bot = lerp3(p0, p1, u);
+            let top = lerp3(p3, p2, u);
+            lerp3(bot, top, v)
+        };
+        for iv in 0..SUB {
+            let v0 = (iv as f32) / (SUB as f32);
+            let v1 = ((iv + 1) as f32) / (SUB as f32);
+            for iu in 0..SUB {
+                let u0 = (iu as f32) / (SUB as f32);
+                let u1 = ((iu + 1) as f32) / (SUB as f32);
+                room_add_quad(
+                    &mut vertices,
+                    &mut indices,
+                    bilerp(u0, v0),
+                    bilerp(u1, v0),
+                    bilerp(u1, v1),
+                    bilerp(u0, v1),
+                    normal,
+                    ch,
+                    mat,
+                );
+            }
+        }
+    };
+
+    // Floor (mat = 0.0)
+    room_add_subdivided_quad(
+        [-11.0, -1.6, 9.0],
+        [11.0, -1.6, 9.0],
+        [11.0, -1.6, -9.0],
+        [-11.0, -1.6, -9.0],
+        [0.0, 1.0, 0.0],
+        0.0,
+        0.0,
+    );
+    // Back acoustic wall (+Z, mat = 0.5)
+    room_add_subdivided_quad(
+        [-11.0, -1.6, 9.0],
+        [-11.0, 5.0, 9.0],
+        [11.0, 5.0, 9.0],
+        [11.0, -1.6, 9.0],
+        [0.0, 0.0, -1.0],
+        0.0,
+        0.5,
+    );
+    // Rear studio wall (-Z, mat = 0.5)
+    room_add_subdivided_quad(
+        [11.0, -1.6, -9.0],
+        [11.0, 5.0, -9.0],
+        [-11.0, 5.0, -9.0],
+        [-11.0, -1.6, -9.0],
+        [0.0, 0.0, 1.0],
+        0.0,
+        0.5,
+    );
+    // Left wall (-X, mat = 0.5)
+    room_add_subdivided_quad(
+        [-11.0, -1.6, -9.0],
+        [-11.0, 5.0, -9.0],
+        [-11.0, 5.0, 9.0],
+        [-11.0, -1.6, 9.0],
+        [1.0, 0.0, 0.0],
+        0.0,
+        0.5,
+    );
+    // Right wall (+X, mat = 0.5)
+    room_add_subdivided_quad(
+        [11.0, -1.6, 9.0],
+        [11.0, 5.0, 9.0],
+        [11.0, 5.0, -9.0],
+        [11.0, -1.6, -9.0],
+        [-1.0, 0.0, 0.0],
+        0.0,
+        0.5,
+    );
+    // Ceiling (+Y, mat = 0.5)
+    room_add_subdivided_quad(
+        [-11.0, 5.0, -9.0],
+        [11.0, 5.0, -9.0],
+        [11.0, 5.0, 9.0],
+        [-11.0, 5.0, 9.0],
+        [0.0, -1.0, 0.0],
+        0.0,
+        0.5,
+    );
+
+    (vertices, indices)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn glass_add_quad(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    p0: [f32; 3],
+    p1: [f32; 3],
+    p2: [f32; 3],
+    p3: [f32; 3],
+    normal: [f32; 3],
+    ch: f32,
+    mat: f32,
+) {
+    let start = vertices.len() as u32;
+    vertices.push(Vertex {
+        position: p0,
+        normal,
+        tex_coords: [ch, mat],
+    });
+    vertices.push(Vertex {
+        position: p1,
+        normal,
+        tex_coords: [ch, mat],
+    });
+    vertices.push(Vertex {
+        position: p2,
+        normal,
+        tex_coords: [ch, mat],
+    });
+    vertices.push(Vertex {
+        position: p3,
+        normal,
+        tex_coords: [ch, mat],
+    });
+    indices.extend_from_slice(&[start, start + 1, start + 2, start, start + 2, start + 3]);
+}
+
+static EMBEDDED_GLASS_FONT: &[u8] = include_bytes!("../../../assets/Orbitron-Black.ttf");
+
+struct GlassGlyphContour {
+    points: Vec<[f32; 2]>,
+}
+
+struct GlassContourBuilder {
+    contours: Vec<GlassGlyphContour>,
+    current_contour: Vec<[f32; 2]>,
+    start_point: [f32; 2],
+    last_point: [f32; 2],
+}
+
+impl GlassContourBuilder {
+    fn new() -> Self {
+        Self {
+            contours: Vec::new(),
+            current_contour: Vec::new(),
+            start_point: [0.0, 0.0],
+            last_point: [0.0, 0.0],
+        }
+    }
+
+    fn finish(mut self) -> Vec<GlassGlyphContour> {
+        if !self.current_contour.is_empty() {
+            self.contours.push(GlassGlyphContour {
+                points: self.current_contour,
+            });
+        }
+        self.contours
+    }
+}
+
+impl ttf_parser::OutlineBuilder for GlassContourBuilder {
+    fn move_to(&mut self, x: f32, y: f32) {
+        if !self.current_contour.is_empty() {
+            self.contours.push(GlassGlyphContour {
+                points: std::mem::take(&mut self.current_contour),
+            });
+        }
+        self.start_point = [x, y];
+        self.last_point = [x, y];
+        self.current_contour.push([x, y]);
+    }
+
+    fn line_to(&mut self, x: f32, y: f32) {
+        self.last_point = [x, y];
+        self.current_contour.push([x, y]);
+    }
+
+    fn quad_to(&mut self, x1: f32, y1: f32, x: f32, y: f32) {
+        let p0 = self.last_point;
+        let p1 = [x1, y1];
+        let p2 = [x, y];
+        let steps = 4;
+        for i in 1..=steps {
+            let t = i as f32 / steps as f32;
+            let it = 1.0 - t;
+            let qx = it * it * p0[0] + 2.0 * it * t * p1[0] + t * t * p2[0];
+            let qy = it * it * p0[1] + 2.0 * it * t * p1[1] + t * t * p2[1];
+            self.current_contour.push([qx, qy]);
+        }
+        self.last_point = [x, y];
+    }
+
+    fn curve_to(&mut self, x1: f32, y1: f32, x2: f32, y2: f32, x: f32, y: f32) {
+        let p0 = self.last_point;
+        let p1 = [x1, y1];
+        let p2 = [x2, y2];
+        let p3 = [x, y];
+        let steps = 6;
+        for i in 1..=steps {
+            let t = i as f32 / steps as f32;
+            let it = 1.0 - t;
+            let cx = it * it * it * p0[0]
+                + 3.0 * it * it * t * p1[0]
+                + 3.0 * it * t * t * p2[0]
+                + t * t * t * p3[0];
+            let cy = it * it * it * p0[1]
+                + 3.0 * it * it * t * p1[1]
+                + 3.0 * it * t * t * p2[1]
+                + t * t * t * p3[1];
+            self.current_contour.push([cx, cy]);
+        }
+        self.last_point = [x, y];
+    }
+
+    fn close(&mut self) {
+        if let Some(last) = self.current_contour.last() {
+            let dx = last[0] - self.start_point[0];
+            let dy = last[1] - self.start_point[1];
+            if (dx * dx + dy * dy).sqrt() < 0.001 && self.current_contour.len() > 1 {
+                self.current_contour.pop();
+            }
+        }
+        if !self.current_contour.is_empty() {
+            self.contours.push(GlassGlyphContour {
+                points: std::mem::take(&mut self.current_contour),
+            });
+        }
+    }
+}
+
+fn glass_contour_signed_area(pts: &[[f32; 2]]) -> f32 {
+    let n = pts.len();
+    if n < 3 {
+        return 0.0;
+    }
+    let mut area = 0.0;
+    for i in 0..n {
+        let j = (i + 1) % n;
+        area += pts[i][0] * pts[j][1] - pts[j][0] * pts[i][1];
+    }
+    area * 0.5
+}
+
+fn point_in_polygon(p: [f32; 2], poly: &[[f32; 2]]) -> bool {
+    let mut inside = false;
+    let n = poly.len();
+    for i in 0..n {
+        let j = (i + 1) % n;
+        let pi = poly[i];
+        let pj = poly[j];
+        if (pi[1] > p[1]) != (pj[1] > p[1]) {
+            let x_int = pi[0] + (p[1] - pi[1]) * (pj[0] - pi[0]) / (pj[1] - pi[1]);
+            if p[0] < x_int {
+                inside = !inside;
+            }
+        }
+    }
+    inside
+}
+
+fn point_strictly_in_triangle(p: [f32; 2], a: [f32; 2], b: [f32; 2], c: [f32; 2]) -> bool {
+    if (p[0] - a[0]).abs() < 1e-4 && (p[1] - a[1]).abs() < 1e-4 {
+        return false;
+    }
+    if (p[0] - b[0]).abs() < 1e-4 && (p[1] - b[1]).abs() < 1e-4 {
+        return false;
+    }
+    if (p[0] - c[0]).abs() < 1e-4 && (p[1] - c[1]).abs() < 1e-4 {
+        return false;
+    }
+
+    let cross1 = (b[0] - a[0]) * (p[1] - a[1]) - (b[1] - a[1]) * (p[0] - a[0]);
+    let cross2 = (c[0] - b[0]) * (p[1] - b[1]) - (c[1] - b[1]) * (p[0] - b[0]);
+    let cross3 = (a[0] - c[0]) * (p[1] - c[1]) - (a[1] - c[1]) * (p[0] - c[0]);
+
+    cross1 > 1e-6 && cross2 > 1e-6 && cross3 > 1e-6
+}
+
+fn earcut_triangulate_polygon(
+    outer: &[[f32; 2]],
+    holes: &[Vec<[f32; 2]>],
+) -> (Vec<[f32; 2]>, Vec<[usize; 3]>) {
+    let mut ring: Vec<[f32; 2]> = outer.to_vec();
+    if glass_contour_signed_area(&ring) < 0.0 {
+        ring.reverse(); // Ensure CCW
+    }
+
+    let mut sorted_holes: Vec<Vec<[f32; 2]>> = holes.to_vec();
+    for h in &mut sorted_holes {
+        if glass_contour_signed_area(h) > 0.0 {
+            h.reverse(); // Ensure CW for holes
+        }
+    }
+    sorted_holes.sort_by(|a, b| {
+        let max_a = a.iter().map(|p| p[0]).fold(f32::NEG_INFINITY, f32::max);
+        let max_b = b.iter().map(|p| p[0]).fold(f32::NEG_INFINITY, f32::max);
+        max_b
+            .partial_cmp(&max_a)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    for h in &sorted_holes {
+        if h.len() < 3 {
+            continue;
+        }
+        let mut best_h_idx = 0;
+        let mut max_hx = f32::NEG_INFINITY;
+        for (i, p) in h.iter().enumerate() {
+            if p[0] > max_hx {
+                max_hx = p[0];
+                best_h_idx = i;
+            }
+        }
+        let h_pt = h[best_h_idx];
+
+        let mut min_x_intersect = f32::INFINITY;
+        let mut best_m_idx = 0;
+        let n_ring = ring.len();
+
+        for i in 0..n_ring {
+            let p0 = ring[i];
+            let p1 = ring[(i + 1) % n_ring];
+
+            let (low, high) = if p0[1] < p1[1] { (p0, p1) } else { (p1, p0) };
+            if h_pt[1] >= low[1] && h_pt[1] <= high[1] && (high[1] - low[1]).abs() > 1e-6 {
+                let t = (h_pt[1] - low[1]) / (high[1] - low[1]);
+                let ix = low[0] + t * (high[0] - low[0]);
+                if ix >= h_pt[0] && ix < min_x_intersect {
+                    min_x_intersect = ix;
+                    best_m_idx = if p0[0] > p1[0] { i } else { (i + 1) % n_ring };
+                }
+            }
+        }
+
+        if min_x_intersect.is_infinite() {
+            let mut min_dist_sq = f32::INFINITY;
+            for (i, p) in ring.iter().enumerate() {
+                let dx = p[0] - h_pt[0];
+                let dy = p[1] - h_pt[1];
+                let d2 = dx * dx + dy * dy;
+                if d2 < min_dist_sq {
+                    min_dist_sq = d2;
+                    best_m_idx = i;
+                }
+            }
+        }
+
+        let mut new_ring = Vec::with_capacity(ring.len() + h.len() + 2);
+        new_ring.extend_from_slice(&ring[..=best_m_idx]);
+        for k in 0..h.len() {
+            new_ring.push(h[(best_h_idx + k) % h.len()]);
+        }
+        new_ring.push(h[best_h_idx]);
+        new_ring.extend_from_slice(&ring[best_m_idx..]);
+        ring = new_ring;
+    }
+
+    let verts = ring;
+    let mut indices_map: Vec<usize> = (0..verts.len()).collect();
+    let mut triangles = Vec::new();
+
+    let mut count = 0;
+    while indices_map.len() > 2 && count < 2000 {
+        count += 1;
+        let n = indices_map.len();
+        let mut ear_found = false;
+
+        for i in 0..n {
+            let prev_idx = indices_map[(i + n - 1) % n];
+            let curr_idx = indices_map[i];
+            let next_idx = indices_map[(i + 1) % n];
+
+            let a = verts[prev_idx];
+            let b = verts[curr_idx];
+            let c = verts[next_idx];
+
+            let cross = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+            if cross <= 1e-7 {
+                continue;
+            }
+
+            let mut inside = false;
+            for j in 0..n {
+                if j == (i + n - 1) % n || j == i || j == (i + 1) % n {
+                    continue;
+                }
+                let test_pt = verts[indices_map[j]];
+                if point_strictly_in_triangle(test_pt, a, b, c) {
+                    inside = true;
+                    break;
+                }
+            }
+
+            if !inside {
+                triangles.push([prev_idx, curr_idx, next_idx]);
+                indices_map.remove(i);
+                ear_found = true;
+                break;
+            }
+        }
+
+        if !ear_found {
+            let mut best_cut = 0;
+            let mut max_cross = f32::NEG_INFINITY;
+            for i in 0..n {
+                let prev_idx = indices_map[(i + n - 1) % n];
+                let curr_idx = indices_map[i];
+                let next_idx = indices_map[(i + 1) % n];
+                let a = verts[prev_idx];
+                let b = verts[curr_idx];
+                let c = verts[next_idx];
+                let cross = (b[0] - a[0]) * (c[1] - a[1]) - (b[1] - a[1]) * (c[0] - a[0]);
+                if cross > max_cross {
+                    max_cross = cross;
+                    best_cut = i;
+                }
+            }
+            if n > 2 && max_cross > -1.0 {
+                let prev_idx = indices_map[(best_cut + n - 1) % n];
+                let curr_idx = indices_map[best_cut];
+                let next_idx = indices_map[(best_cut + 1) % n];
+                triangles.push([prev_idx, curr_idx, next_idx]);
+                indices_map.remove(best_cut);
+            } else {
+                break;
+            }
+        }
+    }
+
+    (verts, triangles)
+}
+
+fn glass_triangulate_contours(contours: &[Vec<[f32; 2]>]) -> (Vec<[f32; 2]>, Vec<[usize; 3]>) {
+    let mut outers = Vec::new();
+    let mut holes = Vec::new();
+
+    for c in contours {
+        if c.len() < 3 {
+            continue;
+        }
+        let area = glass_contour_signed_area(c);
+        if area < 0.0 {
+            outers.push(c.clone());
+        } else {
+            holes.push(c.clone());
+        }
+    }
+
+    if outers.is_empty() && !holes.is_empty() {
+        outers = holes;
+        holes = Vec::new();
+    }
+
+    let mut all_verts = Vec::new();
+    let mut all_tris = Vec::new();
+
+    for outer in &outers {
+        let matching_holes: Vec<Vec<[f32; 2]>> = holes
+            .iter()
+            .filter(|h| h.first().is_some_and(|p| point_in_polygon(*p, outer)))
+            .cloned()
+            .collect();
+
+        let (verts, tris) = earcut_triangulate_polygon(outer, &matching_holes);
+        let base_idx = all_verts.len();
+        all_verts.extend(verts);
+        for t in tris {
+            all_tris.push([base_idx + t[0], base_idx + t[1], base_idx + t[2]]);
+        }
+    }
+
+    (all_verts, all_tris)
+}
+
+pub fn generate_glass_lyrics_mesh(text: &str) -> (Vec<Vertex>, Vec<u32>) {
+    let mut vertices = Vec::with_capacity(16384);
+    let mut indices = Vec::with_capacity(65536);
+
+    let trimmed = text.trim();
+    let display_str = if trimmed.is_empty() {
+        "RUSTTRACKER"
+    } else {
+        trimmed
+    };
+
+    // Cache system DejaVu Sans Bold once across process lifetime, fallback to embedded Orbitron Black
+    static CACHED_SYS_FONT: std::sync::OnceLock<Option<Vec<u8>>> = std::sync::OnceLock::new();
+    let sys_font = CACHED_SYS_FONT.get_or_init(|| {
+        std::fs::read("/usr/share/fonts/dejavu-sans-fonts/DejaVuSans-Bold.ttf").ok()
+    });
+    let font_slice: &[u8] = sys_font.as_deref().unwrap_or(EMBEDDED_GLASS_FONT);
+    let face = ttf_parser::Face::parse(font_slice, 0).ok();
+
+    if let Some(face) = face {
+        let em = face.units_per_em() as f32;
+        let base_scale = 1.0 / em;
+
+        // First pass: compute total text width with typographic advances
+        let mut total_advance = 0.0f32;
+        for ch in display_str.chars() {
+            if let Some(glyph_id) = face.glyph_index(ch) {
+                let adv = face
+                    .glyph_hor_advance(glyph_id)
+                    .unwrap_or(face.units_per_em()) as f32
+                    * base_scale;
+                total_advance += adv;
+            } else {
+                total_advance += 0.5;
+            }
+        }
+
+        let target_width = 7.5f32;
+        let text_scale = (target_width / total_advance.max(1.0)).clamp(0.15, 1.25);
+        let start_x = -total_advance * text_scale * 0.5;
+        let baseline_y = 0.16; // Sits just above water level y = 0.0
+        let depth = 0.22 * text_scale;
+        let bevel = 0.024 * text_scale;
+        let hz = depth * 0.5;
+
+        let mut curr_x = start_x;
+
+        for (ch_idx, ch) in display_str.chars().enumerate() {
+            if let Some(glyph_id) = face.glyph_index(ch) {
+                let adv = face
+                    .glyph_hor_advance(glyph_id)
+                    .unwrap_or(face.units_per_em()) as f32
+                    * base_scale
+                    * text_scale;
+
+                let mut builder = GlassContourBuilder::new();
+                if let Some(_bbox) = face.outline_glyph(glyph_id, &mut builder) {
+                    let contours = builder.finish();
+
+                    let scaled_contours: Vec<Vec<[f32; 2]>> = contours
+                        .iter()
+                        .filter(|c| c.points.len() >= 3)
+                        .map(|c| {
+                            c.points
+                                .iter()
+                                .map(|p| {
+                                    [
+                                        curr_x + p[0] * base_scale * text_scale,
+                                        baseline_y + p[1] * base_scale * text_scale,
+                                    ]
+                                })
+                                .collect()
+                        })
+                        .collect();
+
+                    if !scaled_contours.is_empty() {
+                        let (face_verts_2d, face_tris) =
+                            glass_triangulate_contours(&scaled_contours);
+
+                        // 1. Front and Back Faces
+                        let start_front = vertices.len() as u32;
+                        for p in &face_verts_2d {
+                            vertices.push(Vertex {
+                                position: [p[0], p[1], hz],
+                                normal: [0.0, 0.0, 1.0],
+                                tex_coords: [ch_idx as f32, 1.0], // Mat 1.0 = Glass
+                            });
+                        }
+                        for tri in &face_tris {
+                            indices.push(start_front + tri[0] as u32);
+                            indices.push(start_front + tri[1] as u32);
+                            indices.push(start_front + tri[2] as u32);
+                        }
+
+                        let start_back = vertices.len() as u32;
+                        for p in &face_verts_2d {
+                            vertices.push(Vertex {
+                                position: [p[0], p[1], -hz],
+                                normal: [0.0, 0.0, -1.0],
+                                tex_coords: [ch_idx as f32, 1.0],
+                            });
+                        }
+                        for tri in &face_tris {
+                            indices.push(start_back + tri[0] as u32);
+                            indices.push(start_back + tri[2] as u32);
+                            indices.push(start_back + tri[1] as u32);
+                        }
+
+                        // 2. Extruded Sidewalls & 45 deg Bevel Chamfers
+                        for pts in &scaled_contours {
+                            let n_pts = pts.len();
+                            let area = glass_contour_signed_area(pts);
+                            let is_outer = area < 0.0;
+
+                            for i in 0..n_pts {
+                                let p0 = pts[i];
+                                let p1 = pts[(i + 1) % n_pts];
+
+                                let dx = p1[0] - p0[0];
+                                let dy = p1[1] - p0[1];
+                                let len = (dx * dx + dy * dy).sqrt();
+                                if len < 1e-6 {
+                                    continue;
+                                }
+
+                                let mut nx = dy / len;
+                                let mut ny = -dx / len;
+                                if !is_outer {
+                                    nx = -nx;
+                                    ny = -ny;
+                                }
+
+                                let start_v = vertices.len() as u32;
+
+                                // Side quad
+                                let norm_side = [nx, ny, 0.0];
+                                vertices.push(Vertex {
+                                    position: [p0[0], p0[1], -hz + bevel],
+                                    normal: norm_side,
+                                    tex_coords: [ch_idx as f32, 1.0],
+                                });
+                                vertices.push(Vertex {
+                                    position: [p1[0], p1[1], -hz + bevel],
+                                    normal: norm_side,
+                                    tex_coords: [ch_idx as f32, 1.0],
+                                });
+                                vertices.push(Vertex {
+                                    position: [p1[0], p1[1], hz - bevel],
+                                    normal: norm_side,
+                                    tex_coords: [ch_idx as f32, 1.0],
+                                });
+                                vertices.push(Vertex {
+                                    position: [p0[0], p0[1], hz - bevel],
+                                    normal: norm_side,
+                                    tex_coords: [ch_idx as f32, 1.0],
+                                });
+                                indices.extend_from_slice(&[
+                                    start_v,
+                                    start_v + 1,
+                                    start_v + 2,
+                                    start_v,
+                                    start_v + 2,
+                                    start_v + 3,
+                                ]);
+
+                                // Top Chamfer quad (+Z)
+                                let start_c1 = vertices.len() as u32;
+                                let norm_c1 = [
+                                    nx * std::f32::consts::FRAC_1_SQRT_2,
+                                    ny * std::f32::consts::FRAC_1_SQRT_2,
+                                    std::f32::consts::FRAC_1_SQRT_2,
+                                ];
+                                vertices.push(Vertex {
+                                    position: [p0[0], p0[1], hz - bevel],
+                                    normal: norm_c1,
+                                    tex_coords: [ch_idx as f32, 1.0],
+                                });
+                                vertices.push(Vertex {
+                                    position: [p1[0], p1[1], hz - bevel],
+                                    normal: norm_c1,
+                                    tex_coords: [ch_idx as f32, 1.0],
+                                });
+                                vertices.push(Vertex {
+                                    position: [p1[0] - nx * bevel, p1[1] - ny * bevel, hz],
+                                    normal: norm_c1,
+                                    tex_coords: [ch_idx as f32, 1.0],
+                                });
+                                vertices.push(Vertex {
+                                    position: [p0[0] - nx * bevel, p0[1] - ny * bevel, hz],
+                                    normal: norm_c1,
+                                    tex_coords: [ch_idx as f32, 1.0],
+                                });
+                                indices.extend_from_slice(&[
+                                    start_c1,
+                                    start_c1 + 1,
+                                    start_c1 + 2,
+                                    start_c1,
+                                    start_c1 + 2,
+                                    start_c1 + 3,
+                                ]);
+
+                                // Bot Chamfer quad (-Z)
+                                let start_c2 = vertices.len() as u32;
+                                let norm_c2 = [
+                                    nx * std::f32::consts::FRAC_1_SQRT_2,
+                                    ny * std::f32::consts::FRAC_1_SQRT_2,
+                                    -std::f32::consts::FRAC_1_SQRT_2,
+                                ];
+                                vertices.push(Vertex {
+                                    position: [p0[0] - nx * bevel, p0[1] - ny * bevel, -hz],
+                                    normal: norm_c2,
+                                    tex_coords: [ch_idx as f32, 1.0],
+                                });
+                                vertices.push(Vertex {
+                                    position: [p1[0] - nx * bevel, p1[1] - ny * bevel, -hz],
+                                    normal: norm_c2,
+                                    tex_coords: [ch_idx as f32, 1.0],
+                                });
+                                vertices.push(Vertex {
+                                    position: [p1[0], p1[1], -hz + bevel],
+                                    normal: norm_c2,
+                                    tex_coords: [ch_idx as f32, 1.0],
+                                });
+                                vertices.push(Vertex {
+                                    position: [p0[0], p0[1], -hz + bevel],
+                                    normal: norm_c2,
+                                    tex_coords: [ch_idx as f32, 1.0],
+                                });
+                                indices.extend_from_slice(&[
+                                    start_c2,
+                                    start_c2 + 1,
+                                    start_c2 + 2,
+                                    start_c2,
+                                    start_c2 + 2,
+                                    start_c2 + 3,
+                                ]);
+                            }
+                        }
+                    }
+                }
+                curr_x += adv;
+            } else {
+                curr_x += 0.4 * text_scale;
+            }
+        }
+    }
+
+    // 2. Tessellated 3D Water Grid Plane: 128 x 128 vertices spanning [-16.0, 16.0] x [-10.0, 4.5]
+    let grid_res_x = 128;
+    let grid_res_z = 128;
+    let start_water_vert = vertices.len() as u32;
+
+    for iz in 0..grid_res_z {
+        let fz = iz as f32 / (grid_res_z - 1) as f32;
+        let z = -10.0 + fz * 14.5;
+        for ix in 0..grid_res_x {
+            let fx = ix as f32 / (grid_res_x - 1) as f32;
+            let x = -16.0 + fx * 32.0;
+            vertices.push(Vertex {
+                position: [x, 0.0, z],
+                normal: [0.0, 1.0, 0.0],
+                tex_coords: [0.0, 2.0], // Mat 2.0 = Water
+            });
+        }
+    }
+
+    for iz in 0..(grid_res_z - 1) {
+        for ix in 0..(grid_res_x - 1) {
+            let v0 = start_water_vert + iz * grid_res_x + ix;
+            let v1 = v0 + 1;
+            let v2 = v0 + grid_res_x;
+            let v3 = v2 + 1;
+            indices.extend_from_slice(&[v0, v2, v1, v1, v2, v3]);
+        }
+    }
+
+    // 3. Overhead Softbox Area Light Emitter Quad: at y = 5.2, z = -1.5, tilted downward 35 deg
+    let sb_center = [0.0f32, 5.2, -1.5];
+    let sb_w = 16.0f32;
+    let sb_h = 3.6f32;
+    let tilt: f32 = 35.0f32.to_radians();
+    let cos_t = tilt.cos();
+    let sin_t = tilt.sin();
+
+    let p0 = [
+        sb_center[0] - sb_w * 0.5,
+        sb_center[1] + sb_h * 0.5 * cos_t,
+        sb_center[2] + sb_h * 0.5 * sin_t,
+    ];
+    let p1 = [
+        sb_center[0] + sb_w * 0.5,
+        sb_center[1] + sb_h * 0.5 * cos_t,
+        sb_center[2] + sb_h * 0.5 * sin_t,
+    ];
+    let p2 = [
+        sb_center[0] + sb_w * 0.5,
+        sb_center[1] - sb_h * 0.5 * cos_t,
+        sb_center[2] - sb_h * 0.5 * sin_t,
+    ];
+    let p3 = [
+        sb_center[0] - sb_w * 0.5,
+        sb_center[1] - sb_h * 0.5 * cos_t,
+        sb_center[2] - sb_h * 0.5 * sin_t,
+    ];
+    let sb_norm = [0.0, -sin_t, cos_t];
+
+    glass_add_quad(
+        &mut vertices,
+        &mut indices,
+        p0,
+        p1,
+        p2,
+        p3,
+        sb_norm,
+        0.0,
+        3.0, // Mat 3.0 = Emissive Softbox
+    );
+
+    (vertices, indices)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cyber_add_quad(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    p0: [f32; 3],
+    p1: [f32; 3],
+    p2: [f32; 3],
+    p3: [f32; 3],
+    normal: [f32; 3],
+    mat: f32,
+    uv_y: f32,
+) {
+    let start = vertices.len() as u32;
+    vertices.push(Vertex {
+        position: p0,
+        normal,
+        tex_coords: [mat, uv_y],
+    });
+    vertices.push(Vertex {
+        position: p1,
+        normal,
+        tex_coords: [mat, uv_y],
+    });
+    vertices.push(Vertex {
+        position: p2,
+        normal,
+        tex_coords: [mat, uv_y],
+    });
+    vertices.push(Vertex {
+        position: p3,
+        normal,
+        tex_coords: [mat, uv_y],
+    });
+    indices.extend_from_slice(&[start, start + 1, start + 2, start, start + 2, start + 3]);
+}
+
+fn cyber_add_box(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    center: [f32; 3],
+    size: [f32; 3],
+    rot_y: f32,
+    mat: f32,
+) {
+    let hx = size[0] / 2.0;
+    let hy = size[1] / 2.0;
+    let hz = size[2] / 2.0;
+    let cos_r = rot_y.cos();
+    let sin_r = rot_y.sin();
+
+    let rotate_pt = |p: [f32; 3]| -> [f32; 3] {
+        let rx = p[0] * cos_r + p[2] * sin_r;
+        let rz = -p[0] * sin_r + p[2] * cos_r;
+        [rx + center[0], p[1] + center[1], rz + center[2]]
+    };
+    let rotate_norm = |n: [f32; 3]| -> [f32; 3] {
+        let rx = n[0] * cos_r + n[2] * sin_r;
+        let rz = -n[0] * sin_r + n[2] * cos_r;
+        [rx, n[1], rz]
+    };
+
+    cyber_add_quad(
+        vertices,
+        indices,
+        rotate_pt([-hx, -hy, hz]),
+        rotate_pt([hx, -hy, hz]),
+        rotate_pt([hx, hy, hz]),
+        rotate_pt([-hx, hy, hz]),
+        rotate_norm([0.0, 0.0, 1.0]),
+        mat,
+        center[1] + hy,
+    );
+    cyber_add_quad(
+        vertices,
+        indices,
+        rotate_pt([hx, -hy, -hz]),
+        rotate_pt([-hx, -hy, -hz]),
+        rotate_pt([-hx, hy, -hz]),
+        rotate_pt([hx, hy, -hz]),
+        rotate_norm([0.0, 0.0, -1.0]),
+        mat,
+        center[1] + hy,
+    );
+    cyber_add_quad(
+        vertices,
+        indices,
+        rotate_pt([-hx, -hy, -hz]),
+        rotate_pt([-hx, -hy, hz]),
+        rotate_pt([-hx, hy, hz]),
+        rotate_pt([-hx, hy, -hz]),
+        rotate_norm([-1.0, 0.0, 0.0]),
+        mat,
+        center[1] + hy,
+    );
+    cyber_add_quad(
+        vertices,
+        indices,
+        rotate_pt([hx, -hy, hz]),
+        rotate_pt([hx, -hy, -hz]),
+        rotate_pt([hx, hy, -hz]),
+        rotate_pt([hx, hy, hz]),
+        rotate_norm([1.0, 0.0, 0.0]),
+        mat,
+        center[1] + hy,
+    );
+    cyber_add_quad(
+        vertices,
+        indices,
+        rotate_pt([-hx, hy, hz]),
+        rotate_pt([hx, hy, hz]),
+        rotate_pt([hx, hy, -hz]),
+        rotate_pt([-hx, hy, -hz]),
+        rotate_norm([0.0, 1.0, 0.0]),
+        mat,
+        center[1] + hy,
+    );
+    cyber_add_quad(
+        vertices,
+        indices,
+        rotate_pt([-hx, -hy, -hz]),
+        rotate_pt([hx, -hy, -hz]),
+        rotate_pt([hx, -hy, hz]),
+        rotate_pt([-hx, -hy, hz]),
+        rotate_norm([0.0, -1.0, 0.0]),
+        mat,
+        center[1] - hy,
+    );
+}
+
+struct ObjFaceTri {
+    verts: [(usize, usize); 3],
+    mat: f32,
+}
+
+struct ParsedObjTemplate {
+    positions: Vec<[f32; 3]>,
+    normals: Vec<[f32; 3]>,
+    tris: Vec<ObjFaceTri>,
+}
+
+fn parse_obj_template(obj_src: &str, default_mat: f32) -> ParsedObjTemplate {
+    let mut raw_positions: Vec<[f32; 3]> = Vec::new();
+    let mut raw_normals: Vec<[f32; 3]> = Vec::new();
+    let mut tris = Vec::new();
+    let mut current_mat = default_mat;
+
+    for line in obj_src.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with('#') || trimmed.is_empty() {
+            continue;
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("v ") {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if parts.len() >= 3
+                && let (Ok(x), Ok(y), Ok(z)) = (
+                    parts[0].parse::<f32>(),
+                    parts[1].parse::<f32>(),
+                    parts[2].parse::<f32>(),
+                )
+            {
+                raw_positions.push([x, y, z]);
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("vn ") {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if parts.len() >= 3
+                && let (Ok(x), Ok(y), Ok(z)) = (
+                    parts[0].parse::<f32>(),
+                    parts[1].parse::<f32>(),
+                    parts[2].parse::<f32>(),
+                )
+            {
+                raw_normals.push([x, y, z]);
+            }
+        } else if let Some(rest) = trimmed.strip_prefix("g ") {
+            let group_name = rest.trim();
+            current_mat = match group_name {
+                "floor" => 0.0,
+                "neon_frame_0" => 1.0,
+                "neon_frame_1" => 2.0,
+                "neon_frame_2" => 3.0,
+                "neon_frame_3" => 4.0,
+                "neon_frame_4" => 5.0,
+                "neon_frame_5" => 6.0,
+                "neon_frame_6" => 7.0,
+                "neon_frame_7" => 8.0,
+                "faceplate" => 1.0,
+                "meter_frame" => 2.0,
+                "dial_scale" => 3.0,
+                "needle_left" => 4.0,
+                "needle_right" => 5.0,
+                "knob" => 6.0,
+                "meter_glass" => 7.0,
+                "leds" => 8.0,
+                "screws" => 9.0,
+                "hull" => 1.0,
+                "arch_rib" => 2.0,
+                "floor_grating" => 3.0,
+                "neon_strip" => 4.0,
+                "conduit" => 5.0,
+                "hazard_trim" => 6.0,
+                "paint" => 3.0,
+                "glass" => 4.0,
+                "taillight" => 6.0,
+                "tire" => 7.0,
+                "rim" => 7.5,
+                "carbon" => 8.0,
+                "exhaust" => 9.0,
+                "trunk" => 10.0,
+                "frond" => 10.5,
+                "mast" => 11.0,
+                "lamp" => 11.5,
+                "tower" => 12.0,
+                "spire" => 12.5,
+                _ => default_mat,
+            };
+        } else if let Some(rest) = trimmed.strip_prefix("f ") {
+            let parts: Vec<&str> = rest.split_whitespace().collect();
+            if parts.len() >= 3 {
+                let parse_vert = |tok: &str| -> Option<(usize, usize)> {
+                    let segs: Vec<&str> = tok.split('/').collect();
+                    let v_idx = segs[0].parse::<usize>().ok()?.checked_sub(1)?;
+                    let vn_idx = if segs.len() >= 3 && !segs[2].is_empty() {
+                        segs[2].parse::<usize>().ok()?.checked_sub(1)?
+                    } else {
+                        v_idx
+                    };
+                    Some((v_idx, vn_idx))
+                };
+
+                let face_verts: Vec<(usize, usize)> =
+                    parts.iter().filter_map(|p| parse_vert(p)).collect();
+                if face_verts.len() >= 3 {
+                    for i in 1..face_verts.len() - 1 {
+                        tris.push(ObjFaceTri {
+                            verts: [face_verts[0], face_verts[i], face_verts[i + 1]],
+                            mat: current_mat,
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    ParsedObjTemplate {
+        positions: raw_positions,
+        normals: raw_normals,
+        tris,
+    }
+}
+
+fn instantiate_obj_template(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    template: &ParsedObjTemplate,
+    translation: [f32; 3],
+    scale: [f32; 3],
+    rot_y: f32,
+) {
+    let cos_r = rot_y.cos();
+    let sin_r = rot_y.sin();
+    let transform_pos = |p: [f32; 3]| -> [f32; 3] {
+        let sx = p[0] * scale[0];
+        let sy = p[1] * scale[1];
+        let sz = p[2] * scale[2];
+        let rx = sx * cos_r + sz * sin_r;
+        let rz = -sx * sin_r + sz * cos_r;
+        [
+            rx + translation[0],
+            sy + translation[1],
+            rz + translation[2],
+        ]
+    };
+    let transform_norm = |n: [f32; 3]| -> [f32; 3] {
+        let rx = n[0] * cos_r + n[2] * sin_r;
+        let rz = -n[0] * sin_r + n[2] * cos_r;
+        [rx, n[1], rz]
+    };
+
+    for tri in &template.tris {
+        let start_idx = vertices.len() as u32;
+        for &(v_i, vn_i) in &tri.verts {
+            let pos = if v_i < template.positions.len() {
+                template.positions[v_i]
+            } else {
+                [0.0, 0.0, 0.0]
+            };
+            let norm = if vn_i < template.normals.len() {
+                template.normals[vn_i]
+            } else {
+                [0.0, 1.0, 0.0]
+            };
+            let world_p = transform_pos(pos);
+            let world_n = transform_norm(norm);
+            vertices.push(Vertex {
+                position: world_p,
+                normal: world_n,
+                tex_coords: [tri.mat, translation[2]],
+            });
+        }
+        indices.extend_from_slice(&[start_idx, start_idx + 1, start_idx + 2]);
+    }
+}
+
+fn load_obj_mesh(
+    vertices: &mut Vec<Vertex>,
+    indices: &mut Vec<u32>,
+    obj_src: &str,
+    translation: [f32; 3],
+    scale: [f32; 3],
+    rot_y: f32,
+    default_mat: f32,
+) {
+    let template = parse_obj_template(obj_src, default_mat);
+    instantiate_obj_template(vertices, indices, &template, translation, scale, rot_y);
+}
+
+pub(crate) fn generate_synthwave_racer_mesh() -> (Vec<Vertex>, Vec<u32>) {
+    let mut vertices = Vec::with_capacity(32768);
+    let mut indices = Vec::with_capacity(49152);
+
+    // 1. Continuous Desert / Terrain Ground Planes (mat = 0.5)
+    let ground_w = 200.0;
+    cyber_add_quad(
+        &mut vertices,
+        &mut indices,
+        [-ground_w, -0.05, -10.0],
+        [-9.0, -0.05, -10.0],
+        [-9.0, -0.05, 360.0],
+        [-ground_w, -0.05, 360.0],
+        [0.0, 1.0, 0.0],
+        0.5,
+        0.0,
+    );
+    cyber_add_quad(
+        &mut vertices,
+        &mut indices,
+        [9.0, -0.05, -10.0],
+        [ground_w, -0.05, -10.0],
+        [ground_w, -0.05, 360.0],
+        [9.0, -0.05, 360.0],
+        [0.0, 1.0, 0.0],
+        0.5,
+        0.0,
+    );
+
+    // 2. 3D Highway Roadbed, Curbs & Concrete K-Rails
+    let road_half_w = 9.0;
+    let seg_len = 3.5;
+    let num_segs = 100;
+    for i in 0..num_segs {
+        let z0 = -8.0 + (i as f32) * seg_len;
+        let z1 = z0 + seg_len;
+
+        // Asphalt (mat = 0.0)
+        cyber_add_quad(
+            &mut vertices,
+            &mut indices,
+            [-road_half_w, 0.0, z0],
+            [road_half_w, 0.0, z0],
+            [road_half_w, 0.0, z1],
+            [-road_half_w, 0.0, z1],
+            [0.0, 1.0, 0.0],
+            0.0,
+            z0,
+        );
+
+        // Curbs (mat = 1.0)
+        cyber_add_quad(
+            &mut vertices,
+            &mut indices,
+            [-road_half_w - 0.8, 0.15, z0],
+            [-road_half_w, 0.0, z0],
+            [-road_half_w, 0.0, z1],
+            [-road_half_w - 0.8, 0.15, z1],
+            [0.2, 0.98, 0.0],
+            1.0,
+            z0,
+        );
+        cyber_add_quad(
+            &mut vertices,
+            &mut indices,
+            [road_half_w, 0.0, z0],
+            [road_half_w + 0.8, 0.15, z0],
+            [road_half_w + 0.8, 0.15, z1],
+            [road_half_w, 0.0, z1],
+            [-0.2, 0.98, 0.0],
+            1.0,
+            z0,
+        );
+
+        // Concrete K-Rail Barriers (mat = 2.0)
+        cyber_add_box(
+            &mut vertices,
+            &mut indices,
+            [-road_half_w - 1.2, 0.45, (z0 + z1) / 2.0],
+            [0.35, 0.75, seg_len],
+            0.0,
+            2.0,
+        );
+        cyber_add_box(
+            &mut vertices,
+            &mut indices,
+            [road_half_w + 1.2, 0.45, (z0 + z1) / 2.0],
+            [0.35, 0.75, seg_len],
+            0.0,
+            2.0,
+        );
+    }
+
+    // 3. Embedded 3D Low-Poly Supercar Model (.OBJ)
+    load_obj_mesh(
+        &mut vertices,
+        &mut indices,
+        include_str!("../../../src/assets/models/supercar_f40.obj"),
+        [0.0, 0.40, 5.2],
+        [1.0, 1.0, 1.0],
+        0.0,
+        3.0,
+    );
+
+    // 3b. Solid Supercar Underbody Floor Pan & Interior Cabin Firewall (mat = 8.0 carbon)
+    cyber_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, 0.35, 5.2],
+        [1.70, 0.04, 3.8],
+        0.0,
+        8.0,
+    );
+    cyber_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, 0.44, 4.8],
+        [1.30, 0.16, 1.8],
+        0.0,
+        8.0,
+    );
+
+    // 4. Roadside Streetlamps & Palm Trees (.OBJ Meshes)
+    let palm_template = parse_obj_template(
+        include_str!("../../../src/assets/models/palm_tree.obj"),
+        10.0,
+    );
+    let streetlamp_template = parse_obj_template(
+        include_str!("../../../src/assets/models/streetlamp.obj"),
+        11.0,
+    );
+    for i in 0..12 {
+        let pz = 18.0 + (i as f32) * 26.0;
+        // Left Palm Tree
+        instantiate_obj_template(
+            &mut vertices,
+            &mut indices,
+            &palm_template,
+            [-road_half_w - 3.8, 0.0, pz],
+            [1.0, 1.0, 1.0],
+            (i as f32) * 0.8,
+        );
+        // Right Cobra-Head Streetlamp
+        instantiate_obj_template(
+            &mut vertices,
+            &mut indices,
+            &streetlamp_template,
+            [road_half_w + 2.4, 0.0, pz + 13.0],
+            [1.0, 1.0, 1.0],
+            std::f32::consts::PI,
+        );
+    }
+
+    // 5. Distant Horizon Skyscrapers (.OBJ Meshes)
+    let skyscraper_template = parse_obj_template(
+        include_str!("../../../src/assets/models/skyscraper.obj"),
+        12.0,
+    );
+    for i in 0..16 {
+        let ang = (i as f32) * 0.38 - 3.0;
+        let tx = ang * 46.0;
+        let tz = 260.0 + ((i * 7) % 5) as f32 * 14.0;
+        let s = 0.75 + ((i * 3) % 4) as f32 * 0.15;
+        instantiate_obj_template(
+            &mut vertices,
+            &mut indices,
+            &skyscraper_template,
+            [tx, -2.0, tz],
+            [s, s, s],
+            (i as f32) * 0.5,
+        );
+    }
+
+    (vertices, indices)
+}
+
+pub(crate) fn generate_vumeter_rack_mesh() -> (Vec<Vertex>, Vec<u32>) {
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    load_obj_mesh(
+        &mut vertices,
+        &mut indices,
+        include_str!("../../../src/assets/models/vumeter_rack.obj"),
+        [0.0, 0.0, 0.0],
+        [1.0, 1.0, 1.0],
+        0.0,
+        1.0,
+    );
+    (vertices, indices)
+}
+
+impl VulkanEngine {
+    pub async fn new(window: Arc<Window>) -> Self {
+        let size = window.inner_size();
+
+        // On Windows 11, default to the native DX12 backend (DXGI_SWAP_EFFECT_FLIP_DISCARD +
+        // DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT + SetMaximumFrameLatency(2)) over
+        // Vulkan's VK_KHR_win32_surface unless WGPU_BACKEND is explicitly overridden.
+        // AMDVLK's windowed Vulkan surface does not pace to DWM's waitable VBlank/VRR flip clock
+        // when a background game is driving VRR, causing unpaced >144 FPS presentation and flicker.
+        let explicit_backend = wgpu::Backends::from_env();
+        let preferred_backends = explicit_backend.unwrap_or(if cfg!(target_os = "windows") {
+            wgpu::Backends::DX12
+        } else {
+            wgpu::Backends::PRIMARY
+        });
+
+        let mut instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+            backends: preferred_backends,
+            flags: wgpu::InstanceFlags::default(),
+            backend_options: wgpu::BackendOptions::from_env_or_default(),
+            display: None,
+            memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+        });
+
+        let mut surface = instance.create_surface(window.clone()).unwrap();
+
+        let adapter = match instance
+            .request_adapter(&wgpu::RequestAdapterOptions {
+                power_preference: wgpu::PowerPreference::HighPerformance,
+                compatible_surface: Some(&surface),
+                force_fallback_adapter: false,
+            })
+            .await
+        {
+            Ok(a) => a,
+            Err(_) if explicit_backend.is_none() && cfg!(target_os = "windows") => {
+                instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                    backends: wgpu::Backends::PRIMARY,
+                    flags: wgpu::InstanceFlags::default(),
+                    backend_options: wgpu::BackendOptions::from_env_or_default(),
+                    display: None,
+                    memory_budget_thresholds: wgpu::MemoryBudgetThresholds::default(),
+                });
+                surface = instance.create_surface(window.clone()).unwrap();
+                instance
+                    .request_adapter(&wgpu::RequestAdapterOptions {
+                        power_preference: wgpu::PowerPreference::HighPerformance,
+                        compatible_surface: Some(&surface),
+                        force_fallback_adapter: false,
+                    })
+                    .await
+                    .unwrap()
+            }
+            Err(e) => panic!("Failed to request GPU adapter: {:?}", e),
+        };
+        let adapter_info = adapter.get_info();
+
+        let is_bench =
+            crate::state::BENCH_FRAMES_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) > 0;
+        let want_timestamps = if cfg!(target_os = "android") {
+            false
+        } else {
+            is_bench
+                || std::env::var("RUSTTRACKER_PROFILE")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false)
+        };
+        let pipeline_cache_enabled = std::env::var("RUSTTRACKER_PIPELINE_CACHE")
+            .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
+            .unwrap_or(true);
+        let negotiated_features = negotiate_optional_gpu_features(
+            adapter.features(),
+            want_timestamps,
+            pipeline_cache_enabled,
+        );
+        let supports_timestamps = negotiated_features.timestamp_query;
+        let required_features = negotiated_features.required_features;
+
+        let (device, queue) = adapter
+            .request_device(&wgpu::DeviceDescriptor {
+                label: None,
+                required_features,
+                required_limits: wgpu::Limits::default(),
+                memory_hints: wgpu::MemoryHints::default(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        device.on_uncaptured_error(std::sync::Arc::new(|e: wgpu::Error| {
+            eprintln!("WGPU VALIDATION ERROR: {:?}", e);
+        }));
+
+        // --- Pipeline Cache (persist compiled GPU pipelines across launches) ---
+        // Keyed by the adapter so caches from different devices don't collide.
+        let pipeline_cache_path: Option<std::path::PathBuf> = (|| {
+            let key = wgpu::util::pipeline_cache_key(&adapter.get_info())?;
+            let dir = crate::state::CACHE_DIR_OVERRIDE
+                .get()
+                .cloned()
+                .or_else(|| {
+                    std::env::var("RUSTTRACKER_CACHE_DIR")
+                        .ok()
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .map(std::path::PathBuf::from)
+                })
+                .or_else(|| {
+                    directories::ProjectDirs::from("com", "RustTracker", "RustTracker")
+                        .map(|p| p.cache_dir().to_path_buf())
+                })?;
+            let _ = std::fs::create_dir_all(&dir);
+            Some(dir.join(format!("pipeline_cache_{}.bin", key)))
+        })();
+        let pipeline_cache_data: Option<Vec<u8>> = pipeline_cache_path
+            .as_ref()
+            .and_then(|p| std::fs::read(p).ok());
+        // SAFETY: `data` is `None` on first run, and otherwise comes from a prior
+        // `PipelineCache::get_data()` for this same adapter (keyed via
+        // `util::pipeline_cache_key`), which is the documented-valid source.
+        // `fallback: true` ensures a fresh empty cache is created if the stored
+        // data is rejected (e.g. driver/version change).
+        //
+        // Pipeline caching is enabled by default to eliminate shader recompilation hitches,
+        // with opt-out via RUSTTRACKER_PIPELINE_CACHE=0.
+        let pipeline_cache = if pipeline_cache_enabled
+            && device.features().contains(wgpu::Features::PIPELINE_CACHE)
+        {
+            Some(unsafe {
+                device.create_pipeline_cache(&wgpu::PipelineCacheDescriptor {
+                    label: Some("RustTracker Pipeline Cache"),
+                    data: pipeline_cache_data.as_deref(),
+                    fallback: true,
+                })
+            })
+        } else {
+            None
+        };
+        // Borrow that satisfies `cache: Option<&PipelineCache>` at every descriptor.
+        let pipeline_cache_ref = pipeline_cache.as_ref();
+
+        let surface_caps = surface.get_capabilities(&adapter);
+        let surface_format = surface_caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| f.is_srgb())
+            .unwrap_or(surface_caps.formats[0]);
+
+        // Default to strict hardware VSync (PresentMode::Fifo / VK_PRESENT_MODE_FIFO_KHR)
+        // across all platforms unless uncapped mode or an explicit override is requested.
+        // Avoid defaulting to FifoRelaxed on desktop: in Windows windowed mode under DWM/MPO,
+        // FifoRelaxed tears/flickers whenever a frame arrives slightly after VBlank.
+        let present_mode = if crate::state::UNCAPPED_PRESENT_MODE.load(Ordering::Relaxed) {
+            wgpu::PresentMode::AutoNoVsync
+        } else if let Ok(mode_str) = std::env::var("RUSTTRACKER_PRESENT_MODE") {
+            match mode_str.trim().to_ascii_lowercase().as_str() {
+                "novsync" | "immediate" => wgpu::PresentMode::AutoNoVsync,
+                "mailbox"
+                    if surface_caps
+                        .present_modes
+                        .contains(&wgpu::PresentMode::Mailbox) =>
+                {
+                    wgpu::PresentMode::Mailbox
+                }
+                "fiforelaxed" | "adaptive"
+                    if surface_caps
+                        .present_modes
+                        .contains(&wgpu::PresentMode::FifoRelaxed) =>
+                {
+                    wgpu::PresentMode::FifoRelaxed
+                }
+                "fifo" => wgpu::PresentMode::Fifo,
+                _ => wgpu::PresentMode::Fifo,
+            }
+        } else {
+            wgpu::PresentMode::Fifo
+        };
+
+        let alpha_mode = surface_caps
+            .alpha_modes
+            .iter()
+            .copied()
+            .find(|&m| m == wgpu::CompositeAlphaMode::Opaque)
+            .unwrap_or(surface_caps.alpha_modes[0]);
+
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            format: surface_format,
+            width: size.width.max(1),
+            height: size.height.max(1),
+            present_mode,
+            alpha_mode,
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        surface.configure(&device, &config);
+
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Audio Uniform Buffer"),
+            size: std::mem::size_of::<AudioUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let gpu_spectrum_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("GPU FFT Spectrum Buffer"),
+            size: 32 * 1024 * 8, // 32 channels, 1024 bins, vec2<f32>
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let waveform_storage_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Waveform History Storage (f16 Packed)"),
+            size: (1024 * 144 * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let history_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Heatmap History Texture"),
+            size: wgpu::Extent3d {
+                width: 256,
+                height: 1024,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING,
+            view_formats: &[],
+        });
+        let history_view = history_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let fire_grid_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Fire Grid Texture"),
+            size: wgpu::Extent3d {
+                width: 1024,
+                height: 576,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::R32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let fire_grid_view = fire_grid_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 4,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+            label: Some("audio_bind_group_layout"),
+        });
+
+        let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: &bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: waveform_storage_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(&history_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&fire_grid_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: gpu_spectrum_buffer.as_entire_binding(),
+                },
+            ],
+            label: Some("audio_bind_group"),
+        });
+
+        let camera_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Camera Bind Group Layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+
+        let render_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Render Pipeline Layout"),
+                bind_group_layouts: &[Some(&bind_group_layout)],
+                immediate_size: 0,
+            });
+
+        let render_pipeline_layout_3d =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("3D Render Pipeline Layout"),
+                bind_group_layouts: &[Some(&bind_group_layout), Some(&camera_bind_group_layout)],
+                immediate_size: 0,
+            });
+
+        let biolum_render_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Biolum Render Layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+
+        let biolum_render_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Biolum Render Pipeline Layout"),
+                bind_group_layouts: &[
+                    Some(&bind_group_layout),
+                    Some(&camera_bind_group_layout),
+                    Some(&biolum_render_bind_group_layout),
+                ],
+                immediate_size: 0,
+            });
+
+        let flip_render_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("FLIP Render Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let flip_render_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("FLIP Render Pipeline Layout"),
+                bind_group_layouts: &[
+                    Some(&bind_group_layout),
+                    Some(&flip_render_bind_group_layout),
+                ],
+                immediate_size: 0,
+            });
+
+        let lyrics_render_pipeline_layout_3d =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Lyrics 3D Render Pipeline Layout"),
+                bind_group_layouts: &[
+                    Some(&bind_group_layout),
+                    Some(&flip_render_bind_group_layout),
+                    Some(&camera_bind_group_layout),
+                ],
+                immediate_size: 0,
+            });
+
+        // Shared shader headers — included at compile time, resolved via simple string replacement.
+        // This is the single source of truth for AudioUniforms layout and glyph font.
+        const SHADER_COMMON: &str = include_str!("../../../src/shaders/_common.wgsl");
+        const SHADER_GLYPH_FONT: &str = include_str!("../../../src/shaders/_glyph_font.wgsl");
+
+        let resolve_shader_includes = |source: &str| -> String {
+            source
+                .replace("// INCLUDE: common", SHADER_COMMON)
+                .replace("// INCLUDE: glyph_font", SHADER_GLYPH_FONT)
+        };
+
+        let get_shader_source = |id: u32| -> &'static str {
+            match id {
+                0 => include_str!("../../../src/shaders/vis_spectrum.wgsl"),
+                1 => include_str!("../../../src/shaders/vis_oscilloscope.wgsl"),
+                3 => include_str!("../../../src/shaders/vis_3doscilloscope_raster.wgsl"),
+                4 => include_str!("../../../src/shaders/vis_3doscilloscope_freq.wgsl"),
+                5 => include_str!("../../../src/shaders/vis_flame.wgsl"),
+                6 => include_str!("../../../src/shaders/vis_firesim.wgsl"),
+                7 => include_str!("../../../src/shaders/vis_solar.wgsl"),
+                13 => include_str!("../../../src/shaders/vis_synthwave.wgsl"),
+                14 => include_str!("../../../src/shaders/vis_synthwave_racer_3d.wgsl"),
+                16 => include_str!("../../../src/shaders/vis_rain.wgsl"),
+                19 => include_str!("../../../src/shaders/vis_vumeters_3d.wgsl"),
+                20 => include_str!("../../../src/shaders/vis_bioluminescence.wgsl"),
+                22 => include_str!("../../../src/shaders/vis_neon_room.wgsl"),
+                23 => include_str!("../../../src/shaders/vis_lyrics.wgsl"),
+                24 => include_str!("../../../src/shaders/vis_tape_head.wgsl"),
+                25 => include_str!("../../../src/shaders/vis_spectrum_led.wgsl"),
+                27 => include_str!("../../../src/shaders/vis_flip_ferrofluid.wgsl"),
+                28 => include_str!("../../../src/shaders/vis_glass_water.wgsl"),
+                29 => include_str!("../../../src/shaders/vis_spectrum_canyon.wgsl"),
+                _ => include_str!("../../../src/shaders/vis_spectrum.wgsl"),
+            }
+        };
+
+        let shader_sources: Vec<String> = crate::state::VISUALIZERS
+            .iter()
+            .map(|v| resolve_shader_includes(get_shader_source(v.id)))
+            .collect();
+
+        let render_pipelines: Vec<Option<wgpu::RenderPipeline>> =
+            (0..shader_sources.len()).map(|_| None).collect();
+
+        let scope_fallback = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let fallback_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Fallback Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&shader_sources[0])),
+        });
+
+        let fallback_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Fallback Render Pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &fallback_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &fallback_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview_mask: None,
+            cache: pipeline_cache_ref,
+        });
+
+        let fallback_pipeline_3d = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Fallback 3D Render Pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &fallback_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &fallback_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview_mask: None,
+            cache: pipeline_cache_ref,
+        });
+        let _ = scope_fallback.pop().await;
+
+        let lamp_pipeline = fallback_pipeline_3d.clone();
+
+        // --- Video Pipeline (Quarter-Res Border Blur + Main Display Pass) ---
+        let video_blur_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Video Border Blur Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        // Y
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        // U (or UV interleaved Rg8Unorm / Rg16Unorm)
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        // V (or 1x1 placeholder for SemiPlanar420)
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        // Sampler
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        // Params
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let video_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Video Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        // Pre-blurred quarter-res ambient border texture
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let video_blur_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Video Border Blur Pipeline Layout"),
+                bind_group_layouts: &[Some(&video_blur_bind_group_layout)],
+                immediate_size: 0,
+            });
+
+        let video_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Video Pipeline Layout"),
+                bind_group_layouts: &[Some(&video_bind_group_layout)],
+                immediate_size: 0,
+            });
+
+        let video_shader =
+            device.create_shader_module(wgpu::include_wgsl!("../../../src/shaders/vis_video.wgsl"));
+        let video_border_blur_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Video Quarter-Res Border Blur Pipeline"),
+                layout: Some(&video_blur_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &video_shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &video_shader,
+                    entry_point: Some("fs_border_blur"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: pipeline_cache_ref,
+            });
+
+        let video_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Video Render Pipeline (No Depth)"),
+            layout: Some(&video_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &video_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &video_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: pipeline_cache_ref,
+        });
+
+        let hud_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("HUD Pipeline Layout"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+        let hud_source = resolve_shader_includes(include_str!("../../../src/shaders/hud.wgsl"));
+        let hud_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("HUD Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&hud_source)),
+        });
+        let hud_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("HUD Pipeline"),
+            layout: Some(&hud_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &hud_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &hud_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview_mask: None,
+            cache: pipeline_cache_ref,
+        });
+
+        let solid_black_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Solid Black Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(
+                r#"
+                struct VertexOutput {
+                    @builtin(position) clip_position: vec4<f32>,
+                }
+                @vertex
+                fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
+                    var out: VertexOutput;
+                    let x = f32((in_vertex_index << 1u) & 2u) * 2.0 - 1.0;
+                    let y = f32(in_vertex_index & 2u) * 2.0 - 1.0;
+                    out.clip_position = vec4<f32>(x, y, 1.0, 1.0);
+                    return out;
+                }
+                @fragment
+                fn fs_main() -> @location(0) vec4<f32> {
+                    return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+                }
+            "#,
+            )),
+        });
+
+        let clear_black_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("Clear Black Layout"),
+            bind_group_layouts: &[],
+            immediate_size: 0,
+        });
+
+        let clear_black_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Clear Black Pipeline"),
+            layout: Some(&clear_black_layout),
+            vertex: wgpu::VertexState {
+                module: &solid_black_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &solid_black_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: pipeline_cache_ref,
+        });
+
+        let solid_biolum_bg_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Solid Biolum BG Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(
+                r#"
+                struct VertexOutput {
+                    @builtin(position) clip_position: vec4<f32>,
+                    @location(0) ndc: vec2<f32>,
+                }
+                @vertex
+                fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
+                    var out: VertexOutput;
+                    let x = f32((in_vertex_index << 1u) & 2u) * 2.0 - 1.0;
+                    let y = f32(in_vertex_index & 2u) * 2.0 - 1.0;
+
+                    let ndc = vec2<f32>(x, y);
+                    let r2 = dot(ndc, ndc);
+                    let distorted_ndc = ndc * (1.0 + r2 * 0.055);
+
+                    out.clip_position = vec4<f32>(distorted_ndc, 1.0, 1.0);
+                    out.ndc = distorted_ndc;
+                    return out;
+                }
+                @fragment
+                fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+                    if (abs(in.ndc.x) > 1.0 || abs(in.ndc.y) > 1.0) {
+                        discard;
+                    }
+                    let border_dist = min(1.0 - abs(in.ndc.x), 1.0 - abs(in.ndc.y));
+                    let bezel_mask = smoothstep(0.0, 0.03, border_dist);
+
+                    return vec4<f32>(vec3<f32>(0.001, 0.003, 0.008) * bezel_mask, 1.0);
+                }
+            "#,
+            )),
+        });
+
+        let biolum_bg_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("Biolum BG Pipeline"),
+            layout: Some(&clear_black_layout),
+            vertex: wgpu::VertexState {
+                module: &solid_biolum_bg_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &solid_biolum_bg_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: pipeline_cache_ref,
+        });
+
+        let synthwave_sky_shader_src = resolve_shader_includes(include_str!(
+            "../../../src/shaders/vis_synthwave_racer_sky.wgsl"
+        ));
+        let synthwave_sky_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Synthwave Sky Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(synthwave_sky_shader_src)),
+        });
+
+        let synthwave_sky_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Synthwave Sky Pipeline"),
+                layout: Some(&render_pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &synthwave_sky_shader,
+                    entry_point: Some("vs_main"),
+                    buffers: &[],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &synthwave_sky_shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::REPLACE),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::Always),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: pipeline_cache_ref,
+            });
+
+        let vumeters_bg_shader_src =
+            resolve_shader_includes(include_str!("../../../src/shaders/vis_vumeters_bg.wgsl"));
+        let vumeters_bg_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("VU Meters Background Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(vumeters_bg_shader_src)),
+        });
+
+        let vumeters_bg_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("VU Meters Background Pipeline"),
+            layout: Some(&render_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &vumeters_bg_shader,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &vumeters_bg_shader,
+                entry_point: Some("fs_main"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: wgpu::TextureFormat::Depth32Float,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: pipeline_cache_ref,
+        });
+
+        let depth_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Depth Texture"),
+            size: wgpu::Extent3d {
+                width: config.width.max(1),
+                height: config.height.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Depth32Float,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let depth_texture_view = depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let egui_renderer = egui_wgpu::Renderer::new(
+            &device,
+            config.format,
+            egui_wgpu::RendererOptions {
+                depth_stencil_format: None,
+                ..Default::default()
+            },
+        );
+
+        // --- Fire Compute Pipeline ---
+        let fire_grid_size = 1024 * 576 * 4; // 1024 × 576 × f32
+        let fire_buffer_a = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Fire Grid A"),
+            size: fire_grid_size as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let fire_buffer_b = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Fire Grid B"),
+            size: fire_grid_size as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC,
+            mapped_at_creation: false,
+        });
+        let fire_coal_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Coal Bed"),
+            size: (1024 * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let fire_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Fire Params"),
+            size: std::mem::size_of::<FireParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let heatmap_compute_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("heatmap_compute_layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::StorageTexture {
+                            access: wgpu::StorageTextureAccess::WriteOnly,
+                            format: wgpu::TextureFormat::R32Float,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let heatmap_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("heatmap_bind_group"),
+            layout: &heatmap_compute_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&history_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: gpu_spectrum_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        let heatmap_source =
+            resolve_shader_includes(include_str!("../../../src/shaders/heatmap_compute.wgsl"));
+        let heatmap_compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Heatmap Compute Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&heatmap_source)),
+        });
+        let heatmap_compute_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("heatmap_compute_layout"),
+                bind_group_layouts: &[Some(&heatmap_compute_layout)],
+                immediate_size: 0,
+            });
+        let heatmap_compute_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Heatmap Compute Pipeline"),
+                layout: Some(&heatmap_compute_pipeline_layout),
+                module: &heatmap_compute_shader,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: pipeline_cache_ref,
+            });
+        let fire_compute_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("fire_compute_layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let fire_bind_group_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fire_bg_a"),
+            layout: &fire_compute_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: fire_buffer_a.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: fire_buffer_b.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: fire_coal_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: fire_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: gpu_spectrum_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        let fire_bind_group_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("fire_bg_b"),
+            layout: &fire_compute_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: fire_buffer_b.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: fire_buffer_a.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: fire_coal_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: fire_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: gpu_spectrum_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let firesim_compute_source =
+            resolve_shader_includes(include_str!("../../../src/shaders/firesim_compute.wgsl"));
+        let firesim_compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("FireSim Compute Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&firesim_compute_source)),
+        });
+        let fire_compute_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("fire_compute_layout"),
+                bind_group_layouts: &[Some(&fire_compute_layout)],
+                immediate_size: 0,
+            });
+        let firesim_compute_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FireSim Compute Pipeline"),
+                layout: Some(&fire_compute_pipeline_layout),
+                module: &firesim_compute_shader,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: pipeline_cache_ref,
+            });
+
+        // --- Quantum FLIP Ferrofluid Compute & Render Setup ---
+        let flip_particles = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("FLIP Particles"),
+            size: (65536 * 32) as u64,
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        let flip_grid_accum = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("FLIP Grid Accum"),
+            size: (131072 * 16) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let flip_grid_vel_new = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("FLIP Grid Vel New"),
+            size: (131072 * 16) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let flip_grid_vel_old = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("FLIP Grid Vel Old"),
+            size: (131072 * 16) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let flip_pressure_0 = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("FLIP Pressure 0"),
+            size: (131072 * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let flip_pressure_1 = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("FLIP Pressure 1"),
+            size: (131072 * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let flip_render_grid = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("FLIP Render Grid"),
+            size: (512 * 512 * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // GPU-compacted active airborne splash droplet header (8 u32 words, starting with
+        // DrawIndexedIndirectArgs: [index_count=6, instance_count=0, 0, 0, 0]) + 65,536 active indices.
+        let splash_compact_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Splash Compact Active Indices"),
+            size: ((8 + 65536) * 4) as u64,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let initial_splash_header: [u32; 8] = [6, 0, 0, 0, 0, 0, 0, 0];
+        queue.write_buffer(
+            &splash_compact_buffer,
+            0,
+            bytemuck::cast_slice(&initial_splash_header),
+        );
+
+        let splash_indirect_args_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Splash DrawIndexedIndirect Args"),
+            size: 20,
+            usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(
+            &splash_indirect_args_buffer,
+            0,
+            bytemuck::cast_slice(&initial_splash_header[..5]),
+        );
+
+        let flip_compute_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("flip_compute_layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 6,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 7,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 8,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let flip_compute_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("flip_compute_bg"),
+            layout: &flip_compute_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: flip_particles.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: flip_grid_accum.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: flip_grid_vel_new.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: flip_grid_vel_old.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: flip_pressure_0.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: flip_pressure_1.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 7,
+                    resource: flip_render_grid.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 8,
+                    resource: splash_compact_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let flip_compute_source = resolve_shader_includes(include_str!(
+            "../../../src/shaders/flip_ferrofluid_compute.wgsl"
+        ));
+        let flip_compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("FLIP Ferrofluid Compute Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&flip_compute_source)),
+        });
+        let flip_compute_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("flip_compute_layout"),
+                bind_group_layouts: &[Some(&flip_compute_layout)],
+                immediate_size: 0,
+            });
+
+        let flip_clear_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FLIP Clear"),
+                layout: Some(&flip_compute_pipeline_layout),
+                module: &flip_compute_shader,
+                entry_point: Some("cs_clear"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+
+        let flip_clear_render_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FLIP Clear Render"),
+                layout: Some(&flip_compute_pipeline_layout),
+                module: &flip_compute_shader,
+                entry_point: Some("cs_clear_render"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+
+        let flip_p2g_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("FLIP P2G"),
+            layout: Some(&flip_compute_pipeline_layout),
+            module: &flip_compute_shader,
+            entry_point: Some("cs_p2g"),
+            compilation_options: Default::default(),
+            cache: pipeline_cache_ref,
+        });
+
+        let flip_forces_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FLIP Forces"),
+                layout: Some(&flip_compute_pipeline_layout),
+                module: &flip_compute_shader,
+                entry_point: Some("cs_grid_forces"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+
+        let flip_pressure_0_to_1_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FLIP Pressure 0->1"),
+                layout: Some(&flip_compute_pipeline_layout),
+                module: &flip_compute_shader,
+                entry_point: Some("cs_pressure_0_to_1"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+
+        let flip_pressure_1_to_0_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FLIP Pressure 1->0"),
+                layout: Some(&flip_compute_pipeline_layout),
+                module: &flip_compute_shader,
+                entry_point: Some("cs_pressure_1_to_0"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+
+        let flip_project_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FLIP Project"),
+                layout: Some(&flip_compute_pipeline_layout),
+                module: &flip_compute_shader,
+                entry_point: Some("cs_grid_project"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+
+        let flip_g2p_advect_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FLIP G2P Advect"),
+                layout: Some(&flip_compute_pipeline_layout),
+                module: &flip_compute_shader,
+                entry_point: Some("cs_g2p_advect_splat"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+
+        let flip_render_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("FLIP Render BG"),
+            layout: &flip_render_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: flip_render_grid.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: flip_particles.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: splash_compact_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        // --- Acoustic FLIP Water Compute Pipelines ---
+        let flip_water_compute_source =
+            resolve_shader_includes(include_str!("../../../src/shaders/flip_water_compute.wgsl"));
+        let flip_water_compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("FLIP Water Compute Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(
+                &flip_water_compute_source,
+            )),
+        });
+
+        let flip_water_clear_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FLIP Water Clear"),
+                layout: Some(&flip_compute_pipeline_layout),
+                module: &flip_water_compute_shader,
+                entry_point: Some("cs_clear"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+
+        let flip_water_clear_render_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FLIP Water Clear Render"),
+                layout: Some(&flip_compute_pipeline_layout),
+                module: &flip_water_compute_shader,
+                entry_point: Some("cs_clear_render"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+
+        let flip_water_p2g_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FLIP Water P2G"),
+                layout: Some(&flip_compute_pipeline_layout),
+                module: &flip_water_compute_shader,
+                entry_point: Some("cs_p2g"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+
+        let flip_water_forces_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FLIP Water Forces"),
+                layout: Some(&flip_compute_pipeline_layout),
+                module: &flip_water_compute_shader,
+                entry_point: Some("cs_grid_forces"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+
+        let flip_water_pressure_0_to_1_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FLIP Water Pressure 0->1"),
+                layout: Some(&flip_compute_pipeline_layout),
+                module: &flip_water_compute_shader,
+                entry_point: Some("cs_pressure_0_to_1"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+
+        let flip_water_pressure_1_to_0_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FLIP Water Pressure 1->0"),
+                layout: Some(&flip_compute_pipeline_layout),
+                module: &flip_water_compute_shader,
+                entry_point: Some("cs_pressure_1_to_0"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+
+        let flip_water_project_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FLIP Water Project"),
+                layout: Some(&flip_compute_pipeline_layout),
+                module: &flip_water_compute_shader,
+                entry_point: Some("cs_grid_project"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+
+        let flip_water_g2p_advect_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("FLIP Water G2P Advect"),
+                layout: Some(&flip_compute_pipeline_layout),
+                module: &flip_water_compute_shader,
+                entry_point: Some("cs_g2p_advect_splat"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+
+        // --- 3D Airborne Water Splash Droplet Pipeline ---
+        let splash_quad_verts = [
+            Vertex {
+                position: [-0.5, -0.5, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                tex_coords: [0.0, 0.0],
+            },
+            Vertex {
+                position: [0.5, -0.5, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                tex_coords: [1.0, 0.0],
+            },
+            Vertex {
+                position: [0.5, 0.5, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                tex_coords: [1.0, 1.0],
+            },
+            Vertex {
+                position: [-0.5, 0.5, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                tex_coords: [0.0, 1.0],
+            },
+        ];
+        let splash_quad_inds: [u32; 6] = [0, 1, 2, 0, 2, 3];
+
+        let splash_quad_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Splash Quad Vertex Buffer"),
+            size: (splash_quad_verts.len() * std::mem::size_of::<Vertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(
+            &splash_quad_vertex_buffer,
+            0,
+            bytemuck::cast_slice(&splash_quad_verts),
+        );
+
+        let splash_quad_index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Splash Quad Index Buffer"),
+            size: (splash_quad_inds.len() * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(
+            &splash_quad_index_buffer,
+            0,
+            bytemuck::cast_slice(&splash_quad_inds),
+        );
+
+        let water_splash_source =
+            resolve_shader_includes(include_str!("../../../src/shaders/vis_water_splash.wgsl"));
+        let water_splash_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Water Splash Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&water_splash_source)),
+        });
+
+        let water_splash_pipeline =
+            device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("Water Splash Droplet Pipeline"),
+                layout: Some(&lyrics_render_pipeline_layout_3d),
+                vertex: wgpu::VertexState {
+                    module: &water_splash_shader,
+                    entry_point: Some("vs_splash"),
+                    buffers: &[Vertex::desc()],
+                    compilation_options: Default::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &water_splash_shader,
+                    entry_point: Some("fs_splash"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: config.format,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: Default::default(),
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: Some(wgpu::DepthStencilState {
+                    format: wgpu::TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(false),
+                    depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                    stencil: wgpu::StencilState::default(),
+                    bias: wgpu::DepthBiasState::default(),
+                }),
+                multisample: wgpu::MultisampleState::default(),
+                multiview_mask: None,
+                cache: pipeline_cache_ref,
+            });
+
+        // --- Bioluminescent Waves Compute & Render Setup ---
+        let biolum_particles_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Bioluminescent Particles"),
+            size: (65536 * 32) as u64, // 65,536 particles * 32 bytes/particle
+            usage: wgpu::BufferUsages::STORAGE,
+            mapped_at_creation: false,
+        });
+
+        let biolum_compute_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Biolum Compute Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let biolum_compute_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Biolum Compute Bind Group"),
+            layout: &biolum_compute_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: biolum_particles_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let biolum_compute_source =
+            resolve_shader_includes(include_str!("../../../src/shaders/biolum_compute.wgsl"));
+        let biolum_compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Biolum Compute Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&biolum_compute_source)),
+        });
+
+        let biolum_compute_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Biolum Compute Pipeline Layout"),
+                bind_group_layouts: &[Some(&biolum_compute_layout)],
+                immediate_size: 0,
+            });
+
+        let biolum_compute_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Biolum Compute Pipeline"),
+                layout: Some(&biolum_compute_pipeline_layout),
+                module: &biolum_compute_shader,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+
+        let biolum_render_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Biolum Render Bind Group"),
+            layout: &biolum_render_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: biolum_particles_buffer.as_entire_binding(),
+            }],
+        });
+        // --- End Bioluminescent Waves Setup ---
+
+        let mut query_set = None;
+        let mut query_resolve_buffer = None;
+        let mut query_read_buffer = None;
+        let timestamp_period = queue.get_timestamp_period();
+
+        if supports_timestamps {
+            query_set = Some(device.create_query_set(&wgpu::QuerySetDescriptor {
+                label: Some("Shader Timestamps"),
+                count: 6, // 0-1 for FFT, 2-3 for Fire, 4-5 for Main Vis Render
+                ty: wgpu::QueryType::Timestamp,
+            }));
+
+            query_resolve_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Query Resolve Buffer"),
+                size: 48, // 6 * 8 bytes
+                usage: wgpu::BufferUsages::QUERY_RESOLVE | wgpu::BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            }));
+
+            query_read_buffer = Some(device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Query Read Buffer"),
+                size: 48,
+                usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            }));
+        }
+
+        // --- Resynth compute (consumes the CPU-filled GPU spectrum buffer + AudioUniforms) ---
+        let resynth_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("resynth_bind_group_layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let resynth_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("resynth_bind_group"),
+            layout: &resynth_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: gpu_spectrum_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: uniform_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        let resynth_compute_source =
+            resolve_shader_includes(include_str!("../../../src/shaders/resynth_compute.wgsl"));
+        let resynth_compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Resynth Compute Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&resynth_compute_source)),
+        });
+        let resynth_compute_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("resynth_compute_layout"),
+                bind_group_layouts: &[Some(&resynth_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let resynth_compute_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Resynth Compute Pipeline"),
+                layout: Some(&resynth_compute_pipeline_layout),
+                module: &resynth_compute_shader,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                cache: pipeline_cache_ref,
+            });
+        // --- 3D Engine Extensions Init ---
+        let mut mesh_registry = std::collections::HashMap::new();
+        let mut unique_geometries = std::collections::HashSet::new();
+        for vis in crate::state::VISUALIZERS {
+            if let crate::state::PipelineType::Mesh3D { geometry, .. } = &vis.pipeline_type {
+                unique_geometries.insert(geometry.clone());
+            }
+        }
+
+        for geom in unique_geometries {
+            let (vertices, indices) = match &geom {
+                crate::state::Geometry::Grid { width, depth } => {
+                    let mut vertices = Vec::new();
+                    let mut indices = Vec::new();
+                    let grid_width = *width;
+                    let grid_depth = *depth;
+                    for z in 0..=grid_depth {
+                        for x in 0..=grid_width {
+                            let px = x as f32 - (grid_width as f32) / 2.0;
+                            let pz = z as f32 - (grid_depth as f32) / 2.0;
+                            vertices.push(Vertex {
+                                position: [px, 0.0, pz],
+                                normal: [0.0, 1.0, 0.0],
+                                tex_coords: [
+                                    x as f32 / grid_width as f32,
+                                    z as f32 / grid_depth as f32,
+                                ],
+                            });
+                        }
+                    }
+                    for z in 0..grid_depth {
+                        for x in 0..grid_width {
+                            let start = z * (grid_width + 1) + x;
+                            indices.push(start);
+                            indices.push(start + 1);
+                            indices.push(start + grid_width + 1);
+                            indices.push(start + 1);
+                            indices.push(start + grid_width + 2);
+                            indices.push(start + grid_width + 1);
+                        }
+                    }
+                    (vertices, indices)
+                }
+                crate::state::Geometry::UnitQuad => {
+                    let mut vertices = Vec::new();
+                    let mut indices = Vec::new();
+                    let start_idx = 0;
+                    vertices.push(Vertex {
+                        position: [-0.5, -0.5, 0.0],
+                        normal: [0.0, 0.0, 1.0],
+                        tex_coords: [0.0, 0.0],
+                    });
+                    vertices.push(Vertex {
+                        position: [0.5, -0.5, 0.0],
+                        normal: [0.0, 0.0, 1.0],
+                        tex_coords: [1.0, 0.0],
+                    });
+                    vertices.push(Vertex {
+                        position: [0.5, 0.5, 0.0],
+                        normal: [0.0, 0.0, 1.0],
+                        tex_coords: [1.0, 1.0],
+                    });
+                    vertices.push(Vertex {
+                        position: [-0.5, 0.5, 0.0],
+                        normal: [0.0, 0.0, 1.0],
+                        tex_coords: [0.0, 1.0],
+                    });
+                    indices.extend_from_slice(&[
+                        start_idx,
+                        start_idx + 1,
+                        start_idx + 2,
+                        start_idx,
+                        start_idx + 2,
+                        start_idx + 3,
+                    ]);
+                    (vertices, indices)
+                }
+                crate::state::Geometry::UnitBox => {
+                    let mut vertices = Vec::with_capacity(4);
+                    let mut indices = Vec::with_capacity(6);
+                    // Front-facing (-Z) quad for instanced 3D bars (eliminates 83% culled back/side faces)
+                    let normal = [0.0, 0.0, -1.0];
+                    let quad = [
+                        [0.5, -0.5, -0.5],
+                        [-0.5, -0.5, -0.5],
+                        [-0.5, 0.5, -0.5],
+                        [0.5, 0.5, -0.5],
+                    ];
+                    let uvs = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+                    for (i, pos) in quad.into_iter().enumerate() {
+                        vertices.push(Vertex {
+                            position: pos,
+                            normal,
+                            tex_coords: uvs[i],
+                        });
+                    }
+                    indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+                    (vertices, indices)
+                }
+                crate::state::Geometry::NeonRoom => generate_neon_room_mesh(),
+                crate::state::Geometry::SynthwaveRacerScene => generate_synthwave_racer_mesh(),
+                crate::state::Geometry::VuMeterRack => generate_vumeter_rack_mesh(),
+                crate::state::Geometry::GlassLyricsScene => {
+                    generate_glass_lyrics_mesh("RUSTTRACKER")
+                }
+            };
+
+            let vertex_capacity = (vertices.len() * std::mem::size_of::<Vertex>()).max(64) as u64;
+            let vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("Mesh Vertex Buffer {:?}", geom)),
+                size: vertex_capacity,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            queue.write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+
+            let index_capacity = (indices.len() * std::mem::size_of::<u32>()).max(64) as u64;
+            let index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some(&format!("Mesh Index Buffer {:?}", geom)),
+                size: index_capacity,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            queue.write_buffer(&index_buffer, 0, bytemuck::cast_slice(&indices));
+            let index_count = indices.len() as u32;
+
+            mesh_registry.insert(
+                geom,
+                MeshBuffers {
+                    vertex_buffer,
+                    index_buffer,
+                    vertex_capacity,
+                    index_capacity,
+                    index_count,
+                },
+            );
+        }
+
+        let initial_lyrics_idx_count = mesh_registry
+            .get(&crate::state::Geometry::GlassLyricsScene)
+            .map(|m| m.index_count)
+            .unwrap_or(0);
+        let lyrics_indirect_args_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Lyrics DrawIndexedIndirect Args"),
+            size: 20,
+            usage: wgpu::BufferUsages::INDIRECT | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let initial_lyrics_indirect: [u32; 5] = [initial_lyrics_idx_count, 1, 0, 0, 0];
+        queue.write_buffer(
+            &lyrics_indirect_args_buffer,
+            0,
+            bytemuck::cast_slice(&initial_lyrics_indirect),
+        );
+
+        let camera_uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Camera Uniforms"),
+            size: std::mem::size_of::<CameraUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Camera Bind Group"),
+            layout: &camera_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_uniform_buffer.as_entire_binding(),
+            }],
+        });
+        let (lamp_verts, lamp_inds) = generate_lamp_mesh();
+        let lamp_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Lamp Vertex Buffer"),
+            size: (lamp_verts.len() * std::mem::size_of::<Vertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&lamp_vertex_buffer, 0, bytemuck::cast_slice(&lamp_verts));
+
+        let lamp_index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Lamp Index Buffer"),
+            size: (lamp_inds.len() * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&lamp_index_buffer, 0, bytemuck::cast_slice(&lamp_inds));
+        let lamp_index_count = lamp_inds.len() as u32;
+        // --- END 3D Engine Extensions Init ---
+
+        let pipeline_cache_path = if pipeline_cache_enabled {
+            pipeline_cache_path
+        } else {
+            None
+        };
+
+        let mut engine = Self {
+            instance,
+            surface: Some(surface),
+            device,
+            queue,
+            adapter_info,
+            negotiated_features,
+            config,
+            size,
+            render_pipelines,
+            shader_sources,
+            fallback_pipeline,
+            fallback_pipeline_3d,
+            render_pipeline_layout,
+            render_pipeline_layout_3d,
+            flip_render_pipeline_layout,
+            lyrics_render_pipeline_layout_3d,
+            pipeline_cache,
+            pipeline_cache_path,
+            hud_pipeline,
+            uniform_buffer,
+            waveform_storage_buffer,
+            _history_texture: history_texture,
+            fire_grid_texture,
+            uniform_bind_group,
+            egui_renderer,
+            query_set,
+            query_resolve_buffer,
+            query_read_buffer,
+            timestamp_period,
+            timestamp_mapping_active: false,
+            timestamp_map_complete: Arc::new(AtomicBool::new(false)),
+            cached_fft_us: None,
+            cached_fire_us: None,
+            cached_vis_us: None,
+            meters_uv_rect: [0.0; 4],
+            heatmap_uv_rect: [0.0; 4],
+            fire_uv_rect: [0.0; 4],
+            track_info_rect: None,
+            firesim_compute_pipeline,
+            fire_buffer_a,
+            fire_buffer_b,
+            _fire_coal_buffer: fire_coal_buffer,
+            fire_params_buffer,
+            fire_bind_group_a,
+            fire_bind_group_b,
+            fire_ping: true,
+            retro_fire_cells: Box::new([0u8; 320 * 180]),
+            retro_fire_upload: vec![0.0f32; 1024 * 576],
+            retro_fire_rng: 0x12345678,
+            retro_fire_accum: 0.0,
+            retro_fire_cold_uploaded: false,
+            heatmap_row: 0,
+            heatmap_compute_pipeline,
+            heatmap_bind_group,
+
+            flip_clear_pipeline,
+            flip_clear_render_pipeline,
+            flip_p2g_pipeline,
+            flip_forces_pipeline,
+            flip_pressure_0_to_1_pipeline,
+            flip_pressure_1_to_0_pipeline,
+            flip_project_pipeline,
+            flip_g2p_advect_pipeline,
+            flip_compute_bind_group,
+            flip_render_bind_group,
+
+            flip_water_clear_pipeline,
+            flip_water_clear_render_pipeline,
+            flip_water_p2g_pipeline,
+            flip_water_forces_pipeline,
+            flip_water_pressure_0_to_1_pipeline,
+            flip_water_pressure_1_to_0_pipeline,
+            flip_water_project_pipeline,
+            flip_water_g2p_advect_pipeline,
+            water_splash_pipeline,
+            splash_quad_vertex_buffer,
+            splash_quad_index_buffer,
+            splash_compact_buffer,
+            splash_indirect_args_buffer,
+            lyrics_indirect_args_buffer,
+
+            _biolum_particles_buffer: biolum_particles_buffer,
+            biolum_compute_pipeline,
+            biolum_compute_bind_group,
+            biolum_render_bind_group,
+            _biolum_render_pipeline_layout: biolum_render_pipeline_layout,
+
+            resynth_compute_pipeline,
+            resynth_bind_group,
+            _gpu_spectrum_buffer: gpu_spectrum_buffer,
+
+            depth_texture_view,
+
+            waveform_history_flat: vec![0.0; 2048 * WAVEFORM_HISTORY_RING_CAP],
+            waveform_history_packed: vec![0u32; 1024 * WAVEFORM_HISTORY_RING_CAP],
+            tape_timeline_scratch: vec![0.0; 600 * 8],
+            video_blur_bind_group_layout,
+            video_bind_group_layout,
+            video_border_blur_pipeline,
+            video_pipeline,
+            video_state: None,
+            video_repack_scratch: Vec::new(),
+            clear_black_pipeline,
+            biolum_bg_pipeline,
+            synthwave_sky_pipeline,
+            vumeters_bg_pipeline,
+
+            pending_uniforms: None,
+            cached_meta_path: String::new(),
+            cached_file_dir: String::new(),
+            cached_file_len: None,
+            last_acquire_instant: None,
+
+            camera_uniform_buffer,
+            camera_bind_group,
+            mesh_registry,
+            lamp_vertex_buffer,
+            lamp_index_buffer,
+            lamp_index_count,
+            lamp_pipeline,
+            frame_count: 0,
+            last_history_cam_z: 0.0f64,
+            smooth_time: 0.0f64,
+            play_time: 0.0f64,
+            smooth_audio_seconds: 0.0f64,
+            last_raw_state_seconds: 0.0f64,
+            smooth_dt: 1.0f64 / 60.0f64,
+            last_history_push_count: 0,
+            time_since_last_push: 0.0,
+            measured_push_interval: 1.0f64 / 144.0f64,
+            vu_needle_angles: vec![0.0; 32],
+            vu_needle_velocities: vec![0.0; 32],
+            channel_phases: [0.0; 32],
+            vu_prev_active_segments: [0; 32],
+            vu_segment_glows: [[0.0; 30]; 32],
+            vu_prev_num_channels: 0,
+            last_uploaded_push_count: u64::MAX,
+            last_uploaded_vis_width: 0,
+            last_uploaded_vis_id: u32::MAX,
+            last_uploaded_hist_len: 0,
+            waveform_ring_head: 0,
+            waveform_ring_base: 0,
+            lyric_slam_timer: 0.0,
+            last_lyric_line_idx: None,
+            current_lyric_mesh_text: "RUSTTRACKER".to_string(),
+            fire_intensity: 0.0,
+            splash_cache: SplashCache::default(),
+            stats_cache: StatsDisplayCache::default(),
+            is_game_mode: std::env::var("XDG_CURRENT_DESKTOP")
+                .unwrap_or_default()
+                .eq_ignore_ascii_case("gamescope")
+                || std::env::var("XDG_SESSION_DESKTOP")
+                    .unwrap_or_default()
+                    .eq_ignore_ascii_case("gamescope")
+                || std::env::var("STEAM_DECK").is_ok()
+                || std::env::var("SteamDeck").is_ok()
+                || std::env::var("SteamOS").is_ok()
+                || std::fs::read_to_string("/sys/class/dmi/id/sys_vendor")
+                    .map(|v| v.trim().eq_ignore_ascii_case("valve"))
+                    .unwrap_or(false),
+            last_steps_to_fill: 0,
+            last_aspect_ratio: size.width as f32 / size.height.max(1) as f32,
+        };
+        engine.ensure_visualizer_pipeline(0);
+        engine
+    }
+
+    fn save_pipeline_cache(&self) {
+        // Persist the pipeline cache back to disk atomically so subsequent launches
+        // can skip recompiling compute, UI, and newly compiled visualizer pipelines.
+        if let (Some(path), Some(cache)) = (&self.pipeline_cache_path, &self.pipeline_cache)
+            && let Some(data) = cache.get_data()
+        {
+            let tmp = path.with_extension("tmp");
+            if std::fs::write(&tmp, &data).is_ok() {
+                let _ = std::fs::rename(&tmp, path);
+            }
+        }
+    }
+
+    pub fn ensure_visualizer_pipeline(&mut self, i: usize) {
+        if i >= self.render_pipelines.len() || self.render_pipelines[i].is_some() {
+            return;
+        }
+        let vis_def = &crate::state::VISUALIZERS[i];
+        let is_mesh_3d = matches!(
+            vis_def.pipeline_type,
+            crate::state::PipelineType::Mesh3D { .. }
+        );
+        let source = &self.shader_sources[i];
+        let scope_main = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+
+        let shader = self
+            .device
+            .create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some(&format!("Shader {}", i)),
+                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(source.as_str())),
+            });
+
+        let (layout, vertex_buffers, primitive, vs_entry) = if vis_def.id == 20 {
+            (
+                &self._biolum_render_pipeline_layout,
+                vec![Vertex::desc()],
+                wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                "vs_main_3d",
+            )
+        } else if vis_def.id == 23 {
+            (
+                &self.lyrics_render_pipeline_layout_3d,
+                vec![Vertex::desc()],
+                wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                "vs_main_3d",
+            )
+        } else if vis_def.id == 27 {
+            (
+                &self.flip_render_pipeline_layout,
+                Vec::new(),
+                wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                "vs_main",
+            )
+        } else {
+            match vis_def.pipeline_type {
+                crate::state::PipelineType::FullscreenTriangle => (
+                    &self.render_pipeline_layout,
+                    Vec::new(),
+                    wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        strip_index_format: None,
+                        front_face: wgpu::FrontFace::Ccw,
+                        cull_mode: None,
+                        polygon_mode: wgpu::PolygonMode::Fill,
+                        unclipped_depth: false,
+                        conservative: false,
+                    },
+                    "vs_main",
+                ),
+                crate::state::PipelineType::Mesh3D { .. } => (
+                    &self.render_pipeline_layout_3d,
+                    vec![Vertex::desc()],
+                    wgpu::PrimitiveState {
+                        topology: wgpu::PrimitiveTopology::TriangleList,
+                        strip_index_format: None,
+                        front_face: wgpu::FrontFace::Ccw,
+                        cull_mode: None,
+                        polygon_mode: wgpu::PolygonMode::Fill,
+                        unclipped_depth: false,
+                        conservative: false,
+                    },
+                    "vs_main_3d",
+                ),
+            }
+        };
+
+        let pipeline = self
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some(&format!("Render Pipeline {}", i)),
+                layout: Some(layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: Some(vs_entry),
+                    buffers: &vertex_buffers,
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: Some("fs_main"),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: self.config.format,
+                        blend: Some(if vis_def.id == 4 {
+                            wgpu::BlendState {
+                                color: wgpu::BlendComponent {
+                                    src_factor: wgpu::BlendFactor::One,
+                                    dst_factor: wgpu::BlendFactor::One,
+                                    operation: wgpu::BlendOperation::Add,
+                                },
+                                alpha: wgpu::BlendComponent::OVER,
+                            }
+                        } else if vis_def.id == 3 {
+                            wgpu::BlendState::PREMULTIPLIED_ALPHA_BLENDING
+                        } else {
+                            wgpu::BlendState::REPLACE
+                        }),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                    compilation_options: wgpu::PipelineCompilationOptions::default(),
+                }),
+                primitive,
+                depth_stencil: if is_mesh_3d {
+                    Some(wgpu::DepthStencilState {
+                        format: wgpu::TextureFormat::Depth32Float,
+                        depth_write_enabled: Some(vis_def.id != 4),
+                        depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                        stencil: wgpu::StencilState::default(),
+                        bias: wgpu::DepthBiasState::default(),
+                    })
+                } else {
+                    None
+                },
+                multisample: wgpu::MultisampleState {
+                    count: 1,
+                    mask: !0,
+                    alpha_to_coverage_enabled: false,
+                },
+                multiview_mask: None,
+                cache: self.pipeline_cache.as_ref(),
+            });
+
+        let error_future = scope_main.pop();
+        let _ = self.device.poll(wgpu::PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+
+        if let Some(error) = pollster::block_on(error_future) {
+            eprintln!("WGSL compilation error in visualizer {}: {:?}", i, error);
+            self.render_pipelines[i] = Some(if is_mesh_3d {
+                self.fallback_pipeline_3d.clone()
+            } else {
+                self.fallback_pipeline.clone()
+            });
+        } else {
+            self.render_pipelines[i] = Some(pipeline);
+            if vis_def.id == 13 {
+                let lp = self
+                    .device
+                    .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                        label: Some("Lamp Render Pipeline"),
+                        layout: Some(&self.render_pipeline_layout_3d),
+                        vertex: wgpu::VertexState {
+                            module: &shader,
+                            entry_point: Some("vs_lamp"),
+                            buffers: &[Vertex::desc()],
+                            compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        },
+                        fragment: Some(wgpu::FragmentState {
+                            module: &shader,
+                            entry_point: Some("fs_lamp"),
+                            targets: &[Some(wgpu::ColorTargetState {
+                                format: self.config.format,
+                                blend: Some(wgpu::BlendState::REPLACE),
+                                write_mask: wgpu::ColorWrites::ALL,
+                            })],
+                            compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        }),
+                        primitive: wgpu::PrimitiveState {
+                            topology: wgpu::PrimitiveTopology::TriangleList,
+                            strip_index_format: None,
+                            front_face: wgpu::FrontFace::Ccw,
+                            cull_mode: None,
+                            polygon_mode: wgpu::PolygonMode::Fill,
+                            unclipped_depth: false,
+                            conservative: false,
+                        },
+                        depth_stencil: Some(wgpu::DepthStencilState {
+                            format: wgpu::TextureFormat::Depth32Float,
+                            depth_write_enabled: Some(true),
+                            depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                            stencil: wgpu::StencilState::default(),
+                            bias: wgpu::DepthBiasState::default(),
+                        }),
+                        multisample: wgpu::MultisampleState {
+                            count: 1,
+                            mask: !0,
+                            alpha_to_coverage_enabled: false,
+                        },
+                        multiview_mask: None,
+                        cache: self.pipeline_cache.as_ref(),
+                    });
+                self.lamp_pipeline = lp;
+            }
+            self.save_pipeline_cache();
+        }
+    }
+
+    pub fn resize(&mut self, new_size: winit::dpi::PhysicalSize<u32>) {
+        if new_size.width > 0 && new_size.height > 0 {
+            self.size = new_size;
+            self.config.width = new_size.width.max(1);
+            self.config.height = new_size.height.max(1);
+            if let Some(surface) = &self.surface {
+                surface.configure(&self.device, &self.config);
+            }
+
+            let depth_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                label: Some("Depth Texture"),
+                size: wgpu::Extent3d {
+                    width: self.config.width.max(1),
+                    height: self.config.height.max(1),
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Depth32Float,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            self.depth_texture_view =
+                depth_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        }
+    }
+
+    pub fn suspend_surface(&mut self) {
+        eprintln!("[RustTracker Engine] Suspending surface...");
+        self.surface = None;
+    }
+
+    pub fn resume_surface(&mut self, window: Arc<Window>) {
+        let size = window.inner_size();
+        eprintln!(
+            "[RustTracker Engine] Resuming surface with size: {:?}",
+            size
+        );
+        match self.instance.create_surface(window) {
+            Ok(surface) => {
+                self.surface = Some(surface);
+                self.resize(size);
+                eprintln!("[RustTracker Engine] Surface successfully resumed and configured!");
+            }
+            Err(e) => {
+                eprintln!(
+                    "[RustTracker Engine] Failed to create resumed surface: {:?}",
+                    e
+                );
+            }
+        }
+    }
+
+    pub const VU_PHOSPHOR_FADE_SECS: f32 = 0.35;
+
+    pub fn clear_video_state(&mut self) {
+        self.video_state = None;
+        self.vu_prev_active_segments = [0; 32];
+        self.vu_segment_glows = [[0.0; 30]; 32];
+        self.vu_prev_num_channels = 0;
+        self.channel_phases = [0.0; 32];
+        self.cached_meta_path.clear();
+    }
+
+    /// Updates the per-segment phosphor persistence / afterglow envelope for all 30 blocks across
+    /// up to 32 channels. Whenever a block ceases to be active (`segment_idx >= active_segments`),
+    /// it smoothly fades from `1.0` back to `0.0` (regular unlit background color) over
+    /// `VU_PHOSPHOR_FADE_SECS` (350 ms), packed at 8 bits per segment (`0..=255`) into
+    /// `AudioUniforms::vu_segment_glows` (8 `u32` words per channel).
+    pub fn step_vu_phosphor_ghosts(
+        prev_active: &mut [u32; 32],
+        segment_glows: &mut [[f32; 30]; 32],
+        channels: &[f32; 32],
+        num_channels: u32,
+        dt: f32,
+    ) -> [u32; 256] {
+        let mut packed = [0u32; 256];
+        let count = (num_channels as usize).min(32);
+        let dt_clamped = dt.clamp(0.0, 0.1);
+        let decay = dt_clamped / Self::VU_PHOSPHOR_FADE_SECS;
+
+        for i in 0..count {
+            let vu = channels[i].clamp(0.0, 1.0);
+            let cur_active = ((vu * 30.0).ceil() as usize).min(30);
+            let old_active = (prev_active[i] as usize).min(30);
+
+            for (s, glow) in segment_glows[i].iter_mut().enumerate() {
+                if s < cur_active {
+                    // Currently active block stays fully energized, but we keep stored glow at 0.0
+                    // while rising so only blocks that actually transition from active -> inactive fade.
+                    *glow = 0.0;
+                } else if s < old_active {
+                    // Block was active on the previous frame and just turned off: ignite afterglow at 1.0
+                    *glow = 1.0;
+                } else if *glow > 0.0 {
+                    // Recently active block: smoothly decay back toward unlit background (0.0)
+                    *glow = (*glow - decay).max(0.0);
+                }
+            }
+
+            prev_active[i] = cur_active as u32;
+
+            let base_word = i * 8;
+            for (s, &g) in segment_glows[i].iter().enumerate() {
+                if g > 0.0 && s >= cur_active {
+                    let byte_val = (g.clamp(0.0, 1.0) * 255.0).round() as u32;
+                    packed[base_word + (s >> 2)] |= byte_val << ((s & 3) * 8);
+                }
+            }
+        }
+
+        for i in count..32 {
+            prev_active[i] = 0;
+            segment_glows[i] = [0.0; 30];
+        }
+
+        packed
+    }
+
+    pub fn step_fire_intensity(current: f32, state: &crate::state::AppState, dt: f32) -> f32 {
+        let is_at_end =
+            state.duration_seconds > 0.0 && state.current_seconds >= state.duration_seconds - 0.05;
+        let is_playing = !state.is_paused && state.file_loaded && !state.track_ended && !is_at_end;
+        let target_intensity = if is_playing { 1.0f32 } else { 0.0f32 };
+        let fire_rate = if is_playing { 5.0f32 } else { 3.5f32 };
+        let dt_clamped = dt.clamp(0.001, 0.1);
+        if current < target_intensity {
+            (current + fire_rate * dt_clamped).min(target_intensity)
+        } else if current > target_intensity {
+            (current - fire_rate * dt_clamped).max(target_intensity)
+        } else {
+            current
+        }
+    }
+
+    pub fn update_retro_fire_grid(
+        cells: &mut [u8; 320 * 180],
+        rng: &mut u32,
+        intensity: f32,
+        state: &crate::state::AppState,
+    ) {
+        const W: usize = 320;
+        const H: usize = 180;
+
+        if intensity < 0.001 {
+            // Decay towards 0 when stopped
+            let mut all_zero = true;
+            for cell in cells.iter_mut() {
+                if *cell > 0 {
+                    *cell = cell.saturating_sub(1);
+                    all_zero = false;
+                }
+            }
+            if all_zero {
+                // all zero, nothing further needed
+            }
+        } else {
+            // 1. Audio Analysis: Bass transient detection and column energy mapping
+            let bass_raw = if state.spectrum_data.len() >= 16 {
+                state.spectrum_data[1..16]
+                    .iter()
+                    .copied()
+                    .fold(0.0f32, f32::max)
+            } else {
+                0.0
+            };
+            let bass = (bass_raw / 60.0).clamp(0.0, 1.5);
+
+            let mut col_energies = [0.0f32; W];
+            let spec_len = state.spectrum_data.len();
+
+            if let Some(num_tracks) = state.tracker_channels.filter(|&n| n > 0) {
+                let n_ch = (num_tracks as usize).min(64);
+                let left_master = state.channel_vus.first().copied().unwrap_or(0.0);
+                let right_master = state
+                    .channel_vus
+                    .get(1 + n_ch)
+                    .copied()
+                    .unwrap_or(left_master);
+
+                for (x, energy) in col_energies.iter_mut().enumerate().take(W) {
+                    let track_idx = ((x * n_ch) / W).min(n_ch.saturating_sub(1));
+                    let track_vu = state.channel_vus.get(1 + track_idx).copied().unwrap_or(0.0);
+
+                    // Symmetrical center-out spectrum distribution (bass in center, highs on outer edges)
+                    let center_dist =
+                        (x as f32 - (W - 1) as f32 / 2.0).abs() / ((W - 1) as f32 / 2.0);
+                    let spec_idx = if spec_len > 1 {
+                        (((center_dist.powf(1.4) * 450.0) as usize) + 1)
+                            .clamp(1, spec_len.saturating_sub(1))
+                    } else {
+                        0
+                    };
+                    let spec_val = state.spectrum_data.get(spec_idx).copied().unwrap_or(0.0) / 60.0;
+
+                    let frac = x as f32 / (W - 1) as f32;
+                    let master_pan = left_master * (1.0 - frac) + right_master * frac;
+
+                    *energy =
+                        (track_vu * 0.60 + master_pan * 0.20 + spec_val * 0.20).clamp(0.0, 1.5);
+                }
+            } else {
+                // Non-tracker audio (Stereo MP3, FLAC, AAC, WAV, Radio Stream, Multi-channel 5.1/7.1):
+                let ch_len = state.channel_vus.len();
+                let display_order: &[usize] = match ch_len {
+                    6 => &[4, 0, 2, 3, 1, 5],
+                    8 => &[6, 4, 0, 2, 3, 1, 5, 7],
+                    16 => &[14, 12, 10, 8, 6, 4, 0, 2, 3, 1, 5, 7, 9, 11, 13, 15],
+                    _ => &[0, 1],
+                };
+
+                for (x, energy) in col_energies.iter_mut().enumerate().take(W) {
+                    let frac = x as f32 / (W - 1) as f32;
+
+                    // Continuous spatial channel distribution across the screen width
+                    let pan_vu = if ch_len >= 2 {
+                        let order_len = display_order.len().min(ch_len);
+                        if order_len > 1 {
+                            let pos = frac * (order_len - 1) as f32;
+                            let idx0 = (pos.floor() as usize).min(order_len - 1);
+                            let idx1 = (pos.ceil() as usize).min(order_len - 1);
+                            let blend = pos - idx0 as f32;
+                            let vu0 = state
+                                .channel_vus
+                                .get(display_order[idx0])
+                                .copied()
+                                .unwrap_or(0.0);
+                            let vu1 = state
+                                .channel_vus
+                                .get(display_order[idx1])
+                                .copied()
+                                .unwrap_or(vu0);
+                            vu0 * (1.0 - blend) + vu1 * blend
+                        } else {
+                            state.channel_vus.first().copied().unwrap_or(0.0)
+                        }
+                    } else {
+                        state.channel_vus.first().copied().unwrap_or(0.0)
+                    };
+
+                    // Symmetrical center-out spectrum distribution (bass in center, highs mirroring outward)
+                    let center_dist =
+                        (x as f32 - (W - 1) as f32 / 2.0).abs() / ((W - 1) as f32 / 2.0);
+                    let bin = if spec_len > 1 {
+                        (((center_dist.powf(1.4) * 450.0) as usize) + 1)
+                            .clamp(1, spec_len.saturating_sub(1))
+                    } else {
+                        0
+                    };
+                    let spec_val = state.spectrum_data.get(bin).copied().unwrap_or(0.0) / 60.0;
+
+                    *energy = (spec_val * 0.60 + pan_vu * 0.40).clamp(0.0, 1.5);
+                }
+            }
+
+            let bottom_offset = (H - 1) * W;
+            let hearth_offset = (H - 2) * W;
+
+            // 2. Multi-step cellular automaton (2 sub-steps per frame for snappy transient physics)
+            for _ in 0..2 {
+                // Combustion Hearth Row
+                for (x, &col_energy) in col_energies.iter().enumerate().take(W) {
+                    let col_e = (col_energy * 0.75 + bass * 0.25) * intensity;
+
+                    // Bottom heat scales from quiet ember (11) up to incandescent white-hot (36):
+                    let base_heat = 11.0 + col_e * 25.0;
+
+                    *rng ^= *rng << 13;
+                    *rng ^= *rng >> 17;
+                    *rng ^= *rng << 5;
+                    let crackle = (*rng % 5) as i32 - 2;
+
+                    let heat = ((base_heat as i32 + crackle) as u8).clamp(6, 36);
+                    cells[bottom_offset + x] = heat;
+                    cells[hearth_offset + x] = heat.saturating_sub((*rng % 2) as u8);
+                }
+
+                // In-place DOOM fire propagation across columns
+                for (x, &col_energy) in col_energies.iter().enumerate().take(W) {
+                    let col_e = (col_energy * 0.75 + bass * 0.25) * intensity;
+
+                    // High decay when quiet (0.68), low decay when energetic (0.20):
+                    let decay_prob = (0.68 - col_e * 0.44).clamp(0.20, 0.72);
+                    let thresh = (decay_prob * 1000.0) as u32;
+
+                    // Dynamic vertical convection on strong transients:
+                    *rng ^= *rng << 13;
+                    *rng ^= *rng >> 17;
+                    *rng ^= *rng << 5;
+                    let dy = if col_e > 0.70 && !(*rng).is_multiple_of(4) {
+                        2
+                    } else {
+                        1
+                    };
+
+                    for y in dy..H {
+                        let from = y * W + x;
+                        let pixel = cells[from];
+                        if pixel == 0 {
+                            cells[from - W * dy] = 0;
+                        } else {
+                            *rng ^= *rng << 13;
+                            *rng ^= *rng >> 17;
+                            *rng ^= *rng << 5;
+                            let jitter = ((*rng % 3) as i32) - 1;
+
+                            let target_x = (x as i32 + jitter).clamp(0, (W - 1) as i32) as usize;
+                            let target_y = y.saturating_sub(dy);
+                            let to = target_y * W + target_x;
+
+                            // Altitude cooling: taper smoke above 60% screen height so flame tips dance naturally
+                            let alt_decay = if y < 70 && ((*rng >> 8) % 100 < 35) {
+                                1
+                            } else {
+                                0
+                            };
+                            let decay = if ((*rng >> 4) % 1000) < thresh { 1 } else { 0 };
+                            let total_decay = decay.max(alt_decay);
+                            cells[to] = pixel.saturating_sub(total_decay);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn update_retro_fire(&mut self, state: &crate::state::AppState, uniforms: &AudioUniforms) {
+        let dt = uniforms.frame_dt.clamp(0.001, 0.05);
+        self.retro_fire_accum = (self.retro_fire_accum + dt * 60.0).min(3.0);
+        let steps = (self.retro_fire_accum.floor() as u32).max(1);
+        self.retro_fire_accum = (self.retro_fire_accum - steps as f32).max(0.0);
+
+        for _ in 0..steps {
+            Self::update_retro_fire_grid(
+                &mut self.retro_fire_cells,
+                &mut self.retro_fire_rng,
+                self.fire_intensity,
+                state,
+            );
+        }
+
+        if self.fire_intensity < 0.001 && self.retro_fire_cells.iter().all(|&c| c == 0) {
+            if self.retro_fire_cold_uploaded {
+                return;
+            }
+            self.retro_fire_cold_uploaded = true;
+        } else {
+            self.retro_fire_cold_uploaded = false;
+        }
+
+        // Fast upload to 1024x576 fire_grid_texture using precomputed coordinate maps:
+        const PAL_FLOAT: [f32; 37] = {
+            let mut p = [0.0f32; 37];
+            let mut i = 0;
+            while i <= 36 {
+                p[i] = i as f32 / 36.0;
+                i += 1;
+            }
+            p
+        };
+
+        for py in 0..576 {
+            let sy = (py * 180) / 576;
+            let row_offset = py * 1024;
+            let sim_offset = sy * 320;
+            for px in 0..1024 {
+                let sx = (px * 320) / 1024;
+                let heat_idx = self.retro_fire_cells[sim_offset + sx] as usize;
+                self.retro_fire_upload[row_offset + px] = PAL_FLOAT[heat_idx.min(36)];
+            }
+        }
+
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.fire_grid_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytemuck::cast_slice(&self.retro_fire_upload),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(1024 * 4),
+                rows_per_image: Some(576),
+            },
+            wgpu::Extent3d {
+                width: 1024,
+                height: 576,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    pub fn has_video_stream(&self) -> bool {
+        self.video_state.is_some()
+    }
+
+    pub fn update(&mut self, state: &AppState, dt: f32) {
+        self.frame_count = self.frame_count.wrapping_add(1);
+
+        // Exponential moving average to smooth CPU/GPU scheduling time jitter
+        let alpha = 0.03f64;
+        self.smooth_dt = self.smooth_dt * (1.0 - alpha) + (dt as f64).clamp(0.001, 0.1) * alpha;
+        self.smooth_time =
+            (self.smooth_time + self.smooth_dt).rem_euclid(HOST_TIME_WRAP_PERIOD_SECS);
+        let frame_dt = (self.smooth_dt as f32).clamp(0.0005, 0.1);
+
+        if !state.file_loaded {
+            self.smooth_audio_seconds = 0.0;
+            self.last_raw_state_seconds = 0.0;
+            self.fire_intensity = 0.0;
+            self.vu_prev_active_segments = [0; 32];
+            self.vu_segment_glows = [[0.0; 30]; 32];
+            self.vu_prev_num_channels = 0;
+            self.channel_phases = [0.0; 32];
+            return;
+        }
+
+        // Track pushes to synchronize scrolling phase with physical buffer updates
+        if state.waveform_history_push_count < self.last_history_push_count {
+            self.last_history_push_count = state.waveform_history_push_count;
+            self.time_since_last_push = 0.0;
+        }
+
+        let mut steps = 0;
+        if state.waveform_history_push_count != self.last_history_push_count {
+            let diff = state
+                .waveform_history_push_count
+                .saturating_sub(self.last_history_push_count);
+            steps = diff as u32;
+            self.heatmap_row = (self.heatmap_row + steps) % 1024;
+
+            // Measure the actual elapsed time between buffer pushes to stay in perfect
+            // phase with the audio callback cadence (e.g. PipeWire/ALSA vs WASAPI)
+            if self.time_since_last_push > 0.002 && self.time_since_last_push < 0.25 {
+                let interval_per_step = self.time_since_last_push / (steps as f64).max(1.0);
+                self.measured_push_interval =
+                    self.measured_push_interval * 0.8 + interval_per_step * 0.2;
+            }
+
+            self.time_since_last_push = 0.0;
+            self.last_history_push_count = state.waveform_history_push_count;
+        } else if !state.is_paused && state.file_loaded && !state.track_ended {
+            // Use the real frame dt (not the heavily-smoothed EMA) so the
+            // sub-frame scroll interpolation stays in phase with the actual
+            // DSP push cadence and does not judder.
+            self.time_since_last_push += (dt as f64).clamp(0.0, 0.1);
+        }
+
+        // Target interval between pushes: use measured cadence with fallback to target_fps
+        let push_interval =
+            if self.measured_push_interval > 0.002 && self.measured_push_interval < 0.25 {
+                self.measured_push_interval
+            } else if state.target_fps > 0 {
+                1.0 / state.target_fps as f64
+            } else {
+                1.0 / 60.0
+            };
+
+        // Smoothly interpolate within the current frame push window
+        let step_fraction = (self.time_since_last_push / push_interval).clamp(0.0, 1.0) as f32;
+
+        // Animation time: advances in real time, scaled by 2.88 to preserve the
+        // look that was tuned at 144fps (144 pushes/s * 0.02s = 2.88 anim-seconds
+        // per real second). Render-framerate independent. Uses the EMA-smoothed
+        // dt to avoid CPU scheduling judder. Only advances while playing.
+        if !state.is_paused && state.file_loaded && !state.track_ended {
+            self.play_time += self.smooth_dt * 2.88;
+        }
+
+        // Smooth display-rate audio playhead clock for visualizers (such as Retro Tape Head)
+        if let Some(scrub_t) = state.scrub_target_seconds {
+            self.smooth_audio_seconds = scrub_t;
+            self.last_raw_state_seconds = state.current_seconds;
+        } else if !state.file_loaded {
+            self.smooth_audio_seconds = 0.0;
+            self.last_raw_state_seconds = 0.0;
+        } else if state.is_paused
+            || state.track_ended
+            || state.seek_request.is_some()
+            || (state.current_seconds - self.last_raw_state_seconds).abs() > 0.20
+        {
+            self.smooth_audio_seconds = state.current_seconds;
+            self.last_raw_state_seconds = state.current_seconds;
+        } else {
+            self.smooth_audio_seconds += (dt as f64).clamp(0.0, 0.1);
+            let drift = state.current_seconds - self.smooth_audio_seconds;
+            if drift.abs() > 0.12 {
+                self.smooth_audio_seconds = state.current_seconds;
+            } else if (state.current_seconds - self.last_raw_state_seconds).abs() > 1e-6 {
+                self.smooth_audio_seconds += drift * 0.25;
+            }
+            if state.duration_seconds > 0.0 {
+                self.smooth_audio_seconds =
+                    self.smooth_audio_seconds.clamp(0.0, state.duration_seconds);
+            }
+            self.last_raw_state_seconds = state.current_seconds;
+        }
+
+        // Progress bar fire dies off when playback stops / pauses / ends / reaches end of song
+        self.fire_intensity = Self::step_fire_intensity(self.fire_intensity, state, frame_dt);
+
+        // World-Z camera position locked to history rows (0.5 units/row), used by
+        // visualizers that scroll with the waveform/spectrum history ring buffer.
+        // Wrapped modulo 6000.0 (12,000 rows) in integer math first to maintain precision.
+        self.last_history_cam_z =
+            (((self.last_history_push_count % 12_000) as f64 + step_fraction as f64) * 0.5)
+                % 6000.0;
+        let upmix_active = state
+            .surround_upmix
+            .is_active_for_hardware(state.hardware_channels);
+        let mut uniforms = AudioUniforms {
+            spectrum: [0.0; 1024],
+            fire_heat: [0.0; 1024],
+            channels: [0.0; 32],
+            channel_peaks: [0.0; 32],
+            spatial_channels: [0.0; 16],
+            display_order: [0; 16],
+            channel_phases: self.channel_phases,
+            vu_segment_glows: [0; 256],
+            num_channels: state.channel_vus.len().min(32) as u32,
+            mode: state.visualizer_mode,
+            time: if state.duration_seconds > 0.0 {
+                self.smooth_audio_seconds as f32
+            } else {
+                wrap_host_phase_time(self.smooth_audio_seconds)
+            },
+            duration: state.duration_seconds as f32,
+            smooth_time: wrap_host_phase_time(self.play_time),
+            heatmap_row: self.heatmap_row,
+            fft_channels: state.raw_audio_channels.len() as u32,
+            num_spatial_channels: if upmix_active {
+                state.channel_vus.len().min(16) as u32
+            } else if let Some(tc) = state.tracker_channels.filter(|&n| n > 0) {
+                (tc as u32).min(16)
+            } else {
+                state.channel_vus.len().min(16) as u32
+            },
+            ui_meters_rect: self.meters_uv_rect,
+            ui_heatmap_rect: self.heatmap_uv_rect,
+            ui_fire_rect: self.fire_uv_rect,
+            waveform_resolution: 1024,
+            waveform_history_size: 144,
+            frame_count: self.frame_count,
+            step_fraction,
+            steps_to_fill: steps,
+            aspect_ratio: self.last_aspect_ratio,
+            frame_dt,
+            history_cam_z: self.last_history_cam_z as f32,
+            fire_intensity: self.fire_intensity,
+            waveform_history_ring_base: self.waveform_ring_base,
+            _pad2: 0.0,
+            _pad3: 0.0,
+        };
+        self.last_steps_to_fill = steps;
+
+        uniforms.spectrum.copy_from_slice(&state.spectrum_data);
+        uniforms.fire_heat.copy_from_slice(&state.fire_heat);
+
+        // Update needle physics for 3D retro VU meters
+        let ch_count = state.channel_vus.len().max(2);
+        if self.vu_needle_angles.len() < ch_count {
+            self.vu_needle_angles.resize(ch_count, 0.0);
+            self.vu_needle_velocities.resize(ch_count, 0.0);
+        }
+
+        let rise_time_secs = 0.30;
+        let damping_ratio = 0.85;
+        let omega_n = 4.8 / rise_time_secs;
+        let spring = omega_n * omega_n;
+        let damping = 2.0 * damping_ratio * omega_n;
+
+        let dt_clamped = frame_dt.min(0.05);
+        for i in 0..ch_count {
+            let target = if i < state.raw_channel_vus.len() {
+                state.raw_channel_vus[i]
+            } else if !state.file_loaded {
+                // Sway gently if no file is loaded
+                let t = self.smooth_time as f32;
+                let offset = if i == 0 { 0.0 } else { 1.5 };
+                (0.12 * (t * 2.0 + offset).sin() + 0.15 * (t * 3.7 - offset).cos() + 0.2)
+                    .clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let angle = self.vu_needle_angles[i];
+            let vel = self.vu_needle_velocities[i];
+
+            let acceleration = spring * (target - angle) - damping * vel;
+            let new_vel = vel + acceleration * dt_clamped;
+            let mut new_angle = angle + new_vel * dt_clamped;
+
+            if new_angle < -0.05 {
+                new_angle = -0.05;
+                self.vu_needle_velocities[i] = 0.0;
+            } else if new_angle > 1.1 {
+                new_angle = 1.1;
+                self.vu_needle_velocities[i] = -new_vel * 0.2; // pin bounce
+            } else {
+                self.vu_needle_velocities[i] = new_vel;
+            }
+            self.vu_needle_angles[i] = new_angle;
+        }
+
+        let ch_len = state.channel_vus.len().min(32);
+
+        // 1. Populate UI Display Channels (may be visually remapped)
+        let mut display_order: Vec<usize> = (0..ch_len).collect();
+        if state.tracker_channels.is_none() || upmix_active {
+            if ch_len == 6 {
+                display_order = vec![4, 0, 2, 3, 1, 5]; // Ls, L, C, LFE, R, Rs
+            } else if ch_len == 8 {
+                // SMPTE 7.1: ch4=Ls(side), ch5=Rs(side), ch6=Lrs(rear), ch7=Rrs(rear)
+                display_order = vec![6, 4, 0, 2, 3, 1, 5, 7]; // Lrs, Ls, L, C, LFE, R, Rs, Rrs
+            } else if ch_len == 12 {
+                // 7.1.4 HUD display order matching ["Ltr", "Ltf", "Ls", "L", "C", "LFE", "R", "Rs", "Rtf", "Rtr", "Lrs", "Rrs"]
+                display_order = vec![10, 8, 4, 0, 2, 3, 1, 5, 9, 11, 6, 7];
+            } else if ch_len == 16 {
+                // 16 channels: fan out symmetrically from C with LFE (3) positioned physically but skipped by shaders
+                display_order = vec![14, 12, 10, 8, 6, 4, 0, 2, 3, 1, 5, 7, 9, 11, 13, 15];
+            }
+        }
+
+        for (disp_idx, &src_idx) in display_order.iter().enumerate() {
+            if disp_idx < 16 {
+                uniforms.display_order[disp_idx] = src_idx as u32;
+            }
+            if src_idx < state.channel_vus.len() {
+                uniforms.channels[disp_idx] = state.channel_vus[src_idx];
+                uniforms.channel_peaks[disp_idx] =
+                    state.peak_vus.get(src_idx).copied().unwrap_or(0.0);
+            }
+        }
+
+        // 2. Populate Raw Spatial Channels (strict spatial mapping without UI reordering,
+        // blending fast raw_channel_vus for crisp per-note speaker cone & light transients)
+        let get_fast_vu = |idx: usize| -> f32 {
+            let smoothed = state.channel_vus.get(idx).copied().unwrap_or(0.0);
+            if let Some(&raw) = state.raw_channel_vus.get(idx) {
+                raw * 0.72 + smoothed * 0.28
+            } else {
+                smoothed
+            }
+        };
+        if let Some(num_tracks) = state.tracker_channels.filter(|&n| n > 0 && !upmix_active) {
+            // For tracker files, channel_vus is [L_Peak, Track1..N, R_Peak].
+            // Map individual tracker tracks into spatial channels so surround/room visualizers
+            // light up each speaker with its actual instrument track!
+            let tracks_count = (num_tracks as usize).min(state.channel_vus.len().saturating_sub(2));
+            if tracks_count > 0 {
+                let count = tracks_count.min(16);
+                for i in 0..count {
+                    uniforms.spatial_channels[i] = get_fast_vu(i + 1);
+                }
+            } else if state.channel_vus.len() >= 2 {
+                uniforms.spatial_channels[0] = get_fast_vu(0);
+                uniforms.spatial_channels[1] = get_fast_vu(state.channel_vus.len() - 1);
+            }
+        } else {
+            let spatial_count = state.channel_vus.len().min(16);
+            for i in 0..spatial_count {
+                uniforms.spatial_channels[i] = get_fast_vu(i);
+            }
+        }
+
+        if state.visualizer_mode == 19 {
+            let actual_ch = state.channel_vus.len().max(2);
+            uniforms.num_channels = actual_ch as u32;
+            for (disp_idx, &src_idx) in display_order.iter().enumerate() {
+                if disp_idx < 32 {
+                    uniforms.channels[disp_idx] = if src_idx < self.vu_needle_angles.len() {
+                        self.vu_needle_angles[src_idx]
+                    } else {
+                        0.0
+                    };
+                }
+            }
+            for i in 0..actual_ch.min(16) {
+                uniforms.spatial_channels[i] = if i < self.vu_needle_angles.len() {
+                    self.vu_needle_angles[i]
+                } else {
+                    0.0
+                };
+            }
+        }
+
+        if uniforms.num_channels != self.vu_prev_num_channels {
+            self.vu_prev_active_segments = [0; 32];
+            self.vu_segment_glows = [[0.0; 30]; 32];
+            self.vu_prev_num_channels = uniforms.num_channels;
+        }
+        uniforms.vu_segment_glows = Self::step_vu_phosphor_ghosts(
+            &mut self.vu_prev_active_segments,
+            &mut self.vu_segment_glows,
+            &uniforms.channels,
+            uniforms.num_channels,
+            frame_dt,
+        );
+
+        if state.visualizer_mode == 23 {
+            let display_secs = state.scrub_target_seconds.unwrap_or(state.current_seconds);
+            let active_idx = state
+                .lyrics
+                .as_ref()
+                .and_then(|l| l.find_current_line_idx(display_secs));
+
+            // Smooth 500+ FPS frame-interpolated slam timer accumulated in f64
+            if active_idx != self.last_lyric_line_idx {
+                self.last_lyric_line_idx = active_idx;
+                self.lyric_slam_timer = 0.0;
+            } else if !state.is_paused && state.file_loaded && !state.track_ended {
+                self.lyric_slam_timer += self.smooth_dt.clamp(0.0005, 0.1);
+            }
+
+            let (char_bytes, line_progress, is_instrumental, line_duration) =
+                if let Some(lyrics) = &state.lyrics {
+                    if !lyrics.lines.is_empty() {
+                        if let Some(idx) = active_idx {
+                            let cur_time = lyrics.lines[idx].time_seconds;
+                            let next_time = if idx + 1 < lyrics.lines.len() {
+                                lyrics.lines[idx + 1].time_seconds
+                            } else {
+                                cur_time + 4.0
+                            };
+                            let dur = (next_time - cur_time).max(0.1) as f32;
+                            let elapsed = (display_secs - cur_time).max(0.0) as f32;
+                            let prog = (elapsed / dur).clamp(0.0, 1.0);
+                            let text = lyrics.lines[idx].text.trim().to_uppercase();
+                            let bytes = text.into_bytes();
+
+                            let gap = (next_time - display_secs) as f32;
+                            let is_inst =
+                                if (next_time - cur_time) > 4.5 && elapsed > 2.5 && gap > 1.5 {
+                                    1.0
+                                } else {
+                                    0.0
+                                };
+                            (bytes, prog, is_inst, dur)
+                        } else {
+                            // Intro
+                            let first_time = lyrics.lines[0].time_seconds;
+                            let prog = (display_secs / first_time.max(0.1)).clamp(0.0, 1.0) as f32;
+                            ("RUSTTRACKER".to_string().into_bytes(), prog, 1.0, 4.0)
+                        }
+                    } else {
+                        let title = if !state.song_title.is_empty() {
+                            state.song_title.trim().to_uppercase()
+                        } else {
+                            "RUSTTRACKER".to_string()
+                        };
+                        (title.into_bytes(), 0.0, 1.0, 4.0)
+                    }
+                } else {
+                    let title = if !state.song_title.is_empty() {
+                        state.song_title.trim().to_uppercase()
+                    } else {
+                        "RUSTTRACKER".to_string()
+                    };
+                    (title.into_bytes(), 0.0, 1.0, 4.0)
+                };
+
+            let slam_t_f64 = self.lyric_slam_timer;
+            let bass = if state.spectrum_data.len() > 4 {
+                (state.spectrum_data[1..5]
+                    .iter()
+                    .copied()
+                    .fold(0.0f32, f32::max)
+                    / 65.0)
+                    .clamp(0.0, 1.5)
+            } else {
+                0.0
+            };
+
+            // Calculate exact slam vertical drop, water plunge, and continuous fluid buoyancy in f64
+            let slam_y = if slam_t_f64 < 0.28 {
+                // Gravity drop from y = 3.5 down to 0.0
+                let t_norm = (slam_t_f64 / 0.28).clamp(0.0, 1.0) as f32;
+                3.5 * (1.0 - t_norm * t_norm)
+            } else {
+                // Water impact, plunge and damped spring bobbing
+                let dt_impact = slam_t_f64 - 0.28;
+                let impact_spring =
+                    (-0.32 * (-3.6 * dt_impact).exp() * (9.5 * dt_impact).cos()) as f32;
+                // Gentle continuous idle buoyancy on the water surface after impact settles
+                let settle = (1.0 - (-2.0 * dt_impact).exp()) as f32;
+                let idle_bob = (((slam_t_f64 * 1.6).sin() * 0.022
+                    + (slam_t_f64 * 0.85).cos() * 0.014) as f32)
+                    * settle;
+                let bass_swell = bass * 0.03 * settle;
+                impact_spring + idle_bob + bass_swell
+            };
+            let slam_t = if slam_t_f64 > 10.0 {
+                10.0 + ((slam_t_f64 - 10.0).rem_euclid(HOST_TIME_WRAP_PERIOD_SECS)) as f32
+            } else {
+                slam_t_f64 as f32
+            };
+
+            let char_count = char_bytes.len().min(64);
+
+            // Store lyric parameters in fire_heat array (without touching ui_meters_rect or display_order!)
+            uniforms.fire_heat[0] = slam_t;
+            uniforms.fire_heat[1] = slam_y;
+            uniforms.fire_heat[2] = line_progress;
+            uniforms.fire_heat[3] = char_count as f32;
+            uniforms.fire_heat[4] = line_duration;
+            uniforms.fire_heat[5] = is_instrumental;
+            uniforms.fire_heat[6] = bass;
+            uniforms.fire_heat[7] = ((char_count as f32) * 0.28).clamp(1.5, 5.0); // Estimated text half-width
+
+            for (i, &b) in char_bytes.iter().take(64).enumerate() {
+                uniforms.fire_heat[16 + i] = b as f32;
+            }
+
+            let active_text_str = String::from_utf8_lossy(&char_bytes).to_string();
+            if self.current_lyric_mesh_text != active_text_str {
+                let (vertices, indices) = generate_glass_lyrics_mesh(&active_text_str);
+                let req_v_bytes = (vertices.len() * std::mem::size_of::<Vertex>()).max(64) as u64;
+                let req_i_bytes = (indices.len() * std::mem::size_of::<u32>()).max(64) as u64;
+                let index_count = indices.len() as u32;
+
+                if let Some(existing) = self
+                    .mesh_registry
+                    .get_mut(&crate::state::Geometry::GlassLyricsScene)
+                {
+                    if req_v_bytes > existing.vertex_capacity {
+                        let new_cap = (req_v_bytes * 3 / 2).max(4096);
+                        existing.vertex_buffer =
+                            self.device.create_buffer(&wgpu::BufferDescriptor {
+                                label: Some("Mesh Vertex Buffer GlassLyricsScene"),
+                                size: new_cap,
+                                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                                mapped_at_creation: false,
+                            });
+                        existing.vertex_capacity = new_cap;
+                    }
+                    if !vertices.is_empty() {
+                        self.queue.write_buffer(
+                            &existing.vertex_buffer,
+                            0,
+                            bytemuck::cast_slice(&vertices),
+                        );
+                    }
+
+                    if req_i_bytes > existing.index_capacity {
+                        let new_cap = (req_i_bytes * 3 / 2).max(4096);
+                        existing.index_buffer =
+                            self.device.create_buffer(&wgpu::BufferDescriptor {
+                                label: Some("Mesh Index Buffer GlassLyricsScene"),
+                                size: new_cap,
+                                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                                mapped_at_creation: false,
+                            });
+                        existing.index_capacity = new_cap;
+                    }
+                    if !indices.is_empty() {
+                        self.queue.write_buffer(
+                            &existing.index_buffer,
+                            0,
+                            bytemuck::cast_slice(&indices),
+                        );
+                    }
+                    existing.index_count = index_count;
+                } else {
+                    let vertex_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("Mesh Vertex Buffer GlassLyricsScene"),
+                        size: req_v_bytes,
+                        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    self.queue
+                        .write_buffer(&vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+                    let index_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("Mesh Index Buffer GlassLyricsScene"),
+                        size: req_i_bytes,
+                        usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    });
+                    self.queue
+                        .write_buffer(&index_buffer, 0, bytemuck::cast_slice(&indices));
+                    self.mesh_registry.insert(
+                        crate::state::Geometry::GlassLyricsScene,
+                        MeshBuffers {
+                            vertex_buffer,
+                            index_buffer,
+                            vertex_capacity: req_v_bytes,
+                            index_capacity: req_i_bytes,
+                            index_count,
+                        },
+                    );
+                }
+
+                let lyrics_indirect: [u32; 5] = [index_count, 1, 0, 0, 0];
+                self.queue.write_buffer(
+                    &self.lyrics_indirect_args_buffer,
+                    0,
+                    bytemuck::cast_slice(&lyrics_indirect),
+                );
+                self.current_lyric_mesh_text = active_text_str;
+            }
+        }
+
+        let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
+        let vis_width = state.visual_width.clamp(128, 2048);
+        uniforms.waveform_resolution = vis_width;
+        let max_hist_rows = if vis_def.id == 3 { 96usize } else { 144usize };
+        let hist_len = state.waveform_history.len();
+        let logical_rows = if vis_def.id == 3 {
+            96usize
+        } else {
+            hist_len.min(WAVEFORM_HISTORY_RING_CAP)
+        };
+        uniforms.waveform_history_size = logical_rows as u32;
+        uniforms.step_fraction = step_fraction;
+
+        // Only upload waveform history when the active visualizer requires it,
+        // and only when new rows were pushed or the width/mode changed (uploads
+        // only newly pushed 8KB rows into the 144-slot GPU ring buffer in steady state).
+        let history_dirty = is_waveform_history_dirty(
+            state.waveform_history_push_count,
+            self.last_uploaded_push_count,
+            hist_len,
+            self.last_uploaded_hist_len,
+            vis_width,
+            self.last_uploaded_vis_width,
+            vis_def.id,
+            self.last_uploaded_vis_id,
+        );
+        if vis_def.id == 24 && (!state.is_paused || history_dirty) {
+            crate::audio::update_lookahead_timeline_from_queue(
+                &state.lookahead_queue,
+                &state.raw_waveform,
+                &state.raw_channel_vus,
+                self.smooth_audio_seconds,
+                &mut self.tape_timeline_scratch,
+            );
+            self.last_uploaded_push_count = state.waveform_history_push_count;
+            self.last_uploaded_vis_width = vis_width;
+            self.last_uploaded_vis_id = vis_def.id;
+            self.last_uploaded_hist_len = usize::MAX;
+            self.waveform_ring_head = 0;
+            self.waveform_ring_base = 0;
+            self.queue.write_buffer(
+                &self.waveform_storage_buffer,
+                0,
+                bytemuck::cast_slice(&self.tape_timeline_scratch),
+            );
+        } else if vis_def.requires_history && history_dirty {
+            let new_rows = state
+                .waveform_history_push_count
+                .wrapping_sub(self.last_uploaded_push_count);
+            let smooth_rows = vis_def.id != 3;
+            let can_append_ring = vis_def.id == self.last_uploaded_vis_id
+                && vis_width == self.last_uploaded_vis_width
+                && self.last_uploaded_hist_len > 0
+                && (1..=16).contains(&new_rows)
+                && hist_len
+                    == (self.last_uploaded_hist_len + new_rows as usize)
+                        .min(WAVEFORM_HISTORY_RING_CAP);
+
+            self.last_uploaded_push_count = state.waveform_history_push_count;
+            self.last_uploaded_vis_width = vis_width;
+            self.last_uploaded_vis_id = vis_def.id;
+            self.last_uploaded_hist_len = hist_len;
+
+            let visual_width_usize = vis_width as usize;
+            let format_wave_row = |dst: &mut [f32], wave: &[f32]| {
+                let wave_len = wave.len().min(visual_width_usize);
+                if wave_len > 0 {
+                    dst[..wave_len].copy_from_slice(&wave[..wave_len]);
+                    if wave_len < visual_width_usize {
+                        dst[wave_len..visual_width_usize].fill(0.0);
+                    }
+                    // Simple pre-smoothing inline for 2D CRT trace (skip for 3D Oscilloscope
+                    // so 3D ridges retain crisp transient height)
+                    if smooth_rows && wave_len > 2 {
+                        let mut prev = dst[0];
+                        for j in 1..wave_len - 1 {
+                            let curr = dst[j];
+                            let next = dst[j + 1];
+                            dst[j] = (prev + curr * 2.0 + next) / 4.0;
+                            prev = curr;
+                        }
+                    }
+                } else {
+                    dst[..visual_width_usize].fill(0.0);
+                }
+            };
+
+            if can_append_ring {
+                let append_count = new_rows as usize;
+                for i in 0..append_count {
+                    let wave = &state.waveform_history[hist_len - append_count + i];
+                    let offset = i * 2048;
+                    format_wave_row(&mut self.waveform_history_flat[offset..offset + 2048], wave);
+                    if visual_width_usize < 2048 {
+                        self.waveform_history_flat[offset + visual_width_usize..offset + 2048]
+                            .fill(0.0);
+                    }
+                    pack_wave_row_f16(
+                        &self.waveform_history_flat[offset..offset + 2048],
+                        &mut self.waveform_history_packed[i * 1024..(i + 1) * 1024],
+                    );
+                }
+                let first_rows =
+                    append_count.min(WAVEFORM_HISTORY_RING_CAP - self.waveform_ring_head);
+                self.queue.write_buffer(
+                    &self.waveform_storage_buffer,
+                    (self.waveform_ring_head * 1024 * 4) as u64,
+                    bytemuck::cast_slice(&self.waveform_history_packed[..first_rows * 1024]),
+                );
+                if first_rows < append_count {
+                    self.queue.write_buffer(
+                        &self.waveform_storage_buffer,
+                        0,
+                        bytemuck::cast_slice(
+                            &self.waveform_history_packed[first_rows * 1024..append_count * 1024],
+                        ),
+                    );
+                }
+                self.waveform_ring_head =
+                    (self.waveform_ring_head + append_count) % WAVEFORM_HISTORY_RING_CAP;
+                self.waveform_ring_base =
+                    compute_waveform_ring_base(self.waveform_ring_head, logical_rows);
+            } else {
+                // Full linear resync: upload up to max_hist_rows most recent frames
+                // (right-aligned with leading zero-padding for 3D Oscilloscope), packed 2× as f16.
+                let start = hist_len.saturating_sub(max_hist_rows);
+                let count = hist_len.min(max_hist_rows);
+                let pad_slots = if vis_def.id == 3 {
+                    max_hist_rows.saturating_sub(count)
+                } else {
+                    0
+                };
+                if pad_slots > 0 {
+                    self.waveform_history_flat[..pad_slots * 2048].fill(0.0);
+                    self.waveform_history_packed[..pad_slots * 1024].fill(0);
+                }
+
+                for (i, wave) in state
+                    .waveform_history
+                    .iter()
+                    .skip(start)
+                    .enumerate()
+                    .take(max_hist_rows)
+                {
+                    let slot = pad_slots + i;
+                    let offset = slot * 2048;
+                    format_wave_row(&mut self.waveform_history_flat[offset..offset + 2048], wave);
+                    if visual_width_usize < 2048 {
+                        self.waveform_history_flat[offset + visual_width_usize..offset + 2048]
+                            .fill(0.0);
+                    }
+                    pack_wave_row_f16(
+                        &self.waveform_history_flat[offset..offset + 2048],
+                        &mut self.waveform_history_packed[slot * 1024..(slot + 1) * 1024],
+                    );
+                }
+                let total_slots = pad_slots + count;
+                if total_slots > 0 {
+                    self.queue.write_buffer(
+                        &self.waveform_storage_buffer,
+                        0,
+                        bytemuck::cast_slice(&self.waveform_history_packed[..total_slots * 1024]),
+                    );
+                }
+                self.waveform_ring_head = total_slots % WAVEFORM_HISTORY_RING_CAP;
+                self.waveform_ring_base = 0;
+            }
+        }
+
+        uniforms.waveform_history_ring_base = self.waveform_ring_base;
+        self.pending_uniforms = Some(uniforms);
+
+        if vis_def.requires_fire && (!state.is_paused || self.fire_intensity > 0.001) {
+            if vis_def.id == 5 {
+                let start_sim = std::time::Instant::now();
+                self.update_retro_fire(state, &uniforms);
+                let elapsed_us = start_sim.elapsed().as_micros() as f32;
+                self.cached_fire_us = Some(elapsed_us);
+            } else {
+                let mut bass_sum = 0.0;
+                let mut mids_sum = 0.0;
+                let mut highs_sum = 0.0;
+                for i in 0..64 {
+                    bass_sum += uniforms.fire_heat[i];
+                }
+                let bass = (bass_sum / 64.0 / 100.0).min(1.0);
+                for i in 64..512 {
+                    mids_sum += uniforms.fire_heat[i];
+                }
+                let mids = (mids_sum / 448.0 / 100.0).min(1.0);
+                for i in 512..1024 {
+                    highs_sum += uniforms.fire_heat[i];
+                }
+                let highs = (highs_sum / 512.0 / 100.0).min(1.0);
+
+                let n_ch = state.channel_vus.len().clamp(1, 32);
+                let lfe_idx =
+                    if (n_ch == 6 || n_ch == 8 || n_ch == 16) && state.tracker_channels.is_none() {
+                        3
+                    } else {
+                        999
+                    };
+
+                let mut fire_params = FireParams {
+                    bass,
+                    mids,
+                    highs,
+                    time: wrap_host_phase_time(self.play_time),
+                    cooling_factor: 1.0 - mids * 0.5,
+                    turb_spread_f: self.fire_intensity,
+                    width: 1024,
+                    height: 576,
+                    num_channels: ch_len as u32,
+                    lfe_idx: lfe_idx as u32,
+                    fft_channels: state.raw_audio_channels.len() as u32,
+                    dt: frame_dt,
+                    display_order: [0; 16],
+                    channels: [[0.0; 4]; 8],
+                };
+
+                for i in 0..16 {
+                    fire_params.display_order[i] = uniforms.display_order[i];
+                }
+                for i in 0..n_ch {
+                    fire_params.channels[i / 4][i % 4] = uniforms.channels[i];
+                }
+
+                self.queue.write_buffer(
+                    &self.fire_params_buffer,
+                    0,
+                    bytemuck::cast_slice(&[fire_params]),
+                );
+            }
+        }
+
+        // GPU spectrum is consumed only by the firesim compute (id 6) and the
+        // resynth compute (requires_resynth, id 4) — skip the 256KB upload otherwise,
+        // and only upload when new audio FFT data arrived (history_dirty)
+        if (vis_def.id == 6 || vis_def.requires_resynth)
+            && !state.gpu_spectrum_data.is_empty()
+            && history_dirty
+        {
+            self.last_uploaded_push_count = state.waveform_history_push_count;
+            self.last_uploaded_vis_width = vis_width;
+            self.last_uploaded_vis_id = vis_def.id;
+            self.queue.write_buffer(
+                &self._gpu_spectrum_buffer,
+                0,
+                bytemuck::cast_slice(&state.gpu_spectrum_data),
+            );
+        }
+
+        if let Some(rx) = &state.video_frame_rx {
+            let mut latest_frame = None;
+            while let Ok(frame) = rx.try_recv() {
+                if let Some(old_frame) = latest_frame.take()
+                    && let Some(tx) = &state.free_video_frame_tx
+                {
+                    let _ = tx.try_send(old_frame);
+                }
+                latest_frame = Some(frame);
+            }
+
+            if let Some(frame) = latest_frame {
+                if frame.width >= 2 && frame.height >= 2 {
+                    let use_16bit =
+                        frame.bit_depth > 8 && self.negotiated_features.texture_format_16bit_norm;
+                    let effective_bit_depth = if frame.bit_depth > 8 && !use_16bit {
+                        8u32
+                    } else {
+                        frame.bit_depth as u32
+                    };
+                    let is_semi_planar = frame.chroma_layout.is_semi_planar();
+                    let needs_init = !self.video_state.as_ref().is_some_and(|vs| {
+                        vs.width == frame.width
+                            && vs.height == frame.height
+                            && vs.use_16bit_textures == use_16bit
+                            && vs.chroma_layout.is_semi_planar() == is_semi_planar
+                    });
+                    if needs_init {
+                        let y_format = if use_16bit {
+                            wgpu::TextureFormat::R16Unorm
+                        } else {
+                            wgpu::TextureFormat::R8Unorm
+                        };
+                        let u_format = match (is_semi_planar, use_16bit) {
+                            (true, true) => wgpu::TextureFormat::Rg16Unorm,
+                            (true, false) => wgpu::TextureFormat::Rg8Unorm,
+                            (false, true) => wgpu::TextureFormat::R16Unorm,
+                            (false, false) => wgpu::TextureFormat::R8Unorm,
+                        };
+                        let v_format = if is_semi_planar {
+                            wgpu::TextureFormat::R8Unorm
+                        } else {
+                            y_format
+                        };
+                        let y_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                            label: Some("Video Y Texture"),
+                            size: wgpu::Extent3d {
+                                width: frame.width,
+                                height: frame.height,
+                                depth_or_array_layers: 1,
+                            },
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: y_format,
+                            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                                | wgpu::TextureUsages::COPY_DST,
+                            view_formats: &[],
+                        });
+                        let u_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                            label: Some(if is_semi_planar {
+                                "Video UV Texture (NV12/NV21/P010)"
+                            } else {
+                                "Video U Texture"
+                            }),
+                            size: wgpu::Extent3d {
+                                width: frame.width / 2,
+                                height: frame.height / 2,
+                                depth_or_array_layers: 1,
+                            },
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: u_format,
+                            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                                | wgpu::TextureUsages::COPY_DST,
+                            view_formats: &[],
+                        });
+                        let v_texture = self.device.create_texture(&wgpu::TextureDescriptor {
+                            label: Some(if is_semi_planar {
+                                "Video V Placeholder 1x1"
+                            } else {
+                                "Video V Texture"
+                            }),
+                            size: wgpu::Extent3d {
+                                width: if is_semi_planar { 1 } else { frame.width / 2 },
+                                height: if is_semi_planar { 1 } else { frame.height / 2 },
+                                depth_or_array_layers: 1,
+                            },
+                            mip_level_count: 1,
+                            sample_count: 1,
+                            dimension: wgpu::TextureDimension::D2,
+                            format: v_format,
+                            usage: wgpu::TextureUsages::TEXTURE_BINDING
+                                | wgpu::TextureUsages::COPY_DST,
+                            view_formats: &[],
+                        });
+                        let border_blur_texture =
+                            self.device.create_texture(&wgpu::TextureDescriptor {
+                                label: Some("Video Quarter-Res Border Blur Texture"),
+                                size: wgpu::Extent3d {
+                                    width: (frame.width / 4).max(1),
+                                    height: (frame.height / 4).max(1),
+                                    depth_or_array_layers: 1,
+                                },
+                                mip_level_count: 1,
+                                sample_count: 1,
+                                dimension: wgpu::TextureDimension::D2,
+                                format: wgpu::TextureFormat::Rgba8UnormSrgb,
+                                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                                view_formats: &[],
+                            });
+                        let y_view = y_texture.create_view(&wgpu::TextureViewDescriptor::default());
+                        let u_view = u_texture.create_view(&wgpu::TextureViewDescriptor::default());
+                        let v_view = v_texture.create_view(&wgpu::TextureViewDescriptor::default());
+                        let border_blur_view = border_blur_texture
+                            .create_view(&wgpu::TextureViewDescriptor::default());
+
+                        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+                            label: Some("Video Sampler"),
+                            address_mode_u: wgpu::AddressMode::ClampToEdge,
+                            address_mode_v: wgpu::AddressMode::ClampToEdge,
+                            address_mode_w: wgpu::AddressMode::ClampToEdge,
+                            mag_filter: wgpu::FilterMode::Linear,
+                            min_filter: wgpu::FilterMode::Linear,
+                            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+                            ..Default::default()
+                        });
+
+                        let params_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                            label: Some("Video Params Buffer"),
+                            size: std::mem::size_of::<VideoParams>() as u64,
+                            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                            mapped_at_creation: false,
+                        });
+
+                        let blur_bind_group =
+                            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: Some("Video Border Blur Bind Group"),
+                                layout: &self.video_blur_bind_group_layout,
+                                entries: &[
+                                    wgpu::BindGroupEntry {
+                                        binding: 0,
+                                        resource: wgpu::BindingResource::TextureView(&y_view),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 1,
+                                        resource: wgpu::BindingResource::TextureView(&u_view),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 2,
+                                        resource: wgpu::BindingResource::TextureView(&v_view),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 3,
+                                        resource: wgpu::BindingResource::Sampler(&sampler),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 4,
+                                        resource: params_buffer.as_entire_binding(),
+                                    },
+                                ],
+                            });
+
+                        let bind_group =
+                            self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label: Some("Video Bind Group"),
+                                layout: &self.video_bind_group_layout,
+                                entries: &[
+                                    wgpu::BindGroupEntry {
+                                        binding: 0,
+                                        resource: wgpu::BindingResource::TextureView(&y_view),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 1,
+                                        resource: wgpu::BindingResource::TextureView(&u_view),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 2,
+                                        resource: wgpu::BindingResource::TextureView(&v_view),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 3,
+                                        resource: wgpu::BindingResource::Sampler(&sampler),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 4,
+                                        resource: params_buffer.as_entire_binding(),
+                                    },
+                                    wgpu::BindGroupEntry {
+                                        binding: 5,
+                                        resource: wgpu::BindingResource::TextureView(
+                                            &border_blur_view,
+                                        ),
+                                    },
+                                ],
+                            });
+
+                        self.video_state = Some(VideoState {
+                            y_texture,
+                            u_texture,
+                            v_texture,
+                            border_blur_texture,
+                            border_blur_view,
+                            blur_bind_group,
+                            bind_group,
+                            params_buffer,
+                            last_uploaded_params: None,
+                            width: frame.width,
+                            height: frame.height,
+                            rotation: frame.rotation,
+                            color_space: frame.color_space,
+                            color_range: frame.color_range,
+                            bit_depth: effective_bit_depth,
+                            color_trc: frame.color_trc,
+                            chroma_layout: frame.chroma_layout,
+                            use_16bit_textures: use_16bit,
+                            frame_generation: 0,
+                            blurred_generation: u64::MAX,
+                            blurred_color_key: (u32::MAX, 0, 0, 0, 0),
+                        });
+                    } else if let Some(vs) = &mut self.video_state {
+                        vs.rotation = frame.rotation;
+                        vs.color_space = frame.color_space;
+                        vs.color_range = frame.color_range;
+                        vs.bit_depth = effective_bit_depth;
+                        vs.color_trc = frame.color_trc;
+                        vs.chroma_layout = frame.chroma_layout;
+                    }
+
+                    if let Some(vs) = &mut self.video_state {
+                        vs.frame_generation = if frame.generation != 0 {
+                            frame.generation
+                        } else {
+                            vs.frame_generation.wrapping_add(1).max(1)
+                        };
+
+                        let upload_plane =
+                            |queue: &wgpu::Queue,
+                             scratch: &mut Vec<u8>,
+                             tex: &wgpu::Texture,
+                             plane: &[u8],
+                             src_stride: usize,
+                             tex_w: u32,
+                             tex_h: u32,
+                             channels: usize,
+                             src_16bit: bool,
+                             dst_16bit: bool,
+                             src_bit_depth: u8| {
+                                let dst_bps = if dst_16bit { 2 } else { 1 };
+                                let dst_row_bytes = tex_w as usize * channels * dst_bps;
+                                let aligned_stride =
+                                    crate::state::align_wgpu_row_bytes(dst_row_bytes);
+                                let rows = tex_h as usize;
+
+                                if src_16bit == dst_16bit
+                                    && src_stride == aligned_stride
+                                    && plane.len() >= aligned_stride * rows
+                                {
+                                    // Zero-copy / zero-repack fast path (FFmpeg & Android decoders pre-align to 256B)
+                                    queue.write_texture(
+                                        wgpu::TexelCopyTextureInfo {
+                                            texture: tex,
+                                            mip_level: 0,
+                                            origin: wgpu::Origin3d::ZERO,
+                                            aspect: wgpu::TextureAspect::All,
+                                        },
+                                        &plane[..aligned_stride * rows],
+                                        wgpu::TexelCopyBufferLayout {
+                                            offset: 0,
+                                            bytes_per_row: Some(aligned_stride as u32),
+                                            rows_per_image: Some(tex_h),
+                                        },
+                                        wgpu::Extent3d {
+                                            width: tex_w,
+                                            height: tex_h,
+                                            depth_or_array_layers: 1,
+                                        },
+                                    );
+                                    return;
+                                }
+
+                                let needed = aligned_stride * rows;
+                                if scratch.len() < needed {
+                                    scratch.resize(needed, 0);
+                                }
+                                if src_16bit && !dst_16bit {
+                                    // Graceful 16-bit -> 8-bit fallback for GPUs without TEXTURE_FORMAT_16BIT_NORM
+                                    let shift = match src_bit_depth {
+                                        10 => 2u32,
+                                        12 => 4u32,
+                                        _ => 8u32,
+                                    };
+                                    let samples_per_row = tex_w as usize * channels;
+                                    for r in 0..rows {
+                                        let src_row = r * src_stride;
+                                        let dst_row = r * aligned_stride;
+                                        for s in 0..samples_per_row {
+                                            let idx = src_row + s * 2;
+                                            if idx + 1 < plane.len() {
+                                                let v16 = u16::from_le_bytes([
+                                                    plane[idx],
+                                                    plane[idx + 1],
+                                                ]);
+                                                scratch[dst_row + s] =
+                                                    ((v16 >> shift).min(255)) as u8;
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    for r in 0..rows {
+                                        let src_start = r * src_stride;
+                                        let dst_start = r * aligned_stride;
+                                        if src_start < plane.len() {
+                                            let copy_len =
+                                                dst_row_bytes.min(plane.len() - src_start);
+                                            scratch[dst_start..dst_start + copy_len]
+                                                .copy_from_slice(
+                                                    &plane[src_start..src_start + copy_len],
+                                                );
+                                        }
+                                    }
+                                }
+                                queue.write_texture(
+                                    wgpu::TexelCopyTextureInfo {
+                                        texture: tex,
+                                        mip_level: 0,
+                                        origin: wgpu::Origin3d::ZERO,
+                                        aspect: wgpu::TextureAspect::All,
+                                    },
+                                    &scratch[..needed],
+                                    wgpu::TexelCopyBufferLayout {
+                                        offset: 0,
+                                        bytes_per_row: Some(aligned_stride as u32),
+                                        rows_per_image: Some(tex_h),
+                                    },
+                                    wgpu::Extent3d {
+                                        width: tex_w,
+                                        height: tex_h,
+                                        depth_or_array_layers: 1,
+                                    },
+                                );
+                            };
+
+                        let src_16bit = frame.bit_depth > 8;
+                        upload_plane(
+                            &self.queue,
+                            &mut self.video_repack_scratch,
+                            &vs.y_texture,
+                            &frame.y_plane,
+                            frame.y_stride,
+                            frame.width,
+                            frame.height,
+                            1,
+                            src_16bit,
+                            use_16bit,
+                            frame.bit_depth,
+                        );
+                        upload_plane(
+                            &self.queue,
+                            &mut self.video_repack_scratch,
+                            &vs.u_texture,
+                            &frame.u_plane,
+                            frame.u_stride,
+                            frame.width / 2,
+                            frame.height / 2,
+                            if is_semi_planar { 2 } else { 1 },
+                            src_16bit,
+                            use_16bit,
+                            frame.bit_depth,
+                        );
+                        if !is_semi_planar {
+                            upload_plane(
+                                &self.queue,
+                                &mut self.video_repack_scratch,
+                                &vs.v_texture,
+                                &frame.v_plane,
+                                frame.v_stride,
+                                frame.width / 2,
+                                frame.height / 2,
+                                1,
+                                src_16bit,
+                                use_16bit,
+                                frame.bit_depth,
+                            );
+                        }
+                    }
+                }
+
+                if let Some(tx) = &state.free_video_frame_tx {
+                    let _ = tx.try_send(frame);
+                }
+            }
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub fn render(
+        &mut self,
+        window: &winit::window::Window,
+        egui_ctx: &egui::Context,
+        egui_state: &mut egui_winit::State,
+        state: &AppState,
+        file_dialog: &mut egui_file_dialog::FileDialog,
+        gamepad_events: Vec<egui::Event>,
+    ) -> Result<
+        (
+            EngineAction,
+            f32,
+            f32,
+            Option<f32>,
+            Option<f32>,
+            Option<f32>,
+            f32,
+            f32,
+            f32,
+            f32,
+        ),
+        wgpu::SurfaceStatus,
+    > {
+        let physical_size = window.inner_size();
+        if physical_size.width > 0 && physical_size.height > 0 && physical_size != self.size {
+            self.resize(physical_size);
+        }
+        if self.surface.is_none() {
+            return Err(wgpu::SurfaceStatus::Lost);
+        }
+
+        let mut fft_shader_time_us = self.cached_fft_us;
+        let mut fire_shader_time_us = self.cached_fire_us;
+        let mut vis_shader_time_us = self.cached_vis_us;
+
+        // NON-BLOCKING timestamp readback: poll without waiting, check if mapping completed
+        if self.timestamp_mapping_active {
+            // Non-blocking poll to process any completed GPU work
+            let _ = self.device.poll(wgpu::PollType::Poll);
+
+            if self.timestamp_map_complete.load(Ordering::Acquire)
+                && let Some(read_buffer) = &self.query_read_buffer
+            {
+                let slice = read_buffer.slice(..);
+                let data = slice.get_mapped_range();
+
+                let fft_start: u64 = u64::from_le_bytes(data[0..8].try_into().unwrap());
+                let fft_end: u64 = u64::from_le_bytes(data[8..16].try_into().unwrap());
+                if fft_end > fft_start {
+                    let elapsed_ns = (fft_end - fft_start) as f32 * self.timestamp_period;
+                    fft_shader_time_us = Some(elapsed_ns / 1_000.0);
+                    self.cached_fft_us = fft_shader_time_us;
+                }
+
+                let fire_start: u64 = u64::from_le_bytes(data[16..24].try_into().unwrap());
+                let fire_end: u64 = u64::from_le_bytes(data[24..32].try_into().unwrap());
+                if fire_end > fire_start {
+                    let elapsed_ns = (fire_end - fire_start) as f32 * self.timestamp_period;
+                    fire_shader_time_us = Some(elapsed_ns / 1_000.0);
+                    self.cached_fire_us = fire_shader_time_us;
+                }
+
+                let vis_start: u64 = u64::from_le_bytes(data[32..40].try_into().unwrap());
+                let vis_end: u64 = u64::from_le_bytes(data[40..48].try_into().unwrap());
+                if vis_end > vis_start {
+                    let elapsed_ns = (vis_end - vis_start) as f32 * self.timestamp_period;
+                    vis_shader_time_us = Some(elapsed_ns / 1_000.0);
+                    self.cached_vis_us = vis_shader_time_us;
+                }
+
+                drop(data);
+                read_buffer.unmap();
+                self.timestamp_mapping_active = false;
+            }
+            // If mapping not yet complete, we use cached values from last successful read
+        }
+
+        // Process egui UI
+        let ui_start = std::time::Instant::now();
+        let mut raw_input = egui_state.take_egui_input(window);
+        if (state.hovered_file.is_some() || !raw_input.hovered_files.is_empty())
+            && let Some([x, y]) = state.drag_cursor_pos
+        {
+            raw_input
+                .events
+                .push(egui::Event::PointerMoved(egui::pos2(x, y)));
+        }
+        raw_input.events.extend(gamepad_events);
+        let mut central_rect = egui::Rect::from_min_max(
+            Default::default(),
+            egui::pos2(self.config.width as f32, self.config.height as f32),
+        );
+        let mut engine_action = EngineAction::None;
+
+        let mut out_meters_rect = None;
+        let mut out_fire_rect = None;
+        let mut out_heatmap_rect = None;
+        let mut out_track_info_rect = None;
+        let mut out_top_panel_rect = None;
+        let mut out_video_rect = None;
+
+        let vis_name = crate::state::VISUALIZERS
+            .get(state.current_visualizer_idx)
+            .map(|v| v.name)
+            .unwrap_or("Unknown");
+
+        let mut video_info_str = None;
+        if let Some(vs) = &self.video_state {
+            let cs = match vs.color_space {
+                9 | 10 => "HDR BT.2020",
+                5 | 6 => "SD BT.601",
+                _ => "HD BT.709",
+            };
+            let cr = match vs.color_range {
+                2 => "Full Range",
+                _ => "Limited Range",
+            };
+            let (disp_w, disp_h) = if vs.rotation == 90 || vs.rotation == 270 {
+                (vs.height, vs.width)
+            } else {
+                (vs.width, vs.height)
+            };
+            let disp_bits = if vs.bit_depth == 16 { 10 } else { vs.bit_depth };
+            let fps_suffix = if state.stats.video_fps > 0.0 {
+                if (state.stats.video_fps - state.stats.video_fps.round()).abs() < 0.05 {
+                    format!(" @ {:.0} fps", state.stats.video_fps.round())
+                } else {
+                    format!(" @ {:.2} fps", state.stats.video_fps)
+                }
+            } else {
+                String::new()
+            };
+            let hw_suffix = if !state.stats.video_hw_decoder.is_empty() {
+                format!(" | {}", state.stats.video_hw_decoder)
+            } else {
+                String::new()
+            };
+            video_info_str = Some(format!(
+                "{}x{}{} | {} {}-bit {}{}",
+                disp_w, disp_h, fps_suffix, cs, disp_bits, cr, hw_suffix
+            ));
+        }
+
+        let full_output = egui_ctx.run_ui(raw_input, |ctx| {
+            if state.is_url_dialog_open {
+                let url_modal_w = (ctx.viewport_rect().width() - 24.0).clamp(260.0, 600.0);
+                let url_modal_max_h = (ctx.viewport_rect().height() - 32.0).clamp(240.0, 500.0);
+                egui::Window::new("Open Stream / Device")
+                    .collapsible(false)
+                    .resizable(false)
+                    .default_width(url_modal_w)
+                    .min_width(url_modal_w)
+                    .max_width(url_modal_w)
+                    .max_height(url_modal_max_h)
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .show(ctx, |ui| {
+                        ui.label(egui::RichText::new("Network Stream / URL:").strong());
+                        ui.label("Enter Stream URL (e.g. .pls, .m3u, or direct stream link):");
+                        ui.add_space(4.0);
+                        let mut url_text = state.url_input_text.clone();
+                        let text_resp = ui.add(
+                            egui::TextEdit::singleline(&mut url_text)
+                                .desired_width(f32::INFINITY)
+                                .min_size(egui::vec2(0.0, 30.0))
+                        );
+                        if state.focus_url_input {
+                            text_resp.request_focus();
+                            engine_action = EngineAction::ClearFocusUrlInput;
+                        }
+                        if text_resp.changed() {
+                            engine_action = EngineAction::SetUrlInput(url_text.clone());
+                        }
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if (ui.add_sized([80.0, 30.0], egui::Button::new("Open")).clicked() || (text_resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))))
+                                    && !url_text.is_empty() {
+                                    engine_action = EngineAction::LoadUrl(url_text);
+                                }
+                                if ui.add_sized([80.0, 30.0], egui::Button::new("Cancel")).clicked() {
+                                    engine_action = EngineAction::CloseUrlDialog;
+                                }
+                            });
+                        });
+
+                        ui.separator();
+                        ui.label(egui::RichText::new("Audio Input Devices (Microphone / Line-In):").strong());
+                        ui.add_space(4.0);
+                        let fallback_devs = [crate::audio::SYSTEM_DEFAULT_AUDIO_DEVICE.to_string()];
+                        let input_devs: &[String] = if !state.available_input_devices.is_empty() {
+                            &state.available_input_devices
+                        } else {
+                            &fallback_devs
+                        };
+                        egui::ScrollArea::vertical()
+                            .id_salt("url_dialog_input_devices_scroll")
+                            .max_height(130.0)
+                            .show(ui, |ui| {
+                                for dev in input_devs {
+                                    let is_active_mic = state.is_mic_input
+                                        && state.selected_audio_device.as_deref() == Some(dev.as_str());
+                                    let btn_label = if is_active_mic {
+                                        format!("● {} (Active)", dev)
+                                    } else {
+                                        format!("• {}", dev)
+                                    };
+                                    let width = ui.available_width();
+                                    let mut btn = egui::Button::new(
+                                        egui::RichText::new(btn_label).color(if is_active_mic {
+                                            egui::Color32::from_rgb(220, 255, 230)
+                                        } else {
+                                            egui::Color32::from_rgb(230, 220, 250)
+                                        }),
+                                    )
+                                    .truncate();
+                                    if is_active_mic {
+                                        btn = btn
+                                            .fill(egui::Color32::from_rgb(30, 95, 60))
+                                            .stroke(egui::Stroke::new(
+                                                1.0_f32,
+                                                egui::Color32::from_rgb(80, 220, 130),
+                                            ));
+                                    }
+                                    if ui.add_sized([width.max(0.0), 30.0], btn).clicked() {
+                                        engine_action = EngineAction::LoadInputDevice(dev.clone());
+                                    }
+                                }
+                            });
+
+                        if !state.url_history.is_empty() {
+                            ui.separator();
+                            ui.label(egui::RichText::new("Recent Streams:").strong());
+                            egui::ScrollArea::vertical()
+                                .id_salt("url_dialog_recent_streams_scroll")
+                                .max_height(120.0)
+                                .show(ui, |ui| {
+                                    for (url, title) in state.url_history.iter().rev() {
+                                        ui.horizontal(|ui| {
+                                            let width = ui.available_width() - 38.0;
+                                            let btn = egui::Button::new(format!("{} ({})", title, url)).truncate();
+                                            if ui.add_sized([width.max(0.0), 30.0], btn).clicked() {
+                                                engine_action = EngineAction::LoadUrl(url.clone());
+                                            }
+                                            if ui.add_sized([30.0, 30.0], egui::Button::new("📝")).clicked() {
+                                                engine_action = EngineAction::EditUrl(url.clone());
+                                            }
+                                        });
+                                    }
+                                });
+                        }
+                    });
+            }
+
+
+            if state.show_stats {
+                self.stats_cache.update_if_needed(
+                    state,
+                    self.video_state.is_some(),
+                    self.smooth_time,
+                );
+                let viewport_rect = ctx.viewport_rect();
+                let stats_top_y = if viewport_rect.width() < viewport_rect.height()
+                    || cfg!(target_os = "android")
+                {
+                    48.0
+                } else if state.file_loaded && state.show_hud && state.video_mode != 3 {
+                    let total_h = viewport_rect.height();
+                    let min_h = 120.0f32;
+                    let top_h = (total_h * state.panel_split_ratio)
+                        .clamp(min_h, (total_h - min_h).max(min_h));
+                    if total_h - top_h >= 240.0 {
+                        top_h + 10.0
+                    } else {
+                        10.0
+                    }
+                } else {
+                    10.0
+                };
+                let max_stats_h = (viewport_rect.height() - stats_top_y - 16.0).max(160.0);
+                let max_stats_w = (viewport_rect.width() - 20.0).clamp(240.0, 440.0);
+                egui::Window::new("Stats")
+                    .anchor(egui::Align2::RIGHT_TOP, [-10.0, stats_top_y])
+                    .title_bar(false)
+                    .resizable(false)
+                    .collapsible(false)
+                    .max_width(max_stats_w)
+                    .max_height(max_stats_h)
+                    .frame(
+                        egui::Frame::window(&ctx.global_style())
+                            .fill(egui::Color32::from_black_alpha(210))
+                            .inner_margin(egui::Margin::symmetric(10, 8)),
+                    )
+                    .show(ctx, |ui| {
+                        ui.spacing_mut().item_spacing.y = 2.5;
+                        egui::ScrollArea::vertical()
+                            .max_height(max_stats_h - 16.0)
+                            .show(ui, |ui| {
+                                let vsync_on = is_vsync_present_mode(self.config.present_mode);
+                                let vsync_str = format_vsync_status(self.config.present_mode);
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "RustTracker v{}",
+                                            env!("CARGO_PKG_VERSION")
+                                        ))
+                                        .color(egui::Color32::WHITE)
+                                        .strong(),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new("•")
+                                            .color(egui::Color32::from_gray(100)),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(vsync_str)
+                                        .color(if vsync_on {
+                                            egui::Color32::GREEN
+                                        } else {
+                                            egui::Color32::YELLOW
+                                        })
+                                        .strong(),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new("•")
+                                            .color(egui::Color32::from_gray(100)),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(format!(
+                                            "{:?}",
+                                            self.adapter_info.backend
+                                        ))
+                                        .color(egui::Color32::from_rgb(130, 210, 255))
+                                        .strong(),
+                                    );
+                                });
+                                if state.file_loaded {
+                                    ui.label(
+                                        egui::RichText::new(format!("Visualizer: {}", vis_name))
+                                            .color(egui::Color32::YELLOW),
+                                    );
+                                }
+                                ui.separator();
+
+                                if state.stats.mpegh_bitstream_active {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "MPEG-H 3D Audio 7.1.4 (11.1): ACTIVE",
+                                        )
+                                        .color(egui::Color32::from_rgb(0, 235, 255))
+                                        .strong(),
+                                    );
+                                    if !state.stats.mpegh_carrier_info.is_empty() {
+                                        ui.label(
+                                            egui::RichText::new(&state.stats.mpegh_carrier_info)
+                                                .color(egui::Color32::from_rgb(165, 235, 255))
+                                                .size(11.5),
+                                        );
+                                    }
+                                    ui.separator();
+                                } else if state.stats.bitstream_active {
+                                    ui.label(
+                                        egui::RichText::new("Bitstream Passthrough: ACTIVE")
+                                            .color(egui::Color32::from_rgb(0, 255, 128))
+                                            .strong(),
+                                    );
+                                    if let Some(info) = &state.video_info {
+                                        ui.label(
+                                            egui::RichText::new(format!("Format: {}", info))
+                                                .color(egui::Color32::LIGHT_GREEN),
+                                        );
+                                    }
+                                    ui.separator();
+                                } else if state.passthrough_enabled
+                                    && cfg!(any(target_os = "windows", target_os = "linux"))
+                                {
+                                    ui.label(
+                                        egui::RichText::new("Bitstream Passthrough: Inactive")
+                                            .color(egui::Color32::GRAY),
+                                    );
+                                    ui.separator();
+                                }
+
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(&self.stats_cache.fps_line)
+                                            .color(egui::Color32::GREEN)
+                                            .strong(),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new("•")
+                                            .color(egui::Color32::from_gray(100)),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(&self.stats_cache.cpu_active_line)
+                                            .color(egui::Color32::WHITE),
+                                    );
+                                });
+
+                                if state.file_loaded {
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(&self.stats_cache.cpu_fft_line)
+                                                .color(egui::Color32::WHITE),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new("•")
+                                                .color(egui::Color32::from_gray(100)),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(&self.stats_cache.cpu_decode_line)
+                                                .color(egui::Color32::WHITE),
+                                        );
+                                        if let Some(ref vid_dec) =
+                                            self.stats_cache.video_decode_line
+                                        {
+                                            ui.label(
+                                                egui::RichText::new("•")
+                                                    .color(egui::Color32::from_gray(100)),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(vid_dec)
+                                                    .color(egui::Color32::WHITE),
+                                            );
+                                        }
+                                    });
+                                    if self.stats_cache.gpu_compute_line.is_some()
+                                        || self.stats_cache.vis_shader_line.is_some()
+                                    {
+                                        ui.horizontal_wrapped(|ui| {
+                                            if let Some(ref gpu_comp) =
+                                                self.stats_cache.gpu_compute_line
+                                            {
+                                                ui.label(
+                                                    egui::RichText::new(gpu_comp)
+                                                        .color(egui::Color32::LIGHT_BLUE),
+                                                );
+                                            }
+                                            if let Some(ref vis_line) =
+                                                self.stats_cache.vis_shader_line
+                                            {
+                                                ui.label(
+                                                    egui::RichText::new(vis_line)
+                                                        .color(egui::Color32::LIGHT_BLUE),
+                                                );
+                                            }
+                                        });
+                                    }
+                                    ui.horizontal(|ui| {
+                                        ui.label(
+                                            egui::RichText::new(
+                                                &self.stats_cache.audio_buffer_line,
+                                            )
+                                            .color(self.stats_cache.audio_buffer_color),
+                                        );
+                                        if let Some((ref vbuf_line, vbuf_col)) =
+                                            self.stats_cache.video_buffer_line
+                                        {
+                                            ui.label(
+                                                egui::RichText::new("•")
+                                                    .color(egui::Color32::from_gray(100)),
+                                            );
+                                            ui.label(
+                                                egui::RichText::new(vbuf_line).color(vbuf_col),
+                                            );
+                                        }
+                                    });
+                                }
+                                ui.separator();
+                                ui.label(
+                                    egui::RichText::new("⏱ Frame Phase Breakdown:")
+                                        .color(egui::Color32::from_rgb(180, 180, 255))
+                                        .strong()
+                                        .size(12.0),
+                                );
+                                egui::Grid::new("stats_phases_grid")
+                                    .num_columns(2)
+                                    .spacing([12.0, 2.0])
+                                    .show(ui, |ui| {
+                                        for (idx, (phase_text, color)) in
+                                            self.stats_cache.phase_lines.iter().enumerate()
+                                        {
+                                            ui.label(
+                                                egui::RichText::new(phase_text.trim_start())
+                                                    .color(*color)
+                                                    .size(11.5),
+                                            );
+                                            if idx % 2 == 1 {
+                                                ui.end_row();
+                                            }
+                                        }
+                                        if self.stats_cache.phase_lines.len() % 2 == 1 {
+                                            ui.end_row();
+                                        }
+                                    });
+                                ui.label(
+                                    egui::RichText::new(&self.stats_cache.total_phases_line)
+                                        .color(egui::Color32::from_rgb(180, 180, 255))
+                                        .size(12.0),
+                                );
+                                if state.file_loaded {
+                                    ui.horizontal(|ui| {
+                                        let src_ch = state.source_channels.max(1);
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "Channels: {} hw / {} src",
+                                                state.hardware_channels, src_ch
+                                            ))
+                                            .color(
+                                                if state.hardware_channels != src_ch {
+                                                    egui::Color32::YELLOW
+                                                } else {
+                                                    egui::Color32::GRAY
+                                                },
+                                            )
+                                            .size(12.0),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new("•")
+                                                .color(egui::Color32::from_gray(100)),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(format!(
+                                                "Clips: {}",
+                                                state.stats.clipping_events
+                                            ))
+                                            .color(if state.stats.clipping_events > 0 {
+                                                egui::Color32::RED
+                                            } else {
+                                                egui::Color32::GRAY
+                                            })
+                                            .size(12.0),
+                                        );
+                                    });
+                                    if video_info_str.is_none()
+                                        && let Some(abr) =
+                                            state.stats.audio_bitrate_kbps.or(state.bitrate)
+                                    {
+                                        let abr_str = if abr >= 1000 {
+                                            format!(
+                                                "Audio Bitrate: {} kbps ({:.2} Mbps)",
+                                                abr,
+                                                abr as f32 / 1000.0
+                                            )
+                                        } else {
+                                            format!("Audio Bitrate: {} kbps", abr)
+                                        };
+                                        ui.label(
+                                            egui::RichText::new(abr_str)
+                                                .color(egui::Color32::LIGHT_GREEN)
+                                                .size(12.0),
+                                        );
+                                    }
+                                }
+                                if let Some(vi) = &video_info_str {
+                                    ui.separator();
+                                    ui.horizontal_wrapped(|ui| {
+                                        ui.label(
+                                            egui::RichText::new("Video:")
+                                                .color(egui::Color32::GRAY)
+                                                .size(12.0),
+                                        );
+                                        ui.label(
+                                            egui::RichText::new(vi)
+                                                .color(egui::Color32::YELLOW)
+                                                .size(12.0),
+                                        );
+                                    });
+                                    ui.horizontal_wrapped(|ui| {
+                                        if state.stats.video_fps > 0.0 {
+                                            let fps_str = if (state.stats.video_fps
+                                                - state.stats.video_fps.round())
+                                            .abs()
+                                                < 0.05
+                                            {
+                                                format!(
+                                                    "FPS: {:.0}",
+                                                    state.stats.video_fps.round()
+                                                )
+                                            } else {
+                                                format!("FPS: {:.2}", state.stats.video_fps)
+                                            };
+                                            ui.label(
+                                                egui::RichText::new(fps_str)
+                                                    .color(egui::Color32::LIGHT_GREEN)
+                                                    .size(12.0),
+                                            );
+                                        }
+                                        if let Some(vbr) = state.stats.video_bitrate_kbps {
+                                            let vbr_str = if vbr >= 1000 {
+                                                format!(
+                                                    "• Video: {:.2} Mbps",
+                                                    vbr as f32 / 1000.0
+                                                )
+                                            } else {
+                                                format!("• Video: {} kbps", vbr)
+                                            };
+                                            ui.label(
+                                                egui::RichText::new(vbr_str)
+                                                    .color(egui::Color32::LIGHT_GREEN)
+                                                    .size(12.0),
+                                            );
+                                        }
+                                        if let Some(abr) =
+                                            state.stats.audio_bitrate_kbps.or(state.bitrate)
+                                        {
+                                            let abr_str = if abr >= 1000 {
+                                                format!(
+                                                    "• Audio: {:.2} Mbps",
+                                                    abr as f32 / 1000.0
+                                                )
+                                            } else {
+                                                format!("• Audio: {} kbps", abr)
+                                            };
+                                            ui.label(
+                                                egui::RichText::new(abr_str)
+                                                    .color(egui::Color32::LIGHT_GREEN)
+                                                    .size(12.0),
+                                            );
+                                        }
+                                    });
+                                }
+                            });
+                    });
+            }
+
+            if state.show_help {
+                egui::Window::new("Help")
+                    .anchor(egui::Align2::LEFT_TOP, [10.0, 10.0])
+                    .title_bar(false)
+                    .resizable(false)
+                    .collapsible(false)
+                    .frame(egui::Frame::window(&ctx.global_style()).fill(egui::Color32::from_black_alpha(200)))
+                    .show(ctx, |ui| {
+                        ui.label(egui::RichText::new("Shortcuts").color(egui::Color32::WHITE).strong().size(16.0));
+                        ui.separator();
+                        egui::Grid::new("help_shortcuts_grid")
+                            .num_columns(2)
+                            .spacing([20.0, 6.0])
+                            .show(ui, |ui| {
+                                let ctrl_mod = if std::env::consts::OS == "macos" {
+                                    "⌘"
+                                } else {
+                                    "ctrl+"
+                                };
+                                let shortcut = |ui: &mut egui::Ui, key: &str, gp: Option<&str>, desc: &str| {
+                                    ui.horizontal(|ui| {
+                                        ui.spacing_mut().item_spacing.x = 2.0;
+                                        if !key.is_empty() {
+                                            ui.label(egui::RichText::new(key).color(egui::Color32::WHITE).strong());
+                                        }
+                                        if let Some(gp_act) = gp {
+                                            if !key.is_empty() {
+                                                ui.label(egui::RichText::new(" / ").color(egui::Color32::DARK_GRAY));
+                                            }
+                                            ui.label(egui::RichText::new(gamepad_icon(state.gamepad_type, gp_act))
+                                                .color(egui::Color32::LIGHT_BLUE)
+                                                .size(16.0)
+                                            );
+                                        }
+                                    });
+                                    ui.label(egui::RichText::new(desc).color(egui::Color32::GRAY));
+                                    ui.end_row();
+                                };
+                                shortcut(ui, "o", Some("Y"), "Open File");
+                                shortcut(ui, "space", Some("A"), "Play / Pause");
+                                shortcut(ui, "v", Some("X"), "Toggle Video / View");
+                                shortcut(ui, "m", None, "Visualizer Modules");
+                                shortcut(ui, "left/right", Some("D-Pad L/R"), "Seek Timeline");
+                                shortcut(ui, "", Some("L2 / R2"), "Analog Scrub");
+                                shortcut(ui, ", / .", None, "Step Frame");
+                                shortcut(ui, "tab", Some("L3"), "Toggle HUD");
+                                shortcut(ui, "up/down", Some("D-Pad U/D"), "Cycle Visualizer");
+                                shortcut(ui, "s", Some("B"), "Toggle Stats");
+                                shortcut(ui, "h", None, "Toggle Help");
+                                shortcut(ui, &format!("{}q / esc", ctrl_mod), Some("Select"), "Quit");
+                                shortcut(ui, "f", Some("Start"), "Toggle Fullscreen");
+                                shortcut(ui, "u / e", Some("R3"), "Surround Upmix");
+                                shortcut(ui, "p / n", Some("L1 / R1"), "Prev / Next Track");
+                                shortcut(ui, "1-9", None, "Select Audio Track");
+                                shortcut(ui, "[ / ]", Some("L/R Stick"), "Scale Panels");
+                                if state.visualizer_mode == 20 {
+                                    shortcut(ui, "c", None, "Toggle Camera Mode");
+                                }
+                            });
+                    });
+            }
+
+            if state.show_vis_picker {
+                let screen_rect = ctx.viewport_rect();
+                let modal_w = (screen_rect.width() - 24.0).clamp(260.0, 540.0);
+                let modal_h = (screen_rect.height() - 64.0).clamp(280.0, 500.0);
+                let is_narrow_modal = modal_w < 440.0;
+                let margin_px = if is_narrow_modal { 12.0 } else { 20.0 };
+                let scroll_max_h = (modal_h - 86.0).max(160.0);
+
+                egui::Window::new("Visualizer Modules")
+                    .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                    .title_bar(false)
+                    .resizable(false)
+                    .collapsible(false)
+                    .fixed_size([modal_w, modal_h])
+                    .frame(egui::Frame::window(&ctx.global_style())
+                        .fill(egui::Color32::from_black_alpha(230))
+                        .corner_radius(12.0)
+                        .inner_margin(margin_px))
+                    .show(ctx, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                egui::RichText::new("🎨 Visualization Modules")
+                                    .color(egui::Color32::WHITE)
+                                    .strong()
+                                    .size(if is_narrow_modal { 16.5 } else { 20.0 })
+                            );
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                if ui.add(egui::Button::new(egui::RichText::new("✕").size(14.0).color(egui::Color32::LIGHT_GRAY)).frame(false)).clicked() {
+                                    engine_action = EngineAction::ToggleVisPicker;
+                                }
+                                ui.add_space(4.0);
+                                if ui.link("None").clicked() {
+                                    engine_action = EngineAction::VisPickerEnableNone;
+                                }
+                                ui.label(egui::RichText::new("•").color(egui::Color32::from_gray(100)));
+                                if ui.link("All").clicked() {
+                                    engine_action = EngineAction::VisPickerEnableAll;
+                                }
+                                if !is_narrow_modal {
+                                    ui.label(egui::RichText::new("Rotation:").color(egui::Color32::from_gray(150)).size(13.0));
+                                }
+                            });
+                        });
+                        ui.add_space(2.0);
+                        let hint_str = if cfg!(target_os = "android") || is_narrow_modal {
+                            "Tap row to select  •  Tap ✅ to toggle rotation  •  ✕ to close"
+                        } else if state.has_gamepad {
+                            "A / Enter to select  •  X / Space to toggle rotation  •  B / Esc to close"
+                        } else {
+                            "Enter to select  •  Space to toggle rotation  •  Esc to close"
+                        };
+                        ui.label(
+                            egui::RichText::new(hint_str)
+                                .color(egui::Color32::from_gray(130))
+                                .size(11.0)
+                        );
+                        ui.add_space(6.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+
+                        egui::ScrollArea::vertical()
+                            .max_height(scroll_max_h)
+                            .show(ui, |ui| {
+                                for (i, vis) in crate::state::VISUALIZERS.iter().enumerate() {
+                                    let is_cursor = i == state.vis_picker_cursor;
+                                    let is_active = i == state.current_visualizer_idx;
+                                    let is_enabled = state.vis_enabled.get(i).copied().unwrap_or(true);
+
+                                    let bg = if is_cursor {
+                                        egui::Color32::from_rgba_unmultiplied(50, 110, 220, 100)
+                                    } else if is_active {
+                                        egui::Color32::from_rgba_unmultiplied(30, 90, 30, 80)
+                                    } else {
+                                        egui::Color32::TRANSPARENT
+                                    };
+
+                                    let row_frame = egui::Frame::NONE
+                                        .fill(bg)
+                                        .corner_radius(6.0)
+                                        .inner_margin(egui::Margin::symmetric(10, 6));
+
+                                    let row_resp = row_frame.show(ui, |ui| {
+                                        ui.horizontal(|ui| {
+                                            ui.set_min_width(ui.available_width());
+                                            // Enable/disable toggle indicator
+                                            let toggle_text = if is_enabled { "✅" } else { "⬜" };
+                                            let toggle_color = if i == 0 {
+                                                egui::Color32::from_gray(80) // Locked on
+                                            } else if is_enabled {
+                                                egui::Color32::WHITE
+                                            } else {
+                                                egui::Color32::from_gray(60)
+                                            };
+                                            let toggle_resp = ui.add(
+                                                egui::Label::new(
+                                                    egui::RichText::new(toggle_text)
+                                                        .size(14.0)
+                                                        .color(toggle_color)
+                                                ).sense(egui::Sense::click())
+                                            );
+                                            if toggle_resp.clicked() && i != 0 {
+                                                engine_action = EngineAction::VisPickerToggleEnabled(i);
+                                            }
+
+                                            ui.add_space(6.0);
+
+                                            // Name
+                                            let name_color = if !is_enabled {
+                                                egui::Color32::from_gray(90)
+                                            } else if is_active {
+                                                egui::Color32::from_rgb(80, 255, 80)
+                                            } else {
+                                                egui::Color32::WHITE
+                                            };
+                                            ui.label(
+                                                egui::RichText::new(vis.name)
+                                                    .color(name_color)
+                                                    .strong()
+                                                    .size(if is_narrow_modal { 14.0 } else { 15.0 })
+                                            );
+
+                                            // Active indicator
+                                            if is_active {
+                                                ui.label(
+                                                    egui::RichText::new("▶")
+                                                        .color(egui::Color32::from_rgb(80, 255, 80))
+                                                        .size(13.0)
+                                                );
+                                            }
+
+                                            // Description (right-aligned)
+                                            if !is_narrow_modal {
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(egui::Align::Center),
+                                                    |ui| {
+                                                        let desc_color = if !is_enabled {
+                                                            egui::Color32::from_gray(60)
+                                                        } else {
+                                                            egui::Color32::from_gray(120)
+                                                        };
+                                                        ui.label(
+                                                            egui::RichText::new(vis.description)
+                                                                .color(desc_color)
+                                                                .size(11.5)
+                                                        );
+                                                    }
+                                                );
+                                            }
+                                        });
+                                    });
+
+                                    let rect = row_resp.response.rect;
+                                    let id = ui.id().with(i);
+                                    let response = ui.interact(rect, id, egui::Sense::click());
+
+                                    // Hover moves cursor to this row
+                                    if response.hovered() && !is_cursor {
+                                        engine_action = EngineAction::VisPickerSetCursor(i);
+                                    }
+
+                                    // Click row to select visualizer
+                                    if response.clicked() {
+                                        engine_action = EngineAction::VisPickerSelect(i);
+                                    }
+
+                                    // Ensure cursor row is scrolled into view (for keyboard/gamepad navigation)
+                                    if is_cursor && state.vis_picker_scroll_to_cursor {
+                                        response.scroll_to_me(Some(egui::Align::Center));
+                                    }
+                                }
+                            });
+                    });
+            }
+
+            let mut append = state.append_to_playlist;
+            if matches!(file_dialog.state(), egui_file_dialog::DialogState::Open) {
+                file_dialog.update_with_right_panel_ui(ctx, &mut |ui, _fd| {
+                    ui.add_space(10.0);
+                    ui.heading("Options");
+                    ui.separator();
+                    ui.checkbox(&mut append, "Add to Playlist instead of replacing");
+                });
+
+                if append != state.append_to_playlist {
+                    engine_action = EngineAction::SetAppendToPlaylist(append);
+                }
+            }
+
+            if let Some(paths) = file_dialog.take_picked_multiple() {
+                let strings = paths.into_iter().map(|p| p.display().to_string()).collect();
+                engine_action = EngineAction::LoadFiles(strings, append);
+            } else if let Some(path) = file_dialog.take_picked() {
+                engine_action = EngineAction::LoadFiles(vec![path.display().to_string()], append);
+            }
+
+            if state.file_transfer.is_some() {
+                ctx.request_repaint();
+            }
+
+            let render_file_transfer_panel =
+                |ui: &mut egui::Ui,
+                 transfer: &crate::state::FileTransferState,
+                 anim_time: f32,
+                 max_width: f32| {
+                    let panel_w = (max_width - 8.0).clamp(220.0, 560.0);
+                    egui::Frame::NONE
+                        .fill(egui::Color32::from_rgba_unmultiplied(12, 22, 42, 240))
+                        .stroke(egui::Stroke::new(
+                            1.5_f32,
+                            egui::Color32::from_rgb(0, 215, 255),
+                        ))
+                        .corner_radius(10.0)
+                        .inner_margin(egui::Margin::symmetric(14, 12))
+                        .show(ui, |ui| {
+                            ui.set_width(panel_w);
+                            ui.vertical_centered(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.add(
+                                        egui::Spinner::new()
+                                            .size(16.0)
+                                            .color(egui::Color32::from_rgb(0, 225, 255)),
+                                    );
+                                    ui.add_space(6.0);
+                                    ui.label(
+                                        egui::RichText::new(&transfer.status_text)
+                                            .size(14.5)
+                                            .color(egui::Color32::from_rgb(0, 225, 255))
+                                            .strong(),
+                                    );
+                                });
+
+                                ui.add_space(4.0);
+                                let short_name = if transfer.file_name.chars().count() > 44 {
+                                    let prefix: String =
+                                        transfer.file_name.chars().take(41).collect();
+                                    format!("{}…", prefix)
+                                } else {
+                                    transfer.file_name.clone()
+                                };
+                                ui.label(
+                                    egui::RichText::new(short_name)
+                                        .size(13.5)
+                                        .color(egui::Color32::WHITE)
+                                        .strong(),
+                                );
+
+                                ui.add_space(8.0);
+                                let bar_w = (panel_w - 16.0).max(160.0);
+                                let bar_h = 16.0;
+                                let (bar_rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(bar_w, bar_h),
+                                    egui::Sense::hover(),
+                                );
+                                let painter = ui.painter();
+                                painter.rect(
+                                    bar_rect,
+                                    8.0,
+                                    egui::Color32::from_rgba_unmultiplied(6, 10, 22, 235),
+                                    egui::Stroke::new(
+                                        1.0_f32,
+                                        egui::Color32::from_rgba_unmultiplied(0, 185, 255, 110),
+                                    ),
+                                    egui::StrokeKind::Inside,
+                                );
+
+                                if let Some(pct) = transfer.progress_fraction() {
+                                    let fill_w = (bar_rect.width() * pct.clamp(0.03, 1.0))
+                                        .clamp(8.0, bar_rect.width());
+                                    let fill_rect = egui::Rect::from_min_size(
+                                        bar_rect.min,
+                                        egui::vec2(fill_w, bar_rect.height()),
+                                    );
+                                    painter.rect_filled(
+                                        fill_rect,
+                                        8.0,
+                                        egui::Color32::from_rgb(0, 195, 255),
+                                    );
+                                    // Moving specular shimmer across determinate fill bar
+                                    let shimmer_phase = (anim_time * 1.4).rem_euclid(1.0);
+                                    let shimmer_w = (fill_w * 0.28).clamp(12.0, 64.0);
+                                    let shimmer_x = fill_rect.left()
+                                        + (fill_w - shimmer_w).max(0.0) * shimmer_phase;
+                                    let shimmer_rect = egui::Rect::from_min_size(
+                                        egui::pos2(shimmer_x, fill_rect.top()),
+                                        egui::vec2(
+                                            shimmer_w.min(fill_rect.right() - shimmer_x),
+                                            fill_rect.height(),
+                                        ),
+                                    );
+                                    painter.rect_filled(
+                                        shimmer_rect,
+                                        8.0,
+                                        egui::Color32::from_rgba_unmultiplied(180, 245, 255, 110),
+                                    );
+                                    painter.text(
+                                        bar_rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        format!("{:.0}%", pct * 100.0),
+                                        egui::FontId::proportional(11.5),
+                                        egui::Color32::WHITE,
+                                    );
+                                } else {
+                                    // Smooth bidirectional scanning neon bar during cloud download / openInputStream
+                                    let pulse_w = (bar_rect.width() * 0.34).clamp(40.0, 160.0);
+                                    let travel = (bar_rect.width() - pulse_w).max(0.0);
+                                    let t_osc = 0.5 - 0.5 * (anim_time * 2.8).cos();
+                                    let x0 = bar_rect.left() + travel * t_osc;
+                                    let scan_rect = egui::Rect::from_min_size(
+                                        egui::pos2(x0, bar_rect.top() + 1.0),
+                                        egui::vec2(pulse_w, bar_rect.height() - 2.0),
+                                    );
+                                    painter.rect_filled(
+                                        scan_rect,
+                                        7.0,
+                                        egui::Color32::from_rgb(0, 205, 255),
+                                    );
+                                    let core_rect = scan_rect.shrink2(egui::vec2(pulse_w * 0.22, 1.5));
+                                    painter.rect_filled(
+                                        core_rect,
+                                        6.0,
+                                        egui::Color32::from_rgb(165, 245, 255),
+                                    );
+                                }
+
+                                ui.add_space(6.0);
+                                let detail_line = if transfer.bytes_copied > 0 {
+                                    let copied_mb =
+                                        transfer.bytes_copied as f64 / (1024.0 * 1024.0);
+                                    let rate_str = if transfer.elapsed_secs > 0.15 {
+                                        let mb_per_s = copied_mb / (transfer.elapsed_secs as f64);
+                                        format!("  •  {:.1} MB/s", mb_per_s)
+                                    } else {
+                                        String::new()
+                                    };
+                                    if let Some(tot) = transfer.total_bytes
+                                        && tot > 0
+                                    {
+                                        let total_mb = tot as f64 / (1024.0 * 1024.0);
+                                        format!(
+                                            "{:.1} / {:.1} MB{}  •  {:.1}s",
+                                            copied_mb, total_mb, rate_str, transfer.elapsed_secs
+                                        )
+                                    } else {
+                                        format!(
+                                            "{:.1} MB cached{}  •  {:.1}s",
+                                            copied_mb, rate_str, transfer.elapsed_secs
+                                        )
+                                    }
+                                } else if let Some(tot) = transfer.total_bytes
+                                    && tot > 0
+                                {
+                                    let total_mb = tot as f64 / (1024.0 * 1024.0);
+                                    format!(
+                                        "Size: {:.1} MB  •  Elapsed: {:.1}s",
+                                        total_mb, transfer.elapsed_secs
+                                    )
+                                } else if transfer.elapsed_secs >= 0.1 {
+                                    format!(
+                                        "Elapsed: {:.1}s  •  Waiting for cloud stream…",
+                                        transfer.elapsed_secs
+                                    )
+                                } else {
+                                    "Requesting file stream…".to_string()
+                                };
+                                ui.label(
+                                    egui::RichText::new(detail_line)
+                                        .size(12.0)
+                                        .color(egui::Color32::from_rgb(195, 215, 235)),
+                                );
+                            });
+                        });
+                };
+
+            if !state.file_loaded {
+                central_rect = ctx.content_rect();
+                let time = self.smooth_time as f32;
+                let rect = ctx.content_rect();
+
+                // Ensure cached synthwave background geometry & horizon_y are up to date;
+                // the combined static+dynamic background primitive is prepended directly
+                // to `clipped_primitives` after `egui_ctx.tessellate` to avoid redundant
+                // per-frame `calc_bounds()` and `append_ref()` copies inside `Tessellator`.
+                self.splash_cache.ensure_background(ctx, rect);
+
+                let is_mobile = cfg!(target_os = "android");
+                let is_game_mode = self.is_game_mode;
+
+                let show_kb = !is_game_mode && !is_mobile;
+                let show_gp = state.has_gamepad && !is_mobile;
+                let show_touch = is_mobile;
+                let is_wide_viewport = rect.width() >= 680.0;
+
+                let bottom_reserved_h = if show_touch {
+                    if is_wide_viewport { 96.0 } else { 132.0 }
+                } else if show_kb && show_gp {
+                    168.0
+                } else if show_kb || show_gp {
+                    144.0
+                } else {
+                    0.0
+                };
+
+                if show_kb || show_gp || show_touch {
+                    egui::Area::new(egui::Id::new("splash_shortcuts_area"))
+                        .order(egui::Order::Foreground)
+                        .anchor(
+                            egui::Align2::CENTER_BOTTOM,
+                            egui::vec2(0.0, if is_mobile { -10.0 } else { -24.0 }),
+                        )
+                        .show(ctx, |ui| {
+                            egui::Frame::NONE
+                                .fill(egui::Color32::from_rgba_unmultiplied(10, 10, 20, 220))
+                                .stroke(egui::Stroke::new(
+                                    1.0_f32,
+                                    egui::Color32::from_rgba_unmultiplied(91, 50, 212, 140),
+                                ))
+                                .corner_radius(12.0)
+                                .inner_margin(egui::Margin::symmetric(
+                                    if is_mobile { 16 } else { 22 },
+                                    if is_mobile { 10 } else { 14 },
+                                ))
+                                .show(ui, |ui| {
+                                    if show_touch {
+                                        let gestures: [(&str, &str); 6] = [
+                                            ("Swipe L / R", "Switch Visualizers"),
+                                            ("Swipe U / D", "Tabs / Fullscreen Video"),
+                                            ("Single Tap", "Play / Pause"),
+                                            ("Double Tap", "Toggle HUD Visibility"),
+                                            ("2-Finger Tap", "Cycle Audio Track"),
+                                            ("3-Finger Tap", "Toggle Engine Stats"),
+                                        ];
+                                        let pairs_per_row = if is_wide_viewport { 3 } else { 2 };
+                                        ui.vertical_centered(|ui| {
+                                            ui.label(
+                                                egui::RichText::new("Touch Gestures Guide")
+                                                    .color(egui::Color32::from_rgb(210, 220, 240))
+                                                    .strong()
+                                                    .size(13.0),
+                                            );
+                                            ui.add_space(6.0);
+                                            egui::Grid::new("touch_shortcuts")
+                                                .num_columns(pairs_per_row * 2)
+                                                .spacing([if is_wide_viewport { 16.0 } else { 12.0 }, 5.0])
+                                                .show(ui, |ui| {
+                                                    for (idx, (gesture, desc)) in
+                                                        gestures.iter().enumerate()
+                                                    {
+                                                        ui.label(
+                                                            egui::RichText::new(*gesture)
+                                                                .color(egui::Color32::from_rgb(
+                                                                    0, 220, 255,
+                                                                ))
+                                                                .strong()
+                                                                .size(12.0),
+                                                        );
+                                                        ui.label(
+                                                            egui::RichText::new(*desc)
+                                                                .color(egui::Color32::LIGHT_GRAY)
+                                                                .size(12.0),
+                                                        );
+                                                        if (idx + 1) % pairs_per_row == 0 {
+                                                            ui.end_row();
+                                                        }
+                                                    }
+                                                });
+                                        });
+                                    } else {
+                                        ui.horizontal_centered(|ui| {
+                                            let pairs_per_row = if show_kb && show_gp {
+                                                if rect.width() >= 1100.0 { 3 } else { 2 }
+                                            } else {
+                                                4
+                                            };
+
+                                            if show_kb {
+                                                ui.vertical(|ui| {
+                                                    ui.label(
+                                                        egui::RichText::new(
+                                                            "🖮 Keyboard Shortcuts",
+                                                        )
+                                                        .color(egui::Color32::from_rgb(
+                                                            210, 220, 240,
+                                                        ))
+                                                        .strong()
+                                                        .size(15.0),
+                                                    );
+                                                    ui.add_space(6.0);
+
+                                                    egui::Grid::new("kb_shortcuts")
+                                                        .num_columns(pairs_per_row)
+                                                        .spacing([28.0, 6.0])
+                                                        .show(ui, |ui| {
+                                                            let mut col = 0;
+                                                            let mut kb_shortcut =
+                                                                |key: &str, desc: &str| {
+                                                                    ui.horizontal(|ui| {
+                                                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                                                        ui.label(
+                                                                            egui::RichText::new(key)
+                                                                                .color(egui::Color32::from_rgb(0, 220, 255))
+                                                                                .strong()
+                                                                                .size(12.5),
+                                                                        );
+                                                                        ui.label(
+                                                                            egui::RichText::new(desc)
+                                                                                .color(egui::Color32::LIGHT_GRAY)
+                                                                                .size(12.5),
+                                                                        );
+                                                                    });
+                                                                    col += 1;
+                                                                    if col == pairs_per_row {
+                                                                        ui.end_row();
+                                                                        col = 0;
+                                                                    }
+                                                                };
+                                                            let ctrl_mod =
+                                                                if std::env::consts::OS == "macos" {
+                                                                    "⌘"
+                                                                } else {
+                                                                    "ctrl+"
+                                                                };
+                                                            kb_shortcut("o", "Open File");
+                                                            kb_shortcut("space", "Play / Pause");
+                                                            kb_shortcut("v", "Toggle Video");
+                                                            kb_shortcut("m", "Visualizer Modules");
+                                                            kb_shortcut(
+                                                                "left/right",
+                                                                "Seek Timeline",
+                                                            );
+                                                            kb_shortcut("tab", "Toggle HUD");
+                                                            kb_shortcut("up/down", "Cycle Vis");
+                                                            kb_shortcut("s", "Toggle Stats");
+                                                            kb_shortcut(
+                                                                &format!("{}q / esc", ctrl_mod),
+                                                                "Quit",
+                                                            );
+                                                            kb_shortcut("f", "Fullscreen");
+                                                            kb_shortcut("u / e", "Surround Upmix");
+                                                            kb_shortcut("1-9", "Audio Track");
+                                                            kb_shortcut("p / n", "Prev/Next");
+                                                            kb_shortcut(
+                                                                &format!("{}L/R", ctrl_mod),
+                                                                "Seek ±60s",
+                                                            );
+                                                            kb_shortcut("[ / ]", "Scale Panels");
+                                                            kb_shortcut("h", "Toggle Help");
+                                                        });
+                                                });
+                                            }
+
+                                            if show_kb && show_gp {
+                                                ui.add_space(16.0);
+                                                let (sep_rect, _) = ui.allocate_exact_size(
+                                                    egui::vec2(1.0, 130.0),
+                                                    egui::Sense::hover(),
+                                                );
+                                                ui.painter().line_segment(
+                                                    [
+                                                        sep_rect.center_top(),
+                                                        sep_rect.center_bottom(),
+                                                    ],
+                                                    (1.0, egui::Color32::from_gray(65)),
+                                                );
+                                                ui.add_space(16.0);
+                                            }
+
+                                            if show_gp {
+                                                ui.vertical(|ui| {
+                                                    ui.label(
+                                                        egui::RichText::new("🎮 Gamepad Controls")
+                                                            .color(egui::Color32::from_rgb(
+                                                                210, 220, 240,
+                                                            ))
+                                                            .strong()
+                                                            .size(15.0),
+                                                    );
+                                                    ui.add_space(6.0);
+                                                    egui::Grid::new("gp_shortcuts_wide")
+                                                        .num_columns(pairs_per_row)
+                                                        .spacing([28.0, 6.0])
+                                                        .show(ui, |ui| {
+                                                            let mut col = 0;
+                                                            let mut gp_shortcut =
+                                                                |gp: &str, desc: &str| {
+                                                                    ui.horizontal(|ui| {
+                                                                        ui.spacing_mut().item_spacing.x = 6.0;
+                                                                        ui.label(
+                                                                            egui::RichText::new(
+                                                                                gamepad_icon(
+                                                                                    state.gamepad_type,
+                                                                                    gp,
+                                                                                ),
+                                                                            )
+                                                                            .color(
+                                                                                egui::Color32::LIGHT_BLUE,
+                                                                            )
+                                                                            .strong()
+                                                                            .size(13.0),
+                                                                        );
+                                                                        ui.label(
+                                                                            egui::RichText::new(desc)
+                                                                                .color(
+                                                                                    egui::Color32::LIGHT_GRAY,
+                                                                                )
+                                                                                .size(12.5),
+                                                                        );
+                                                                    });
+                                                                    col += 1;
+                                                                    if col == pairs_per_row {
+                                                                        ui.end_row();
+                                                                        col = 0;
+                                                                    }
+                                                                };
+                                                            gp_shortcut("Y", "Open File");
+                                                            gp_shortcut("A", "Play / Pause");
+                                                            gp_shortcut("X", "Toggle Video");
+                                                            gp_shortcut(
+                                                                "D-Pad L/R",
+                                                                "Seek Timeline",
+                                                            );
+                                                            gp_shortcut("L2 / R2", "Analog Scrub");
+                                                            gp_shortcut("L3", "Toggle HUD");
+                                                            gp_shortcut("D-Pad U/D", "Cycle Vis");
+                                                            gp_shortcut("B", "Toggle Stats");
+                                                            gp_shortcut("Select", "Quit");
+                                                            gp_shortcut("Start", "Fullscreen");
+                                                            gp_shortcut("R3", "Surround Upmix");
+                                                            gp_shortcut("L1 / R1", "Prev/Next");
+                                                            gp_shortcut("L/R Stick", "Scale Panels");
+                                                        });
+                                                });
+                                            }
+                                        });
+                                    }
+                                });
+                        });
+                }
+
+                let frame = egui::Frame::NONE
+                    .fill(egui::Color32::TRANSPARENT)
+                    .inner_margin(if is_mobile { 12.0 } else { 28.0 });
+
+                egui::CentralPanel::default()
+                    .frame(frame)
+                    .show_inside(ctx, |ui| {
+                        let real_avail_height = ui.available_height();
+                        let real_avail_width = ui.available_width();
+
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            ui.vertical_centered(|ui| {
+                                let is_portrait_splash = rect.width() < rect.height();
+                                let top_space = if is_portrait_splash {
+                                    40.0
+                                } else if is_mobile {
+                                    30.0
+                                } else {
+                                    (real_avail_height * 0.03).clamp(8.0, 28.0)
+                                };
+                                ui.add_space(top_space);
+
+                                // Scale title dynamically so it sits cleanly in the upper sky without colliding with the top-right Stats panel
+                                let target_w = (real_avail_width - 24.0).max(120.0);
+                                let width_scale = (target_w / 950.0).clamp(0.25, 0.58);
+                                let height_scale = (real_avail_height / 500.0).clamp(0.25, 0.58);
+                                let scale_factor = width_scale.min(height_scale);
+                                let title_width = 950.0 * scale_factor;
+                                let title_height = 122.0 * scale_factor;
+                                let font_size = 114.0 * scale_factor;
+                                let gradient_extent = 50.0 * scale_factor;
+
+                                // --- Glowing Animated Chrome Title (Cached glyph quads, merged into background primitive) ---
+                                let (title_rect, _) = ui.allocate_exact_size(
+                                    egui::vec2(title_width, title_height),
+                                    egui::Sense::hover(),
+                                );
+                                self.splash_cache.update_title_mesh(
+                                    ui,
+                                    title_rect,
+                                    gradient_extent,
+                                    font_size,
+                                    time,
+                                );
+
+                                // Format & Engine Subtitle Pill
+                                ui.add_space(2.0);
+                                ui.label(
+                                    egui::RichText::new(
+                                        "MOD • XM • S3M • IT • FLAC • WAV • MP3 • OPUS • MKV/MP4 • LIVE STREAM",
+                                    )
+                                    .size((12.0 * scale_factor.max(0.75)).clamp(9.5, 12.5))
+                                    .color(egui::Color32::from_rgb(235, 195, 250))
+                                    .strong(),
+                                );
+
+                                // Position the Hero Action Card over the perspective neon grid just below the sunset horizon,
+                                // leaving the sliced synthwave sun and mountain peaks unobstructed in the sky above.
+                                let is_narrow = real_avail_width < 600.0;
+                                let after_subtitle_y = ui.cursor().min.y;
+                                let transfer_extra_h =
+                                    if state.file_transfer.is_some() { 112.0 } else { 0.0 };
+                                let est_card_h = (if is_narrow { 255.0 } else { 222.0 }) + transfer_extra_h;
+                                let max_card_top_y = (rect.bottom() - bottom_reserved_h - est_card_h - 18.0)
+                                    .max(after_subtitle_y + 10.0);
+                                let target_card_top_y =
+                                    (self.splash_cache.horizon_y + 8.0).min(max_card_top_y);
+                                let scenic_gap =
+                                    (target_card_top_y - after_subtitle_y).max(10.0);
+                                ui.add_space(scenic_gap);
+
+                                // --- Unified Translucent Hero Action Card ---
+                                let card_max_w = if is_narrow {
+                                    (real_avail_width - 16.0).clamp(260.0, 420.0)
+                                } else {
+                                    620.0
+                                };
+
+                                egui::Frame::NONE
+                                    .fill(egui::Color32::from_rgba_unmultiplied(14, 12, 28, 215))
+                                    .stroke(egui::Stroke::new(
+                                        1.0_f32,
+                                        egui::Color32::from_rgba_unmultiplied(212, 34, 161, 135),
+                                    ))
+                                    .corner_radius(14.0)
+                                    .inner_margin(egui::Margin::symmetric(
+                                        if is_narrow { 16 } else { 24 },
+                                        if is_narrow { 14 } else { 18 },
+                                    ))
+                                    .show(ui, |ui| {
+                                        ui.set_max_width(card_max_w);
+                                        ui.vertical_centered(|ui| {
+                                            if let Some(ref transfer) = state.file_transfer {
+                                                render_file_transfer_panel(
+                                                    ui,
+                                                    transfer,
+                                                    time,
+                                                    card_max_w - 24.0,
+                                                );
+                                                ui.add_space(12.0);
+                                            }
+                                            let is_file_hovered =
+                                                !ui.input(|i| i.raw.hovered_files.is_empty())
+                                                    || state.hovered_file.is_some();
+                                            if is_file_hovered {
+                                                let badge_text =
+                                                    if let Some(hf) = &state.hovered_file {
+                                                        let fn_only = std::path::Path::new(hf)
+                                                            .file_name()
+                                                            .unwrap_or_default()
+                                                            .to_string_lossy();
+                                                        format!(
+                                                            "📥 Drop '{}' to start playing",
+                                                            fn_only
+                                                        )
+                                                    } else {
+                                                        "📥 Drop media file here to start playing"
+                                                            .to_string()
+                                                    };
+                                                egui::Frame::NONE
+                                                    .fill(egui::Color32::from_rgba_unmultiplied(
+                                                        215, 105, 0, 230,
+                                                    ))
+                                                    .stroke(egui::Stroke::new(
+                                                        1.5_f32,
+                                                        egui::Color32::from_rgb(255, 175, 40),
+                                                    ))
+                                                    .corner_radius(8.0)
+                                                    .inner_margin(egui::Margin::symmetric(14, 7))
+                                                    .show(ui, |ui| {
+                                                        ui.label(
+                                                            egui::RichText::new(badge_text)
+                                                                .size(15.0)
+                                                                .color(egui::Color32::WHITE)
+                                                                .strong(),
+                                                        );
+                                                    });
+                                                ui.add_space(10.0);
+                                            }
+
+                                            let btn_text = if is_file_hovered {
+                                                "📥 DROP TO PLAY"
+                                            } else {
+                                                "OPEN FILE"
+                                            };
+                                            let btn_fill = if is_file_hovered {
+                                                egui::Color32::from_rgb(240, 125, 10)
+                                            } else {
+                                                egui::Color32::from_rgb(205, 95, 0)
+                                            };
+                                            let btn_stroke = if is_file_hovered {
+                                                egui::Stroke::new(
+                                                    2.0_f32,
+                                                    egui::Color32::from_rgb(255, 195, 70),
+                                                )
+                                            } else {
+                                                egui::Stroke::new(
+                                                    1.0_f32,
+                                                    egui::Color32::from_rgb(255, 145, 30),
+                                                )
+                                            };
+
+                                            let btn_font_size = if is_narrow { 17.0 } else { 20.0 };
+                                            let btn_h = if is_narrow { 48.0 } else { 54.0 };
+                                            let btn_w = if is_narrow {
+                                                (card_max_w - 32.0).clamp(200.0, 340.0)
+                                            } else {
+                                                265.0
+                                            };
+
+                                            let btn = egui::Button::new(
+                                                egui::RichText::new(btn_text)
+                                                    .size(btn_font_size)
+                                                    .color(egui::Color32::WHITE)
+                                                    .strong(),
+                                            )
+                                            .fill(btn_fill)
+                                            .stroke(btn_stroke)
+                                            .corner_radius(8.0);
+
+                                            let url_btn = egui::Button::new(
+                                                egui::RichText::new("OPEN STREAM/DEVICE")
+                                                    .size(btn_font_size)
+                                                    .color(egui::Color32::WHITE)
+                                                    .strong(),
+                                            )
+                                            .fill(egui::Color32::from_rgb(100, 50, 150))
+                                            .stroke(egui::Stroke::new(
+                                                1.0_f32,
+                                                egui::Color32::from_rgb(180, 80, 255),
+                                            ))
+                                            .corner_radius(8.0);
+
+                                            let no_modal_open = !state.is_file_picker_open
+                                                && !state.is_url_dialog_open
+                                                && !state.show_vis_picker;
+
+                                            if is_narrow {
+                                                let resp1 = ui.add_sized([btn_w, btn_h], btn);
+                                                if state.has_gamepad
+                                                    && no_modal_open
+                                                    && ui.ctx().memory(|m| m.focused().is_none())
+                                                {
+                                                    resp1.request_focus();
+                                                }
+                                                if resp1.clicked() {
+                                                    engine_action = EngineAction::OpenFile;
+                                                }
+                                                ui.add_space(10.0);
+                                                let resp2 = ui.add_sized([btn_w, btn_h], url_btn);
+                                                if resp2.clicked() {
+                                                    engine_action = EngineAction::OpenUrlDialog;
+                                                }
+                                            } else {
+                                                ui.horizontal(|ui| {
+                                                    let total_width = btn_w * 2.0 + 16.0;
+                                                    let pad = ((ui.available_width() - total_width)
+                                                        * 0.5)
+                                                        .max(0.0);
+                                                    ui.add_space(pad);
+                                                    let resp1 = ui.add_sized([btn_w, btn_h], btn);
+                                                    if state.has_gamepad
+                                                        && no_modal_open
+                                                        && ui.ctx().memory(|m| m.focused().is_none())
+                                                    {
+                                                        resp1.request_focus();
+                                                    }
+                                                    if resp1.clicked() {
+                                                        engine_action = EngineAction::OpenFile;
+                                                    }
+                                                    ui.add_space(16.0);
+                                                    let resp2 =
+                                                        ui.add_sized([btn_w, btn_h], url_btn);
+                                                    if resp2.clicked() {
+                                                        engine_action =
+                                                            EngineAction::OpenUrlDialog;
+                                                    }
+                                                });
+                                            }
+
+                                            ui.add_space(10.0);
+
+                                            // Quick-Access Utility Row: Visualizer Module Picker & Recent Stream
+                                            let vis_btn_label =
+                                                format!("🎨 Visualizer: {}", vis_name);
+                                            let vis_btn = egui::Button::new(
+                                                egui::RichText::new(vis_btn_label)
+                                                    .size(12.5)
+                                                    .color(egui::Color32::from_rgb(190, 225, 255)),
+                                            )
+                                            .fill(egui::Color32::from_rgba_unmultiplied(
+                                                30, 35, 65, 210,
+                                            ))
+                                            .stroke(egui::Stroke::new(
+                                                1.0_f32,
+                                                egui::Color32::from_rgba_unmultiplied(
+                                                    0, 190, 255, 130,
+                                                ),
+                                            ))
+                                            .corner_radius(6.0);
+
+                                            if let Some((recent_url, recent_title)) =
+                                                state.url_history.last()
+                                            {
+                                                let display_ref = if !recent_title.is_empty() {
+                                                    recent_title.as_str()
+                                                } else {
+                                                    recent_url.as_str()
+                                                };
+                                                let short_url = if display_ref.chars().count() > 28
+                                                {
+                                                    let truncated: String =
+                                                        display_ref.chars().take(26).collect();
+                                                    format!("📡 Recent: {}…", truncated)
+                                                } else {
+                                                    format!("📡 Recent: {}", display_ref)
+                                                };
+                                                let recent_btn = egui::Button::new(
+                                                    egui::RichText::new(short_url)
+                                                        .size(12.5)
+                                                        .color(egui::Color32::from_rgb(
+                                                            225, 195, 255,
+                                                        )),
+                                                )
+                                                .fill(egui::Color32::from_rgba_unmultiplied(
+                                                    50, 28, 78, 210,
+                                                ))
+                                                .stroke(egui::Stroke::new(
+                                                    1.0_f32,
+                                                    egui::Color32::from_rgba_unmultiplied(
+                                                        180, 90, 255, 130,
+                                                    ),
+                                                ))
+                                                .corner_radius(6.0);
+
+                                                if is_narrow {
+                                                    if ui
+                                                        .add_sized([btn_w, 30.0], vis_btn)
+                                                        .clicked()
+                                                    {
+                                                        engine_action =
+                                                            EngineAction::ToggleVisPicker;
+                                                    }
+                                                    ui.add_space(6.0);
+                                                    if ui
+                                                        .add_sized([btn_w, 30.0], recent_btn)
+                                                        .on_hover_text(recent_url.as_str())
+                                                        .clicked()
+                                                    {
+                                                        engine_action = EngineAction::LoadUrl(
+                                                            recent_url.clone(),
+                                                        );
+                                                    }
+                                                } else {
+                                                    ui.horizontal(|ui| {
+                                                        let sub_w =
+                                                            (btn_w * 2.0 + 16.0 - 12.0) * 0.5;
+                                                        let total_w = sub_w * 2.0 + 12.0;
+                                                        let pad = ((ui.available_width() - total_w)
+                                                            * 0.5)
+                                                            .max(0.0);
+                                                        ui.add_space(pad);
+                                                        if ui
+                                                            .add_sized([sub_w, 30.0], vis_btn)
+                                                            .clicked()
+                                                        {
+                                                            engine_action =
+                                                                EngineAction::ToggleVisPicker;
+                                                        }
+                                                        ui.add_space(12.0);
+                                                        if ui
+                                                            .add_sized([sub_w, 30.0], recent_btn)
+                                                            .on_hover_text(recent_url.as_str())
+                                                            .clicked()
+                                                        {
+                                                            engine_action = EngineAction::LoadUrl(
+                                                                recent_url.clone(),
+                                                            );
+                                                        }
+                                                    });
+                                                }
+                                            } else {
+                                                let pill_w = if is_narrow {
+                                                    btn_w
+                                                } else {
+                                                    btn_w * 2.0 + 16.0
+                                                };
+                                                if ui.add_sized([pill_w, 30.0], vis_btn).clicked()
+                                                {
+                                                    engine_action = EngineAction::ToggleVisPicker;
+                                                }
+                                            }
+
+                                            ui.add_space(8.0);
+                                            ui.separator();
+                                            ui.add_space(4.0);
+
+                                            // Audio output toggles inside the hero card for high legibility
+                                            let mut force_stereo = state.force_stereo_downmix;
+                                            if ui
+                                                .checkbox(
+                                                    &mut force_stereo,
+                                                    egui::RichText::new(
+                                                        "Force Stereo Downmix (Fixes crackling on some devices)",
+                                                    )
+                                                    .size(12.5)
+                                                    .color(egui::Color32::from_rgb(205, 210, 225)),
+                                                )
+                                                .changed()
+                                            {
+                                                engine_action =
+                                                    EngineAction::SetForceStereo(force_stereo);
+                                            }
+
+                                            let mut surround_upmix = state.surround_upmix.enabled;
+                                            if ui
+                                                .checkbox(
+                                                    &mut surround_upmix,
+                                                    egui::RichText::new(
+                                                        "Auto Surround Upmix (5.1/7.1 Bed or 7.1.4 Bed + Height)",
+                                                    )
+                                                    .size(12.5)
+                                                    .color(egui::Color32::from_rgb(255, 180, 85)),
+                                                )
+                                                .on_hover_text("When connected to a multi-channel surround output (>2ch), upmixes stereo sources across the surround bed (5.1/7.1) or bed + overhead height channels (7.1.4). Stereo/mono outputs (<=2ch) remain completely unchanged.")
+                                                .changed()
+                                            {
+                                                engine_action =
+                                                    EngineAction::ToggleSurroundUpmix(surround_upmix);
+                                            }
+
+                                            #[cfg(any(
+                                                target_os = "windows",
+                                                target_os = "linux"
+                                            ))]
+                                            {
+                                                let mut passthrough = state.passthrough_enabled;
+
+                                                #[cfg(target_os = "windows")]
+                                                let label = "Enable Bitstream Passthrough (WASAPI Exclusive)";
+                                                #[cfg(target_os = "linux")]
+                                                let label =
+                                                    "Enable Bitstream Passthrough (PipeWire)";
+
+                                                if ui
+                                                    .checkbox(
+                                                        &mut passthrough,
+                                                        egui::RichText::new(label)
+                                                            .size(12.5)
+                                                            .color(egui::Color32::from_rgb(
+                                                                205, 210, 225,
+                                                            )),
+                                                    )
+                                                    .changed()
+                                                {
+                                                    engine_action =
+                                                        EngineAction::SetPassthrough(passthrough);
+                                                }
+                                            }
+                                        });
+                                    });
+                            });
+                        });
+                    });
+
+                // Render OSD notifications on the splash screen when not superseded by the transfer panel
+                if state.file_transfer.is_none()
+                    && let Some(osd) = &state.osd_text
+                    && state.osd_timer > 0.0
+                {
+                    let painter = ctx.layer_painter(egui::LayerId::new(
+                        egui::Order::Foreground,
+                        egui::Id::new("splash_osd_notification"),
+                    ));
+                    let alpha = (state.osd_timer.min(0.5) * 2.0 * 255.0) as u8;
+                    let screen = ctx.viewport_rect();
+                    let is_portrait = screen.width() < screen.height();
+                    let max_width = if is_portrait {
+                        (screen.width() - 40.0).max(100.0)
+                    } else {
+                        (screen.width() * 0.85).max(200.0)
+                    };
+                    let font_size = if is_portrait { 18.0 } else { 22.0 };
+                    let text_color = egui::Color32::from_rgba_premultiplied(255, 255, 255, alpha);
+                    let galley = painter.layout(
+                        osd.clone(),
+                        egui::FontId::proportional(font_size),
+                        text_color,
+                        max_width,
+                    );
+                    let top_y = if is_portrait {
+                        screen.top() + 52.0
+                    } else {
+                        screen.top() + 32.0
+                    };
+                    let galley_pos = egui::pos2(
+                        screen.center().x - galley.rect.width() * 0.5,
+                        top_y,
+                    );
+                    let bg_rect = galley
+                        .rect
+                        .translate(galley_pos.to_vec2())
+                        .expand2(egui::vec2(14.0, 8.0));
+                    painter.rect_filled(
+                        bg_rect,
+                        8.0,
+                        egui::Color32::from_rgba_unmultiplied(10, 10, 20, (alpha as f32 * 0.8) as u8),
+                    );
+                    painter.galley(galley_pos, galley, text_color);
+                }
+
+                return;
+            }
+
+            if let Some(ref transfer) = state.file_transfer {
+                let anim_time = self.smooth_time as f32;
+                let viewport_w = ctx.viewport_rect().width();
+                egui::Area::new(egui::Id::new("active_file_transfer_overlay"))
+                    .order(egui::Order::Foreground)
+                    .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                    .show(ctx, |ui| {
+                        render_file_transfer_panel(
+                            ui,
+                            transfer,
+                            anim_time,
+                            (viewport_w - 32.0).clamp(240.0, 480.0),
+                        );
+                    });
+            }
+
+            let is_portrait = ctx.viewport_rect().width() < ctx.viewport_rect().height();
+            if state.show_hud && state.video_mode != 3 {
+                let total_h = ctx.viewport_rect().height();
+                let min_h = 120.0f32;
+                let top_h = (total_h * state.panel_split_ratio).clamp(min_h, (total_h - min_h).max(min_h));
+                let top_margin = if is_portrait {
+                    54
+                } else if cfg!(target_os = "android") {
+                    42
+                } else {
+                    8
+                };
+                let bottom_margin = if is_portrait { 14 } else { 8 };
+                let panel_resp = egui::Panel::top("top_panel")
+                    .resizable(false)
+                    .frame(
+                        egui::Frame::NONE
+                            .fill(egui::Color32::TRANSPARENT)
+                            .inner_margin(egui::Margin {
+                                left: 16,
+                                right: 16,
+                                top: top_margin,
+                                bottom: bottom_margin,
+                            })
+                    )
+                    .exact_size(top_h)
+                    .show_inside(ctx, |ui| {
+                        let render_progress_bar = |col: &mut egui::Ui, out_fire_rect: &mut Option<egui::Rect>, engine_action: &mut EngineAction| {
+                            // Custom Fire/Charred Progress Bar
+                            let (rect, response) = col.allocate_exact_size(
+                                egui::vec2(col.available_width(), 16.0),
+                                egui::Sense::click_and_drag(),
+                            );
+                            *out_fire_rect = Some(rect);
+
+                            if response.hovered() || response.dragged() {
+                                col.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                            }
+
+                            let pointer_pos = response
+                                .interact_pointer_pos()
+                                .or_else(|| col.ctx().pointer_latest_pos());
+                            let pct_from_pos = pointer_pos.map(|mouse_pos| {
+                                let width = rect.width().max(1.0);
+                                let rel_x = (mouse_pos.x - rect.left()).clamp(0.0, width);
+                                (rel_x / width).clamp(0.0, 1.0)
+                            });
+
+                            if response.drag_stopped() || response.clicked() {
+                                if let Some(pct) = pct_from_pos {
+                                    *engine_action = EngineAction::Seek(pct);
+                                } else if let Some(target_secs) = state.scrub_target_seconds
+                                    && state.duration_seconds > 0.0
+                                {
+                                    let pct = (target_secs / state.duration_seconds).clamp(0.0, 1.0) as f32;
+                                    *engine_action = EngineAction::Seek(pct);
+                                }
+                            } else if response.dragged() || response.is_pointer_button_down_on() {
+                                if let Some(pct) = pct_from_pos {
+                                    *engine_action = EngineAction::ScrubPreview(pct, 0.0);
+                                }
+                            } else if state.scrub_target_seconds.is_some() && !state.is_touch_scrubbing {
+                                *engine_action = EngineAction::ScrubEnd;
+                            }
+
+                            let painter = col.painter();
+                            let display_secs = state.scrub_target_seconds.unwrap_or(state.current_seconds);
+                            let force_hours = state.duration_seconds >= 3600.0 || display_secs >= 3600.0;
+                            let time_text = if state.duration_seconds <= 0.0 {
+                                format!(
+                                    "{} / LIVE",
+                                    crate::state::format_timeline_time(display_secs, force_hours)
+                                )
+                            } else {
+                                format!(
+                                    "{} / {}",
+                                    crate::state::format_timeline_time(display_secs, force_hours),
+                                    crate::state::format_timeline_time(state.duration_seconds, force_hours)
+                                )
+                            };
+
+                            let font_id = egui::FontId::proportional(11.0);
+                            let shadow_color = egui::Color32::from_black_alpha(210);
+                            for offset in [
+                                egui::vec2(-1.0, 0.0),
+                                egui::vec2(1.0, 0.0),
+                                egui::vec2(0.0, -1.0),
+                                egui::vec2(0.0, 1.0),
+                            ] {
+                                painter.text(
+                                    rect.center() + offset,
+                                    egui::Align2::CENTER_CENTER,
+                                    &time_text,
+                                    font_id.clone(),
+                                    shadow_color,
+                                );
+                            }
+                            painter.text(
+                                rect.center(),
+                                egui::Align2::CENTER_CENTER,
+                                time_text,
+                                font_id,
+                                egui::Color32::WHITE,
+                            );
+                        };
+
+                        if state.video_mode == 2 && (self.video_state.is_some() || state.has_video_stream) {
+                            // Video occupies the top panel with a full-width timeline bar at the bottom
+                            let video_h = (ui.available_height() - 22.0).max(40.0);
+                            let (v_rect, _) = ui.allocate_exact_size(
+                                egui::vec2(ui.available_width(), video_h),
+                                egui::Sense::hover(),
+                            );
+                            out_video_rect = Some(v_rect);
+                            ui.add_space(4.0);
+                            render_progress_bar(ui, &mut out_fire_rect, &mut engine_action);
+                        } else {
+                            let render_col_channels = |col: &mut egui::Ui, out_meters_rect: &mut Option<egui::Rect>, out_fire_rect: &mut Option<egui::Rect>, engine_action: &mut EngineAction| {
+                                if !is_portrait {
+                                    col.heading("Channels");
+                                    col.separator();
+                                }
+                                let meters_height = if is_portrait {
+                                    col.available_height()
+                                } else {
+                                    (col.available_height() - 30.0).max(20.0)
+                                };
+                                let (channel_rect, _) = col.allocate_exact_size(
+                                    egui::vec2(col.available_width(), meters_height),
+                                    egui::Sense::hover()
+                                );
+                                *out_meters_rect = Some(channel_rect);
+
+                                let painter = col.painter();
+                                let num_channels = state.channel_vus.len();
+                                if num_channels > 0 {
+                                    let w = channel_rect.width() / num_channels as f32;
+                                    for i in 0..num_channels {
+                                        let x = channel_rect.left() + i as f32 * w + w * 0.2;
+                                        let bw = w * 0.6;
+                                        let y_bottom = channel_rect.bottom() - 15.0;
+
+                                        // Label
+                                        if num_channels <= 16 {
+                                            let label = if state.tracker_channels.is_some()
+                                                && !state
+                                                    .surround_upmix
+                                                    .is_active_for(state.source_channels, state.hardware_channels)
+                                            {
+                                                if i == 0 {
+                                                    "L".to_string()
+                                                } else if i == num_channels - 1 {
+                                                    "R".to_string()
+                                                } else {
+                                                    format!("{}", i)
+                                                }
+                                            } else {
+                                                match num_channels {
+                                                    2 => ["L", "R"].get(i).unwrap_or(&"?").to_string(),
+                                                    3 => ["L", "C", "R"].get(i).unwrap_or(&"?").to_string(),
+                                                    4 => ["Ls", "L", "R", "Rs"].get(i).unwrap_or(&"?").to_string(),
+                                                    6 => ["Ls", "L", "C", "LFE", "R", "Rs"].get(i).unwrap_or(&"?").to_string(),
+                                                    8 => ["Lrs", "Ls", "L", "C", "LFE", "R", "Rs", "Rrs"].get(i).unwrap_or(&"?").to_string(),
+                                                    12 => ["Ltr", "Ltf", "Ls", "L", "C", "LFE", "R", "Rs", "Rtf", "Rtr", "Lrs", "Rrs"].get(i).unwrap_or(&"?").to_string(),
+                                                    _ => format!("{}", i + 1),
+                                                }
+                                            };
+                                            painter.text(
+                                                egui::pos2(x + bw * 0.5, y_bottom + 2.0),
+                                                egui::Align2::CENTER_TOP,
+                                                label,
+                                                egui::FontId::proportional(12.0),
+                                                egui::Color32::GRAY,
+                                            );
+                                        }
+                                    }
+                                }
+
+                                if !is_portrait {
+                                    col.add_space(5.0);
+                                    render_progress_bar(col, out_fire_rect, engine_action);
+                                }
+                            };
+
+                            let render_col_heatmap = |col: &mut egui::Ui, out_heatmap_rect: &mut Option<egui::Rect>, engine_action: &mut EngineAction| {
+                                if state.show_surround_eq {
+                                    // Swap out the Tracker Pattern / Heatmap viewer with the Surround Routing & Crossover Curve
+                                    // when the user flips the middle panel to the EQ view.
+                                    *out_heatmap_rect = None;
+                                    let mut cfg = state.surround_upmix;
+                                    let mut cfg_changed = false;
+                                    let has_height =
+                                        crate::state::SurroundUpmixConfig::has_height_channels(
+                                            state.hardware_channels,
+                                        );
+
+                                    if !is_portrait {
+                                        let eq_heading = if state.hardware_channels > 2 {
+                                            format!(
+                                                "Surround Upmix ({})",
+                                                crate::state::SurroundUpmixConfig::short_tag(
+                                                    state.hardware_channels,
+                                                )
+                                            )
+                                        } else {
+                                            "Surround Upmix".to_string()
+                                        };
+                                        col.horizontal(|ui| {
+                                            ui.heading(eq_heading);
+                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                                let flip_btn = egui::Button::new(
+                                                    egui::RichText::new("📊 Pattern View")
+                                                        .size(11.0)
+                                                        .strong()
+                                                        .color(egui::Color32::from_rgb(255, 228, 185)),
+                                                )
+                                                .fill(egui::Color32::from_rgb(48, 36, 24))
+                                                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(210, 135, 45)))
+                                                .corner_radius(4.0);
+                                                if ui
+                                                    .add(flip_btn)
+                                                    .on_hover_text("Flip middle panel back to Tracker Pattern / Heatmap / Lyrics viewer")
+                                                    .clicked()
+                                                {
+                                                    *engine_action = EngineAction::SetShowSurroundEq(false);
+                                                }
+                                                ui.add_space(4.0);
+                                                let reset_btn = egui::Button::new(
+                                                    egui::RichText::new("↺ Reset")
+                                                        .size(11.0)
+                                                        .strong()
+                                                        .color(egui::Color32::from_rgb(225, 220, 212)),
+                                                )
+                                                .fill(egui::Color32::from_rgb(44, 42, 40))
+                                                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(105, 98, 90)))
+                                                .corner_radius(4.0);
+                                                if ui
+                                                    .add(reset_btn)
+                                                    .on_hover_text("Reset surround routing bands, crossovers, and speaker levels to defaults")
+                                                    .clicked()
+                                                {
+                                                    cfg.reset_tuning();
+                                                    cfg_changed = true;
+                                                }
+                                                if ui.available_width() > 110.0 {
+                                                    ui.add_space(4.0);
+                                                    if has_height {
+                                                        ui.label(
+                                                            egui::RichText::new("• Height ↑")
+                                                                .size(10.5)
+                                                                .color(egui::Color32::from_rgb(255, 225, 130)),
+                                                        );
+                                                    }
+                                                    ui.label(
+                                                        egui::RichText::new("• Surround Bed")
+                                                            .size(10.5)
+                                                            .color(egui::Color32::from_rgb(255, 165, 35)),
+                                                    );
+                                                    ui.label(
+                                                        egui::RichText::new("• LFE")
+                                                            .size(10.5)
+                                                            .color(egui::Color32::from_rgb(220, 68, 32)),
+                                                    );
+                                                }
+                                            });
+                                        });
+                                        col.separator();
+                                    }
+
+                                    let controls_h = 46.0;
+                                    let graph_h = (col.available_height() - controls_h - 4.0).max(56.0);
+                                    let (graph_rect, response) = col.allocate_exact_size(
+                                        egui::vec2(col.available_width(), graph_h),
+                                        egui::Sense::click_and_drag(),
+                                    );
+
+                                    let min_freq = 20.0f32;
+                                    let max_freq = 20000.0f32;
+                                    let log_span = (max_freq / min_freq).ln();
+                                    let pad_x = 24.0f32;
+                                    let pad_top = 14.0f32;
+                                    let pad_bot = 15.0f32;
+                                    let plot_rect = egui::Rect::from_min_max(
+                                        egui::pos2(graph_rect.left() + pad_x, graph_rect.top() + pad_top),
+                                        egui::pos2((graph_rect.right() - 8.0).max(graph_rect.left() + pad_x + 20.0), (graph_rect.bottom() - pad_bot).max(graph_rect.top() + pad_top + 20.0)),
+                                    );
+
+                                    let freq_to_x = |f: f32| -> f32 {
+                                        let t = ((f.clamp(min_freq, max_freq) / min_freq).ln() / log_span).clamp(0.0, 1.0);
+                                        plot_rect.left() + t * plot_rect.width()
+                                    };
+                                    let x_to_freq = |x: f32| -> f32 {
+                                        let t = ((x - plot_rect.left()) / plot_rect.width().max(1.0)).clamp(0.0, 1.0);
+                                        min_freq * (max_freq / min_freq).powf(t)
+                                    };
+                                    let db_to_y = |db: f32| -> f32 {
+                                        let norm = ((15.0 - db.clamp(-15.0, 15.0)) / 30.0).clamp(0.0, 1.0);
+                                        plot_rect.top() + norm * plot_rect.height()
+                                    };
+                                    let y_to_db = |y: f32| -> f32 {
+                                        let norm = ((y - plot_rect.top()) / plot_rect.height().max(1.0)).clamp(0.0, 1.0);
+                                        (15.0 - norm * 30.0).clamp(-12.0, 12.0)
+                                    };
+                                    let mag_to_y = |mag: f32| -> f32 {
+                                        let db = 20.0 * mag.max(0.001).log10();
+                                        db_to_y(db)
+                                    };
+
+                                    // Pointer interaction for 5 surround routing band nodes (1..=5), Sub Crossover (6), Height Crossover (7, only when has_height)
+                                    let drag_id = egui::Id::new("surround_eq_active_handle");
+                                    let mut active_handle: u8 = col.ctx().data_mut(|d| *d.get_temp_mut_or_default::<u8>(drag_id));
+                                    if !has_height && active_handle == 7 {
+                                        active_handle = 0;
+                                    }
+
+                                    let pointer_pos = response
+                                        .interact_pointer_pos()
+                                        .or_else(|| col.ctx().pointer_latest_pos());
+
+                                    if let Some(pos) = pointer_pos {
+                                        if response.double_clicked() || response.secondary_clicked() {
+                                            for (i, &bf) in crate::state::SurroundUpmixConfig::EQ_BAND_FREQS.iter().enumerate() {
+                                                let node_pos = egui::pos2(freq_to_x(bf), db_to_y(cfg.band_gains_db[i]));
+                                                if pos.distance(node_pos) <= 16.0 {
+                                                    cfg.band_gains_db[i] = 0.0;
+                                                    cfg_changed = true;
+                                                }
+                                            }
+                                        }
+
+                                        if response.drag_started() || (response.clicked() && active_handle == 0) {
+                                            let mut best_h = 0u8;
+                                            let mut best_dist = 18.0f32;
+                                            for (i, &bf) in crate::state::SurroundUpmixConfig::EQ_BAND_FREQS.iter().enumerate() {
+                                                let node_pos = egui::pos2(freq_to_x(bf), db_to_y(cfg.band_gains_db[i]));
+                                                let d = pos.distance(node_pos);
+                                                if d < best_dist {
+                                                    best_dist = d;
+                                                    best_h = (i + 1) as u8;
+                                                }
+                                            }
+                                            let sub_x = freq_to_x(cfg.sub_crossover_hz);
+                                            let sub_d = (pos.x - sub_x).abs();
+                                            if sub_d < best_dist.min(13.0) {
+                                                best_dist = sub_d;
+                                                best_h = 6;
+                                            }
+                                            if has_height {
+                                                let height_x = freq_to_x(cfg.height_crossover_hz);
+                                                let height_d = (pos.x - height_x).abs();
+                                                if height_d < best_dist.min(13.0) {
+                                                    best_h = 7;
+                                                }
+                                            }
+                                            active_handle = best_h;
+                                            col.ctx().data_mut(|d| d.insert_temp(drag_id, active_handle));
+                                        }
+
+                                        if (response.dragged() || response.is_pointer_button_down_on()) && active_handle != 0 {
+                                            col.ctx().set_cursor_icon(egui::CursorIcon::Grabbing);
+                                            match active_handle {
+                                                1..=5 => {
+                                                    let idx = (active_handle - 1) as usize;
+                                                    let new_db = (y_to_db(pos.y) * 4.0).round() / 4.0;
+                                                    if (cfg.band_gains_db[idx] - new_db).abs() > 1e-3 {
+                                                        cfg.band_gains_db[idx] = new_db;
+                                                        cfg_changed = true;
+                                                    }
+                                                }
+                                                6 => {
+                                                    let new_sub = x_to_freq(pos.x).clamp(40.0, 250.0).round();
+                                                    if (cfg.sub_crossover_hz - new_sub).abs() > 0.2 {
+                                                        cfg.sub_crossover_hz = new_sub;
+                                                        cfg_changed = true;
+                                                    }
+                                                }
+                                                7 if has_height => {
+                                                    let new_h = (x_to_freq(pos.x).clamp(800.0, 10000.0) / 10.0).round() * 10.0;
+                                                    if (cfg.height_crossover_hz - new_h).abs() > 1.0 {
+                                                        cfg.height_crossover_hz = new_h;
+                                                        cfg_changed = true;
+                                                    }
+                                                }
+                                                _ => {}
+                                            }
+                                        }
+                                    }
+
+                                    if (response.drag_stopped()
+                                        || !response.is_pointer_button_down_on())
+                                        && active_handle != 0
+                                    {
+                                        active_handle = 0;
+                                        col.ctx().data_mut(|d| d.insert_temp(drag_id, 0u8));
+                                    }
+
+                                    if response.hovered() && active_handle == 0 {
+                                        col.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                                    }
+
+                                    let painter = col.painter().with_clip_rect(graph_rect);
+                                    // Studio dark glass backdrop
+                                    painter.rect(
+                                        graph_rect,
+                                        5.0,
+                                        egui::Color32::from_rgba_unmultiplied(18, 18, 20, 240),
+                                        egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(110, 92, 74, 110)),
+                                        egui::StrokeKind::Inside,
+                                    );
+
+                                    // Horizontal dB grid lines (+12, +6, 0, -6, -12 dB)
+                                    for &db in &[12.0f32, 6.0, 0.0, -6.0, -12.0] {
+                                        let y = db_to_y(db);
+                                        let is_zero = db.abs() < 0.1;
+                                        let line_col = if is_zero {
+                                            egui::Color32::from_rgba_unmultiplied(190, 182, 172, 95)
+                                        } else {
+                                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 18)
+                                        };
+                                        painter.line_segment(
+                                            [egui::pos2(plot_rect.left(), y), egui::pos2(plot_rect.right(), y)],
+                                            (if is_zero { 1.2 } else { 1.0 }, line_col),
+                                        );
+                                        let lbl = if db > 0.0 {
+                                            format!("+{:.0}", db)
+                                        } else {
+                                            format!("{:.0}", db)
+                                        };
+                                        painter.text(
+                                            egui::pos2(plot_rect.left() - 3.0, y),
+                                            egui::Align2::RIGHT_CENTER,
+                                            lbl,
+                                            egui::FontId::proportional(9.5),
+                                            egui::Color32::from_rgb(155, 148, 140),
+                                        );
+                                    }
+
+                                    // Vertical log-frequency grid lines
+                                    for &(f_grid, f_lbl) in &[
+                                        (60.0f32, "60"),
+                                        (120.0, "120"),
+                                        (250.0, "250"),
+                                        (500.0, "500"),
+                                        (1000.0, "1k"),
+                                        (2500.0, "2.5k"),
+                                        (5000.0, "5k"),
+                                        (10000.0, "10k"),
+                                    ] {
+                                        let x = freq_to_x(f_grid);
+                                        painter.line_segment(
+                                            [egui::pos2(x, plot_rect.top()), egui::pos2(x, plot_rect.bottom())],
+                                            (1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16)),
+                                        );
+                                        painter.text(
+                                            egui::pos2(x, graph_rect.bottom() - 2.0),
+                                            egui::Align2::CENTER_BOTTOM,
+                                            f_lbl,
+                                            egui::FontId::proportional(9.5),
+                                            egui::Color32::from_rgb(155, 148, 140),
+                                        );
+                                    }
+
+                                    // Live background spectrum bars colored by LFE / Bed / Height routing split
+                                    if !state.spectrum_data.is_empty() {
+                                        let num_bars = 72usize;
+                                        let bar_step = plot_rect.width() / num_bars as f32;
+                                        let spec_len = state.spectrum_data.len();
+                                        let max_f_spec = state.max_frequency.max(2000.0);
+                                        let log_spec_span = (max_f_spec / min_freq).ln();
+                                        for b in 0..num_bars {
+                                            let x0 = plot_rect.left() + b as f32 * bar_step;
+                                            let f_bar = x_to_freq(x0 + bar_step * 0.5);
+                                            let spec_t = ((f_bar / min_freq).ln() / log_spec_span).clamp(0.0, 1.0);
+                                            let bin_idx = ((spec_t * (spec_len - 1) as f32).round() as usize).min(spec_len - 1);
+                                            let val = (state.spectrum_data[bin_idx] / 100.0).clamp(0.0, 1.0);
+                                            if val > 0.01 {
+                                                let bh = val * plot_rect.height() * 0.85;
+                                                let (_, lfe_m, bed_m, h_m) =
+                                                    cfg.evaluate_band_routing_for_layout(
+                                                        f_bar,
+                                                        has_height,
+                                                        state.current_sample_rate,
+                                                    );
+                                                let sum_m = (lfe_m + bed_m + h_m).max(0.01);
+                                                let r_c = ((lfe_m * 220.0 + bed_m * 255.0 + h_m * 255.0) / sum_m).clamp(0.0, 255.0) as u8;
+                                                let g_c = ((lfe_m * 68.0 + bed_m * 165.0 + h_m * 225.0) / sum_m).clamp(0.0, 255.0) as u8;
+                                                let b_c = ((lfe_m * 32.0 + bed_m * 35.0 + h_m * 130.0) / sum_m).clamp(0.0, 255.0) as u8;
+                                                let bar_rect = egui::Rect::from_min_max(
+                                                    egui::pos2(x0 + 0.5, plot_rect.bottom() - bh),
+                                                    egui::pos2(x0 + (bar_step - 0.8).max(1.0), plot_rect.bottom()),
+                                                );
+                                                painter.rect_filled(
+                                                    bar_rect,
+                                                    1.0,
+                                                    egui::Color32::from_rgba_unmultiplied(r_c, g_c, b_c, 48),
+                                                );
+                                            }
+                                        }
+                                    }
+
+                                    // Compute & draw LFE, Bed Surround, Height (if present), and Surround Routing Contour curves
+                                    let samples = 112usize;
+                                    let mut lfe_pts = Vec::with_capacity(samples);
+                                    let mut bed_pts = Vec::with_capacity(samples);
+                                    let mut height_pts = Vec::with_capacity(samples);
+                                    let mut eq_pts = Vec::with_capacity(samples);
+
+                                    for s in 0..samples {
+                                        let t = s as f32 / (samples - 1) as f32;
+                                        let x = plot_rect.left() + t * plot_rect.width();
+                                        let f = x_to_freq(x);
+                                        let (eq_gain, lfe_m, bed_m, height_m) =
+                                            cfg.evaluate_band_routing_for_layout(
+                                                f,
+                                                has_height,
+                                                state.current_sample_rate,
+                                            );
+                                        let y_lfe = mag_to_y(lfe_m);
+                                        let y_bed = mag_to_y(bed_m);
+                                        let y_height = mag_to_y(height_m);
+                                        let y_eq = mag_to_y(eq_gain);
+
+                                        lfe_pts.push(egui::pos2(x, y_lfe));
+                                        bed_pts.push(egui::pos2(x, y_bed));
+                                        if has_height {
+                                            height_pts.push(egui::pos2(x, y_height));
+                                        }
+                                        eq_pts.push(egui::pos2(x, y_eq));
+
+                                        // Subtle vertical tint columns under each curve for instant visual split clarity
+                                        if s + 1 < samples {
+                                            let col_w = (plot_rect.width() / (samples - 1) as f32) + 0.5;
+                                            if y_bed < plot_rect.bottom() - 1.0 {
+                                                painter.rect_filled(
+                                                    egui::Rect::from_min_max(egui::pos2(x, y_bed), egui::pos2(x + col_w, plot_rect.bottom())),
+                                                    0.0,
+                                                    egui::Color32::from_rgba_unmultiplied(255, 160, 35, 18),
+                                                );
+                                            }
+                                            if has_height && y_height < plot_rect.bottom() - 1.0 {
+                                                painter.rect_filled(
+                                                    egui::Rect::from_min_max(egui::pos2(x, y_height), egui::pos2(x + col_w, plot_rect.bottom())),
+                                                    0.0,
+                                                    egui::Color32::from_rgba_unmultiplied(255, 225, 130, 20),
+                                                );
+                                            }
+                                            if y_lfe < plot_rect.bottom() - 1.0 {
+                                                painter.rect_filled(
+                                                    egui::Rect::from_min_max(egui::pos2(x, y_lfe), egui::pos2(x + col_w, plot_rect.bottom())),
+                                                    0.0,
+                                                    egui::Color32::from_rgba_unmultiplied(220, 65, 30, 26),
+                                                );
+                                            }
+                                        }
+                                    }
+
+                                    painter.add(egui::Shape::line(
+                                        lfe_pts,
+                                        egui::Stroke::new(1.8_f32, egui::Color32::from_rgb(220, 68, 32)),
+                                    ));
+                                    painter.add(egui::Shape::line(
+                                        bed_pts,
+                                        egui::Stroke::new(2.0_f32, egui::Color32::from_rgb(255, 165, 35)),
+                                    ));
+                                    if has_height {
+                                        painter.add(egui::Shape::line(
+                                            height_pts,
+                                            egui::Stroke::new(2.1_f32, egui::Color32::from_rgb(255, 225, 130)),
+                                        ));
+                                    }
+                                    painter.add(egui::Shape::line(
+                                        eq_pts,
+                                        egui::Stroke::new(1.5_f32, egui::Color32::from_rgba_unmultiplied(220, 215, 208, 215)),
+                                    ));
+
+                                    // Draw vertical Crossover Handles (LFE Sub & optional Height Split)
+                                    let sub_x = freq_to_x(cfg.sub_crossover_hz);
+                                    let sub_col = if active_handle == 6 {
+                                        egui::Color32::from_rgb(255, 150, 95)
+                                    } else {
+                                        egui::Color32::from_rgb(220, 68, 32)
+                                    };
+                                    painter.line_segment(
+                                        [egui::pos2(sub_x, plot_rect.top()), egui::pos2(sub_x, plot_rect.bottom())],
+                                        (1.5, sub_col),
+                                    );
+                                    let sub_badge_text = format!("SUB {:.0}Hz", cfg.sub_crossover_hz);
+                                    let sub_galley = painter.layout_no_wrap(
+                                        sub_badge_text,
+                                        egui::FontId::proportional(10.0),
+                                        egui::Color32::WHITE,
+                                    );
+                                    let sub_badge_rect = egui::Rect::from_center_size(
+                                        egui::pos2(sub_x.clamp(plot_rect.left() + 28.0, plot_rect.right() - 28.0), graph_rect.top() + 8.0),
+                                        sub_galley.size() + egui::vec2(8.0, 2.0),
+                                    );
+                                    painter.rect(
+                                        sub_badge_rect,
+                                        3.0,
+                                        egui::Color32::from_rgba_unmultiplied(50, 20, 12, 230),
+                                        egui::Stroke::new(1.0_f32, sub_col),
+                                        egui::StrokeKind::Inside,
+                                    );
+                                    painter.galley(sub_badge_rect.min + egui::vec2(4.0, 1.0), sub_galley, egui::Color32::WHITE);
+
+                                    if has_height {
+                                        let height_x = freq_to_x(cfg.height_crossover_hz);
+                                        let height_col = if active_handle == 7 {
+                                            egui::Color32::from_rgb(255, 242, 185)
+                                        } else {
+                                            egui::Color32::from_rgb(255, 225, 130)
+                                        };
+                                        painter.line_segment(
+                                            [egui::pos2(height_x, plot_rect.top()), egui::pos2(height_x, plot_rect.bottom())],
+                                            (1.5, height_col),
+                                        );
+                                        let height_badge_text = if cfg.height_crossover_hz >= 1000.0 {
+                                            format!("HEIGHT ↑ {:.1}kHz", cfg.height_crossover_hz / 1000.0)
+                                        } else {
+                                            format!("HEIGHT ↑ {:.0}Hz", cfg.height_crossover_hz)
+                                        };
+                                        let height_galley = painter.layout_no_wrap(
+                                            height_badge_text,
+                                            egui::FontId::proportional(10.0),
+                                            egui::Color32::WHITE,
+                                        );
+                                        let height_badge_rect = egui::Rect::from_center_size(
+                                            egui::pos2(height_x.clamp(plot_rect.left() + 42.0, plot_rect.right() - 42.0), graph_rect.top() + 8.0),
+                                            height_galley.size() + egui::vec2(8.0, 2.0),
+                                        );
+                                        painter.rect(
+                                            height_badge_rect,
+                                            3.0,
+                                            egui::Color32::from_rgba_unmultiplied(46, 36, 16, 235),
+                                            egui::Stroke::new(1.0_f32, height_col),
+                                            egui::StrokeKind::Inside,
+                                        );
+                                        painter.galley(height_badge_rect.min + egui::vec2(4.0, 1.0), height_galley, egui::Color32::WHITE);
+                                    }
+
+                                    // Draw the 5 interactive Surround Routing Band Nodes
+                                    for (i, &bf) in crate::state::SurroundUpmixConfig::EQ_BAND_FREQS.iter().enumerate() {
+                                        let gain_db = cfg.band_gains_db[i];
+                                        let node_pos = egui::pos2(freq_to_x(bf), db_to_y(gain_db));
+                                        let is_active = active_handle == (i + 1) as u8;
+                                        let node_color = if bf <= cfg.sub_crossover_hz * 1.1 {
+                                            egui::Color32::from_rgb(225, 75, 35)
+                                        } else if has_height && bf >= cfg.height_crossover_hz {
+                                            egui::Color32::from_rgb(255, 225, 130)
+                                        } else {
+                                            egui::Color32::from_rgb(255, 165, 35)
+                                        };
+                                        painter.circle_filled(
+                                            node_pos,
+                                            if is_active { 7.0 } else { 5.5 },
+                                            egui::Color32::from_rgb(24, 22, 20),
+                                        );
+                                        painter.circle_stroke(
+                                            node_pos,
+                                            if is_active { 7.0 } else { 5.5 },
+                                            egui::Stroke::new(
+                                                if is_active { 2.5_f32 } else { 2.0_f32 },
+                                                node_color,
+                                            ),
+                                        );
+                                        painter.circle_filled(node_pos, 2.5, egui::Color32::WHITE);
+
+                                        if is_active || gain_db.abs() >= 0.25 {
+                                            let sign = if gain_db > 0.0 { "+" } else { "" };
+                                            let db_txt = format!("{}{:.1}dB", sign, gain_db);
+                                            let lbl_y = if node_pos.y > plot_rect.top() + 18.0 {
+                                                node_pos.y - 11.0
+                                            } else {
+                                                node_pos.y + 11.0
+                                            };
+                                            painter.text(
+                                                egui::pos2(node_pos.x, lbl_y),
+                                                egui::Align2::CENTER_CENTER,
+                                                db_txt,
+                                                egui::FontId::proportional(10.0),
+                                                egui::Color32::WHITE,
+                                            );
+                                        }
+                                    }
+
+                                    // Bottom compact speaker routing & level sliders (2 rows x 3 columns),
+                                    // tailored to Bed + Height (>8ch) vs Bed-Only (3..=8ch) systems
+                                    col.add_space(3.0);
+                                    col.columns(3, |cols| {
+                                        cols[0].horizontal(|ui| {
+                                            ui.spacing_mut().slider_width = (ui.available_width() - 56.0).max(28.0);
+                                            ui.label(egui::RichText::new("Front").size(11.0).color(egui::Color32::from_rgb(210, 205, 198)));
+                                            if ui
+                                                .add(egui::Slider::new(&mut cfg.front_level, 0.0..=1.5).show_value(false))
+                                                .on_hover_text(format!("Front L/R Anchor Level (uncolored): {:.0}%", cfg.front_level * 100.0))
+                                                .changed()
+                                            {
+                                                cfg_changed = true;
+                                            }
+                                        });
+                                        cols[1].horizontal(|ui| {
+                                            ui.spacing_mut().slider_width = (ui.available_width() - 62.0).max(28.0);
+                                            ui.label(egui::RichText::new("Side/Rear").size(11.0).color(egui::Color32::from_rgb(255, 165, 35)));
+                                            if ui
+                                                .add(egui::Slider::new(&mut cfg.side_rear_level, 0.0..=1.5).show_value(false))
+                                                .on_hover_text(format!("Side & Rear Surround Bed Level: {:.0}%", cfg.side_rear_level * 100.0))
+                                                .changed()
+                                            {
+                                                cfg_changed = true;
+                                            }
+                                        });
+                                        cols[2].horizontal(|ui| {
+                                            ui.spacing_mut().slider_width = (ui.available_width() - 58.0).max(28.0);
+                                            if has_height {
+                                                ui.label(egui::RichText::new("Height ↑").size(11.0).color(egui::Color32::from_rgb(255, 225, 130)));
+                                                if ui
+                                                    .add(egui::Slider::new(&mut cfg.height_level, 0.0..=1.5).show_value(false))
+                                                    .on_hover_text(format!("Overhead Height (Top Front / Top Rear) Level: {:.0}%", cfg.height_level * 100.0))
+                                                    .changed()
+                                                {
+                                                    cfg_changed = true;
+                                                }
+                                            } else {
+                                                ui.label(egui::RichText::new("Width").size(11.0).color(egui::Color32::from_rgb(235, 185, 105)));
+                                                if ui
+                                                    .add(egui::Slider::new(&mut cfg.stereo_width, 0.0..=2.0).show_value(false))
+                                                    .on_hover_text(format!("Surround Bed Ambient Width: {:.0}%", cfg.stereo_width * 100.0))
+                                                    .changed()
+                                                {
+                                                    cfg_changed = true;
+                                                }
+                                            }
+                                        });
+                                    });
+                                    col.columns(3, |cols| {
+                                        cols[0].horizontal(|ui| {
+                                            ui.spacing_mut().slider_width = (ui.available_width() - 56.0).max(28.0);
+                                            ui.label(egui::RichText::new("LFE Sub").size(11.0).color(egui::Color32::from_rgb(225, 75, 35)));
+                                            if ui
+                                                .add(egui::Slider::new(&mut cfg.lfe_level, 0.0..=1.5).show_value(false))
+                                                .on_hover_text(format!("LFE Subwoofer Level: {:.0}%", cfg.lfe_level * 100.0))
+                                                .changed()
+                                            {
+                                                cfg_changed = true;
+                                            }
+                                        });
+                                        cols[1].horizontal(|ui| {
+                                            ui.spacing_mut().slider_width = (ui.available_width() - 62.0).max(28.0);
+                                            ui.label(egui::RichText::new("Center").size(11.0).color(egui::Color32::from_rgb(245, 195, 85)));
+                                            if ui
+                                                .add(egui::Slider::new(&mut cfg.center_level, 0.0..=1.5).show_value(false))
+                                                .on_hover_text(format!("Center Speaker Mid Level: {:.0}% (0% = Pure Left/Right Side Split)", cfg.center_level * 100.0))
+                                                .changed()
+                                            {
+                                                cfg_changed = true;
+                                            }
+                                        });
+                                        cols[2].horizontal(|ui| {
+                                            ui.spacing_mut().slider_width = (ui.available_width() - 58.0).max(28.0);
+                                            if has_height {
+                                                ui.label(egui::RichText::new("Hi-Bleed").size(11.0).color(egui::Color32::from_rgb(215, 195, 165)));
+                                                if ui
+                                                    .add(egui::Slider::new(&mut cfg.surround_high_bleed, 0.0..=1.0).show_value(false))
+                                                    .on_hover_text(format!("High-Frequency Bleed in Ear-Level Side/Rear Speakers: {:.0}% (0% routes highs exclusively to Height speakers)", cfg.surround_high_bleed * 100.0))
+                                                    .changed()
+                                                {
+                                                    cfg_changed = true;
+                                                }
+                                            } else {
+                                                ui.label(egui::RichText::new("Sub X-O").size(11.0).color(egui::Color32::from_rgb(235, 120, 60)));
+                                                if ui
+                                                    .add(egui::Slider::new(&mut cfg.sub_crossover_hz, 40.0..=250.0).show_value(false))
+                                                    .on_hover_text(format!("LFE Subwoofer Low-Pass Crossover: {:.0} Hz", cfg.sub_crossover_hz))
+                                                    .changed()
+                                                {
+                                                    cfg_changed = true;
+                                                }
+                                            }
+                                        });
+                                    });
+
+                                    if cfg_changed {
+                                        *engine_action = EngineAction::SetSurroundUpmix(cfg);
+                                    }
+                                    return;
+                                }
+
+                                if !is_portrait {
+                                    let col1_heading = if state.lyrics.is_some() {
+                                        "Lyrics"
+                                    } else if !state.tracker_patterns_by_order.is_empty() {
+                                        "Tracker Pattern"
+                                    } else {
+                                        "Pattern Heatmap"
+                                    };
+                                    col.horizontal(|ui| {
+                                        ui.heading(col1_heading);
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            let upmix_active = state
+                                                .surround_upmix
+                                                .is_active_for(state.source_channels, state.hardware_channels);
+                                            let (eq_fill, eq_stroke, eq_col) = if upmix_active {
+                                                (
+                                                    egui::Color32::from_rgb(56, 38, 20),
+                                                    egui::Color32::from_rgb(210, 135, 45),
+                                                    egui::Color32::from_rgb(255, 228, 185),
+                                                )
+                                            } else {
+                                                (
+                                                    egui::Color32::from_rgb(44, 42, 40),
+                                                    egui::Color32::from_rgb(105, 98, 90),
+                                                    egui::Color32::from_rgb(225, 220, 212),
+                                                )
+                                            };
+                                            let eq_btn = egui::Button::new(
+                                                egui::RichText::new("🎚 Surround EQ")
+                                                    .size(11.0)
+                                                    .strong()
+                                                    .color(eq_col),
+                                            )
+                                            .fill(eq_fill)
+                                            .stroke(egui::Stroke::new(1.0_f32, eq_stroke))
+                                            .corner_radius(4.0);
+                                            if ui
+                                                .add(eq_btn)
+                                                .on_hover_text("Flip middle panel between Tracker Pattern / Heatmap / Lyrics viewer and Surround Upmix EQ")
+                                                .clicked()
+                                            {
+                                                *engine_action = EngineAction::SetShowSurroundEq(true);
+                                            }
+                                        });
+                                    });
+                                    col.separator();
+                                }
+                                let hm_rect = col.available_rect_before_wrap();
+                                *out_heatmap_rect = Some(hm_rect);
+
+                                col.painter().rect_filled(hm_rect, 0.0, egui::Color32::TRANSPARENT);
+
+                                let painter = col.painter().with_clip_rect(hm_rect);
+                                let chunks = 64;
+                                let cell_w = hm_rect.width() / chunks as f32;
+
+                                for c in 0..=chunks {
+                                    let x = hm_rect.left() + c as f32 * cell_w;
+                                    painter.line_segment([egui::pos2(x, hm_rect.top()), egui::pos2(x, hm_rect.bottom())], (1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 5)));
+                                }
+
+                                if let Some(lyrics) = &state.lyrics {
+                                    // Layer 1: Backdrop Scrim - Dim heatmap slightly for crisp lyrics readability
+                                    painter.rect_filled(
+                                        hm_rect,
+                                        0.0,
+                                        egui::Color32::from_rgba_unmultiplied(10, 10, 14, 175)
+                                    );
+
+                                    let display_secs = state.scrub_target_seconds.unwrap_or(state.current_seconds);
+                                    let center_y = hm_rect.top() + hm_rect.height() / 2.0;
+                                    let row_height = 32.0;
+                                    let num_rows_to_draw = (hm_rect.height() / row_height) as i32;
+                                    let half_rows = (num_rows_to_draw / 2).max(1);
+
+                                    let active_idx = lyrics.find_current_line_idx(display_secs);
+                                    let is_intro = active_idx.is_none();
+                                    let base_idx = active_idx.unwrap_or(0);
+
+                                    for offset in -half_rows..=half_rows {
+                                        let target_idx = (base_idx as i32) + offset - if is_intro && offset > 0 { 1 } else { 0 };
+                                        let y = center_y + (offset as f32) * row_height;
+
+                                        let distance = offset.abs() as f32 / (half_rows as f32);
+                                        let alpha = (1.0 - distance * 0.80).clamp(0.0, 1.0);
+                                        if alpha <= 0.02 {
+                                            continue;
+                                        }
+
+                                        if is_intro && offset == 0 {
+                                            // Active Intro indicator
+                                            let font_id = egui::FontId::proportional(18.0);
+                                            let text = "♪   ♪   ♪   (Intro)";
+                                            let galley = painter.layout_no_wrap(
+                                                text.to_string(),
+                                                font_id,
+                                                egui::Color32::from_rgba_unmultiplied(225, 225, 240, 240),
+                                            );
+                                            let pos = egui::pos2(hm_rect.center().x, y);
+                                            let rect = egui::Rect::from_center_size(pos, galley.size());
+                                            painter.rect(
+                                                rect.expand2(egui::vec2(14.0, 4.0)),
+                                                5.0,
+                                                egui::Color32::from_rgba_unmultiplied(14, 14, 18, 235),
+                                                egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 50)),
+                                                egui::StrokeKind::Outside,
+                                            );
+                                            painter.galley(rect.min, galley, egui::Color32::from_rgba_unmultiplied(225, 225, 240, 240));
+                                            continue;
+                                        }
+
+                                        if is_intro && offset < 0 {
+                                            continue;
+                                        }
+
+                                        if target_idx >= 0 && (target_idx as usize) < lyrics.lines.len() {
+                                            let line = &lyrics.lines[target_idx as usize];
+                                            let is_current = !is_intro && offset == 0;
+                                            let text_display = if line.text.is_empty() {
+                                                "♪   ♪   ♪"
+                                            } else {
+                                                line.text.as_str()
+                                            };
+
+                                            let pos = egui::pos2(hm_rect.center().x, y);
+
+                                            if is_current {
+                                                // Active line: prominent large font + high contrast pill with subtle luminous border
+                                                let font_id = egui::FontId::proportional(20.0);
+                                                let max_w = (hm_rect.width() - 24.0).max(50.0);
+                                                let galley = painter.layout(
+                                                    text_display.to_string(),
+                                                    font_id,
+                                                    egui::Color32::WHITE,
+                                                    max_w,
+                                                );
+                                                let rect = egui::Rect::from_center_size(pos, galley.size());
+
+                                                painter.rect(
+                                                    rect.expand2(egui::vec2(16.0, 5.0)),
+                                                    6.0,
+                                                    egui::Color32::from_rgba_unmultiplied(12, 12, 16, 240),
+                                                    egui::Stroke::new(1.0_f32, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 60)),
+                                                    egui::StrokeKind::Outside,
+                                                );
+                                                painter.galley(rect.min, galley, egui::Color32::WHITE);
+                                            } else {
+                                                // Surrounding lines: readable 16pt font with smooth distance fade + soft dark backdrop for contrast
+                                                let font_id = egui::FontId::proportional(16.0);
+                                                let max_w = (hm_rect.width() - 24.0).max(50.0);
+                                                let text_color = if line.text.is_empty() {
+                                                    egui::Color32::from_rgba_unmultiplied(150, 150, 160, (alpha * 140.0) as u8)
+                                                } else {
+                                                    egui::Color32::from_rgba_unmultiplied(225, 225, 235, (alpha * 200.0) as u8)
+                                                };
+                                                let galley = painter.layout(
+                                                    text_display.to_string(),
+                                                    font_id,
+                                                    text_color,
+                                                    max_w,
+                                                );
+                                                let rect = egui::Rect::from_center_size(pos, galley.size());
+
+                                                let pill_alpha = (alpha * 180.0) as u8;
+                                                if pill_alpha > 15 {
+                                                    painter.rect_filled(
+                                                        rect.expand2(egui::vec2(10.0, 3.0)),
+                                                        4.0,
+                                                        egui::Color32::from_rgba_unmultiplied(10, 10, 14, pill_alpha),
+                                                    );
+                                                }
+                                                painter.galley(rect.min, galley, text_color);
+                                            }
+                                        }
+                                    }
+                                } else if !state.tracker_patterns_by_order.is_empty() {
+                                    let current_order = state.current_tracker_order;
+                                    let current_row = state.current_tracker_row;
+                                    let center_y = hm_rect.top() + hm_rect.height() / 2.0;
+                                    let row_height = 16.0;
+                                    let num_rows_to_draw = (hm_rect.height() / row_height) as i32;
+
+                                    let font_id = egui::FontId::monospace(12.0);
+                                    let char_width = 7.5; // Monospace char width at 12pt with safety margin
+                                    let max_chars = ((hm_rect.width() - 24.0) / char_width).max(10.0) as usize;
+                                    let max_text_chars = max_chars.saturating_sub(4);
+
+                                    let mut formatted = String::with_capacity(max_text_chars + 16);
+
+                                    for offset in -(num_rows_to_draw / 2)..=(num_rows_to_draw / 2) {
+                                        let mut resolved_order = current_order;
+                                        let mut resolved_row = current_row + offset;
+
+                                        if offset < 0 {
+                                            // Read exact playback sequence from history
+                                            let history_idx = (-offset - 1) as usize;
+                                            if history_idx < state.tracker_row_history.len() {
+                                                let (hist_order, hist_row) = state.tracker_row_history[history_idx];
+                                                resolved_order = hist_order;
+                                                resolved_row = hist_row;
+                                            } else {
+                                                // Fall back to underflow if history hasn't built up yet
+                                                while resolved_row < 0 && resolved_order > 0 {
+                                                    resolved_order -= 1;
+                                                    if (resolved_order as usize) < state.tracker_patterns_by_order.len() {
+                                                        resolved_row += state.tracker_patterns_by_order[resolved_order as usize].len() as i32;
+                                                    } else {
+                                                        break;
+                                                    }
+                                                }
+                                            }
+                                        } else if offset > 0 {
+                                            // Overflow forwards within the current pattern, clamped
+                                            while (resolved_order as usize) < state.tracker_patterns_by_order.len() {
+                                                let pattern_len = state.tracker_patterns_by_order[resolved_order as usize].len() as i32;
+                                                if resolved_row >= pattern_len {
+                                                    resolved_row -= pattern_len;
+                                                    resolved_order += 1;
+                                                } else {
+                                                    break;
+                                                }
+                                            }
+                                        }
+
+                                        if resolved_order >= 0 && (resolved_order as usize) < state.tracker_patterns_by_order.len() {
+                                            let pattern = &state.tracker_patterns_by_order[resolved_order as usize];
+                                            if resolved_row >= 0 && (resolved_row as usize) < pattern.len() {
+                                                let row_str = &pattern[resolved_row as usize];
+
+                                                let distance = offset.abs() as f32 / (num_rows_to_draw as f32 / 2.0);
+                                                let alpha = (1.0 - distance * 0.75).clamp(0.0, 1.0);
+                                                let y = center_y + (offset as f32) * row_height;
+
+                                                // Format tracker row text
+                                                formatted.clear();
+                                                let text_slice = if row_str.chars().count() > max_text_chars {
+                                                    let mut end = row_str.len();
+                                                    for (char_count, (byte_idx, _)) in row_str.char_indices().enumerate() {
+                                                        if char_count == max_text_chars {
+                                                            end = byte_idx;
+                                                            break;
+                                                        }
+                                                    }
+                                                    &row_str[..end]
+                                                } else {
+                                                    row_str.as_str()
+                                                };
+
+                                                use std::fmt::Write;
+                                                let _ = write!(formatted, "{:02} | {}", resolved_row, text_slice);
+
+                                                let pos = egui::pos2(hm_rect.left() + 10.0, y);
+                                                if offset == 0 {
+                                                    // Prominent highlight background on the active playback row
+                                                    let galley = painter.layout_no_wrap(
+                                                        formatted.clone(),
+                                                        font_id.clone(),
+                                                        egui::Color32::WHITE,
+                                                    );
+                                                    let rect = egui::Rect::from_min_size(
+                                                        pos + egui::vec2(0.0, -galley.size().y / 2.0),
+                                                        galley.size(),
+                                                    );
+                                                    painter.rect_filled(
+                                                        rect.expand2(egui::vec2(10.0, 2.0)),
+                                                        4.0,
+                                                        egui::Color32::from_black_alpha(220)
+                                                    );
+                                                    painter.galley(rect.min, galley, egui::Color32::WHITE);
+                                                } else {
+                                                    // Valid unmultiplied alpha color
+                                                    let color = egui::Color32::from_rgba_unmultiplied(150, 150, 150, (alpha * 100.0) as u8);
+
+                                                    let galley = painter.layout_no_wrap(
+                                                        formatted.clone(),
+                                                        font_id.clone(),
+                                                        egui::Color32::WHITE,
+                                                    );
+
+                                                    let rect = egui::Rect::from_min_size(
+                                                        pos + egui::vec2(0.0, -galley.size().y / 2.0),
+                                                        galley.size(),
+                                                    );
+                                                    painter.galley(rect.min, galley, color);
+                                                }
+
+                                                // Pattern boundary indicator
+                                                if resolved_row == 0 {
+                                                    painter.line_segment(
+                                                        [egui::pos2(hm_rect.left(), y - row_height / 2.0), egui::pos2(hm_rect.right(), y - row_height / 2.0)],
+                                                        (1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, (alpha * 150.0) as u8))
+                                                    );
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            };
+
+                            let mut render_col_info = |col: &mut egui::Ui, out_track_info_rect: &mut Option<egui::Rect>, engine_action: &mut EngineAction| {
+                                if state.video_mode == 1 && self.video_state.is_some() {
+                                    let available = col.available_size();
+                                    let (rect, _) = col.allocate_exact_size(available, egui::Sense::hover());
+                                    *out_track_info_rect = Some(rect);
+                                } else {
+                                    col.style_mut().visuals.override_text_color = Some(egui::Color32::from_gray(235));
+                                    let heading_text = if state.playlist.len() > 1 {
+                                        format!("Track Info ({}/{})", state.playlist_index + 1, state.playlist.len())
+                                    } else {
+                                        "Track Info".to_string()
+                                    };
+                                    col.horizontal(|ui| {
+                                        ui.heading(heading_text);
+                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                            let btn_h = if is_portrait { 30.0 } else { 24.0 };
+                                            let open_hdr_btn = egui::Button::new(
+                                                egui::RichText::new("📂 OPEN FILE")
+                                                    .size(12.0)
+                                                    .strong()
+                                                    .color(egui::Color32::WHITE)
+                                            )
+                                            .fill(egui::Color32::from_rgb(205, 95, 0))
+                                            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(255, 145, 30)))
+                                            .corner_radius(4.0)
+                                            .min_size(egui::vec2(92.0, btn_h));
+                                            if ui.add(open_hdr_btn).clicked() {
+                                                *engine_action = EngineAction::OpenFile;
+                                            }
+                                            if ui.available_width() > 110.0 {
+                                                let stream_hdr_btn = egui::Button::new(
+                                                    egui::RichText::new("🔊 STREAM/DEV")
+                                                        .size(11.5)
+                                                        .strong()
+                                                        .color(egui::Color32::WHITE)
+                                                )
+                                                .fill(egui::Color32::from_rgb(100, 50, 150))
+                                                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(180, 80, 255)))
+                                                .corner_radius(4.0)
+                                                .min_size(egui::vec2(96.0, btn_h));
+                                                if ui
+                                                    .add(stream_hdr_btn)
+                                                    .on_hover_text("Open network stream URL or local audio input device (microphone)")
+                                                    .clicked()
+                                                {
+                                                    *engine_action = EngineAction::OpenUrlDialog;
+                                                }
+                                            }
+                                        });
+                                    });
+                                    col.separator();
+
+                                    let render_smooth_marquee = |ui: &mut egui::Ui, text: &str, size: f32, is_title: bool| {
+                                        let available_width = ui.available_width();
+                                        let font_id = egui::FontId::proportional(size);
+                                        let color = ui.style().visuals.override_text_color.unwrap_or(egui::Color32::from_gray(235));
+                                        let text_color = if is_title { egui::Color32::WHITE } else { color };
+
+                                        let galley = ui.painter().layout_no_wrap(text.to_string(), font_id, text_color);
+                                        let text_width = galley.rect.width();
+                                        let height = galley.rect.height();
+
+                                        let (rect, _response) = ui.allocate_exact_size(egui::vec2(available_width, height), egui::Sense::hover());
+                                        let painter = ui.painter().with_clip_rect(rect);
+
+                                        if text_width > available_width {
+                                            let max_scroll = text_width - available_width;
+                                            let scroll_duration = max_scroll / 35.0;
+                                            let total_period = 2.0 + scroll_duration + 2.0 + scroll_duration;
+                                            let t = (state.current_seconds as f32) % total_period;
+
+                                            let offset = if t < 2.0 {
+                                                0.0
+                                            } else if t < 2.0 + scroll_duration {
+                                                let progress = (t - 2.0) / scroll_duration;
+                                                progress * max_scroll
+                                            } else if t < 2.0 + scroll_duration + 2.0 {
+                                                max_scroll
+                                            } else {
+                                                let progress = (t - (2.0 + scroll_duration + 2.0)) / scroll_duration;
+                                                max_scroll - (progress * max_scroll)
+                                            };
+
+                                            painter.galley(rect.min + egui::vec2(-offset, 0.0), galley, text_color);
+                                        } else {
+                                            painter.galley(rect.min, galley, text_color);
+                                        }
+                                    };
+
+                                    let strip_android_cache_prefix = |s: &str| -> String {
+                                        if let Some(rest) = s.strip_prefix("track_")
+                                            && let Some(idx) = rest.find('_')
+                                            && idx > 0
+                                            && rest[..idx].chars().all(|c| c.is_ascii_digit())
+                                        {
+                                            return rest[idx + 1..].to_string();
+                                        }
+                                        s.to_string()
+                                    };
+
+                                    let raw_display_title = if state.song_title.is_empty() {
+                                        "Unknown Title".to_string()
+                                    } else {
+                                        let p = std::path::Path::new(&state.song_title);
+                                        if p.extension().is_some() || state.song_title.contains('/') || state.song_title.contains('\\') {
+                                            p.file_stem().unwrap_or_default().to_string_lossy().to_string()
+                                        } else {
+                                            state.song_title.clone()
+                                        }
+                                    };
+                                    let display_title = strip_android_cache_prefix(&raw_display_title);
+
+                                    let current_path_str = if state.playlist_index < state.playlist.len() {
+                                        state.playlist[state.playlist_index].clone()
+                                    } else {
+                                        state.song_title.clone()
+                                    };
+                                    let is_mic_stream = crate::state::is_mic_uri(&current_path_str)
+                                        || crate::state::is_mic_uri(&state.song_title)
+                                        || state.is_mic_input;
+                                    let is_network = current_path_str.starts_with("http://") || current_path_str.starts_with("https://");
+                                    let file_path = std::path::Path::new(&current_path_str);
+                                    let file_name = if is_network || is_mic_stream {
+                                        display_title.clone()
+                                    } else {
+                                        let raw_fname = file_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                                        strip_android_cache_prefix(&raw_fname)
+                                    };
+                                    if self.cached_meta_path != current_path_str {
+                                        self.cached_meta_path = current_path_str.clone();
+                                        if is_network || is_mic_stream {
+                                            self.cached_file_dir = current_path_str.clone();
+                                            self.cached_file_len = None;
+                                        } else {
+                                            let abs_path = if std::path::Path::new(&current_path_str).is_absolute() {
+                                                std::path::PathBuf::from(&current_path_str)
+                                            } else if let Ok(cwd) = std::env::current_dir() {
+                                                cwd.join(&current_path_str)
+                                            } else {
+                                                std::path::PathBuf::from(&current_path_str)
+                                            };
+                                            let dir_path = abs_path.parent().map(|p| p.to_string_lossy().to_string()).unwrap_or_default();
+                                            self.cached_file_dir = if let Ok(home) = std::env::var("HOME") {
+                                                if dir_path.starts_with(&home) {
+                                                    dir_path.replacen(&home, "~", 1)
+                                                } else {
+                                                    dir_path
+                                                }
+                                            } else {
+                                                dir_path
+                                            };
+                                            self.cached_file_len = std::fs::metadata(&current_path_str).ok().map(|m| m.len());
+                                        }
+                                    }
+                                    let file_dir = self.cached_file_dir.clone();
+                                    let cached_file_len = self.cached_file_len;
+
+                                    let avail_info_h = col.available_height().max(32.0);
+                                    egui::ScrollArea::vertical()
+                                        .auto_shrink([false, false])
+                                        .max_height(avail_info_h)
+                                        .min_scrolled_height(32.0)
+                                        .show(col, |ui| {
+                                            egui::Grid::new("track_info_meta_grid")
+                                                .num_columns(2)
+                                                .spacing([10.0, 4.0])
+                                                .show(ui, |ui| {
+                                                    // 1. Song Title
+                                                    ui.label(egui::RichText::new("Title:").color(egui::Color32::from_rgb(160, 180, 200)).strong());
+                                                    render_smooth_marquee(ui, &display_title, 14.0, true);
+                                                    ui.end_row();
+
+                                                    // 2. Artist (only display if known)
+                                                    let trimmed_artist = state.artist.trim();
+                                                    if !trimmed_artist.is_empty()
+                                                        && !trimmed_artist.eq_ignore_ascii_case("unknown")
+                                                        && !trimmed_artist.eq_ignore_ascii_case("unknown artist")
+                                                    {
+                                                        ui.label(egui::RichText::new("Artist:").color(egui::Color32::from_rgb(160, 180, 200)));
+                                                        render_smooth_marquee(ui, trimmed_artist, 14.0, false);
+                                                        ui.end_row();
+                                                    }
+
+                                                    // 3. File Name
+                                                    if !is_mic_stream {
+                                                        ui.label(egui::RichText::new("File:").color(egui::Color32::from_rgb(160, 180, 200)));
+                                                        render_smooth_marquee(ui, &file_name, 14.0, false);
+                                                        ui.end_row();
+                                                    }
+
+                                                    // 4. File Directory / URL / Input Device (skip internal Android cache path)
+                                                    if is_mic_stream {
+                                                        let input_dev = state
+                                                            .selected_audio_device
+                                                            .as_deref()
+                                                            .or_else(|| crate::state::device_from_mic_uri(&current_path_str))
+                                                            .unwrap_or(crate::audio::SYSTEM_DEFAULT_AUDIO_DEVICE);
+                                                        ui.label(egui::RichText::new("Input:").color(egui::Color32::from_rgb(160, 180, 200)));
+                                                        render_smooth_marquee(ui, input_dev, 14.0, false);
+                                                        ui.end_row();
+                                                    } else {
+                                                        let is_android_cache_dir = file_dir.contains("com.rusttracker.app/cache");
+                                                        if !is_android_cache_dir {
+                                                            let folder_label = if is_network { "Stream:" } else { "Folder:" };
+                                                            ui.label(egui::RichText::new(folder_label).color(egui::Color32::from_rgb(160, 180, 200)));
+                                                            render_smooth_marquee(ui, &file_dir, 14.0, false);
+                                                            ui.end_row();
+                                                        }
+                                                    }
+
+                                                    // 5 & 6. Format, Bitrate & Channels
+                                                    let effective_bitrate = state.bitrate.or_else(|| {
+                                                        if state.duration_seconds > 0.0 && !is_network {
+                                                            cached_file_len.map(|len| ((len as f64 * 8.0) / (state.duration_seconds * 1000.0)).round() as u32)
+                                                        } else {
+                                                            None
+                                                        }
+                                                    });
+
+                                                    let format_name = if let Some(track) = state.audio_tracks.get(state.selected_audio_track) {
+                                                        if !track.codec.is_empty()
+                                                            && !state.module_type.to_ascii_uppercase().contains(&track.codec.to_ascii_uppercase())
+                                                        {
+                                                            format!("{}/{}", track.codec, state.module_type)
+                                                        } else {
+                                                            state.module_type.clone()
+                                                        }
+                                                    } else {
+                                                        state.module_type.clone()
+                                                    };
+
+                                                    let format_name = if let Some(ext) = file_path.extension().and_then(|e| e.to_str()) {
+                                                        let ext_upper = ext.to_ascii_uppercase();
+                                                        if (ext_upper == "MP4" || ext_upper == "M4A" || ext_upper == "MOV" || ext_upper == "MKV")
+                                                            && !format_name.to_ascii_uppercase().contains(&ext_upper)
+                                                        {
+                                                            format!("{}/{}", format_name, ext_upper)
+                                                        } else {
+                                                            format_name
+                                                        }
+                                                    } else {
+                                                        format_name
+                                                    };
+
+                                                    let ch_info = if state.is_native_atmos {
+                                                        "Dolby Atmos (7.1.4)".to_string()
+                                                    } else if state.stats.mpegh_bitstream_active {
+                                                        let is_atmos_spatial = state
+                                                            .stats
+                                                            .mpegh_carrier_info
+                                                            .contains("SpatialAudio")
+                                                            || state.stats.mpegh_carrier_info.contains("Dolby");
+                                                        let carrier_tag = if is_atmos_spatial {
+                                                            "Dolby Atmos"
+                                                        } else {
+                                                            "MPEG-H"
+                                                        };
+                                                        if let Some(tc) = state.tracker_channels {
+                                                            format!("11.1 {} (12ch) / {} tracker", carrier_tag, tc)
+                                                        } else if state.source_channels >= 12 {
+                                                            format!("11.1 {} (7.1.4 / 12ch)", carrier_tag)
+                                                        } else {
+                                                            let src_label = match state.source_channels {
+                                                                1 => "Mono (1ch)".to_string(),
+                                                                2 => "Stereo (2ch)".to_string(),
+                                                                6 => "5.1 (6ch)".to_string(),
+                                                                8 => "7.1 (8ch)".to_string(),
+                                                                10 => "7.1.2 (10ch)".to_string(),
+                                                                n => format!("{}ch", n.max(1)),
+                                                            };
+                                                            if state.surround_upmix.is_active_for(state.source_channels, state.hardware_channels) {
+                                                                format!("{} -> 7.1.4 {} Upmix (12ch)", src_label, carrier_tag)
+                                                            } else {
+                                                                format!("{} via {} 7.1.4", src_label, carrier_tag)
+                                                            }
+                                                        }
+                                                    } else if let Some(tc) = state.tracker_channels {
+                                                        format!("{} hw / {} tracker", state.hardware_channels, tc)
+                                                    } else if state.num_channels == 1 {
+                                                        "1-channel".to_string()
+                                                    } else {
+                                                        format!("{}-channels", state.num_channels)
+                                                    };
+
+                                                    if is_portrait {
+                                                        // In mobile view: "Audio: AAC/MP4, X-channels, Y bitrate"
+                                                        ui.label(egui::RichText::new("Audio:").color(egui::Color32::from_rgb(160, 180, 200)));
+                                                        let audio_val = if let Some(br) = effective_bitrate {
+                                                            format!("{}, {}, {} kbps", format_name, ch_info, br)
+                                                        } else {
+                                                            format!("{}, {}", format_name, ch_info)
+                                                        };
+                                                        ui.label(audio_val);
+                                                        ui.end_row();
+                                                    } else {
+                                                        // Desktop / Wide layout: separate lines
+                                                        let format_str = if let Some(br) = effective_bitrate {
+                                                            format!("{} ({} kbps)", format_name, br)
+                                                        } else {
+                                                            format_name
+                                                        };
+                                                        ui.label(egui::RichText::new("Format:").color(egui::Color32::from_rgb(160, 180, 200)));
+                                                        ui.label(format_str);
+                                                        ui.end_row();
+
+                                                        ui.label(egui::RichText::new("Channels:").color(egui::Color32::from_rgb(160, 180, 200)));
+                                                        ui.label(ch_info);
+                                                        ui.end_row();
+                                                    }
+
+                                                    // 7. Track Duration
+                                                    ui.label(egui::RichText::new("Duration:").color(egui::Color32::from_rgb(160, 180, 200)));
+                                                    if is_mic_stream {
+                                                        ui.label("Live Input");
+                                                    } else if state.duration_seconds <= 0.0 {
+                                                        ui.label("Live Stream");
+                                                    } else {
+                                                        let formatted = crate::state::format_timeline_time(
+                                                            state.duration_seconds,
+                                                            state.duration_seconds >= 3600.0,
+                                                        );
+                                                        ui.label(format!("{} ({:.1}s)", formatted, state.duration_seconds));
+                                                    }
+                                                    ui.end_row();
+
+                                                    // 8. Synchronized Lyrics Source (if loaded)
+                                                    if let Some(lyrics) = &state.lyrics {
+                                                        let lrc_name = lyrics.file_name.as_deref().unwrap_or("Synchronized LRC");
+                                                        ui.label(egui::RichText::new("Lyrics:").color(egui::Color32::from_rgb(160, 180, 200)));
+                                                        render_smooth_marquee(ui, lrc_name, 14.0, false);
+                                                        ui.end_row();
+                                                    }
+
+                                                    // 9. Active Visualizer Module
+                                                    let vis_name = crate::state::VISUALIZERS
+                                                        .get(state.current_visualizer_idx)
+                                                        .map(|v| v.name)
+                                                        .unwrap_or("Unknown");
+                                                    ui.label(egui::RichText::new("Visualizer:").color(egui::Color32::from_rgb(160, 180, 200)));
+                                                    let vis_link = ui.link(egui::RichText::new(vis_name).color(egui::Color32::from_rgb(255, 215, 0)).strong());
+                                                    if vis_link.clicked() {
+                                                        *engine_action = EngineAction::ToggleVisPicker;
+                                                    }
+                                                    vis_link.on_hover_text("Click to open Visualization Modules selector (Shortcut: 'm')");
+                                                    ui.end_row();
+                                                });
+
+                                            if state.audio_tracks.len() > 1 {
+                                                ui.add_space(6.0);
+                                                ui.horizontal(|ui| {
+                                                    ui.label(egui::RichText::new("Audio Tracks:").strong().color(egui::Color32::from_rgb(0, 210, 255)));
+                                                });
+                                                ui.add_space(3.0);
+
+                                                // Multi-Track Mix Interface
+                                                let total_avail_w = ui.available_width();
+                                                // Fixed controls width:
+                                                // Checkbox: 24.0
+                                                // 5 gaps of 4.0: 20.0
+                                                // Slider rail: 55.0
+                                                // Percentage text: 28.0
+                                                // Mute button [M]: 22.0
+                                                // Solo button [S]: 22.0
+                                                // Total non-title = 24.0 + 20.0 + 55.0 + 28.0 + 22.0 + 22.0 = 171.0
+                                                let title_w = (total_avail_w - 171.0).max(60.0);
+
+                                                for (idx, track) in state.audio_tracks.iter().enumerate() {
+                                                    let is_in_mix = state.active_audio_tracks.contains(&idx);
+                                                    let lower = track.title.to_lowercase();
+                                                    let (icon, color) = if lower.contains("vocal") || lower.contains("guide") {
+                                                        ("♪", egui::Color32::from_rgb(255, 110, 180))
+                                                    } else if lower.contains("instrumental") || lower.contains("karaoke") || lower.contains("music") {
+                                                        ("♫", egui::Color32::from_rgb(0, 230, 160))
+                                                    } else {
+                                                        ("♪", egui::Color32::from_rgb(255, 200, 60))
+                                                    };
+
+                                                    let mut current_vol = state.audio_track_volumes.get(idx).copied().unwrap_or(1.0);
+
+                                                    ui.horizontal(|ui| {
+                                                        ui.spacing_mut().item_spacing.x = 4.0;
+
+                                                        // 1. Checkbox button to toggle track into/out of mix
+                                                        let chk_label = if is_in_mix { "☑" } else { "☐" };
+                                                        let chk_btn = egui::Button::new(
+                                                            egui::RichText::new(chk_label)
+                                                                .color(if is_in_mix { color } else { egui::Color32::GRAY })
+                                                                .size(14.0)
+                                                                .strong(),
+                                                        )
+                                                        .fill(if is_in_mix {
+                                                            egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 35)
+                                                        } else {
+                                                            egui::Color32::from_rgba_unmultiplied(40, 40, 45, 160)
+                                                        })
+                                                        .stroke(if is_in_mix {
+                                                            egui::Stroke::new(1.0_f32, color)
+                                                        } else {
+                                                            egui::Stroke::NONE
+                                                        });
+                                                        if ui.add_sized([24.0, 26.0], chk_btn).clicked() {
+                                                            *engine_action = EngineAction::ToggleAudioTrackInMix(idx);
+                                                        }
+
+                                                        // 2. Track Title Button - tapping solos this track!
+                                                        let title_label = format!("{} {}", icon, track.title);
+                                                        let title_btn_resp = ui.allocate_ui_with_layout(
+                                                            egui::vec2(title_w, 26.0),
+                                                            egui::Layout::left_to_right(egui::Align::Center).with_main_align(egui::Align::Min),
+                                                            |ui| {
+                                                                let title_btn = egui::Button::new(
+                                                                    egui::RichText::new(title_label)
+                                                                        .color(if is_in_mix { color } else { egui::Color32::from_gray(160) })
+                                                                        .size(12.0),
+                                                                )
+                                                                .truncate()
+                                                                .min_size(egui::vec2(title_w, 26.0))
+                                                                .fill(if is_in_mix {
+                                                                    egui::Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 25)
+                                                                } else {
+                                                                    egui::Color32::from_rgba_unmultiplied(40, 40, 45, 160)
+                                                                })
+                                                                .stroke(if is_in_mix {
+                                                                    egui::Stroke::new(1.0_f32, color)
+                                                                } else {
+                                                                    egui::Stroke::NONE
+                                                                });
+                                                                ui.add(title_btn)
+                                                            },
+                                                        ).inner;
+                                                        if title_btn_resp.clicked() {
+                                                            *engine_action = EngineAction::SetAudioMixTracks(vec![(idx, 1.0)]);
+                                                        }
+
+                                                        // 3. Track Volume Slider (55 pt rail)
+                                                        ui.spacing_mut().slider_width = 55.0;
+                                                        let slider = egui::Slider::new(&mut current_vol, 0.0..=1.0).show_value(false);
+                                                        let slider_resp = ui.add_enabled(is_in_mix, slider);
+                                                        if slider_resp.changed() {
+                                                            *engine_action = EngineAction::SetAudioTrackVolume(idx, current_vol);
+                                                        }
+
+                                                        // 4. Volume Percentage Label (dedicated 28 pt column, never jitters or overflows)
+                                                        let vol_pct = format!("{:>3.0}%", (current_vol * 100.0).round());
+                                                        let vol_lbl = egui::Label::new(
+                                                            egui::RichText::new(vol_pct)
+                                                                .monospace()
+                                                                .size(11.0)
+                                                                .color(if is_in_mix { egui::Color32::WHITE } else { egui::Color32::from_gray(120) }),
+                                                        );
+                                                        ui.add_sized([28.0, 26.0], vol_lbl);
+
+                                                        // 5. Mute button [M]
+                                                        let is_muted = current_vol == 0.0;
+                                                        let m_btn = egui::Button::new(
+                                                            egui::RichText::new("M")
+                                                                .strong()
+                                                                .color(if !is_in_mix {
+                                                                    egui::Color32::from_gray(100)
+                                                                } else if is_muted {
+                                                                    egui::Color32::RED
+                                                                } else {
+                                                                    egui::Color32::LIGHT_GRAY
+                                                                })
+                                                                .size(11.0),
+                                                        )
+                                                        .fill(if !is_in_mix {
+                                                            egui::Color32::from_rgba_unmultiplied(35, 35, 40, 120)
+                                                        } else if is_muted {
+                                                            egui::Color32::from_rgba_unmultiplied(200, 50, 50, 80)
+                                                        } else {
+                                                            egui::Color32::from_rgba_unmultiplied(50, 50, 55, 180)
+                                                        });
+                                                        if ui.add_enabled(is_in_mix, m_btn).clicked() {
+                                                            let new_vol = if is_muted { 1.0 } else { 0.0 };
+                                                            *engine_action = EngineAction::SetAudioTrackVolume(idx, new_vol);
+                                                        }
+
+                                                        // 6. Solo button [S] (always clickable to solo any track)
+                                                        let is_solo = state.active_audio_tracks.len() == 1 && state.active_audio_tracks.contains(&idx);
+                                                        let s_btn = egui::Button::new(
+                                                            egui::RichText::new("S")
+                                                                .strong()
+                                                                .color(if is_solo { egui::Color32::BLACK } else { egui::Color32::YELLOW })
+                                                                .size(11.0),
+                                                        )
+                                                        .fill(if is_solo {
+                                                            egui::Color32::YELLOW
+                                                        } else {
+                                                            egui::Color32::from_rgba_unmultiplied(50, 50, 55, 180)
+                                                        });
+                                                        if ui.add_sized([22.0, 26.0], s_btn).clicked() {
+                                                            *engine_action = EngineAction::SetAudioMixTracks(vec![(idx, 1.0)]);
+                                                        }
+                                                    });
+                                                    ui.add_space(2.0);
+                                                }
+
+                                                // Quick Mix Presets Bar (Always Available)
+                                                ui.add_space(5.0);
+                                                ui.label(egui::RichText::new("Quick Mix Presets:").size(12.0).color(egui::Color32::from_rgb(170, 190, 210)).strong());
+                                                ui.add_space(2.0);
+
+                                                let num_tracks = state.audio_tracks.len();
+                                                let is_all_on = state.active_audio_tracks.len() == num_tracks && num_tracks > 0;
+                                                let is_mix_1_2 = state.active_audio_tracks.len() == 2 && state.active_audio_tracks.contains(&0) && state.active_audio_tracks.contains(&1);
+
+                                                 let total_width = ui.available_width();
+                                                 let spacing = 6.0;
+                                                 let is_compact = cfg!(target_os = "android") || total_width < 420.0;
+                                                 let btn_h = 34.0;
+
+                                                 let render_all_on = |ui: &mut egui::Ui, w: f32, h: f32, engine_action: &mut EngineAction| {
+                                                     let all_btn = egui::Button::new(
+                                                         egui::RichText::new("All On").strong().size(12.0).color(if is_all_on { egui::Color32::from_rgb(0, 240, 170) } else { egui::Color32::LIGHT_GRAY })
+                                                     )
+                                                     .fill(if is_all_on { egui::Color32::from_rgba_unmultiplied(0, 140, 100, 180) } else { egui::Color32::from_rgba_unmultiplied(50, 60, 70, 220) })
+                                                     .stroke(if is_all_on { egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0, 240, 170)) } else { egui::Stroke::NONE });
+
+                                                     if ui.add_sized([w, h], all_btn).clicked() {
+                                                         let all_mix: Vec<(usize, f32)> = (0..num_tracks).map(|i| (i, 1.0)).collect();
+                                                         *engine_action = EngineAction::SetAudioMixTracks(all_mix);
+                                                     }
+                                                 };
+
+                                                 let render_mix_1_2 = |ui: &mut egui::Ui, w: f32, h: f32, engine_action: &mut EngineAction| {
+                                                     let mix_btn = egui::Button::new(
+                                                         egui::RichText::new("Mix 1&2").strong().size(12.0).color(if is_mix_1_2 { egui::Color32::from_rgb(0, 240, 170) } else { egui::Color32::from_rgb(0, 210, 160) })
+                                                     )
+                                                     .fill(if is_mix_1_2 { egui::Color32::from_rgba_unmultiplied(0, 150, 110, 200) } else { egui::Color32::from_rgba_unmultiplied(0, 80, 70, 180) })
+                                                     .stroke(if is_mix_1_2 { egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0, 240, 170)) } else { egui::Stroke::NONE });
+
+                                                     if ui.add_sized([w, h], mix_btn).clicked() {
+                                                         *engine_action = EngineAction::SetAudioMixTracks(vec![(0, 1.0), (1, 1.0)]);
+                                                     }
+                                                 };
+
+                                                 let render_solo = |ui: &mut egui::Ui, track_idx: usize, w: f32, h: f32, engine_action: &mut EngineAction| {
+                                                     let is_solo = state.active_audio_tracks.len() == 1 && state.active_audio_tracks.contains(&track_idx);
+                                                     let label = if num_tracks == 2 {
+                                                         let t_opt = state.audio_tracks.get(track_idx);
+                                                         let t_lower = t_opt.map(|t| t.title.to_lowercase()).unwrap_or_default();
+                                                         if track_idx == 0 && (t_lower.contains("instrumental") || t_lower.contains("karaoke") || t_lower.contains("music")) {
+                                                             "Trk 1 (Music)".to_string()
+                                                         } else if track_idx == 1 && (t_lower.contains("vocal") || t_lower.contains("guide") || t_lower.contains("full mix") || t_lower.contains("fullmix")) {
+                                                             "Trk 2 (Vocals)".to_string()
+                                                         } else {
+                                                             format!("Trk {}", track_idx + 1)
+                                                         }
+                                                     } else {
+                                                         format!("Trk {}", track_idx + 1)
+                                                     };
+                                                     let btn = egui::Button::new(
+                                                         egui::RichText::new(label).strong().size(12.0).color(if is_solo { egui::Color32::from_rgb(0, 220, 255) } else { egui::Color32::LIGHT_GRAY })
+                                                     )
+                                                     .fill(if is_solo { egui::Color32::from_rgba_unmultiplied(0, 100, 150, 180) } else { egui::Color32::from_rgba_unmultiplied(50, 60, 70, 220) })
+                                                     .stroke(if is_solo { egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(0, 220, 255)) } else { egui::Stroke::NONE });
+
+                                                     if ui.add_sized([w, h], btn).clicked() {
+                                                         *engine_action = EngineAction::SetAudioMixTracks(vec![(track_idx, 1.0)]);
+                                                     }
+                                                 };
+
+                                                 if num_tracks <= 2 {
+                                                     if is_compact {
+                                                         // 2 rows on mobile/narrow screen:
+                                                         // Row 1: [All On] [Mix 1&2] (50% width each)
+                                                         let row_w = ((total_width - spacing) / 2.0).max(60.0);
+                                                         ui.horizontal(|ui| {
+                                                             ui.spacing_mut().item_spacing.x = spacing;
+                                                             render_all_on(ui, row_w, btn_h, engine_action);
+                                                             if num_tracks >= 2 {
+                                                                 render_mix_1_2(ui, row_w, btn_h, engine_action);
+                                                             }
+                                                         });
+                                                         if num_tracks >= 2 {
+                                                             ui.add_space(3.0);
+                                                             // Row 2: [Trk 1] [Trk 2] (50% width each)
+                                                             ui.horizontal(|ui| {
+                                                                 ui.spacing_mut().item_spacing.x = spacing;
+                                                                 render_solo(ui, 0, row_w, btn_h, engine_action);
+                                                                 render_solo(ui, 1, row_w, btn_h, engine_action);
+                                                             });
+                                                         }
+                                                     } else {
+                                                         // Wide screen: 4 buttons in a single row
+                                                         let btn_count = if num_tracks == 2 { 4.0 } else { 2.0 };
+                                                         let btn_w = ((total_width - spacing * (btn_count - 1.0)) / btn_count).max(50.0);
+                                                         ui.horizontal(|ui| {
+                                                             ui.spacing_mut().item_spacing.x = spacing;
+                                                             render_all_on(ui, btn_w, btn_h, engine_action);
+                                                             render_solo(ui, 0, btn_w, btn_h, engine_action);
+                                                             if num_tracks >= 2 {
+                                                                 render_solo(ui, 1, btn_w, btn_h, engine_action);
+                                                                 render_mix_1_2(ui, btn_w, btn_h, engine_action);
+                                                             }
+                                                         });
+                                                     }
+                                                 } else {
+                                                     // 3+ tracks:
+                                                     // Row 1: Mix combos [All On] [Mix 1&2] (each 50% width)
+                                                     let row1_w = ((total_width - spacing) / 2.0).max(60.0);
+                                                     ui.horizontal(|ui| {
+                                                         ui.spacing_mut().item_spacing.x = spacing;
+                                                         render_all_on(ui, row1_w, btn_h, engine_action);
+                                                         render_mix_1_2(ui, row1_w, btn_h, engine_action);
+                                                     });
+
+                                                     ui.add_space(3.0);
+
+                                                     let display_count = num_tracks.min(4);
+                                                     if is_compact {
+                                                         // Solo tracks in rows of 2 for mobile/narrow
+                                                         let chunks: Vec<Vec<usize>> = (0..display_count).collect::<Vec<_>>().chunks(2).map(|c| c.to_vec()).collect();
+                                                         for (c_idx, chunk) in chunks.iter().enumerate() {
+                                                             let chunk_w = ((total_width - spacing * (chunk.len() - 1) as f32) / chunk.len() as f32).max(45.0);
+                                                             ui.horizontal(|ui| {
+                                                                 ui.spacing_mut().item_spacing.x = spacing;
+                                                                 for &idx in chunk {
+                                                                     render_solo(ui, idx, chunk_w, 32.0, engine_action);
+                                                                 }
+                                                             });
+                                                             if c_idx + 1 < chunks.len() {
+                                                                 ui.add_space(3.0);
+                                                             }
+                                                         }
+                                                     } else {
+                                                         // Wide screen: all solo tracks in a single row
+                                                         let row2_w = ((total_width - spacing * (display_count - 1) as f32) / display_count as f32).max(45.0);
+                                                         ui.horizontal(|ui| {
+                                                             ui.spacing_mut().item_spacing.x = spacing;
+                                                             for idx in 0..display_count {
+                                                                 render_solo(ui, idx, row2_w, 32.0, engine_action);
+                                                             }
+                                                         });
+                                                     }
+                                                 }
+                                                ui.add_space(4.0);
+                                            }
+
+                                            ui.horizontal(|ui| {
+                                                ui.label(egui::RichText::new("Device:").color(egui::Color32::from_rgb(160, 180, 200)));
+                                                let mut current_device = state.selected_audio_device.clone().unwrap_or_else(|| "Default Device".to_string());
+                                                let prev_device = current_device.clone();
+
+                                                egui::ComboBox::from_id_salt("audio_device_combo")
+                                                    .selected_text(&current_device)
+                                                    .width(ui.available_width().max(80.0))
+                                                    .show_ui(ui, |ui| {
+                                                        for dev in &state.available_audio_devices {
+                                                            ui.selectable_value(&mut current_device, dev.clone(), dev);
+                                                        }
+                                                    });
+
+                                                if current_device != prev_device {
+                                                    *engine_action = EngineAction::SetAudioDevice(current_device);
+                                                }
+                                            });
+
+                                            #[cfg(any(target_os = "windows", target_os = "linux"))]
+                                            ui.horizontal(|ui| {
+                                                let mut passthrough = state.passthrough_enabled;
+                                                let label = if cfg!(target_os = "windows") {
+                                                    "Bitstream Passthrough (WASAPI Exclusive)"
+                                                } else {
+                                                    "Bitstream Passthrough (PipeWire)"
+                                                };
+                                                if ui
+                                                    .checkbox(
+                                                        &mut passthrough,
+                                                        egui::RichText::new(label)
+                                                            .size(12.0)
+                                                            .color(egui::Color32::from_rgb(160, 180, 200)),
+                                                    )
+                                                    .on_hover_text("Enable raw IEC 61937 hardware bitstreaming (TrueHD/Atmos, E-AC3, DTS, AC3) to an external HDMI AVR. Unchecked (default) decodes in software using Shared Mode so other apps can play audio simultaneously.")
+                                                    .changed()
+                                                {
+                                                    *engine_action = EngineAction::SetPassthrough(passthrough);
+                                                }
+                                            });
+
+                                            if state.hardware_channels > 2
+                                                || state.stats.mpegh_bitstream_active
+                                                || state.surround_upmix.user_overridden
+                                            {
+                                                ui.horizontal(|ui| {
+                                                    let upmix_enabled = state.surround_upmix.enabled;
+                                                    let is_native_bypass = state.file_loaded
+                                                        && (state.is_native_atmos
+                                                            || (state.hardware_channels > 2
+                                                                && !crate::state::SurroundUpmixConfig::can_upmix(
+                                                                    state.source_channels,
+                                                                    state.hardware_channels,
+                                                                )));
+                                                    let upmix_active = !is_native_bypass
+                                                        && state
+                                                            .surround_upmix
+                                                            .is_active_for(state.source_channels, state.hardware_channels);
+                                                    let layout_tag =
+                                                        crate::state::SurroundUpmixConfig::short_tag(
+                                                            state.hardware_channels,
+                                                        );
+                                                    let (btn_text, btn_fill, btn_stroke, txt_col) = if upmix_active {
+                                                        (
+                                                            format!("🔊 Surround Upmix ({layout_tag}): ON"),
+                                                            egui::Color32::from_rgb(165, 85, 12),
+                                                            egui::Color32::from_rgb(255, 175, 50),
+                                                            egui::Color32::from_rgb(255, 240, 200),
+                                                        )
+                                                    } else if is_native_bypass {
+                                                        (
+                                                            "🔊 Surround Upmix: OFF (Native)".to_string(),
+                                                            egui::Color32::from_rgb(36, 34, 36),
+                                                            egui::Color32::from_rgb(90, 84, 76),
+                                                            egui::Color32::from_rgb(175, 170, 162),
+                                                        )
+                                                    } else if upmix_enabled {
+                                                        (
+                                                            "🔊 Surround Upmix: ON".to_string(),
+                                                            egui::Color32::from_rgb(165, 85, 12),
+                                                            egui::Color32::from_rgb(255, 175, 50),
+                                                            egui::Color32::from_rgb(255, 240, 200),
+                                                        )
+                                                    } else {
+                                                        (
+                                                            if state.hardware_channels > 2 {
+                                                                format!("🔊 Surround Upmix ({layout_tag}): OFF")
+                                                            } else {
+                                                                "🔊 Surround Upmix: OFF".to_string()
+                                                            },
+                                                            egui::Color32::from_rgb(36, 34, 36),
+                                                            egui::Color32::from_rgb(90, 84, 76),
+                                                            egui::Color32::from_rgb(200, 192, 182),
+                                                        )
+                                                    };
+                                                    let upmix_btn = egui::Button::new(
+                                                        egui::RichText::new(btn_text)
+                                                            .size(11.5)
+                                                            .strong()
+                                                            .color(txt_col),
+                                                    )
+                                                    .fill(btn_fill)
+                                                    .stroke(egui::Stroke::new(1.0_f32, btn_stroke))
+                                                    .corner_radius(4.0);
+                                                    if ui
+                                                        .add(upmix_btn)
+                                                        .on_hover_text("Upmix the media file's audio channels to fill all remaining available channels on the surround output device. Use the '🎚 Surround EQ' button in the middle panel title bar to view the live Crossover & 5-band Parametric EQ controls. (Shortcut: 'u' / 'e' / R3)")
+                                                        .clicked()
+                                                    {
+                                                        *engine_action = EngineAction::ToggleSurroundUpmix(!upmix_enabled);
+                                                    }
+                                                    #[cfg(any(target_os = "windows", target_os = "linux"))]
+                                                    if state.stats.mpegh_bitstream_active
+                                                        || state.hardware_channels > 8
+                                                        || (state.surround_upmix.mpegh_user_overridden
+                                                            && !state.surround_upmix.mpegh_bitstream)
+                                                    {
+                                                        let mpegh_on = state.surround_upmix.mpegh_bitstream;
+                                                        let mpegh_live = state.stats.mpegh_bitstream_active;
+                                                        let is_atmos_spatial = state
+                                                            .stats
+                                                            .mpegh_carrier_info
+                                                            .contains("SpatialAudio")
+                                                            || state.stats.mpegh_carrier_info.contains("Dolby");
+                                                        let (m_text, m_fill, m_stroke, m_txt_col) = if mpegh_live {
+                                                            (
+                                                                if is_atmos_spatial {
+                                                                    "ATMOS 7.1.4"
+                                                                } else {
+                                                                    "MPEG-H 7.1.4"
+                                                                },
+                                                                egui::Color32::from_rgb(12, 68, 92),
+                                                                egui::Color32::from_rgb(0, 210, 255),
+                                                                egui::Color32::from_rgb(200, 248, 255),
+                                                            )
+                                                        } else if state.hardware_channels > 8 && mpegh_on {
+                                                            (
+                                                                "7.1.4 Height: ON",
+                                                                egui::Color32::from_rgb(28, 52, 68),
+                                                                egui::Color32::from_rgb(70, 150, 190),
+                                                                egui::Color32::from_rgb(185, 225, 240),
+                                                            )
+                                                        } else {
+                                                            (
+                                                                "7.1 Bed Only",
+                                                                egui::Color32::from_rgb(36, 34, 36),
+                                                                egui::Color32::from_rgb(90, 84, 76),
+                                                                egui::Color32::from_rgb(200, 192, 182),
+                                                            )
+                                                        };
+                                                        let mpegh_btn = egui::Button::new(
+                                                            egui::RichText::new(m_text)
+                                                                .size(11.5)
+                                                                .strong()
+                                                                .color(m_txt_col),
+                                                        )
+                                                        .fill(m_fill)
+                                                        .stroke(egui::Stroke::new(1.0_f32, m_stroke))
+                                                        .corner_radius(4.0);
+                                                        let hover_tip = if mpegh_live && !state.stats.mpegh_carrier_info.is_empty() {
+                                                            format!(
+                                                                "Active 7.1.4 carrier: {}\nClick to toggle 12-channel 7.1.4 height output vs. 8-channel 7.1 LPCM bed.",
+                                                                state.stats.mpegh_carrier_info
+                                                            )
+                                                        } else {
+                                                            "Toggle 12-channel 7.1.4 (Bed + Height) output vs. 8-channel 7.1 Bed Only.".to_string()
+                                                        };
+                                                        if ui
+                                                            .add(mpegh_btn)
+                                                            .on_hover_text(hover_tip)
+                                                            .clicked()
+                                                        {
+                                                            *engine_action = EngineAction::ToggleMpeghBitstream(!mpegh_on);
+                                                        }
+                                                    }
+                                                });
+                                            }
+
+                                            // 8. Next Song (placed at the bottom, smooth marquee if long)
+                                            if state.playlist_index + 1 < state.playlist.len() {
+                                                let next_path = std::path::Path::new(&state.playlist[state.playlist_index + 1]);
+                                                let next_song = next_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                                                ui.horizontal(|ui| {
+                                                    ui.label("Next Song:");
+                                                    render_smooth_marquee(ui, &next_song, 14.0, false);
+                                                });
+                                            }
+                                        });
+
+                                    *out_track_info_rect = Some(col.max_rect());
+                                }
+                            };
+
+                            if is_portrait {
+                                let has_video = state.has_video_stream || self.video_state.is_some();
+                                let progress_height = 20.0;
+                                let available_h = ui.available_height();
+                                let content_h = (available_h - progress_height).max(40.0);
+
+                                ui.allocate_ui_with_layout(
+                                    egui::vec2(ui.available_width(), content_h),
+                                    egui::Layout::top_down(egui::Align::Min),
+                                    |ui| {
+                                        match state.mobile_hud_tab {
+                                            crate::state::MobileHudTab::Channels => {
+                                                render_col_channels(ui, &mut out_meters_rect, &mut out_fire_rect, &mut engine_action);
+                                            }
+                                            crate::state::MobileHudTab::Heatmap => {
+                                                render_col_heatmap(ui, &mut out_heatmap_rect, &mut engine_action);
+                                            }
+                                            crate::state::MobileHudTab::Info => {
+                                                render_col_info(ui, &mut out_track_info_rect, &mut engine_action);
+                                            }
+                                            crate::state::MobileHudTab::Video => {
+                                                if has_video {
+                                                    let (rect, _) = ui.allocate_exact_size(ui.available_size(), egui::Sense::hover());
+                                                    out_video_rect = Some(rect);
+                                                } else {
+                                                    ui.centered_and_justified(|ui| {
+                                                        ui.label(egui::RichText::new("No video stream present").italics());
+                                                    });
+                                                }
+                                            }
+                                        }
+                                    }
+                                );
+
+                                ui.add_space(2.0);
+                                render_progress_bar(ui, &mut out_fire_rect, &mut engine_action);
+                            } else {
+                                ui.columns(3, |columns| {
+                                    render_col_channels(&mut columns[0], &mut out_meters_rect, &mut out_fire_rect, &mut engine_action);
+                                    render_col_heatmap(&mut columns[1], &mut out_heatmap_rect, &mut engine_action);
+                                    render_col_info(&mut columns[2], &mut out_track_info_rect, &mut engine_action);
+                                });
+                            }
+                        }
+                    });
+                out_top_panel_rect = Some(panel_resp.response.rect);
+            }
+
+        if state.show_hud && state.video_mode != 3 {
+            let total_height = ctx.content_rect().height();
+            let total_width = ctx.content_rect().width();
+            let drag_h = if is_portrait { 24.0 } else { 8.0 };
+
+            let drag_y = out_top_panel_rect.map(|r| r.bottom()).unwrap_or(total_height * state.panel_split_ratio);
+            let drag_top_y = if is_portrait {
+                drag_y - drag_h * 0.5
+            } else {
+                drag_y - 2.0
+            };
+
+            egui::Area::new("split_drag_area".into())
+                .fixed_pos(egui::pos2(0.0, drag_top_y))
+                .order(egui::Order::Foreground)
+                .show(ctx, |ui| {
+                    let drag_rect = egui::Rect::from_min_size(
+                        ui.min_rect().min,
+                        egui::vec2(total_width, drag_h)
+                    );
+                    let response = ui.allocate_rect(drag_rect, egui::Sense::click_and_drag());
+                    if is_portrait {
+                        let pill_color = if response.dragged() {
+                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 180)
+                        } else {
+                            egui::Color32::from_rgba_unmultiplied(200, 210, 225, 70)
+                        };
+                        let pill_rect = egui::Rect::from_center_size(
+                            drag_rect.center(),
+                            egui::vec2(38.0, 4.0),
+                        );
+                        ui.painter().rect_filled(pill_rect, 2.0, pill_color);
+                    }
+                    if response.hovered() || response.dragged() {
+                        ui.ctx().set_cursor_icon(egui::CursorIcon::ResizeVertical);
+                    }
+                    if response.dragged()
+                        && let Some(mouse_pos) = response.interact_pointer_pos() {
+                        let min_h = 120.0f32;
+                        let min_r = min_h / total_height;
+                        let max_r = (total_height - min_h) / total_height;
+                        let new_ratio = mouse_pos.y / total_height;
+                        engine_action = EngineAction::SetSplitRatio(new_ratio.clamp(min_r.min(max_r), min_r.max(max_r)));
+                    }
+                });
+        }
+
+            let frame = egui::Frame::NONE.fill(egui::Color32::TRANSPARENT);
+            egui::CentralPanel::default().frame(frame).show_inside(ctx, |ui| {
+                let rect = ui.available_rect_before_wrap();
+                central_rect = rect;
+
+                // Draw OSD text from keyboard/gamepad/touch actions
+                if let Some(osd) = &state.osd_text
+                    && state.osd_timer > 0.0 {
+                    let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("osd_notification")));
+                        let alpha = (state.osd_timer.min(0.5) * 2.0 * 255.0) as u8;
+                        let screen = ui.ctx().viewport_rect();
+                        let is_portrait = screen.width() < screen.height();
+
+                        let max_width = if is_portrait {
+                            (screen.width() - 40.0).max(100.0)
+                        } else {
+                            (screen.width() * 0.85).max(200.0)
+                        };
+
+                        let font_size = if is_portrait {
+                            if osd.len() > 32 {
+                                17.0
+                            } else if osd.len() > 18 {
+                                21.0
+                            } else {
+                                26.0
+                            }
+                        } else {
+                            if osd.len() > 35 {
+                                24.0
+                            } else {
+                                32.0
+                            }
+                        };
+
+                        let text_color = egui::Color32::from_rgba_premultiplied(255, 255, 255, alpha);
+                        let galley = painter.layout(
+                            osd.clone(),
+                            egui::FontId::proportional(font_size),
+                            text_color,
+                            max_width,
+                        );
+
+                        let top_y = if is_portrait {
+                            screen.top() + 65.0
+                        } else {
+                            screen.top() + 40.0
+                        };
+                        let galley_pos = egui::pos2(
+                            screen.center().x - galley.rect.width() * 0.5,
+                            top_y,
+                        );
+
+                        let bg_rect = galley.rect.translate(galley_pos.to_vec2()).expand2(egui::vec2(14.0, 8.0));
+                        let bg_alpha = (alpha as f32 * 0.65) as u8;
+                        painter.rect_filled(
+                            bg_rect,
+                            8.0,
+                            egui::Color32::from_rgba_unmultiplied(10, 10, 15, bg_alpha),
+                        );
+
+                        painter.galley(galley_pos, galley, text_color);
+                    }
+
+                if state.visualizer_mode == 0 && state.show_hud && state.video_mode != 3 {
+                    let painter = ui.painter();
+                    let is_portrait = ui.ctx().viewport_rect().width() < ui.ctx().viewport_rect().height();
+                    let bottom_margin = if is_portrait { 36.0 } else { 20.0 };
+                    let y = rect.bottom() - bottom_margin;
+
+                    let max_freq = state.max_frequency;
+                    let min_freq = 20.0_f32;
+                    let x_at = |f: f32| -> f32 { (f / min_freq).ln() / (max_freq / min_freq).ln() };
+
+                    let side_margin = if is_portrait { 28.0 } else { 16.0 };
+                    let usable_width = (rect.width() - 2.0 * side_margin).max(10.0);
+
+                    let labels = [
+                        (0.0_f32, format!("{}Hz", min_freq as u32), egui::Align2::LEFT_BOTTOM),
+                        (x_at(100.0), "100Hz".to_string(), egui::Align2::CENTER_BOTTOM),
+                        (x_at(1000.0), "1kHz".to_string(), egui::Align2::CENTER_BOTTOM),
+                        (x_at(5000.0), "5kHz".to_string(), egui::Align2::CENTER_BOTTOM),
+                        (1.0_f32, format!("{:.0}kHz", max_freq / 1000.0), egui::Align2::RIGHT_BOTTOM),
+                    ];
+
+                    for (x_pct, text, align) in labels.iter() {
+                        let x = rect.left() + side_margin + usable_width * x_pct;
+                        painter.text(
+                            egui::pos2(x, y),
+                            *align,
+                            text,
+                            egui::FontId::proportional(15.0),
+                            egui::Color32::from_gray(230),
+                        );
+                    }
+                }
+            });
+
+            let pointer_pos = state
+                .drag_cursor_pos
+                .map(|[x, y]| egui::pos2(x, y))
+                .or_else(|| ctx.input(|i| i.pointer.hover_pos().or(i.pointer.latest_pos())));
+            let is_over_track_info = if let (Some(pos), Some(ti_rect)) = (pointer_pos, out_track_info_rect) {
+                ti_rect.contains(pos)
+            } else {
+                false
+            };
+
+            if (!ctx.input(|i| i.raw.hovered_files.is_empty()) || state.hovered_file.is_some()) && state.file_loaded {
+                let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, egui::Id::new("drag_overlay")));
+                if is_over_track_info && state.has_active_playback() {
+                    if let Some(ti_rect) = out_track_info_rect {
+                        painter.rect(
+                            ti_rect.expand(2.0),
+                            6.0,
+                            egui::Color32::from_rgba_unmultiplied(20, 80, 40, 100),
+                            egui::Stroke::new(2.5_f32, egui::Color32::from_rgb(80, 240, 120)),
+                            egui::StrokeKind::Outside,
+                        );
+                        let font_id = egui::FontId::proportional(15.0);
+                        let galley = painter.layout(
+                            "➕ Add to Playlist".to_string(),
+                            font_id,
+                            egui::Color32::WHITE,
+                            ti_rect.width(),
+                        );
+                        let badge_rect = egui::Rect::from_center_size(ti_rect.center(), galley.size() + egui::vec2(20.0, 10.0));
+                        painter.rect(
+                            badge_rect,
+                            6.0,
+                            egui::Color32::from_rgba_unmultiplied(12, 35, 18, 235),
+                            egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(90, 230, 130)),
+                            egui::StrokeKind::Outside,
+                        );
+                        painter.galley(badge_rect.min + egui::vec2(10.0, 5.0), galley, egui::Color32::WHITE);
+                    }
+                } else {
+                    let screen_rect = ctx.content_rect();
+                    let font_id = egui::FontId::proportional(16.0);
+                    let galley = painter.layout(
+                        "▶  Drop to Play Immediately".to_string(),
+                        font_id,
+                        egui::Color32::WHITE,
+                        400.0,
+                    );
+                    let banner_rect = egui::Rect::from_center_size(
+                        egui::pos2(screen_rect.center().x, screen_rect.top() + 45.0),
+                        galley.size() + egui::vec2(28.0, 14.0),
+                    );
+                    painter.rect(
+                        banner_rect,
+                        8.0,
+                        egui::Color32::from_rgba_unmultiplied(10, 25, 45, 240),
+                        egui::Stroke::new(1.5_f32, egui::Color32::from_rgb(80, 180, 255)),
+                        egui::StrokeKind::Outside,
+                    );
+                    painter.galley(banner_rect.min + egui::vec2(14.0, 7.0), galley, egui::Color32::WHITE);
+                }
+            }
+
+        });
+
+        self.track_info_rect = out_track_info_rect.map(|r| [r.min.x, r.min.y, r.max.x, r.max.y]);
+
+        let scale = egui_ctx.pixels_per_point();
+        let w = self.config.width as f32;
+        let h = self.config.height as f32;
+
+        if let Some(r) = out_meters_rect {
+            self.meters_uv_rect = [
+                (r.min.x * scale) / w,
+                (r.min.y * scale) / h,
+                (r.max.x * scale) / w,
+                (r.max.y * scale) / h,
+            ];
+        } else {
+            self.meters_uv_rect = [0.0; 4];
+        }
+
+        if let Some(r) = out_fire_rect {
+            self.fire_uv_rect = [
+                (r.min.x * scale) / w,
+                (r.min.y * scale) / h,
+                (r.max.x * scale) / w,
+                (r.max.y * scale) / h,
+            ];
+        } else {
+            self.fire_uv_rect = [0.0; 4];
+        }
+
+        if let Some(r) = out_heatmap_rect {
+            self.heatmap_uv_rect = [
+                (r.min.x * scale) / w,
+                (r.min.y * scale) / h,
+                (r.max.x * scale) / w,
+                (r.max.y * scale) / h,
+            ];
+        } else {
+            self.heatmap_uv_rect = [0.0; 4];
+        }
+
+        egui_state.handle_platform_output(window, full_output.platform_output);
+        let mut clipped_primitives =
+            egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+        if !state.file_loaded {
+            clipped_primitives.insert(
+                0,
+                self.splash_cache.build_combined_bg_primitive(
+                    egui_ctx,
+                    central_rect,
+                    self.smooth_time as f32,
+                ),
+            );
+        }
+
+        let ui_elapsed = ui_start.elapsed().as_micros() as f32;
+        let phase_egui_layout_us = ui_elapsed; // Egui layout now accurately measures only UI logic and tessellation
+
+        for (id, image_delta) in &full_output.textures_delta.set {
+            self.egui_renderer
+                .update_texture(&self.device, &self.queue, *id, image_delta);
+        }
+
+        // Acquire swapchain image AFTER CPU UI layout & tessellation ("Late Swapchain Acquire")
+        // so Egui layout overlaps with the previous frame's GPU execution and VSync fence wait,
+        // and GPU command submission happens immediately after VSync unblocks.
+        let surface_start = std::time::Instant::now();
+        let surface = self.surface.as_ref().ok_or(wgpu::SurfaceStatus::Lost)?;
+        let output = surface.get_current_texture();
+        let surface_texture = match output {
+            wgpu::CurrentSurfaceTexture::Success(tex)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(tex) => tex,
+            wgpu::CurrentSurfaceTexture::Lost => return Err(wgpu::SurfaceStatus::Lost),
+            wgpu::CurrentSurfaceTexture::Outdated => return Err(wgpu::SurfaceStatus::Outdated),
+            wgpu::CurrentSurfaceTexture::Timeout => return Err(wgpu::SurfaceStatus::Timeout),
+            _ => return Err(wgpu::SurfaceStatus::Lost),
+        };
+        if cfg!(windows)
+            && is_vsync_present_mode(self.config.present_mode)
+            && crate::state::BENCH_FRAMES_OVERRIDE.load(Ordering::Relaxed) == 0
+            && std::env::var_os("BENCH_FRAMES").is_none()
+        {
+            // In windowed mode over a lower-FPS VRR game, DWM FLIP_DISCARD can occasionally
+            // recycle a queued backbuffer early and signal the waitable swapchain semaphore
+            // before the display's physical minimum refresh period (1 / target_fps) has elapsed.
+            // Clamp early wakeups to the monitor's max refresh rate ceiling (e.g. 144 Hz = 6.944 ms).
+            let min_frame_time =
+                std::time::Duration::from_secs_f32(1.0 / (state.target_fps.clamp(30, 500) as f32));
+            if let Some(last_acq) = self.last_acquire_instant {
+                let target_instant = last_acq + min_frame_time;
+                let now = std::time::Instant::now();
+                if target_instant > now {
+                    let rem = target_instant - now;
+                    let spin_margin = std::time::Duration::from_micros(1500);
+                    if rem > spin_margin {
+                        std::thread::sleep(rem - spin_margin);
+                    }
+                    while std::time::Instant::now() < target_instant {
+                        std::hint::spin_loop();
+                    }
+                }
+            }
+            self.last_acquire_instant = Some(std::time::Instant::now());
+        } else {
+            self.last_acquire_instant = None;
+        }
+        let view = surface_texture
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let phase_surface_us = surface_start.elapsed().as_micros() as f32;
+
+        let screen_descriptor = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.config.width, self.config.height],
+            pixels_per_point: egui_ctx.pixels_per_point(),
+        };
+        let render_start = std::time::Instant::now();
+
+        let scale_factor = egui_ctx.pixels_per_point();
+        let vp_x =
+            ((central_rect.min.x * scale_factor).clamp(0.0, self.config.width as f32)).round();
+        let vp_y =
+            ((central_rect.min.y * scale_factor).clamp(0.0, self.config.height as f32)).round();
+        let max_w = (self.config.width as f32 - vp_x).max(1.0);
+        let vp_w = ((central_rect.width() * scale_factor).clamp(1.0, max_w)).round();
+        let max_h = (self.config.height as f32 - vp_y).max(1.0);
+        let vp_h = ((central_rect.height() * scale_factor).clamp(1.0, max_h)).round();
+
+        let is_portrait = self.config.width < self.config.height;
+        let is_video_active = state.file_loaded
+            && self.video_state.is_some()
+            && (state.video_mode > 0
+                || (is_portrait && state.mobile_hud_tab == crate::state::MobileHudTab::Video));
+
+        let mut v_vp_x = 0.0;
+        let mut v_vp_y = 0.0;
+        let mut v_vp_w = self.config.width as f32;
+        let mut v_vp_h = self.config.height as f32;
+
+        if state.file_loaded && is_video_active {
+            let target_rect = if state.video_mode == 3 {
+                None // mode 3: full screen
+            } else if is_portrait && state.mobile_hud_tab == crate::state::MobileHudTab::Video {
+                out_video_rect
+            } else if state.video_mode == 1 {
+                out_track_info_rect
+            } else if state.video_mode == 2 {
+                out_video_rect.or(out_top_panel_rect)
+            } else {
+                None // mode 3: full screen
+            };
+
+            if let Some(r) = target_rect {
+                v_vp_x = ((r.min.x * scale_factor).clamp(0.0, self.config.width as f32)).round();
+                v_vp_y = ((r.min.y * scale_factor).clamp(0.0, self.config.height as f32)).round();
+                let max_w = (self.config.width as f32 - v_vp_x).max(1.0);
+                v_vp_w = ((r.width() * scale_factor).clamp(1.0, max_w)).round();
+                let max_h = (self.config.height as f32 - v_vp_y).max(1.0);
+                v_vp_h = ((r.height() * scale_factor).clamp(1.0, max_h)).round();
+            }
+        }
+
+        if state.file_loaded {
+            let mode_idx = state
+                .current_visualizer_idx
+                .min(self.render_pipelines.len() - 1);
+            self.ensure_visualizer_pipeline(mode_idx);
+
+            let aspect = vp_w / vp_h.max(1.0);
+            self.last_aspect_ratio = aspect;
+
+            if let Some(mut uniforms) = self.pending_uniforms.take() {
+                uniforms.ui_meters_rect = self.meters_uv_rect;
+                uniforms.ui_heatmap_rect = self.heatmap_uv_rect;
+                uniforms.ui_fire_rect = self.fire_uv_rect;
+                uniforms.aspect_ratio = aspect;
+                self.queue
+                    .write_buffer(&self.uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+            }
+
+            let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
+            if matches!(
+                vis_def.pipeline_type,
+                crate::state::PipelineType::Mesh3D { .. }
+            ) {
+                // Adapt FOV when aspect ratio is square or portrait (< 1.0) so 3D scenes fit without horizontal clipping
+                let base_fov = if state.visualizer_mode == 22 {
+                    64.0_f32.to_radians()
+                } else {
+                    48.0_f32.to_radians()
+                };
+                let fov_y = if state.visualizer_mode == 19
+                    || state.visualizer_mode == 23
+                    || state.visualizer_mode == 29
+                {
+                    base_fov
+                } else if aspect < 1.0 {
+                    (base_fov / aspect.clamp(0.65, 1.0)).min(if state.visualizer_mode == 22 {
+                        85.0_f32.to_radians()
+                    } else {
+                        75.0_f32.to_radians()
+                    })
+                } else {
+                    base_fov
+                };
+                let proj = glam::Mat4::perspective_rh_gl(fov_y, aspect, 0.1, 1000.0);
+                let cam_view = if state.visualizer_mode == 20 && state.biolum_top_down {
+                    glam::Mat4::look_at_rh(
+                        glam::Vec3::new(0.0, 14.0, 0.0),
+                        glam::Vec3::new(0.0, 0.0, 0.0),
+                        glam::Vec3::new(0.0, 0.0, 1.0),
+                    )
+                } else if state.visualizer_mode == 14 {
+                    let cam_y = if aspect < 1.0 { 1.65 } else { 1.50 };
+                    let cam_z = if aspect < 1.0 { 0.2 } else { 0.6 };
+                    glam::Mat4::look_at_rh(
+                        glam::Vec3::new(0.0, cam_y, cam_z),
+                        glam::Vec3::new(0.0, 0.95, 14.0),
+                        glam::Vec3::new(0.0, 1.0, 0.0),
+                    )
+                } else if state.visualizer_mode == 19 {
+                    let cam_z = (13.5 / aspect).clamp(6.2, 22.0);
+                    glam::Mat4::look_at_rh(
+                        glam::Vec3::new(0.0, 0.0, cam_z),
+                        glam::Vec3::new(0.0, 0.0, 0.0),
+                        glam::Vec3::new(0.0, 1.0, 0.0),
+                    )
+                } else if state.visualizer_mode == 23 {
+                    let lyrics_scale = (2.2 / aspect).max(1.0);
+                    let eye_y = 0.45 + 0.95 * lyrics_scale;
+                    let eye_z = 4.2 * lyrics_scale;
+                    glam::Mat4::look_at_rh(
+                        glam::Vec3::new(0.0, eye_y, eye_z),
+                        glam::Vec3::new(0.0, 0.45, 0.0),
+                        glam::Vec3::new(0.0, 1.0, 0.0),
+                    )
+                } else if state.visualizer_mode == 22 {
+                    let t_cam = wrap_host_phase_time(self.play_time) * 0.18;
+                    let cam_radius = 9.8f32;
+                    let cam_h = 2.4f32 + (t_cam * 0.7).sin() * 0.6f32;
+                    let cam_x = t_cam.sin() * cam_radius * 0.55f32;
+                    let cam_z = -t_cam.cos() * cam_radius * 0.6f32 - 2.8f32;
+                    glam::Mat4::look_at_rh(
+                        glam::Vec3::new(cam_x, cam_h, cam_z),
+                        glam::Vec3::new(0.0, 0.4, 2.5),
+                        glam::Vec3::new(0.0, 1.0, 0.0),
+                    )
+                } else if state.visualizer_mode == 29 {
+                    glam::Mat4::look_at_rh(
+                        glam::Vec3::new(0.0, 0.0, -6.5),
+                        glam::Vec3::new(0.0, 0.0, 20.0),
+                        glam::Vec3::new(0.0, 1.0, 0.0),
+                    )
+                } else {
+                    glam::Mat4::look_at_rh(
+                        glam::Vec3::new(0.0, 1.5, -2.0),
+                        glam::Vec3::new(0.0, 1.5, 0.0),
+                        glam::Vec3::new(0.0, 1.0, 0.0),
+                    )
+                };
+                let camera_uniforms = CameraUniforms {
+                    view_matrix: cam_view.to_cols_array_2d(),
+                    proj_matrix: proj.to_cols_array_2d(),
+                };
+                self.queue.write_buffer(
+                    &self.camera_uniform_buffer,
+                    0,
+                    bytemuck::cast_slice(&[camera_uniforms]),
+                );
+            }
+
+            if is_video_active && let Some(vs) = &mut self.video_state {
+                let chroma_layout_u32 = vs.chroma_layout.shader_code();
+                let params = VideoParams {
+                    color_space: vs.color_space,
+                    color_range: vs.color_range,
+                    bit_depth: vs.bit_depth,
+                    color_trc: vs.color_trc,
+                    viewport_width: v_vp_w,
+                    viewport_height: v_vp_h,
+                    video_width: vs.width as f32,
+                    video_height: vs.height as f32,
+                    rotation: vs.rotation,
+                    chroma_layout: chroma_layout_u32,
+                    _pad2: 0.0,
+                    _pad3: 0.0,
+                };
+                let params_bytes: [u8; std::mem::size_of::<VideoParams>()] = bytemuck::cast(params);
+                if vs.last_uploaded_params != Some(params_bytes) {
+                    self.queue.write_buffer(&vs.params_buffer, 0, &params_bytes);
+                    vs.last_uploaded_params = Some(params_bytes);
+                }
+            }
+        }
+
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Render Encoder"),
+            });
+
+        // Pre-blur video borders at quarter resolution ONLY when a new decoded video frame
+        // (generation) or color metadata arrives, eliminating 93 per-pixel fetches every refresh.
+        if state.file_loaded
+            && is_video_active
+            && let Some(vs) = &mut self.video_state
+        {
+            let chroma_layout_u32 = vs.chroma_layout.shader_code();
+            let color_key = (
+                vs.color_space,
+                vs.color_range,
+                vs.bit_depth,
+                vs.color_trc,
+                chroma_layout_u32,
+            );
+            if vs.blurred_generation != vs.frame_generation || vs.blurred_color_key != color_key {
+                const VIDEO_BLUR_CLEAR_COLOR: wgpu::Color = wgpu::Color::BLACK;
+                let mut blur_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Video Quarter-Res Border Blur Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &vs.border_blur_view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Clear(VIDEO_BLUR_CLEAR_COLOR),
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                blur_pass.set_pipeline(&self.video_border_blur_pipeline);
+                blur_pass.set_bind_group(0, &vs.blur_bind_group, &[]);
+                blur_pass.draw(0..3, 0..1);
+                drop(blur_pass);
+                vs.blurred_generation = vs.frame_generation;
+                vs.blurred_color_key = color_key;
+            }
+        }
+
+        self.egui_renderer.update_buffers(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            &clipped_primitives,
+            &screen_descriptor,
+        );
+
+        let is_bench =
+            crate::state::BENCH_FRAMES_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) > 0;
+        let should_start_mapping = state.file_loaded
+            && (state.show_stats || is_bench)
+            && !self.timestamp_mapping_active
+            && self.query_set.is_some();
+        let active_query_set = if should_start_mapping {
+            self.query_set.as_ref()
+        } else {
+            None
+        };
+
+        // GPU compute passes (skipped when paused and idle so paused frames do minimal GPU work)
+        if state.file_loaded {
+            let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
+            let need_heatmap_or_resynth = !state.is_paused
+                || self.last_steps_to_fill > 0
+                || vis_def.requires_resynth
+                || active_query_set.is_some();
+            if need_heatmap_or_resynth {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Heatmap & Resynth Compute Pass"),
+                    timestamp_writes: active_query_set.map(|qs| wgpu::ComputePassTimestampWrites {
+                        query_set: qs,
+                        beginning_of_pass_write_index: Some(0),
+                        end_of_pass_write_index: Some(1),
+                    }),
+                });
+                compute_pass.set_pipeline(&self.heatmap_compute_pipeline);
+                compute_pass.set_bind_group(0, Some(&self.heatmap_bind_group), &[]);
+                compute_pass.dispatch_workgroups(1, 1, 1); // 256x1x1 threads
+
+                if vis_def.requires_resynth && !state.is_paused {
+                    compute_pass.set_pipeline(&self.resynth_compute_pipeline);
+                    compute_pass.set_bind_group(0, Some(&self.resynth_bind_group), &[]);
+                    compute_pass.dispatch_workgroups(32, 2, 1); // 512/16=32, 32/16=2
+                }
+            }
+
+            let mut sim_timestamp_written = false;
+            let mut take_sim_timestamps = || {
+                if sim_timestamp_written {
+                    None
+                } else {
+                    active_query_set.map(|qs| {
+                        sim_timestamp_written = true;
+                        wgpu::ComputePassTimestampWrites {
+                            query_set: qs,
+                            beginning_of_pass_write_index: Some(2),
+                            end_of_pass_write_index: Some(3),
+                        }
+                    })
+                }
+            };
+
+            // GPU fire compute: dispatch simulation + copy result to texture
+            if vis_def.requires_fire
+                && (!state.is_paused || self.fire_intensity > 0.001)
+                && vis_def.id == 6
+            {
+                {
+                    let mut compute_pass =
+                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("Fire Compute"),
+                            timestamp_writes: take_sim_timestamps(),
+                        });
+                    compute_pass.set_pipeline(&self.firesim_compute_pipeline);
+                    let bg = if self.fire_ping {
+                        &self.fire_bind_group_a
+                    } else {
+                        &self.fire_bind_group_b
+                    };
+                    compute_pass.set_bind_group(0, Some(bg), &[]);
+                    compute_pass.dispatch_workgroups(64, 36, 1); // 1024/16=64, 576/16=36
+                }
+                let output_buffer = if self.fire_ping {
+                    &self.fire_buffer_b
+                } else {
+                    &self.fire_buffer_a
+                };
+                encoder.copy_buffer_to_texture(
+                    wgpu::TexelCopyBufferInfo {
+                        buffer: output_buffer,
+                        layout: wgpu::TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(1024 * 4),
+                            rows_per_image: Some(576),
+                        },
+                    },
+                    wgpu::TexelCopyTextureInfo {
+                        texture: &self.fire_grid_texture,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width: 1024,
+                        height: 576,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                self.fire_ping = !self.fire_ping;
+            }
+
+            if !state.is_paused {
+                if vis_def.requires_flip_ferrofluid {
+                    let mut compute_pass =
+                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("Quantum FLIP Ferrofluid Compute"),
+                            timestamp_writes: take_sim_timestamps(),
+                        });
+                    compute_pass.set_pipeline(&self.flip_clear_pipeline);
+                    compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                    compute_pass.dispatch_workgroups(512, 1, 1);
+
+                    compute_pass.set_pipeline(&self.flip_clear_render_pipeline);
+                    compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                    compute_pass.dispatch_workgroups(1024, 1, 1);
+
+                    compute_pass.set_pipeline(&self.flip_p2g_pipeline);
+                    compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                    compute_pass.dispatch_workgroups(96, 1, 1);
+
+                    compute_pass.set_pipeline(&self.flip_forces_pipeline);
+                    compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                    compute_pass.dispatch_workgroups(512, 1, 1);
+
+                    for _ in 0..1 {
+                        compute_pass.set_pipeline(&self.flip_pressure_0_to_1_pipeline);
+                        compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                        compute_pass.dispatch_workgroups(512, 1, 1);
+
+                        compute_pass.set_pipeline(&self.flip_pressure_1_to_0_pipeline);
+                        compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                        compute_pass.dispatch_workgroups(512, 1, 1);
+                    }
+
+                    compute_pass.set_pipeline(&self.flip_project_pipeline);
+                    compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                    compute_pass.dispatch_workgroups(512, 1, 1);
+
+                    compute_pass.set_pipeline(&self.flip_g2p_advect_pipeline);
+                    compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                    compute_pass.dispatch_workgroups(96, 1, 1);
+                }
+
+                if vis_def.requires_flip_water {
+                    let mut compute_pass =
+                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("Acoustic FLIP Water Compute"),
+                            timestamp_writes: take_sim_timestamps(),
+                        });
+                    compute_pass.set_pipeline(&self.flip_water_clear_pipeline);
+                    compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                    compute_pass.dispatch_workgroups(512, 1, 1);
+
+                    compute_pass.set_pipeline(&self.flip_water_clear_render_pipeline);
+                    compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                    compute_pass.dispatch_workgroups(1024, 1, 1);
+
+                    compute_pass.set_pipeline(&self.flip_water_p2g_pipeline);
+                    compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                    compute_pass.dispatch_workgroups(256, 1, 1);
+
+                    compute_pass.set_pipeline(&self.flip_water_forces_pipeline);
+                    compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                    compute_pass.dispatch_workgroups(512, 1, 1);
+
+                    for _ in 0..8 {
+                        compute_pass.set_pipeline(&self.flip_water_pressure_0_to_1_pipeline);
+                        compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                        compute_pass.dispatch_workgroups(512, 1, 1);
+
+                        compute_pass.set_pipeline(&self.flip_water_pressure_1_to_0_pipeline);
+                        compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                        compute_pass.dispatch_workgroups(512, 1, 1);
+                    }
+
+                    compute_pass.set_pipeline(&self.flip_water_project_pipeline);
+                    compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                    compute_pass.dispatch_workgroups(512, 1, 1);
+
+                    compute_pass.set_pipeline(&self.flip_water_g2p_advect_pipeline);
+                    compute_pass.set_bind_group(0, Some(&self.flip_compute_bind_group), &[]);
+                    compute_pass.dispatch_workgroups(256, 1, 1);
+                    drop(compute_pass);
+
+                    if vis_def.id == 23 {
+                        encoder.copy_buffer_to_buffer(
+                            &self.splash_compact_buffer,
+                            0,
+                            &self.splash_indirect_args_buffer,
+                            0,
+                            20,
+                        );
+                    }
+                }
+
+                if vis_def.id == 20 {
+                    let mut compute_pass =
+                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                            label: Some("Bioluminescence Waves Sim Compute"),
+                            timestamp_writes: take_sim_timestamps(),
+                        });
+                    compute_pass.set_pipeline(&self.biolum_compute_pipeline);
+                    compute_pass.set_bind_group(0, Some(&self.biolum_compute_bind_group), &[]);
+                    compute_pass.dispatch_workgroups(144, 1, 1);
+                }
+            }
+
+            if !sim_timestamp_written && let Some(qs) = active_query_set {
+                encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Dummy Sim Pass"),
+                    timestamp_writes: Some(wgpu::ComputePassTimestampWrites {
+                        query_set: qs,
+                        beginning_of_pass_write_index: Some(2),
+                        end_of_pass_write_index: Some(3),
+                    }),
+                });
+            }
+        }
+
+        let is_mesh_3d = state.file_loaded
+            && matches!(
+                crate::state::VISUALIZERS[state.current_visualizer_idx].pipeline_type,
+                crate::state::PipelineType::Mesh3D { .. }
+            );
+
+        // If a 3D mesh visualizer is active, run its depth-buffered pass first, then overlay 2D HUD + Egui
+        // without depth attachment. Otherwise (2D visualizers or Splash), execute a SINGLE swapchain render pass
+        // with no depth attachment for minimal GPU overhead.
+        if is_mesh_3d {
+            let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
+            let mode_idx = state
+                .current_visualizer_idx
+                .min(self.render_pipelines.len() - 1);
+            let mut render_pass_3d = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("3D Visualizer Render Pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(APP_DEFAULT_BG_CLEAR_COLOR),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_texture_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Discard,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: active_query_set.map(|qs| wgpu::RenderPassTimestampWrites {
+                    query_set: qs,
+                    beginning_of_pass_write_index: Some(4),
+                    end_of_pass_write_index: Some(5),
+                }),
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+
+            render_pass_3d.set_viewport(vp_x, vp_y, vp_w, vp_h, 0.0, 1.0);
+            render_pass_3d.set_scissor_rect(vp_x as u32, vp_y as u32, vp_w as u32, vp_h as u32);
+
+            if vis_def.id == 20 {
+                render_pass_3d.set_pipeline(&self.biolum_bg_pipeline);
+                render_pass_3d.draw(0..3, 0..1);
+            } else if vis_def.id == 14 {
+                render_pass_3d.set_pipeline(&self.synthwave_sky_pipeline);
+                render_pass_3d.set_bind_group(0, &self.uniform_bind_group, &[]);
+                render_pass_3d.draw(0..3, 0..1);
+            } else if vis_def.id == 19 {
+                render_pass_3d.set_pipeline(&self.vumeters_bg_pipeline);
+                render_pass_3d.set_bind_group(0, &self.uniform_bind_group, &[]);
+                render_pass_3d.draw(0..3, 0..1);
+            } else if vis_def.id != 13 && vis_def.id != 22 && vis_def.id != 29 {
+                render_pass_3d.set_pipeline(&self.clear_black_pipeline);
+                render_pass_3d.draw(0..3, 0..1);
+            }
+
+            if let Some(vis_pipeline) = self.render_pipelines[mode_idx].as_ref() {
+                render_pass_3d.set_pipeline(vis_pipeline);
+            }
+            render_pass_3d.set_bind_group(0, &self.uniform_bind_group, &[]);
+
+            if let crate::state::PipelineType::Mesh3D {
+                geometry,
+                instances,
+            } = &vis_def.pipeline_type
+            {
+                if vis_def.id == 23 {
+                    render_pass_3d.set_bind_group(1, &self.flip_render_bind_group, &[]);
+                    render_pass_3d.set_bind_group(2, &self.camera_bind_group, &[]);
+                } else {
+                    render_pass_3d.set_bind_group(1, &self.camera_bind_group, &[]);
+                    if vis_def.id == 20 {
+                        render_pass_3d.set_bind_group(2, &self.biolum_render_bind_group, &[]);
+                    }
+                }
+                if let Some(mesh) = self.mesh_registry.get(geometry) {
+                    render_pass_3d.set_vertex_buffer(0, mesh.vertex_buffer.slice(..));
+                    render_pass_3d
+                        .set_index_buffer(mesh.index_buffer.slice(..), wgpu::IndexFormat::Uint32);
+                    if vis_def.id == 23 {
+                        render_pass_3d.draw_indexed_indirect(&self.lyrics_indirect_args_buffer, 0);
+                    } else {
+                        render_pass_3d.draw_indexed(0..mesh.index_count, 0, 0..*instances);
+                    }
+                }
+
+                if vis_def.id == 23 {
+                    render_pass_3d.set_pipeline(&self.water_splash_pipeline);
+                    render_pass_3d.set_vertex_buffer(0, self.splash_quad_vertex_buffer.slice(..));
+                    render_pass_3d.set_index_buffer(
+                        self.splash_quad_index_buffer.slice(..),
+                        wgpu::IndexFormat::Uint32,
+                    );
+                    render_pass_3d.draw_indexed_indirect(&self.splash_indirect_args_buffer, 0);
+                }
+
+                if vis_def.id == 13 {
+                    render_pass_3d.set_pipeline(&self.lamp_pipeline);
+                    render_pass_3d.set_vertex_buffer(0, self.lamp_vertex_buffer.slice(..));
+                    render_pass_3d.set_index_buffer(
+                        self.lamp_index_buffer.slice(..),
+                        wgpu::IndexFormat::Uint32,
+                    );
+                    render_pass_3d.draw_indexed(0..self.lamp_index_count, 0, 0..16);
+                }
+            }
+        }
+
+        {
+            let mut render_pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("Main Render Pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: if is_mesh_3d {
+                                wgpu::LoadOp::Load
+                            } else {
+                                wgpu::LoadOp::Clear(APP_DEFAULT_BG_CLEAR_COLOR)
+                            },
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: if is_mesh_3d {
+                        None
+                    } else {
+                        active_query_set.map(|qs| wgpu::RenderPassTimestampWrites {
+                            query_set: qs,
+                            beginning_of_pass_write_index: Some(4),
+                            end_of_pass_write_index: Some(5),
+                        })
+                    },
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                })
+                .forget_lifetime();
+
+            if state.file_loaded {
+                if !is_mesh_3d {
+                    let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
+                    let mode_idx = state
+                        .current_visualizer_idx
+                        .min(self.render_pipelines.len() - 1);
+
+                    render_pass.set_viewport(vp_x, vp_y, vp_w, vp_h, 0.0, 1.0);
+                    render_pass.set_scissor_rect(
+                        vp_x as u32,
+                        vp_y as u32,
+                        vp_w as u32,
+                        vp_h as u32,
+                    );
+
+                    if let Some(vis_pipeline) = self.render_pipelines[mode_idx].as_ref() {
+                        render_pass.set_pipeline(vis_pipeline);
+                    }
+                    render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                    if vis_def.id == 27 {
+                        render_pass.set_bind_group(1, &self.flip_render_bind_group, &[]);
+                    }
+                    render_pass.draw(0..3, 0..1);
+                }
+
+                if is_video_active {
+                    render_pass.set_viewport(v_vp_x, v_vp_y, v_vp_w, v_vp_h, 0.0, 1.0);
+                    render_pass.set_scissor_rect(
+                        v_vp_x as u32,
+                        v_vp_y as u32,
+                        v_vp_w as u32,
+                        v_vp_h as u32,
+                    );
+
+                    if let Some(vs) = &self.video_state {
+                        render_pass.set_pipeline(&self.video_pipeline);
+                        render_pass.set_bind_group(0, &vs.bind_group, &[]);
+                        render_pass.draw(0..3, 0..1);
+                    }
+                }
+
+                if state.show_hud
+                    && state.video_mode != 3
+                    && (out_meters_rect.is_some()
+                        || out_heatmap_rect.is_some()
+                        || out_fire_rect.is_some())
+                {
+                    render_pass.set_viewport(
+                        0.0,
+                        0.0,
+                        self.config.width as f32,
+                        self.config.height as f32,
+                        0.0,
+                        1.0,
+                    );
+                    render_pass.set_pipeline(&self.hud_pipeline);
+                    render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+
+                    let mut draw_rect = |r: Option<egui::Rect>| {
+                        if let Some(rect) = r {
+                            let x = ((rect.min.x * scale_factor)
+                                .clamp(0.0, self.config.width as f32))
+                            .round() as u32;
+                            let y = ((rect.min.y * scale_factor)
+                                .clamp(0.0, self.config.height as f32))
+                            .round() as u32;
+
+                            let w = if x < self.config.width {
+                                let max_w = self.config.width - x;
+                                ((rect.width() * scale_factor).round() as u32).clamp(1, max_w)
+                            } else {
+                                0
+                            };
+
+                            let h = if y < self.config.height {
+                                let max_h = self.config.height - y;
+                                ((rect.height() * scale_factor).round() as u32).clamp(1, max_h)
+                            } else {
+                                0
+                            };
+
+                            if w > 0 && h > 0 {
+                                render_pass.set_scissor_rect(x, y, w, h);
+                                render_pass.draw(0..3, 0..1);
+                            }
+                        }
+                    };
+
+                    draw_rect(out_meters_rect);
+                    draw_rect(out_heatmap_rect);
+                    draw_rect(out_fire_rect);
+                }
+
+                render_pass.set_viewport(
+                    0.0,
+                    0.0,
+                    self.config.width as f32,
+                    self.config.height as f32,
+                    0.0,
+                    1.0,
+                );
+                render_pass.set_scissor_rect(0, 0, self.config.width, self.config.height);
+            }
+
+            if !clipped_primitives.is_empty() {
+                self.egui_renderer.render(
+                    &mut render_pass,
+                    &clipped_primitives,
+                    &screen_descriptor,
+                );
+            }
+        }
+
+        // Resolve timestamp queries into the resolve buffer, then copy to the read buffer.
+        // ONLY do this when stats are visible and no mapping is pending.
+        if should_start_mapping
+            && let (Some(qs), Some(res_buf), Some(read_buf)) = (
+                &self.query_set,
+                &self.query_resolve_buffer,
+                &self.query_read_buffer,
+            )
+        {
+            encoder.resolve_query_set(qs, 0..6, res_buf, 0);
+            encoder.copy_buffer_to_buffer(res_buf, 0, read_buf, 0, 48);
+        }
+
+        static CAPTURE_ENV: std::sync::OnceLock<(Option<u32>, u32, bool)> =
+            std::sync::OnceLock::new();
+        let &(env_bench_frames, capture_count, env_capture_enabled) =
+            CAPTURE_ENV.get_or_init(|| {
+                let bf = std::env::var("BENCH_FRAMES")
+                    .ok()
+                    .and_then(|s| s.parse::<u32>().ok());
+                let cc = std::env::var("CAPTURE_FRAMES_COUNT")
+                    .ok()
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(1);
+                let cap = std::env::var("CAPTURE_FRAME").is_ok();
+                (bf, cc, cap)
+            });
+
+        let bench_override = crate::state::BENCH_FRAMES_OVERRIDE.load(Ordering::Relaxed);
+        let capture_frame = if bench_override > 0 {
+            bench_override.saturating_sub(1)
+        } else if let Some(bf) = env_bench_frames {
+            bf.saturating_sub(1)
+        } else {
+            180
+        };
+        let capture_start = if capture_count > 1 {
+            capture_frame.saturating_sub(capture_count.saturating_sub(1))
+        } else {
+            capture_frame
+        };
+        let do_capture = env_capture_enabled
+            && self.frame_count >= capture_start
+            && self.frame_count <= capture_frame;
+
+        let mut readback_buffer = None;
+        if do_capture {
+            let bpr = (self.config.width * 4 + 255) & !255;
+            let rb = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("Readback"),
+                size: (bpr * self.config.height) as u64,
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &surface_texture.texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &rb,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(bpr),
+                        rows_per_image: Some(self.config.height),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: self.config.width,
+                    height: self.config.height,
+                    depth_or_array_layers: 1,
+                },
+            );
+            readback_buffer = Some(rb);
+        }
+
+        let command_buffer = encoder.finish();
+        let phase_encode_us = render_start.elapsed().as_micros() as f32;
+        let submit_start = std::time::Instant::now();
+
+        self.queue.submit(std::iter::once(command_buffer));
+
+        // Start async timestamp mapping AFTER submit (non-blocking)
+        if should_start_mapping && let Some(read_buf) = &self.query_read_buffer {
+            let flag = self.timestamp_map_complete.clone();
+            flag.store(false, Ordering::Release);
+            let slice = read_buf.slice(..);
+            slice.map_async(wgpu::MapMode::Read, move |result| {
+                if result.is_ok() {
+                    flag.store(true, Ordering::Release);
+                }
+            });
+            self.timestamp_mapping_active = true;
+        }
+
+        if let Some(rb) = readback_buffer {
+            let slice = rb.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |v| tx.send(v).unwrap());
+            self.device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                })
+                .unwrap();
+            if rx.recv().unwrap().is_ok() {
+                let data = slice.get_mapped_range();
+                let bpr = (self.config.width * 4 + 255) & !255;
+                let mut img = image::RgbaImage::new(self.config.width, self.config.height);
+                for y in 0..self.config.height {
+                    for x in 0..self.config.width {
+                        let offset = (y * bpr + x * 4) as usize;
+                        let b = data[offset];
+                        let g = data[offset + 1];
+                        let r = data[offset + 2];
+                        let _a = data[offset + 3];
+                        img.put_pixel(x, y, image::Rgba([r, g, b, 255])); // Ignore A to force fully opaque screenshot
+                    }
+                }
+                let base_capture_path =
+                    std::env::var("CAPTURE_PATH").unwrap_or_else(|_| "screenshot.png".to_string());
+                let capture_path = if capture_count > 1 {
+                    if let Some(pos) = base_capture_path.rfind('.') {
+                        format!(
+                            "{}_{:03}{}",
+                            &base_capture_path[..pos],
+                            self.frame_count,
+                            &base_capture_path[pos..]
+                        )
+                    } else {
+                        format!("{}_{:03}.png", base_capture_path, self.frame_count)
+                    }
+                } else {
+                    base_capture_path
+                };
+                img.save(&capture_path).unwrap();
+                println!("Screenshot saved to {}", capture_path);
+            }
+            if bench_override == 0
+                && env_bench_frames.is_none()
+                && self.frame_count == capture_frame
+            {
+                std::process::exit(0);
+            }
+        }
+
+        window.pre_present_notify();
+        surface_texture.present();
+
+        for id in &full_output.textures_delta.free {
+            self.egui_renderer.free_texture(id);
+        }
+
+        let phase_submit_us = submit_start.elapsed().as_micros() as f32;
+        let submit_elapsed = phase_encode_us + phase_submit_us;
+
+        Ok((
+            engine_action,
+            ui_elapsed,
+            submit_elapsed,
+            fire_shader_time_us,
+            fft_shader_time_us,
+            vis_shader_time_us,
+            phase_surface_us,
+            phase_egui_layout_us,
+            phase_encode_us,
+            phase_submit_us,
+        ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn workspace_path(rel: &str) -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(rel)
+    }
+
+    impl SplashCache {
+        fn build_dynamic_bg_mesh(&self, rect: egui::Rect, time: f32, ppp: f32) -> egui::Mesh {
+            let mut mesh = egui::Mesh::default();
+            self.append_dynamic_bg(&mut mesh, rect, time, ppp);
+            mesh
+        }
+    }
+
+    #[test]
+    fn test_uniform_size_alignment() {
+        let rust_size = std::mem::size_of::<AudioUniforms>();
+        assert_eq!(
+            rust_size, 9856,
+            "Rust AudioUniforms size is not 9856 bytes (actual: {})",
+            rust_size
+        );
+
+        // Parse _common.wgsl to compute WGSL structure size
+        let common_source = std::fs::read_to_string(workspace_path("src/shaders/_common.wgsl"))
+            .expect("Failed to read _common.wgsl");
+
+        // Parse AudioUniforms struct fields
+        let struct_content = common_source
+            .split("struct AudioUniforms {")
+            .nth(1)
+            .expect("Could not find struct AudioUniforms in _common.wgsl")
+            .split("};")
+            .next()
+            .expect("Could not find end of struct AudioUniforms");
+
+        let mut offset: usize = 0;
+        for line in struct_content.lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with("//") {
+                continue;
+            }
+            let parts: Vec<&str> = line.split(':').collect();
+            if parts.len() < 2 {
+                continue;
+            }
+            let ty = parts[1].trim().trim_end_matches(',');
+
+            // Determine size and alignment
+            let (size, align) = if ty.starts_with("array<") {
+                if ty.contains("vec4<") {
+                    let count_str = ty.split(',').nth(1).unwrap().trim().trim_end_matches('>');
+                    let count: usize = count_str.parse().unwrap();
+                    (count * 16, 16)
+                } else {
+                    panic!("Unknown array type in shader: {}", ty);
+                }
+            } else {
+                match ty {
+                    "u32" | "i32" | "f32" => (4, 4),
+                    "vec2<f32>" | "vec2<u32>" | "vec2<i32>" => (8, 8),
+                    "vec3<f32>" | "vec3<u32>" | "vec3<i32>" => (12, 16),
+                    "vec4<f32>" | "vec4<u32>" | "vec4<i32>" => (16, 16),
+                    _ => panic!("Unknown type in shader: {}", ty),
+                }
+            };
+
+            // Align the offset
+            offset = offset.div_ceil(align) * align;
+            offset += size;
+        }
+
+        // Align struct size to maximum alignment (16)
+        let wgsl_size = offset.div_ceil(16) * 16;
+        assert_eq!(
+            wgsl_size, 9856,
+            "WGSL AudioUniforms size is not 9856 bytes (actual: {})",
+            wgsl_size
+        );
+        assert_eq!(
+            rust_size, wgsl_size,
+            "Size mismatch: Rust AudioUniforms is {}, WGSL is {}",
+            rust_size, wgsl_size
+        );
+    }
+
+    #[test]
+    fn test_timing_and_scroll_stability() {
+        let mut smooth_dt = 1.0f64 / 60.0f64;
+        let mut smooth_time = 0.0f64;
+        let mut raw_time = 0.0f64;
+
+        let mut raw_deltas = Vec::new();
+        let mut smooth_deltas = Vec::new();
+
+        // Simulate 100 frames with CPU scheduling noise
+        for i in 0..100 {
+            // Deterministic pseudo-random jitter between 13ms and 20ms using a sine phase
+            let phase = (i as f64) * 0.73;
+            let jitter = phase.sin() * 0.0035; // +/- 3.5ms
+            let dt = 0.01667 + jitter;
+
+            let prev_raw = raw_time;
+            raw_time += dt;
+            raw_deltas.push(raw_time - prev_raw);
+
+            let alpha = 0.03f64;
+            let prev_smooth = smooth_time;
+            smooth_dt = smooth_dt * (1.0 - alpha) + dt.clamp(0.001, 0.1) * alpha;
+            smooth_time += smooth_dt;
+            smooth_deltas.push(smooth_time - prev_smooth);
+        }
+
+        // Calculate second derivative (acceleration / velocity change) of the timeline
+        let mut raw_accelerations = Vec::new();
+        let mut smooth_accelerations = Vec::new();
+        for i in 1..99 {
+            let acc_raw = raw_deltas[i] - raw_deltas[i - 1];
+            let acc_smooth = smooth_deltas[i] - smooth_deltas[i - 1];
+            raw_accelerations.push(acc_raw.abs());
+            smooth_accelerations.push(acc_smooth.abs());
+        }
+
+        let max_raw_acc = raw_accelerations.iter().cloned().fold(0.0, f64::max);
+        let max_smooth_acc = smooth_accelerations.iter().cloned().fold(0.0, f64::max);
+
+        println!("Max raw frame-to-frame velocity jump: {:.6}s", max_raw_acc);
+        println!(
+            "Max smoothed frame-to-frame velocity jump: {:.6}s",
+            max_smooth_acc
+        );
+
+        // Smooth timelines must have at least 15x lower frame-to-frame velocity jumps
+        assert!(
+            max_smooth_acc < max_raw_acc / 15.0,
+            "The timing filter did not damp frame-to-frame velocity changes sufficiently: smooth={:.6}, raw={:.6}",
+            max_smooth_acc,
+            max_raw_acc
+        );
+    }
+
+    #[test]
+    fn test_drag_and_drop_use_cases() {
+        let mut state = crate::state::AppState::new(String::new());
+        let track_info_rect = [800.0f32, 0.0, 1200.0, 300.0];
+        state.track_info_rect = Some(track_info_rect);
+
+        let cursor_inside = Some([950.0f32, 100.0]);
+        let cursor_outside = Some([400.0f32, 150.0]);
+
+        // Use Case 1: Nothing is playing (file_loaded == false), even if dropped on Track Info -> play immediately
+        assert!(!state.file_loaded);
+        state.handle_dropped_files(vec!["song1.flac".to_string()], cursor_inside);
+        assert!(state.file_loaded);
+        assert!(!state.is_paused);
+        assert!(!state.track_ended);
+        assert_eq!(*state.playlist, vec!["song1.flac".to_string()]);
+        assert_eq!(state.playlist_index, 0);
+        assert_eq!(state.load_request.take(), Some("song1.flac".to_string()));
+        state.song_title = "song1.flac".to_string();
+
+        // Use Case 2: Single track is playing, drop onto Track Info -> creates playlist with dropped track as next track
+        state.handle_dropped_files(vec!["song2.mp3".to_string()], cursor_inside);
+        assert_eq!(
+            *state.playlist,
+            vec!["song1.flac".to_string(), "song2.mp3".to_string()]
+        );
+        assert_eq!(state.playlist_index, 0);
+        assert_eq!(state.playlist[state.playlist_index + 1], "song2.mp3");
+        assert_eq!(state.load_request, None);
+        assert_eq!(
+            state.osd_text,
+            Some("Added to Playlist: song2.mp3".to_string())
+        );
+
+        // Use Case 3: Playlist is playing track 0 ("song1.flac"), drop "song_next.wav" onto Track Info
+        // -> inserts "song_next.wav" as the next track (index 1) before "song2.mp3"
+        state.handle_dropped_files(vec!["song_next.wav".to_string()], cursor_inside);
+        assert_eq!(
+            *state.playlist,
+            vec![
+                "song1.flac".to_string(),
+                "song_next.wav".to_string(),
+                "song2.mp3".to_string()
+            ]
+        );
+        assert_eq!(state.playlist_index, 0);
+        assert_eq!(state.playlist[state.playlist_index + 1], "song_next.wav");
+        assert_eq!(state.load_request, None);
+        assert_eq!(
+            state.osd_text,
+            Some("Added to Playlist: song_next.wav".to_string())
+        );
+
+        // Use Case 4: Drop outside Track Info while playing -> replaces playlist and plays immediately
+        state.handle_dropped_files(vec!["song3.ogg".to_string()], cursor_outside);
+        assert_eq!(*state.playlist, vec!["song3.ogg".to_string()]);
+        assert_eq!(state.playlist_index, 0);
+        assert_eq!(state.load_request.take(), Some("song3.ogg".to_string()));
+        state.song_title = "song3.ogg".to_string();
+
+        // Use Case 5: Playback has ended (track_ended == true), drop onto Track Info -> plays immediately
+        state.track_ended = true;
+        state.is_paused = true;
+        state.handle_dropped_files(vec!["song4.flac".to_string()], cursor_inside);
+        assert!(!state.track_ended);
+        assert!(!state.is_paused);
+        assert_eq!(*state.playlist, vec!["song4.flac".to_string()]);
+        assert_eq!(state.playlist_index, 0);
+        assert_eq!(state.load_request.take(), Some("song4.flac".to_string()));
+    }
+
+    #[test]
+    fn test_view_mode_rotation() {
+        let mut state = crate::state::AppState::new("Test App".to_string());
+        assert!(state.show_hud);
+        assert_eq!(state.video_mode, 0);
+
+        // Press 'v' in audio mode -> Toggle HUD off (Full Screen Visualizer)
+        state.show_hud = !state.show_hud;
+        state.video_mode = 0;
+        assert!(!state.show_hud);
+
+        // Press 'v' again -> Toggle HUD back on (Standard View)
+        state.show_hud = !state.show_hud;
+        state.video_mode = 0;
+        assert!(state.show_hud);
+    }
+
+    #[test]
+    fn test_synthwave_lyrics_visualizer_registration() {
+        let vis = crate::state::VISUALIZERS.iter().find(|v| v.id == 23);
+        assert!(
+            vis.is_some(),
+            "Visualizer ID 23 (3D Glass Water Lyrics) must be registered in VISUALIZERS"
+        );
+        let def = vis.unwrap();
+        assert_eq!(def.name, "3D Glass Water Lyrics");
+        assert_eq!(def.filename, "vis_lyrics.wgsl");
+        assert_eq!(
+            def.pipeline_type,
+            crate::state::PipelineType::Mesh3D {
+                geometry: crate::state::Geometry::GlassLyricsScene,
+                instances: 1
+            }
+        );
+
+        // Verify that the shader source is present and includes compile cleanly
+        let raw_source = include_str!("../../../src/shaders/vis_lyrics.wgsl");
+        assert!(raw_source.contains("// INCLUDE: common"));
+        assert!(raw_source.contains("vs_main_3d"));
+        assert!(raw_source.contains("fs_main"));
+        assert!(raw_source.contains("camera.view_matrix"));
+
+        // Verify ID 23 is disabled by default in AppState
+        let state = crate::state::AppState::new("Test App".to_string());
+        let lyrics_idx = crate::state::VISUALIZERS
+            .iter()
+            .position(|v| v.id == 23)
+            .unwrap();
+        assert!(
+            !state.vis_enabled[lyrics_idx],
+            "3D Glass Water Lyrics (ID 23) should be disabled by default"
+        );
+    }
+
+    #[test]
+    fn test_mobile_visualizer_fixes() {
+        // Verify Midnight Storm shader (vis_rain.wgsl) has the updated reactive lightning logic
+        let rain_source = include_str!("../../../src/shaders/vis_rain.wgsl");
+        assert!(rain_source.contains("lightning_bolt"));
+        assert!(rain_source.contains("strike_tick"));
+        assert!(rain_source.contains("audio.smooth_time"));
+        assert!(rain_source.contains("channel_peaks"));
+
+        // Verify VU meter rack OBJ model loads cleanly and has non-empty geometry
+        let (vu_verts, vu_indices) = generate_vumeter_rack_mesh();
+        assert!(
+            !vu_verts.is_empty(),
+            "VU meter rack vertices must not be empty"
+        );
+        assert!(
+            !vu_indices.is_empty(),
+            "VU meter rack indices must not be empty"
+        );
+
+        // Verify Glass Lyrics mesh generator handles long strings with appropriate scaling
+        let (lyrics_verts, lyrics_indices) =
+            generate_glass_lyrics_mesh("THIS IS A VERY LONG TEST LYRIC LINE FOR MOBILE VIEWPORT");
+        assert!(
+            !lyrics_verts.is_empty(),
+            "Glass lyrics vertices must not be empty for long line"
+        );
+        assert!(
+            !lyrics_indices.is_empty(),
+            "Glass lyrics indices must not be empty for long line"
+        );
+
+        const SHADER_COMMON: &str = include_str!("../../../src/shaders/_common.wgsl");
+        const SHADER_GLYPH_FONT: &str = include_str!("../../../src/shaders/_glyph_font.wgsl");
+        let resolve_shader_includes = |source: &str| -> String {
+            source
+                .replace("// INCLUDE: common", SHADER_COMMON)
+                .replace("// INCLUDE: glyph_font", SHADER_GLYPH_FONT)
+        };
+        let rain_resolved =
+            resolve_shader_includes(include_str!("../../../src/shaders/vis_rain.wgsl"));
+        if let Err(e) = wgpu::naga::front::wgsl::parse_str(&rain_resolved) {
+            panic!("vis_rain WGSL error:\n{}", e.emit_to_string(&rain_resolved));
+        }
+
+        let vu_resolved =
+            resolve_shader_includes(include_str!("../../../src/shaders/vis_vumeters_3d.wgsl"));
+        if let Err(e) = wgpu::naga::front::wgsl::parse_str(&vu_resolved) {
+            panic!(
+                "vis_vumeters_3d WGSL error:\n{}",
+                e.emit_to_string(&vu_resolved)
+            );
+        }
+
+        let lyrics_resolved =
+            resolve_shader_includes(include_str!("../../../src/shaders/vis_lyrics.wgsl"));
+        if let Err(e) = wgpu::naga::front::wgsl::parse_str(&lyrics_resolved) {
+            panic!(
+                "vis_lyrics WGSL error:\n{}",
+                e.emit_to_string(&lyrics_resolved)
+            );
+        }
+
+        let crt_scope_resolved =
+            resolve_shader_includes(include_str!("../../../src/shaders/vis_oscilloscope.wgsl"));
+        if let Err(e) = wgpu::naga::front::wgsl::parse_str(&crt_scope_resolved) {
+            panic!(
+                "vis_oscilloscope WGSL error:\n{}",
+                e.emit_to_string(&crt_scope_resolved)
+            );
+        }
+
+        let scope_resolved = resolve_shader_includes(include_str!(
+            "../../../src/shaders/vis_3doscilloscope_raster.wgsl"
+        ));
+        if let Err(e) = wgpu::naga::front::wgsl::parse_str(&scope_resolved) {
+            panic!(
+                "vis_3doscilloscope_raster WGSL error:\n{}",
+                e.emit_to_string(&scope_resolved)
+            );
+        }
+
+        let resynth_resolved =
+            resolve_shader_includes(include_str!("../../../src/shaders/resynth_compute.wgsl"));
+        if let Err(e) = wgpu::naga::front::wgsl::parse_str(&resynth_resolved) {
+            panic!(
+                "resynth_compute WGSL error:\n{}",
+                e.emit_to_string(&resynth_resolved)
+            );
+        }
+
+        let freq_scope_resolved = resolve_shader_includes(include_str!(
+            "../../../src/shaders/vis_3doscilloscope_freq.wgsl"
+        ));
+        if let Err(e) = wgpu::naga::front::wgsl::parse_str(&freq_scope_resolved) {
+            panic!(
+                "vis_3doscilloscope_freq WGSL error:\n{}",
+                e.emit_to_string(&freq_scope_resolved)
+            );
+        }
+        let freq_vis = crate::state::VISUALIZERS
+            .iter()
+            .find(|v| v.id == 4)
+            .expect("Visualizer ID 4 (Strings) must exist");
+        assert_eq!(freq_vis.name, "Strings");
+        assert!(
+            matches!(
+                freq_vis.pipeline_type,
+                crate::state::PipelineType::Mesh3D { .. }
+            ),
+            "Strings visualizer must use PipelineType::Mesh3D"
+        );
+    }
+
+    #[test]
+    fn test_quick_mix_presets_layout() {
+        // Verify that in compact / mobile mode, preset widths and rows never overflow available width
+        let mobile_widths = [280.0_f32, 320.0, 360.0, 400.0];
+        let spacing = 6.0_f32;
+
+        for &width in &mobile_widths {
+            // 2 tracks: 2 buttons per row, 2 rows
+            let row_w = ((width - spacing) / 2.0).max(60.0);
+            let row_total = row_w * 2.0 + spacing;
+            assert!(
+                row_total <= width + 0.01,
+                "Row width {} must fit in available width {}",
+                row_total,
+                width
+            );
+
+            // 4 tracks: Row 1 has 2 buttons, Row 2 has 2 buttons, Row 3 has 2 buttons
+            let chunk_w = ((width - spacing) / 2.0).max(45.0);
+            let chunk_total = chunk_w * 2.0 + spacing;
+            assert!(
+                chunk_total <= width + 0.01,
+                "Chunk width {} must fit in available width {}",
+                chunk_total,
+                width
+            );
+        }
+    }
+
+    #[test]
+    fn test_mobile_audio_info_formatting() {
+        // Verify mobile portrait single-line audio format string e.g. "Audio: AAC/MP4, X-channels, Y bitrate"
+        let format_audio_line = |module_type: &str,
+                                 codec: Option<&str>,
+                                 bitrate: Option<u32>,
+                                 num_channels: usize,
+                                 tracker_channels: Option<usize>,
+                                 hardware_channels: usize|
+         -> (String, String) {
+            let format_name = if let Some(c) = codec {
+                if !c.is_empty() && !module_type.eq_ignore_ascii_case(c) {
+                    format!("{}/{}", c, module_type)
+                } else {
+                    module_type.to_string()
+                }
+            } else {
+                module_type.to_string()
+            };
+
+            let ch_info = if let Some(tc) = tracker_channels {
+                format!("{} hw / {} tracker", hardware_channels, tc)
+            } else if num_channels == 1 {
+                "1-channel".to_string()
+            } else {
+                format!("{}-channels", num_channels)
+            };
+
+            let audio_val = if let Some(br) = bitrate {
+                format!("{}, {}, {} kbps", format_name, ch_info, br)
+            } else {
+                format!("{}, {}", format_name, ch_info)
+            };
+
+            ("Audio:".to_string(), audio_val)
+        };
+
+        // Case 1: AAC in MP4 container with bitrate
+        let (label, val) = format_audio_line("MP4", Some("AAC"), Some(256), 2, None, 2);
+        assert_eq!(label, "Audio:");
+        assert_eq!(val, "AAC/MP4, 2-channels, 256 kbps");
+
+        // Case 2: FLAC, 1-channel with bitrate
+        let (_, val) = format_audio_line("FLAC", Some("FLAC"), Some(98), 1, None, 1);
+        assert_eq!(val, "FLAC, 1-channel, 98 kbps");
+
+        // Case 3: MP3 with bitrate
+        let (_, val) = format_audio_line("MP3", None, Some(320), 2, None, 2);
+        assert_eq!(val, "MP3, 2-channels, 320 kbps");
+
+        // Case 4: Tracker module with hardware/tracker channel breakdown (no bitrate)
+        let (_, val) = format_audio_line("ProTracker MOD", None, None, 4, Some(4), 4);
+        assert_eq!(val, "ProTracker MOD, 4 hw / 4 tracker");
+
+        // Case 5: Composite module_type already containing codec (avoid AAC/AAC/MP4)
+        let format_audio_line_dedup = |module_type: &str,
+                                       codec: Option<&str>,
+                                       bitrate: Option<u32>,
+                                       num_channels: usize|
+         -> String {
+            let format_name = if let Some(c) = codec {
+                if !c.is_empty()
+                    && !module_type
+                        .to_ascii_uppercase()
+                        .contains(&c.to_ascii_uppercase())
+                {
+                    format!("{}/{}", c, module_type)
+                } else {
+                    module_type.to_string()
+                }
+            } else {
+                module_type.to_string()
+            };
+            if let Some(br) = bitrate {
+                format!("{}, {}-channels, {} kbps", format_name, num_channels, br)
+            } else {
+                format!("{}, {}-channels", format_name, num_channels)
+            }
+        };
+        let val = format_audio_line_dedup("AAC/MP4", Some("AAC"), Some(788), 2);
+        assert_eq!(val, "AAC/MP4, 2-channels, 788 kbps");
+
+        // Case 6: When module_type is "AAC" and file extension is "mp4", container is retained
+        let format_audio_with_ext = |format_name: &str, ext: Option<&str>| -> String {
+            if let Some(e) = ext {
+                let ext_upper = e.to_ascii_uppercase();
+                if (ext_upper == "MP4"
+                    || ext_upper == "M4A"
+                    || ext_upper == "MOV"
+                    || ext_upper == "MKV")
+                    && !format_name.to_ascii_uppercase().contains(&ext_upper)
+                {
+                    format!("{}/{}", format_name, ext_upper)
+                } else {
+                    format_name.to_string()
+                }
+            } else {
+                format_name.to_string()
+            }
+        };
+        assert_eq!(format_audio_with_ext("AAC", Some("mp4")), "AAC/MP4");
+        assert_eq!(format_audio_with_ext("AAC/MP4", Some("mp4")), "AAC/MP4");
+    }
+
+    #[test]
+    fn test_artist_unknown_omission() {
+        let should_display_artist = |artist: &str| -> bool {
+            let trimmed = artist.trim();
+            !trimmed.is_empty()
+                && !trimmed.eq_ignore_ascii_case("unknown")
+                && !trimmed.eq_ignore_ascii_case("unknown artist")
+        };
+
+        assert!(!should_display_artist(""));
+        assert!(!should_display_artist("   "));
+        assert!(!should_display_artist("Unknown"));
+        assert!(!should_display_artist("unknown"));
+        assert!(!should_display_artist("UNKNOWN"));
+        assert!(!should_display_artist("Unknown Artist"));
+        assert!(!should_display_artist("  Unknown  "));
+        assert!(should_display_artist("Daft Punk"));
+        assert!(should_display_artist("Aphex Twin"));
+    }
+
+    #[test]
+    fn test_single_open_file_button() {
+        let engine_source = include_str!("engine.rs");
+        // Count occurrences of OPEN FILE button definitions in engine.rs
+        // 1: In the empty state (no file loaded) -> btn_text = ... "OPEN FILE"
+        // 2: In the Track Info header (shared by mobile portrait & desktop) -> "📂 OPEN FILE"
+        // Ensure that render_col_info has the only header button and no duplicates exist
+        let target_needle = format!("{}(\"{}\")", "egui::RichText::new", "📂 OPEN FILE");
+        let rich_open_occurrences = engine_source
+            .lines()
+            .take_while(|l| !l.contains("mod tests"))
+            .filter(|l| l.contains(&target_needle) || l.contains("📂  OPEN FILE"))
+            .count();
+        assert_eq!(
+            rich_open_occurrences, 1,
+            "Expected exactly 1 RichText OPEN FILE button in engine.rs Track Info header, found {}",
+            rich_open_occurrences
+        );
+    }
+
+    #[test]
+    fn test_fire_visualizers_registration() {
+        use std::collections::HashSet;
+
+        // Ensure all visualizer IDs are unique
+        let mut ids = HashSet::new();
+        for v in crate::state::VISUALIZERS {
+            assert!(ids.insert(v.id), "Duplicate visualizer ID found: {}", v.id);
+        }
+
+        // Verify Retro Fire (ID 5)
+        let retro_fire = crate::state::VISUALIZERS
+            .iter()
+            .find(|v| v.id == 5)
+            .expect("Visualizer ID 5 (Retro Fire) must be registered in VISUALIZERS");
+        assert_eq!(retro_fire.name, "Retro Fire");
+        assert_eq!(retro_fire.filename, "vis_flame.wgsl");
+        assert!(retro_fire.requires_fire, "Retro Fire requires fire compute");
+
+        // Verify Fire Simulation (ID 6)
+        let firesim = crate::state::VISUALIZERS
+            .iter()
+            .find(|v| v.id == 6)
+            .expect("Visualizer ID 6 (Fire Simulation) must be registered in VISUALIZERS");
+        assert_eq!(firesim.name, "Fire Simulation");
+        assert_eq!(firesim.filename, "vis_firesim.wgsl");
+
+        // Verify ID 26 (DOOM Fire) is removed
+        assert!(
+            crate::state::VISUALIZERS.iter().all(|v| v.id != 26),
+            "ID 26 should no longer exist"
+        );
+
+        // Verify default enablement states in AppState
+        let state = crate::state::AppState::new("Test App".to_string());
+        let retro_fire_idx = crate::state::VISUALIZERS
+            .iter()
+            .position(|v| v.id == 5)
+            .unwrap();
+        let firesim_idx = crate::state::VISUALIZERS
+            .iter()
+            .position(|v| v.id == 6)
+            .unwrap();
+        assert!(
+            state.vis_enabled[retro_fire_idx],
+            "Retro Fire should be enabled by default"
+        );
+        assert!(
+            !state.vis_enabled[firesim_idx],
+            "Fire Simulation should be disabled by default"
+        );
+
+        // Verify vis_flame.wgsl contains DOOM palette and CRT post-processing
+        let flame_source = include_str!("../../../src/shaders/vis_flame.wgsl");
+        assert!(flame_source.contains("doom_palette"));
+        assert!(flame_source.contains("apply_crt_effects"));
+    }
+
+    #[test]
+    fn test_progress_fire_decay_when_stopped() {
+        let mut state = crate::state::AppState::new("Test App".to_string());
+        state.file_loaded = true;
+        state.is_paused = false;
+        state.track_ended = false;
+
+        let mut fire_intensity = 0.0f32;
+        let dt = 1.0f32 / 60.0f32;
+
+        // 1. When playing, fire should ramp up to 1.0
+        for _ in 0..60 {
+            fire_intensity = VulkanEngine::step_fire_intensity(fire_intensity, &state, dt);
+        }
+        assert!(
+            (fire_intensity - 1.0).abs() < 1e-4,
+            "Fire should be fully ignited (1.0) while playing"
+        );
+
+        // 2. Pause playback -> fire intensity should decay down to 0.0
+        state.is_paused = true;
+        for _ in 0..60 {
+            fire_intensity = VulkanEngine::step_fire_intensity(fire_intensity, &state, dt);
+        }
+        assert_eq!(
+            fire_intensity, 0.0,
+            "Fire intensity should die off completely (0.0) when paused"
+        );
+
+        // 3. Track ended -> fire intensity should die off
+        state.is_paused = false;
+        state.track_ended = true;
+        fire_intensity = 0.8;
+        for _ in 0..60 {
+            fire_intensity = VulkanEngine::step_fire_intensity(fire_intensity, &state, dt);
+        }
+        assert_eq!(
+            fire_intensity, 0.0,
+            "Fire intensity should die off completely (0.0) when track ended"
+        );
+
+        // 4. End of song reached (current_seconds >= duration_seconds) -> fire intensity should die off
+        state.track_ended = false;
+        state.duration_seconds = 180.0;
+        state.current_seconds = 180.0;
+        fire_intensity = 0.9;
+        for _ in 0..60 {
+            fire_intensity = VulkanEngine::step_fire_intensity(fire_intensity, &state, dt);
+        }
+        assert_eq!(
+            fire_intensity, 0.0,
+            "Fire intensity should die off completely (0.0) when end of song is reached"
+        );
+    }
+
+    #[test]
+    fn test_retro_fire_audio_reactivity() {
+        let mut state = crate::state::AppState::new("Test App".to_string());
+        state.file_loaded = true;
+        state.is_paused = false;
+        state.track_ended = false;
+
+        const W: usize = 320;
+        const H: usize = 180;
+        let mut cells = [0u8; W * H];
+        let mut rng = 0x12345678u32;
+
+        // 1. In silence / quiet passages: hearth is low embers (< 18), flames stay in bottom region
+        state.spectrum_data = vec![0.0; 1024];
+        state.channel_vus = vec![0.0; 2];
+        for _ in 0..40 {
+            VulkanEngine::update_retro_fire_grid(&mut cells, &mut rng, 1.0, &state);
+        }
+
+        let bottom_row = (H - 1) * W;
+        let mut quiet_hearth_sum = 0u32;
+        for x in 0..W {
+            quiet_hearth_sum += cells[bottom_row + x] as u32;
+        }
+        let quiet_hearth_avg = quiet_hearth_sum as f32 / W as f32;
+        assert!(
+            quiet_hearth_avg <= 18.0,
+            "Quiet hearth should be low embers (<= 18), got average {:.2}",
+            quiet_hearth_avg
+        );
+
+        // In quiet passages, flames must not reach upper half of the screen
+        let upper_heat_count: usize = cells[..90 * W].iter().filter(|&&c| c > 0).count();
+        assert_eq!(
+            upper_heat_count, 0,
+            "Quiet audio should not produce flames in upper half of screen"
+        );
+
+        // 2. On a loud bass kick: center bass columns (x in 140..180) erupt to white-hot (>= 34),
+        // and full-spectrum chorus drives the entire hearth to white-hot (>= 33)
+        for i in 1..16 {
+            state.spectrum_data[i] = 90.0; // Heavy bass transient
+        }
+        state.channel_vus = vec![1.0; 2];
+        for _ in 0..60 {
+            VulkanEngine::update_retro_fire_grid(&mut cells, &mut rng, 1.0, &state);
+        }
+
+        let mut bass_col_sum = 0u32;
+        let mut loud_hearth_sum = 0u32;
+        for x in 0..W {
+            let heat = cells[bottom_row + x] as u32;
+            loud_hearth_sum += heat;
+            if (150..170).contains(&x) {
+                bass_col_sum += heat;
+            }
+        }
+        let bass_col_avg = bass_col_sum as f32 / 20.0;
+        let loud_hearth_avg = loud_hearth_sum as f32 / W as f32;
+        assert!(
+            bass_col_avg >= 34.0,
+            "Center bass columns should be incandescent white-hot (>= 34), got average {:.2}",
+            bass_col_avg
+        );
+        assert!(
+            loud_hearth_avg >= 25.0,
+            "Overall hearth on loud beat should be >= 25.0 (quiet was {:.2}), got average {:.2}",
+            quiet_hearth_avg,
+            loud_hearth_avg
+        );
+
+        // Now test full-spectrum chorus
+        state.spectrum_data.fill(70.0);
+        for _ in 0..60 {
+            VulkanEngine::update_retro_fire_grid(&mut cells, &mut rng, 1.0, &state);
+        }
+        let full_hearth_sum: u32 = (0..W).map(|x| cells[bottom_row + x] as u32).sum();
+        let full_hearth_avg = full_hearth_sum as f32 / W as f32;
+        assert!(
+            full_hearth_avg >= 33.0,
+            "Full spectrum chorus hearth should be white-hot (>= 33), got average {:.2}",
+            full_hearth_avg
+        );
+
+        // Flames must now reach into the upper half of screen
+        let loud_upper_heat_count: usize = cells[..90 * W].iter().filter(|&&c| c > 0).count();
+        assert!(
+            loud_upper_heat_count > 100,
+            "Loud beat should push flames well into the upper half of screen, got {} pixels",
+            loud_upper_heat_count
+        );
+
+        // 3. Stereo channel symmetry: balanced stereo must be symmetric across left/right
+        state.tracker_channels = None;
+        state.channel_vus = vec![0.8, 0.8];
+        for _ in 0..60 {
+            VulkanEngine::update_retro_fire_grid(&mut cells, &mut rng, 1.0, &state);
+        }
+        let mut left_half_sum = 0u32;
+        let mut right_half_sum = 0u32;
+        for y in 0..H {
+            for x in 0..160 {
+                left_half_sum += cells[y * W + x] as u32;
+            }
+            for x in 160..320 {
+                right_half_sum += cells[y * W + x] as u32;
+            }
+        }
+        let lr_ratio = right_half_sum as f32 / left_half_sum.max(1) as f32;
+        assert!(
+            (lr_ratio - 1.0).abs() < 0.05,
+            "Balanced stereo must produce symmetric left/right fire energy within 5%, got ratio {:.3} (left: {}, right: {})",
+            lr_ratio,
+            left_half_sum,
+            right_half_sum
+        );
+
+        // 4. Stereo panning responsiveness: Left-heavy vs Right-heavy
+        state.channel_vus = vec![1.0, 0.1];
+        for _ in 0..60 {
+            VulkanEngine::update_retro_fire_grid(&mut cells, &mut rng, 1.0, &state);
+        }
+        let left_heavy_l: u32 = (0..H)
+            .flat_map(|y| (0..160).map(move |x| cells[y * W + x] as u32))
+            .sum();
+        let left_heavy_r: u32 = (0..H)
+            .flat_map(|y| (160..320).map(move |x| cells[y * W + x] as u32))
+            .sum();
+        assert!(
+            left_heavy_l > left_heavy_r,
+            "Left-panned audio should have more heat on left half (L: {}, R: {})",
+            left_heavy_l,
+            left_heavy_r
+        );
+
+        // 5. Tracker channel separation: Active Track 1 vs Silent Track 2
+        state.tracker_channels = Some(4);
+        state.spectrum_data = vec![0.0; 1024];
+        // [Left_peak, Track1, Track2, Track3, Track4, Right_peak]
+        state.channel_vus = vec![0.5, 1.0, 0.0, 0.8, 0.0, 0.5];
+        for _ in 0..50 {
+            VulkanEngine::update_retro_fire_grid(&mut cells, &mut rng, 1.0, &state);
+        }
+
+        // Track 1 column band: x in 0..80. Track 2 column band: x in 80..160
+        let mut track1_heat = 0u32;
+        let mut track2_heat = 0u32;
+        for y in 0..H {
+            for x in 0..80 {
+                track1_heat += cells[y * W + x] as u32;
+            }
+            for x in 80..160 {
+                track2_heat += cells[y * W + x] as u32;
+            }
+        }
+        assert!(
+            track1_heat > track2_heat * 2,
+            "Active tracker channel should have vastly higher energy than silent channel (Track1: {}, Track2: {})",
+            track1_heat,
+            track2_heat
+        );
+
+        // 6. Decay to zero when stopped
+        for _ in 0..50 {
+            VulkanEngine::update_retro_fire_grid(&mut cells, &mut rng, 0.0, &state);
+        }
+        let remaining_heat: u32 = cells.iter().map(|&c| c as u32).sum();
+        assert_eq!(
+            remaining_heat, 0,
+            "Cells should completely decay to 0 when stopped"
+        );
+    }
+
+    #[test]
+    fn test_windows_installer_icon_registration() {
+        let iss_content = std::fs::read_to_string(workspace_path("installer.iss"))
+            .expect("installer.iss must exist");
+        let build_rs =
+            std::fs::read_to_string(workspace_path("build.rs")).expect("build.rs must exist");
+
+        // Ensure build.rs explicitly links resource.o / resource.lib into the rusttracker binary
+        // so that [lib] in Cargo.toml does not cause the linker to discard the .rsrc section.
+        assert!(
+            build_rs.contains("cargo:rustc-link-arg-bin=rusttracker={}/resource.o"),
+            "build.rs must link resource.o directly into rusttracker.exe on GNU targets"
+        );
+        assert!(
+            build_rs.contains("cargo:rustc-link-arg-bin=rusttracker={}/resource.lib"),
+            "build.rs must link resource.lib directly into rusttracker.exe on MSVC targets"
+        );
+
+        // Ensure no unquoted or raw .ico,0 references exist (Windows ExtractIconEx fails with .ico,0)
+        assert!(
+            !iss_content.contains("{app}\\icon.ico,0"),
+            "installer.iss must not reference icon.ico,0 as Windows shell requires PE resource indexing on .exe"
+        );
+
+        // Ensure ApplicationIcon is registered for the modern Windows 10/11 'Open with' menu
+        assert!(
+            iss_content.contains(r#"Root: HKA; Subkey: "Software\Classes\Applications\rusttracker.exe"; ValueType: string; ValueName: "ApplicationIcon"; ValueData: """{app}\rusttracker.exe"",0""#),
+            "installer.iss must register ApplicationIcon under Software\\Classes\\Applications\\rusttracker.exe"
+        );
+
+        // Ensure DefaultIcon points to the PE resource in rusttracker.exe with quotes
+        assert!(
+            iss_content.contains(r#"Root: HKA; Subkey: "Software\Classes\Applications\rusttracker.exe\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: """{app}\rusttracker.exe"",0""#),
+            "installer.iss must register DefaultIcon under Software\\Classes\\Applications\\rusttracker.exe\\DefaultIcon"
+        );
+
+        // Ensure App Paths is registered so Windows 11 Open With / AssocQueryString resolves rusttracker.exe
+        assert!(
+            iss_content.contains(r#"Root: HKA; Subkey: "Software\Microsoft\Windows\CurrentVersion\App Paths\rusttracker.exe"; ValueType: string; ValueName: ""; ValueData: "{app}\rusttracker.exe""#),
+            "installer.iss must register App Paths\\rusttracker.exe"
+        );
+
+        // Ensure file association ProgIDs have correct quoted executable icon references and Application\ApplicationIcon for Windows 11 OpenWithProgids
+        assert!(
+            iss_content.contains(r#"Root: HKA; Subkey: "Software\Classes\RustTracker.AudioFile\DefaultIcon"; ValueType: string; ValueName: ""; ValueData: """{app}\rusttracker.exe"",0""#),
+            "RustTracker.AudioFile must use quoted rusttracker.exe,0 DefaultIcon"
+        );
+        assert!(
+            iss_content.contains(r#"Root: HKA; Subkey: "Software\Classes\RustTracker.AudioFile\Application"; ValueType: string; ValueName: "ApplicationIcon"; ValueData: """{app}\rusttracker.exe"",0""#),
+            "RustTracker.AudioFile must register Application\\ApplicationIcon for Windows 11 Open With menu"
+        );
+    }
+
+    #[test]
+    fn test_bitstream_state_reset_on_stream_change() {
+        let mut state = crate::state::AppState::new("Test App".to_string());
+
+        // Simulate bitstream playback active
+        state.stats.bitstream_active = true;
+        state.stats.audio_buffer_fill_pct = 78.5;
+        state.stats.video_buffer_fill_pct = 62.0;
+        state.stats.video_fps = 59.94;
+        state.stats.video_bitrate_kbps = Some(15000);
+        state.stats.audio_bitrate_kbps = Some(768);
+        state.track_ended = false;
+        assert!(state.stats.bitstream_active);
+        assert_eq!(state.stats.audio_buffer_fill_pct, 78.5);
+        assert_eq!(state.stats.video_fps, 59.94);
+        assert_eq!(state.stats.video_bitrate_kbps, Some(15000));
+        assert_eq!(state.stats.audio_bitrate_kbps, Some(768));
+
+        // Simulate stream drop / transition logic from main.rs
+        state.video_frame_rx = None;
+        state.free_video_frame_tx = None;
+        state.video_mode = 0;
+        state.stats.bitstream_active = false;
+        state.stats.audio_buffer_fill_pct = 0.0;
+        state.stats.video_buffer_fill_pct = 0.0;
+        state.stats.video_hw_decoder.clear();
+        state.stats.video_fps = 0.0;
+        state.stats.video_bitrate_kbps = None;
+        state.stats.audio_bitrate_kbps = None;
+        state.track_ended = false;
+
+        assert!(
+            !state.stats.bitstream_active,
+            "bitstream_active must be false after dropping stream"
+        );
+        assert_eq!(
+            state.stats.audio_buffer_fill_pct, 0.0,
+            "audio_buffer_fill_pct must be 0 after dropping stream"
+        );
+        assert_eq!(
+            state.stats.video_buffer_fill_pct, 0.0,
+            "video_buffer_fill_pct must be 0 after dropping stream"
+        );
+        assert_eq!(
+            state.stats.video_fps, 0.0,
+            "video_fps must be 0 after dropping stream"
+        );
+        assert!(
+            state.stats.video_bitrate_kbps.is_none(),
+            "video_bitrate_kbps must be None after dropping stream"
+        );
+        assert!(
+            state.stats.audio_bitrate_kbps.is_none(),
+            "audio_bitrate_kbps must be None after dropping stream"
+        );
+    }
+
+    #[test]
+    fn test_push_planar_lookahead_slices_timestamps() {
+        let mut state = crate::state::AppState::new("Test App".to_string());
+        let sample_rate = 48000;
+        let samples = vec![0.5f32; 48000]; // 1 second of audio
+        let channels = vec![samples.clone(), samples];
+        let current_seconds = 12.5;
+
+        crate::audio::push_planar_lookahead_slices(
+            &mut state,
+            &channels,
+            sample_rate,
+            current_seconds,
+        );
+
+        assert!(
+            !state.lookahead_queue.is_empty(),
+            "Queue must contain slices"
+        );
+        let (first_t, _) = state.lookahead_queue.front().unwrap();
+        let (last_t, _) = state.lookahead_queue.back().unwrap();
+
+        assert!(
+            *first_t >= current_seconds,
+            "First slice timestamp ({}) must start at or after current_seconds ({})",
+            first_t,
+            current_seconds
+        );
+        assert!(
+            *last_t > *first_t,
+            "Last slice timestamp ({}) must be ahead of first slice timestamp ({})",
+            last_t,
+            first_t
+        );
+        assert!(
+            (*last_t - current_seconds) >= 0.9,
+            "Lookahead span should extend ~1s into the future"
+        );
+    }
+
+    #[test]
+    fn test_lookahead_timeline_continuity_and_synthesis() {
+        let mut state = crate::state::AppState::new("Test App".to_string());
+        state.lookahead_timeline = vec![0.0; 600 * 8];
+
+        // Part 1: Full 7-second decoded lookahead buffer (normal playback)
+        for i in 0..700 {
+            let t = 5.0 + (i as f64 * 0.01);
+            let s = (i as f32 * 0.05).sin() * 0.4;
+            state.lookahead_queue.push_back((
+                t,
+                [-s.abs(), s.abs(), -s.abs(), s.abs(), 0.35, 0.35, 0.5, 0.5],
+            ));
+        }
+
+        let cur_t = 6.0;
+        let q_len = state.lookahead_queue.len();
+        let (t_first, d_first) = state.lookahead_queue[0];
+        let (t_last, d_last) = state.lookahead_queue[q_len - 1];
+
+        for k in 0..600 {
+            let target_t = cur_t + (k as f64 - 100.0) * 0.01;
+            let off = k * 8;
+
+            if target_t < t_first {
+                let fade = (1.0 - ((t_first - target_t) / 0.5)).max(0.0) as f32;
+                for (c, val) in d_first.iter().enumerate() {
+                    state.lookahead_timeline[off + c] = *val * fade;
+                }
+            } else if target_t > t_last {
+                let fade = (1.0 - ((target_t - t_last) / 0.5)).max(0.0) as f32;
+                for (c, val) in d_last.iter().enumerate() {
+                    state.lookahead_timeline[off + c] = *val * fade;
+                }
+            } else {
+                let idx = match state.lookahead_queue.binary_search_by(|(t, _)| {
+                    t.partial_cmp(&target_t)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                }) {
+                    Ok(i) => i,
+                    Err(i) => i,
+                };
+
+                if idx == 0 {
+                    state.lookahead_timeline[off..off + 8].copy_from_slice(&d_first);
+                } else if idx >= q_len {
+                    state.lookahead_timeline[off..off + 8].copy_from_slice(&d_last);
+                } else {
+                    let (t0, d0) = state.lookahead_queue[idx - 1];
+                    let (t1, d1) = state.lookahead_queue[idx];
+                    let dt = t1 - t0;
+                    if dt > 0.0001 && dt < 1.0 && target_t >= t0 && target_t <= t1 {
+                        let frac = ((target_t - t0) / dt).clamp(0.0, 1.0) as f32;
+                        for c in 0..8 {
+                            state.lookahead_timeline[off + c] = d0[c] * (1.0 - frac) + d1[c] * frac;
+                        }
+                    } else {
+                        state.lookahead_timeline[off..off + 8].copy_from_slice(&d0);
+                    }
+                }
+            }
+        }
+
+        // Verify that lookahead is continuous with NO step discontinuities / banding across adjacent slices
+        for k in 0..599 {
+            let off0 = k * 8;
+            let off1 = (k + 1) * 8;
+            let max0 = state.lookahead_timeline[off0 + 1];
+            let max1 = state.lookahead_timeline[off1 + 1];
+            let diff = (max1 - max0).abs();
+            assert!(
+                diff < 0.05,
+                "Adjacent slices {} and {} must be continuous (diff: {})",
+                k,
+                k + 1,
+                diff
+            );
+        }
+
+        // Part 2: Fallback synthesis when queue is empty
+        state.lookahead_queue.clear();
+        state.raw_waveform = vec![0.5; 512];
+        state.raw_channel_vus = vec![0.7, 0.7];
+
+        let wave_len = state.raw_waveform.len();
+        let vu_l = state
+            .raw_channel_vus
+            .first()
+            .copied()
+            .unwrap_or(0.2)
+            .clamp(0.05, 1.0);
+        let vu_r = state
+            .raw_channel_vus
+            .get(1)
+            .copied()
+            .unwrap_or(vu_l)
+            .clamp(0.05, 1.0);
+        for k in 0..600 {
+            let off = k * 8;
+            let wave_idx = (k * 13) % wave_len;
+            let sample = state.raw_waveform[wave_idx].clamp(-1.0, 1.0);
+            let sample_next = state.raw_waveform[(wave_idx + 1) % wave_len].clamp(-1.0, 1.0);
+            let min_s = sample.min(sample_next).min(0.0) * vu_l;
+            let max_s = sample.max(sample_next).max(0.0) * vu_l;
+            let min_r = sample.min(sample_next).min(0.0) * vu_r;
+            let max_r = sample.max(sample_next).max(0.0) * vu_r;
+            let rms = (sample.abs() * 0.7 + 0.3 * (vu_l + vu_r) * 0.5).min(1.0);
+            state.lookahead_timeline[off] = min_s;
+            state.lookahead_timeline[off + 1] = max_s;
+            state.lookahead_timeline[off + 2] = min_r;
+            state.lookahead_timeline[off + 3] = max_r;
+            state.lookahead_timeline[off + 4] = rms;
+            state.lookahead_timeline[off + 5] = rms;
+            state.lookahead_timeline[off + 6] = vu_l;
+            state.lookahead_timeline[off + 7] = vu_r;
+        }
+
+        for k in 0..600 {
+            let off = k * 8;
+            let max_s = state.lookahead_timeline[off + 1];
+            let rms = state.lookahead_timeline[off + 4];
+            assert!(max_s > 0.0, "Fallback slice {} max_s should be positive", k);
+            assert!(rms > 0.0, "Fallback slice {} rms should be non-zero", k);
+        }
+    }
+
+    #[test]
+    fn test_open_file_button_theme_colors() {
+        let engine_code = std::fs::read_to_string(workspace_path("crates/rt-render/src/engine.rs"))
+            .expect("crates/rt-render/src/engine.rs must exist");
+        let prod_code = engine_code
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or(&engine_code);
+
+        // Assert no old cyan/blue button colors in empty state or header button
+        assert!(
+            !prod_code.contains("Color32::from_rgb(0, 150, 220)"),
+            "Button must not use cyan/blue fill color"
+        );
+        assert!(
+            !prod_code.contains("Color32::from_rgb(0, 185, 255)"),
+            "Button must not use bright blue hover fill color"
+        );
+        assert!(
+            !prod_code.contains("Color32::from_rgb(100, 220, 255)"),
+            "Button must not use cyan stroke color"
+        );
+
+        // Assert signature orange/amber theme colors are present
+        assert!(
+            prod_code.contains("Color32::from_rgb(205, 95, 0)"),
+            "Button must use theme amber/orange fill color"
+        );
+        assert!(
+            prod_code.contains("Color32::from_rgb(255, 145, 30)"),
+            "Button must use theme orange stroke color"
+        );
+    }
+
+    #[test]
+    fn test_macos_bundle_and_entitlements_config() {
+        let macos_yml = std::fs::read_to_string(workspace_path(".github/workflows/macos.yml"))
+            .expect(".github/workflows/macos.yml must exist")
+            .replace("\r\n", "\n");
+        let entitlements = std::fs::read_to_string(workspace_path("entitlements.plist"))
+            .expect("entitlements.plist must exist");
+
+        // Verify required microphone & library entitlements are present
+        assert!(
+            entitlements.contains("com.apple.security.device.audio-input"),
+            "entitlements.plist must request audio-input for --mic support"
+        );
+        assert!(
+            entitlements.contains("com.apple.security.cs.disable-library-validation"),
+            "entitlements.plist must allow loading bundled Homebrew dylibs"
+        );
+
+        // Verify both Developer ID and ad-hoc signing pass --entitlements entitlements.plist
+        assert!(
+            macos_yml.contains(
+                "codesign --force --entitlements entitlements.plist --sign - RustTracker.app/Contents/MacOS/rusttracker"
+            ),
+            "Ad-hoc signing must embed entitlements.plist on the main executable"
+        );
+        assert!(
+            macos_yml.contains(
+                "codesign --force --entitlements entitlements.plist --sign - RustTracker.app"
+            ),
+            "Ad-hoc signing must embed entitlements.plist on the app bundle"
+        );
+
+        // Verify minimum macOS version matches Apple Silicon baseline (11.0)
+        assert!(
+            macos_yml
+                .contains("<key>LSMinimumSystemVersion</key>\n              <string>11.0</string>"),
+            "Info.plist LSMinimumSystemVersion must be 11.0 for Apple Silicon builds"
+        );
+
+        // Verify every extension in FILE_DIALOG_EXTENSIONS is registered in Info.plist CFBundleDocumentTypes
+        for ext in crate::playlist::FILE_DIALOG_EXTENSIONS {
+            let tag = format!("<string>{}</string>", ext);
+            assert!(
+                macos_yml.contains(&tag),
+                "macOS Info.plist CFBundleDocumentTypes is missing extension: {}",
+                ext
+            );
+        }
+    }
+
+    #[test]
+    fn test_app_default_grey_background_invariants() {
+        // 1. Verify the canonical application default grey clear color constant
+        assert_eq!(
+            APP_DEFAULT_BG_CLEAR_COLOR,
+            wgpu::Color {
+                r: 0.1,
+                g: 0.1,
+                b: 0.1,
+                a: 1.0,
+            },
+            "APP_DEFAULT_BG_CLEAR_COLOR must remain (0.1, 0.1, 0.1, 1.0) so the HUD/UI panel background stays default grey"
+        );
+
+        let engine_code = std::fs::read_to_string(workspace_path("crates/rt-render/src/engine.rs"))
+            .expect("crates/rt-render/src/engine.rs must exist");
+        let prod_code = engine_code
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or(&engine_code);
+
+        // 2. Main Render Pass must clear to APP_DEFAULT_BG_CLEAR_COLOR and never inline a custom wgpu::Color
+        assert!(
+            prod_code.contains("load: wgpu::LoadOp::Clear(APP_DEFAULT_BG_CLEAR_COLOR)"),
+            "Main Render Pass must clear using APP_DEFAULT_BG_CLEAR_COLOR"
+        );
+        assert!(
+            !prod_code.contains("LoadOp::Clear(wgpu::Color"),
+            "Main Render Pass must not override APP_DEFAULT_BG_CLEAR_COLOR with an inline wgpu::Color"
+        );
+    }
+
+    #[test]
+    fn test_visualizer_curation_and_glass_water_overhaul() {
+        // 1. Verify retired visualizers 8 (Spatial Vectors), 9 (Chrome Ferrofluid), and 10 (Ferrofluid Particle Sim) are removed
+        for retired_id in [8u32, 9, 10] {
+            assert!(
+                crate::state::VISUALIZERS.iter().all(|v| v.id != retired_id),
+                "Visualizer ID {} must be removed from VISUALIZERS",
+                retired_id
+            );
+        }
+
+        // 2. Verify Acoustic Glass Water Chamber (ID 28) remains registered and honestly analytic
+        let glass_water = crate::state::VISUALIZERS
+            .iter()
+            .find(|v| v.id == 28)
+            .expect("Visualizer ID 28 (Acoustic Glass Water Chamber) must be registered");
+        assert_eq!(glass_water.filename, "vis_glass_water.wgsl");
+        assert!(!glass_water.requires_flip_water);
+
+        // 3. Validate WGSL compilation and key optical/analytic wave features of vis_glass_water.wgsl
+        const SHADER_COMMON: &str = include_str!("../../../src/shaders/_common.wgsl");
+        let glass_src = include_str!("../../../src/shaders/vis_glass_water.wgsl")
+            .replace("// INCLUDE: common", SHADER_COMMON);
+        if let Err(e) = wgpu::naga::front::wgsl::parse_str(&glass_src) {
+            panic!(
+                "vis_glass_water.wgsl WGSL parse error:\n{}",
+                e.emit_to_string(&glass_src)
+            );
+        }
+        assert!(!glass_src.contains("eval_cylinder_wall_glass"));
+        assert!(glass_src.contains("eval_studio_reflection"));
+        assert!(glass_src.contains("sample_macro_acoustic_energy"));
+
+        // 4. Validate WGSL parsing for all optimized visualizers (Tape Head, LED Spectrum, Canyon, Neon Room, Synthwave, Biolum, Ferrofluid)
+        const SHADER_GLYPH_FONT: &str = include_str!("../../../src/shaders/_glyph_font.wgsl");
+        for (name, raw_src) in [
+            (
+                "vis_tape_head.wgsl",
+                include_str!("../../../src/shaders/vis_tape_head.wgsl"),
+            ),
+            (
+                "vis_spectrum_led.wgsl",
+                include_str!("../../../src/shaders/vis_spectrum_led.wgsl"),
+            ),
+            (
+                "vis_spectrum_canyon.wgsl",
+                include_str!("../../../src/shaders/vis_spectrum_canyon.wgsl"),
+            ),
+            (
+                "vis_neon_room.wgsl",
+                include_str!("../../../src/shaders/vis_neon_room.wgsl"),
+            ),
+            (
+                "vis_synthwave.wgsl",
+                include_str!("../../../src/shaders/vis_synthwave.wgsl"),
+            ),
+            (
+                "vis_synthwave_racer_3d.wgsl",
+                include_str!("../../../src/shaders/vis_synthwave_racer_3d.wgsl"),
+            ),
+            (
+                "vis_synthwave_racer_sky.wgsl",
+                include_str!("../../../src/shaders/vis_synthwave_racer_sky.wgsl"),
+            ),
+            (
+                "vis_bioluminescence.wgsl",
+                include_str!("../../../src/shaders/vis_bioluminescence.wgsl"),
+            ),
+            (
+                "biolum_compute.wgsl",
+                include_str!("../../../src/shaders/biolum_compute.wgsl"),
+            ),
+            (
+                "vis_flip_ferrofluid.wgsl",
+                include_str!("../../../src/shaders/vis_flip_ferrofluid.wgsl"),
+            ),
+            (
+                "flip_ferrofluid_compute.wgsl",
+                include_str!("../../../src/shaders/flip_ferrofluid_compute.wgsl"),
+            ),
+            (
+                "vis_vumeters_bg.wgsl",
+                include_str!("../../../src/shaders/vis_vumeters_bg.wgsl"),
+            ),
+        ] {
+            let resolved = raw_src
+                .replace("// INCLUDE: common", SHADER_COMMON)
+                .replace("// INCLUDE: glyph_font", SHADER_GLYPH_FONT);
+            if let Err(e) = wgpu::naga::front::wgsl::parse_str(&resolved) {
+                panic!(
+                    "{} WGSL parse error:\n{}",
+                    name,
+                    e.emit_to_string(&resolved)
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_hardware_capability_tier_and_vsync_stats_panel() {
+        use crate::state::{GpuCapabilityTier, VISUALIZERS, classify_gpu_capability};
+
+        // 1. Verify crates/rt-core/src/state.rs contains zero OS-based (`target_os = "android"`) visualizer exclusions
+        let state_code = std::fs::read_to_string(workspace_path("crates/rt-core/src/state.rs"))
+            .expect("crates/rt-core/src/state.rs must exist");
+        assert!(
+            !state_code.contains("target_os = \"android\""),
+            "Visualizers must never be disabled based on target_os = \"android\""
+        );
+        assert_eq!(
+            VISUALIZERS.len(),
+            19,
+            "All 19 visualizers must be compiled on every platform"
+        );
+
+        let make_adapter = |name: &str, device_type: wgpu::DeviceType| wgpu::AdapterInfo {
+            name: name.to_string(),
+            vendor: 0,
+            device: 0,
+            device_type,
+            device_pci_bus_id: String::new(),
+            driver: String::new(),
+            driver_info: String::new(),
+            backend: wgpu::Backend::Vulkan,
+            subgroup_min_size: 32,
+            subgroup_max_size: 64,
+            transient_saves_memory: false,
+        };
+
+        // 2. Flagship Android phone GPUs and discrete desktop GPUs -> GpuCapabilityTier::High
+        for (gpu_name, dev_type, w, h) in [
+            (
+                "Adreno (TM) 740",
+                wgpu::DeviceType::IntegratedGpu,
+                3088,
+                1440,
+            ),
+            (
+                "Adreno (TM) 750",
+                wgpu::DeviceType::IntegratedGpu,
+                3120,
+                1440,
+            ),
+            (
+                "Adreno (TM) 830",
+                wgpu::DeviceType::IntegratedGpu,
+                3200,
+                1440,
+            ),
+            (
+                "Immortalis-G720 MC12",
+                wgpu::DeviceType::IntegratedGpu,
+                2800,
+                1260,
+            ),
+            (
+                "Samsung Xclipse 940",
+                wgpu::DeviceType::IntegratedGpu,
+                3120,
+                1440,
+            ),
+            ("Apple M3 Max", wgpu::DeviceType::IntegratedGpu, 3456, 2234),
+            (
+                "AMD Radeon AI PRO R9700",
+                wgpu::DeviceType::DiscreteGpu,
+                3840,
+                2160,
+            ),
+        ] {
+            let info = make_adapter(gpu_name, dev_type);
+            assert_eq!(
+                classify_gpu_capability(&info, w * h),
+                GpuCapabilityTier::High,
+                "{} should classify as High capability tier",
+                gpu_name
+            );
+            let mut state = AppState::new("Test".to_string());
+            state.apply_gpu_capability_profile(&info, w, h);
+            assert_eq!(state.gpu_capability_tier, GpuCapabilityTier::High);
+            for (idx, v) in VISUALIZERS.iter().enumerate() {
+                if !matches!(v.id, 6 | 7 | 23) {
+                    assert!(
+                        state.vis_enabled[idx],
+                        "Visualizer {} ({}) must remain enabled on High-tier GPU {}",
+                        v.id, v.name, gpu_name
+                    );
+                }
+            }
+        }
+
+        // 3. Constrained GPUs (Pixel Tablet Mali-G710 @ 2560x1600, mid-range Adreno 640, Steam Deck APU) -> Constrained
+        for (gpu_name, dev_type, w, h) in [
+            ("Mali-G710", wgpu::DeviceType::IntegratedGpu, 2560, 1600),
+            (
+                "Adreno (TM) 640",
+                wgpu::DeviceType::IntegratedGpu,
+                2400,
+                1080,
+            ),
+            (
+                "AMD Custom GPU 0405 (RADV VANGOGH)",
+                wgpu::DeviceType::IntegratedGpu,
+                1280,
+                800,
+            ),
+            (
+                "llvmpipe (LLVM 19.1.0, 256 bits)",
+                wgpu::DeviceType::Cpu,
+                1920,
+                1080,
+            ),
+        ] {
+            let info = make_adapter(gpu_name, dev_type);
+            assert_eq!(
+                classify_gpu_capability(&info, w * h),
+                GpuCapabilityTier::Constrained,
+                "{} should classify as Constrained capability tier",
+                gpu_name
+            );
+            let mut state = AppState::new("Test".to_string());
+            state.apply_gpu_capability_profile(&info, w, h);
+            assert_eq!(state.gpu_capability_tier, GpuCapabilityTier::Constrained);
+            for (idx, v) in VISUALIZERS.iter().enumerate() {
+                if v.heavy_shader {
+                    assert!(
+                        !state.vis_enabled[idx],
+                        "Heavy shader visualizer {} ({}) should default to unchecked on Constrained GPU {}",
+                        v.id, v.name, gpu_name
+                    );
+                } else {
+                    assert!(
+                        state.vis_enabled[idx],
+                        "Standard visualizer {} ({}) must remain enabled on Constrained GPU {}",
+                        v.id, v.name, gpu_name
+                    );
+                }
+            }
+        }
+
+        // 4. Runtime Frame-Budget Watchdog auto-disables non-overridden heavy shader if < 85% VSync FPS
+        let mut state = AppState::new("Watchdog Test".to_string());
+        state.file_loaded = true;
+        state.is_paused = false;
+        let heavy_idx = VISUALIZERS
+            .iter()
+            .position(|v| v.id == 28)
+            .expect("ID 28 must exist");
+        state.current_visualizer_idx = heavy_idx;
+        state.visualizer_mode = 28;
+        for _ in 0..140 {
+            // Simulate 33.3ms frame time (30 FPS on a 60Hz display)
+            state.update_visualizer_perf_guard(1.0 / 30.0, 60.0);
+        }
+        assert!(
+            !state.vis_enabled[heavy_idx],
+            "Watchdog must uncheck heavy visualizer when it drops to 30 FPS on 60Hz display"
+        );
+        assert_ne!(
+            state.current_visualizer_idx, heavy_idx,
+            "Watchdog must advance to the next enabled visualizer"
+        );
+
+        // 5. Explicit user selection (`vis_user_overridden`) bypasses the watchdog
+        let mut user_state = AppState::new("User Override Test".to_string());
+        user_state.file_loaded = true;
+        user_state.is_paused = false;
+        user_state.current_visualizer_idx = heavy_idx;
+        user_state.visualizer_mode = 28;
+        user_state.vis_user_overridden[heavy_idx] = true;
+        for _ in 0..200 {
+            user_state.update_visualizer_perf_guard(1.0 / 25.0, 60.0);
+        }
+        assert!(
+            user_state.vis_enabled[heavy_idx],
+            "User-overridden visualizer must never be auto-disabled by the watchdog"
+        );
+        assert_eq!(user_state.current_visualizer_idx, heavy_idx);
+
+        // 6. Verify VSYNC status formatting and Stats panel integration
+        assert_eq!(format_vsync_status(wgpu::PresentMode::Fifo), "VSYNC: ON");
+        assert_eq!(
+            format_vsync_status(wgpu::PresentMode::FifoRelaxed),
+            "VSYNC: ON"
+        );
+        assert_eq!(
+            format_vsync_status(wgpu::PresentMode::AutoVsync),
+            "VSYNC: ON"
+        );
+        assert_eq!(
+            format_vsync_status(wgpu::PresentMode::AutoNoVsync),
+            "VSYNC: OFF"
+        );
+        assert_eq!(
+            format_vsync_status(wgpu::PresentMode::Immediate),
+            "VSYNC: OFF"
+        );
+        assert_eq!(
+            format_vsync_status(wgpu::PresentMode::Mailbox),
+            "VSYNC: OFF"
+        );
+
+        let engine_code = std::fs::read_to_string(workspace_path("crates/rt-render/src/engine.rs"))
+            .expect("crates/rt-render/src/engine.rs must exist");
+        let prod_code = engine_code
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or(&engine_code);
+        assert!(
+            prod_code.contains("format_vsync_status(self.config.present_mode)"),
+            "Stats panel must display VSYNC: ON / VSYNC: OFF status"
+        );
+    }
+
+    #[test]
+    fn test_appimage_packaging_and_apprun_config() {
+        let repackage = std::fs::read_to_string(workspace_path("repackage_appimage.sh"))
+            .expect("repackage_appimage.sh must exist");
+        let apprun = std::fs::read_to_string(workspace_path("AppRun.template"))
+            .expect("AppRun.template must exist");
+        let linux_yml =
+            std::fs::read_to_string(workspace_path(".github/workflows/linux-build.yml"))
+                .expect(".github/workflows/linux-build.yml must exist");
+
+        // 1. Verify modern AppImage/appimagetool repository URL (not deprecated AppImage/AppImageKit)
+        assert!(
+            repackage.contains("https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"),
+            "repackage_appimage.sh must fetch appimagetool from AppImage/appimagetool"
+        );
+        assert!(
+            !repackage.contains("AppImage/AppImageKit"),
+            "repackage_appimage.sh must not reference deprecated AppImage/AppImageKit URL"
+        );
+
+        // 2. Verify rDNS AppStream metadata alignment for zero-warning appstreamcli validation
+        assert!(
+            repackage.contains("com.soddentrough.rusttracker.appdata.xml"),
+            "repackage_appimage.sh must install com.soddentrough.rusttracker.appdata.xml"
+        );
+        assert!(
+            repackage.contains("com.soddentrough.rusttracker.desktop"),
+            "repackage_appimage.sh must align desktop entry filename to rDNS ID"
+        );
+
+        // 3. Verify AppRun.template preserves XDG_DATA_DIRS fallback and configures Gamescope Wayland
+        assert!(
+            apprun.contains("/usr/local/share:/usr/share"),
+            "AppRun.template must preserve standard XDG_DATA_DIRS fallback paths"
+        );
+        assert!(
+            apprun.contains("RUSTTRACKER_WAYLAND"),
+            "AppRun.template must export RUSTTRACKER_WAYLAND under Gamescope / Steam Deck"
+        );
+
+        // 4. Verify Linux CI workflow packages and uploads the AppImage
+        assert!(
+            linux_yml.contains("RustTracker-Linux-AppImage"),
+            "linux-build.yml must upload the RustTracker-Linux-AppImage artifact"
+        );
+        assert!(
+            linux_yml.contains("RustTracker-SteamDeck-*.AppImage"),
+            "linux-build.yml must publish RustTracker-SteamDeck-*.AppImage on release tags"
+        );
+    }
+
+    #[test]
+    fn test_splash_screen_cache_and_holistic_ux() {
+        let ctx = egui::Context::default();
+        let rect = egui::Rect::from_min_size(egui::pos2(0.0, 0.0), egui::vec2(1280.0, 800.0));
+        let mut splash_cache = SplashCache::default();
+
+        // 1. Static background mesh should build once and remain cached for identical viewport geometry
+        splash_cache.ensure_background(&ctx, rect);
+        assert!(
+            !splash_cache.static_bg_mesh.vertices.is_empty(),
+            "Static splash background mesh must contain tessellated sky, sun, mountains, and perspective grid"
+        );
+        assert_eq!(
+            splash_cache.stars.len(),
+            56,
+            "SplashCache must precompute 56 stars"
+        );
+        let first_arc_ptr = std::sync::Arc::as_ptr(&splash_cache.static_bg_mesh);
+
+        splash_cache.ensure_background(&ctx, rect);
+        assert_eq!(
+            std::sync::Arc::as_ptr(&splash_cache.static_bg_mesh),
+            first_arc_ptr,
+            "SplashCache must reuse the cached Arc<Mesh> when viewport dimensions and ppp do not change"
+        );
+
+        // 2. Dynamic background mesh builds twinkling stars + scrolling horizontal grid lines in a single Mesh
+        let dyn_mesh = splash_cache.build_dynamic_bg_mesh(rect, 1.25, 2.0);
+        assert!(
+            dyn_mesh.vertices.len() >= 50 * 4,
+            "Dynamic splash mesh must contain at least 50 star quads plus scrolling grid lines"
+        );
+
+        // 2b. Title chrome mesh builds 24 slices over tight glyph bounds with C0 slice-boundary continuity
+        // and anchored sky->white-horizon->obsidian-crease->sunset-gold reflection (zero barber-pole wrap seam).
+        let mut fonts = egui::FontDefinitions::default();
+        fonts.font_data.insert(
+            "Orbitron".to_owned(),
+            egui::FontData::from_static(EMBEDDED_GLASS_FONT).into(),
+        );
+        fonts.families.insert(
+            egui::FontFamily::Name("Orbitron".into()),
+            vec!["Orbitron".to_owned()],
+        );
+        ctx.set_fonts(fonts);
+
+        let title_rect =
+            egui::Rect::from_center_size(egui::pos2(640.0, 90.0), egui::vec2(550.0, 70.0));
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            egui::CentralPanel::default().show_inside(ui, |ui| {
+                splash_cache.update_title_mesh(ui, title_rect, 29.0, 66.0, 1.25);
+            });
+        });
+        assert_eq!(
+            splash_cache.title_slice_ranges.len(),
+            24,
+            "Splash title mesh must use 24 vertical chrome slices"
+        );
+        assert!(
+            splash_cache.title_glyph_bounds.width() > 100.0
+                && splash_cache.title_glyph_bounds.height() > 20.0,
+            "Splash title must compute tight glyph bounding box"
+        );
+
+        // Verify adjacent slices share identical vertex colors at their shared horizontal seam (y_bot == y_top)
+        let mut matched_seams = 0usize;
+        for w in splash_cache.title_slice_ranges.windows(2) {
+            let (s0, e0) = w[0];
+            let (s1, e1) = w[1];
+            let quads0 = splash_cache.title_base_mesh.vertices[s0..e0]
+                .as_chunks::<4>()
+                .0;
+            let quads1 = splash_cache.title_base_mesh.vertices[s1..e1]
+                .as_chunks::<4>()
+                .0;
+            for q0 in quads0 {
+                for q1 in quads1 {
+                    if (q0[0].pos.x - q1[0].pos.x).abs() < 1e-3
+                        && (q0[2].pos.y - q1[0].pos.y).abs() < 1e-3
+                    {
+                        assert_eq!(
+                            q0[3].color, q1[0].color,
+                            "Left vertex color at slice boundary must be C0 continuous"
+                        );
+                        assert_eq!(
+                            q0[2].color, q1[1].color,
+                            "Right vertex color at slice boundary must be C0 continuous"
+                        );
+                        matched_seams += 1;
+                    }
+                }
+            }
+        }
+        assert!(
+            matched_seams >= 100,
+            "All active glyph slice boundaries must match seamlessly"
+        );
+
+        // Verify chrome reflection remains anchored (sky on top, warm sunset on bottom) at all times
+        for &sample_t in &[0.0_f32, 1.7, 3.4, 5.1, 8.8] {
+            let top_col = SplashCache::evaluate_chrome_color(0.5, 0.02, 0.5, sample_t);
+            let bot_col = SplashCache::evaluate_chrome_color(0.5, 0.98, 0.5, sample_t);
+            assert!(
+                top_col.b() > top_col.r(),
+                "Top of chrome glyphs must reflect blue/cyan sky at t={sample_t}"
+            );
+            assert!(
+                bot_col.r() > bot_col.b(),
+                "Bottom of chrome glyphs must reflect warm sunset coral/gold at t={sample_t}"
+            );
+        }
+
+        // 3. StatsDisplayCache throttles string formatting to 10 Hz (100ms) and separates CPU command recording from driver submit+present
+        let mut stats_cache = StatsDisplayCache::default();
+        let mut state = AppState::new("Stats Cache Test".to_string());
+        state.current_fps = 60.0;
+        state.stats.phase_lock_update_us = 100.0;
+        state.stats.phase_snapshot_us = 20.0;
+        state.stats.phase_surface_us = 13500.0;
+        state.stats.phase_egui_layout_us = 1200.0;
+        state.stats.phase_encode_us = 200.0;
+        state.stats.phase_submit_us = 1400.0;
+        state.stats.phase_post_us = 10.0;
+        stats_cache.update_if_needed(&state, false, 1.0);
+        assert_eq!(stats_cache.fps_line, "FPS: 60.0 (16.67 ms)");
+        assert_eq!(
+            stats_cache.cpu_active_line, "CPU Active Total: 1.53 ms",
+            "CPU Active Total must sum only active CPU phases (excluding VSync wait and Submit+Present)"
+        );
+        assert_eq!(stats_cache.phase_lines[3].0, "  UI Layout + Tess: 1.20 ms");
+        assert_eq!(stats_cache.phase_lines[4].0, "  Cmd Record (CPU): 0.20 ms");
+        assert_eq!(stats_cache.phase_lines[5].0, "  Submit + Present: 1.40 ms");
+        assert_eq!(
+            stats_cache.total_phases_line,
+            "  Total Frame Loop: 16.43 ms"
+        );
+
+        // Within 100ms window (t = 1.03s), cached strings must remain stable even if raw telemetry fluctuates
+        state.current_fps = 50.0;
+        stats_cache.update_if_needed(&state, false, 1.03);
+        assert_eq!(
+            stats_cache.fps_line, "FPS: 60.0 (16.67 ms)",
+            "StatsDisplayCache must throttle updates within the 100ms window"
+        );
+
+        // After >= 100ms (t = 1.12s), cached strings must refresh
+        stats_cache.update_if_needed(&state, false, 1.12);
+        assert_eq!(
+            stats_cache.fps_line, "FPS: 50.0 (20.00 ms)",
+            "StatsDisplayCache must refresh after 100ms"
+        );
+    }
+
+    #[test]
+    fn test_vu_meter_phosphor_ghosting_decay() {
+        // 1. Validate hud.wgsl compiles cleanly with naga
+        const SHADER_COMMON: &str = include_str!("../../../src/shaders/_common.wgsl");
+        let hud_resolved = include_str!("../../../src/shaders/hud.wgsl")
+            .replace("// INCLUDE: common", SHADER_COMMON);
+        if let Err(e) = wgpu::naga::front::wgsl::parse_str(&hud_resolved) {
+            panic!(
+                "hud.wgsl WGSL parse error:\n{}",
+                e.emit_to_string(&hud_resolved)
+            );
+        }
+
+        let mut prev_active = [0u32; 32];
+        let mut segment_glows = [[0.0f32; 30]; 32];
+        let mut channels = [0.0f32; 32];
+
+        let unpack_seg = |packed: &[u32; 256], ch: usize, seg: usize| -> f32 {
+            let word = packed[ch * 8 + (seg >> 2)];
+            let byte = (word >> ((seg & 3) * 8)) & 0xFF;
+            byte as f32 / 255.0
+        };
+
+        // 2. Rising from 0 to 20 segments must NOT trigger ghosting above the bar
+        channels[0] = 20.0 / 30.0;
+        let packed = VulkanEngine::step_vu_phosphor_ghosts(
+            &mut prev_active,
+            &mut segment_glows,
+            &channels,
+            2,
+            0.010,
+        );
+        assert_eq!(prev_active[0], 20);
+        for s in 0..30 {
+            assert_eq!(
+                unpack_seg(&packed, 0, s),
+                0.0,
+                "Rising VU bar must not light unlit blocks"
+            );
+        }
+
+        // 3. Drop by 4 blocks (20 -> 16): segments 16..20 ignite at 1.0, segments 20..30 stay 0.0
+        channels[0] = 16.0 / 30.0;
+        let packed = VulkanEngine::step_vu_phosphor_ghosts(
+            &mut prev_active,
+            &mut segment_glows,
+            &channels,
+            2,
+            0.010,
+        );
+        assert_eq!(prev_active[0], 16);
+        for s in 16..20 {
+            assert!(
+                (unpack_seg(&packed, 0, s) - 1.0).abs() < 1e-3,
+                "Deactivated segment {} should start fade at 1.0",
+                s
+            );
+        }
+        assert_eq!(unpack_seg(&packed, 0, 20), 0.0);
+
+        // 4. Advance by half the fade duration (175 ms of 350 ms): segments 16..20 should be at ~0.50
+        let half_dt = VulkanEngine::VU_PHOSPHOR_FADE_SECS * 0.5;
+        let packed = VulkanEngine::step_vu_phosphor_ghosts(
+            &mut prev_active,
+            &mut segment_glows,
+            &channels,
+            2,
+            0.100,
+        );
+        let _ = packed;
+        let packed = VulkanEngine::step_vu_phosphor_ghosts(
+            &mut prev_active,
+            &mut segment_glows,
+            &channels,
+            2,
+            half_dt - 0.100,
+        );
+        for s in 16..20 {
+            let g = unpack_seg(&packed, 0, s);
+            assert!(
+                (g - 0.50).abs() < 0.02,
+                "At half fade duration, segment {} should be ~0.50 (got {})",
+                s,
+                g
+            );
+        }
+
+        // 5. Partial upward bounce (16 -> 18) must NOT wipe out still-fading segments 18..20 above it!
+        channels[0] = 18.0 / 30.0;
+        let packed = VulkanEngine::step_vu_phosphor_ghosts(
+            &mut prev_active,
+            &mut segment_glows,
+            &channels,
+            2,
+            0.035,
+        );
+        assert_eq!(prev_active[0], 18);
+        assert_eq!(
+            unpack_seg(&packed, 0, 17),
+            0.0,
+            "Active segment 17 is drawn via is_active"
+        );
+        assert!(
+            (unpack_seg(&packed, 0, 18) - 0.40).abs() < 0.02,
+            "Segment 18 above bounce must continue fading smoothly (got {})",
+            unpack_seg(&packed, 0, 18)
+        );
+        assert!(
+            (unpack_seg(&packed, 0, 19) - 0.40).abs() < 0.02,
+            "Segment 19 above bounce must continue fading smoothly (got {})",
+            unpack_seg(&packed, 0, 19)
+        );
+
+        // 6. Advance remaining fade time: segments 18..20 reach 0.0
+        for _ in 0..3 {
+            let _ = VulkanEngine::step_vu_phosphor_ghosts(
+                &mut prev_active,
+                &mut segment_glows,
+                &channels,
+                2,
+                0.080,
+            );
+        }
+        let packed = VulkanEngine::step_vu_phosphor_ghosts(
+            &mut prev_active,
+            &mut segment_glows,
+            &channels,
+            2,
+            0.010,
+        );
+        assert!(unpack_seg(&packed, 0, 18) < 1e-4);
+        assert!(unpack_seg(&packed, 0, 19) < 1e-4);
+    }
+
+    #[test]
+    fn test_file_transfer_state_progress_and_snapshot() {
+        let mut state = AppState::new("Test".to_string());
+        assert!(state.file_transfer.is_none());
+
+        // Indeterminate phase (cloud download inside openInputStream before bytes stream)
+        state.file_transfer = Some(crate::state::FileTransferState {
+            file_name: "Atmos_Demo.mkv".to_string(),
+            status_text: "Downloading from Google Drive...".to_string(),
+            bytes_copied: 0,
+            total_bytes: Some(50 * 1024 * 1024),
+            elapsed_secs: 1.5,
+        });
+        let snap1 = state.render_snapshot();
+        let ft1 = snap1
+            .file_transfer
+            .as_ref()
+            .expect("render_snapshot must preserve active file_transfer");
+        assert_eq!(ft1.file_name, "Atmos_Demo.mkv");
+        assert_eq!(ft1.progress_fraction(), None);
+
+        // Determinate caching phase (25 MB of 50 MB copied)
+        if let Some(ref mut ft) = state.file_transfer {
+            ft.status_text = "Caching from Google Drive...".to_string();
+            ft.bytes_copied = 25 * 1024 * 1024;
+            ft.elapsed_secs = 3.0;
+        }
+        let snap2 = state.render_snapshot();
+        let ft2 = snap2.file_transfer.as_ref().unwrap();
+        let pct = ft2
+            .progress_fraction()
+            .expect("Expected determinate progress");
+        assert!((pct - 0.5).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_open_stream_device_dialog_and_mic_input_mode_transitions() {
+        let engine_src = include_str!("engine.rs");
+        assert!(engine_src.contains("OPEN STREAM/DEVICE"));
+        assert!(!engine_src.contains(concat!("OPEN URL", " / STREAM")));
+        assert!(engine_src.contains("Open Stream / Device"));
+        assert!(engine_src.contains("Audio Input Devices (Microphone / Line-In):"));
+
+        let uri = crate::state::mic_uri_for_device("USB Condenser Mic");
+        assert_eq!(uri, "mic://USB Condenser Mic");
+        assert!(crate::state::is_mic_uri(&uri));
+        assert_eq!(
+            crate::state::device_from_mic_uri(&uri),
+            Some("USB Condenser Mic")
+        );
+        assert!(!crate::state::is_mic_uri("https://example.com/stream.mp3"));
+
+        let mut state = AppState::new("Test".to_string());
+        assert!(!state.is_mic_input);
+        assert!(!state.available_input_devices.is_empty());
+
+        state.available_input_devices = vec![
+            crate::audio::SYSTEM_DEFAULT_AUDIO_DEVICE.to_string(),
+            "USB Condenser Mic".to_string(),
+        ];
+        state.set_mic_input_mode(true, Some("USB Condenser Mic".to_string()));
+        assert!(state.is_mic_input);
+        assert_eq!(
+            state.selected_audio_device.as_deref(),
+            Some("USB Condenser Mic")
+        );
+        assert_eq!(state.available_audio_devices, state.available_input_devices);
+
+        state.file_loaded = true;
+        state.playlist = std::sync::Arc::new(vec![uri.clone()]);
+        state.song_title = "Microphone Input".to_string();
+        assert!(
+            !state.has_active_playback(),
+            "Microphone capture mode must not be treated as active file playback for drop-to-queue"
+        );
+
+        let snap = state.render_snapshot();
+        assert!(snap.is_mic_input);
+        assert_eq!(snap.available_input_devices, state.available_input_devices);
+
+        // Dropping a file while in microphone mode replaces the mic input and switches back to output mode
+        state.track_info_rect = Some([0.0, 0.0, 400.0, 400.0]);
+        state.handle_dropped_files(vec!["song.flac".to_string()], Some([100.0, 100.0]));
+        assert!(!state.is_mic_input);
+        assert_eq!(*state.playlist, vec!["song.flac".to_string()]);
+        assert_eq!(state.load_request.as_deref(), Some("song.flac"));
+    }
+
+    #[test]
+    fn test_waveform_history_ring_slot_mapping() {
+        const CAP: usize = WAVEFORM_HISTORY_RING_CAP;
+        assert_eq!(CAP, 144);
+        let mut ring = [0u64; CAP];
+        let mut ring_head = 0usize;
+
+        // Simulate 300 sequential pushes and verify both 144-row (2D) and 96-row (3D) windows
+        // map logical [0..N] oldest->newest onto the exact physical ring slots.
+        for seq in 1..=300u64 {
+            ring[ring_head] = seq;
+            ring_head = (ring_head + 1) % CAP;
+
+            for logical_rows in [seq.min(144) as usize, seq.min(96) as usize] {
+                let ring_base = compute_waveform_ring_base(ring_head, logical_rows) as usize;
+                for hist_idx in 0..logical_rows {
+                    let phys_row = (ring_base + hist_idx) % CAP;
+                    let expected_seq = seq - (logical_rows - 1 - hist_idx) as u64;
+                    assert_eq!(
+                        ring[phys_row], expected_seq,
+                        "seq={seq}, logical_rows={logical_rows}, hist_idx={hist_idx}"
+                    );
+                }
+            }
+        }
+
+        // Steady-state paused frame with unchanged push_count and hist_len is NOT dirty
+        assert!(!is_waveform_history_dirty(
+            420, 420, 96, 96, 1024, 1024, 3, 3
+        ));
+        // Paused seek / clear (`waveform_history.clear()` sets hist_len = 0 without advancing push_count)
+        // MUST mark history dirty so 3D/CRT oscilloscope rows resync/zero immediately instead of freezing
+        assert!(is_waveform_history_dirty(420, 420, 0, 96, 1024, 1024, 3, 3));
+        // Switching away from Visualizer 24 (`last_hist_len = usize::MAX`) forces resync even when hist_len == 0
+        assert!(is_waveform_history_dirty(
+            0,
+            0,
+            0,
+            usize::MAX,
+            1024,
+            1024,
+            3,
+            24
+        ));
+    }
+
+    #[test]
+    fn test_waveform_history_f16_pack_unpack_roundtrip_and_bandwidth_halving() {
+        // Verify exact special cases (zero, signed zero, +/-1.0, subnormals, overflow -> Inf, NaN)
+        assert_eq!(f32_to_f16_bits(0.0), 0x0000);
+        assert_eq!(f32_to_f16_bits(-0.0), 0x8000);
+        assert_eq!(f32_to_f16_bits(1.0), 0x3C00);
+        assert_eq!(f32_to_f16_bits(-1.0), 0xBC00);
+        assert_eq!(f16_bits_to_f32(0x3C00), 1.0);
+        assert_eq!(f16_bits_to_f32(0xBC00), -1.0);
+        assert!(f16_bits_to_f32(f32_to_f16_bits(1.0e6)).is_infinite());
+        assert!(f16_bits_to_f32(f32_to_f16_bits(f32::NAN)).is_nan());
+        // Subnormal f16 roundtrip (~1e-6)
+        let sub = 1.0e-6f32;
+        let sub_rt = f16_bits_to_f32(f32_to_f16_bits(sub));
+        assert!((sub_rt - sub).abs() < 1.0e-7, "sub_rt={sub_rt}");
+
+        // Exhaustively verify the exact branchless WGSL `unpack2x16float_compat` bit-math across
+        // ALL 65,536 possible IEEE-754 binary16 bit patterns (normals, subnormals, +/-0, Inf/NaN).
+        let unpack2x16_wgsl_mirror = |packed_word: u32| -> [f32; 2] {
+            let h = [packed_word & 0xFFFF, packed_word >> 16];
+            let mut out = [0.0f32; 2];
+            for lane in 0..2 {
+                let sign_bits = (h[lane] & 0x8000) << 16;
+                let exp = (h[lane] >> 10) & 0x1F;
+                let mant_shifted = (h[lane] & 0x03FF) << 13;
+                let norm_val =
+                    f32::from_bits(sign_bits | ((exp.wrapping_add(112)) << 23) | mant_shifted);
+                let sub_mag = f32::from_bits(0x3880_0000 | mant_shifted) - 6.103_515_6e-5_f32;
+                let sub_val = f32::from_bits(sub_mag.to_bits() | sign_bits);
+                let finite_val = if exp == 0 { sub_val } else { norm_val };
+                out[lane] = if exp == 31 { 0.0 } else { finite_val };
+            }
+            out
+        };
+        for pair_idx in 0..32768u32 {
+            let lo = (pair_idx * 2) as u16;
+            let hi = (pair_idx * 2 + 1) as u16;
+            let word = (lo as u32) | ((hi as u32) << 16);
+            let got = unpack2x16_wgsl_mirror(word);
+            for (lane, bits) in [(0usize, lo), (1usize, hi)] {
+                let exp = (bits >> 10) & 0x1F;
+                if exp == 31 {
+                    assert_eq!(
+                        got[lane], 0.0,
+                        "Inf/NaN f16 bits {bits:#06x} must sanitize to 0.0"
+                    );
+                } else {
+                    let expected = f16_bits_to_f32(bits);
+                    assert_eq!(
+                        got[lane].to_bits(),
+                        expected.to_bits(),
+                        "Exact bit mismatch for f16 {bits:#06x}: got {} ({:#010x}), expected {} ({:#010x})",
+                        got[lane],
+                        got[lane].to_bits(),
+                        expected,
+                        expected.to_bits()
+                    );
+                }
+            }
+        }
+
+        // Pack a full 2048-sample normalized waveform row into 1024 u32 words (4 KB vs 8 KB)
+        let mut src_row = [0.0f32; 2048];
+        for (i, sample) in src_row.iter_mut().enumerate() {
+            let phase = (i as f32 / 2048.0) * std::f32::consts::TAU * 7.0;
+            *sample = phase.sin() * 0.95 + (phase * 3.0).cos() * 0.05;
+        }
+        let mut packed_row = [0u32; 1024];
+        pack_wave_row_f16(&src_row, &mut packed_row);
+        assert_eq!(std::mem::size_of_val(&packed_row), 4096);
+        assert_eq!(std::mem::size_of_val(&src_row), 8192);
+
+        // Verify WGSL unpack2x16float lane semantics: low 16 bits = even index (.x), high 16 bits = odd index (.y)
+        for (flat_idx, &orig) in src_row.iter().enumerate() {
+            let word = packed_row[flat_idx >> 1];
+            let half_bits = if (flat_idx & 1) == 0 {
+                (word & 0xFFFF) as u16
+            } else {
+                (word >> 16) as u16
+            };
+            let decoded = f16_bits_to_f32(half_bits);
+            assert!(
+                (decoded - orig).abs() < 6.0e-4,
+                "idx={flat_idx}: orig={orig}, decoded={decoded}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_negotiate_optional_gpu_features_graceful_fallback_and_full_enable() {
+        // 1. Baseline / mobile / software adapter with zero optional features: must succeed with empty set
+        let baseline = negotiate_optional_gpu_features(wgpu::Features::empty(), true, true);
+        assert!(baseline.required_features.is_empty());
+        assert!(!baseline.shader_f16);
+        assert!(!baseline.subgroup);
+        assert!(!baseline.subgroup_barrier);
+        assert!(!baseline.indirect_first_instance);
+        assert!(!baseline.multi_draw_indirect_count);
+        assert!(!baseline.texture_format_16bit_norm);
+        assert!(!baseline.pipeline_cache);
+        assert!(!baseline.timestamp_query);
+
+        // 2. Modern desktop adapter (e.g. RDNA 4 gfx1201) advertising full feature set
+        let modern_caps = wgpu::Features::SHADER_F16
+            | wgpu::Features::SUBGROUP
+            | wgpu::Features::SUBGROUP_BARRIER
+            | wgpu::Features::INDIRECT_FIRST_INSTANCE
+            | wgpu::Features::MULTI_DRAW_INDIRECT_COUNT
+            | wgpu::Features::TEXTURE_FORMAT_16BIT_NORM
+            | wgpu::Features::PIPELINE_CACHE
+            | wgpu::Features::TIMESTAMP_QUERY;
+        let negotiated = negotiate_optional_gpu_features(modern_caps, false, true);
+        assert!(negotiated.shader_f16);
+        assert!(negotiated.subgroup);
+        assert!(negotiated.subgroup_barrier);
+        assert!(negotiated.indirect_first_instance);
+        assert!(negotiated.multi_draw_indirect_count);
+        assert!(negotiated.texture_format_16bit_norm);
+        assert!(negotiated.pipeline_cache);
+        assert!(
+            !negotiated.timestamp_query,
+            "Timestamps must remain opt-in when enable_timestamps is false"
+        );
+    }
+
+    #[test]
+    fn test_host_f64_modular_time_precision_after_48_hours() {
+        // Simulate 48 hours of monotonic f64 playback at 144 FPS wrapped into [P, 2*P)
+        let dt = 1.0f64 / 144.0;
+        let play_time = 48.0 * 3600.0 * 2.88_f64;
+        let t0 = wrap_host_phase_time(play_time);
+        let play_time_next = play_time + dt * 2.88;
+        let t1 = wrap_host_phase_time(play_time_next);
+
+        assert!(
+            (t0 as f64) >= HOST_TIME_WRAP_PERIOD_SECS
+                && (t0 as f64) < 2.0 * HOST_TIME_WRAP_PERIOD_SECS,
+            "t0={t0} must lie in [P, 2*P)"
+        );
+        // If wrap boundary was not crossed, f32 delta must match 2.88/144 = 0.02s within < 1ms!
+        if t1 > t0 {
+            let delta = t1 - t0;
+            assert!(
+                (delta - 0.02).abs() < 0.001,
+                "Expected smooth 20ms anim step after 48h, got {delta}"
+            );
+        }
+
+        // Verify smooth_time > 0.0 at EVERY wrap multiple k*P (k >= 1) so `select(audio.time, audio.smooth_time, audio.smooth_time > 0.0)` never glitches!
+        for k in 1..=8 {
+            let exact_wrap = wrap_host_phase_time((k as f64) * HOST_TIME_WRAP_PERIOD_SECS);
+            assert!(
+                exact_wrap > 0.0,
+                "wrap_host_phase_time({k}*P) must stay strictly > 0.0, got {exact_wrap}"
+            );
+        }
+
+        // Verify exact 2π phase continuity across the [P, 2*P) -> P wrap boundary for BOTH integer
+        // AND decimal shader frequencies (0.18, 0.225, 0.35, 0.45, 0.86, 0.92, 1.2, 3.2)!
+        let pre_wrap = wrap_host_phase_time(2.0 * HOST_TIME_WRAP_PERIOD_SECS - 1e-4);
+        let post_wrap = wrap_host_phase_time(2.0 * HOST_TIME_WRAP_PERIOD_SECS + 1e-4);
+        for freq in [1.0f32, 0.18, 0.225, 0.35, 0.45, 0.86, 0.92, 1.2, 3.2] {
+            let diff_sin = ((pre_wrap * freq).sin() - (post_wrap * freq).sin()).abs();
+            let diff_cos = ((pre_wrap * freq).cos() - (post_wrap * freq).cos()).abs();
+            assert!(
+                diff_sin < 5e-3 && diff_cos < 5e-3,
+                "Decimal shader frequency {freq} jumped across wrap: pre={pre_wrap}, post={post_wrap}, diff_sin={diff_sin}, diff_cos={diff_cos}"
+            );
+        }
+
+        assert_eq!(wrap_host_phase_time(0.0), 0.0);
+        assert_eq!(wrap_host_phase_time(-1.0), 0.0);
+        assert_eq!(wrap_host_phase_time(f64::NAN), 0.0);
+        assert_eq!(wrap_host_phase_time(f64::INFINITY), 0.0);
+    }
+
+    #[test]
+    fn test_phase3_video_two_plane_border_blur_and_indirect_draws() {
+        // 1. Validate vis_video.wgsl compiles and exposes both fs_border_blur and fs_main entry points
+        let video_wgsl = include_str!("../../../src/shaders/vis_video.wgsl");
+        let module = wgpu::naga::front::wgsl::parse_str(video_wgsl)
+            .expect("vis_video.wgsl must parse cleanly");
+        let mut validator = wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::empty(),
+        );
+        validator
+            .validate(&module)
+            .expect("vis_video.wgsl must validate under Capabilities::empty()");
+
+        let ep_names: Vec<&str> = module
+            .entry_points
+            .iter()
+            .map(|ep| ep.name.as_str())
+            .collect();
+        assert!(ep_names.contains(&"vs_main"));
+        assert!(ep_names.contains(&"fs_border_blur"));
+        assert!(ep_names.contains(&"fs_main"));
+        assert!(
+            video_wgsl.contains("params.chroma_layout == 1u")
+                && video_wgsl.contains("params.chroma_layout == 2u"),
+            "vis_video.wgsl must support 2-plane SemiPlanar420 (NV12/P010) and SemiPlanarVu420 (NV21)"
+        );
+        assert!(
+            !video_wgsl.contains("let half_s = 15"),
+            "vis_video.wgsl fs_main must not run a 93-fetch per-pixel border loop"
+        );
+
+        let common_wgsl = include_str!("../../../src/shaders/_common.wgsl");
+        assert!(
+            common_wgsl.contains("fn unpack2x16float_compat(")
+                && !common_wgsl.contains("decode_f16_bits"),
+            "_common.wgsl must use branchless dual-lane unpack2x16float_compat under Capabilities::empty()"
+        );
+
+        // 2. Verify Visualizer 23 uses draw_indexed_indirect (no unconditional 0..65536 splash draw)
+        let engine_code = std::fs::read_to_string(workspace_path("crates/rt-render/src/engine.rs"))
+            .expect("engine.rs must exist");
+        let prod_code = engine_code
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or(&engine_code);
+        assert!(
+            !prod_code.contains("draw_indexed(0..6, 0, 0..65536)"),
+            "Visualizer 23 must not unconditionally draw 65,536 splash instances"
+        );
+        assert!(
+            prod_code.contains("draw_indexed_indirect(&self.lyrics_indirect_args_buffer, 0)")
+                && prod_code
+                    .contains("draw_indexed_indirect(&self.splash_indirect_args_buffer, 0)"),
+            "Visualizer 23 must use draw_indexed_indirect for both lyrics and compacted droplets"
+        );
+        assert!(
+            !prod_code.contains("draw(0..6,"),
+            "Fullscreen passes must use 3-vertex oversized fullscreen triangles, never 6-vertex quads"
+        );
+    }
+}

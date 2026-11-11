@@ -1,7 +1,7 @@
 [Desktop Entry]
 Name=RustTracker
 GenericName=Audio & Module Visualizer
-Comment=High-Performance Vulkan Tracker Module Visualizer
+Comment=High-Performance WGPU Audio, Video & Tracker Visualizer
 Exec=rusttracker %F
 Icon=rusttracker
 Terminal=false

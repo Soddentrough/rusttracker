@@ -37,7 +37,7 @@ fn main() {
                 Ok(module) => {
                     let mut validator = naga::valid::Validator::new(
                         naga::valid::ValidationFlags::all(),
-                        naga::valid::Capabilities::all(),
+                        naga::valid::Capabilities::empty(),
                     );
                     match validator.validate(&module) {
                         Ok(_) => {

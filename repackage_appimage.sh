@@ -98,19 +98,19 @@ find AppDir/usr/lib -maxdepth 1 \( \
     -name 'libdbus*' \
 \) -delete || true
 
-echo "Patching GLIBC_2.44 symbol versions for SteamOS (glibc 2.43) compatibility..."
-python3 scripts/patch_glibc_compat.py AppDir/usr/bin AppDir/usr/lib
-
 echo "Injecting custom AppRun wrapper..."
 rm -f AppDir/AppRun
 cp AppRun.template AppDir/AppRun
 chmod +x AppDir/AppRun
 
-echo "Injecting SoundFont asset, SteamGrid artwork, and AppStream metadata into AppDir..."
+echo "Injecting SoundFont asset, SteamGrid artwork, licenses, and AppStream metadata into AppDir..."
 mkdir -p AppDir/usr/share/rusttracker/assets
 cp assets/soundfont.sf2 AppDir/usr/share/rusttracker/assets/
 mkdir -p AppDir/usr/share/rusttracker/steamgrid
 cp assets/steamgrid/* AppDir/usr/share/rusttracker/steamgrid/
+mkdir -p AppDir/usr/share/doc/rusttracker AppDir/usr/share/licenses/rusttracker
+cp LICENSE THIRD_PARTY_NOTICES.txt AppDir/usr/share/doc/rusttracker/
+cp LICENSE THIRD_PARTY_NOTICES.txt AppDir/usr/share/licenses/rusttracker/
 
 # Align desktop and AppStream metadata filenames to rDNS ID (com.soddentrough.rusttracker)
 # so appstreamcli and appimagetool validate cleanly with zero warnings.

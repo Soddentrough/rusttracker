@@ -19,7 +19,7 @@ Combined with SteamOS's **PipeWire** audio graph, this enables the Steam Deck ru
 #### Mode B: Steam Deck as a USB Sound Card + Dedicated Visualizer Display (`Host PC Audio ➔ USB-C ➔ RustTracker on Deck`)
 * **Workflow:** Connect the Steam Deck to a desktop PC or laptop via USB-C and use the Deck as an external 1280×800 hardware-accelerated music visualizer and/or DAC.
 * **Audio Routing:** The host PC sees **`Steam Deck USB Audio`** as a USB Speaker/DAC. Audio played on the host PC streams over USB-C into the Steam Deck's `UAC2_Gadget` capture source (and optionally loops through PipeWire to the Steam Deck's internal speakers or 3.5mm headphone jack).
-* **RustTracker Behavior:** Running RustTracker in Live Input (`--mic`) mode captures the incoming `UAC2_Gadget` PCM stream for real-time 21-shader GPU visualization.
+* **RustTracker Behavior:** Running RustTracker in Live Input (`--mic`) mode captures the incoming `UAC2_Gadget` PCM stream for real-time 19-shader GPU visualization.
 
 ---
 

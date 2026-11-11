@@ -1,0 +1,25 @@
+[package]
+name = "rt-core"
+version = "0.9.39"
+edition = "2024"
+description = "Core state, DSP math, playlist, lyrics, touch gestures, and IPC for RustTracker"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+anyhow = "1.0.102"
+cpal = "0.17.3"
+crossbeam-channel = "0.5.15"
+directories = "6.0.0"
+egui = "0.34.2"
+wgpu = "29.0.3"
+winit = "0.30.13"
+
+[target.'cfg(target_os = "android")'.dependencies]
+winit = { version = "0.30.13", features = ["android-game-activity"] }
+
+[target."cfg(windows)".dependencies]
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+] }

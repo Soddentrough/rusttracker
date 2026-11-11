@@ -1,0 +1,20 @@
+[package]
+name = "rt-decode"
+version = "0.9.39"
+edition = "2024"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+rt-core = { path = "../rt-core" }
+anyhow = "1.0.102"
+crossbeam-channel = "0.5.15"
+symphonia = { version = "0.5.5", features = ["all"] }
+
+[target.'cfg(not(target_os = "android"))'.dependencies]
+ffmpeg-next = { version = "9.0.0", default-features = false, features = ["codec", "format", "software-resampling", "software-scaling"] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+ffmpeg-next = { version = "9.0.0", default-features = false, features = ["static", "codec", "format", "software-resampling", "software-scaling"] }
+
+[build-dependencies]
+cc = "1.2"

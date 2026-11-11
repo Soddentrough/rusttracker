@@ -7,7 +7,20 @@
 
 @group(0) @binding(0) var<uniform> audio: AudioUniforms;
 @group(1) @binding(1) var<storage, read> particles: array<Particle>;
+@group(1) @binding(2) var<storage, read> splash_compact: SplashCompactRead;
 @group(2) @binding(0) var<uniform> camera: CameraUniforms;
+
+struct SplashCompactRead {
+    index_count: u32,
+    instance_count: u32,
+    first_index: u32,
+    base_vertex: i32,
+    first_instance: u32,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
+    active_indices: array<u32, 65536>,
+}
 
 struct CameraUniforms {
     view_matrix: mat4x4<f32>,
@@ -37,7 +50,8 @@ struct SplashVertexOutput {
 fn vs_splash(in: VertexInput, @builtin(instance_index) inst_id: u32) -> SplashVertexOutput {
     var out: SplashVertexOutput;
 
-    let p = particles[inst_id];
+    let particle_idx = splash_compact.active_indices[inst_id];
+    let p = particles[particle_idx];
 
     // Only draw active airborne splash droplets launched around the letter impact stage (|x| < 6.5, |z| < 2.5, y > 0.035)
     if (p.pos.y <= 0.035 || abs(p.pos.x) > 6.5 || abs(p.pos.z) > 2.5) {
