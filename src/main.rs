@@ -3733,7 +3733,8 @@ async fn run_gui(
                                 let mut max_right_y = std::mem::take(&mut frame_right_stick_y);
                                 let mut max_lt = std::mem::take(&mut frame_left_trigger);
                                 let mut max_rt = std::mem::take(&mut frame_right_trigger);
-                                for (_id, gamepad) in gilrs.gamepads() {
+                                let gamepad_input_active = is_game_mode || window.has_focus();
+                                for (_id, gamepad) in gilrs.gamepads().filter(|_| gamepad_input_active) {
                                     let left_y = gamepad.value(gilrs::Axis::LeftStickY);
                                     if left_y.abs() > max_left_y.abs() {
                                         max_left_y = left_y;
@@ -4697,6 +4698,15 @@ async fn run_gui(
                         }
                     }
 
+                    let gamepad_input_active = is_game_mode || window.has_focus();
+                    if !gamepad_input_active {
+                        // Unfocused: drain and discard events so other apps own the controller.
+                        while gilrs.next_event().is_some() {}
+                        frame_left_stick_y = 0.0;
+                        frame_right_stick_y = 0.0;
+                        frame_left_trigger = 0.0;
+                        frame_right_trigger = 0.0;
+                    }
                     while let Some(gilrs::Event { event: g_event, .. }) = gilrs.next_event() {
                         match g_event {
                             gilrs::EventType::AxisChanged(axis, val, _) => match axis {
