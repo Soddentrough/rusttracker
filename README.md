@@ -124,6 +124,7 @@ RustTracker features a specialized dual-pane touch interface optimized for mobil
 * **`--mpegh`** / **`--no-mpegh`** *(alias `--mpegh-714`)*: Enable (default) or disable 7.1.4 (11.1) MPEG-H 3D Audio HDMI bitstream encoding on >8ch capable Linux (PipeWire) and Windows (WASAPI Exclusive fallback) endpoints.
 * **`--fullscreen`** / **`--windowed`**: Force fullscreen or windowed startup mode (mutually exclusive).
 * **`--uncapped`**: Disable VSync/refresh-rate pacing and run at uncapped hardware frame rates (`AutoNoVsync` / `Immediate` present mode).
+* **`--auto-vis-guard`**: Opt in to the frame-budget watchdog switching visualizers automatically: heavy visualizers running below 85% of the display refresh rate are unchecked and skipped, and heavy visualizers start unchecked on constrained GPUs. By default RustTracker never changes visualizers on its own (it only shows an OSD warning); visualizers change only on your input.
 * **`--bench [frames]`**: Run automated benchmark loop for a given frame count (default `300` when omitted) with GPU timestamp profiling enabled.
 * **`--register-steam`**: Headlessly register or update **RustTracker** in Steam's `shortcuts.vdf`, provision all SteamOS Home Screen & Library artwork (`config/grid/` and `appcache/librarycache/`), restart `steam-launcher.service` if active, and exit (ideal for one-step SSH deployment).
 

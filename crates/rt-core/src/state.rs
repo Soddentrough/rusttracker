@@ -1123,6 +1123,11 @@ pub struct AppState {
     pub vis_perf_watch_idx: usize,
     pub vis_active_frames: u32,
     pub vis_low_fps_frames: u32,
+    /// Opt-in (`--auto-vis-guard`): lets the frame-budget watchdog and Constrained-GPU profile
+    /// uncheck and switch away from heavy visualizers automatically. Off by default.
+    pub auto_vis_guard: bool,
+    /// Visualizer index for which the watchdog already showed its low-FPS warning.
+    pub vis_perf_warned_idx: Option<usize>,
     pub osd_text: Option<String>,
     pub osd_timer: f32,
     pub cumulative_scrub: f64,
@@ -1342,6 +1347,8 @@ impl AppState {
             vis_perf_watch_idx: 0,
             vis_active_frames: 0,
             vis_low_fps_frames: 0,
+            auto_vis_guard: false,
+            vis_perf_warned_idx: None,
             osd_text: None,
             osd_timer: 0.0,
             cumulative_scrub: 0.0,
@@ -1511,6 +1518,8 @@ impl AppState {
             vis_perf_watch_idx: self.vis_perf_watch_idx,
             vis_active_frames: self.vis_active_frames,
             vis_low_fps_frames: self.vis_low_fps_frames,
+            auto_vis_guard: self.auto_vis_guard,
+            vis_perf_warned_idx: self.vis_perf_warned_idx,
             gamepad_type: self.gamepad_type,
             has_gamepad: self.has_gamepad,
             panel_split_ratio: self.panel_split_ratio,
@@ -1656,8 +1665,9 @@ impl AppState {
     /// Radeon 680M/780M/890M, Intel Arc), all production visualizers remain enabled in rotation.
     /// On `GpuCapabilityTier::Constrained` (fillrate/power-constrained GPUs such as Mali-G710
     /// driving a 2560x1600 QHD+ panel, older integrated GPUs, or Steam Deck's 15W APU),
-    /// visualizers marked `heavy_shader: true` start unchecked in auto-rotation unless the
-    /// user explicitly selected or enabled them.
+    /// visualizers marked `heavy_shader: true` start unchecked only when `auto_vis_guard`
+    /// (`--auto-vis-guard`) is enabled and the user has not explicitly selected or enabled them;
+    /// by default no visualizer is unchecked or switched automatically.
     pub fn apply_gpu_capability_profile(
         &mut self,
         info: &wgpu::AdapterInfo,
@@ -1669,7 +1679,7 @@ impl AppState {
         self.gpu_capability_tier = tier;
         self.gpu_adapter_name = info.name.clone();
 
-        if tier == GpuCapabilityTier::Constrained {
+        if tier == GpuCapabilityTier::Constrained && self.auto_vis_guard {
             for (idx, v) in VISUALIZERS.iter().enumerate() {
                 if v.heavy_shader && !self.vis_user_overridden[idx] {
                     self.vis_enabled[idx] = false;
@@ -1688,8 +1698,9 @@ impl AppState {
     /// Runtime frame-budget watchdog: monitors frame times while a heavy shader visualizer is
     /// actively rendering. If a non-user-overridden `heavy_shader` visualizer cannot sustain
     /// at least 85% of the target display refresh rate (e.g., < 51 FPS on a 60Hz panel) over a
-    /// sustained window after warm-up, it is automatically unchecked from auto-rotation and
-    /// advances to the next enabled visualizer.
+    /// sustained window after warm-up: with `auto_vis_guard` (`--auto-vis-guard`) it is unchecked
+    /// and the next enabled visualizer is selected; by default it only shows a one-time OSD
+    /// warning and never changes the visualizer.
     pub fn update_visualizer_perf_guard(&mut self, dt: f32, target_refresh_hz: f32) {
         let idx = self.current_visualizer_idx.min(VISUALIZERS.len() - 1);
         if self.vis_perf_watch_idx != idx {
@@ -1724,6 +1735,19 @@ impl AppState {
         }
 
         if self.vis_low_fps_frames >= 90 {
+            if !self.auto_vis_guard {
+                self.vis_low_fps_frames = 0;
+                if self.vis_perf_warned_idx != Some(idx) {
+                    self.vis_perf_warned_idx = Some(idx);
+                    self.osd_text = Some(format!(
+                        "{} is running below {:.0} FPS (use --auto-vis-guard to switch automatically)",
+                        VISUALIZERS[idx].name,
+                        effective_hz * 0.85
+                    ));
+                    self.osd_timer = 4.0;
+                }
+                return;
+            }
             let dropped_name = VISUALIZERS[idx].name;
             self.vis_enabled[idx] = false;
             self.vis_low_fps_frames = 0;

@@ -108,6 +108,13 @@ struct Args {
     #[arg(
         long,
         default_value_t = false,
+        help = "Let the frame-budget watchdog automatically uncheck and switch away from heavy visualizers that run below 85% of the refresh rate (off by default; visualizers only change on user input)"
+    )]
+    auto_vis_guard: bool,
+
+    #[arg(
+        long,
+        default_value_t = false,
         conflicts_with_all = ["passthrough", "surround_upmix", "mpegh"],
         help = "Force 2.0 stereo downmix output even on multi-channel hardware endpoints"
     )]
@@ -555,6 +562,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let mut state = app_state.lock().unwrap();
         state.playlist = std::sync::Arc::new(args.file.clone());
         apply_cli_audio_flags(&mut state, &args);
+        state.auto_vis_guard = args.auto_vis_guard;
         state.playlist_index = 0;
 
         let mut history_changed = false;
@@ -6525,6 +6533,7 @@ mod tests {
             "--list-vis",
             "--bench",
             "--uncapped",
+            "--auto-vis-guard",
             "--stereo",
             "--passthrough",
             "--surround-upmix",

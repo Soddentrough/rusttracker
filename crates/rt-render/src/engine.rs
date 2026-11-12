@@ -14597,6 +14597,17 @@ mod tests {
                 gpu_name
             );
             let mut state = AppState::new("Test".to_string());
+            let mut default_off = AppState::new("Default".to_string());
+            default_off.apply_gpu_capability_profile(&info, w, h);
+            assert!(
+                default_off
+                    .vis_enabled
+                    .iter()
+                    .zip(AppState::new("Ref".to_string()).vis_enabled.iter())
+                    .all(|(a, b)| a == b),
+                "Constrained GPU must not auto-uncheck visualizers without --auto-vis-guard ({gpu_name})"
+            );
+            state.auto_vis_guard = true;
             state.apply_gpu_capability_profile(&info, w, h);
             assert_eq!(state.gpu_capability_tier, GpuCapabilityTier::Constrained);
             for (idx, v) in VISUALIZERS.iter().enumerate() {
@@ -14617,7 +14628,30 @@ mod tests {
         }
 
         // 4. Runtime Frame-Budget Watchdog auto-disables non-overridden heavy shader if < 85% VSync FPS
+        // Default (no --auto-vis-guard): watchdog warns via OSD but never switches or unchecks
+        let mut passive = AppState::new("Passive".to_string());
+        passive.file_loaded = true;
+        passive.is_paused = false;
+        let passive_idx = VISUALIZERS
+            .iter()
+            .position(|v| v.id == 28)
+            .expect("ID 28 must exist");
+        passive.current_visualizer_idx = passive_idx;
+        passive.visualizer_mode = 28;
+        for _ in 0..300 {
+            passive.update_visualizer_perf_guard(1.0 / 30.0, 60.0);
+        }
+        assert!(passive.vis_enabled[passive_idx]);
+        assert_eq!(passive.current_visualizer_idx, passive_idx);
+        assert!(
+            passive
+                .osd_text
+                .as_deref()
+                .is_some_and(|t| t.contains("--auto-vis-guard"))
+        );
+
         let mut state = AppState::new("Watchdog Test".to_string());
+        state.auto_vis_guard = true;
         state.file_loaded = true;
         state.is_paused = false;
         let heavy_idx = VISUALIZERS
@@ -14641,6 +14675,7 @@ mod tests {
 
         // 5. Explicit user selection (`vis_user_overridden`) bypasses the watchdog
         let mut user_state = AppState::new("User Override Test".to_string());
+        user_state.auto_vis_guard = true;
         user_state.file_loaded = true;
         user_state.is_paused = false;
         user_state.current_visualizer_idx = heavy_idx;
