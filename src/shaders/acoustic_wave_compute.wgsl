@@ -27,7 +27,7 @@ const GRID_DIM_F: vec3<f32> = vec3<f32>(64.0, 32.0, 64.0);
 const LAPLACIAN_W: vec3<f32> = vec3<f32>(0.5639, 1.6058, 0.8303);
 const WAVE_C2: f32 = 0.24;
 
-// Match speaker locations in vis_neon_room.wgsl
+// Match speaker locations in vis_neon_acoustic_room.wgsl
 const SPEAKER_POS: array<vec3<f32>, 12> = array<vec3<f32>, 12>(
     vec3<f32>(-3.8, -0.25,  5.5), // 0: FL
     vec3<f32>( 3.8, -0.25,  5.5), // 1: FR

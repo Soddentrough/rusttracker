@@ -1732,7 +1732,6 @@ pub struct VulkanEngine {
     _acoustic_wave_b_buffer: wgpu::Buffer,
     acoustic_packed_buffer: wgpu::Buffer,
     acoustic_volume_texture: wgpu::Texture,
-    acoustic_render_pipeline_layout: wgpu::PipelineLayout,
     neon_acoustic_render_pipeline_layout_3d: wgpu::PipelineLayout,
     acoustic_render_bind_group: wgpu::BindGroup,
     acoustic_wave_initialized: bool,
@@ -4598,16 +4597,6 @@ impl VulkanEngine {
                 ],
             });
 
-        let acoustic_render_pipeline_layout =
-            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("Acoustic Wave Render Pipeline Layout"),
-                bind_group_layouts: &[
-                    Some(&bind_group_layout),
-                    Some(&acoustic_render_bind_group_layout),
-                ],
-                immediate_size: 0,
-            });
-
         let neon_acoustic_render_pipeline_layout_3d =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("Neon Acoustic Studio 3D Render Pipeline Layout"),
@@ -4644,14 +4633,12 @@ impl VulkanEngine {
                 16 => include_str!("../../../src/shaders/vis_rain.wgsl"),
                 19 => include_str!("../../../src/shaders/vis_vumeters_3d.wgsl"),
                 20 => include_str!("../../../src/shaders/vis_bioluminescence.wgsl"),
-                22 => include_str!("../../../src/shaders/vis_neon_room.wgsl"),
                 23 => include_str!("../../../src/shaders/vis_lyrics.wgsl"),
                 24 => include_str!("../../../src/shaders/vis_tape_head.wgsl"),
                 25 => include_str!("../../../src/shaders/vis_spectrum_led.wgsl"),
                 27 => include_str!("../../../src/shaders/vis_flip_ferrofluid.wgsl"),
                 28 => include_str!("../../../src/shaders/vis_glass_water.wgsl"),
                 29 => include_str!("../../../src/shaders/vis_spectrum_canyon.wgsl"),
-                30 => include_str!("../../../src/shaders/vis_acoustic_waves.wgsl"),
                 31 => include_str!("../../../src/shaders/vis_neon_acoustic_room.wgsl"),
                 _ => include_str!("../../../src/shaders/vis_spectrum.wgsl"),
             }
@@ -6672,7 +6659,6 @@ impl VulkanEngine {
             _acoustic_wave_b_buffer: acoustic_wave_b_buffer,
             acoustic_packed_buffer,
             acoustic_volume_texture,
-            acoustic_render_pipeline_layout,
             neon_acoustic_render_pipeline_layout_3d,
             acoustic_render_bind_group,
             acoustic_wave_initialized: false,
@@ -6818,21 +6804,6 @@ impl VulkanEngine {
         } else if vis_def.id == 27 {
             (
                 &self.flip_render_pipeline_layout,
-                Vec::new(),
-                wgpu::PrimitiveState {
-                    topology: wgpu::PrimitiveTopology::TriangleList,
-                    strip_index_format: None,
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: None,
-                    polygon_mode: wgpu::PolygonMode::Fill,
-                    unclipped_depth: false,
-                    conservative: false,
-                },
-                "vs_main",
-            )
-        } else if vis_def.id == 30 {
-            (
-                &self.acoustic_render_pipeline_layout,
                 Vec::new(),
                 wgpu::PrimitiveState {
                     topology: wgpu::PrimitiveTopology::TriangleList,
@@ -8100,7 +8071,7 @@ impl VulkanEngine {
         }
 
         let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
-        if vis_def.requires_acoustic_waves && (vis_def.id != 31 || state.room_volume_smoke) {
+        if vis_def.requires_acoustic_waves && state.room_volume_smoke {
             Self::extract_acoustic_wave_phases(
                 &mut self.channel_phases,
                 &state.raw_audio_channels,
@@ -12972,7 +12943,7 @@ impl VulkanEngine {
                 crate::state::PipelineType::Mesh3D { .. }
             ) {
                 // Adapt FOV when aspect ratio is square or portrait (< 1.0) so 3D scenes fit without horizontal clipping
-                let is_room_vis = state.visualizer_mode == 22 || state.visualizer_mode == 31;
+                let is_room_vis = state.visualizer_mode == 31;
                 let base_fov = if is_room_vis {
                     64.0_f32.to_radians()
                 } else {
@@ -13026,17 +12997,6 @@ impl VulkanEngine {
                 } else if state.visualizer_mode == 31 {
                     let (cam_eye, cam_target) = compute_neon_acoustic_studio_camera(self.play_time);
                     glam::Mat4::look_at_rh(cam_eye, cam_target, glam::Vec3::Y)
-                } else if is_room_vis {
-                    let t_cam = wrap_host_phase_time(self.play_time) * 0.18;
-                    let cam_radius = 9.8f32;
-                    let cam_h = 2.4f32 + (t_cam * 0.7).sin() * 0.6f32;
-                    let cam_x = t_cam.sin() * cam_radius * 0.55f32;
-                    let cam_z = -t_cam.cos() * cam_radius * 0.6f32 - 2.8f32;
-                    glam::Mat4::look_at_rh(
-                        glam::Vec3::new(cam_x, cam_h, cam_z),
-                        glam::Vec3::new(0.0, 0.4, 2.5),
-                        glam::Vec3::new(0.0, 1.0, 0.0),
-                    )
                 } else if state.visualizer_mode == 29 {
                     glam::Mat4::look_at_rh(
                         glam::Vec3::new(0.0, 0.0, -6.5),
@@ -13350,7 +13310,7 @@ impl VulkanEngine {
                 }
             }
 
-            if vis_def.requires_acoustic_waves && (vis_def.id != 31 || state.room_volume_smoke) {
+            if vis_def.requires_acoustic_waves && state.room_volume_smoke {
                 let needs_clear = !self.acoustic_wave_initialized;
                 if needs_clear || !state.is_paused {
                     {
@@ -13468,7 +13428,7 @@ impl VulkanEngine {
                 render_pass_3d.set_pipeline(&self.vumeters_bg_pipeline);
                 render_pass_3d.set_bind_group(0, &self.uniform_bind_group, &[]);
                 render_pass_3d.draw(0..3, 0..1);
-            } else if vis_def.id != 13 && vis_def.id != 22 && vis_def.id != 29 && vis_def.id != 31 {
+            } else if vis_def.id != 13 && vis_def.id != 29 && vis_def.id != 31 {
                 render_pass_3d.set_pipeline(&self.clear_black_pipeline);
                 render_pass_3d.draw(0..3, 0..1);
             }
@@ -13580,8 +13540,6 @@ impl VulkanEngine {
                     render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
                     if vis_def.id == 27 {
                         render_pass.set_bind_group(1, &self.flip_render_bind_group, &[]);
-                    } else if vis_def.id == 30 {
-                        render_pass.set_bind_group(1, &self.acoustic_render_bind_group, &[]);
                     }
                     render_pass.draw(0..3, 0..1);
                 }
@@ -15084,8 +15042,9 @@ mod tests {
 
     #[test]
     fn test_visualizer_curation_and_glass_water_overhaul() {
-        // 1. Verify retired visualizers 8 (Spatial Vectors), 9 (Chrome Ferrofluid), and 10 (Ferrofluid Particle Sim) are removed
-        for retired_id in [8u32, 9, 10] {
+        // 1. Verify retired visualizers 8 (Spatial Vectors), 9 (Chrome Ferrofluid), 10 (Ferrofluid Particle Sim),
+        // 22 (Neon Spatial Room), and 30 (Acoustic Wave Chamber) are removed
+        for retired_id in [8u32, 9, 10, 22, 30] {
             assert!(
                 crate::state::VISUALIZERS.iter().all(|v| v.id != retired_id),
                 "Visualizer ID {} must be removed from VISUALIZERS",
@@ -15131,8 +15090,8 @@ mod tests {
                 include_str!("../../../src/shaders/vis_spectrum_canyon.wgsl"),
             ),
             (
-                "vis_neon_room.wgsl",
-                include_str!("../../../src/shaders/vis_neon_room.wgsl"),
+                "vis_neon_acoustic_room.wgsl",
+                include_str!("../../../src/shaders/vis_neon_acoustic_room.wgsl"),
             ),
             (
                 "vis_synthwave.wgsl",
@@ -15193,8 +15152,8 @@ mod tests {
         );
         assert_eq!(
             VISUALIZERS.len(),
-            21,
-            "All 21 visualizers must be compiled on every platform"
+            19,
+            "All 19 visualizers must be compiled on every platform"
         );
 
         let make_adapter = |name: &str, device_type: wgpu::DeviceType| wgpu::AdapterInfo {
@@ -16142,21 +16101,12 @@ mod tests {
 
     #[test]
     fn test_acoustic_wave_chamber_registration_and_phase_extraction() {
-        let vis = crate::state::VISUALIZERS
-            .iter()
-            .find(|v| v.id == 30)
-            .expect("Visualizer ID 30 (Acoustic Wave Chamber) must be registered");
-        assert_eq!(vis.name, "Acoustic Wave Chamber");
-        assert_eq!(vis.filename, "vis_acoustic_waves.wgsl");
-        assert!(vis.requires_acoustic_waves);
         assert!(
-            !vis.heavy_shader,
-            "Acoustic Wave Chamber must run smoothly by default on Constrained GPUs"
+            crate::state::VISUALIZERS
+                .iter()
+                .all(|v| v.id != 22 && v.id != 30),
+            "Legacy Neon Spatial Room (ID 22) and Acoustic Wave Chamber (ID 30) must be removed"
         );
-        assert!(matches!(
-            vis.pipeline_type,
-            crate::state::PipelineType::FullscreenTriangle
-        ));
 
         let studio = crate::state::VISUALIZERS
             .iter()
@@ -16173,10 +16123,6 @@ mod tests {
                 instances: 1,
             }
         ));
-        assert!(
-            crate::state::VISUALIZERS.iter().any(|v| v.id == 22),
-            "Existing Visualizer ID 22 (Neon Spatial Room) must remain registered"
-        );
         let mut st = crate::state::AppState::new("smoke_default_check.flac".to_string());
         assert!(
             st.room_volume_smoke,

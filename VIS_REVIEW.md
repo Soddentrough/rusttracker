@@ -1,6 +1,6 @@
 # RustTracker Visualization System Review
 
-> **Document Status Note:** Sections 1–6 below are the historical **`2026-07-19`** review snapshot (written when the codebase had `22` registered visualizers and `34` WGSL files). **Section 7 (`2026-11-11` Audit & Resolution Status)** at the bottom of this file reflects current ground truth: **`21` registered visualizers** (`18` enabled in default rotation) and **`35` `.wgsl` files** in `src/shaders/` (**`33` standalone Naga-validated shader modules** + `2` shared include headers `_common.wgsl` and `_glyph_font.wgsl`).
+> **Document Status Note:** Sections 1–6 below are the historical **`2026-07-19`** review snapshot (written when the codebase had `22` registered visualizers and `34` WGSL files). **Section 7 (`2026-11-11` Audit & Resolution Status)** at the bottom of this file reflects current ground truth: **`19` registered visualizers** (`16` enabled in default rotation) and **`33` `.wgsl` files** in `src/shaders/` (**`31` standalone Naga-validated shader modules** + `2` shared include headers `_common.wgsl` and `_glyph_font.wgsl`).
 
 Historical Review Date: 2026-07-19. Historical Scope: all 34 WGSL shaders in
 src/shaders/, the host-side visualization pipeline in src/engine.rs
@@ -318,8 +318,8 @@ P3 (aesthetics/UX):
 =====================================================================
 
 Current Registry & Shader Counts:
-- 21 visualizers registered in state.rs::VISUALIZERS (18 enabled in default rotation; IDs: 0, 25, 24, 1, 3, 4, 5, 6, 7, 13, 14, 16, 19, 20, 22, 23, 27, 28, 29, 30, 31).
-- 33 standalone WGSL shader modules + 2 shared include headers (`_common.wgsl`, `_glyph_font.wgsl`) = 35 `.wgsl` files in `src/shaders/` (all 33 standalone modules pass Naga validation with `Capabilities::empty()`; 19 unreferenced/retired `.wgsl` shaders were purged).
+- 19 visualizers registered in state.rs::VISUALIZERS (16 enabled in default rotation; IDs: 0, 25, 24, 1, 3, 4, 5, 6, 7, 13, 14, 16, 19, 20, 31, 23, 27, 28, 29).
+- 31 standalone WGSL shader modules + 2 shared include headers (`_common.wgsl`, `_glyph_font.wgsl`) = 33 `.wgsl` files in `src/shaders/` (all 31 standalone modules pass Naga validation with `Capabilities::empty()`; 21 unreferenced/retired `.wgsl` shaders were purged).
 
 Critical Findings (Section 2):
 - [C1] Ferrofluidsim particle stride: RESOLVED (repacked to two vec4s = 32B; legacy `ferrofluidsim` shaders subsequently purged in favor of `flip_ferrofluid_compute.wgsl` / `vis_flip_ferrofluid.wgsl`).

@@ -341,6 +341,15 @@ pub(crate) fn matches_visualizer_spec(vis: &str) -> Option<usize> {
                             | "psxfire"
                     ))
                 || (v.id == 6 && matches!(vis_norm.as_str(), "firesim" | "firesimulation"))
+                || (v.id == 31
+                    && matches!(
+                        vis_norm.as_str(),
+                        "neonroom"
+                            | "neonspatialroom"
+                            | "acousticwaves"
+                            | "acousticwavechamber"
+                            | "neonstudio"
+                    ))
         })
 }
 
@@ -7184,8 +7193,8 @@ mod tests {
         }
         let shared_wgsl = total_wgsl - standalone_wgsl;
         assert_eq!(shared_wgsl, 2);
-        assert_eq!(standalone_wgsl, 33);
-        assert_eq!(total_wgsl, 35);
+        assert_eq!(standalone_wgsl, 31);
+        assert_eq!(total_wgsl, 33);
 
         let vis_count = crate::state::VISUALIZERS.len();
         let vis_review = include_str!("../VIS_REVIEW.md");
