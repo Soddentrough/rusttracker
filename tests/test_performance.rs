@@ -427,6 +427,119 @@ async fn run_perf_test() {
             immediate_size: 0,
         });
 
+    let acoustic_render_bind_group_layout =
+        device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("Acoustic Wave Volume Render Layout"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+
+    let acoustic_render_pipeline_layout =
+        device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Acoustic Wave Render Pipeline Layout"),
+            bind_group_layouts: &[
+                Some(&bind_group_layout),
+                Some(&acoustic_render_bind_group_layout),
+            ],
+            immediate_size: 0,
+        });
+
+    let neon_acoustic_render_pipeline_layout_3d =
+        device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Neon Acoustic Studio 3D Render Pipeline Layout"),
+            bind_group_layouts: &[
+                Some(&bind_group_layout),
+                Some(&camera_bind_group_layout),
+                Some(&acoustic_render_bind_group_layout),
+            ],
+            immediate_size: 0,
+        });
+
+    let acoustic_volume_texture = device.create_texture(&TextureDescriptor {
+        label: Some("Acoustic Wave 3D Volume Texture"),
+        size: Extent3d {
+            width: 64,
+            height: 32,
+            depth_or_array_layers: 64,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D3,
+        format: TextureFormat::Rgba8Unorm,
+        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    // Populate realistic standing wave + nodal gradient data so volumetric raymarch executes full density path
+    let acoustic_seed: Vec<u8> = (0..(64 * 32 * 64))
+        .flat_map(|i| {
+            let x = (i % 64) as f32 * 0.25;
+            let s = (x.sin().abs() * 200.0) as u8;
+            let g = (x.cos().abs() * 180.0) as u8;
+            let p = ((x.sin() * 0.45 + 0.5) * 255.0) as u8;
+            [s, g, p, 140]
+        })
+        .collect();
+    queue.write_texture(
+        TexelCopyTextureInfo {
+            texture: &acoustic_volume_texture,
+            mip_level: 0,
+            origin: Origin3d::ZERO,
+            aspect: TextureAspect::All,
+        },
+        &acoustic_seed,
+        TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(64 * 4),
+            rows_per_image: Some(32),
+        },
+        Extent3d {
+            width: 64,
+            height: 32,
+            depth_or_array_layers: 64,
+        },
+    );
+    let acoustic_volume_view =
+        acoustic_volume_texture.create_view(&TextureViewDescriptor::default());
+    let acoustic_volume_sampler = device.create_sampler(&SamplerDescriptor {
+        label: Some("Acoustic Wave Volume Sampler"),
+        address_mode_u: AddressMode::ClampToEdge,
+        address_mode_v: AddressMode::ClampToEdge,
+        address_mode_w: AddressMode::ClampToEdge,
+        mag_filter: FilterMode::Linear,
+        min_filter: FilterMode::Linear,
+        ..Default::default()
+    });
+    let acoustic_render_bind_group = device.create_bind_group(&BindGroupDescriptor {
+        label: Some("Acoustic Wave Volume Render Bind Group"),
+        layout: &acoustic_render_bind_group_layout,
+        entries: &[
+            BindGroupEntry {
+                binding: 0,
+                resource: BindingResource::TextureView(&acoustic_volume_view),
+            },
+            BindGroupEntry {
+                binding: 1,
+                resource: BindingResource::Sampler(&acoustic_volume_sampler),
+            },
+        ],
+    });
+
     // Grid buffers
     let mut vertices = Vec::new();
     let mut indices: Vec<u32> = Vec::new();
@@ -634,6 +747,8 @@ async fn run_perf_test() {
             27 => include_str!("../src/shaders/vis_flip_ferrofluid.wgsl"),
             28 => include_str!("../src/shaders/vis_glass_water.wgsl"),
             29 => include_str!("../src/shaders/vis_spectrum_canyon.wgsl"),
+            30 => include_str!("../src/shaders/vis_acoustic_waves.wgsl"),
+            31 => include_str!("../src/shaders/vis_neon_acoustic_room.wgsl"),
             _ => include_str!("../src/shaders/vis_spectrum.wgsl"),
         }
     };
@@ -660,6 +775,10 @@ async fn run_perf_test() {
             &biolum_render_pipeline_layout
         } else if vis_def.id == 27 {
             &flip_render_pipeline_layout
+        } else if vis_def.id == 30 {
+            &acoustic_render_pipeline_layout
+        } else if vis_def.id == 31 {
+            &neon_acoustic_render_pipeline_layout_3d
         } else if vis_def.id == 23 {
             &lyrics_render_pipeline_layout_3d
         } else if is_3d {
@@ -790,6 +909,8 @@ async fn run_perf_test() {
                 rp.set_bind_group(0, &uniform_bind_group, &[]);
                 if vis_def.id == 27 {
                     rp.set_bind_group(1, &flip_render_bind_group, &[]);
+                } else if vis_def.id == 30 {
+                    rp.set_bind_group(1, &acoustic_render_bind_group, &[]);
                 }
                 if is_3d {
                     if vis_def.id == 23 {
@@ -804,6 +925,9 @@ async fn run_perf_test() {
                         rp.set_index_buffer(quad_index_buffer.slice(..), IndexFormat::Uint32);
                         rp.draw_indexed(0..quad_index_count, 0, 0..65536);
                     } else {
+                        if vis_def.id == 31 {
+                            rp.set_bind_group(2, &acoustic_render_bind_group, &[]);
+                        }
                         rp.set_vertex_buffer(0, grid_vertex_buffer.slice(..));
                         rp.set_index_buffer(grid_index_buffer.slice(..), IndexFormat::Uint32);
                         let (draw_index_count, instances) = match vis_def.pipeline_type {
@@ -888,6 +1012,8 @@ async fn run_perf_test() {
                 rp.set_bind_group(0, &uniform_bind_group, &[]);
                 if vis_def.id == 27 {
                     rp.set_bind_group(1, &flip_render_bind_group, &[]);
+                } else if vis_def.id == 30 {
+                    rp.set_bind_group(1, &acoustic_render_bind_group, &[]);
                 }
                 if is_3d {
                     if vis_def.id == 23 {
@@ -902,6 +1028,9 @@ async fn run_perf_test() {
                         rp.set_index_buffer(quad_index_buffer.slice(..), IndexFormat::Uint32);
                         rp.draw_indexed(0..quad_index_count, 0, 0..65536);
                     } else {
+                        if vis_def.id == 31 {
+                            rp.set_bind_group(2, &acoustic_render_bind_group, &[]);
+                        }
                         rp.set_vertex_buffer(0, grid_vertex_buffer.slice(..));
                         rp.set_index_buffer(grid_index_buffer.slice(..), IndexFormat::Uint32);
                         let (draw_index_count, instances) = match vis_def.pipeline_type {
@@ -6333,6 +6462,1433 @@ fn test_gpu_video_two_plane_nv12_p010_and_quarter_res_border_blur() {
                     && center_p010[1].abs_diff(center_p010[2]) <= 2
                     && center_p010[0] > 100,
                 "2-Plane 10-bit P010 neutral (512<<6) chroma must render neutral grey without tint, got {center_p010:?}"
+            );
+        }
+    });
+}
+
+#[test]
+fn test_acoustic_wave_chamber_compute_and_nodal_interference() {
+    pollster::block_on(async {
+        let instance = Instance::new(InstanceDescriptor {
+            backends: Backends::PRIMARY,
+            flags: InstanceFlags::default(),
+            backend_options: BackendOptions::default(),
+            display: None,
+            memory_budget_thresholds: MemoryBudgetThresholds::default(),
+        });
+        let adapter = instance
+            .request_adapter(&RequestAdapterOptions {
+                power_preference: PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            })
+            .await
+            .expect("GPU adapter required for acoustic wave compute test");
+        let (device, queue) = adapter
+            .request_device(&DeviceDescriptor {
+                label: Some("Acoustic Wave Test Device"),
+                required_features: Features::empty(),
+                required_limits: Limits::default(),
+                memory_hints: MemoryHints::default(),
+                ..Default::default()
+            })
+            .await
+            .expect("GPU device required");
+
+        const VOXELS: usize = 64 * 32 * 64;
+        let uniform_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("Acoustic Test Uniforms"),
+            size: std::mem::size_of::<engine::AudioUniforms>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let wave_a_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("Acoustic Test Wave A"),
+            size: (VOXELS * 16) as u64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let wave_b_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("Acoustic Test Wave B"),
+            size: (VOXELS * 16) as u64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let packed_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("Acoustic Test Packed"),
+            size: (VOXELS * 4) as u64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let staging_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("Acoustic Test Readback"),
+            size: (VOXELS * 4) as u64,
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("Acoustic Test Compute Layout"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let bind_group = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Acoustic Test Compute Bind Group"),
+            layout: &layout,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buf.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: wave_a_buf.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: wave_b_buf.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 3,
+                    resource: packed_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let compute_src =
+            resolve_shader_includes(include_str!("../src/shaders/acoustic_wave_compute.wgsl"));
+        let shader = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("Acoustic Test Compute Shader"),
+            source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&compute_src)),
+        });
+        let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Acoustic Test Pipeline Layout"),
+            bind_group_layouts: &[Some(&layout)],
+            immediate_size: 0,
+        });
+        let clear_pipe = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("Acoustic Test Clear"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("cs_clear_waves"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let step_ab_pipe = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("Acoustic Test Step AB"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("cs_step_ab"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let step_ba_pipe = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("Acoustic Test Step BA"),
+            layout: Some(&pipeline_layout),
+            module: &shader,
+            entry_point: Some("cs_step_ba"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let run_case = |phase_fr: f32| -> Vec<u32> {
+            let mut uniforms: engine::AudioUniforms = bytemuck::Zeroable::zeroed();
+            uniforms.mode = 30;
+            uniforms.num_channels = 12;
+            uniforms.num_spatial_channels = 12;
+            uniforms.spatial_channels[0] = 1.0; // FL (-3.8, -0.25, 5.5)
+            uniforms.spatial_channels[1] = 1.0; // FR (+3.8, -0.25, 5.5)
+            uniforms.channel_phases[0] = 0.0;
+            uniforms.channel_phases[1] = phase_fr;
+            uniforms.channel_phases[16] = 0.25;
+            uniforms.channel_phases[31] = 1.0;
+            uniforms.frame_dt = 1.0 / 60.0;
+            queue.write_buffer(&uniform_buf, 0, bytemuck::cast_slice(&[uniforms]));
+
+            let mut clear_enc = device.create_command_encoder(&CommandEncoderDescriptor::default());
+            {
+                let mut cp = clear_enc.begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("Acoustic Test Clear Pass"),
+                    timestamp_writes: None,
+                });
+                cp.set_pipeline(&clear_pipe);
+                cp.set_bind_group(0, Some(&bind_group), &[]);
+                cp.dispatch_workgroups(8, 8, 16);
+            }
+            queue.submit(Some(clear_enc.finish()));
+
+            for frame in 0..60u32 {
+                uniforms.frame_count = frame;
+                uniforms.channel_phases[17] =
+                    (frame as f32 * 0.40).rem_euclid(std::f32::consts::TAU);
+                queue.write_buffer(&uniform_buf, 0, bytemuck::cast_slice(&[uniforms]));
+
+                let mut step_enc =
+                    device.create_command_encoder(&CommandEncoderDescriptor::default());
+                {
+                    let mut cp = step_enc.begin_compute_pass(&ComputePassDescriptor {
+                        label: Some("Acoustic Test Step Pass"),
+                        timestamp_writes: None,
+                    });
+                    cp.set_bind_group(0, Some(&bind_group), &[]);
+                    cp.set_pipeline(&step_ab_pipe);
+                    cp.dispatch_workgroups(8, 8, 16);
+                    cp.set_pipeline(&step_ba_pipe);
+                    cp.dispatch_workgroups(8, 8, 16);
+                }
+                if frame == 59 {
+                    step_enc.copy_buffer_to_buffer(
+                        &packed_buf,
+                        0,
+                        &staging_buf,
+                        0,
+                        (VOXELS * 4) as u64,
+                    );
+                }
+                queue.submit(Some(step_enc.finish()));
+            }
+
+            let slice = staging_buf.slice(..);
+            slice.map_async(MapMode::Read, |r| r.unwrap());
+            let _ = device.poll(PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            });
+            let mapped = slice.get_mapped_range();
+            let voxels: Vec<u32> = bytemuck::cast_slice(&mapped).to_vec();
+            drop(mapped);
+            staging_buf.unmap();
+            voxels
+        };
+
+        let in_phase = run_case(0.0);
+        let out_phase = run_case(std::f32::consts::PI);
+
+        let vox_at = |buf: &[u32], ix: usize, iy: usize, iz: usize| -> [u8; 4] {
+            buf[ix + iy * 64 + iz * 2048].to_le_bytes()
+        };
+
+        let mut in_mid_r_sum = 0.0f32;
+        let mut out_mid_r_sum = 0.0f32;
+        let mut out_mid_g_sum = 0.0f32;
+        let mut mid_pair_diff_max = 0.0f32;
+        let mut count = 0usize;
+
+        for iz in 38..=56 {
+            for iy in 5..=12 {
+                let in_l = vox_at(&in_phase, 31, iy, iz);
+                let in_r = vox_at(&in_phase, 32, iy, iz);
+                let out_l = vox_at(&out_phase, 31, iy, iz);
+                let out_r = vox_at(&out_phase, 32, iy, iz);
+
+                in_mid_r_sum += (in_l[0] as f32 + in_r[0] as f32) * 0.5;
+                out_mid_r_sum += (out_l[0] as f32 + out_r[0] as f32) * 0.5;
+                out_mid_g_sum += (out_l[1] as f32 + out_r[1] as f32) * 0.5;
+
+                // Trilinear pressure average right at the X=0 median plane (midpoint of ix=31 and ix=32)
+                let p_mid_signed = ((out_l[2] as f32 - 127.5) + (out_r[2] as f32 - 127.5)) * 0.5;
+                mid_pair_diff_max = mid_pair_diff_max.max(p_mid_signed.abs());
+                count += 1;
+            }
+        }
+
+        let in_mid_r_avg = in_mid_r_sum / count as f32;
+        let out_mid_r_avg = out_mid_r_sum / count as f32;
+        let out_mid_g_avg = out_mid_g_sum / count as f32;
+
+        // Also check off-axis standing energy near FL in the out-of-phase run
+        let mut off_axis_r_sum = 0.0f32;
+        let mut off_count = 0usize;
+        for iz in 44..=56 {
+            for iy in 5..=10 {
+                for ix in 18..=24 {
+                    off_axis_r_sum += vox_at(&out_phase, ix, iy, iz)[0] as f32;
+                    off_count += 1;
+                }
+            }
+        }
+        let off_axis_r_avg = off_axis_r_sum / off_count as f32;
+
+        assert!(
+            in_mid_r_avg > 20.0,
+            "Constructive in-phase FL+FR must create strong X=0 antinode pressure, got avg R={in_mid_r_avg}"
+        );
+        assert!(
+            in_mid_r_avg > out_mid_r_avg * 2.5,
+            "Constructive X=0 pressure ({in_mid_r_avg}) must strongly exceed destructive cancellation ({out_mid_r_avg})"
+        );
+        assert!(
+            mid_pair_diff_max <= 3.0,
+            "Destructive out-of-phase median X=0 pressure interpolation must cancel near zero, got max |p_mid|={mid_pair_diff_max} bytes"
+        );
+        assert!(
+            off_axis_r_avg > 15.0 && out_mid_g_avg > 10.0,
+            "Out-of-phase run must maintain strong off-axis lobes ({off_axis_r_avg}) and high X=0 gradient velocity ({out_mid_g_avg})"
+        );
+
+        // --- Heavy 12-channel + LFE + 3-object deep-bass slam: must stay semi-transparent (no whiteout) ---
+        let mut bass_uniforms: engine::AudioUniforms = bytemuck::Zeroable::zeroed();
+        bass_uniforms.mode = 30;
+        bass_uniforms.num_channels = 12;
+        bass_uniforms.num_spatial_channels = 12;
+        bass_uniforms.aspect_ratio = 640.0 / 360.0;
+        bass_uniforms.spatial_channels = [1.0; 16];
+        for bin in 1..20 {
+            bass_uniforms.spectrum[bin] = 65.0;
+        }
+        for bin in 20..80 {
+            bass_uniforms.spectrum[bin] = 20.0;
+        }
+        bass_uniforms.channel_phases[16] = 0.08; // heavy bass centroid
+        bass_uniforms.channel_phases[18] = -2.8;
+        bass_uniforms.channel_phases[19] = 2.0;
+        bass_uniforms.channel_phases[20] = 2.6;
+        bass_uniforms.channel_phases[21] = 0.85;
+        bass_uniforms.channel_phases[22] = 2.6;
+        bass_uniforms.channel_phases[23] = 1.1;
+        bass_uniforms.channel_phases[24] = -1.8;
+        bass_uniforms.channel_phases[25] = 0.85;
+        bass_uniforms.channel_phases[26] = 0.4;
+        bass_uniforms.channel_phases[27] = 0.6;
+        bass_uniforms.channel_phases[28] = 1.9;
+        bass_uniforms.channel_phases[29] = 0.85;
+        bass_uniforms.channel_phases[30] = 1.0; // full bass kick
+        bass_uniforms.channel_phases[31] = 1.0; // full sim intensity
+        bass_uniforms.frame_dt = 1.0 / 60.0;
+
+        let mut clear_enc = device.create_command_encoder(&CommandEncoderDescriptor::default());
+        {
+            let mut cp = clear_enc.begin_compute_pass(&ComputePassDescriptor {
+                label: Some("Acoustic Bass Test Clear Pass"),
+                timestamp_writes: None,
+            });
+            cp.set_pipeline(&clear_pipe);
+            cp.set_bind_group(0, Some(&bind_group), &[]);
+            cp.dispatch_workgroups(8, 8, 16);
+        }
+        queue.submit(Some(clear_enc.finish()));
+
+        let bass_vol_tex = device.create_texture(&TextureDescriptor {
+            label: Some("Acoustic Bass Test Volume 3D"),
+            size: Extent3d {
+                width: 64,
+                height: 32,
+                depth_or_array_layers: 64,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D3,
+            format: TextureFormat::Rgba8Unorm,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let bass_vol_view = bass_vol_tex.create_view(&TextureViewDescriptor::default());
+        let bass_vol_sampler = device.create_sampler(&SamplerDescriptor {
+            label: Some("Acoustic Bass Test Volume Sampler"),
+            address_mode_u: AddressMode::ClampToEdge,
+            address_mode_v: AddressMode::ClampToEdge,
+            address_mode_w: AddressMode::ClampToEdge,
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            ..Default::default()
+        });
+
+        for frame in 0..90u32 {
+            bass_uniforms.frame_count = frame;
+            bass_uniforms.smooth_time = frame as f32 * (1.0 / 60.0);
+            bass_uniforms.channel_phases[17] = (bass_uniforms.channel_phases[17]
+                + (1.0 / 60.0) * (28.0 + 14.0 * bass_uniforms.channel_phases[16]))
+                .rem_euclid(std::f32::consts::TAU);
+            queue.write_buffer(&uniform_buf, 0, bytemuck::cast_slice(&[bass_uniforms]));
+
+            let mut step_enc = device.create_command_encoder(&CommandEncoderDescriptor::default());
+            {
+                let mut cp = step_enc.begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("Acoustic Bass Test Step Pass"),
+                    timestamp_writes: None,
+                });
+                cp.set_bind_group(0, Some(&bind_group), &[]);
+                cp.set_pipeline(&step_ab_pipe);
+                cp.dispatch_workgroups(8, 8, 16);
+                cp.set_pipeline(&step_ba_pipe);
+                cp.dispatch_workgroups(8, 8, 16);
+            }
+            if frame == 89 {
+                step_enc.copy_buffer_to_texture(
+                    TexelCopyBufferInfo {
+                        buffer: &packed_buf,
+                        layout: TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(64 * 4),
+                            rows_per_image: Some(32),
+                        },
+                    },
+                    TexelCopyTextureInfo {
+                        texture: &bass_vol_tex,
+                        mip_level: 0,
+                        origin: Origin3d::ZERO,
+                        aspect: TextureAspect::All,
+                    },
+                    Extent3d {
+                        width: 64,
+                        height: 32,
+                        depth_or_array_layers: 64,
+                    },
+                );
+            }
+            queue.submit(Some(step_enc.finish()));
+        }
+
+        let r_w = 640u32;
+        let r_h = 360u32;
+        let render_bgl0 = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("Acoustic Bass Test Render BGL0"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let render_bgl1 = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("Acoustic Bass Test Render BGL1"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let render_bg0 = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Acoustic Bass Test Render BG0"),
+            layout: &render_bgl0,
+            entries: &[BindGroupEntry {
+                binding: 0,
+                resource: uniform_buf.as_entire_binding(),
+            }],
+        });
+        let render_bg1 = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Acoustic Bass Test Render BG1"),
+            layout: &render_bgl1,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: BindingResource::TextureView(&bass_vol_view),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: BindingResource::Sampler(&bass_vol_sampler),
+                },
+            ],
+        });
+
+        let vis_src =
+            resolve_shader_includes(include_str!("../src/shaders/vis_acoustic_waves.wgsl"));
+        let vis_mod = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("Acoustic Bass Test Render Shader"),
+            source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&vis_src)),
+        });
+        let render_pipe_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Acoustic Bass Test Render Pipeline Layout"),
+            bind_group_layouts: &[Some(&render_bgl0), Some(&render_bgl1)],
+            immediate_size: 0,
+        });
+        let render_pipe = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("Acoustic Bass Test Render Pipeline"),
+            layout: Some(&render_pipe_layout),
+            vertex: VertexState {
+                module: &vis_mod,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: PipelineCompilationOptions::default(),
+            },
+            fragment: Some(FragmentState {
+                module: &vis_mod,
+                entry_point: Some("fs_main"),
+                targets: &[Some(ColorTargetState {
+                    format: TextureFormat::Rgba8UnormSrgb,
+                    blend: Some(BlendState::REPLACE),
+                    write_mask: ColorWrites::ALL,
+                })],
+                compilation_options: PipelineCompilationOptions::default(),
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                ..Default::default()
+            },
+            depth_stencil: None,
+            multisample: MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let render_target = device.create_texture(&TextureDescriptor {
+            label: Some("Acoustic Bass Test RenderTarget"),
+            size: Extent3d {
+                width: r_w,
+                height: r_h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8UnormSrgb,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let render_view = render_target.create_view(&TextureViewDescriptor::default());
+        let img_readback_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("Acoustic Bass Test Image Readback"),
+            size: (r_w * r_h * 4) as u64,
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut render_enc = device.create_command_encoder(&CommandEncoderDescriptor::default());
+        {
+            let mut rp = render_enc.begin_render_pass(&RenderPassDescriptor {
+                label: Some("Acoustic Bass Test Render Pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &render_view,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Clear(Color::BLACK),
+                        store: StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rp.set_pipeline(&render_pipe);
+            rp.set_bind_group(0, &render_bg0, &[]);
+            rp.set_bind_group(1, &render_bg1, &[]);
+            rp.draw(0..3, 0..1);
+        }
+        render_enc.copy_texture_to_buffer(
+            TexelCopyTextureInfo {
+                texture: &render_target,
+                mip_level: 0,
+                origin: Origin3d::ZERO,
+                aspect: TextureAspect::All,
+            },
+            TexelCopyBufferInfo {
+                buffer: &img_readback_buf,
+                layout: TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(r_w * 4),
+                    rows_per_image: Some(r_h),
+                },
+            },
+            Extent3d {
+                width: r_w,
+                height: r_h,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(render_enc.finish()));
+
+        let img_slice = img_readback_buf.slice(..);
+        img_slice.map_async(MapMode::Read, |r| r.unwrap());
+        let _ = device.poll(PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        let mapped_img = img_slice.get_mapped_range();
+        let rgba_bytes = mapped_img.to_vec();
+        drop(mapped_img);
+        img_readback_buf.unmap();
+
+        let img = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(r_w, r_h, rgba_bytes.clone())
+            .expect("640x360 RGBA buffer must build image");
+        img.save("target/vis_acoustic_waves_bass.png")
+            .expect("Save target/vis_acoustic_waves_bass.png");
+
+        let mut white_pixels = 0usize;
+        let mut dark_pixels = 0usize;
+        let mut luma_sum = 0.0f64;
+        for &[r, g, b, _] in rgba_bytes.as_chunks::<4>().0 {
+            if r > 215 && g > 215 && b > 215 {
+                white_pixels += 1;
+            }
+            let luma = (0.2126 * r as f64 + 0.7152 * g as f64 + 0.0722 * b as f64) / 255.0;
+            if luma < 0.25 {
+                dark_pixels += 1;
+            }
+            luma_sum += luma;
+        }
+        let avg_luma = luma_sum / (r_w * r_h) as f64;
+        println!(
+            "Acoustic bass slam render: avg_luma={avg_luma:.4}, white_pixels={white_pixels}, dark_pixels={dark_pixels}"
+        );
+        assert_eq!(
+            white_pixels, 0,
+            "Heavy 12ch+LFE bass slam must not bleach viewport to white (got {white_pixels} white pixels)"
+        );
+        assert!(
+            avg_luma < 0.42 && dark_pixels > 5000,
+            "Heavy bass cloud must remain semi-transparent with dark chamber/nodal visibility (avg_luma={avg_luma:.4}, dark_pixels={dark_pixels})"
+        );
+    });
+}
+
+#[test]
+fn test_neon_acoustic_studio_smoke_blasts_and_toggle() {
+    pollster::block_on(async {
+        let instance = Instance::new(InstanceDescriptor {
+            backends: Backends::PRIMARY,
+            flags: InstanceFlags::default(),
+            backend_options: BackendOptions::default(),
+            display: None,
+            memory_budget_thresholds: MemoryBudgetThresholds::default(),
+        });
+        let adapter = instance
+            .request_adapter(&RequestAdapterOptions {
+                power_preference: PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+            })
+            .await
+            .expect("GPU adapter required for Neon Acoustic Studio test");
+        let has_timestamp_query = adapter.features().contains(Features::TIMESTAMP_QUERY);
+        let required_features = if has_timestamp_query {
+            Features::TIMESTAMP_QUERY
+        } else {
+            Features::empty()
+        };
+        let (device, queue) = adapter
+            .request_device(&DeviceDescriptor {
+                label: Some("Neon Acoustic Studio Test Device"),
+                required_features,
+                required_limits: Limits::default(),
+                memory_hints: MemoryHints::default(),
+                ..Default::default()
+            })
+            .await
+            .expect("GPU device required");
+
+        const VOXELS: usize = 64 * 32 * 64;
+        let uniform_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("Studio Test Uniforms"),
+            size: std::mem::size_of::<engine::AudioUniforms>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let wave_a_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("Studio Test Wave A"),
+            size: (VOXELS * 16) as u64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let wave_b_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("Studio Test Wave B"),
+            size: (VOXELS * 16) as u64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let packed_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("Studio Test Packed"),
+            size: (VOXELS * 4) as u64,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let comp_bgl = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("Studio Test Compute BGL"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let comp_bg = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Studio Test Compute BG"),
+            layout: &comp_bgl,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buf.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: wave_a_buf.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: wave_b_buf.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 3,
+                    resource: packed_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let compute_src =
+            resolve_shader_includes(include_str!("../src/shaders/acoustic_wave_compute.wgsl"));
+        let comp_mod = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("Studio Test Compute Shader"),
+            source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&compute_src)),
+        });
+        let comp_pipe_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Studio Test Compute Pipeline Layout"),
+            bind_group_layouts: &[Some(&comp_bgl)],
+            immediate_size: 0,
+        });
+        let clear_pipe = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("Studio Test Clear"),
+            layout: Some(&comp_pipe_layout),
+            module: &comp_mod,
+            entry_point: Some("cs_clear_waves"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let step_ab_pipe = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("Studio Test Step AB"),
+            layout: Some(&comp_pipe_layout),
+            module: &comp_mod,
+            entry_point: Some("cs_step_ab"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let step_ba_pipe = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("Studio Test Step BA"),
+            layout: Some(&comp_pipe_layout),
+            module: &comp_mod,
+            entry_point: Some("cs_step_ba"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let r_w = 640u32;
+        let r_h = 360u32;
+        let mut uniforms: engine::AudioUniforms = bytemuck::Zeroable::zeroed();
+        uniforms.mode = 31;
+        uniforms.num_channels = 12;
+        uniforms.num_spatial_channels = 12;
+        uniforms.aspect_ratio = r_w as f32 / r_h as f32;
+        uniforms.spatial_channels = [1.0; 16];
+        for bin in 1..20 {
+            uniforms.spectrum[bin] = 65.0;
+        }
+        for bin in 20..80 {
+            uniforms.spectrum[bin] = 20.0;
+        }
+        uniforms.channel_phases[16] = 0.08;
+        uniforms.channel_phases[18] = -2.8;
+        uniforms.channel_phases[19] = 2.0;
+        uniforms.channel_phases[20] = 2.6;
+        uniforms.channel_phases[21] = 0.85;
+        uniforms.channel_phases[22] = 2.6;
+        uniforms.channel_phases[23] = 1.1;
+        uniforms.channel_phases[24] = -1.8;
+        uniforms.channel_phases[25] = 0.85;
+        uniforms.channel_phases[26] = 0.4;
+        uniforms.channel_phases[27] = 0.6;
+        uniforms.channel_phases[28] = 1.9;
+        uniforms.channel_phases[29] = 0.85;
+        uniforms.channel_phases[30] = 1.0;
+        uniforms.channel_phases[31] = 1.0;
+        uniforms.frame_dt = 1.0 / 60.0;
+
+        let vol_tex = device.create_texture(&TextureDescriptor {
+            label: Some("Studio Test Volume 3D"),
+            size: Extent3d {
+                width: 64,
+                height: 32,
+                depth_or_array_layers: 64,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D3,
+            format: TextureFormat::Rgba8Unorm,
+            usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let vol_view = vol_tex.create_view(&TextureViewDescriptor::default());
+        let vol_sampler = device.create_sampler(&SamplerDescriptor {
+            label: Some("Studio Test Volume Sampler"),
+            address_mode_u: AddressMode::ClampToEdge,
+            address_mode_v: AddressMode::ClampToEdge,
+            address_mode_w: AddressMode::ClampToEdge,
+            mag_filter: FilterMode::Linear,
+            min_filter: FilterMode::Linear,
+            ..Default::default()
+        });
+
+        let mut clear_enc = device.create_command_encoder(&CommandEncoderDescriptor::default());
+        {
+            let mut cp = clear_enc.begin_compute_pass(&ComputePassDescriptor {
+                label: Some("Studio Test Clear Pass"),
+                timestamp_writes: None,
+            });
+            cp.set_pipeline(&clear_pipe);
+            cp.set_bind_group(0, Some(&comp_bg), &[]);
+            cp.dispatch_workgroups(8, 8, 16);
+        }
+        queue.submit(Some(clear_enc.finish()));
+
+        for frame in 0..90u32 {
+            uniforms.frame_count = frame;
+            uniforms.smooth_time = frame as f32 * (1.0 / 60.0);
+            uniforms.channel_phases[17] = (uniforms.channel_phases[17]
+                + (1.0 / 60.0) * (28.0 + 14.0 * uniforms.channel_phases[16]))
+                .rem_euclid(std::f32::consts::TAU);
+            queue.write_buffer(&uniform_buf, 0, bytemuck::cast_slice(&[uniforms]));
+
+            let mut step_enc = device.create_command_encoder(&CommandEncoderDescriptor::default());
+            {
+                let mut cp = step_enc.begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("Studio Test Step Pass"),
+                    timestamp_writes: None,
+                });
+                cp.set_bind_group(0, Some(&comp_bg), &[]);
+                cp.set_pipeline(&step_ab_pipe);
+                cp.dispatch_workgroups(8, 8, 16);
+                cp.set_pipeline(&step_ba_pipe);
+                cp.dispatch_workgroups(8, 8, 16);
+            }
+            if frame == 89 {
+                step_enc.copy_buffer_to_texture(
+                    TexelCopyBufferInfo {
+                        buffer: &packed_buf,
+                        layout: TexelCopyBufferLayout {
+                            offset: 0,
+                            bytes_per_row: Some(64 * 4),
+                            rows_per_image: Some(32),
+                        },
+                    },
+                    TexelCopyTextureInfo {
+                        texture: &vol_tex,
+                        mip_level: 0,
+                        origin: Origin3d::ZERO,
+                        aspect: TextureAspect::All,
+                    },
+                    Extent3d {
+                        width: 64,
+                        height: 32,
+                        depth_or_array_layers: 64,
+                    },
+                );
+            }
+            queue.submit(Some(step_enc.finish()));
+        }
+
+        // Synchronize smooth_time and CameraUniforms look_at_rh eye position (Shot 0 Master View)
+        let render_smooth_time = 1.50f32;
+        uniforms.smooth_time = render_smooth_time;
+        let (cam_eye, cam_target) =
+            engine::compute_neon_acoustic_studio_camera(render_smooth_time as f64);
+        let cam_view = glam::Mat4::look_at_rh(cam_eye, cam_target, glam::Vec3::Y);
+        let cam_proj = glam::Mat4::perspective_rh_gl(
+            64.0_f32.to_radians(),
+            r_w as f32 / r_h as f32,
+            0.1,
+            1000.0,
+        );
+        let camera_uniforms = engine::CameraUniforms {
+            view_matrix: cam_view.to_cols_array_2d(),
+            proj_matrix: cam_proj.to_cols_array_2d(),
+        };
+        let camera_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("Studio Test Camera Uniforms"),
+            size: std::mem::size_of::<engine::CameraUniforms>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&camera_buf, 0, bytemuck::cast_slice(&[camera_uniforms]));
+
+        let (room_verts, room_inds) = engine::generate_neon_room_mesh();
+        let room_vb = device.create_buffer(&BufferDescriptor {
+            label: Some("Studio Test Room VB"),
+            size: (room_verts.len() * std::mem::size_of::<engine::Vertex>()) as u64,
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&room_vb, 0, bytemuck::cast_slice(&room_verts));
+        let room_ib = device.create_buffer(&BufferDescriptor {
+            label: Some("Studio Test Room IB"),
+            size: (room_inds.len() * std::mem::size_of::<u32>()) as u64,
+            usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&room_ib, 0, bytemuck::cast_slice(&room_inds));
+        let room_index_count = room_inds.len() as u32;
+
+        let bgl0 = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("Studio Test BGL0"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let bgl1 = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("Studio Test BGL1"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let bgl2 = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("Studio Test BGL2"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Texture {
+                        sample_type: TextureSampleType::Float { filterable: true },
+                        view_dimension: TextureViewDimension::D3,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::FRAGMENT,
+                    ty: BindingType::Sampler(SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let bg0 = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Studio Test BG0"),
+            layout: &bgl0,
+            entries: &[BindGroupEntry {
+                binding: 0,
+                resource: uniform_buf.as_entire_binding(),
+            }],
+        });
+        let bg1 = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Studio Test BG1"),
+            layout: &bgl1,
+            entries: &[BindGroupEntry {
+                binding: 0,
+                resource: camera_buf.as_entire_binding(),
+            }],
+        });
+        let bg2 = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Studio Test BG2"),
+            layout: &bgl2,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: BindingResource::TextureView(&vol_view),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: BindingResource::Sampler(&vol_sampler),
+                },
+            ],
+        });
+
+        let vis_src =
+            resolve_shader_includes(include_str!("../src/shaders/vis_neon_acoustic_room.wgsl"));
+        let vis_mod = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("Studio Test Render Shader"),
+            source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&vis_src)),
+        });
+        let render_pipe_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Studio Test Render Pipeline Layout"),
+            bind_group_layouts: &[Some(&bgl0), Some(&bgl1), Some(&bgl2)],
+            immediate_size: 0,
+        });
+        let render_pipe = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("Studio Test Render Pipeline"),
+            layout: Some(&render_pipe_layout),
+            vertex: VertexState {
+                module: &vis_mod,
+                entry_point: Some("vs_main_3d"),
+                buffers: &[engine::Vertex::desc()],
+                compilation_options: PipelineCompilationOptions::default(),
+            },
+            fragment: Some(FragmentState {
+                module: &vis_mod,
+                entry_point: Some("fs_main"),
+                targets: &[Some(ColorTargetState {
+                    format: TextureFormat::Rgba8UnormSrgb,
+                    blend: Some(BlendState::REPLACE),
+                    write_mask: ColorWrites::ALL,
+                })],
+                compilation_options: PipelineCompilationOptions::default(),
+            }),
+            primitive: PrimitiveState {
+                topology: PrimitiveTopology::TriangleList,
+                front_face: FrontFace::Ccw,
+                cull_mode: None,
+                ..Default::default()
+            },
+            depth_stencil: Some(DepthStencilState {
+                format: TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(CompareFunction::LessEqual),
+                stencil: StencilState::default(),
+                bias: DepthBiasState::default(),
+            }),
+            multisample: MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let render_target = device.create_texture(&TextureDescriptor {
+            label: Some("Studio Test Color Target"),
+            size: Extent3d {
+                width: r_w,
+                height: r_h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Rgba8UnormSrgb,
+            usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let render_view = render_target.create_view(&TextureViewDescriptor::default());
+        let depth_tex = device.create_texture(&TextureDescriptor {
+            label: Some("Studio Test Depth Target"),
+            size: Extent3d {
+                width: r_w,
+                height: r_h,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: TextureDimension::D2,
+            format: TextureFormat::Depth32Float,
+            usage: TextureUsages::RENDER_ATTACHMENT,
+            view_formats: &[],
+        });
+        let depth_view = depth_tex.create_view(&TextureViewDescriptor::default());
+        let img_readback_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("Studio Test Readback"),
+            size: (r_w * r_h * 4) as u64,
+            usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let mut perf_uniforms = uniforms;
+        perf_uniforms._pad2 = 0.0;
+
+        let render_with_smoke = |smoke_pad: f32, out_path: &str| -> Vec<u8> {
+            let mut u = uniforms;
+            u._pad2 = smoke_pad;
+            queue.write_buffer(&uniform_buf, 0, bytemuck::cast_slice(&[u]));
+
+            let mut enc = device.create_command_encoder(&CommandEncoderDescriptor::default());
+            {
+                let mut rp = enc.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("Studio Test Render Pass"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view: &render_view,
+                        resolve_target: None,
+                        ops: Operations {
+                            load: LoadOp::Clear(Color::BLACK),
+                            store: StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                        view: &depth_view,
+                        depth_ops: Some(Operations {
+                            load: LoadOp::Clear(1.0),
+                            store: StoreOp::Discard,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                rp.set_pipeline(&render_pipe);
+                rp.set_bind_group(0, &bg0, &[]);
+                rp.set_bind_group(1, &bg1, &[]);
+                rp.set_bind_group(2, &bg2, &[]);
+                rp.set_vertex_buffer(0, room_vb.slice(..));
+                rp.set_index_buffer(room_ib.slice(..), IndexFormat::Uint32);
+                rp.draw_indexed(0..room_index_count, 0, 0..1);
+            }
+            enc.copy_texture_to_buffer(
+                TexelCopyTextureInfo {
+                    texture: &render_target,
+                    mip_level: 0,
+                    origin: Origin3d::ZERO,
+                    aspect: TextureAspect::All,
+                },
+                TexelCopyBufferInfo {
+                    buffer: &img_readback_buf,
+                    layout: TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(r_w * 4),
+                        rows_per_image: Some(r_h),
+                    },
+                },
+                Extent3d {
+                    width: r_w,
+                    height: r_h,
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.submit(Some(enc.finish()));
+
+            let img_slice = img_readback_buf.slice(..);
+            img_slice.map_async(MapMode::Read, |r| r.unwrap());
+            let _ = device.poll(PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            });
+            let mapped = img_slice.get_mapped_range();
+            let bytes = mapped.to_vec();
+            drop(mapped);
+            img_readback_buf.unmap();
+
+            let img = image::ImageBuffer::<image::Rgba<u8>, _>::from_raw(r_w, r_h, bytes.clone())
+                .expect("640x360 RGBA buffer must build image");
+            img.save(out_path).expect("Save PNG image");
+            bytes
+        };
+
+        let rgba_on = render_with_smoke(0.0, "target/vis_neon_acoustic_studio_smoke_on.png");
+        let rgba_off = render_with_smoke(1.0, "target/vis_neon_acoustic_studio_smoke_off.png");
+
+        queue.write_buffer(&uniform_buf, 0, bytemuck::cast_slice(&[perf_uniforms]));
+        for _ in 0..10 {
+            let mut enc = device.create_command_encoder(&CommandEncoderDescriptor::default());
+            {
+                let mut rp = enc.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("Studio Perf Warmup Pass"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view: &render_view,
+                        resolve_target: None,
+                        ops: Operations {
+                            load: LoadOp::Clear(Color::BLACK),
+                            store: StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                        view: &depth_view,
+                        depth_ops: Some(Operations {
+                            load: LoadOp::Clear(1.0),
+                            store: StoreOp::Discard,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                rp.set_pipeline(&render_pipe);
+                rp.set_bind_group(0, &bg0, &[]);
+                rp.set_bind_group(1, &bg1, &[]);
+                rp.set_bind_group(2, &bg2, &[]);
+                rp.set_vertex_buffer(0, room_vb.slice(..));
+                rp.set_index_buffer(room_ib.slice(..), IndexFormat::Uint32);
+                rp.draw_indexed(0..room_index_count, 0, 0..1);
+            }
+            queue.submit(Some(enc.finish()));
+            let _ = device.poll(PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            });
+        }
+
+        if has_timestamp_query {
+            let qs = device.create_query_set(&QuerySetDescriptor {
+                label: Some("Studio Perf Timestamp Query Set"),
+                ty: QueryType::Timestamp,
+                count: 2,
+            });
+            let res_buf = device.create_buffer(&BufferDescriptor {
+                label: Some("Studio Perf Timestamp Resolve"),
+                size: 16,
+                usage: BufferUsages::QUERY_RESOLVE | BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let read_buf = device.create_buffer(&BufferDescriptor {
+                label: Some("Studio Perf Timestamp Read"),
+                size: 16,
+                usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let timestamp_period = queue.get_timestamp_period();
+            let perf_iters = 40u32;
+            let mut total_ms = 0.0f32;
+            for _ in 0..perf_iters {
+                let mut enc = device.create_command_encoder(&CommandEncoderDescriptor::default());
+                {
+                    let mut rp = enc.begin_render_pass(&RenderPassDescriptor {
+                        label: Some("Studio Perf Timed Pass"),
+                        color_attachments: &[Some(RenderPassColorAttachment {
+                            view: &render_view,
+                            resolve_target: None,
+                            ops: Operations {
+                                load: LoadOp::Clear(Color::BLACK),
+                                store: StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                            view: &depth_view,
+                            depth_ops: Some(Operations {
+                                load: LoadOp::Clear(1.0),
+                                store: StoreOp::Discard,
+                            }),
+                            stencil_ops: None,
+                        }),
+                        timestamp_writes: Some(RenderPassTimestampWrites {
+                            query_set: &qs,
+                            beginning_of_pass_write_index: Some(0),
+                            end_of_pass_write_index: Some(1),
+                        }),
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    rp.set_pipeline(&render_pipe);
+                    rp.set_bind_group(0, &bg0, &[]);
+                    rp.set_bind_group(1, &bg1, &[]);
+                    rp.set_bind_group(2, &bg2, &[]);
+                    rp.set_vertex_buffer(0, room_vb.slice(..));
+                    rp.set_index_buffer(room_ib.slice(..), IndexFormat::Uint32);
+                    rp.draw_indexed(0..room_index_count, 0, 0..1);
+                }
+                enc.resolve_query_set(&qs, 0..2, &res_buf, 0);
+                enc.copy_buffer_to_buffer(&res_buf, 0, &read_buf, 0, 16);
+                queue.submit(Some(enc.finish()));
+                let _ = device.poll(PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                });
+                let slice = read_buf.slice(..);
+                let (tx, rx) = std::sync::mpsc::channel();
+                slice.map_async(MapMode::Read, move |res| {
+                    tx.send(res).unwrap();
+                });
+                let _ = device.poll(PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                });
+                rx.recv().unwrap().unwrap();
+                let data = slice.get_mapped_range();
+                let start = u64::from_le_bytes(data[0..8].try_into().unwrap());
+                let end = u64::from_le_bytes(data[8..16].try_into().unwrap());
+                drop(data);
+                read_buf.unmap();
+                if end > start {
+                    total_ms += ((end - start) as f32 * timestamp_period) / 1_000_000.0;
+                }
+            }
+            let full_room_render_ms = total_ms / perf_iters as f32;
+            println!(
+                "Neon Acoustic Studio 640x360 full-mesh GPU render: {full_room_render_ms:.3} ms (budget < 0.700 ms)"
+            );
+            assert!(
+                full_room_render_ms < 0.700,
+                "Full Neon Acoustic Studio 640x360 render exceeded budget: {full_room_render_ms:.3} ms"
+            );
+        }
+
+        let measure = |bytes: &[u8]| -> (f64, usize, usize) {
+            let mut luma_sum = 0.0f64;
+            let mut dark = 0usize;
+            let mut bright_white = 0usize;
+            for &[r, g, b, _] in bytes.as_chunks::<4>().0 {
+                let luma = (0.2126 * r as f64 + 0.7152 * g as f64 + 0.0722 * b as f64) / 255.0;
+                luma_sum += luma;
+                if luma < 0.25 {
+                    dark += 1;
+                }
+                if r > 235 && g > 235 && b > 235 {
+                    bright_white += 1;
+                }
+            }
+            (luma_sum / (r_w * r_h) as f64, dark, bright_white)
+        };
+
+        let (avg_luma_on, dark_pixels_on, bright_white_pixels_on) = measure(&rgba_on);
+        let (avg_luma_off, dark_pixels_off, bright_white_pixels_off) = measure(&rgba_off);
+        let luma_delta = avg_luma_on - avg_luma_off;
+
+        let mut abs_diff_sum = 0u64;
+        for (a, b) in rgba_on
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(rgba_off.as_chunks::<4>().0)
+        {
+            abs_diff_sum += a[0].abs_diff(b[0]) as u64
+                + a[1].abs_diff(b[1]) as u64
+                + a[2].abs_diff(b[2]) as u64;
+        }
+        let mean_abs_channel_diff = abs_diff_sum as f64 / ((r_w * r_h * 3) as f64);
+
+        println!(
+            "Neon Acoustic Studio render: on(luma={avg_luma_on:.4}, dark={dark_pixels_on}, white={bright_white_pixels_on}), off(luma={avg_luma_off:.4}, dark={dark_pixels_off}, white={bright_white_pixels_off}), luma_delta={luma_delta:.4}, mean_abs_channel_diff={mean_abs_channel_diff:.3}"
+        );
+
+        assert!(
+            0.006 < luma_delta && luma_delta < 0.055 && mean_abs_channel_diff > 1.2,
+            "Smoke blasts must be subtly visible by default without washing out the studio (luma_delta={luma_delta:.4}, mean_abs_channel_diff={mean_abs_channel_diff:.3})"
+        );
+        assert!(
+            avg_luma_on < avg_luma_off + 0.055 && avg_luma_on < 0.315 && dark_pixels_on > 120_000,
+            "Heavy bass smoke blasts must preserve baseline studio dark contrast (avg_luma_on={avg_luma_on:.4}, avg_luma_off={avg_luma_off:.4}, dark_pixels_on={dark_pixels_on})"
+        );
+        assert!(
+            bright_white_pixels_on <= bright_white_pixels_off + 30,
+            "Smoke blasts must not cause white clipping beyond clean room highlights (on={bright_white_pixels_on}, off={bright_white_pixels_off})"
+        );
+
+        // Render and verify additional choreographed angles (Shot 1: Sub+Center Stack Hero, Shot 2: Control Room EQ Window Reveal, Shot 3: High Catwalk Panorama)
+        for &(shot_play_time, out_path, label, max_luma, min_dark) in &[
+            (
+                12.5 * 2.88,
+                "target/vis_neon_acoustic_studio_stack_hero.png",
+                "Shot 1 Sub+Center Stack Hero",
+                0.44_f64,
+                65_000_usize,
+            ),
+            (
+                21.0 * 2.88,
+                "target/vis_neon_acoustic_studio_eq_window.png",
+                "Shot 2 EQ Window",
+                0.36_f64,
+                90_000_usize,
+            ),
+            (
+                30.0 * 2.88,
+                "target/vis_neon_acoustic_studio_catwalk.png",
+                "Shot 3 High Catwalk",
+                0.36_f64,
+                90_000_usize,
+            ),
+        ] {
+            let (shot_eye, shot_target) =
+                engine::compute_neon_acoustic_studio_camera(shot_play_time);
+            let shot_view = glam::Mat4::look_at_rh(shot_eye, shot_target, glam::Vec3::Y);
+            let shot_cam = engine::CameraUniforms {
+                view_matrix: shot_view.to_cols_array_2d(),
+                proj_matrix: cam_proj.to_cols_array_2d(),
+            };
+            queue.write_buffer(&camera_buf, 0, bytemuck::cast_slice(&[shot_cam]));
+            let bytes = render_with_smoke(0.0, out_path);
+            let (avg_luma, dark_pixels, bright_white) = measure(&bytes);
+            println!(
+                "Neon Acoustic Studio {label}: luma={avg_luma:.4}, dark={dark_pixels}, white={bright_white}"
+            );
+            assert!(
+                0.05 < avg_luma
+                    && avg_luma < max_luma
+                    && dark_pixels > min_dark
+                    && bright_white < 12_000,
+                "{label} must stay cleanly framed and dark-contrasted (avg_luma={avg_luma:.4}, max_luma={max_luma:.2}, dark={dark_pixels}, min_dark={min_dark}, white={bright_white})"
             );
         }
     });

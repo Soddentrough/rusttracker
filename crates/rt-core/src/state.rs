@@ -319,6 +319,7 @@ pub struct VisualizerDef {
     pub requires_resynth: bool,
     pub requires_flip_ferrofluid: bool,
     pub requires_flip_water: bool,
+    pub requires_acoustic_waves: bool,
     /// True for compute/fillrate-heavy shaders (per-pixel raymarching, multi-octave FBM,
     /// or 3D FLIP hydrodynamic compute + heightfield raymarching) that require a High-tier
     /// GPU to sustain 60+ FPS at high resolutions.
@@ -337,6 +338,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_resynth: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: false,
+        requires_acoustic_waves: false,
         heavy_shader: false,
     },
     VisualizerDef {
@@ -350,6 +352,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_resynth: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: false,
+        requires_acoustic_waves: false,
         heavy_shader: false,
     },
     VisualizerDef {
@@ -363,6 +366,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_resynth: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: false,
+        requires_acoustic_waves: false,
         heavy_shader: false,
     },
     VisualizerDef {
@@ -376,6 +380,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_resynth: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: false,
+        requires_acoustic_waves: false,
         heavy_shader: true,
     },
     VisualizerDef {
@@ -395,6 +400,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_resynth: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: false,
+        requires_acoustic_waves: false,
         heavy_shader: false,
     },
     VisualizerDef {
@@ -414,6 +420,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_resynth: true,
         requires_flip_ferrofluid: false,
         requires_flip_water: false,
+        requires_acoustic_waves: false,
         heavy_shader: false,
     },
     VisualizerDef {
@@ -427,6 +434,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_resynth: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: false,
+        requires_acoustic_waves: false,
         heavy_shader: false,
     },
     VisualizerDef {
@@ -440,6 +448,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_resynth: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: false,
+        requires_acoustic_waves: false,
         heavy_shader: true,
     },
     VisualizerDef {
@@ -453,6 +462,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_resynth: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: false,
+        requires_acoustic_waves: false,
         heavy_shader: true,
     },
     VisualizerDef {
@@ -472,6 +482,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_resynth: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: false,
+        requires_acoustic_waves: false,
         heavy_shader: true,
     },
     VisualizerDef {
@@ -488,6 +499,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_resynth: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: false,
+        requires_acoustic_waves: false,
         heavy_shader: false,
     },
     VisualizerDef {
@@ -501,6 +513,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_resynth: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: false,
+        requires_acoustic_waves: false,
         heavy_shader: true,
     },
     VisualizerDef {
@@ -517,6 +530,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_resynth: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: false,
+        requires_acoustic_waves: false,
         heavy_shader: false,
     },
     VisualizerDef {
@@ -533,6 +547,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_resynth: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: false,
+        requires_acoustic_waves: false,
         heavy_shader: false,
     },
     VisualizerDef {
@@ -549,6 +564,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_resynth: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: false,
+        requires_acoustic_waves: false,
         heavy_shader: false,
     },
     VisualizerDef {
@@ -565,6 +581,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_resynth: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: true,
+        requires_acoustic_waves: false,
         heavy_shader: true,
     },
     VisualizerDef {
@@ -578,6 +595,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_resynth: false,
         requires_flip_ferrofluid: true,
         requires_flip_water: false,
+        requires_acoustic_waves: false,
         heavy_shader: true,
     },
     VisualizerDef {
@@ -591,6 +609,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_resynth: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: false,
+        requires_acoustic_waves: false,
         heavy_shader: true,
     },
     VisualizerDef {
@@ -607,6 +626,38 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_resynth: false,
         requires_flip_ferrofluid: false,
         requires_flip_water: false,
+        requires_acoustic_waves: false,
+        heavy_shader: false,
+    },
+    VisualizerDef {
+        id: 30,
+        name: "Acoustic Wave Chamber",
+        filename: "vis_acoustic_waves.wgsl",
+        description: "Real-time 3D multi-speaker acoustic wave propagation, standing waves & volumetric nodal interference",
+        pipeline_type: PipelineType::FullscreenTriangle,
+        requires_history: false,
+        requires_fire: false,
+        requires_resynth: false,
+        requires_flip_ferrofluid: false,
+        requires_flip_water: false,
+        requires_acoustic_waves: true,
+        heavy_shader: false,
+    },
+    VisualizerDef {
+        id: 31,
+        name: "Neon Acoustic Studio",
+        filename: "vis_neon_acoustic_room.wgsl",
+        description: "3D spatial listening studio with speaker smoke blasts & acoustic wave interference",
+        pipeline_type: PipelineType::Mesh3D {
+            geometry: Geometry::NeonRoom,
+            instances: 1,
+        },
+        requires_history: false,
+        requires_fire: false,
+        requires_resynth: false,
+        requires_flip_ferrofluid: false,
+        requires_flip_water: false,
+        requires_acoustic_waves: true,
         heavy_shader: false,
     },
 ];
@@ -1133,6 +1184,7 @@ pub struct AppState {
     pub cumulative_scrub: f64,
     pub audio_device_lost: bool,
     pub biolum_top_down: bool,
+    pub room_volume_smoke: bool,
     pub selected_audio_device: Option<String>,
     pub available_audio_devices: Vec<String>,
     pub is_mic_input: bool,
@@ -1354,6 +1406,7 @@ impl AppState {
             cumulative_scrub: 0.0,
             audio_device_lost: false,
             biolum_top_down: true,
+            room_volume_smoke: true,
             selected_audio_device: default_audio_device,
             available_audio_devices,
             is_mic_input: is_mic,
@@ -1531,6 +1584,7 @@ impl AppState {
             cumulative_scrub: self.cumulative_scrub,
             audio_device_lost: self.audio_device_lost,
             biolum_top_down: self.biolum_top_down,
+            room_volume_smoke: self.room_volume_smoke,
             selected_audio_device: self.selected_audio_device.clone(),
             available_audio_devices: self.available_audio_devices.clone(),
             is_mic_input: self.is_mic_input,

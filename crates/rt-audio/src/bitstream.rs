@@ -2916,6 +2916,7 @@ mod wasapi_bitstream {
                     profile,
                     buffer_frames,
                     frame_bytes,
+                    active_has_video,
                 ))
             })();
 
@@ -2932,6 +2933,7 @@ mod wasapi_bitstream {
                     profile,
                     buffer_frames,
                     frame_bytes,
+                    active_has_video,
                 )) => {
                     let out_rate = if stream_type == WasapiStreamType::CompressedBitstream {
                         decoder_sample_rate

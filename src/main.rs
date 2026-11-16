@@ -171,6 +171,7 @@ struct Args {
     register_steam: bool,
 }
 
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn env_flag_enabled(val: Option<&str>) -> bool {
     val.is_some_and(|v| {
         let trimmed = v.trim();
@@ -178,6 +179,7 @@ pub(crate) fn env_flag_enabled(val: Option<&str>) -> bool {
     })
 }
 
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn should_prefer_x11_backend(
     wayland_env: Option<&str>,
     x11_env: Option<&str>,
@@ -2901,6 +2903,14 @@ async fn run_gui(
                                                     }
                                                 ));
                                                 state.osd_timer = 2.0;
+                                            } else if state.visualizer_mode == 31 {
+                                                state.room_volume_smoke = !state.room_volume_smoke;
+                                                state.osd_text = Some(if state.room_volume_smoke {
+                                                    "💨 Smoke Volume: ON".to_string()
+                                                } else {
+                                                    "💨 Smoke Volume: OFF".to_string()
+                                                });
+                                                state.osd_timer = 2.0;
                                             }
                                         }
                                         WinitKeyCode::KeyS => {
@@ -3734,7 +3744,9 @@ async fn run_gui(
                                 let mut max_lt = std::mem::take(&mut frame_left_trigger);
                                 let mut max_rt = std::mem::take(&mut frame_right_trigger);
                                 let gamepad_input_active = is_game_mode || window.has_focus();
-                                for (_id, gamepad) in gilrs.gamepads().filter(|_| gamepad_input_active) {
+                                for (_id, gamepad) in
+                                    gilrs.gamepads().filter(|_| gamepad_input_active)
+                                {
                                     let left_y = gamepad.value(gilrs::Axis::LeftStickY);
                                     if left_y.abs() > max_left_y.abs() {
                                         max_left_y = left_y;
@@ -4097,6 +4109,15 @@ async fn run_gui(
                                     }
                                     EngineAction::SetShowSurroundEq(val) => {
                                         state.set_show_surround_eq(val);
+                                    }
+                                    EngineAction::ToggleRoomVolumeSmoke => {
+                                        state.room_volume_smoke = !state.room_volume_smoke;
+                                        state.osd_text = Some(if state.room_volume_smoke {
+                                            "💨 Smoke Volume: ON".to_string()
+                                        } else {
+                                            "💨 Smoke Volume: OFF".to_string()
+                                        });
+                                        state.osd_timer = 2.0;
                                     }
                                     EngineAction::SetPassthrough(val) => {
                                         if cfg!(any(target_os = "windows", target_os = "linux")) {
@@ -7163,8 +7184,8 @@ mod tests {
         }
         let shared_wgsl = total_wgsl - standalone_wgsl;
         assert_eq!(shared_wgsl, 2);
-        assert_eq!(standalone_wgsl, 30);
-        assert_eq!(total_wgsl, 32);
+        assert_eq!(standalone_wgsl, 33);
+        assert_eq!(total_wgsl, 35);
 
         let vis_count = crate::state::VISUALIZERS.len();
         let vis_review = include_str!("../VIS_REVIEW.md");

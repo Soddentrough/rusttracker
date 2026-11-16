@@ -52,8 +52,8 @@ const SPEAKER_COLORS: array<vec3<f32>, 12> = array<vec3<f32>, 12>(
 const SPEAKER_POS: array<vec3<f32>, 12> = array<vec3<f32>, 12>(
     vec3<f32>(-3.8, -0.25,  5.5), // FL (0)
     vec3<f32>( 3.8, -0.25,  5.5), // FR (1)
-    vec3<f32>( 0.0, -0.85,  6.8), // C (2)
-    vec3<f32>( 0.0, -1.05,  5.2), // Sub (3)
+    vec3<f32>( 0.0, -0.02,  5.32), // C (2) — stacked on top of Sub
+    vec3<f32>( 0.0, -0.90,  5.50), // Sub (3) — base on stage riser
     vec3<f32>(-6.2,  0.50,  0.5), // SL (4)
     vec3<f32>( 6.2,  0.50,  0.5), // SR (5)
     vec3<f32>(-4.2,  0.10, -4.8), // RL (6)
@@ -153,10 +153,12 @@ fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
         let sp_center = SPEAKER_POS[ch_idx];
         let rel = pos - sp_center;
         let vib = 0.65 + 0.35 * sin(audio.smooth_time * 28.0 + f32(ch_idx) * 1.3);
-        let scale_xz = 1.0 + ch_energy * 0.20 * vib;
-        let scale_y  = 1.0 + ch_energy * 0.14 * vib;
+        let scale_xz = 1.0 + ch_energy * select(0.20, 0.14, ch_idx == 3u) * vib;
+        let y_expand = select(select(0.14, 0.09, ch_idx == 2u), 0.05, ch_idx == 3u);
+        let scale_y  = 1.0 + ch_energy * y_expand * vib;
         let bounce_dir = select(1.0, -1.0, ch_idx >= 8u);
-        let hop_y = bounce_dir * ch_energy * 0.15 * abs(sin(audio.smooth_time * 16.0 + f32(ch_idx) * 1.1));
+        let hop_amp = select(select(0.15, 0.07, ch_idx == 2u), 0.02, ch_idx == 3u);
+        let hop_y = bounce_dir * ch_energy * hop_amp * abs(sin(audio.smooth_time * 16.0 + f32(ch_idx) * 1.1));
         pos = sp_center + vec3<f32>(rel.x * scale_xz, rel.y * scale_y + hop_y, rel.z * scale_xz);
     }
 
@@ -345,8 +347,10 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
         var h_u = clamp((P.y - (sp_pos.y - 1.05)) / 2.1, 0.0, 1.0);
         if (ch_idx == 4u || ch_idx == 5u) {
             h_u = clamp((P.y - (sp_pos.y - 0.58)) / 1.16, 0.0, 1.0);
-        } else if (ch_idx == 2u || ch_idx == 3u) {
-            h_u = clamp((P.y - (sp_pos.y - 0.45)) / 0.90, 0.0, 1.0);
+        } else if (ch_idx == 2u) {
+            h_u = clamp((P.y - (sp_pos.y - 0.30)) / 0.60, 0.0, 1.0);
+        } else if (ch_idx == 3u) {
+            h_u = clamp((P.y - (sp_pos.y - 0.46)) / 0.92, 0.0, 1.0);
         } else if (ch_idx >= 8u) {
             h_u = clamp(1.0 - (P.y - 4.08) / 0.46, 0.0, 1.0);
         }

@@ -10,7 +10,7 @@ RustTracker pairs a **multi-threaded audio/video/DSP pipeline** (dedicated demux
 
 ## 🚀 Features
 
-* **19 Hardware Visualizers (16 in Default Rotation):** Cinematic WGPU compute and fragment shaders mapped to real-time acoustic frequencies (`Quantum FLIP Ferrofluid`, `Acoustic Glass Water Chamber`, `3D Glass Water Lyrics`, `Prismatic Spectrum Canyon`, `Synthwave 3D Racer`, `Synthwave Terrain`, `Retro VU Meters`, `Bioluminescent Waves`, `Neon Spatial Room`, `Midnight Storm`, `Solar Flare`, `Fire Simulation`, `Retro Fire`, `CRT Oscilloscope`, `3D Oscilloscope`, `Strings`, `Retro Tape Head`, `Studio LED Spectrum`, and `Frequency Spectrum`).
+* **21 Hardware Visualizers (18 in Default Rotation):** Cinematic WGPU compute and fragment shaders mapped to real-time acoustic frequencies (`Quantum FLIP Ferrofluid`, `Acoustic Glass Water Chamber`, `3D Glass Water Lyrics`, `Neon Acoustic Studio`, `Acoustic Wave Chamber`, `Prismatic Spectrum Canyon`, `Synthwave 3D Racer`, `Synthwave Terrain`, `Retro VU Meters`, `Bioluminescent Waves`, `Neon Spatial Room`, `Midnight Storm`, `Solar Flare`, `Fire Simulation`, `Retro Fire`, `CRT Oscilloscope`, `3D Oscilloscope`, `Strings`, `Retro Tape Head`, `Studio LED Spectrum`, and `Frequency Spectrum`).
 * **Multi-Platform Support:** Native support for **Linux (Fedora/RHEL & Ubuntu/Debian)**, **Android (Mobile & Tablet)**, **Windows 10/11**, **macOS**, and **Steam Deck (Gaming Mode)**.
 * **Universal Media Playback:**
   * **Tracker Modules:** `.MOD`, `.S3M`, `.IT`, `.XM` with real-time tracker pattern viewer and synchronized channel VU meters.
@@ -117,7 +117,7 @@ RustTracker features a specialized dual-pane touch interface optimized for mobil
 * **`--tui`**: Launch in terminal UI (TUI) spectrum analyzer and tracker viewer mode.
 * **`--mic`**: Capture live microphone/line-in audio instead of playing a file.
 * **`--vis <id|name>`**: Start directly on the specified hardware visualizer ID or name (or pass bare `--vis` / `--vis list` to list visualizers and exit).
-* **`--list-vis`**: List all 19 available hardware visualizers (IDs, names, and descriptions) and exit.
+* **`--list-vis`**: List all 21 available hardware visualizers (IDs, names, and descriptions) and exit.
 * **`--stereo`**: Force 2.0 stereo downmix output even on multi-channel hardware endpoints.
 * **`--passthrough`**: Enable compressed SPDIF/HDMI bitstream passthrough (AC-3, E-AC-3/Atmos, DTS-HD, TrueHD) on Linux and Windows.
 * **`--surround-upmix`** / **`--no-surround-upmix`** *(aliases `--upmix` / `--no-upmix`)*: Enable (default) or disable automatic surround/height upmixing when >2ch hardware output is available.

@@ -1331,6 +1331,16 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                             EngineAction::SetShowSurroundEq(val) => {
                                 self.app_state.lock().unwrap().set_show_surround_eq(val);
                             }
+                            EngineAction::ToggleRoomVolumeSmoke => {
+                                let mut state = self.app_state.lock().unwrap();
+                                state.room_volume_smoke = !state.room_volume_smoke;
+                                state.osd_text = Some(if state.room_volume_smoke {
+                                    "💨 Smoke Volume: ON".to_string()
+                                } else {
+                                    "💨 Smoke Volume: OFF".to_string()
+                                });
+                                state.osd_timer = 2.0;
+                            }
                             EngineAction::None => {}
                         }
                         self.app_state.lock().unwrap().sync_rt_control();

@@ -160,8 +160,10 @@ fn resolve_path(entry: &str, base_dir: &Path) -> String {
     if entry.starts_with("http://") || entry.starts_with("https://") {
         return entry.to_string();
     }
-    let p = PathBuf::from(entry);
-    if p.is_absolute() {
+    let p = Path::new(entry);
+    // On Unix, a leading slash is absolute. On Windows, Path::is_absolute requires a drive letter
+    // or UNC share, but a leading '/' or '\' is root-relative/absolute and should not be joined to base_dir.
+    if p.is_absolute() || entry.starts_with('/') || entry.starts_with('\\') {
         entry.to_string()
     } else {
         base_dir.join(p).to_string_lossy().into_owned()

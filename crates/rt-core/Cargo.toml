@@ -21,5 +21,6 @@ winit = { version = "0.30.13", features = ["android-game-activity"] }
 windows = { version = "0.62.2", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
+    "Win32_System_IO",
     "Win32_System_Pipes",
 ] }

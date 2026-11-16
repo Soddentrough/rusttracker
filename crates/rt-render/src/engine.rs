@@ -82,6 +82,7 @@ pub enum EngineAction {
     ToggleMpeghBitstream(bool),
     SetSurroundUpmix(crate::state::SurroundUpmixConfig),
     SetShowSurroundEq(bool),
+    ToggleRoomVolumeSmoke,
 }
 
 #[repr(C)]
@@ -311,6 +312,132 @@ pub fn wrap_host_phase_time(time_secs: f64) -> f32 {
         (HOST_TIME_WRAP_PERIOD_SECS
             + (time_secs - HOST_TIME_WRAP_PERIOD_SECS).rem_euclid(HOST_TIME_WRAP_PERIOD_SECS))
             as f32
+    }
+}
+
+pub const NEON_STUDIO_CAM_SHOT_SECS: f64 = 9.0;
+pub const NEON_STUDIO_CAM_CYCLE_SECS: f64 = 54.0;
+
+#[inline]
+fn quintic_hermite_vec3(
+    p0: glam::Vec3,
+    p1: glam::Vec3,
+    m0: glam::Vec3,
+    m1: glam::Vec3,
+    s: f32,
+) -> glam::Vec3 {
+    let s2 = s * s;
+    let s3 = s2 * s;
+    let s4 = s2 * s2;
+    let s5 = s3 * s2;
+    let h00 = 1.0 - 10.0 * s3 + 15.0 * s4 - 6.0 * s5;
+    let h10 = s - 6.0 * s3 + 8.0 * s4 - 3.0 * s5;
+    let h01 = 10.0 * s3 - 15.0 * s4 + 6.0 * s5;
+    let h11 = -4.0 * s3 + 7.0 * s4 - 3.0 * s5;
+    p0 * h00 + m0 * h10 + p1 * h01 + m1 * h11
+}
+
+/// Computes a 6-shot, 54-second `C2`-smooth "Dwell & Glide" camera tour `(eye, target)` for
+/// Visualizer 31 (`Neon Acoustic Studio`), given `play_time` (which runs at `2.88x` real-time seconds).
+pub fn compute_neon_acoustic_studio_camera(play_time: f64) -> (glam::Vec3, glam::Vec3) {
+    #[derive(Clone, Copy)]
+    struct Shot {
+        eye_start: glam::Vec3,
+        eye_end: glam::Vec3,
+        target_start: glam::Vec3,
+        target_end: glam::Vec3,
+    }
+
+    const fn shot(
+        eye_start: [f32; 3],
+        eye_end: [f32; 3],
+        target_start: [f32; 3],
+        target_end: [f32; 3],
+    ) -> Shot {
+        Shot {
+            eye_start: glam::Vec3::from_array(eye_start),
+            eye_end: glam::Vec3::from_array(eye_end),
+            target_start: glam::Vec3::from_array(target_start),
+            target_end: glam::Vec3::from_array(target_end),
+        }
+    }
+
+    const SHOTS: [Shot; 6] = [
+        // 0: Wide Rear Control-Booth Master
+        shot(
+            [2.60, 2.60, -7.85],
+            [-1.80, 2.45, -7.65],
+            [-0.20, 0.55, 3.80],
+            [0.15, 0.65, 3.80],
+        ),
+        // 1: Low Sweet-Spot to Dual-15" Subwoofer & Stage Push-In
+        shot(
+            [-1.65, 0.22, -1.35],
+            [-2.25, -0.08, 1.55],
+            [0.10, -0.28, 5.35],
+            [0.25, -0.20, 5.35],
+        ),
+        // 2: Front-Left Flank Reverse Studio & Control Room Live EQ Window Reveal
+        shot(
+            [-7.60, 1.55, 3.45],
+            [-7.35, 2.05, 5.45],
+            [0.45, 1.20, -5.40],
+            [-0.10, 1.40, -6.50],
+        ),
+        // 3: High Stage-Catwalk Overhead Panorama (Atmos Cones, 3D Wave Volume & EQ Window)
+        shot(
+            [-2.40, 3.55, 6.95],
+            [2.40, 3.55, 6.95],
+            [0.25, 0.35, -2.20],
+            [-0.25, 0.35, -2.20],
+        ),
+        // 4: Right Surround Gallery & Sweet-Spot Lateral Cross-Fire
+        shot(
+            [8.35, 1.05, 2.15],
+            [8.05, 1.25, -2.85],
+            [-1.20, 0.45, 1.80],
+            [-1.30, 0.55, -0.20],
+        ),
+        // 5: High Rear-Right Corner Diagonal Studio Panorama
+        shot(
+            [7.15, 3.25, -7.35],
+            [4.60, 2.95, -7.80],
+            [-1.60, 0.45, 2.60],
+            [-0.80, 0.50, 3.40],
+        ),
+    ];
+
+    const DWELL_FRAC: f32 = 0.72;
+    const TRANS_FRAC: f32 = 0.28;
+
+    let real_secs = if play_time.is_finite() && play_time > 0.0 {
+        (play_time / 2.88).rem_euclid(NEON_STUDIO_CAM_CYCLE_SECS)
+    } else {
+        0.0
+    };
+    let shot_pos = real_secs / NEON_STUDIO_CAM_SHOT_SECS;
+    let shot_idx = (shot_pos.floor() as usize).min(SHOTS.len() - 1);
+    let local_u = (shot_pos - shot_idx as f64) as f32;
+    let curr = SHOTS[shot_idx];
+
+    if local_u <= DWELL_FRAC {
+        let d = (local_u / DWELL_FRAC).clamp(0.0, 1.0);
+        (
+            curr.eye_start.lerp(curr.eye_end, d),
+            curr.target_start.lerp(curr.target_end, d),
+        )
+    } else {
+        let next = SHOTS[(shot_idx + 1) % SHOTS.len()];
+        let s = ((local_u - DWELL_FRAC) / TRANS_FRAC).clamp(0.0, 1.0);
+        let scale = TRANS_FRAC / DWELL_FRAC;
+        let eye_m0 = (curr.eye_end - curr.eye_start) * scale;
+        let eye_m1 = (next.eye_end - next.eye_start) * scale;
+        let tgt_m0 = (curr.target_end - curr.target_start) * scale;
+        let tgt_m1 = (next.target_end - next.target_start) * scale;
+        (
+            quintic_hermite_vec3(curr.eye_end, next.eye_start, eye_m0, eye_m1, s),
+            quintic_hermite_vec3(curr.target_end, next.target_start, tgt_m0, tgt_m1, s),
+        )
     }
 }
 
@@ -1412,7 +1539,8 @@ impl StatsDisplayCache {
         let has_sim_pass = vis_def.requires_fire
             || vis_def.id == 20
             || vis_def.requires_flip_ferrofluid
-            || vis_def.requires_flip_water;
+            || vis_def.requires_flip_water
+            || vis_def.requires_acoustic_waves;
         if has_sim_pass {
             total_vis_us += state.stats.fire_us;
         }
@@ -1595,6 +1723,19 @@ pub struct VulkanEngine {
     resynth_compute_pipeline: wgpu::ComputePipeline,
     resynth_bind_group: wgpu::BindGroup,
     _gpu_spectrum_buffer: wgpu::Buffer,
+
+    acoustic_wave_clear_pipeline: wgpu::ComputePipeline,
+    acoustic_wave_step_ab_pipeline: wgpu::ComputePipeline,
+    acoustic_wave_step_ba_pipeline: wgpu::ComputePipeline,
+    acoustic_wave_compute_bind_group: wgpu::BindGroup,
+    _acoustic_wave_a_buffer: wgpu::Buffer,
+    _acoustic_wave_b_buffer: wgpu::Buffer,
+    acoustic_packed_buffer: wgpu::Buffer,
+    acoustic_volume_texture: wgpu::Texture,
+    acoustic_render_pipeline_layout: wgpu::PipelineLayout,
+    neon_acoustic_render_pipeline_layout_3d: wgpu::PipelineLayout,
+    acoustic_render_bind_group: wgpu::BindGroup,
+    acoustic_wave_initialized: bool,
 
     depth_texture_view: wgpu::TextureView,
 
@@ -2244,7 +2385,7 @@ fn room_add_speaker_tower(
     }
 }
 
-pub(crate) fn generate_neon_room_mesh() -> (Vec<Vertex>, Vec<u32>) {
+pub fn generate_neon_room_mesh() -> (Vec<Vertex>, Vec<u32>) {
     let mut vertices = Vec::new();
     let mut indices = Vec::new();
 
@@ -2464,11 +2605,81 @@ pub(crate) fn generate_neon_room_mesh() -> (Vec<Vertex>, Vec<u32>) {
         true,
     );
 
-    // Channel 2: Center Channel (Horizontal Cabinet on Riser, front baffle at Z = 6.46 facing -Z)
+    // Channel 3: Massive LFE Dual Subwoofer (base of stacked front center array, flush on stage riser y = -1.36)
     room_add_box(
         &mut vertices,
         &mut indices,
-        [0.0, -0.85, 6.8],
+        [0.0, -0.90, 5.50],
+        [2.5, 0.92, 1.1],
+        0.0,
+        3.0,
+        1.2,
+    );
+    room_add_cone(
+        &mut vertices,
+        &mut indices,
+        [-0.64, -0.90, 4.94],
+        0.38,
+        0.17,
+        std::f32::consts::PI,
+        3.0,
+        2.0,
+    );
+    room_add_cone(
+        &mut vertices,
+        &mut indices,
+        [0.64, -0.90, 4.94],
+        0.38,
+        0.17,
+        std::f32::consts::PI,
+        3.0,
+        2.0,
+    );
+    // Subwoofer bass reflex port & neon trim on front face (Z = 4.94)
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, -0.57, 4.94],
+        [0.42, 0.08, 0.05],
+        0.0,
+        3.0,
+        5.2,
+    );
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, -1.335, 5.50],
+        [2.56, 0.05, 1.16],
+        0.0,
+        3.0,
+        5.2,
+    );
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, -0.44, 5.50],
+        [2.56, 0.05, 1.16],
+        0.0,
+        3.0,
+        5.2,
+    );
+
+    // Acoustic isolation plinth bridging LFE Subwoofer top and Center Horizontal Cabinet
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, -0.385, 5.32],
+        [1.72, 0.06, 0.62],
+        0.0,
+        0.0,
+        1.0,
+    );
+
+    // Channel 2: Center Channel (Horizontal Cabinet stacked atop LFE Subwoofer, front baffle at Z = 4.98 facing -Z)
+    room_add_box(
+        &mut vertices,
+        &mut indices,
+        [0.0, -0.02, 5.32],
         [1.8, 0.60, 0.66],
         0.0,
         2.0,
@@ -2477,7 +2688,7 @@ pub(crate) fn generate_neon_room_mesh() -> (Vec<Vertex>, Vec<u32>) {
     room_add_cone(
         &mut vertices,
         &mut indices,
-        [-0.54, -0.85, 6.46],
+        [-0.54, -0.02, 4.98],
         0.21,
         0.08,
         std::f32::consts::PI,
@@ -2487,7 +2698,7 @@ pub(crate) fn generate_neon_room_mesh() -> (Vec<Vertex>, Vec<u32>) {
     room_add_cone(
         &mut vertices,
         &mut indices,
-        [0.54, -0.85, 6.46],
+        [0.54, -0.02, 4.98],
         0.21,
         0.08,
         std::f32::consts::PI,
@@ -2497,7 +2708,7 @@ pub(crate) fn generate_neon_room_mesh() -> (Vec<Vertex>, Vec<u32>) {
     room_add_cone(
         &mut vertices,
         &mut indices,
-        [0.0, -0.85, 6.46],
+        [0.0, -0.02, 4.98],
         0.11,
         0.04,
         std::f32::consts::PI,
@@ -2507,7 +2718,7 @@ pub(crate) fn generate_neon_room_mesh() -> (Vec<Vertex>, Vec<u32>) {
     room_add_box(
         &mut vertices,
         &mut indices,
-        [0.0, -1.16, 6.8],
+        [0.0, -0.33, 5.32],
         [1.86, 0.04, 0.70],
         0.0,
         2.0,
@@ -2516,69 +2727,10 @@ pub(crate) fn generate_neon_room_mesh() -> (Vec<Vertex>, Vec<u32>) {
     room_add_box(
         &mut vertices,
         &mut indices,
-        [0.0, -0.54, 6.8],
+        [0.0, 0.29, 5.32],
         [1.86, 0.04, 0.70],
         0.0,
         2.0,
-        5.2,
-    );
-
-    // Channel 3: Massive LFE Dual Subwoofer (front baffle at Z = 4.64 facing -Z toward camera)
-    room_add_box(
-        &mut vertices,
-        &mut indices,
-        [0.0, -1.05, 5.2],
-        [2.5, 0.92, 1.1],
-        0.0,
-        3.0,
-        1.2,
-    );
-    room_add_cone(
-        &mut vertices,
-        &mut indices,
-        [-0.64, -1.05, 4.64],
-        0.38,
-        0.17,
-        std::f32::consts::PI,
-        3.0,
-        2.0,
-    );
-    room_add_cone(
-        &mut vertices,
-        &mut indices,
-        [0.64, -1.05, 4.64],
-        0.38,
-        0.17,
-        std::f32::consts::PI,
-        3.0,
-        2.0,
-    );
-    // Subwoofer bass reflex port & neon trim on front face (Z = 4.64)
-    room_add_box(
-        &mut vertices,
-        &mut indices,
-        [0.0, -0.72, 4.64],
-        [0.42, 0.08, 0.05],
-        0.0,
-        3.0,
-        5.2,
-    );
-    room_add_box(
-        &mut vertices,
-        &mut indices,
-        [0.0, -1.50, 5.2],
-        [2.56, 0.05, 1.16],
-        0.0,
-        3.0,
-        5.2,
-    );
-    room_add_box(
-        &mut vertices,
-        &mut indices,
-        [0.0, -0.58, 5.2],
-        [2.56, 0.05, 1.16],
-        0.0,
-        3.0,
         5.2,
     );
 
@@ -4423,6 +4575,50 @@ impl VulkanEngine {
                 immediate_size: 0,
             });
 
+        let acoustic_render_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Acoustic Wave Volume Render Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D3,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                ],
+            });
+
+        let acoustic_render_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Acoustic Wave Render Pipeline Layout"),
+                bind_group_layouts: &[
+                    Some(&bind_group_layout),
+                    Some(&acoustic_render_bind_group_layout),
+                ],
+                immediate_size: 0,
+            });
+
+        let neon_acoustic_render_pipeline_layout_3d =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Neon Acoustic Studio 3D Render Pipeline Layout"),
+                bind_group_layouts: &[
+                    Some(&bind_group_layout),
+                    Some(&camera_bind_group_layout),
+                    Some(&acoustic_render_bind_group_layout),
+                ],
+                immediate_size: 0,
+            });
+
         // Shared shader headers — included at compile time, resolved via simple string replacement.
         // This is the single source of truth for AudioUniforms layout and glyph font.
         const SHADER_COMMON: &str = include_str!("../../../src/shaders/_common.wgsl");
@@ -4455,6 +4651,8 @@ impl VulkanEngine {
                 27 => include_str!("../../../src/shaders/vis_flip_ferrofluid.wgsl"),
                 28 => include_str!("../../../src/shaders/vis_glass_water.wgsl"),
                 29 => include_str!("../../../src/shaders/vis_spectrum_canyon.wgsl"),
+                30 => include_str!("../../../src/shaders/vis_acoustic_waves.wgsl"),
+                31 => include_str!("../../../src/shaders/vis_neon_acoustic_room.wgsl"),
                 _ => include_str!("../../../src/shaders/vis_spectrum.wgsl"),
             }
         };
@@ -6005,6 +6203,180 @@ impl VulkanEngine {
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 cache: pipeline_cache_ref,
             });
+
+        // --- Acoustic Wave Chamber 3D FDTD Compute Pipeline ---
+        const ACOUSTIC_GRID_VOXELS: u64 = 64 * 32 * 64;
+        let acoustic_wave_a_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Acoustic Wave Field A"),
+            size: ACOUSTIC_GRID_VOXELS * 16,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let acoustic_wave_b_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Acoustic Wave Field B"),
+            size: ACOUSTIC_GRID_VOXELS * 16,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let acoustic_packed_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Acoustic Wave Packed Volume Buffer"),
+            size: ACOUSTIC_GRID_VOXELS * 4,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let acoustic_volume_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("Acoustic Wave 3D Volume Texture"),
+            size: wgpu::Extent3d {
+                width: 64,
+                height: 32,
+                depth_or_array_layers: 64,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D3,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let acoustic_volume_view =
+            acoustic_volume_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let acoustic_volume_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("Acoustic Wave Volume Sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let acoustic_render_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Acoustic Wave Volume Render Bind Group"),
+            layout: &acoustic_render_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&acoustic_volume_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&acoustic_volume_sampler),
+                },
+            ],
+        });
+        let acoustic_wave_compute_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Acoustic Wave Compute Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let acoustic_wave_compute_bind_group =
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("Acoustic Wave Compute Bind Group"),
+                layout: &acoustic_wave_compute_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: uniform_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: acoustic_wave_a_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: acoustic_wave_b_buffer.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: acoustic_packed_buffer.as_entire_binding(),
+                    },
+                ],
+            });
+        let acoustic_wave_compute_source = resolve_shader_includes(include_str!(
+            "../../../src/shaders/acoustic_wave_compute.wgsl"
+        ));
+        let acoustic_wave_compute_shader =
+            device.create_shader_module(wgpu::ShaderModuleDescriptor {
+                label: Some("Acoustic Wave Compute Shader"),
+                source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(
+                    &acoustic_wave_compute_source,
+                )),
+            });
+        let acoustic_wave_compute_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Acoustic Wave Compute Pipeline Layout"),
+                bind_group_layouts: &[Some(&acoustic_wave_compute_layout)],
+                immediate_size: 0,
+            });
+        let acoustic_wave_clear_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Acoustic Wave Clear Pipeline"),
+                layout: Some(&acoustic_wave_compute_pipeline_layout),
+                module: &acoustic_wave_compute_shader,
+                entry_point: Some("cs_clear_waves"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+        let acoustic_wave_step_ab_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Acoustic Wave Step A->B Pipeline"),
+                layout: Some(&acoustic_wave_compute_pipeline_layout),
+                module: &acoustic_wave_compute_shader,
+                entry_point: Some("cs_step_ab"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+        let acoustic_wave_step_ba_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Acoustic Wave Step B->A Pipeline"),
+                layout: Some(&acoustic_wave_compute_pipeline_layout),
+                module: &acoustic_wave_compute_shader,
+                entry_point: Some("cs_step_ba"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
         // --- 3D Engine Extensions Init ---
         let mut mesh_registry = std::collections::HashMap::new();
         let mut unique_geometries = std::collections::HashSet::new();
@@ -6292,6 +6664,19 @@ impl VulkanEngine {
             resynth_bind_group,
             _gpu_spectrum_buffer: gpu_spectrum_buffer,
 
+            acoustic_wave_clear_pipeline,
+            acoustic_wave_step_ab_pipeline,
+            acoustic_wave_step_ba_pipeline,
+            acoustic_wave_compute_bind_group,
+            _acoustic_wave_a_buffer: acoustic_wave_a_buffer,
+            _acoustic_wave_b_buffer: acoustic_wave_b_buffer,
+            acoustic_packed_buffer,
+            acoustic_volume_texture,
+            acoustic_render_pipeline_layout,
+            neon_acoustic_render_pipeline_layout_3d,
+            acoustic_render_bind_group,
+            acoustic_wave_initialized: false,
+
             depth_texture_view,
 
             waveform_history_flat: vec![0.0; 2048 * WAVEFORM_HISTORY_RING_CAP],
@@ -6444,6 +6829,36 @@ impl VulkanEngine {
                     conservative: false,
                 },
                 "vs_main",
+            )
+        } else if vis_def.id == 30 {
+            (
+                &self.acoustic_render_pipeline_layout,
+                Vec::new(),
+                wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                "vs_main",
+            )
+        } else if vis_def.id == 31 {
+            (
+                &self.neon_acoustic_render_pipeline_layout_3d,
+                vec![Vertex::desc()],
+                wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                "vs_main_3d",
             )
         } else {
             match vis_def.pipeline_type {
@@ -6656,12 +7071,193 @@ impl VulkanEngine {
 
     pub const VU_PHOSPHOR_FADE_SECS: f32 = 0.35;
 
+    /// Extracts inter-channel phase relationships, spectral centroid oscillator phase, and
+    /// 3 orbiting 3D object stem coordinates into the 32-float `channel_phases` uniform block
+    /// used by Acoustic Wave Chamber (`id == 30`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn extract_acoustic_wave_phases(
+        phases_out: &mut [f32; 32],
+        raw_audio_channels: &[Vec<f32>],
+        spectrum_data: &[f32],
+        spatial_channels: &[f32; 16],
+        num_spatial_channels: u32,
+        frame_dt: f32,
+        is_playing: bool,
+        play_time_s: f32,
+    ) {
+        use std::f32::consts::{PI, TAU};
+        let dt = frame_dt.clamp(0.0005, 0.05);
+        let phi_alpha = (dt * 24.0).clamp(0.15, 0.65);
+
+        // 1. Choose active reference channel (prefer Ch 0 / Left if active)
+        let ch_limit = raw_audio_channels.len().min(16);
+        let tail_rms_sq = |samples: &[f32], n: usize| -> f32 {
+            let start = samples.len().saturating_sub(n);
+            let slice = &samples[start..];
+            if slice.is_empty() {
+                return 0.0;
+            }
+            let mean = slice.iter().sum::<f32>() / slice.len() as f32;
+            slice.iter().map(|&s| (s - mean) * (s - mean)).sum::<f32>()
+        };
+
+        let mut ref_idx = 0usize;
+        if ch_limit > 0 {
+            if tail_rms_sq(&raw_audio_channels[0], 256) < 1e-7 {
+                let mut best_e = 1e-7;
+                for (i, buf) in raw_audio_channels.iter().take(ch_limit).enumerate() {
+                    let e = tail_rms_sq(buf, 256);
+                    if e > best_e {
+                        best_e = e;
+                        ref_idx = i;
+                    }
+                }
+            }
+
+            let ref_buf = &raw_audio_channels[ref_idx];
+            let n = ref_buf.len().min(256);
+            if n >= 4 {
+                let ref_slice = &ref_buf[ref_buf.len() - n..];
+                let ref_mean = ref_slice.iter().sum::<f32>() / n as f32;
+                let mut ref_c = [0.0f32; 256];
+                let mut d_ref = [0.0f32; 256];
+                let mut e_ref = 0.0f32;
+                let mut e_dref = 0.0f32;
+                for k in 0..n {
+                    let v = ref_slice[k] - ref_mean;
+                    ref_c[k] = v;
+                    e_ref += v * v;
+                    let dv = if k == 0 {
+                        ref_slice[1] - ref_slice[0]
+                    } else if k + 1 == n {
+                        ref_slice[n - 1] - ref_slice[n - 2]
+                    } else {
+                        0.5 * (ref_slice[k + 1] - ref_slice[k - 1])
+                    };
+                    d_ref[k] = dv;
+                    e_dref += dv * dv;
+                }
+
+                for (c, buf) in raw_audio_channels.iter().take(ch_limit).enumerate() {
+                    if c == ref_idx {
+                        phases_out[c] = 0.0;
+                        continue;
+                    }
+                    if buf.len() >= n && e_ref > 1e-7 {
+                        let ch_slice = &buf[buf.len() - n..];
+                        let ch_mean = ch_slice.iter().sum::<f32>() / n as f32;
+                        let mut e_c = 0.0f32;
+                        let mut dot_i = 0.0f32;
+                        let mut dot_q = 0.0f32;
+                        for k in 0..n {
+                            let cv = ch_slice[k] - ch_mean;
+                            e_c += cv * cv;
+                            dot_i += cv * ref_c[k];
+                            dot_q += cv * d_ref[k];
+                        }
+                        if e_c > 1e-7 {
+                            let i_norm = dot_i / (e_c * e_ref).sqrt();
+                            let q_norm = if e_dref > 1e-10 {
+                                dot_q / (e_c * e_dref).sqrt()
+                            } else {
+                                0.0
+                            };
+                            let target_phi = q_norm.atan2(i_norm);
+                            let delta = (target_phi - phases_out[c] + PI).rem_euclid(TAU) - PI;
+                            let next_phi = phases_out[c] + delta * phi_alpha;
+                            phases_out[c] = (next_phi + PI).rem_euclid(TAU) - PI;
+                        } else {
+                            phases_out[c] *= 1.0 - (dt * 4.0).clamp(0.0, 0.5);
+                        }
+                    } else {
+                        phases_out[c] *= 1.0 - (dt * 4.0).clamp(0.0, 0.5);
+                    }
+                }
+            }
+        }
+        for slot in &mut phases_out[ch_limit..16] {
+            *slot *= 1.0 - (dt * 4.0).clamp(0.0, 0.5);
+        }
+
+        // 2. Spectral centroid -> f_vis [16] and wrap-safe continuous base_osc [17]
+        let mut weighted_bin = 0.0f32;
+        let mut total_mag = 0.0f32;
+        let max_scan = spectrum_data.len().min(96);
+        for (bin, &mag) in spectrum_data.iter().enumerate().take(max_scan).skip(1) {
+            let m = mag.max(0.0);
+            weighted_bin += (bin as f32) * m;
+            total_mag += m;
+        }
+        let target_f_vis = if total_mag > 1e-3 {
+            let centroid = weighted_bin / total_mag;
+            (centroid.ln_1p() / 96.0f32.ln_1p()).clamp(0.0, 1.0)
+        } else {
+            0.35
+        };
+        let f_alpha = (dt * 8.0).clamp(0.05, 0.40);
+        phases_out[16] += (target_f_vis - phases_out[16]) * f_alpha;
+        if is_playing {
+            let omega = 28.0 + 14.0 * phases_out[16].clamp(0.0, 1.0);
+            phases_out[17] = (phases_out[17] + dt * omega).rem_euclid(TAU);
+        }
+
+        // 3. Three dynamic 3D object / stem monopoles [18..30] with <=2-decimal time factors
+        let slice_avg = |start: usize, end: usize, norm: f32, max_cap: f32| -> f32 {
+            let lo = start.min(spectrum_data.len());
+            let hi = end.min(spectrum_data.len());
+            if hi <= lo {
+                return 0.0;
+            }
+            let sum: f32 = spectrum_data[lo..hi].iter().copied().sum();
+            (sum / ((hi - lo) as f32 * norm)).clamp(0.0, max_cap)
+        };
+        let obj0_e_raw = slice_avg(26, 80, 35.0, 0.85);
+        let obj1_e_raw = slice_avg(8, 26, 45.0, 0.85);
+        let obj2_e_raw = slice_avg(2, 8, 55.0, 0.85);
+        let bass_kick_raw = slice_avg(1, 6, 65.0, 1.0);
+
+        let e_alpha = (dt * 14.0).clamp(0.08, 0.55);
+        phases_out[18] = (play_time_s * 0.45).sin() * 4.8;
+        phases_out[19] = 2.2 + (play_time_s * 0.28).cos() * 1.3;
+        phases_out[20] = (play_time_s * 0.36).cos() * 4.2;
+        phases_out[21] += (obj0_e_raw - phases_out[21]) * e_alpha;
+
+        phases_out[22] = -(play_time_s * 0.32).cos() * 3.6;
+        phases_out[23] = 1.0 + (play_time_s * 0.52).sin() * 1.1;
+        phases_out[24] = (play_time_s * 0.41).sin() * 3.8;
+        phases_out[25] += (obj1_e_raw - phases_out[25]) * e_alpha;
+
+        phases_out[26] = (play_time_s * 0.24).sin() * 3.2;
+        phases_out[27] = 0.1 + (play_time_s * 0.38).sin().abs() * 1.2;
+        phases_out[28] = -(play_time_s * 0.29).cos() * 3.4;
+        phases_out[29] += (obj2_e_raw - phases_out[29]) * e_alpha;
+
+        // 4. Bass transient follower [30] and master simulation intensity [31]
+        let kick_alpha = if bass_kick_raw > phases_out[30] {
+            (dt * 28.0).clamp(0.2, 0.85)
+        } else {
+            (dt * 7.0).clamp(0.04, 0.25)
+        };
+        phases_out[30] += (bass_kick_raw - phases_out[30]) * kick_alpha;
+
+        let active_sp = (num_spatial_channels as usize).clamp(1, 16);
+        let sp_peak = spatial_channels[..active_sp]
+            .iter()
+            .copied()
+            .fold(0.0f32, f32::max);
+        let sim_target =
+            (sp_peak * 0.85 + (obj0_e_raw + obj1_e_raw + bass_kick_raw) * 0.20).clamp(0.0, 1.0);
+        let sim_alpha = (dt * 10.0).clamp(0.05, 0.45);
+        phases_out[31] += (sim_target - phases_out[31]) * sim_alpha;
+    }
+
     pub fn clear_video_state(&mut self) {
         self.video_state = None;
         self.vu_prev_active_segments = [0; 32];
         self.vu_segment_glows = [[0.0; 30]; 32];
         self.vu_prev_num_channels = 0;
         self.channel_phases = [0.0; 32];
+        self.acoustic_wave_initialized = false;
         self.cached_meta_path.clear();
     }
 
@@ -7016,6 +7612,7 @@ impl VulkanEngine {
             self.vu_segment_glows = [[0.0; 30]; 32];
             self.vu_prev_num_channels = 0;
             self.channel_phases = [0.0; 32];
+            self.acoustic_wave_initialized = false;
             return;
         }
 
@@ -7152,7 +7749,7 @@ impl VulkanEngine {
             history_cam_z: self.last_history_cam_z as f32,
             fire_intensity: self.fire_intensity,
             waveform_history_ring_base: self.waveform_ring_base,
-            _pad2: 0.0,
+            _pad2: if state.room_volume_smoke { 0.0 } else { 1.0 },
             _pad3: 0.0,
         };
         self.last_steps_to_fill = steps;
@@ -7503,6 +8100,19 @@ impl VulkanEngine {
         }
 
         let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
+        if vis_def.requires_acoustic_waves && (vis_def.id != 31 || state.room_volume_smoke) {
+            Self::extract_acoustic_wave_phases(
+                &mut self.channel_phases,
+                &state.raw_audio_channels,
+                &state.spectrum_data,
+                &uniforms.spatial_channels,
+                uniforms.num_spatial_channels,
+                frame_dt,
+                !state.is_paused && !state.track_ended,
+                uniforms.smooth_time,
+            );
+            uniforms.channel_phases = self.channel_phases;
+        }
         let vis_width = state.visual_width.clamp(128, 2048);
         uniforms.waveform_resolution = vis_width;
         let max_hist_rows = if vis_def.id == 3 { 96usize } else { 144usize };
@@ -8833,6 +9443,8 @@ impl VulkanEngine {
                                 shortcut(ui, "[ / ]", Some("L/R Stick"), "Scale Panels");
                                 if state.visualizer_mode == 20 {
                                     shortcut(ui, "c", None, "Toggle Camera Mode");
+                                } else if state.visualizer_mode == 31 {
+                                    shortcut(ui, "c", None, "Toggle Smoke Volume");
                                 }
                             });
                     });
@@ -11391,11 +12003,46 @@ impl VulkanEngine {
                                                         .map(|v| v.name)
                                                         .unwrap_or("Unknown");
                                                     ui.label(egui::RichText::new("Visualizer:").color(egui::Color32::from_rgb(160, 180, 200)));
-                                                    let vis_link = ui.link(egui::RichText::new(vis_name).color(egui::Color32::from_rgb(255, 215, 0)).strong());
-                                                    if vis_link.clicked() {
-                                                        *engine_action = EngineAction::ToggleVisPicker;
-                                                    }
-                                                    vis_link.on_hover_text("Click to open Visualization Modules selector (Shortcut: 'm')");
+                                                    ui.horizontal(|ui| {
+                                                        let vis_link = ui.link(egui::RichText::new(vis_name).color(egui::Color32::from_rgb(255, 215, 0)).strong());
+                                                        if vis_link.clicked() {
+                                                            *engine_action = EngineAction::ToggleVisPicker;
+                                                        }
+                                                        vis_link.on_hover_text("Click to open Visualization Modules selector (Shortcut: 'm')");
+                                                        if state.visualizer_mode == 31 {
+                                                            let (smoke_lbl, smoke_fill, smoke_stroke, smoke_col) = if state.room_volume_smoke {
+                                                                (
+                                                                    "💨 Smoke: ON",
+                                                                    egui::Color32::from_rgb(18, 62, 78),
+                                                                    egui::Color32::from_rgb(0, 205, 245),
+                                                                    egui::Color32::from_rgb(205, 248, 255),
+                                                                )
+                                                            } else {
+                                                                (
+                                                                    "💨 Smoke: OFF",
+                                                                    egui::Color32::from_rgb(38, 38, 44),
+                                                                    egui::Color32::from_rgb(95, 95, 108),
+                                                                    egui::Color32::from_rgb(185, 188, 198),
+                                                                )
+                                                            };
+                                                            let smoke_btn = egui::Button::new(
+                                                                egui::RichText::new(smoke_lbl)
+                                                                    .size(10.5)
+                                                                    .strong()
+                                                                    .color(smoke_col),
+                                                            )
+                                                            .fill(smoke_fill)
+                                                            .stroke(egui::Stroke::new(1.0_f32, smoke_stroke))
+                                                            .corner_radius(4.0);
+                                                            if ui
+                                                                .add(smoke_btn)
+                                                                .on_hover_text("Toggle volumetric speaker smoke blasts & standing-wave vapor (Shortcut: 'c')")
+                                                                .clicked()
+                                                            {
+                                                                *engine_action = EngineAction::ToggleRoomVolumeSmoke;
+                                                            }
+                                                        }
+                                                    });
                                                     ui.end_row();
                                                 });
 
@@ -12325,7 +12972,8 @@ impl VulkanEngine {
                 crate::state::PipelineType::Mesh3D { .. }
             ) {
                 // Adapt FOV when aspect ratio is square or portrait (< 1.0) so 3D scenes fit without horizontal clipping
-                let base_fov = if state.visualizer_mode == 22 {
+                let is_room_vis = state.visualizer_mode == 22 || state.visualizer_mode == 31;
+                let base_fov = if is_room_vis {
                     64.0_f32.to_radians()
                 } else {
                     48.0_f32.to_radians()
@@ -12336,7 +12984,7 @@ impl VulkanEngine {
                 {
                     base_fov
                 } else if aspect < 1.0 {
-                    (base_fov / aspect.clamp(0.65, 1.0)).min(if state.visualizer_mode == 22 {
+                    (base_fov / aspect.clamp(0.65, 1.0)).min(if is_room_vis {
                         85.0_f32.to_radians()
                     } else {
                         75.0_f32.to_radians()
@@ -12375,7 +13023,10 @@ impl VulkanEngine {
                         glam::Vec3::new(0.0, 0.45, 0.0),
                         glam::Vec3::new(0.0, 1.0, 0.0),
                     )
-                } else if state.visualizer_mode == 22 {
+                } else if state.visualizer_mode == 31 {
+                    let (cam_eye, cam_target) = compute_neon_acoustic_studio_camera(self.play_time);
+                    glam::Mat4::look_at_rh(cam_eye, cam_target, glam::Vec3::Y)
+                } else if is_room_vis {
                     let t_cam = wrap_host_phase_time(self.play_time) * 0.18;
                     let cam_radius = 9.8f32;
                     let cam_h = 2.4f32 + (t_cam * 0.7).sin() * 0.6f32;
@@ -12699,6 +13350,56 @@ impl VulkanEngine {
                 }
             }
 
+            if vis_def.requires_acoustic_waves && (vis_def.id != 31 || state.room_volume_smoke) {
+                let needs_clear = !self.acoustic_wave_initialized;
+                if needs_clear || !state.is_paused {
+                    {
+                        let mut compute_pass =
+                            encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                                label: Some("Acoustic Wave Chamber Compute"),
+                                timestamp_writes: take_sim_timestamps(),
+                            });
+                        compute_pass.set_bind_group(
+                            0,
+                            Some(&self.acoustic_wave_compute_bind_group),
+                            &[],
+                        );
+                        if needs_clear {
+                            compute_pass.set_pipeline(&self.acoustic_wave_clear_pipeline);
+                            compute_pass.dispatch_workgroups(8, 8, 16);
+                            self.acoustic_wave_initialized = true;
+                        }
+                        if !state.is_paused {
+                            compute_pass.set_pipeline(&self.acoustic_wave_step_ab_pipeline);
+                            compute_pass.dispatch_workgroups(8, 8, 16);
+                            compute_pass.set_pipeline(&self.acoustic_wave_step_ba_pipeline);
+                            compute_pass.dispatch_workgroups(8, 8, 16);
+                        }
+                    }
+                    encoder.copy_buffer_to_texture(
+                        wgpu::TexelCopyBufferInfo {
+                            buffer: &self.acoustic_packed_buffer,
+                            layout: wgpu::TexelCopyBufferLayout {
+                                offset: 0,
+                                bytes_per_row: Some(64 * 4),
+                                rows_per_image: Some(32),
+                            },
+                        },
+                        wgpu::TexelCopyTextureInfo {
+                            texture: &self.acoustic_volume_texture,
+                            mip_level: 0,
+                            origin: wgpu::Origin3d::ZERO,
+                            aspect: wgpu::TextureAspect::All,
+                        },
+                        wgpu::Extent3d {
+                            width: 64,
+                            height: 32,
+                            depth_or_array_layers: 64,
+                        },
+                    );
+                }
+            }
+
             if !sim_timestamp_written && let Some(qs) = active_query_set {
                 encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                     label: Some("Dummy Sim Pass"),
@@ -12767,7 +13468,7 @@ impl VulkanEngine {
                 render_pass_3d.set_pipeline(&self.vumeters_bg_pipeline);
                 render_pass_3d.set_bind_group(0, &self.uniform_bind_group, &[]);
                 render_pass_3d.draw(0..3, 0..1);
-            } else if vis_def.id != 13 && vis_def.id != 22 && vis_def.id != 29 {
+            } else if vis_def.id != 13 && vis_def.id != 22 && vis_def.id != 29 && vis_def.id != 31 {
                 render_pass_3d.set_pipeline(&self.clear_black_pipeline);
                 render_pass_3d.draw(0..3, 0..1);
             }
@@ -12789,6 +13490,8 @@ impl VulkanEngine {
                     render_pass_3d.set_bind_group(1, &self.camera_bind_group, &[]);
                     if vis_def.id == 20 {
                         render_pass_3d.set_bind_group(2, &self.biolum_render_bind_group, &[]);
+                    } else if vis_def.id == 31 {
+                        render_pass_3d.set_bind_group(2, &self.acoustic_render_bind_group, &[]);
                     }
                 }
                 if let Some(mesh) = self.mesh_registry.get(geometry) {
@@ -12877,6 +13580,8 @@ impl VulkanEngine {
                     render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
                     if vis_def.id == 27 {
                         render_pass.set_bind_group(1, &self.flip_render_bind_group, &[]);
+                    } else if vis_def.id == 30 {
+                        render_pass.set_bind_group(1, &self.acoustic_render_bind_group, &[]);
                     }
                     render_pass.draw(0..3, 0..1);
                 }
@@ -14488,8 +15193,8 @@ mod tests {
         );
         assert_eq!(
             VISUALIZERS.len(),
-            19,
-            "All 19 visualizers must be compiled on every platform"
+            21,
+            "All 21 visualizers must be compiled on every platform"
         );
 
         let make_adapter = |name: &str, device_type: wgpu::DeviceType| wgpu::AdapterInfo {
@@ -15432,6 +16137,297 @@ mod tests {
         assert!(
             !prod_code.contains("draw(0..6,"),
             "Fullscreen passes must use 3-vertex oversized fullscreen triangles, never 6-vertex quads"
+        );
+    }
+
+    #[test]
+    fn test_acoustic_wave_chamber_registration_and_phase_extraction() {
+        let vis = crate::state::VISUALIZERS
+            .iter()
+            .find(|v| v.id == 30)
+            .expect("Visualizer ID 30 (Acoustic Wave Chamber) must be registered");
+        assert_eq!(vis.name, "Acoustic Wave Chamber");
+        assert_eq!(vis.filename, "vis_acoustic_waves.wgsl");
+        assert!(vis.requires_acoustic_waves);
+        assert!(
+            !vis.heavy_shader,
+            "Acoustic Wave Chamber must run smoothly by default on Constrained GPUs"
+        );
+        assert!(matches!(
+            vis.pipeline_type,
+            crate::state::PipelineType::FullscreenTriangle
+        ));
+
+        let studio = crate::state::VISUALIZERS
+            .iter()
+            .find(|v| v.id == 31)
+            .expect("Visualizer ID 31 (Neon Acoustic Studio) must be registered");
+        assert_eq!(studio.name, "Neon Acoustic Studio");
+        assert_eq!(studio.filename, "vis_neon_acoustic_room.wgsl");
+        assert!(studio.requires_acoustic_waves);
+        assert!(!studio.heavy_shader);
+        assert!(matches!(
+            studio.pipeline_type,
+            crate::state::PipelineType::Mesh3D {
+                geometry: crate::state::Geometry::NeonRoom,
+                instances: 1,
+            }
+        ));
+        assert!(
+            crate::state::VISUALIZERS.iter().any(|v| v.id == 22),
+            "Existing Visualizer ID 22 (Neon Spatial Room) must remain registered"
+        );
+        let mut st = crate::state::AppState::new("smoke_default_check.flac".to_string());
+        assert!(
+            st.room_volume_smoke,
+            "Neon Acoustic Studio smoke must default ON"
+        );
+        st.room_volume_smoke = false;
+        assert!(
+            !st.render_snapshot().room_volume_smoke,
+            "render_snapshot() must preserve room_volume_smoke"
+        );
+
+        let sine_wave: Vec<f32> = (0..256).map(|k| (k as f32 * 0.25).sin()).collect();
+        let inv_wave: Vec<f32> = sine_wave.iter().map(|&s| -s).collect();
+        let mut spectrum = vec![0.0f32; 1024];
+        spectrum[1] = 50.0;
+        spectrum[12] = 40.0;
+        spectrum[40] = 30.0;
+        let mut spatial = [0.0f32; 16];
+        spatial[0] = 0.9;
+        spatial[1] = 0.9;
+
+        let mut phases = [0.0f32; 32];
+        let in_phase_channels = vec![sine_wave.clone(), sine_wave.clone()];
+        for f in 0..16 {
+            VulkanEngine::extract_acoustic_wave_phases(
+                &mut phases,
+                &in_phase_channels,
+                &spectrum,
+                &spatial,
+                2,
+                1.0 / 60.0,
+                true,
+                f as f32 * (1.0 / 60.0),
+            );
+        }
+        assert!(
+            phases[0].abs() < 1e-4 && phases[1].abs() < 0.08,
+            "In-phase L==R must yield zero inter-channel phase delta, got {:?}",
+            &phases[0..2]
+        );
+
+        let out_phase_channels = vec![sine_wave, inv_wave];
+        for f in 0..24 {
+            VulkanEngine::extract_acoustic_wave_phases(
+                &mut phases,
+                &out_phase_channels,
+                &spectrum,
+                &spatial,
+                2,
+                1.0 / 60.0,
+                true,
+                f as f32 * (1.0 / 60.0),
+            );
+        }
+        assert!(
+            (phases[1].abs() - std::f32::consts::PI).abs() < 0.08,
+            "Inverted polarity L==-R must converge to +-PI phase delta, got {}",
+            phases[1]
+        );
+
+        for step in 0..500 {
+            VulkanEngine::extract_acoustic_wave_phases(
+                &mut phases,
+                &out_phase_channels,
+                &spectrum,
+                &spatial,
+                2,
+                1.0 / 60.0,
+                true,
+                step as f32 * 0.05,
+            );
+            assert!(
+                phases[17] >= 0.0 && phases[17] < std::f32::consts::TAU,
+                "base_osc must wrap continuously inside [0, TAU)"
+            );
+            for obj_idx in 0..3 {
+                let x = phases[18 + obj_idx * 4];
+                let y = phases[19 + obj_idx * 4];
+                let z = phases[20 + obj_idx * 4];
+                assert!(x.abs() < 10.8 && y > -1.5 && y < 4.9 && z.abs() < 8.9);
+            }
+            assert!(phases[31] >= 0.0 && phases[31] <= 1.0);
+        }
+    }
+
+    #[test]
+    fn test_neon_acoustic_studio_camera_choreography_and_clearance() {
+        let obstacles: &[(&str, [f32; 3], [f32; 3])] = &[
+            ("FL tower", [-3.8, -0.25, 5.5], [0.51, 1.15, 0.54]),
+            ("FR tower", [3.8, -0.25, 5.5], [0.51, 1.15, 0.54]),
+            ("Center cabinet", [0.0, -0.02, 5.32], [0.93, 0.35, 0.35]),
+            ("LFE sub", [0.0, -0.90, 5.50], [1.28, 0.51, 0.58]),
+            ("SL monitor", [-6.2, -0.05, 0.5], [0.38, 1.18, 0.38]),
+            ("SR monitor", [6.2, -0.05, 0.5], [0.38, 1.18, 0.38]),
+            ("RL tower", [-4.2, 0.1, -4.8], [0.51, 1.15, 0.54]),
+            ("RR tower", [4.2, 0.1, -4.8], [0.51, 1.15, 0.54]),
+            ("TFL Atmos", [-3.2, 4.32, 3.5], [0.38, 0.28, 0.38]),
+            ("TFR Atmos", [3.2, 4.32, 3.5], [0.38, 0.28, 0.38]),
+            ("TRL Atmos", [-3.2, 4.32, -2.5], [0.38, 0.28, 0.38]),
+            ("TRR Atmos", [3.2, 4.32, -2.5], [0.38, 0.28, 0.38]),
+        ];
+
+        const STEPS: usize = 1080;
+        const DT_REAL: f64 = 0.05;
+        let mut samples = Vec::with_capacity(STEPS);
+
+        let mut min_x = f32::MAX;
+        let mut max_x = f32::MIN;
+        let mut min_y = f32::MAX;
+        let mut max_y = f32::MIN;
+        let mut min_z = f32::MAX;
+        let mut max_z = f32::MIN;
+        let mut min_dir_x = f32::MAX;
+        let mut min_dir_z = f32::MAX;
+        let mut max_dir_z = f32::MIN;
+
+        for idx in 0..STEPS {
+            let real_t = idx as f64 * DT_REAL;
+            let (eye, target) = compute_neon_acoustic_studio_camera(real_t * 2.88);
+            assert!(
+                eye.is_finite() && target.is_finite(),
+                "Non-finite camera coordinates at t={real_t:.2}s"
+            );
+            assert!(
+                eye.x.abs() < 9.5 && eye.y > -0.8 && eye.y < 3.85 && eye.z > -8.2 && eye.z < 7.5,
+                "Camera out of safe room interior bounds at t={real_t:.2}s: {eye:?}"
+            );
+            if eye.z > 3.5 && eye.x.abs() < 5.4 {
+                assert!(
+                    eye.y > -0.7,
+                    "Camera clipped stage riser at t={real_t:.2}s: {eye:?}"
+                );
+            }
+            for &(label, center, half) in obstacles {
+                let in_x = (eye.x - center[0]).abs() < (half[0] + 0.50);
+                let in_y = (eye.y - center[1]).abs() < (half[1] + 0.50);
+                let in_z = (eye.z - center[2]).abs() < (half[2] + 0.50);
+                assert!(
+                    !(in_x && in_y && in_z),
+                    "Camera violated 0.5m clearance of {label} at t={real_t:.2}s: {eye:?}"
+                );
+            }
+
+            let gaze = target - eye;
+            let gaze_len = gaze.length();
+            assert!(
+                gaze_len > 3.5,
+                "Degenerate short look_at vector ({gaze_len:.2}m) at t={real_t:.2}s"
+            );
+            let dir = gaze / gaze_len;
+            assert!(
+                dir.y.abs() < 0.85,
+                "Steep look_at pitch (dir.y={:.3}) at t={real_t:.2}s",
+                dir.y
+            );
+
+            min_x = min_x.min(eye.x);
+            max_x = max_x.max(eye.x);
+            min_y = min_y.min(eye.y);
+            max_y = max_y.max(eye.y);
+            min_z = min_z.min(eye.z);
+            max_z = max_z.max(eye.z);
+            min_dir_x = min_dir_x.min(dir.x);
+            min_dir_z = min_dir_z.min(dir.z);
+            max_dir_z = max_dir_z.max(dir.z);
+
+            samples.push((real_t, eye, dir));
+        }
+
+        let mut dwell_speed_sum = 0.0f32;
+        let mut dwell_count = 0usize;
+        let mut peak_trans_speed = 0.0f32;
+        for idx in 0..STEPS {
+            let (real_t, eye_curr, dir_curr) = samples[idx];
+            let (_, eye_next, dir_next) = samples[(idx + 1) % STEPS];
+            let step_dist = (eye_next - eye_curr).length();
+            let dir_delta = (dir_next - dir_curr).length();
+            assert!(
+                step_dist < 0.40 && dir_delta < 0.12,
+                "Camera jump at t={real_t:.2}s: step_dist={step_dist:.4}, dir_delta={dir_delta:.4}"
+            );
+
+            let speed = step_dist / (DT_REAL as f32);
+            let local_u = ((real_t % NEON_STUDIO_CAM_SHOT_SECS) / NEON_STUDIO_CAM_SHOT_SECS) as f32;
+            if local_u < 0.70 {
+                dwell_speed_sum += speed;
+                dwell_count += 1;
+            } else if local_u > 0.74 && local_u < 0.98 {
+                peak_trans_speed = peak_trans_speed.max(speed);
+            }
+        }
+
+        let avg_dwell_speed = dwell_speed_sum / (dwell_count as f32);
+        assert!(
+            avg_dwell_speed < 0.85 && peak_trans_speed > 2.5,
+            "Strategic Dwell & Glide contrast invalid: avg_dwell={avg_dwell_speed:.3} m/s, peak_trans={peak_trans_speed:.3} m/s"
+        );
+        assert!(
+            min_x < -7.0
+                && max_x > 7.0
+                && min_z < -7.0
+                && max_z > 6.5
+                && min_y < 0.05
+                && max_y > 3.4
+                && max_dir_z > 0.7
+                && min_dir_z < -0.7
+                && min_dir_x < -0.8,
+            "Incomplete room coverage: x=[{min_x:.2},{max_x:.2}], y=[{min_y:.2},{max_y:.2}], z=[{min_z:.2},{max_z:.2}], dir_x_min={min_dir_x:.2}, dir_z=[{min_dir_z:.2},{max_dir_z:.2}]"
+        );
+
+        let (hi_eye, hi_target) =
+            compute_neon_acoustic_studio_camera(2.0 * HOST_TIME_WRAP_PERIOD_SECS);
+        assert!(
+            hi_eye.is_finite()
+                && hi_target.is_finite()
+                && (hi_target - hi_eye).length() > 3.5
+                && hi_eye.x.abs() < 9.5
+        );
+
+        let (mesh_verts, _mesh_inds) = generate_neon_room_mesh();
+        let mut min_y_c2 = f32::MAX;
+        let mut sum_x_c2 = 0.0f32;
+        let mut sum_z_c2 = 0.0f32;
+        let mut cnt_c2 = 0usize;
+        let mut max_y_c3 = f32::MIN;
+        let mut sum_x_c3 = 0.0f32;
+        let mut sum_z_c3 = 0.0f32;
+        let mut cnt_c3 = 0usize;
+        for v in &mesh_verts {
+            if (v.tex_coords[0] - 2.0).abs() < 0.1 {
+                min_y_c2 = min_y_c2.min(v.position[1]);
+                sum_x_c2 += v.position[0];
+                sum_z_c2 += v.position[2];
+                cnt_c2 += 1;
+            } else if (v.tex_coords[0] - 3.0).abs() < 0.1 && v.tex_coords[1] > 1.1 {
+                max_y_c3 = max_y_c3.max(v.position[1]);
+                sum_x_c3 += v.position[0];
+                sum_z_c3 += v.position[2];
+                cnt_c3 += 1;
+            }
+        }
+        assert!(cnt_c2 > 0 && cnt_c3 > 0);
+        let avg_x_c2 = sum_x_c2 / cnt_c2 as f32;
+        let avg_z_c2 = sum_z_c2 / cnt_c2 as f32;
+        let avg_x_c3 = sum_x_c3 / cnt_c3 as f32;
+        let avg_z_c3 = sum_z_c3 / cnt_c3 as f32;
+        assert!(
+            min_y_c2 >= max_y_c3 + 0.05
+                && (avg_x_c2 - avg_x_c3).abs() < 0.05
+                && (avg_z_c2 - avg_z_c3).abs() < 0.30,
+            "Center (ch 2) must be cleanly stacked above LFE Sub (ch 3): min_y_c2={min_y_c2:.3}, max_y_c3={max_y_c3:.3}, avg_c2=({avg_x_c2:.2},{avg_z_c2:.2}), avg_c3=({avg_x_c3:.2},{avg_z_c3:.2})"
         );
     }
 }
