@@ -1,7 +1,7 @@
 use crate::audio;
-use crate::cli::{
-    Args, has_cli_upmix_override, reconcile_passthrough_change_osd, should_prefer_x11_backend,
-};
+#[cfg(target_os = "linux")]
+use crate::cli::should_prefer_x11_backend;
+use crate::cli::{Args, has_cli_upmix_override, reconcile_passthrough_change_osd};
 use crate::engine::{EngineAction, VulkanEngine};
 use crate::state::AppState;
 use crate::steam::auto_provision_steam_artwork;

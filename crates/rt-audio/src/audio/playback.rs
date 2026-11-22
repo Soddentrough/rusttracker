@@ -3814,7 +3814,7 @@ fn run_wasapi_exclusive_multichannel(
                                     current_chunk = Some(chunk);
                                     chunk_frame_pos = 0;
                                 }
-                                Err(_) => {
+                                None => {
                                     break;
                                 }
                             }

@@ -36,10 +36,10 @@ pub fn is_relevant_audio_device(name: &str) -> bool {
 
 pub fn format_cpal_device_name(desc: &cpal::DeviceDescription) -> String {
     #[cfg(target_os = "windows")]
-    if let Some(friendly) = desc.extended().first()
+    if let Some(friendly) = desc.extended().next()
         && !friendly.trim().is_empty()
     {
-        return friendly.clone();
+        return friendly.to_string();
     }
     desc.name().to_string()
 }

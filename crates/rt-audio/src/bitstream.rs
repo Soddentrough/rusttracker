@@ -1060,29 +1060,13 @@ mod wasapi_bitstream {
 
     impl Drop for OwnedHandle {
         fn drop(&mut self) {
-            if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
+            if !self.0.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
                 unsafe {
                     let _ = CloseHandle(self.0);
                 }
             }
         }
     }
-    static PIPE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-
-    // ─── Standard PCM & IEEE Float WASAPI SubFormat GUIDs ──────────
-    const KSDATAFORMAT_SUBTYPE_PCM: GUID = GUID {
-        data1: 0x00000001,
-        data2: 0x0000,
-        data3: 0x0010,
-        data4: [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
-    };
-
-    const KSDATAFORMAT_SUBTYPE_IEEE_FLOAT: GUID = GUID {
-        data1: 0x00000003,
-        data2: 0x0000,
-        data3: 0x0010,
-        data4: [0x80, 0x00, 0x00, 0xaa, 0x00, 0x38, 0x9b, 0x71],
-    };
 
     // ─── IEC 61937 WASAPI SubFormat GUIDs ────────────────────────────
     const KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_DIGITAL: GUID = GUID {
@@ -1133,23 +1117,14 @@ mod wasapi_bitstream {
             pid: 14,
         };
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    enum WasapiStreamType {
-        CompressedBitstream,
-        Lpcm,
-    }
-
     #[derive(Debug, Clone)]
     struct AudioProfile {
         name: String,
-        stream_type: WasapiStreamType,
         channels: u16,
         rate: u32,
-        valid_bits: u16,
         container_bits: u16,
         channel_mask: u32,
         sub_format: GUID,
-        sample_format: ffmpeg_next::format::sample::Sample,
     }
 
     fn get_device_name(device: &IMMDevice) -> Option<String> {
@@ -1247,92 +1222,70 @@ mod wasapi_bitstream {
         codec_id: ffmpeg_next::codec::Id,
         _src_channels: u16,
         _src_rate: u32,
-    ) -> Result<(String, WasapiStreamType, Vec<AudioProfile>)> {
+    ) -> Result<(String, Vec<AudioProfile>)> {
         match codec_id {
             ffmpeg_next::codec::Id::TRUEHD => Ok((
                 "truehd".to_string(),
-                WasapiStreamType::CompressedBitstream,
                 vec![
                     AudioProfile {
                         name: "TrueHD / Dolby Atmos (MAT 2.0 HBR)".to_string(),
-                        stream_type: WasapiStreamType::CompressedBitstream,
                         channels: 8,
                         rate: 192000,
-                        valid_bits: 16,
                         container_bits: 16,
                         channel_mask: 0x63F,
                         sub_format: KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_MAT20,
-                        sample_format: ffmpeg_next::format::sample::Sample::None,
                     },
                     AudioProfile {
                         name: "TrueHD / Dolby Atmos (MLP HBR)".to_string(),
-                        stream_type: WasapiStreamType::CompressedBitstream,
                         channels: 8,
                         rate: 192000,
-                        valid_bits: 16,
                         container_bits: 16,
                         channel_mask: 0x63F,
                         sub_format: KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_MLP,
-                        sample_format: ffmpeg_next::format::sample::Sample::None,
                     },
                 ],
             )),
             ffmpeg_next::codec::Id::EAC3 => Ok((
                 "eac3".to_string(),
-                WasapiStreamType::CompressedBitstream,
                 vec![AudioProfile {
                     name: "E-AC3 / Dolby Digital Plus".to_string(),
-                    stream_type: WasapiStreamType::CompressedBitstream,
                     channels: 2,
                     rate: 192000,
-                    valid_bits: 16,
                     container_bits: 16,
                     channel_mask: 0x3,
                     sub_format: KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_DIGITAL_PLUS,
-                    sample_format: ffmpeg_next::format::sample::Sample::None,
                 }],
             )),
             ffmpeg_next::codec::Id::DTS => Ok((
                 "dts".to_string(),
-                WasapiStreamType::CompressedBitstream,
                 vec![
                     AudioProfile {
                         name: "DTS-HD MA (HBR)".to_string(),
-                        stream_type: WasapiStreamType::CompressedBitstream,
                         channels: 8,
                         rate: 192000,
-                        valid_bits: 16,
                         container_bits: 16,
                         channel_mask: 0x63F,
                         sub_format: KSDATAFORMAT_SUBTYPE_IEC61937_DTS_HD,
-                        sample_format: ffmpeg_next::format::sample::Sample::None,
                     },
                     AudioProfile {
                         name: "DTS Core (fallback)".to_string(),
-                        stream_type: WasapiStreamType::CompressedBitstream,
                         channels: 2,
                         rate: 48000,
-                        valid_bits: 16,
                         container_bits: 16,
                         channel_mask: 0x3,
                         sub_format: KSDATAFORMAT_SUBTYPE_IEC61937_DTS,
-                        sample_format: ffmpeg_next::format::sample::Sample::None,
                     },
                 ],
             )),
             ffmpeg_next::codec::Id::AC3 => Ok((
                 "ac3".to_string(),
-                WasapiStreamType::CompressedBitstream,
                 vec![AudioProfile {
                     name: "AC3 / Dolby Digital".to_string(),
-                    stream_type: WasapiStreamType::CompressedBitstream,
                     channels: 2,
                     rate: 48000,
-                    valid_bits: 16,
                     container_bits: 16,
                     channel_mask: 0x3,
                     sub_format: KSDATAFORMAT_SUBTYPE_IEC61937_DOLBY_DIGITAL,
-                    sample_format: ffmpeg_next::format::sample::Sample::None,
                 }],
             )),
             // Uncompressed Multi-Channel LPCM uses WASAPI Shared Mode via cpal; Exclusive Mode is restricted to compressed bitstreams
@@ -1354,76 +1307,45 @@ mod wasapi_bitstream {
     fn build_format(profile: &AudioProfile) -> Vec<u8> {
         let block_align = profile.channels * (profile.container_bits / 8);
         let avg_bytes = profile.rate * block_align as u32;
+        let is_hbr = profile.rate > 48000;
+        let format_ext = WAVEFORMATEXTENSIBLE {
+            Format: WAVEFORMATEX {
+                wFormatTag: 0xFFFE, // WAVE_FORMAT_EXTENSIBLE
+                nChannels: profile.channels,
+                nSamplesPerSec: profile.rate,
+                nAvgBytesPerSec: avg_bytes,
+                nBlockAlign: block_align,
+                wBitsPerSample: 16,
+                cbSize: if is_hbr { 34 } else { 22 },
+            },
+            Samples: WAVEFORMATEXTENSIBLE_0 {
+                wValidBitsPerSample: 16,
+            },
+            dwChannelMask: profile.channel_mask,
+            SubFormat: profile.sub_format,
+        };
 
-        match profile.stream_type {
-            WasapiStreamType::CompressedBitstream => {
-                let is_hbr = profile.rate > 48000;
-                let format_ext = WAVEFORMATEXTENSIBLE {
-                    Format: WAVEFORMATEX {
-                        wFormatTag: 0xFFFE, // WAVE_FORMAT_EXTENSIBLE
-                        nChannels: profile.channels,
-                        nSamplesPerSec: profile.rate,
-                        nAvgBytesPerSec: avg_bytes,
-                        nBlockAlign: block_align,
-                        wBitsPerSample: 16,
-                        cbSize: if is_hbr { 34 } else { 22 },
-                    },
-                    Samples: WAVEFORMATEXTENSIBLE_0 {
-                        wValidBitsPerSample: 16,
-                    },
-                    dwChannelMask: profile.channel_mask,
-                    SubFormat: profile.sub_format,
-                };
-
-                if is_hbr {
-                    let iec = WAVEFORMATEXTENSIBLE_IEC61937 {
-                        format_ext,
-                        dw_encoded_samples_per_sec: profile.rate,
-                        dw_encoded_channel_count: profile.channels as u32,
-                        dw_average_bytes_per_sec: avg_bytes,
-                    };
-                    unsafe {
-                        std::slice::from_raw_parts(
-                            &iec as *const _ as *const u8,
-                            std::mem::size_of::<WAVEFORMATEXTENSIBLE_IEC61937>(),
-                        )
-                        .to_vec()
-                    }
-                } else {
-                    unsafe {
-                        std::slice::from_raw_parts(
-                            &format_ext as *const _ as *const u8,
-                            std::mem::size_of::<WAVEFORMATEXTENSIBLE>(),
-                        )
-                        .to_vec()
-                    }
-                }
+        if is_hbr {
+            let iec = WAVEFORMATEXTENSIBLE_IEC61937 {
+                format_ext,
+                dw_encoded_samples_per_sec: profile.rate,
+                dw_encoded_channel_count: profile.channels as u32,
+                dw_average_bytes_per_sec: avg_bytes,
+            };
+            unsafe {
+                std::slice::from_raw_parts(
+                    &iec as *const _ as *const u8,
+                    std::mem::size_of::<WAVEFORMATEXTENSIBLE_IEC61937>(),
+                )
+                .to_vec()
             }
-            WasapiStreamType::Lpcm => {
-                let format_ext = WAVEFORMATEXTENSIBLE {
-                    Format: WAVEFORMATEX {
-                        wFormatTag: 0xFFFE, // WAVE_FORMAT_EXTENSIBLE
-                        nChannels: profile.channels,
-                        nSamplesPerSec: profile.rate,
-                        nAvgBytesPerSec: avg_bytes,
-                        nBlockAlign: block_align,
-                        wBitsPerSample: profile.container_bits,
-                        cbSize: 22,
-                    },
-                    Samples: WAVEFORMATEXTENSIBLE_0 {
-                        wValidBitsPerSample: profile.valid_bits,
-                    },
-                    dwChannelMask: profile.channel_mask,
-                    SubFormat: profile.sub_format,
-                };
-
-                unsafe {
-                    std::slice::from_raw_parts(
-                        &format_ext as *const _ as *const u8,
-                        std::mem::size_of::<WAVEFORMATEXTENSIBLE>(),
-                    )
-                    .to_vec()
-                }
+        } else {
+            unsafe {
+                std::slice::from_raw_parts(
+                    &format_ext as *const _ as *const u8,
+                    std::mem::size_of::<WAVEFORMATEXTENSIBLE>(),
+                )
+                .to_vec()
             }
         }
     }
@@ -1491,7 +1413,7 @@ mod wasapi_bitstream {
             audio_bitrate_kbps = Some((probe_decoder.bit_rate() / 1000).max(1) as u32);
         }
 
-        let (codec_name, stream_type, profiles) =
+        let (codec_name, profiles) =
             detect_codec_profile(codec_id, src_channels, decoder_sample_rate)?;
         let video_setup = crate::audio::probe_video_stream(&ictx);
         let has_video = video_setup.is_some();
@@ -1738,9 +1660,6 @@ mod wasapi_bitstream {
                 let (pcm_tx, pcm_rx) = crossbeam_channel::bounded::<AudioPacket>(1024);
                 let (vis_tx, vis_rx) = crossbeam_channel::bounded::<DspMessage>(1024);
 
-                let stop_token_ffmpeg = stop_token_pump.clone();
-                let profile_clone = profile.clone();
-
                 let (video_stream_index, video_time_base, video_packet_tx, video_packet_rx) =
                     if let Some(vs) = video_setup {
                         let tb = vs.time_base;
@@ -1760,340 +1679,329 @@ mod wasapi_bitstream {
                     };
                 let active_has_video = video_stream_index.is_some();
 
-                let ffmpeg_thread = match stream_type {
-                    WasapiStreamType::CompressedBitstream => {
-                        use std::sync::atomic::Ordering;
-                        use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
-                        use windows::Win32::System::Pipes::{
-                            ConnectNamedPipe, CreateNamedPipeA, NAMED_PIPE_MODE, PeekNamedPipe,
+                let ffmpeg_thread = {
+                    use std::sync::atomic::Ordering;
+                    use windows::Win32::Storage::FileSystem::FILE_FLAGS_AND_ATTRIBUTES;
+                    use windows::Win32::System::Pipes::{
+                        ConnectNamedPipe, CreateNamedPipeA, NAMED_PIPE_MODE, PeekNamedPipe,
+                    };
+
+                    let pipe_id = PIPE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let pipe_name = format!(
+                        "\\\\.\\pipe\\rusttracker_bitstream_{}_{}",
+                        std::process::id(),
+                        pipe_id
+                    );
+                    let pipe_name_nul = format!("{}\0", pipe_name);
+
+                    let pipe_handle = OwnedHandle::new(
+                        match unsafe {
+                            CreateNamedPipeA(
+                                windows::core::PCSTR::from_raw(pipe_name_nul.as_ptr()),
+                                FILE_FLAGS_AND_ATTRIBUTES(1), // PIPE_ACCESS_INBOUND
+                                NAMED_PIPE_MODE(0), // PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT
+                                255,                // PIPE_UNLIMITED_INSTANCES
+                                65536,
+                                65536,
+                                0,
+                                None,
+                            )
+                        } {
+                            Ok(h) => h,
+                            Err(e) => {
+                                drop(render_client);
+                                drop(audio_client);
+                                return Err(anyhow::anyhow!(e));
+                            }
+                        },
+                    );
+
+                    let pipe_name_clone = pipe_name.clone();
+                    let stop_token_worker = stop_token_pump.clone();
+                    let vis_tx_worker = vis_tx.clone();
+                    let pcm_tx_worker = pcm_tx.clone();
+                    let shared_state_worker = shared_state_pump.clone();
+                    let eof_flag = Arc::new(AtomicBool::new(false));
+                    let eof_flag_worker = eof_flag.clone();
+                    let eof_flag_feeder = eof_flag.clone();
+                    let initial_epoch = shared_state_pump.lock().map(|s| s.seek_epoch).unwrap_or(0);
+                    let writer_epoch = Arc::new(std::sync::atomic::AtomicU64::new(initial_epoch));
+                    let writer_epoch_worker = writer_epoch.clone();
+                    let writer_epoch_feeder = writer_epoch.clone();
+                    let pipe_flushing = Arc::new(AtomicBool::new(false));
+                    let pipe_flushing_worker = pipe_flushing.clone();
+                    let pipe_flushing_feeder = pipe_flushing.clone();
+
+                    let ffmpeg_worker = std::thread::spawn(move || {
+                        let _custom_io = custom_io;
+                        let mut ictx = ictx;
+                        println!("[bitstream] Compressed bitstream FFmpeg worker thread started.");
+
+                        let mut octx =
+                            match ffmpeg_next::format::output_as(&pipe_name_clone, "spdif") {
+                                Ok(ctx) => ctx,
+                                Err(e) => {
+                                    eprintln!("[bitstream] Failed to open spdif muxer: {}", e);
+                                    let _ = std::fs::OpenOptions::new()
+                                        .write(true)
+                                        .open(&pipe_name_clone);
+                                    return;
+                                }
+                            };
+                        let ost_index = {
+                            let mut ost = match octx.add_stream(ffmpeg_next::codec::Id::None) {
+                                Ok(st) => st,
+                                Err(e) => {
+                                    eprintln!("[bitstream] Failed to add stream: {}", e);
+                                    return;
+                                }
+                            };
+                            ost.set_parameters(parameters.clone());
+                            ost.index()
                         };
 
-                        let pipe_id =
-                            PIPE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        let pipe_name = format!(
-                            "\\\\.\\pipe\\rusttracker_bitstream_{}_{}",
-                            std::process::id(),
-                            pipe_id
-                        );
-                        let pipe_name_nul = format!("{}\0", pipe_name);
+                        let mut dict = ffmpeg_next::Dictionary::new();
+                        dict.set("flush_packets", "1");
+                        if let Err(e) = octx.write_header_with(dict) {
+                            eprintln!("[bitstream] Failed to write header: {}", e);
+                            return;
+                        }
 
-                        let pipe_handle = OwnedHandle::new(
-                            match unsafe {
-                                CreateNamedPipeA(
-                                    windows::core::PCSTR::from_raw(pipe_name_nul.as_ptr()),
-                                    FILE_FLAGS_AND_ATTRIBUTES(1), // PIPE_ACCESS_INBOUND
-                                    NAMED_PIPE_MODE(0), // PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT
-                                    255,                // PIPE_UNLIMITED_INSTANCES
-                                    65536,
-                                    65536,
-                                    0,
-                                    None,
-                                )
-                            } {
-                                Ok(h) => h,
-                                Err(e) => {
-                                    drop(render_client);
-                                    drop(audio_client);
-                                    return Err(anyhow::anyhow!(e));
-                                }
-                            },
-                        );
-
-                        let pipe_name_clone = pipe_name.clone();
-                        let stop_token_worker = stop_token_pump.clone();
-                        let vis_tx_worker = vis_tx.clone();
-                        let pcm_tx_worker = pcm_tx.clone();
-                        let shared_state_worker = shared_state_pump.clone();
-                        let eof_flag = Arc::new(AtomicBool::new(false));
-                        let eof_flag_worker = eof_flag.clone();
-                        let eof_flag_feeder = eof_flag.clone();
-                        let initial_epoch =
-                            shared_state_pump.lock().map(|s| s.seek_epoch).unwrap_or(0);
-                        let writer_epoch =
-                            Arc::new(std::sync::atomic::AtomicU64::new(initial_epoch));
-                        let writer_epoch_worker = writer_epoch.clone();
-                        let writer_epoch_feeder = writer_epoch.clone();
-                        let pipe_flushing = Arc::new(AtomicBool::new(false));
-                        let pipe_flushing_worker = pipe_flushing.clone();
-                        let pipe_flushing_feeder = pipe_flushing.clone();
-
-                        let ffmpeg_worker = std::thread::spawn(move || {
-                            let _custom_io = custom_io;
-                            let mut ictx = ictx;
-                            println!(
-                                "[bitstream] Compressed bitstream FFmpeg worker thread started."
-                            );
-
-                            let mut octx =
-                                match ffmpeg_next::format::output_as(&pipe_name_clone, "spdif") {
-                                    Ok(ctx) => ctx,
-                                    Err(e) => {
-                                        eprintln!("[bitstream] Failed to open spdif muxer: {}", e);
-                                        let _ = std::fs::OpenOptions::new()
-                                            .write(true)
-                                            .open(&pipe_name_clone);
-                                        return;
-                                    }
-                                };
-                            let ost_index = {
-                                let mut ost = match octx.add_stream(ffmpeg_next::codec::Id::None) {
-                                    Ok(st) => st,
-                                    Err(e) => {
-                                        eprintln!("[bitstream] Failed to add stream: {}", e);
-                                        return;
-                                    }
-                                };
-                                ost.set_parameters(parameters.clone());
-                                ost.index()
-                            };
-
-                            let mut dict = ffmpeg_next::Dictionary::new();
-                            dict.set("flush_packets", "1");
-                            if let Err(e) = octx.write_header_with(dict) {
-                                eprintln!("[bitstream] Failed to write header: {}", e);
-                                return;
-                            }
-
-                            let decoder_context =
-                                match ffmpeg_next::codec::context::Context::from_parameters(
-                                    parameters.clone(),
-                                ) {
-                                    Ok(ctx) => ctx,
-                                    Err(e) => {
-                                        eprintln!(
-                                            "[bitstream] Failed to create visualizer decoder context: {}",
-                                            e
-                                        );
-                                        return;
-                                    }
-                                };
-                            let mut decoder = match decoder_context.decoder().audio() {
-                                Ok(dec) => dec,
+                        let decoder_context =
+                            match ffmpeg_next::codec::context::Context::from_parameters(
+                                parameters.clone(),
+                            ) {
+                                Ok(ctx) => ctx,
                                 Err(e) => {
                                     eprintln!(
-                                        "[bitstream] Failed to create visualizer audio decoder: {}",
+                                        "[bitstream] Failed to create visualizer decoder context: {}",
                                         e
                                     );
                                     return;
                                 }
                             };
+                        let mut decoder = match decoder_context.decoder().audio() {
+                            Ok(dec) => dec,
+                            Err(e) => {
+                                eprintln!(
+                                    "[bitstream] Failed to create visualizer audio decoder: {}",
+                                    e
+                                );
+                                return;
+                            }
+                        };
 
-                            let vis_channels = (decoder.channels() as i32).clamp(2, 8);
-                            let target_channel_layout =
-                                ffmpeg_next::channel_layout::ChannelLayout::default(vis_channels);
-                            let target_ch = vis_channels as usize;
+                        let vis_channels = (decoder.channels() as i32).clamp(2, 8);
+                        let target_channel_layout =
+                            ffmpeg_next::channel_layout::ChannelLayout::default(vis_channels);
+                        let target_ch = vis_channels as usize;
 
-                            let decoder_rate = decoder.rate() as f32;
-                            let window_size =
-                                crate::audio::calculate_power_of_two_window_size(decoder.rate());
-                            let update_interval = ((decoder_rate / 60.0).round() as usize).max(256);
-                            let mut accumulator: Vec<Vec<f32>> =
-                                vec![vec![0.0f32; window_size]; target_ch];
-                            let mut samples_since_last_send = 0usize;
-                            let mut current_seconds = 0.0;
-                            let mut seek_in_progress = true;
-                            let mut target_seek_time: Option<f64> = None;
+                        let decoder_rate = decoder.rate() as f32;
+                        let window_size =
+                            crate::audio::calculate_power_of_two_window_size(decoder.rate());
+                        let update_interval = ((decoder_rate / 60.0).round() as usize).max(256);
+                        let mut accumulator: Vec<Vec<f32>> =
+                            vec![vec![0.0f32; window_size]; target_ch];
+                        let mut samples_since_last_send = 0usize;
+                        let mut current_seconds = 0.0;
+                        let mut seek_in_progress = true;
+                        let mut target_seek_time: Option<f64> = None;
 
-                            let mut resampler: Option<
-                                ffmpeg_next::software::resampling::context::Context,
-                            > = None;
-                            let mut cur_in_fmt = ffmpeg_next::format::sample::Sample::None;
-                            let mut cur_in_layout =
-                                ffmpeg_next::channel_layout::ChannelLayout::default(0);
-                            let mut cur_in_rate = 0;
+                        let mut resampler: Option<
+                            ffmpeg_next::software::resampling::context::Context,
+                        > = None;
+                        let mut cur_in_fmt = ffmpeg_next::format::sample::Sample::None;
+                        let mut cur_in_layout =
+                            ffmpeg_next::channel_layout::ChannelLayout::default(0);
+                        let mut cur_in_rate = 0;
 
-                            let mut current_seek_epoch = shared_state_worker
-                                .lock()
-                                .map(|s| s.seek_epoch)
-                                .unwrap_or(0);
-                            let mut is_eof = false;
-                            let mut audio_pkt_bytes_accum: u64 = 0;
-                            let mut audio_pkt_window_start: Option<f64> = None;
+                        let mut current_seek_epoch = shared_state_worker
+                            .lock()
+                            .map(|s| s.seek_epoch)
+                            .unwrap_or(0);
+                        let mut is_eof = false;
+                        let mut audio_pkt_bytes_accum: u64 = 0;
+                        let mut audio_pkt_window_start: Option<f64> = None;
 
-                            loop {
-                                if stop_token_worker.load(std::sync::atomic::Ordering::Relaxed) {
-                                    break;
+                        loop {
+                            if stop_token_worker.load(std::sync::atomic::Ordering::Relaxed) {
+                                break;
+                            }
+
+                            let (seek_req, playback_sec) = {
+                                if let Ok(mut state) = shared_state_worker.lock() {
+                                    if let Some(target) = state.seek_request.take() {
+                                        state.seek_epoch += 1;
+                                        state.current_seconds = target;
+                                        state.track_ended = false;
+                                        state.lookahead_queue.clear();
+                                        state.lookahead_sample_buffer.clear();
+                                        state.lookahead_timeline.fill(0.0);
+                                        state.lookahead_buffer_start_time = target;
+                                        state.waveform_history.clear();
+                                        state.raw_waveform.fill(0.0);
+                                        (Some((target, state.seek_epoch)), target)
+                                    } else {
+                                        (None, state.current_seconds)
+                                    }
+                                } else {
+                                    (None, current_seconds)
+                                }
+                            };
+
+                            if let Some((pos, epoch)) = seek_req {
+                                pipe_flushing_worker.store(true, Ordering::SeqCst);
+                                current_seek_epoch = epoch;
+                                is_eof = false;
+                                eof_flag_worker.store(false, Ordering::SeqCst);
+                                seek_in_progress = true;
+                                target_seek_time = Some(pos);
+                                samples_since_last_send = 0;
+                                audio_pkt_bytes_accum = 0;
+                                audio_pkt_window_start = None;
+                                if let Some(ref v_rx) = video_packet_rx {
+                                    while v_rx.try_recv().is_ok() {}
                                 }
 
-                                let (seek_req, playback_sec) = {
-                                    if let Ok(mut state) = shared_state_worker.lock() {
-                                        if let Some(target) = state.seek_request.take() {
-                                            state.seek_epoch += 1;
-                                            state.current_seconds = target;
-                                            state.track_ended = false;
-                                            state.lookahead_queue.clear();
-                                            state.lookahead_sample_buffer.clear();
-                                            state.lookahead_timeline.fill(0.0);
-                                            state.lookahead_buffer_start_time = target;
-                                            state.waveform_history.clear();
-                                            state.raw_waveform.fill(0.0);
-                                            (Some((target, state.seek_epoch)), target)
-                                        } else {
-                                            (None, state.current_seconds)
-                                        }
-                                    } else {
-                                        (None, current_seconds)
-                                    }
+                                let (seek_stream_idx, target_pts) = if let (Some(v_idx), Some(tb)) =
+                                    (video_stream_index, video_time_base)
+                                {
+                                    let tb_f64 =
+                                        tb.numerator() as f64 / tb.denominator().max(1) as f64;
+                                    (v_idx as i32, (pos / tb_f64).max(0.0) as i64)
+                                } else if stream_time_base > 0.0 {
+                                    (
+                                        best_audio_index as i32,
+                                        (pos / stream_time_base).max(0.0) as i64,
+                                    )
+                                } else {
+                                    (
+                                        -1,
+                                        (pos * ffmpeg_next::ffi::AV_TIME_BASE as f64).max(0.0)
+                                            as i64,
+                                    )
                                 };
-
-                                if let Some((pos, epoch)) = seek_req {
-                                    pipe_flushing_worker.store(true, Ordering::SeqCst);
-                                    current_seek_epoch = epoch;
-                                    is_eof = false;
-                                    eof_flag_worker.store(false, Ordering::SeqCst);
-                                    seek_in_progress = true;
-                                    target_seek_time = Some(pos);
-                                    samples_since_last_send = 0;
-                                    audio_pkt_bytes_accum = 0;
-                                    audio_pkt_window_start = None;
-                                    if let Some(ref v_rx) = video_packet_rx {
-                                        while v_rx.try_recv().is_ok() {}
-                                    }
-
-                                    let (seek_stream_idx, target_pts) =
-                                        if let (Some(v_idx), Some(tb)) =
-                                            (video_stream_index, video_time_base)
-                                        {
-                                            let tb_f64 = tb.numerator() as f64
-                                                / tb.denominator().max(1) as f64;
-                                            (v_idx as i32, (pos / tb_f64).max(0.0) as i64)
-                                        } else if stream_time_base > 0.0 {
-                                            (
-                                                best_audio_index as i32,
-                                                (pos / stream_time_base).max(0.0) as i64,
-                                            )
-                                        } else {
-                                            (
-                                                -1,
-                                                (pos * ffmpeg_next::ffi::AV_TIME_BASE as f64)
-                                                    .max(0.0)
-                                                    as i64,
-                                            )
-                                        };
-                                    unsafe {
-                                        let ret = ffmpeg_next::ffi::av_seek_frame(
+                                unsafe {
+                                    let ret = ffmpeg_next::ffi::av_seek_frame(
+                                        ictx.as_mut_ptr(),
+                                        seek_stream_idx,
+                                        target_pts,
+                                        ffmpeg_next::ffi::AVSEEK_FLAG_BACKWARD,
+                                    );
+                                    if ret < 0 {
+                                        let fallback_pts =
+                                            (pos * ffmpeg_next::ffi::AV_TIME_BASE as f64).max(0.0)
+                                                as i64;
+                                        ffmpeg_next::ffi::av_seek_frame(
                                             ictx.as_mut_ptr(),
-                                            seek_stream_idx,
-                                            target_pts,
+                                            -1,
+                                            fallback_pts,
                                             ffmpeg_next::ffi::AVSEEK_FLAG_BACKWARD,
                                         );
-                                        if ret < 0 {
-                                            let fallback_pts = (pos
-                                                * ffmpeg_next::ffi::AV_TIME_BASE as f64)
-                                                .max(0.0)
-                                                as i64;
-                                            ffmpeg_next::ffi::av_seek_frame(
-                                                ictx.as_mut_ptr(),
-                                                -1,
-                                                fallback_pts,
-                                                ffmpeg_next::ffi::AVSEEK_FLAG_BACKWARD,
-                                            );
-                                        }
                                     }
-                                    decoder.flush();
-                                    for acc in &mut accumulator {
-                                        acc.fill(0.0);
-                                    }
-                                    // Wait briefly for feeder_thread to drain any pre-seek SPDIF bytes
-                                    // buffered in the OS named pipe before advancing writer_epoch.
-                                    let flush_wait_start = std::time::Instant::now();
-                                    while pipe_flushing_worker.load(Ordering::SeqCst)
-                                        && !stop_token_worker.load(Ordering::Relaxed)
-                                        && flush_wait_start.elapsed()
-                                            < std::time::Duration::from_millis(50)
-                                    {
-                                        std::thread::sleep(std::time::Duration::from_micros(500));
-                                    }
-                                    pipe_flushing_worker.store(false, Ordering::SeqCst);
-                                    writer_epoch_worker.store(epoch, Ordering::SeqCst);
-                                    current_seconds = pos;
                                 }
-
-                                if is_eof
-                                    || (target_seek_time.is_none()
-                                        && (pcm_tx_worker.len() > 256
-                                            || (current_seconds > playback_sec + 7.5
-                                                && pcm_tx_worker.len() > 16)))
+                                decoder.flush();
+                                for acc in &mut accumulator {
+                                    acc.fill(0.0);
+                                }
+                                // Wait briefly for feeder_thread to drain any pre-seek SPDIF bytes
+                                // buffered in the OS named pipe before advancing writer_epoch.
+                                let flush_wait_start = std::time::Instant::now();
+                                while pipe_flushing_worker.load(Ordering::SeqCst)
+                                    && !stop_token_worker.load(Ordering::Relaxed)
+                                    && flush_wait_start.elapsed()
+                                        < std::time::Duration::from_millis(50)
                                 {
-                                    std::thread::sleep(std::time::Duration::from_millis(10));
-                                    continue;
+                                    std::thread::sleep(std::time::Duration::from_micros(500));
                                 }
+                                pipe_flushing_worker.store(false, Ordering::SeqCst);
+                                writer_epoch_worker.store(epoch, Ordering::SeqCst);
+                                current_seconds = pos;
+                            }
 
-                                let Some((stream, mut packet)) = ictx.packets().next() else {
-                                    is_eof = true;
-                                    eof_flag_worker.store(true, Ordering::SeqCst);
-                                    continue;
-                                };
+                            if is_eof
+                                || (target_seek_time.is_none()
+                                    && (pcm_tx_worker.len() > 256
+                                        || (current_seconds > playback_sec + 7.5
+                                            && pcm_tx_worker.len() > 16)))
+                            {
+                                std::thread::sleep(std::time::Duration::from_millis(10));
+                                continue;
+                            }
 
-                                if Some(stream.index()) == video_stream_index {
-                                    if let Some(ref v_tx) = video_packet_tx {
-                                        let _ = v_tx.try_send((current_seek_epoch, packet.clone()));
+                            let Some((stream, mut packet)) = ictx.packets().next() else {
+                                is_eof = true;
+                                eof_flag_worker.store(true, Ordering::SeqCst);
+                                continue;
+                            };
+
+                            if Some(stream.index()) == video_stream_index {
+                                if let Some(ref v_tx) = video_packet_tx {
+                                    let _ = v_tx.try_send((current_seek_epoch, packet.clone()));
+                                }
+                                continue;
+                            }
+                            if stream.index() == best_audio_index {
+                                let vis_packet = packet.clone();
+                                audio_pkt_bytes_accum =
+                                    audio_pkt_bytes_accum.saturating_add(packet.size() as u64);
+
+                                let pts = packet.pts().or_else(|| packet.dts());
+                                if let Some(p) = pts {
+                                    let pkt_sec = p as f64 * f64::from(stream.time_base());
+                                    if seek_in_progress || (pkt_sec - current_seconds).abs() > 0.25
+                                    {
+                                        current_seconds = pkt_sec;
+                                        seek_in_progress = false;
                                     }
-                                    continue;
-                                }
-                                if stream.index() == best_audio_index {
-                                    let vis_packet = packet.clone();
-                                    audio_pkt_bytes_accum =
-                                        audio_pkt_bytes_accum.saturating_add(packet.size() as u64);
-
-                                    let pts = packet.pts().or_else(|| packet.dts());
-                                    if let Some(p) = pts {
-                                        let pkt_sec = p as f64 * f64::from(stream.time_base());
-                                        if seek_in_progress
-                                            || (pkt_sec - current_seconds).abs() > 0.25
-                                        {
-                                            current_seconds = pkt_sec;
-                                            seek_in_progress = false;
-                                        }
-                                        if let Some(start_t) = audio_pkt_window_start {
-                                            let win_dur = pkt_sec - start_t;
-                                            if win_dur >= 0.5 {
-                                                let kbps = ((audio_pkt_bytes_accum as f64 * 8.0)
-                                                    / (win_dur * 1000.0))
-                                                    .round()
-                                                    as u32;
-                                                if kbps > 0
-                                                    && let Ok(mut state) =
-                                                        shared_state_worker.try_lock()
-                                                    && state.stats.audio_bitrate_kbps.is_none()
-                                                {
-                                                    state.bitrate = Some(kbps);
-                                                    state.stats.audio_bitrate_kbps = Some(kbps);
-                                                }
-                                                audio_pkt_window_start = Some(pkt_sec);
-                                                audio_pkt_bytes_accum = 0;
+                                    if let Some(start_t) = audio_pkt_window_start {
+                                        let win_dur = pkt_sec - start_t;
+                                        if win_dur >= 0.5 {
+                                            let kbps = ((audio_pkt_bytes_accum as f64 * 8.0)
+                                                / (win_dur * 1000.0))
+                                                .round()
+                                                as u32;
+                                            if kbps > 0
+                                                && let Ok(mut state) =
+                                                    shared_state_worker.try_lock()
+                                                && state.stats.audio_bitrate_kbps.is_none()
+                                            {
+                                                state.bitrate = Some(kbps);
+                                                state.stats.audio_bitrate_kbps = Some(kbps);
                                             }
-                                        } else {
                                             audio_pkt_window_start = Some(pkt_sec);
                                             audio_pkt_bytes_accum = 0;
                                         }
+                                    } else {
+                                        audio_pkt_window_start = Some(pkt_sec);
+                                        audio_pkt_bytes_accum = 0;
                                     }
+                                }
 
-                                    let mut skip_spdif_packet = false;
-                                    if decoder.send_packet(&vis_packet).is_ok() {
-                                        let mut frame = ffmpeg_next::frame::Audio::empty();
-                                        while decoder.receive_frame(&mut frame).is_ok() {
-                                            if stop_token_worker
-                                                .load(std::sync::atomic::Ordering::Relaxed)
-                                            {
-                                                break;
-                                            }
-                                            let frame_layout = if frame.channel_layout().channels()
-                                                > 0
-                                            {
-                                                frame.channel_layout()
-                                            } else {
-                                                ffmpeg_next::channel_layout::ChannelLayout::default(
-                                                    frame.channels().max(1) as i32,
-                                                )
-                                            };
+                                let mut skip_spdif_packet = false;
+                                if decoder.send_packet(&vis_packet).is_ok() {
+                                    let mut frame = ffmpeg_next::frame::Audio::empty();
+                                    while decoder.receive_frame(&mut frame).is_ok() {
+                                        if stop_token_worker
+                                            .load(std::sync::atomic::Ordering::Relaxed)
+                                        {
+                                            break;
+                                        }
+                                        let frame_layout = if frame.channel_layout().channels() > 0
+                                        {
+                                            frame.channel_layout()
+                                        } else {
+                                            ffmpeg_next::channel_layout::ChannelLayout::default(
+                                                frame.channels().max(1) as i32,
+                                            )
+                                        };
 
-                                            if resampler.is_none()
-                                                || frame.format() != cur_in_fmt
-                                                || frame_layout != cur_in_layout
-                                                || frame.rate() != cur_in_rate
-                                            {
-                                                resampler = ffmpeg_next::software::resampling::context::Context::get(
+                                        if resampler.is_none()
+                                            || frame.format() != cur_in_fmt
+                                            || frame_layout != cur_in_layout
+                                            || frame.rate() != cur_in_rate
+                                        {
+                                            resampler = ffmpeg_next::software::resampling::context::Context::get(
                                                     frame.format(),
                                                     frame_layout,
                                                     frame.rate(),
@@ -2101,803 +2009,300 @@ mod wasapi_bitstream {
                                                     target_channel_layout,
                                                     frame.rate(),
                                                 ).ok();
-                                                cur_in_fmt = frame.format();
-                                                cur_in_layout = frame_layout;
-                                                cur_in_rate = frame.rate();
-                                            }
+                                            cur_in_fmt = frame.format();
+                                            cur_in_layout = frame_layout;
+                                            cur_in_rate = frame.rate();
+                                        }
 
-                                            if let Some(ref mut resamp) = resampler {
-                                                let mut vis_frame =
-                                                    ffmpeg_next::frame::Audio::empty();
-                                                if resamp.run(&frame, &mut vis_frame).is_ok() {
-                                                    let total_samples = vis_frame.samples();
-                                                    let planes = (vis_frame.channels() as usize)
-                                                        .min(target_ch);
-                                                    if total_samples == 0 || planes == 0 {
+                                        if let Some(ref mut resamp) = resampler {
+                                            let mut vis_frame = ffmpeg_next::frame::Audio::empty();
+                                            if resamp.run(&frame, &mut vis_frame).is_ok() {
+                                                let total_samples = vis_frame.samples();
+                                                let planes =
+                                                    (vis_frame.channels() as usize).min(target_ch);
+                                                if total_samples == 0 || planes == 0 {
+                                                    continue;
+                                                }
+                                                let rate_u32 = decoder.rate().max(1);
+                                                let frame_dur =
+                                                    total_samples as f64 / rate_u32 as f64;
+                                                if let Some(target_pos) = target_seek_time {
+                                                    if current_seconds + frame_dur <= target_pos {
+                                                        current_seconds += frame_dur;
+                                                        skip_spdif_packet = true;
+                                                        continue;
+                                                    } else {
+                                                        if current_seconds < target_pos {
+                                                            current_seconds = target_pos;
+                                                        }
+                                                        target_seek_time = None;
+                                                        skip_spdif_packet = false;
+                                                    }
+                                                }
+
+                                                let mut fresh_planes = Vec::with_capacity(planes);
+                                                for p in 0..planes {
+                                                    fresh_planes.push(
+                                                        vis_frame.plane::<f32>(p)[..total_samples]
+                                                            .to_vec(),
+                                                    );
+                                                }
+                                                if let Ok(mut state) = shared_state_worker.lock()
+                                                    && state.seek_epoch == current_seek_epoch
+                                                {
+                                                    crate::audio::push_planar_lookahead_slices(
+                                                        &mut state,
+                                                        &fresh_planes,
+                                                        rate_u32,
+                                                        current_seconds,
+                                                    );
+                                                }
+
+                                                let mut sample_offset = 0;
+                                                while sample_offset < total_samples {
+                                                    let step = (total_samples - sample_offset)
+                                                        .min(update_interval);
+                                                    for (p, acc) in accumulator
+                                                        .iter_mut()
+                                                        .enumerate()
+                                                        .take(planes)
+                                                    {
+                                                        let plane_data = vis_frame.plane::<f32>(p);
+                                                        acc.extend_from_slice(
+                                                            &plane_data[sample_offset
+                                                                ..sample_offset + step],
+                                                        );
+                                                        let excess =
+                                                            acc.len().saturating_sub(window_size);
+                                                        if excess > 0 {
+                                                            acc.drain(0..excess);
+                                                        }
+                                                    }
+
+                                                    sample_offset += step;
+                                                    samples_since_last_send += step;
+                                                    if samples_since_last_send < update_interval {
                                                         continue;
                                                     }
-                                                    let rate_u32 = decoder.rate().max(1);
-                                                    let frame_dur =
-                                                        total_samples as f64 / rate_u32 as f64;
-                                                    if let Some(target_pos) = target_seek_time {
-                                                        if current_seconds + frame_dur <= target_pos
-                                                        {
-                                                            current_seconds += frame_dur;
-                                                            skip_spdif_packet = true;
-                                                            continue;
-                                                        } else {
-                                                            if current_seconds < target_pos {
-                                                                current_seconds = target_pos;
-                                                            }
-                                                            target_seek_time = None;
-                                                            skip_spdif_packet = false;
+                                                    samples_since_last_send = 0;
+
+                                                    let slice_time = current_seconds
+                                                        + (sample_offset as f64 / rate_u32 as f64);
+
+                                                    let mut channel_audio_data =
+                                                        Vec::with_capacity(target_ch);
+                                                    let mut channel_vus =
+                                                        Vec::with_capacity(target_ch);
+                                                    let eval_len = step.max(update_interval);
+                                                    for acc in accumulator.iter().take(target_ch) {
+                                                        let mut peak = 0.0f32;
+                                                        let start_idx =
+                                                            acc.len().saturating_sub(eval_len);
+                                                        for &s in &acc[start_idx..] {
+                                                            peak = peak.max(s.abs());
                                                         }
+                                                        channel_vus.push(peak.clamp(0.0, 1.0));
+                                                        channel_audio_data.push(acc.clone());
                                                     }
 
-                                                    let mut fresh_planes =
-                                                        Vec::with_capacity(planes);
-                                                    for p in 0..planes {
-                                                        fresh_planes.push(
-                                                            vis_frame.plane::<f32>(p)
-                                                                [..total_samples]
-                                                                .to_vec(),
-                                                        );
-                                                    }
-                                                    if let Ok(mut state) =
-                                                        shared_state_worker.lock()
-                                                        && state.seek_epoch == current_seek_epoch
-                                                    {
-                                                        crate::audio::push_planar_lookahead_slices(
-                                                            &mut state,
-                                                            &fresh_planes,
-                                                            rate_u32,
-                                                            current_seconds,
-                                                        );
-                                                    }
-
-                                                    let mut sample_offset = 0;
-                                                    while sample_offset < total_samples {
-                                                        let step = (total_samples - sample_offset)
-                                                            .min(update_interval);
-                                                        for (p, acc) in accumulator
-                                                            .iter_mut()
+                                                    let mono_audio_data = {
+                                                        let mut mono = vec![0.0f32; window_size];
+                                                        for (ch_idx, acc) in accumulator
+                                                            .iter()
+                                                            .take(target_ch)
                                                             .enumerate()
-                                                            .take(planes)
                                                         {
-                                                            let plane_data =
-                                                                vis_frame.plane::<f32>(p);
-                                                            acc.extend_from_slice(
-                                                                &plane_data[sample_offset
-                                                                    ..sample_offset + step],
-                                                            );
-                                                            let excess = acc
-                                                                .len()
-                                                                .saturating_sub(window_size);
-                                                            if excess > 0 {
-                                                                acc.drain(0..excess);
-                                                            }
-                                                        }
-
-                                                        sample_offset += step;
-                                                        samples_since_last_send += step;
-                                                        if samples_since_last_send < update_interval
-                                                        {
-                                                            continue;
-                                                        }
-                                                        samples_since_last_send = 0;
-
-                                                        let slice_time = current_seconds
-                                                            + (sample_offset as f64
-                                                                / rate_u32 as f64);
-
-                                                        let mut channel_audio_data =
-                                                            Vec::with_capacity(target_ch);
-                                                        let mut channel_vus =
-                                                            Vec::with_capacity(target_ch);
-                                                        let eval_len = step.max(update_interval);
-                                                        for acc in
-                                                            accumulator.iter().take(target_ch)
-                                                        {
-                                                            let mut peak = 0.0f32;
-                                                            let start_idx =
-                                                                acc.len().saturating_sub(eval_len);
-                                                            for &s in &acc[start_idx..] {
-                                                                peak = peak.max(s.abs());
-                                                            }
-                                                            channel_vus.push(peak.clamp(0.0, 1.0));
-                                                            channel_audio_data.push(acc.clone());
-                                                        }
-
-                                                        let mono_audio_data = {
-                                                            let mut mono =
-                                                                vec![0.0f32; window_size];
-                                                            for (ch_idx, acc) in accumulator
+                                                            let ch_weight = match ch_idx {
+                                                                0 | 1 => {
+                                                                    if target_ch == 1 {
+                                                                        1.0
+                                                                    } else {
+                                                                        0.5
+                                                                    }
+                                                                }
+                                                                2 => {
+                                                                    std::f32::consts::FRAC_1_SQRT_2
+                                                                }
+                                                                _ => 0.25,
+                                                            };
+                                                            let off = window_size
+                                                                .saturating_sub(acc.len());
+                                                            for (i, &sample) in acc
                                                                 .iter()
-                                                                .take(target_ch)
+                                                                .take(window_size)
                                                                 .enumerate()
                                                             {
-                                                                let ch_weight = match ch_idx {
-                                                                    0 | 1 => {
-                                                                        if target_ch == 1 {
-                                                                            1.0
-                                                                        } else {
-                                                                            0.5
-                                                                        }
-                                                                    }
-                                                                    2 => std::f32::consts::FRAC_1_SQRT_2,
-                                                                    _ => 0.25,
-                                                                };
-                                                                let off = window_size
-                                                                    .saturating_sub(acc.len());
-                                                                for (i, &sample) in acc
-                                                                    .iter()
-                                                                    .take(window_size)
-                                                                    .enumerate()
-                                                                {
-                                                                    mono[off + i] +=
-                                                                        sample * ch_weight;
-                                                                }
+                                                                mono[off + i] += sample * ch_weight;
                                                             }
-                                                            for s in &mut mono {
-                                                                *s = s.clamp(-1.0, 1.0);
-                                                            }
-                                                            mono
-                                                        };
-                                                        let vis_msg = DspMessage {
-                                                            audio_data: mono_audio_data,
-                                                            channel_vus,
-                                                            current_order: 0,
-                                                            current_row: 0,
-                                                            bpm: 0,
-                                                            speed: 0,
-                                                            current_seconds: slice_time,
-                                                            current_row_string: String::new(),
-                                                            channel_audio_data,
-                                                            seek_epoch: current_seek_epoch,
-                                                        };
-                                                        let _ = vis_tx_worker.try_send(vis_msg);
-                                                    }
-                                                    current_seconds += frame_dur;
+                                                        }
+                                                        for s in &mut mono {
+                                                            *s = s.clamp(-1.0, 1.0);
+                                                        }
+                                                        mono
+                                                    };
+                                                    let vis_msg = DspMessage {
+                                                        audio_data: mono_audio_data,
+                                                        channel_vus,
+                                                        current_order: 0,
+                                                        current_row: 0,
+                                                        bpm: 0,
+                                                        speed: 0,
+                                                        current_seconds: slice_time,
+                                                        current_row_string: String::new(),
+                                                        channel_audio_data,
+                                                        seek_epoch: current_seek_epoch,
+                                                    };
+                                                    let _ = vis_tx_worker.try_send(vis_msg);
                                                 }
+                                                current_seconds += frame_dur;
                                             }
                                         }
                                     }
+                                }
 
-                                    if !skip_spdif_packet {
-                                        packet.set_pts(None);
-                                        packet.set_dts(None);
-                                        packet.set_position(-1);
-                                        packet.set_stream(ost_index);
+                                if !skip_spdif_packet {
+                                    packet.set_pts(None);
+                                    packet.set_dts(None);
+                                    packet.set_position(-1);
+                                    packet.set_stream(ost_index);
 
-                                        if let Err(e) = packet.write(&mut octx) {
-                                            eprintln!(
-                                                "[bitstream] Failed to write packet to spdif: {}",
-                                                e
-                                            );
-                                            break;
-                                        }
+                                    if let Err(e) = packet.write(&mut octx) {
+                                        eprintln!(
+                                            "[bitstream] Failed to write packet to spdif: {}",
+                                            e
+                                        );
+                                        break;
                                     }
                                 }
                             }
-                            if !stop_token_worker.load(std::sync::atomic::Ordering::Relaxed) {
-                                let _ = octx.write_trailer();
-                            }
-                        });
-
-                        println!("[bitstream] Connecting named pipe for bitstream...");
-                        unsafe {
-                            let _ = ConnectNamedPipe(pipe_handle.raw(), None);
                         }
-                        println!("[bitstream] Named pipe connected!");
+                        if !stop_token_worker.load(std::sync::atomic::Ordering::Relaxed) {
+                            let _ = octx.write_trailer();
+                        }
+                    });
 
-                        let pipe_handle_raw = pipe_handle.into_raw().0 as isize;
-                        let pcm_tx_feeder = pcm_tx.clone();
-                        let stop_token_feeder = stop_token_pump.clone();
-                        let shared_state_feeder = shared_state_pump.clone();
-                        let feeder_thread = std::thread::spawn(move || {
-                            use std::os::windows::io::FromRawHandle;
-                            let raw_ptr = pipe_handle_raw as *mut std::ffi::c_void;
-                            let pipe_h = windows::Win32::Foundation::HANDLE(raw_ptr);
-                            let mut file = unsafe { std::fs::File::from_raw_handle(raw_ptr) };
-                            let mut buf = vec![0u8; 16384];
-                            while !stop_token_feeder.load(Ordering::Relaxed) {
-                                let mut avail: u32 = 0;
-                                let peek_ok = unsafe {
-                                    PeekNamedPipe(pipe_h, None, 0, None, Some(&mut avail), None)
-                                };
-                                if peek_ok.is_err() {
-                                    pipe_flushing_feeder.store(false, Ordering::SeqCst);
-                                    break;
+                    println!("[bitstream] Connecting named pipe for bitstream...");
+                    unsafe {
+                        let _ = ConnectNamedPipe(pipe_handle.raw(), None);
+                    }
+                    println!("[bitstream] Named pipe connected!");
+
+                    let pipe_handle_raw = pipe_handle.into_raw().0 as isize;
+                    let pcm_tx_feeder = pcm_tx.clone();
+                    let stop_token_feeder = stop_token_pump.clone();
+                    let shared_state_feeder = shared_state_pump.clone();
+                    let feeder_thread = std::thread::spawn(move || {
+                        use std::os::windows::io::FromRawHandle;
+                        let raw_ptr = pipe_handle_raw as *mut std::ffi::c_void;
+                        let pipe_h = windows::Win32::Foundation::HANDLE(raw_ptr);
+                        let mut file = unsafe { std::fs::File::from_raw_handle(raw_ptr) };
+                        let mut buf = vec![0u8; 16384];
+                        while !stop_token_feeder.load(Ordering::Relaxed) {
+                            let mut avail: u32 = 0;
+                            let peek_ok = unsafe {
+                                PeekNamedPipe(pipe_h, None, 0, None, Some(&mut avail), None)
+                            };
+                            if peek_ok.is_err() {
+                                pipe_flushing_feeder.store(false, Ordering::SeqCst);
+                                break;
+                            }
+                            if pipe_flushing_feeder.load(Ordering::SeqCst) {
+                                while avail > 0 {
+                                    let to_drain = (avail as usize).min(buf.len());
+                                    let _ = file.read(&mut buf[..to_drain]);
+                                    avail = 0;
+                                    if unsafe {
+                                        PeekNamedPipe(pipe_h, None, 0, None, Some(&mut avail), None)
+                                    }
+                                    .is_err()
+                                    {
+                                        break;
+                                    }
                                 }
-                                if pipe_flushing_feeder.load(Ordering::SeqCst) {
-                                    while avail > 0 {
-                                        let to_drain = (avail as usize).min(buf.len());
-                                        let _ = file.read(&mut buf[..to_drain]);
-                                        avail = 0;
-                                        if unsafe {
-                                            PeekNamedPipe(
-                                                pipe_h,
-                                                None,
-                                                0,
-                                                None,
-                                                Some(&mut avail),
-                                                None,
-                                            )
+                                pipe_flushing_feeder.store(false, Ordering::SeqCst);
+                                continue;
+                            }
+                            if avail == 0 {
+                                if eof_flag_feeder.swap(false, Ordering::SeqCst) {
+                                    let cur_epoch = writer_epoch_feeder.load(Ordering::SeqCst);
+                                    let _ = pcm_tx_feeder.try_send(AudioPacket {
+                                        pcm_bytes: Vec::new(),
+                                        epoch: cur_epoch,
+                                        is_eof: true,
+                                    });
+                                }
+                                std::thread::sleep(std::time::Duration::from_millis(2));
+                                continue;
+                            }
+                            let chunk_epoch = writer_epoch_feeder.load(Ordering::SeqCst);
+                            let to_read = (avail as usize).min(buf.len());
+                            match file.read(&mut buf[..to_read]) {
+                                Ok(0) => break,
+                                Ok(n) => {
+                                    if pipe_flushing_feeder.load(Ordering::SeqCst) {
+                                        continue;
+                                    }
+                                    let pkt = AudioPacket {
+                                        pcm_bytes: buf[..n].to_vec(),
+                                        epoch: chunk_epoch,
+                                        is_eof: false,
+                                    };
+                                    let mut pending = Some(pkt);
+                                    while let Some(chunk) = pending.take() {
+                                        if stop_token_feeder
+                                            .load(std::sync::atomic::Ordering::Relaxed)
+                                        {
+                                            drop(file);
+                                            return;
                                         }
-                                        .is_err()
+                                        if let Ok(state) = shared_state_feeder.try_lock()
+                                            && (state.seek_request.is_some()
+                                                || state.seek_epoch > chunk.epoch)
                                         {
                                             break;
                                         }
-                                    }
-                                    pipe_flushing_feeder.store(false, Ordering::SeqCst);
-                                    continue;
-                                }
-                                if avail == 0 {
-                                    if eof_flag_feeder.swap(false, Ordering::SeqCst) {
-                                        let cur_epoch = writer_epoch_feeder.load(Ordering::SeqCst);
-                                        let _ = pcm_tx_feeder.try_send(AudioPacket {
-                                            pcm_bytes: Vec::new(),
-                                            epoch: cur_epoch,
-                                            is_eof: true,
-                                        });
-                                    }
-                                    std::thread::sleep(std::time::Duration::from_millis(2));
-                                    continue;
-                                }
-                                let chunk_epoch = writer_epoch_feeder.load(Ordering::SeqCst);
-                                let to_read = (avail as usize).min(buf.len());
-                                match file.read(&mut buf[..to_read]) {
-                                    Ok(0) => break,
-                                    Ok(n) => {
-                                        if pipe_flushing_feeder.load(Ordering::SeqCst) {
-                                            continue;
-                                        }
-                                        let pkt = AudioPacket {
-                                            pcm_bytes: buf[..n].to_vec(),
-                                            epoch: chunk_epoch,
-                                            is_eof: false,
-                                        };
-                                        let mut pending = Some(pkt);
-                                        while let Some(chunk) = pending.take() {
-                                            if stop_token_feeder
-                                                .load(std::sync::atomic::Ordering::Relaxed)
-                                            {
+                                        match pcm_tx_feeder.send_timeout(
+                                            chunk,
+                                            std::time::Duration::from_millis(20),
+                                        ) {
+                                            Ok(()) => break,
+                                            Err(crossbeam_channel::SendTimeoutError::Timeout(
+                                                c,
+                                            )) => {
+                                                pending = Some(c);
+                                            }
+                                            Err(
+                                                crossbeam_channel::SendTimeoutError::Disconnected(
+                                                    _,
+                                                ),
+                                            ) => {
                                                 drop(file);
                                                 return;
                                             }
-                                            if let Ok(state) = shared_state_feeder.try_lock()
-                                                && (state.seek_request.is_some()
-                                                    || state.seek_epoch > chunk.epoch)
-                                            {
-                                                break;
-                                            }
-                                            match pcm_tx_feeder.send_timeout(chunk, std::time::Duration::from_millis(20)) {
-                                                Ok(()) => break,
-                                                Err(crossbeam_channel::SendTimeoutError::Timeout(c)) => {
-                                                    pending = Some(c);
-                                                }
-                                                Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
-                                                    drop(file);
-                                                    return;
-                                                }
-                                            }
                                         }
                                     }
-                                    Err(_) => break,
                                 }
+                                Err(_) => break,
                             }
-                            drop(file);
-                            if !stop_token_feeder.load(std::sync::atomic::Ordering::Relaxed) {
-                                let final_epoch = shared_state_feeder
-                                    .lock()
-                                    .map(|s| s.seek_epoch)
-                                    .unwrap_or(0);
-                                let _ = pcm_tx_feeder.try_send(AudioPacket {
-                                    pcm_bytes: Vec::new(),
-                                    epoch: final_epoch,
-                                    is_eof: true,
-                                });
-                            }
-                        });
+                        }
+                        drop(file);
+                        if !stop_token_feeder.load(std::sync::atomic::Ordering::Relaxed) {
+                            let final_epoch = shared_state_feeder
+                                .lock()
+                                .map(|s| s.seek_epoch)
+                                .unwrap_or(0);
+                            let _ = pcm_tx_feeder.try_send(AudioPacket {
+                                pcm_bytes: Vec::new(),
+                                epoch: final_epoch,
+                                is_eof: true,
+                            });
+                        }
+                    });
 
-                        std::thread::spawn(move || {
-                            let _ = feeder_thread.join();
-                            let _ = ffmpeg_worker.join();
-                        })
-                    }
-                    WasapiStreamType::Lpcm => {
-                        let pcm_tx_lpcm = pcm_tx.clone();
-                        let vis_tx_lpcm = vis_tx.clone();
-                        let stop_token_lpcm = stop_token_ffmpeg.clone();
-                        let shared_state_lpcm = shared_state_pump.clone();
-
-                        std::thread::spawn(move || {
-                            let _custom_io = custom_io;
-                            let mut ictx = ictx;
-                            println!(
-                                "[bitstream] Multi-Channel LPCM FFmpeg worker thread started."
-                            );
-
-                            let decoder_context =
-                                match ffmpeg_next::codec::context::Context::from_parameters(
-                                    parameters.clone(),
-                                ) {
-                                    Ok(ctx) => ctx,
-                                    Err(e) => {
-                                        eprintln!(
-                                            "[bitstream] Failed to create LPCM decoder context: {}",
-                                            e
-                                        );
-                                        return;
-                                    }
-                                };
-                            let mut decoder = match decoder_context.decoder().audio() {
-                                Ok(dec) => dec,
-                                Err(e) => {
-                                    eprintln!(
-                                        "[bitstream] Failed to create LPCM audio decoder: {}",
-                                        e
-                                    );
-                                    return;
-                                }
-                            };
-
-                            let target_channel_layout =
-                                ffmpeg_next::channel_layout::ChannelLayout::default(
-                                    profile_clone.channels as i32,
-                                );
-                            let target_channels = profile_clone.channels as usize;
-                            let bytes_per_sample = (profile_clone.container_bits / 8) as usize;
-                            let out_rate = profile_clone.rate as f32;
-                            let window_size = crate::audio::calculate_power_of_two_window_size(
-                                profile_clone.rate,
-                            );
-                            let update_interval = ((out_rate / 60.0).round() as usize).max(256);
-                            let mut accumulator: Vec<Vec<f32>> =
-                                vec![vec![0.0f32; window_size]; target_channels];
-                            let mut samples_since_last_send = 0usize;
-                            let mut current_seconds = 0.0;
-
-                            let mut pcm_resampler: Option<
-                                ffmpeg_next::software::resampling::context::Context,
-                            > = None;
-                            let mut vis_resampler: Option<
-                                ffmpeg_next::software::resampling::context::Context,
-                            > = None;
-                            let mut cur_in_fmt = ffmpeg_next::format::sample::Sample::None;
-                            let mut cur_in_layout =
-                                ffmpeg_next::channel_layout::ChannelLayout::default(0);
-                            let mut cur_in_rate = 0;
-
-                            let mut process_frame =
-                                |frame: &ffmpeg_next::frame::Audio,
-                                 current_seconds: &mut f64,
-                                 target_seek_time: &mut Option<f64>,
-                                 samples_since_last_send: &mut usize,
-                                 epoch: u64,
-                                 accumulator: &mut [Vec<f32>]| {
-                                    let frame_layout = if frame.channel_layout().channels() > 0 {
-                                        frame.channel_layout()
-                                    } else {
-                                        ffmpeg_next::channel_layout::ChannelLayout::default(
-                                            frame.channels().max(1) as i32,
-                                        )
-                                    };
-
-                                    if pcm_resampler.is_none()
-                                        || frame.format() != cur_in_fmt
-                                        || frame_layout != cur_in_layout
-                                        || frame.rate() != cur_in_rate
-                                    {
-                                        pcm_resampler = ffmpeg_next::software::resampling::context::Context::get(
-                                        frame.format(),
-                                        frame_layout,
-                                        frame.rate(),
-                                        profile_clone.sample_format,
-                                        target_channel_layout,
-                                        profile_clone.rate,
-                                    ).ok();
-                                        vis_resampler = ffmpeg_next::software::resampling::context::Context::get(
-                                        frame.format(),
-                                        frame_layout,
-                                        frame.rate(),
-                                        ffmpeg_next::format::sample::Sample::F32(ffmpeg_next::format::sample::Type::Planar),
-                                        target_channel_layout,
-                                        profile_clone.rate,
-                                    ).ok();
-                                        cur_in_fmt = frame.format();
-                                        cur_in_layout = frame_layout;
-                                        cur_in_rate = frame.rate();
-                                    }
-
-                                    let rate_f64 = profile_clone.rate.max(1) as f64;
-                                    let est_samples = frame.samples();
-                                    let est_dur = est_samples as f64 / frame.rate().max(1) as f64;
-                                    if let Some(target_pos) = *target_seek_time {
-                                        if *current_seconds + est_dur <= target_pos {
-                                            *current_seconds += est_dur;
-                                            return;
-                                        } else {
-                                            if *current_seconds < target_pos {
-                                                *current_seconds = target_pos;
-                                            }
-                                            *target_seek_time = None;
-                                        }
-                                    }
-
-                                    if let Some(ref mut presamp) = pcm_resampler {
-                                        let mut pcm_frame = ffmpeg_next::frame::Audio::empty();
-                                        if presamp.run(frame, &mut pcm_frame).is_ok() {
-                                            let samples = pcm_frame.samples();
-                                            let raw_bytes = pcm_frame.data(0);
-                                            let expected_bytes =
-                                                samples * target_channels * bytes_per_sample;
-                                            if raw_bytes.len() >= expected_bytes {
-                                                let pkt = AudioPacket {
-                                                    pcm_bytes: raw_bytes[..expected_bytes].to_vec(),
-                                                    epoch,
-                                                    is_eof: false,
-                                                };
-                                                let mut pending = Some(pkt);
-                                                while let Some(chunk) = pending.take() {
-                                                    if stop_token_lpcm
-                                                        .load(std::sync::atomic::Ordering::Relaxed)
-                                                    {
-                                                        return;
-                                                    }
-                                                    if let Ok(state) = shared_state_lpcm.try_lock()
-                                                        && (state.seek_request.is_some()
-                                                            || state.seek_epoch > chunk.epoch)
-                                                    {
-                                                        return;
-                                                    }
-                                                    match pcm_tx_lpcm.send_timeout(chunk, std::time::Duration::from_millis(20)) {
-                                                    Ok(()) => break,
-                                                    Err(crossbeam_channel::SendTimeoutError::Timeout(c)) => {
-                                                        pending = Some(c);
-                                                    }
-                                                    Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => {
-                                                        return;
-                                                    }
-                                                }
-                                                }
-                                            }
-                                        }
-                                    }
-
-                                    if let Some(ref mut vresamp) = vis_resampler {
-                                        let mut vis_frame = ffmpeg_next::frame::Audio::empty();
-                                        if vresamp.run(frame, &mut vis_frame).is_ok() {
-                                            let total_samples = vis_frame.samples();
-                                            let planes = (vis_frame.channels() as usize)
-                                                .min(target_channels);
-                                            if total_samples == 0 || planes == 0 {
-                                                return;
-                                            }
-                                            let mut fresh_planes = Vec::with_capacity(planes);
-                                            for p in 0..planes {
-                                                fresh_planes.push(
-                                                    vis_frame.plane::<f32>(p)[..total_samples]
-                                                        .to_vec(),
-                                                );
-                                            }
-                                            if let Ok(mut state) = shared_state_lpcm.lock()
-                                                && state.seek_epoch == epoch
-                                            {
-                                                crate::audio::push_planar_lookahead_slices(
-                                                    &mut state,
-                                                    &fresh_planes,
-                                                    profile_clone.rate,
-                                                    *current_seconds,
-                                                );
-                                            }
-
-                                            let mut sample_offset = 0;
-
-                                            while sample_offset < total_samples {
-                                                let step = (total_samples - sample_offset)
-                                                    .min(update_interval);
-                                                for (p, acc) in
-                                                    accumulator.iter_mut().enumerate().take(planes)
-                                                {
-                                                    let plane_data = vis_frame.plane::<f32>(p);
-                                                    acc.extend_from_slice(
-                                                        &plane_data
-                                                            [sample_offset..sample_offset + step],
-                                                    );
-                                                    let excess =
-                                                        acc.len().saturating_sub(window_size);
-                                                    if excess > 0 {
-                                                        acc.drain(0..excess);
-                                                    }
-                                                }
-
-                                                sample_offset += step;
-                                                *samples_since_last_send += step;
-                                                if *samples_since_last_send < update_interval {
-                                                    continue;
-                                                }
-                                                *samples_since_last_send = 0;
-
-                                                let slice_time = *current_seconds
-                                                    + (sample_offset as f64 / rate_f64);
-
-                                                let mut channel_audio_data =
-                                                    Vec::with_capacity(target_channels);
-                                                let mut channel_vus =
-                                                    Vec::with_capacity(target_channels);
-                                                let eval_len = step.max(update_interval);
-                                                for acc in accumulator.iter().take(target_channels)
-                                                {
-                                                    let mut peak = 0.0f32;
-                                                    let start_idx =
-                                                        acc.len().saturating_sub(eval_len);
-                                                    for &s in &acc[start_idx..] {
-                                                        peak = peak.max(s.abs());
-                                                    }
-                                                    channel_vus.push(peak.clamp(0.0, 1.0));
-                                                    channel_audio_data.push(acc.clone());
-                                                }
-
-                                                let mono_audio_data = {
-                                                    let mut mono = vec![0.0f32; window_size];
-                                                    for (ch_idx, acc) in accumulator
-                                                        .iter()
-                                                        .take(target_channels)
-                                                        .enumerate()
-                                                    {
-                                                        let ch_weight = match ch_idx {
-                                                            0 | 1 => {
-                                                                if target_channels == 1 {
-                                                                    1.0
-                                                                } else {
-                                                                    0.5
-                                                                }
-                                                            }
-                                                            2 => std::f32::consts::FRAC_1_SQRT_2,
-                                                            _ => 0.25,
-                                                        };
-                                                        let off =
-                                                            window_size.saturating_sub(acc.len());
-                                                        for (i, &sample) in
-                                                            acc.iter().take(window_size).enumerate()
-                                                        {
-                                                            mono[off + i] += sample * ch_weight;
-                                                        }
-                                                    }
-                                                    for s in &mut mono {
-                                                        *s = s.clamp(-1.0, 1.0);
-                                                    }
-                                                    mono
-                                                };
-                                                let vis_msg = DspMessage {
-                                                    audio_data: mono_audio_data,
-                                                    channel_vus,
-                                                    current_order: 0,
-                                                    current_row: 0,
-                                                    bpm: 0,
-                                                    speed: 0,
-                                                    current_seconds: slice_time,
-                                                    current_row_string: String::new(),
-                                                    channel_audio_data,
-                                                    seek_epoch: epoch,
-                                                };
-                                                let _ = vis_tx_lpcm.try_send(vis_msg);
-                                            }
-                                            *current_seconds += total_samples as f64 / rate_f64;
-                                        }
-                                    }
-                                };
-
-                            let mut current_seek_epoch =
-                                shared_state_lpcm.lock().map(|s| s.seek_epoch).unwrap_or(0);
-                            let mut is_eof = false;
-                            let mut seek_in_progress = true;
-                            let mut target_seek_time: Option<f64> = None;
-                            let mut audio_pkt_bytes_accum: u64 = 0;
-                            let mut audio_pkt_window_start: Option<f64> = None;
-
-                            loop {
-                                if stop_token_lpcm.load(std::sync::atomic::Ordering::Relaxed) {
-                                    break;
-                                }
-
-                                let (seek_req, playback_sec) = {
-                                    if let Ok(mut state) = shared_state_lpcm.lock() {
-                                        if let Some(target) = state.seek_request.take() {
-                                            state.seek_epoch += 1;
-                                            state.current_seconds = target;
-                                            state.track_ended = false;
-                                            state.lookahead_queue.clear();
-                                            state.lookahead_sample_buffer.clear();
-                                            state.lookahead_timeline.fill(0.0);
-                                            state.lookahead_buffer_start_time = target;
-                                            state.waveform_history.clear();
-                                            state.raw_waveform.fill(0.0);
-                                            (Some((target, state.seek_epoch)), target)
-                                        } else {
-                                            (None, state.current_seconds)
-                                        }
-                                    } else {
-                                        (None, current_seconds)
-                                    }
-                                };
-
-                                if let Some((pos, epoch)) = seek_req {
-                                    current_seek_epoch = epoch;
-                                    is_eof = false;
-                                    seek_in_progress = true;
-                                    target_seek_time = Some(pos);
-                                    samples_since_last_send = 0;
-                                    audio_pkt_bytes_accum = 0;
-                                    audio_pkt_window_start = None;
-                                    if let Some(ref v_rx) = video_packet_rx {
-                                        while v_rx.try_recv().is_ok() {}
-                                    }
-
-                                    let (seek_stream_idx, target_pts) =
-                                        if let (Some(v_idx), Some(tb)) =
-                                            (video_stream_index, video_time_base)
-                                        {
-                                            let tb_f64 = tb.numerator() as f64
-                                                / tb.denominator().max(1) as f64;
-                                            (v_idx as i32, (pos / tb_f64).max(0.0) as i64)
-                                        } else if stream_time_base > 0.0 {
-                                            (
-                                                best_audio_index as i32,
-                                                (pos / stream_time_base).max(0.0) as i64,
-                                            )
-                                        } else {
-                                            (
-                                                -1,
-                                                (pos * ffmpeg_next::ffi::AV_TIME_BASE as f64)
-                                                    .max(0.0)
-                                                    as i64,
-                                            )
-                                        };
-                                    unsafe {
-                                        let ret = ffmpeg_next::ffi::av_seek_frame(
-                                            ictx.as_mut_ptr(),
-                                            seek_stream_idx,
-                                            target_pts,
-                                            ffmpeg_next::ffi::AVSEEK_FLAG_BACKWARD,
-                                        );
-                                        if ret < 0 {
-                                            let fallback_pts = (pos
-                                                * ffmpeg_next::ffi::AV_TIME_BASE as f64)
-                                                .max(0.0)
-                                                as i64;
-                                            ffmpeg_next::ffi::av_seek_frame(
-                                                ictx.as_mut_ptr(),
-                                                -1,
-                                                fallback_pts,
-                                                ffmpeg_next::ffi::AVSEEK_FLAG_BACKWARD,
-                                            );
-                                        }
-                                    }
-                                    decoder.flush();
-                                    for acc in &mut accumulator {
-                                        acc.fill(0.0);
-                                    }
-                                    current_seconds = pos;
-                                }
-
-                                if is_eof
-                                    || (target_seek_time.is_none()
-                                        && (pcm_tx_lpcm.len() > 256
-                                            || (current_seconds > playback_sec + 7.5
-                                                && pcm_tx_lpcm.len() > 16)))
-                                {
-                                    std::thread::sleep(std::time::Duration::from_millis(10));
-                                    continue;
-                                }
-
-                                if stop_token_lpcm.load(std::sync::atomic::Ordering::Relaxed) {
-                                    break;
-                                }
-
-                                match ictx.packets().next() {
-                                    Some((stream, packet)) => {
-                                        if Some(stream.index()) == video_stream_index {
-                                            if let Some(ref v_tx) = video_packet_tx {
-                                                let _ = v_tx
-                                                    .try_send((current_seek_epoch, packet.clone()));
-                                            }
-                                        } else if stream.index() == best_audio_index {
-                                            audio_pkt_bytes_accum = audio_pkt_bytes_accum
-                                                .saturating_add(packet.size() as u64);
-                                            let pts = packet.pts().or_else(|| packet.dts());
-                                            if let Some(p) = pts {
-                                                let pkt_sec = p as f64 * stream_time_base;
-                                                if seek_in_progress
-                                                    || (pkt_sec - current_seconds).abs() > 0.25
-                                                {
-                                                    current_seconds = pkt_sec;
-                                                    seek_in_progress = false;
-                                                }
-                                                if let Some(start_t) = audio_pkt_window_start {
-                                                    let win_dur = pkt_sec - start_t;
-                                                    if win_dur >= 0.5 {
-                                                        let kbps = ((audio_pkt_bytes_accum as f64
-                                                            * 8.0)
-                                                            / (win_dur * 1000.0))
-                                                            .round()
-                                                            as u32;
-                                                        if kbps > 0
-                                                            && let Ok(mut state) =
-                                                                shared_state_lpcm.try_lock()
-                                                            && state
-                                                                .stats
-                                                                .audio_bitrate_kbps
-                                                                .is_none()
-                                                        {
-                                                            state.bitrate = Some(kbps);
-                                                            state.stats.audio_bitrate_kbps =
-                                                                Some(kbps);
-                                                        }
-                                                        audio_pkt_window_start = Some(pkt_sec);
-                                                        audio_pkt_bytes_accum = 0;
-                                                    }
-                                                } else {
-                                                    audio_pkt_window_start = Some(pkt_sec);
-                                                    audio_pkt_bytes_accum = 0;
-                                                }
-                                            }
-
-                                            if decoder.send_packet(&packet).is_ok() {
-                                                let mut frame = ffmpeg_next::frame::Audio::empty();
-                                                while decoder.receive_frame(&mut frame).is_ok() {
-                                                    if stop_token_lpcm
-                                                        .load(std::sync::atomic::Ordering::Relaxed)
-                                                    {
-                                                        break;
-                                                    }
-                                                    if let Ok(state) = shared_state_lpcm.lock()
-                                                        && state.seek_request.is_some()
-                                                    {
-                                                        break;
-                                                    }
-                                                    process_frame(
-                                                        &frame,
-                                                        &mut current_seconds,
-                                                        &mut target_seek_time,
-                                                        &mut samples_since_last_send,
-                                                        current_seek_epoch,
-                                                        &mut accumulator,
-                                                    );
-                                                }
-                                            }
-                                        }
-                                    }
-                                    None => {
-                                        let _ = decoder.send_eof();
-                                        let mut frame = ffmpeg_next::frame::Audio::empty();
-                                        while decoder.receive_frame(&mut frame).is_ok() {
-                                            if stop_token_lpcm
-                                                .load(std::sync::atomic::Ordering::Relaxed)
-                                            {
-                                                break;
-                                            }
-                                            process_frame(
-                                                &frame,
-                                                &mut current_seconds,
-                                                &mut target_seek_time,
-                                                &mut samples_since_last_send,
-                                                current_seek_epoch,
-                                                &mut accumulator,
-                                            );
-                                        }
-                                        let _ = pcm_tx_lpcm.try_send(AudioPacket {
-                                            pcm_bytes: Vec::new(),
-                                            epoch: current_seek_epoch,
-                                            is_eof: true,
-                                        });
-                                        is_eof = true;
-                                    }
-                                }
-                            }
-                        })
-                    }
+                    std::thread::spawn(move || {
+                        let _ = feeder_thread.join();
+                        let _ = ffmpeg_worker.join();
+                    })
                 };
 
                 drop(pcm_tx);
@@ -2934,16 +2339,8 @@ mod wasapi_bitstream {
                     frame_bytes,
                     active_has_video,
                 )) => {
-                    let out_rate = if stream_type == WasapiStreamType::CompressedBitstream {
-                        decoder_sample_rate
-                    } else {
-                        profile.rate
-                    };
-                    let out_channels = if stream_type == WasapiStreamType::CompressedBitstream {
-                        src_channels.clamp(2, 8)
-                    } else {
-                        profile.channels
-                    };
+                    let out_rate = decoder_sample_rate;
+                    let out_channels = src_channels.clamp(2, 8);
 
                     let _ = init_tx.send(Ok((
                         out_rate,
