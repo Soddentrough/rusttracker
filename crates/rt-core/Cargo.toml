@@ -6,6 +6,5 @@ description = "Core state, DSP math, playlist, lyrics, and touch gestures for Ru
 license = "GPL-3.0-or-later"
 
 [dependencies]
-anyhow = "1.0.102"
 crossbeam-channel = "0.5.15"
 directories = "6.0.0"

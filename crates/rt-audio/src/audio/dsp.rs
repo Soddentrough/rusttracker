@@ -603,12 +603,18 @@ pub(in crate::audio) fn spawn_dsp_thread_with_recycle(
                 if need_gpu_spectrum {
                     gpu_spectrum.fill(0.0);
                     if num_channels > 0 {
-                        for c in 0..num_channels {
-                            let channel_data = &msg.channel_audio_data[c];
-                            for i in 0..window_size {
-                                let sample = *channel_data.get(i).unwrap_or(&0.0);
-                                real_input[i] = sample * hann_window[i];
+                        for (c, channel_data) in
+                            msg.channel_audio_data.iter().enumerate().take(num_channels)
+                        {
+                            let valid = channel_data.len().min(window_size);
+                            for ((dst, &sample), &hann) in real_input[..valid]
+                                .iter_mut()
+                                .zip(&channel_data[..valid])
+                                .zip(&hann_window[..valid])
+                            {
+                                *dst = sample * hann;
                             }
+                            real_input[valid..window_size].fill(0.0);
                             real_input.rotate_left(window_size / 2);
                             let _ = r2c.process_with_scratch(
                                 &mut real_input,

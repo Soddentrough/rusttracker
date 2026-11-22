@@ -2542,12 +2542,8 @@ fn test_neon_acoustic_studio_smoke_blasts_and_toggle() {
         uniforms.num_spatial_channels = 12;
         uniforms.aspect_ratio = r_w as f32 / r_h as f32;
         uniforms.spatial_channels = [1.0; 16];
-        for bin in 1..20 {
-            uniforms.spectrum[bin] = 65.0;
-        }
-        for bin in 20..80 {
-            uniforms.spectrum[bin] = 20.0;
-        }
+        uniforms.spectrum[1..20].fill(65.0);
+        uniforms.spectrum[20..80].fill(20.0);
         uniforms.channel_phases[16] = 0.08;
         uniforms.channel_phases[18] = -2.8;
         uniforms.channel_phases[19] = 2.0;

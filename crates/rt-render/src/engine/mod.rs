@@ -3563,8 +3563,8 @@ impl VulkanEngine {
             let tracks_count = (num_tracks as usize).min(state.channel_vus.len().saturating_sub(2));
             if tracks_count > 0 {
                 let count = tracks_count.min(16);
-                for i in 0..count {
-                    uniforms.spatial_channels[i] = get_fast_vu(i + 1);
+                for (i, dst) in uniforms.spatial_channels.iter_mut().enumerate().take(count) {
+                    *dst = get_fast_vu(i + 1);
                 }
             } else if state.channel_vus.len() >= 2 {
                 uniforms.spatial_channels[0] = get_fast_vu(0);
@@ -3572,8 +3572,13 @@ impl VulkanEngine {
             }
         } else {
             let spatial_count = state.channel_vus.len().min(16);
-            for i in 0..spatial_count {
-                uniforms.spatial_channels[i] = get_fast_vu(i);
+            for (i, dst) in uniforms
+                .spatial_channels
+                .iter_mut()
+                .enumerate()
+                .take(spatial_count)
+            {
+                *dst = get_fast_vu(i);
             }
         }
 
@@ -4014,20 +4019,11 @@ impl VulkanEngine {
                 let elapsed_us = start_sim.elapsed().as_micros() as f32;
                 self.cached_fire_us = Some(elapsed_us);
             } else {
-                let mut bass_sum = 0.0;
-                let mut mids_sum = 0.0;
-                let mut highs_sum = 0.0;
-                for i in 0..64 {
-                    bass_sum += uniforms.fire_heat[i];
-                }
+                let bass_sum: f32 = uniforms.fire_heat[..64].iter().sum();
                 let bass = (bass_sum / 64.0 / 100.0).min(1.0);
-                for i in 64..512 {
-                    mids_sum += uniforms.fire_heat[i];
-                }
+                let mids_sum: f32 = uniforms.fire_heat[64..512].iter().sum();
                 let mids = (mids_sum / 448.0 / 100.0).min(1.0);
-                for i in 512..1024 {
-                    highs_sum += uniforms.fire_heat[i];
-                }
+                let highs_sum: f32 = uniforms.fire_heat[512..1024].iter().sum();
                 let highs = (highs_sum / 512.0 / 100.0).min(1.0);
 
                 let n_ch = state.channel_vus.len().clamp(1, 32);

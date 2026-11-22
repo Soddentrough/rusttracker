@@ -560,10 +560,10 @@ impl AudioSource for MidiSource {
 
         let dt = frames_to_render as f32 / target_sr as f32;
         let decay = 10.0_f32.powf(-13.3 * dt / 20.0);
-        for c in 0..16 {
-            self.channel_vus[c] *= decay;
-            if self.channel_vus[c] < 1e-4 {
-                self.channel_vus[c] = 0.0;
+        for ch in &mut self.channel_vus {
+            *ch *= decay;
+            if *ch < 1e-4 {
+                *ch = 0.0;
             }
         }
 
@@ -618,9 +618,7 @@ impl AudioSource for MidiSource {
         while self.event_idx < self.events.len() && self.events[self.event_idx].time_sec < pos {
             self.event_idx += 1;
         }
-        for c in 0..16 {
-            self.channel_vus[c] = 0.0;
-        }
+        self.channel_vus.fill(0.0);
     }
 
     fn get_num_channels(&mut self) -> i32 {

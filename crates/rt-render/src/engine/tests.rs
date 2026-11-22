@@ -730,9 +730,7 @@ fn test_retro_fire_audio_reactivity() {
 
     // 2. On a loud bass kick: center bass columns (x in 140..180) erupt to white-hot (>= 34),
     // and full-spectrum chorus drives the entire hearth to white-hot (>= 33)
-    for i in 1..16 {
-        state.spectrum_data[i] = 90.0; // Heavy bass transient
-    }
+    state.spectrum_data[1..16].fill(90.0); // Heavy bass transient
     state.channel_vus = vec![1.0; 2];
     for _ in 0..60 {
         VulkanEngine::update_retro_fire_grid(&mut cells, &mut rng, 1.0, &state);

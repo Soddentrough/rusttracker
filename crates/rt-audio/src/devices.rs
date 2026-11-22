@@ -67,8 +67,9 @@ pub fn is_usable_cpal_device_for_mode(desc: &cpal::DeviceDescription, mic: bool)
         return true;
     }
     if mic {
-        if matches!(desc.direction(), cpal::DeviceDirection::Output) {
-            return false;
+        #[cfg(not(target_os = "android"))]
+        {
+            !matches!(desc.direction(), cpal::DeviceDirection::Output)
         }
         #[cfg(target_os = "android")]
         {
@@ -87,11 +88,9 @@ pub fn is_usable_cpal_device_for_mode(desc: &cpal::DeviceDescription, mic: bool)
                     | cpal::InterfaceType::Bluetooth
                     | cpal::InterfaceType::Line
             );
-            if !usable_type && !usable_iface {
-                return false;
-            }
+            !matches!(desc.direction(), cpal::DeviceDirection::Output)
+                && (usable_type || usable_iface)
         }
-        true
     } else {
         !matches!(desc.direction(), cpal::DeviceDirection::Input)
     }

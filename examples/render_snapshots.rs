@@ -68,12 +68,8 @@ fn test_render_retro_fire_snapshot() {
     // Tracker module playing:
     // Track 1 (kick): 1.0, Track 2 (snare): 0.8, Track 3 (silent rest): 0.05, Track 4 (lead): 0.95
     state.channel_vus = vec![0.5, 1.0, 0.8, 0.05, 0.95, 0.5];
-    for i in 1..16 {
-        state.spectrum_data[i] = 85.0;
-    }
-    for i in 250..350 {
-        state.spectrum_data[i] = 60.0;
-    }
+    state.spectrum_data[1..16].fill(85.0);
+    state.spectrum_data[250..350].fill(60.0);
 
     for _ in 0..90 {
         engine::VulkanEngine::update_retro_fire_grid(&mut cells, &mut rng, 1.0, &state);
@@ -4261,13 +4257,13 @@ fn test_vis_midnight_storm_snapshot() {
         _pad3: 0.0,
     };
 
-    for i in 0..1024 {
+    for (i, dst) in uniforms.spectrum.iter_mut().enumerate() {
         let f = (i as f32) / 1024.0;
         let bass_boost = (-f * 6.5).exp() * 94.0;
         let mid_groove = (-(f - 0.18).powi(2) / 0.025).exp() * 74.0;
         let high_sparkle = (-(f - 0.55).powi(2) / 0.06).exp() * 62.0;
         let val = (bass_boost + mid_groove + high_sparkle).clamp(10.0, 100.0);
-        uniforms.spectrum[i] = val;
+        *dst = val;
     }
 
     let uniform_buffer = device.create_buffer(&BufferDescriptor {

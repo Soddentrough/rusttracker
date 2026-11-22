@@ -3923,7 +3923,6 @@ dependencies = [
 name = "rt-core"
 version = "0.10.0"
 dependencies = [
- "anyhow",
  "crossbeam-channel",
  "directories",
 ]
@@ -3973,7 +3972,6 @@ dependencies = [
 name = "rt-tui"
 version = "0.10.0"
 dependencies = [
- "anyhow",
  "crossterm",
  "ratatui",
  "rt-core",
