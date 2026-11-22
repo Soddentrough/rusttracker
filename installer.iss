@@ -1,3 +1,7 @@
+#ifndef MyAppVersion
+  #define MyAppVersion "0.10.0"
+#endif
+
 [Setup]
 AppName=RustTracker
 AppVersion={#MyAppVersion}
@@ -16,8 +20,8 @@ ChangesAssociations=yes
 [Tasks]
 Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
 Name: "assoc_tracker"; Description: "Associate Tracker Modules (.mod, .xm, .s3m, .it, .mptm, .stm, .669, .mtm, .med, .okt, .psm)"; GroupDescription: "File Associations:"; Flags: checkedonce
-Name: "assoc_audio"; Description: "Associate Audio Files (.flac, .mp3, .wav, .ogg, .opus, .aac, .m4a, .mid, .midi, .aif, .wma)"; GroupDescription: "File Associations:"; Flags: unchecked
-Name: "assoc_video"; Description: "Associate Video Containers (.mp4, .mkv, .webm, .avi, .mov)"; GroupDescription: "File Associations:"; Flags: unchecked
+Name: "assoc_audio"; Description: "Associate Audio Files (.flac, .mp3, .wav, .ogg, .opus, .aac, .m4a, .mka, .mid, .midi, .aif, .aiff, .wma, .ac3, .eac3, .dts, .dtshd, .thd, .truehd, .mlp, .iamf)"; GroupDescription: "File Associations:"; Flags: unchecked
+Name: "assoc_video"; Description: "Associate Video & Disc Images (.mp4, .m4v, .mkv, .webm, .avi, .mov, .ts, .m2ts, .mts, .flv, .wmv, .mpg, .mpeg, .ogv, .3gp, .vob, .aob, .iso)"; GroupDescription: "File Associations:"; Flags: unchecked
 Name: "assoc_playlist"; Description: "Associate Playlists (.pls, .m3u, .m3u8)"; GroupDescription: "File Associations:"; Flags: unchecked
 Name: "contextmenu"; Description: "Add 'Play with RustTracker' to Explorer context menu"; GroupDescription: "Explorer Integration:"; Flags: checkedonce
 
@@ -164,10 +168,30 @@ Root: HKA; Subkey: "Software\Classes\.aiff\OpenWithProgids"; ValueType: string; 
 Root: HKA; Subkey: "Software\Classes\.aiff"; ValueType: string; ValueName: ""; ValueData: "RustTracker.AudioFile"; Flags: uninsdeletevalue; Tasks: assoc_audio
 Root: HKA; Subkey: "Software\Classes\.wma\OpenWithProgids"; ValueType: string; ValueName: "RustTracker.AudioFile"; ValueData: ""; Flags: uninsdeletevalue
 Root: HKA; Subkey: "Software\Classes\.wma"; ValueType: string; ValueName: ""; ValueData: "RustTracker.AudioFile"; Flags: uninsdeletevalue; Tasks: assoc_audio
+Root: HKA; Subkey: "Software\Classes\.mka\OpenWithProgids"; ValueType: string; ValueName: "RustTracker.AudioFile"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKA; Subkey: "Software\Classes\.mka"; ValueType: string; ValueName: ""; ValueData: "RustTracker.AudioFile"; Flags: uninsdeletevalue; Tasks: assoc_audio
+Root: HKA; Subkey: "Software\Classes\.ac3\OpenWithProgids"; ValueType: string; ValueName: "RustTracker.AudioFile"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKA; Subkey: "Software\Classes\.ac3"; ValueType: string; ValueName: ""; ValueData: "RustTracker.AudioFile"; Flags: uninsdeletevalue; Tasks: assoc_audio
+Root: HKA; Subkey: "Software\Classes\.eac3\OpenWithProgids"; ValueType: string; ValueName: "RustTracker.AudioFile"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKA; Subkey: "Software\Classes\.eac3"; ValueType: string; ValueName: ""; ValueData: "RustTracker.AudioFile"; Flags: uninsdeletevalue; Tasks: assoc_audio
+Root: HKA; Subkey: "Software\Classes\.dts\OpenWithProgids"; ValueType: string; ValueName: "RustTracker.AudioFile"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKA; Subkey: "Software\Classes\.dts"; ValueType: string; ValueName: ""; ValueData: "RustTracker.AudioFile"; Flags: uninsdeletevalue; Tasks: assoc_audio
+Root: HKA; Subkey: "Software\Classes\.dtshd\OpenWithProgids"; ValueType: string; ValueName: "RustTracker.AudioFile"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKA; Subkey: "Software\Classes\.dtshd"; ValueType: string; ValueName: ""; ValueData: "RustTracker.AudioFile"; Flags: uninsdeletevalue; Tasks: assoc_audio
+Root: HKA; Subkey: "Software\Classes\.thd\OpenWithProgids"; ValueType: string; ValueName: "RustTracker.AudioFile"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKA; Subkey: "Software\Classes\.thd"; ValueType: string; ValueName: ""; ValueData: "RustTracker.AudioFile"; Flags: uninsdeletevalue; Tasks: assoc_audio
+Root: HKA; Subkey: "Software\Classes\.truehd\OpenWithProgids"; ValueType: string; ValueName: "RustTracker.AudioFile"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKA; Subkey: "Software\Classes\.truehd"; ValueType: string; ValueName: ""; ValueData: "RustTracker.AudioFile"; Flags: uninsdeletevalue; Tasks: assoc_audio
+Root: HKA; Subkey: "Software\Classes\.mlp\OpenWithProgids"; ValueType: string; ValueName: "RustTracker.AudioFile"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKA; Subkey: "Software\Classes\.mlp"; ValueType: string; ValueName: ""; ValueData: "RustTracker.AudioFile"; Flags: uninsdeletevalue; Tasks: assoc_audio
+Root: HKA; Subkey: "Software\Classes\.iamf\OpenWithProgids"; ValueType: string; ValueName: "RustTracker.AudioFile"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKA; Subkey: "Software\Classes\.iamf"; ValueType: string; ValueName: ""; ValueData: "RustTracker.AudioFile"; Flags: uninsdeletevalue; Tasks: assoc_audio
 
 ; File Association Mappings - Video Files
 Root: HKA; Subkey: "Software\Classes\.mp4\OpenWithProgids"; ValueType: string; ValueName: "RustTracker.VideoFile"; ValueData: ""; Flags: uninsdeletevalue
 Root: HKA; Subkey: "Software\Classes\.mp4"; ValueType: string; ValueName: ""; ValueData: "RustTracker.VideoFile"; Flags: uninsdeletevalue; Tasks: assoc_video
+Root: HKA; Subkey: "Software\Classes\.m4v\OpenWithProgids"; ValueType: string; ValueName: "RustTracker.VideoFile"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKA; Subkey: "Software\Classes\.m4v"; ValueType: string; ValueName: ""; ValueData: "RustTracker.VideoFile"; Flags: uninsdeletevalue; Tasks: assoc_video
 Root: HKA; Subkey: "Software\Classes\.mkv\OpenWithProgids"; ValueType: string; ValueName: "RustTracker.VideoFile"; ValueData: ""; Flags: uninsdeletevalue
 Root: HKA; Subkey: "Software\Classes\.mkv"; ValueType: string; ValueName: ""; ValueData: "RustTracker.VideoFile"; Flags: uninsdeletevalue; Tasks: assoc_video
 Root: HKA; Subkey: "Software\Classes\.webm\OpenWithProgids"; ValueType: string; ValueName: "RustTracker.VideoFile"; ValueData: ""; Flags: uninsdeletevalue
@@ -176,6 +200,30 @@ Root: HKA; Subkey: "Software\Classes\.avi\OpenWithProgids"; ValueType: string; V
 Root: HKA; Subkey: "Software\Classes\.avi"; ValueType: string; ValueName: ""; ValueData: "RustTracker.VideoFile"; Flags: uninsdeletevalue; Tasks: assoc_video
 Root: HKA; Subkey: "Software\Classes\.mov\OpenWithProgids"; ValueType: string; ValueName: "RustTracker.VideoFile"; ValueData: ""; Flags: uninsdeletevalue
 Root: HKA; Subkey: "Software\Classes\.mov"; ValueType: string; ValueName: ""; ValueData: "RustTracker.VideoFile"; Flags: uninsdeletevalue; Tasks: assoc_video
+Root: HKA; Subkey: "Software\Classes\.ts\OpenWithProgids"; ValueType: string; ValueName: "RustTracker.VideoFile"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKA; Subkey: "Software\Classes\.ts"; ValueType: string; ValueName: ""; ValueData: "RustTracker.VideoFile"; Flags: uninsdeletevalue; Tasks: assoc_video
+Root: HKA; Subkey: "Software\Classes\.m2ts\OpenWithProgids"; ValueType: string; ValueName: "RustTracker.VideoFile"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKA; Subkey: "Software\Classes\.m2ts"; ValueType: string; ValueName: ""; ValueData: "RustTracker.VideoFile"; Flags: uninsdeletevalue; Tasks: assoc_video
+Root: HKA; Subkey: "Software\Classes\.mts\OpenWithProgids"; ValueType: string; ValueName: "RustTracker.VideoFile"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKA; Subkey: "Software\Classes\.mts"; ValueType: string; ValueName: ""; ValueData: "RustTracker.VideoFile"; Flags: uninsdeletevalue; Tasks: assoc_video
+Root: HKA; Subkey: "Software\Classes\.flv\OpenWithProgids"; ValueType: string; ValueName: "RustTracker.VideoFile"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKA; Subkey: "Software\Classes\.flv"; ValueType: string; ValueName: ""; ValueData: "RustTracker.VideoFile"; Flags: uninsdeletevalue; Tasks: assoc_video
+Root: HKA; Subkey: "Software\Classes\.wmv\OpenWithProgids"; ValueType: string; ValueName: "RustTracker.VideoFile"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKA; Subkey: "Software\Classes\.wmv"; ValueType: string; ValueName: ""; ValueData: "RustTracker.VideoFile"; Flags: uninsdeletevalue; Tasks: assoc_video
+Root: HKA; Subkey: "Software\Classes\.mpg\OpenWithProgids"; ValueType: string; ValueName: "RustTracker.VideoFile"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKA; Subkey: "Software\Classes\.mpg"; ValueType: string; ValueName: ""; ValueData: "RustTracker.VideoFile"; Flags: uninsdeletevalue; Tasks: assoc_video
+Root: HKA; Subkey: "Software\Classes\.mpeg\OpenWithProgids"; ValueType: string; ValueName: "RustTracker.VideoFile"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKA; Subkey: "Software\Classes\.mpeg"; ValueType: string; ValueName: ""; ValueData: "RustTracker.VideoFile"; Flags: uninsdeletevalue; Tasks: assoc_video
+Root: HKA; Subkey: "Software\Classes\.ogv\OpenWithProgids"; ValueType: string; ValueName: "RustTracker.VideoFile"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKA; Subkey: "Software\Classes\.ogv"; ValueType: string; ValueName: ""; ValueData: "RustTracker.VideoFile"; Flags: uninsdeletevalue; Tasks: assoc_video
+Root: HKA; Subkey: "Software\Classes\.3gp\OpenWithProgids"; ValueType: string; ValueName: "RustTracker.VideoFile"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKA; Subkey: "Software\Classes\.3gp"; ValueType: string; ValueName: ""; ValueData: "RustTracker.VideoFile"; Flags: uninsdeletevalue; Tasks: assoc_video
+Root: HKA; Subkey: "Software\Classes\.vob\OpenWithProgids"; ValueType: string; ValueName: "RustTracker.VideoFile"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKA; Subkey: "Software\Classes\.vob"; ValueType: string; ValueName: ""; ValueData: "RustTracker.VideoFile"; Flags: uninsdeletevalue; Tasks: assoc_video
+Root: HKA; Subkey: "Software\Classes\.aob\OpenWithProgids"; ValueType: string; ValueName: "RustTracker.VideoFile"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKA; Subkey: "Software\Classes\.aob"; ValueType: string; ValueName: ""; ValueData: "RustTracker.VideoFile"; Flags: uninsdeletevalue; Tasks: assoc_video
+Root: HKA; Subkey: "Software\Classes\.iso\OpenWithProgids"; ValueType: string; ValueName: "RustTracker.VideoFile"; ValueData: ""; Flags: uninsdeletevalue
+Root: HKA; Subkey: "Software\Classes\.iso"; ValueType: string; ValueName: ""; ValueData: "RustTracker.VideoFile"; Flags: uninsdeletevalue; Tasks: assoc_video
 
 ; File Association Mappings - Playlists
 Root: HKA; Subkey: "Software\Classes\.pls\OpenWithProgids"; ValueType: string; ValueName: "RustTracker.PlaylistFile"; ValueData: ""; Flags: uninsdeletevalue

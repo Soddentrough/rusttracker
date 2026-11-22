@@ -15,9 +15,9 @@ const BASE_WATER_Y: f32 = 0.42;
 const MAX_WATER_Y: f32 = 0.92;
 
 // Raymarch tuning
-const MAX_STEPS: i32 = 10;
+const MAX_STEPS: i32 = 28;
 const HIT_EPS: f32 = 0.0038;
-const STEP_SCALE: f32 = 0.92;
+const STEP_SCALE: f32 = 0.85;
 
 var<private> g_time: f32 = 0.0;
 var<private> g_sub_bass: f32 = 0.0;
@@ -40,16 +40,14 @@ fn sample_water_height_march(p: vec2<f32>) -> f32 {
     let swell_boost = g_bass_energy * 0.28;
     let bass_drive = g_sub_bass + swell_boost;
 
-    var central_plume = 0.0;
-    if (r2 < 2.8) {
-        let plume_core = (1.0 / (1.0 + r2 * 2.4 + r2 * r2 * 2.8)) * (0.06 + bass_drive * 0.34) * g_plume_pulse;
-        let r_approx = r2 * inverseSqrt(max(r2, 1e-6));
-        let dc = r_approx - g_collar1_r;
-        let dt_r = r_approx - 0.52;
-        let collar1 = (1.0 / (1.0 + (dc * dc) * 9.5)) * (0.025 + bass_drive * 0.105);
-        let trough1 = -(1.0 / (1.0 + (dt_r * dt_r) * 15.0)) * (0.015 + bass_drive * 0.042);
-        central_plume = plume_core + collar1 + trough1;
-    }
+    let plume_mask = smoothstep_r(3.6, 2.2, r2);
+    let plume_core = (1.0 / (1.0 + r2 * 2.4 + r2 * r2 * 2.8)) * (0.06 + bass_drive * 0.34) * g_plume_pulse;
+    let r_approx = r2 * inverseSqrt(max(r2, 1e-6));
+    let dc = r_approx - g_collar1_r;
+    let dt_r = r_approx - 0.52;
+    let collar1 = (1.0 / (1.0 + (dc * dc) * 9.5)) * (0.025 + bass_drive * 0.105);
+    let trough1 = -(1.0 / (1.0 + (dt_r * dt_r) * 15.0)) * (0.015 + bass_drive * 0.042);
+    let central_plume = (plume_core + collar1 + trough1) * plume_mask;
 
     let far_fade = 1.0 / (1.0 + r2 * 0.0022);
     let d1 = vec2<f32>(0.866, 0.500);
@@ -75,16 +73,14 @@ fn sample_water_height(p: vec2<f32>) -> f32 {
     let swell_boost = g_bass_energy * 0.28;
     let bass_drive = g_sub_bass + swell_boost;
 
-    // 1. Central Sub-Bass Acoustic Fountain Plume & Concentric Rayleigh Collars (pure ALU rational Gaussian)
-    var central_plume = 0.0;
-    if (r2 < 2.8) {
-        let plume_core = (1.0 / (1.0 + r2 * 2.4 + r2 * r2 * 2.8)) * (0.06 + bass_drive * 0.34) * g_plume_pulse;
-        let dc = r - g_collar1_r;
-        let dt_r = r - 0.52;
-        let collar1 = (1.0 / (1.0 + (dc * dc) * 9.5)) * (0.025 + bass_drive * 0.105);
-        let trough1 = -(1.0 / (1.0 + (dt_r * dt_r) * 15.0)) * (0.015 + bass_drive * 0.042);
-        central_plume = plume_core + collar1 + trough1;
-    }
+    // 1. Central Sub-Bass Acoustic Fountain Plume & Concentric Rayleigh Collars (C-infinity smooth radial fade)
+    let plume_mask = smoothstep_r(3.6, 2.2, r2);
+    let plume_core = (1.0 / (1.0 + r2 * 2.4 + r2 * r2 * 2.8)) * (0.06 + bass_drive * 0.34) * g_plume_pulse;
+    let dc = r - g_collar1_r;
+    let dt_r = r - 0.52;
+    let collar1 = (1.0 / (1.0 + (dc * dc) * 9.5)) * (0.025 + bass_drive * 0.105);
+    let trough1 = -(1.0 / (1.0 + (dt_r * dt_r) * 15.0)) * (0.015 + bass_drive * 0.042);
+    let central_plume = (plume_core + collar1 + trough1) * plume_mask;
 
     // 2. Expansive Radially Propagating Gravity Wave Rings (unbounded across the viewport)
     let far_fade = 1.0 / (1.0 + r * 0.035 + r2 * 0.0006);
@@ -300,16 +296,16 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let time = select(audio.time, audio.smooth_time, audio.smooth_time > 0.0);
     g_time = time;
 
-    // Support both live [0..100] spectrum and synthetic [0..2] benchmark inputs seamlessly
+    // Normalize from live [0..100] audio spectrum uniformly without discontinuous threshold pops
     let raw_s0 = audio.spectrum[0].x;
     let raw_lm = audio.spectrum[3].x + audio.spectrum[5].x;
     let raw_m = audio.spectrum[8].x + audio.spectrum[16].x;
     let raw_h = audio.spectrum[32].x + audio.spectrum[48].x;
 
-    let s0_norm = select(raw_s0 / 55.0, raw_s0, raw_s0 > 0.0 && raw_s0 <= 3.0);
-    let lm_norm = select(raw_lm / 110.0, raw_lm * 0.5, raw_lm > 0.0 && raw_lm <= 4.0);
-    let m_norm = select(raw_m / 110.0, raw_m * 0.5, raw_m > 0.0 && raw_m <= 4.0);
-    let h_norm = select(raw_h / 110.0, raw_h * 0.5, raw_h > 0.0 && raw_h <= 4.0);
+    let s0_norm = raw_s0 / 55.0;
+    let lm_norm = raw_lm / 110.0;
+    let m_norm = raw_m / 110.0;
+    let h_norm = raw_h / 110.0;
 
     let sub_bass = clamp(s0_norm + audio.channels[0].x * 0.85, 0.0, 2.2);
     let lowmids = clamp(lm_norm + (audio.channels[0].x + audio.channels[0].y) * 0.35, 0.0, 1.6);
@@ -359,12 +355,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     if (rd.y < -0.0005) {
         let inv_rdy = 1.0 / rd.y;
-        var t_start = max(0.0, (MAX_WATER_Y - ro.y) * inv_rdy);
-        let p_top = ro + rd * t_start;
-        // Outside central plume cylinder, waves never exceed y = 0.55
-        if (dot(p_top.xz, p_top.xz) > 2.3 && dot(p_top.xz, rd.xz) >= -0.05) {
-            t_start = max(t_start, (0.55 - ro.y) * inv_rdy);
-        }
+        let t_start = max(0.0, (MAX_WATER_Y - ro.y) * inv_rdy);
         let t_max = min(56.0, (MIN_WATER_Y - ro.y) * inv_rdy);
         let inv_slant = 1.0 / (max(-rd.y, 0.02) + 0.28);
 

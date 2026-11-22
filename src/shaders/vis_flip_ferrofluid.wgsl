@@ -14,9 +14,9 @@ const DISH_RADIUS: f32 = 3.35;
 const DOMAIN_HALF: f32 = 3.6;
 
 // Raymarch tuning
-const MAX_STEPS: i32 = 16;
+const MAX_STEPS: i32 = 32;
 const HIT_EPS: f32 = 0.0045;
-const STEP_SCALE: f32 = 0.72;
+const STEP_SCALE: f32 = 0.65;
 
 fn get_grid_height(gx: i32, gz: i32) -> f32 {
     if (gx < 0 || gx >= RENDER_GRID_SIZE || gz < 0 || gz >= RENDER_GRID_SIZE) {
@@ -75,7 +75,12 @@ fn calc_normal(p: vec2<f32>, eps: f32) -> vec3<f32> {
 
 // Fast Ray-AABB intersection for early background rejection
 fn intersect_aabb(ro: vec3<f32>, rd: vec3<f32>, box_min: vec3<f32>, box_max: vec3<f32>) -> vec2<f32> {
-    let inv_d = 1.0 / rd;
+    let safe_rd = vec3<f32>(
+        select(rd.x, select(-1e-6, 1e-6, rd.x >= 0.0), abs(rd.x) < 1e-6),
+        select(rd.y, select(-1e-6, 1e-6, rd.y >= 0.0), abs(rd.y) < 1e-6),
+        select(rd.z, select(-1e-6, 1e-6, rd.z >= 0.0), abs(rd.z) < 1e-6),
+    );
+    let inv_d = 1.0 / safe_rd;
     let t0 = (box_min - ro) * inv_d;
     let t1 = (box_max - ro) * inv_d;
 
@@ -131,7 +136,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let t_cyl0 = (-b_cyl - sqrt_disc) * inv_a_cyl;
     let t_cyl1 = (-b_cyl + sqrt_disc) * inv_a_cyl;
 
-    let inv_rdy = 1.0 / rd.y;
+    let safe_rdy = select(rd.y, select(-1e-6, 1e-6, rd.y >= 0.0), abs(rd.y) < 1e-6);
+    let inv_rdy = 1.0 / safe_rdy;
     let ty0 = (0.0 - ro.y) * inv_rdy;
     let ty1 = (1.32 - ro.y) * inv_rdy;
     let t_near = max(max(0.0, t_cyl0), min(ty0, ty1));
@@ -191,7 +197,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let r2_hit = dot(hit_p.xz, hit_p.xz);
         let r_xz = sqrt(r2_hit);
         let floor_y = 0.025 + 0.022 * r2_hit;
-        let dish_mask = smoothstep(DISH_RADIUS, DISH_RADIUS - 0.45, r_xz);
+        let dish_mask = smoothstep_r(DISH_RADIUS, DISH_RADIUS - 0.45, r_xz);
         let base_puddle = floor_y + 0.055 * dish_mask;
         let spike_h = max(0.0, hit_p.y - base_puddle);
 
@@ -246,7 +252,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // Dish glass rim glow: visible where fluid thins out towards container edge
         let dish_glass_glow = smoothstep(DISH_RADIUS - 0.45, DISH_RADIUS, r_xz) * coil_freq * (0.8 + sub_bass * 0.8);
         // Spike root flux: electromagnetic energy exciting fluid at the base of erupting spikes
-        let spike_root_flux = smoothstep(0.01, 0.12, spike_h) * smoothstep(0.45, 0.10, spike_h) * (0.35 + sub_bass * 0.5);
+        let spike_root_flux = smoothstep(0.01, 0.12, spike_h) * smoothstep_r(0.45, 0.10, spike_h) * (0.35 + sub_bass * 0.5);
         let underglow = coil_col * (dish_glass_glow + spike_root_flux) * (1.0 - NdotV * 0.4);
 
         // Iridescent Thin-Film Sheen on Sharp Magnetic Spike Tips

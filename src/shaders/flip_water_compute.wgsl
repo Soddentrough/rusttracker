@@ -53,7 +53,7 @@ const CHAMBER_RADIUS: f32 = 6.0;
 const FIXED_SCALE: f32 = 512.0;
 const FLUID_DENSITY: f32 = 1.0;
 const FLIP_RATIO: f32 = 0.95; // 95% FLIP, 5% PIC
-const SOR_OMEGA: f32 = 1.28; // Stable damped Jacobi over-relaxation factor (omega < 4/3)
+const SOR_OMEGA: f32 = 0.75; // Stable damped Jacobi under-relaxation factor (convergent on arbitrary grids)
 
 // --- Bindings ---
 @group(0) @binding(0) var<uniform> audio: AudioUniforms;
@@ -171,22 +171,6 @@ fn cs_p2g(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let y = -0.70 + r3 * 0.52; // Resting submerged below water line (y in [-0.70, -0.18])
 
             p.pos = vec4<f32>(x, y, z, 1.23);
-            p.vel = vec4<f32>(0.0);
-            particles[p_idx] = p;
-        }
-    } else {
-        // Seed initial particle pool across the open water domain (ID 28) if uninitialized or switched from another mode
-        if (length(p.pos.xyz) < 0.001 || abs(p.pos.w - 1.333) > 0.01) {
-            let fi = f32(p_idx);
-            let r1 = fract(sin(fi * 12.9898 + 0.123) * 43758.5453);
-            let r2 = fract(sin(fi * 78.233 + 0.456) * 43758.5453);
-            let r3 = fract(sin(fi * 39.421 + 0.789) * 43758.5453);
-
-            let angle = r1 * 6.2831853;
-            let radius = sqrt(r2) * 5.8;
-            let y_pos = 0.12 + r3 * 0.30; // Resting water level ~42cm
-
-            p.pos = vec4<f32>(cos(angle) * radius, y_pos, sin(angle) * radius, 1.333);
             p.vel = vec4<f32>(0.0);
             particles[p_idx] = p;
         }
@@ -310,7 +294,7 @@ fn cs_grid_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
                 let ch_val = select(select(select(audio.channels[0].w, audio.channels[0].z, k == 2u), audio.channels[0].y, k == 1u), audio.channels[0].x, k == 0u);
                 let ch_amp = clamp(ch_val, 0.0, 1.5);
                 let falloff = exp(-dist_t2 * 0.35);
-                let transducer_force = ch_amp * 4.5 * falloff * smoothstep(0.1, -0.4, world_p.y);
+                let transducer_force = ch_amp * 4.5 * falloff * smoothstep_r(0.1, -0.4, world_p.y);
                 force.y += transducer_force;
             }
 
@@ -329,60 +313,6 @@ fn cs_grid_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let dt_scale = dt / 0.016;
             vel *= pow(0.985, dt_scale);
         }
-    } else {
-        let r_xz = length(world_p.xz);
-
-        // Boundary classification: open domain outer margin and seabed floor (ID 28)
-        if (r_xz > CHAMBER_RADIUS || world_p.y < 0.08) {
-            cell_type = 2.0; // SOLID
-            grid_vel_new[idx] = vec4<f32>(0.0, 0.0, 0.0, cell_type);
-            grid_vel_old[idx] = vec4<f32>(0.0, 0.0, 0.0, cell_type);
-            return;
-        }
-
-        if (raw_wt > 0.002) {
-            cell_type = 1.0; // LIQUID
-            let inv_wt = 1.0 / raw_wt;
-            vel.x = (f32(atomicLoad(&grid_accum[idx].u_mom)) / FIXED_SCALE) * inv_wt;
-            vel.y = (f32(atomicLoad(&grid_accum[idx].v_mom)) / FIXED_SCALE) * inv_wt;
-            vel.z = (f32(atomicLoad(&grid_accum[idx].w_mom)) / FIXED_SCALE) * inv_wt;
-
-            var force = vec3<f32>(0.0, -9.8, 0.0);
-
-            // Cohesive Acoustic Sub-bass Fountain Swell & Toroidal Roll (supports both [0..100] and [0..2] scales)
-            let spec0 = select(audio.spectrum[0].x / 55.0, audio.spectrum[0].x, audio.spectrum[0].x > 0.0 && audio.spectrum[0].x <= 3.0);
-            let sub_bass = clamp(spec0 + audio.channels[0].x * 0.85, 0.0, 2.2);
-            let jet_falloff = exp(-r_xz * r_xz * 0.85);
-            let geyser_impulse = sub_bass * 54.0 * jet_falloff * smoothstep(0.72, 0.10, world_p.y);
-            force.y += geyser_impulse;
-
-            let spread_factor = smoothstep(0.36, 0.78, world_p.y) * sub_bass * 18.0 * exp(-r_xz * 0.35);
-            if (r_xz > 0.01) {
-                force.x += (world_p.x / r_xz) * spread_factor;
-                force.z += (world_p.z / r_xz) * spread_factor;
-            }
-
-            // Faraday Acoustic Surface Waves & Open Ocean Harmonic Excitation
-            let azimuth = atan2(world_p.z, world_p.x);
-            let raw_m = audio.spectrum[8].x + audio.spectrum[16].x;
-            let raw_h = audio.spectrum[32].x + audio.spectrum[48].x;
-            let mids = clamp(select(raw_m / 110.0, raw_m * 0.5, raw_m > 0.0 && raw_m <= 4.0) + audio.channels[0].y * 0.4, 0.0, 1.6);
-            let highs = clamp(select(raw_h / 110.0, raw_h * 0.5, raw_h > 0.0 && raw_h <= 4.0) + audio.channels[0].x * 0.3, 0.0, 1.4);
-
-            let anim_t = select(audio.time, audio.smooth_time, audio.smooth_time > 0.0);
-            let standing_wave = cos(r_xz * 3.8 - anim_t * 3.8) * cos(azimuth * 4.0)
-                              + 0.5 * sin(r_xz * 6.2 + anim_t * 2.9) * cos(azimuth * 6.0);
-            let ripple_force = standing_wave * (mids * 14.0 + highs * 10.0) * smoothstep(0.14, 0.45, world_p.y);
-            force.y += ripple_force;
-
-            // Smooth hydrostatic equilibrium restoring force around resting level (0.42m)
-            let excess_h = world_p.y - 0.42;
-            force.y -= excess_h * 26.0;
-
-            vel += force * dt;
-            let dt_scale = dt / 0.016;
-            vel *= pow(0.975, dt_scale);
-        }
     }
 
     grid_vel_new[idx] = vec4<f32>(vel, cell_type);
@@ -398,14 +328,32 @@ fn compute_divergence(gx: i32, gy: i32, gz: i32) -> f32 {
     let inv_2dy = 0.5 * inv_cell.y;
     let inv_2dz = 0.5 * inv_cell.z;
 
-    let x_plus = select(0.0, grid_vel_new[get_cell_idx(u32(gx + 1), u32(gy), u32(gz))].x, gx + 1 < i32(GRID_X));
-    let x_minus = select(0.0, grid_vel_new[get_cell_idx(u32(gx - 1), u32(gy), u32(gz))].x, gx - 1 >= 0);
+    var x_plus = 0.0;
+    if (gx + 1 < i32(GRID_X)) {
+        x_plus = grid_vel_new[get_cell_idx(u32(gx + 1), u32(gy), u32(gz))].x;
+    }
+    var x_minus = 0.0;
+    if (gx - 1 >= 0) {
+        x_minus = grid_vel_new[get_cell_idx(u32(gx - 1), u32(gy), u32(gz))].x;
+    }
 
-    let y_plus = select(0.0, grid_vel_new[get_cell_idx(u32(gx), u32(gy + 1), u32(gz))].y, gy + 1 < i32(GRID_Y));
-    let y_minus = select(0.0, grid_vel_new[get_cell_idx(u32(gx), u32(gy - 1), u32(gz))].y, gy - 1 >= 0);
+    var y_plus = 0.0;
+    if (gy + 1 < i32(GRID_Y)) {
+        y_plus = grid_vel_new[get_cell_idx(u32(gx), u32(gy + 1), u32(gz))].y;
+    }
+    var y_minus = 0.0;
+    if (gy - 1 >= 0) {
+        y_minus = grid_vel_new[get_cell_idx(u32(gx), u32(gy - 1), u32(gz))].y;
+    }
 
-    let z_plus = select(0.0, grid_vel_new[get_cell_idx(u32(gx), u32(gy), u32(gz + 1))].z, gz + 1 < i32(GRID_Z));
-    let z_minus = select(0.0, grid_vel_new[get_cell_idx(u32(gx), u32(gy), u32(gz - 1))].z, gz - 1 >= 0);
+    var z_plus = 0.0;
+    if (gz + 1 < i32(GRID_Z)) {
+        z_plus = grid_vel_new[get_cell_idx(u32(gx), u32(gy), u32(gz + 1))].z;
+    }
+    var z_minus = 0.0;
+    if (gz - 1 >= 0) {
+        z_minus = grid_vel_new[get_cell_idx(u32(gx), u32(gy), u32(gz - 1))].z;
+    }
 
     return (x_plus - x_minus) * inv_2dx + (y_plus - y_minus) * inv_2dy + (z_plus - z_minus) * inv_2dz;
 }
@@ -425,9 +373,9 @@ fn cs_pressure_0_to_1(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let gy = i32((idx / GRID_X) % GRID_Y);
     let gz = i32(idx / (GRID_X * GRID_Y));
 
-    let div = compute_divergence(gx, gy, gz);
-    let dt = clamp(audio.frame_dt, 0.001, 0.033);
-    let rhs = (FLUID_DENSITY / dt) * div;
+    let rhs = grid_vel_old[idx].w;
+    // Cache rhs in grid_vel_old.w so cs_pressure_1_to_0 avoids recomputing 6-neighbor velocity divergence
+    grid_vel_old[idx].w = rhs;
 
     let inv_c = get_inv_cell_size();
     let wx = inv_c.x * inv_c.x;
@@ -486,9 +434,7 @@ fn cs_pressure_1_to_0(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let gy = i32((idx / GRID_X) % GRID_Y);
     let gz = i32(idx / (GRID_X * GRID_Y));
 
-    let div = compute_divergence(gx, gy, gz);
-    let dt = clamp(audio.frame_dt, 0.001, 0.033);
-    let rhs = (FLUID_DENSITY / dt) * div;
+    let rhs = grid_vel_old[idx].w;
 
     let inv_c = get_inv_cell_size();
     let wx = inv_c.x * inv_c.x;
@@ -727,109 +673,20 @@ fn cs_g2p_advect_splat(@builtin(global_invocation_id) global_id: vec3<u32>) {
         if (ix >= 0 && ix < i32(RENDER_GRID_SIZE) && iz >= 0 && iz < i32(RENDER_GRID_SIZE)) {
             let cell = u32(iz) * RENDER_GRID_SIZE + u32(ix);
             let h_mm = u32(clamp((p.pos.y + 0.55) * 1000.0, 0.0, 3500.0));
-            atomicMax(&render_grid[cell], h_mm << 16u);
-            if (p.pos.y > 0.05) {
-                atomicAdd(&render_grid[cell], 1u);
-            }
-        }
-    } else {
-        // Visualizer ID 28: Open Water / Ocean Surface
-        let r_p = length(p.pos.xz);
-
-        // Cohesive Acoustic Sub-bass Fountain Swell (normalized from [0, 100] or [0, 2] scale)
-        let spec0 = select(audio.spectrum[0].x / 55.0, audio.spectrum[0].x, audio.spectrum[0].x > 0.0 && audio.spectrum[0].x <= 3.0);
-        let sub_bass = clamp(spec0 + audio.channels[0].x * 0.85, 0.0, 2.2);
-        let jet_falloff = exp(-r_p * r_p * 1.1);
-        let geyser_kick = sub_bass * 2.4 * jet_falloff * smoothstep(0.68, 0.12, p.pos.y);
-        v_cur.y += geyser_kick * (dt / 0.016);
-
-        if (r_p > 0.01 && p.pos.y > 0.38) {
-            let spread = smoothstep(0.38, 0.85, p.pos.y) * sub_bass * 1.8 * exp(-r_p * 0.35) * (dt / 0.016);
-            v_cur.x += (p.pos.x / r_p) * spread;
-            v_cur.z += (p.pos.z / r_p) * spread;
-        }
-
-        // Faraday standing waves ripple impulse
-        let azimuth = atan2(p.pos.z, p.pos.x);
-        let raw_m = audio.spectrum[8].x + audio.spectrum[16].x;
-        let raw_h = audio.spectrum[32].x + audio.spectrum[48].x;
-        let mids = clamp(select(raw_m / 110.0, raw_m * 0.5, raw_m > 0.0 && raw_m <= 4.0) + audio.channels[0].y * 0.4, 0.0, 1.6);
-        let highs = clamp(select(raw_h / 110.0, raw_h * 0.5, raw_h > 0.0 && raw_h <= 4.0) + audio.channels[0].x * 0.3, 0.0, 1.4);
-        let anim_t = select(audio.time, audio.smooth_time, audio.smooth_time > 0.0);
-        let standing_wave = cos(r_p * 3.8 - anim_t * 3.8) * cos(azimuth * 4.0);
-        v_cur.y += standing_wave * (mids * 0.65 + highs * 0.45) * smoothstep(0.15, 0.48, p.pos.y) * (dt / 0.016);
-
-        // Restoring gravity & equilibrium surface tension around resting level (0.42m)
-        v_cur.y -= 9.8 * dt * ballistic_mask;
-        let excess_h = p.pos.y - 0.42;
-        v_cur.y -= excess_h * 14.0 * dt;
-
-        p.vel = vec4<f32>(v_cur, p.vel.w);
-        p.pos = vec4<f32>(p.pos.xyz + p.vel.xyz * dt, p.pos.w);
-
-        let r_xz = length(p.pos.xz);
-        let floor_y = 0.09;
-
-        if (p.pos.y < floor_y) {
-            p.pos.y = floor_y;
-            if (p.vel.y < 0.0) {
-                p.vel.y = -p.vel.y * 0.25;
-            }
-        }
-
-        if (r_xz > CHAMBER_RADIUS) {
-            let normal_xz = normalize(p.pos.xz);
-            p.pos.x = normal_xz.x * CHAMBER_RADIUS;
-            p.pos.z = normal_xz.y * CHAMBER_RADIUS;
-            let v_radial = dot(p.vel.xz, normal_xz);
-            if (v_radial > 0.0) {
-                p.vel.x -= 1.15 * v_radial * normal_xz.x;
-                p.vel.z -= 1.15 * v_radial * normal_xz.y;
-            }
-        }
-
-        if (p.pos.y > 0.92) {
-            p.pos.y = 0.92;
-            p.vel.y = -abs(p.vel.y) * 0.35;
-        }
-
-        particles[p_idx] = p;
-
-        // Skip 5x5 atomicMax splat for deeply submerged bottom-layer particles
-        if (p.pos.y <= 0.36) {
-            return;
-        }
-
-        // Splat Particle to 512x512 Render Heightfield Grid (World [-6.4, 6.4] -> [0, 512])
-        let rx = ((p.pos.x + 6.4) / 12.8) * f32(RENDER_GRID_SIZE);
-        let rz = ((p.pos.z + 6.4) / 12.8) * f32(RENDER_GRID_SIZE);
-
-        let ix = i32(round(rx));
-        let iz = i32(round(rz));
-
-        // Splat only excess elevation above resting level with a C1-continuous zero-boundary kernel
-        let excess = clamp(p.pos.y - 0.38, 0.0, 0.45);
-        if (excess <= 0.002) {
-            return;
-        }
-
-        for (var dz = -2; dz <= 2; dz++) {
-            let gz = iz + dz;
-            if (gz < 0 || gz >= i32(RENDER_GRID_SIZE)) { continue; }
-
-            for (var dx = -2; dx <= 2; dx++) {
-                let gx = ix + dx;
-                if (gx < 0 || gx >= i32(RENDER_GRID_SIZE)) { continue; }
-
-                let d2 = f32(dx * dx + dz * dz);
-                let w = max(0.0, 1.0 - d2 / 9.0);
-                let falloff = w * w;
-                let splat_u = u32((excess * falloff) * 1000.0);
-
-                if (splat_u > 0u) {
-                    let cell = u32(gz) * RENDER_GRID_SIZE + u32(gx);
-                    atomicMax(&render_grid[cell], splat_u);
+            let splash_inc = select(0u, 1u, p.pos.y > 0.05);
+            var cur = atomicLoad(&render_grid[cell]);
+            loop {
+                let next_h = max(cur >> 16u, h_mm);
+                let next_s = min((cur & 0xFFFFu) + splash_inc, 0xFFFFu);
+                let desired = (next_h << 16u) | next_s;
+                if (desired == cur) {
+                    break;
                 }
+                let res = atomicCompareExchangeWeak(&render_grid[cell], cur, desired);
+                if (res.exchanged) {
+                    break;
+                }
+                cur = res.old_value;
             }
         }
     }

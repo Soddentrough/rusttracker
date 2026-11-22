@@ -20,9 +20,16 @@ fn build_libmpeghe() {
     let mut c_files: Vec<PathBuf> = std::fs::read_dir(&encoder_dir)
         .expect("Failed to read third_party/libmpeghe/encoder directory")
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("c"))
+        .filter(|p| matches!(p.extension().and_then(|s| s.to_str()), Some("c" | "h")))
         .collect();
     c_files.sort();
+    for file in &c_files {
+        println!("cargo:rerun-if-changed={}", file.display());
+    }
+    let c_sources: Vec<PathBuf> = c_files
+        .into_iter()
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("c"))
+        .collect();
 
     let target_arch = env::var("CARGO_CFG_TARGET_ARCH").unwrap_or_default();
     let target_env = env::var("CARGO_CFG_TARGET_ENV").unwrap_or_default();
@@ -30,7 +37,7 @@ fn build_libmpeghe() {
     let mut build = cc::Build::new();
     build
         .include(&encoder_dir)
-        .files(&c_files)
+        .files(&c_sources)
         .opt_level(3)
         .warnings(true)
         .define("_LIB", None);
@@ -50,7 +57,7 @@ fn build_libmpeghe() {
             .flag_if_supported("-Wno-sign-compare");
         if target_arch == "aarch64" || target_arch == "arm" {
             build.define("_ARM_", None);
-        } else {
+        } else if target_arch == "x86_64" || target_arch == "x86" {
             build.define("_X86_", None);
         }
     }

@@ -286,7 +286,7 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
 
         // Audio-reactive crystal core luminescence + progressive karaoke laser sweep
         let core_glow = vec3<f32>(0.15, 0.45, 0.85) * pow(bass, 1.3) * 0.85;
-        let sung_mask = smoothstep(line_progress + 0.04, line_progress - 0.02, char_norm);
+        let sung_mask = smoothstep_r(line_progress + 0.04, line_progress - 0.02, char_norm);
         let active_laser = exp(-pow((char_norm - line_progress) * max(4.0, char_count * 0.45), 2.0));
         let karaoke_glow = vec3<f32>(0.08, 0.32, 0.55) * sung_mask
                          + vec3<f32>(0.45, 0.85, 1.35) * active_laser * (0.65 + bass * 0.55);

@@ -47,6 +47,29 @@ fn test_audio_transition_and_fallback() {
     let handle1 = audio::start_audio_thread(mod_path, false, shared_state.clone())
         .expect("Failed to start first audio thread (MOD)");
     std::thread::sleep(std::time::Duration::from_millis(300));
+    let mod_type = {
+        let st = shared_state.lock().unwrap();
+        assert!(
+            st.duration_seconds > 0.0,
+            "MOD track should report > 0 duration, got {}",
+            st.duration_seconds
+        );
+        assert!(
+            st.num_channels > 0,
+            "MOD track should report > 0 channels, got {}",
+            st.num_channels
+        );
+        assert!(
+            st.current_sample_rate > 0.0,
+            "MOD track should report > 0 sample rate, got {}",
+            st.current_sample_rate
+        );
+        assert!(
+            !st.module_type.is_empty(),
+            "MOD track should report non-empty module_type"
+        );
+        st.module_type.clone()
+    };
     drop(handle1);
 
     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -54,6 +77,29 @@ fn test_audio_transition_and_fallback() {
     let handle2 = audio::start_audio_thread(mid_path, false, shared_state.clone())
         .expect("Failed to start second audio track (MIDI)");
     std::thread::sleep(std::time::Duration::from_millis(300));
+    {
+        let st = shared_state.lock().unwrap();
+        assert!(
+            st.duration_seconds > 0.0,
+            "MIDI track should report > 0 duration, got {}",
+            st.duration_seconds
+        );
+        assert!(
+            st.num_channels > 0,
+            "MIDI track should report > 0 channels, got {}",
+            st.num_channels
+        );
+        assert!(
+            st.current_sample_rate > 0.0,
+            "MIDI track should report > 0 sample rate, got {}",
+            st.current_sample_rate
+        );
+        assert_ne!(
+            st.module_type, mod_type,
+            "Transitioning from MOD ({}) to MIDI should update module_type",
+            mod_type
+        );
+    }
     drop(handle2);
 }
 

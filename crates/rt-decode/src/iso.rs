@@ -61,9 +61,9 @@ impl ResolvedIsoMedia {
         let target = target_sec.max(0.0);
 
         if !self.cells.is_empty() {
-            for cell in &self.cells {
+            for (pos_idx, cell) in self.cells.iter().enumerate() {
                 let cell_end = cell.start_time_sec + cell.duration_sec;
-                if target <= cell_end || cell.cell_index + 1 == self.cells.len() {
+                if target <= cell_end || pos_idx + 1 == self.cells.len() {
                     let frac = if cell.duration_sec > 0.001 {
                         ((target - cell.start_time_sec) / cell.duration_sec).clamp(0.0, 1.0)
                     } else {
@@ -696,8 +696,20 @@ fn build_resolved_dvd_media_with_paths(
         let mut cumulative_time = 0.0f64;
 
         for (idx, raw_cell) in ifo.cells.iter().enumerate() {
-            let cell_vob_start = raw_cell.first_sector * DVD_SECTOR_SIZE;
-            let cell_vob_len = (raw_cell.last_sector - raw_cell.first_sector + 1) * DVD_SECTOR_SIZE;
+            if raw_cell.last_sector < raw_cell.first_sector {
+                continue;
+            }
+            let Some(cell_vob_start) = raw_cell.first_sector.checked_mul(DVD_SECTOR_SIZE) else {
+                continue;
+            };
+            let Some(sector_count) = raw_cell
+                .last_sector
+                .checked_sub(raw_cell.first_sector)
+                .and_then(|d| d.checked_add(1))
+            else {
+                continue;
+            };
+            let cell_vob_len = sector_count.saturating_mul(DVD_SECTOR_SIZE);
             if cell_vob_start < total_vob_space {
                 let clamped_len = cell_vob_len.min(total_vob_space - cell_vob_start);
                 let cell_logical_start = logical_cursor;
@@ -903,10 +915,11 @@ pub fn resolve_iso_or_vob_media(path: &Path) -> Result<Option<ResolvedIsoMedia>>
                     .push((part_num, entry));
             }
         }
-        if let Some((_, mut parts)) = ats_aob_groups
-            .into_iter()
-            .max_by_key(|(_, parts)| parts.iter().map(|(_, e)| e.total_len).sum::<u64>())
-        {
+        if let Some((_, mut parts)) = ats_aob_groups.into_iter().max_by_key(|(_, parts)| {
+            parts
+                .iter()
+                .fold(0u64, |acc, (_, e)| acc.saturating_add(e.total_len))
+        }) {
             parts.sort_by_key(|(part_num, _)| *part_num);
             let mut raw_extents = Vec::new();
             for (_, entry) in parts {
@@ -1097,9 +1110,19 @@ impl Read for IsoVirtualStream {
             return Ok(0);
         };
         let ext = self.extents[ext_idx].clone();
-        let offset_in_ext = self.pos - ext.logical_start;
-        let target_phys = ext.physical_offset + offset_in_ext;
-        let max_read = (ext.byte_len - offset_in_ext).min(buf.len() as u64) as usize;
+        let Some(offset_in_ext) = self.pos.checked_sub(ext.logical_start) else {
+            return Ok(0);
+        };
+        let Some(target_phys) = ext.physical_offset.checked_add(offset_in_ext) else {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "ISO extent physical offset overflow",
+            ));
+        };
+        let max_read = ext
+            .byte_len
+            .saturating_sub(offset_in_ext)
+            .min(buf.len() as u64) as usize;
 
         let need_reopen = self
             .active_file
@@ -1111,7 +1134,11 @@ impl Read for IsoVirtualStream {
             self.active_file = Some((ext.file_path.clone(), f, target_phys));
         }
 
-        let (_, file, cur_phys) = self.active_file.as_mut().unwrap();
+        let Some((_, file, cur_phys)) = self.active_file.as_mut() else {
+            return Err(std::io::Error::other(
+                "ISO virtual stream active file missing after open",
+            ));
+        };
         if *cur_phys != target_phys {
             file.seek(SeekFrom::Start(target_phys))?;
             *cur_phys = target_phys;

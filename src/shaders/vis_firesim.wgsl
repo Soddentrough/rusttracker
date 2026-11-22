@@ -124,7 +124,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             spatial_idx = spatial_idx + 1u;
         }
     }
-    let raw_ch = audio.display_order[hover_display_idx / 4u][hover_display_idx % 4u];
+    let safe_hover_disp = min(hover_display_idx, 15u);
+    let raw_ch = select(
+        hover_display_idx,
+        audio.display_order[safe_hover_disp / 4u][safe_hover_disp % 4u],
+        hover_display_idx < 16u
+    );
 
     if (base_heat > 0.003) {
         let col_id = floor(uv.x * 24.0);

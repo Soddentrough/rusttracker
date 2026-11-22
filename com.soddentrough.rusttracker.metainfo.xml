@@ -69,6 +69,11 @@
   <content_rating type="oars-1.1" />
   
   <releases>
+    <release version="0.10.0" date="2026-11-22">
+      <description>
+        <p>Upgraded core stack (wgpu 30, egui 0.37, cpal 0.18, symphonia 0.6, ffmpeg-next 9.1, rubato, rtrb), modularized crates and subsystems, replaced SoundFont with GPLv2 TimGM6mb.sf2, fixed FLIP fluid solvers, HDR10/HLG video math, Linux bitstream passthrough rates, CLI visualizer ID resolution, Steam VDF shortcut handling, and idle power consumption.</p>
+      </description>
+    </release>
     <release version="0.9.39" date="2026-11-07">
       <description>
         <p>Overhauled the Terminal UI (--tui) with multi-column dBFS channel VU meters, real-time Tracker Pattern viewer, Synced Lyrics, Spectrogram Heatmap, and interactive Surround Upmix &amp; 5-Band EQ views, full mouse and keyboard controls, and local audio input device selection (including Android RECORD_AUDIO support).</p>

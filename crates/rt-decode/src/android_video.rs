@@ -415,8 +415,10 @@ pub mod decoder {
     }
 
     const AMEDIAEXTRACTOR_SEEK_PREVIOUS_SYNC: i32 = 0;
+    const AMEDIAEXTRACTOR_SAMPLE_FLAG_SYNC: u32 = 1;
     const AMEDIACODEC_INFO_OUTPUT_FORMAT_CHANGED: isize = -2;
     const AMEDIACODEC_INFO_TRY_AGAIN_LATER: isize = -1;
+    const AMEDIACODEC_BUFFER_FLAG_KEY_FRAME: u32 = 1;
     const AMEDIACODEC_BUFFER_FLAG_END_OF_STREAM: u32 = 4;
 
     #[link(name = "mediandk")]
@@ -822,15 +824,20 @@ pub mod decoder {
                                     if sample_size > 0 {
                                         let sample_pts =
                                             AMediaExtractor_getSampleTime(extractor).max(0) as u64;
-                                        let sample_flags =
-                                            AMediaExtractor_getSampleFlags(extractor);
+                                        let raw_flags = AMediaExtractor_getSampleFlags(extractor);
+                                        let codec_flags =
+                                            if (raw_flags & AMEDIAEXTRACTOR_SAMPLE_FLAG_SYNC) != 0 {
+                                                AMEDIACODEC_BUFFER_FLAG_KEY_FRAME
+                                            } else {
+                                                0
+                                            };
                                         AMediaCodec_queueInputBuffer(
                                             codec,
                                             in_idx as usize,
                                             0,
                                             sample_size as usize,
                                             sample_pts,
-                                            sample_flags,
+                                            codec_flags,
                                         );
                                         AMediaExtractor_advance(extractor);
                                     } else {

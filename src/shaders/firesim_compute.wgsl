@@ -24,9 +24,12 @@ struct FireParams {
 @group(0) @binding(4) var<storage, read> multi_spectrum: array<vec2<f32>>;
 
 fn hash22(p: vec2<f32>) -> vec2<f32> {
-    let q = vec2<f32>(dot(p, vec2<f32>(127.1, 311.7)),
-                      dot(p, vec2<f32>(269.5, 183.3)));
-    return fract(sin(q) * 43758.5453) * 2.0 - 1.0;
+    let ip = vec2<i32>(floor(p));
+    let hx = pcg_hash_common(bitcast<u32>(ip.x) * 1597334677u ^ bitcast<u32>(ip.y) * 3812015801u);
+    let hy = pcg_hash_common(hx ^ 0x9E3779B9u);
+    let fx = f32(hx & 0x00FFFFFFu) / f32(0x01000000);
+    let fy = f32(hy & 0x00FFFFFFu) / f32(0x01000000);
+    return vec2<f32>(fx, fy) * 2.0 - 1.0;
 }
 
 fn perlin_noise(p: vec2<f32>) -> f32 {
@@ -98,8 +101,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
         if n_spatial_ch <= 2u { sigma_scale = 0.25; }
 
         var spatial_idx = 0u;
-        for (var i = 0u; i < n_ch; i = i + 1u) {
-            let raw_ch = params.display_order[i / 4u][i % 4u];
+        let capped_ch = min(n_ch, 32u);
+        for (var i = 0u; i < capped_ch; i = i + 1u) {
+            let raw_ch = select(i, params.display_order[min(i, 15u) / 4u][min(i, 15u) % 4u], i < 16u);
             if raw_ch == lfe_idx { continue; }
             let center_x = (f32(spatial_idx) + 0.5) * channel_width;
             let dist = f32(x) - center_x;
@@ -156,7 +160,9 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
 
     // === Hearth rows: Heat rising from the coals ===
     if (y >= bottom - 2u) {
-        let coal_heat = min(coal_bed[x], 1.0) * intensity_gate;
+        // Read previous frame's settled bottom coal row from immutable `input_grid` to eliminate
+        // cross-workgroup read/write races with row `y == bottom` updating `coal_bed[x]`.
+        let coal_heat = clamp(input_grid[bottom * w + x], 0.0, 1.0) * intensity_gate;
         var out_val = coal_heat;
 
         if intensity_gate > 0.1 {
@@ -210,7 +216,7 @@ fn main(@builtin(global_invocation_id) id: vec3<u32>) {
     let jitter = (f32(pcg_hash_common(jitter_seed) % 100u) / 100.0) - 0.5;
 
     let dt = dt_scale;
-    let src_p = p1 - vel * dt + vec2<f32>(0.0, jitter * 2.0);
+    let src_p = p1 - vel * dt + vec2<f32>(0.0, jitter * 2.0 * dt_scale);
 
     var new_val = sample_grid(src_p.x, src_p.y);
 

@@ -20,52 +20,71 @@ pub struct TuiLayout {
     pub split_row_y: u16,
 }
 
-fn val_to_color(val: f32) -> Color {
-    let v = val.clamp(0.0, 100.0);
-    if v < 5.0 {
-        Color::Rgb(20, 20, 25) // Dark smokey grey
-    } else if v < 20.0 {
-        Color::Rgb(80, 20, 20) // Deep dark red
-    } else if v < 40.0 {
-        Color::Rgb(180, 30, 20) // Red
-    } else if v < 60.0 {
-        Color::Rgb(255, 100, 20) // Orange
-    } else if v < 85.0 {
-        Color::Rgb(255, 200, 50) // Yellow
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+
+fn supports_truecolor_env(colorterm: Option<&str>) -> bool {
+    colorterm.is_some_and(|v| {
+        let lower = v.to_ascii_lowercase();
+        lower.contains("truecolor") || lower.contains("24bit")
+    })
+}
+
+fn supports_truecolor() -> bool {
+    static TRUECOLOR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *TRUECOLOR.get_or_init(|| supports_truecolor_env(std::env::var("COLORTERM").ok().as_deref()))
+}
+
+fn rgb_to_xterm256(r: u8, g: u8, b: u8) -> u8 {
+    if r == g && g == b {
+        if r < 8 {
+            return 16;
+        }
+        if r > 248 {
+            return 231;
+        }
+        return 232 + (((r as u16 - 8) * 24) / 247).min(23) as u8;
+    }
+    let r6 = ((r as u16 * 5) / 255) as u8;
+    let g6 = ((g as u16 * 5) / 255) as u8;
+    let b6 = ((b as u16 * 5) / 255) as u8;
+    16 + 36 * r6 + 6 * g6 + b6
+}
+
+#[inline]
+fn adapt_color(r: u8, g: u8, b: u8) -> Color {
+    if supports_truecolor() {
+        Color::Rgb(r, g, b)
     } else {
-        Color::Rgb(255, 255, 255) // White Hot
+        Color::Indexed(rgb_to_xterm256(r, g, b))
     }
 }
 
-/// Approximate terminal column width of a Unicode scalar (2 for wide CJK/emoji, 1 otherwise).
-fn char_display_width(c: char) -> usize {
-    let u = c as u32;
-    if (0x1100..=0x115F).contains(&u)
-        || (0x2E80..=0x303E).contains(&u)
-        || (0x3040..=0xA4CF).contains(&u)
-        || (0xAC00..=0xD7A3).contains(&u)
-        || (0xF900..=0xFAFF).contains(&u)
-        || (0xFE10..=0xFE6F).contains(&u)
-        || (0xFF00..=0xFF60).contains(&u)
-        || (0xFFE0..=0xFFE6).contains(&u)
-        || (0x1F300..=0x1FAFF).contains(&u)
-        || (0x20000..=0x3FFFD).contains(&u)
-    {
-        2
+fn val_to_color(val: f32) -> Color {
+    let v = val.clamp(0.0, 100.0);
+    if v < 5.0 {
+        adapt_color(20, 20, 25) // Dark smokey grey
+    } else if v < 20.0 {
+        adapt_color(80, 20, 20) // Deep dark red
+    } else if v < 40.0 {
+        adapt_color(180, 30, 20) // Red
+    } else if v < 60.0 {
+        adapt_color(255, 100, 20) // Orange
+    } else if v < 85.0 {
+        adapt_color(255, 200, 50) // Yellow
     } else {
-        1
+        adapt_color(255, 255, 255) // White Hot
     }
 }
 
 fn str_display_width(s: &str) -> usize {
-    s.chars().map(char_display_width).sum()
+    UnicodeWidthStr::width(s)
 }
 
 fn truncate_to_display_width(s: &str, max_cols: usize) -> String {
     let mut out = String::new();
     let mut used = 0;
     for c in s.chars() {
-        let w = char_display_width(c);
+        let w = c.width().unwrap_or(0);
         if used + w > max_cols {
             break;
         }
@@ -105,14 +124,14 @@ fn scroll_text_by_time(text: &str, max_cols: usize, time_secs: f32) -> String {
     let mut skipped_cols = 0;
     let mut start_idx = 0;
     while start_idx < max_scroll && skipped_cols < target_skip_cols {
-        skipped_cols += char_display_width(chars[start_idx]);
+        skipped_cols += chars[start_idx].width().unwrap_or(0);
         start_idx += 1;
     }
 
     let mut out = String::new();
     let mut used_cols = 0;
     for &c in &chars[start_idx..] {
-        let w = char_display_width(c);
+        let w = c.width().unwrap_or(0);
         if used_cols + w > max_cols {
             break;
         }
@@ -656,7 +675,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
                 let (txt, style) = if c.peak <= 0.01 {
                     (
                         " -∞ ".to_string(),
-                        Style::default().fg(Color::Rgb(75, 75, 82)),
+                        Style::default().fg(adapt_color(75, 75, 82)),
                     )
                 } else {
                     let db = (c.peak.clamp(0.0, 1.0) * 60.0 - 60.0).min(0.0);
@@ -670,7 +689,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
                     } else if db >= -6.0 {
                         Color::Yellow
                     } else {
-                        Color::Rgb(165, 165, 175)
+                        adapt_color(165, 165, 175)
                     };
                     (formatted, Style::default().fg(fg))
                 };
@@ -707,7 +726,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
                 };
                 spans.push(Span::styled(
                     scale_label,
-                    Style::default().fg(Color::Rgb(90, 90, 100)),
+                    Style::default().fg(adapt_color(90, 90, 100)),
                 ));
             }
 
@@ -743,7 +762,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
                 } else if c.slot_w >= 3 {
                     (
                         "░".repeat(c.bar_w),
-                        Style::default().fg(Color::Rgb(28, 28, 34)),
+                        Style::default().fg(adapt_color(28, 28, 34)),
                     )
                 } else {
                     (" ".repeat(c.bar_w), Style::default())
@@ -887,11 +906,11 @@ pub fn draw(f: &mut Frame, state: &AppState) {
                             } else {
                                 let distance = offset.abs();
                                 let fg_color = if distance == 1 {
-                                    Color::Rgb(200, 200, 200)
+                                    adapt_color(200, 200, 200)
                                 } else if distance == 2 {
-                                    Color::Rgb(140, 140, 140)
+                                    adapt_color(140, 140, 140)
                                 } else {
-                                    Color::Rgb(80, 80, 80)
+                                    adapt_color(80, 80, 80)
                                 };
                                 let formatted = format!("{}{}", " ".repeat(padding + 2), truncated);
                                 lyric_lines.push(Line::from(vec![Span::styled(
@@ -975,7 +994,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
                                     format!("{}{}", formatted, " ".repeat(pad)),
                                     Style::default()
                                         .fg(Color::Yellow)
-                                        .bg(Color::Rgb(30, 42, 62))
+                                        .bg(adapt_color(30, 42, 62))
                                         .add_modifier(Modifier::BOLD),
                                 )]));
                             } else {
@@ -983,11 +1002,11 @@ pub fn draw(f: &mut Frame, state: &AppState) {
                                 let fg_col = if resolved_row == 0 {
                                     Color::Cyan
                                 } else if dist == 1 {
-                                    Color::Rgb(205, 210, 220)
+                                    adapt_color(205, 210, 220)
                                 } else if dist <= 3 {
-                                    Color::Rgb(145, 150, 160)
+                                    adapt_color(145, 150, 160)
                                 } else {
-                                    Color::Rgb(85, 90, 100)
+                                    adapt_color(85, 90, 100)
                                 };
                                 let sep = if resolved_row == 0 { "┼" } else { "│" };
                                 pattern_lines.push(Line::from(vec![Span::styled(
@@ -1127,7 +1146,7 @@ pub fn draw(f: &mut Frame, state: &AppState) {
                     eq_lines.push(Line::raw(""));
                 }
                 if eq_lines.len() < center_height {
-                    let hint = "[u] Upmix  [m] 7.1.4 MPEG-H  [r] Reset  [v/Tab] View";
+                    let hint = "[u] Upmix  [g] 7.1.4 MPEG-H  [r] Reset  [v/Tab] View";
                     eq_lines.push(Line::from(vec![Span::styled(
                         truncate_to_display_width(hint, center_width),
                         Style::default().fg(Color::DarkGray),
@@ -1386,14 +1405,14 @@ pub fn draw(f: &mut Frame, state: &AppState) {
         )
     };
     let gauge = Gauge::default()
-        .gauge_style(Style::default().fg(Color::Cyan).bg(Color::Rgb(30, 30, 30)))
+        .gauge_style(Style::default().fg(Color::Cyan).bg(adapt_color(30, 30, 30)))
         .percent((progress * 100.0).round() as u16)
         .label(gauge_label);
 
     f.render_widget(gauge, layout.timeline_rect);
 
     // 6. Instructions & Active OSD Notification
-    let hints = "q/Esc: Quit │ Space: Pause │ ←/→: Seek │ n/p: Track │ v/Tab: View │ u: Upmix │ d: Device │ [/]: Split";
+    let hints = "q/Esc: Quit │ Space: Pause │ m: Mute │ g: MPEG-H │ ←/→: Seek │ n/p: Track │ v/Tab: View │ u: Upmix │ d: Device │ [/]: Split";
     let footer_line = if state.osd_timer > 0.0
         && let Some(osd) = &state.osd_text
     {
@@ -1572,7 +1591,9 @@ mod tests {
             for x in (layout.center_rect.x + layout.center_rect.width / 2)
                 ..(layout.center_rect.right() - 1)
             {
-                if buf[(x, y)].fg == Color::Rgb(255, 255, 255) {
+                if buf[(x, y)].fg == Color::Rgb(255, 255, 255)
+                    || buf[(x, y)].fg == Color::Indexed(231)
+                {
                     found_white_hot = true;
                     break;
                 }
@@ -1635,5 +1656,21 @@ mod tests {
         assert!(surround_screen.contains("LFE"));
         assert!(surround_screen.contains("Ls"));
         assert!(surround_screen.contains("Rs"));
+    }
+
+    #[test]
+    fn test_unicode_width_and_256_color_fallback() {
+        assert_eq!(str_display_width("hello"), 5);
+        assert_eq!(str_display_width("音楽"), 4);
+        assert_eq!(truncate_to_display_width("A音楽B", 4), "A音");
+
+        assert!(supports_truecolor_env(Some("truecolor")));
+        assert!(supports_truecolor_env(Some("24bit")));
+        assert!(!supports_truecolor_env(None));
+        assert!(!supports_truecolor_env(Some("")));
+
+        assert_eq!(rgb_to_xterm256(255, 255, 255), 231);
+        assert_eq!(rgb_to_xterm256(0, 0, 0), 16);
+        assert!(rgb_to_xterm256(255, 100, 20) >= 16);
     }
 }

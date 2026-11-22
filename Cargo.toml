@@ -1,6 +1,6 @@
 [package]
 name = "rusttracker"
-version = "0.9.39"
+version = "0.10.0"
 edition = "2024"
 authors = ["Soddentrough"]
 default-run = "rusttracker"
@@ -65,6 +65,7 @@ members = [
     "crates/rt-audio",
     "crates/rt-render",
     "crates/rt-tui",
+    "crates/rt-tools",
 ]
 resolver = "3"
 
@@ -77,25 +78,25 @@ anyhow = "1.0.102"
 clap = { version = "4.6.1", features = ["derive"] }
 crossbeam-channel = "0.5.15"
 directories = "6.0.0"
-egui = "0.34.2"
-egui-file-dialog = "0.13.0"
-egui-winit = "0.34.2"
+egui = "0.37.0"
+egui-file-dialog = "0.16.0"
+egui-winit = "0.37.0"
 env_logger = "0.11.10"
-gilrs = "0.11.0"
-image = "0.25.10"
-naga = { version = "29.0.3", features = ["wgsl-in"] }
+gilrs = "0.11.2"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 pollster = "0.4.0"
-ttf-parser = "0.25"
-wgpu = "29.0.3"
+wgpu = "30.0.2"
 winit = "0.30.13"
 
 [target.'cfg(not(target_os = "android"))'.dependencies]
 rt-tui = { path = "crates/rt-tui" }
 crossterm = "0.29.0"
-ratatui = "0.30.0"
+ratatui = "0.30.2"
 rfd = "0.17.2"
 keepawake = "0.6.0"
-ffmpeg-next = { version = "9.0.0", default-features = false, features = ["codec", "format", "software-resampling", "software-scaling"] }
+
+[target.'cfg(not(target_os = "android"))'.dev-dependencies]
+ffmpeg-next = { version = "9.1.0", default-features = false, features = ["codec", "format", "software-resampling", "software-scaling"] }
 
 [target.'cfg(target_os = "android")'.dependencies]
 android-activity = { version = "0.6", features = ["game-activity"] }
@@ -111,6 +112,10 @@ winres = "0.1.12"
 
 [target."cfg(windows)".dependencies]
 windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Pipes",
     "Win32_UI_Shell",
 ] }
 

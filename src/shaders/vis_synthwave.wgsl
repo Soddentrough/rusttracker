@@ -24,7 +24,11 @@ struct VertexOutput3D {
     @location(4) local_z: f32,
 }
 
-fn hash1(n: f32) -> f32 { return fract(sin(n) * 43758.5453); }
+fn hash1(n: f32) -> f32 {
+    var u = bitcast<u32>(n + 0.0) * 1597334677u;
+    u = (u ^ (u >> 16u)) * 2654435769u;
+    return f32((u ^ (u >> 16u)) & 0x00FFFFFFu) / f32(0x01000000);
+}
 
 // Integer-based hash: no sin(), no precision loss at large coordinates.
 // Operates on the integer lattice so f32 magnitude doesn't matter.
@@ -175,7 +179,8 @@ fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
 fn grid_line(pos: vec2<f32>, line_width: f32) -> f32 {
     let deriv = fwidth(pos);
     let f = abs(fract(pos - 0.5) - 0.5);
-    let grid = smoothstep(deriv * line_width, vec2<f32>(0.0), f);
+    let edge = max(deriv * line_width, vec2<f32>(1e-6));
+    let grid = vec2<f32>(1.0) - smoothstep(vec2<f32>(0.0), edge, f);
     return max(grid.x, grid.y);
 }
 
@@ -377,7 +382,7 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
             if cut > cut_threshold || p.y > sun_pos.y + 0.05 {
                 let sun_t = clamp((p.y - sun_pos.y + 0.2) * 2.0, 0.0, 1.0);
                 let sun_col = mix(vec3<f32>(1.0, 0.05, 0.42), vec3<f32>(1.0, 0.86, 0.12), sun_t) * (1.1 + bass_pulse * 0.35);
-                sky_color = mix(sky_color, sun_col, smoothstep(sun_radius, sun_radius - 0.02, sun_dist));
+                sky_color = mix(sky_color, sun_col, smoothstep_r(sun_radius, sun_radius - 0.02, sun_dist));
             }
         }
         

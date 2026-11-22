@@ -1,0 +1,4442 @@
+use rusttracker::{engine, state};
+use wgpu::*;
+
+fn resolve_shader_includes(source: &str) -> String {
+    const SHADER_COMMON: &str = include_str!("../src/shaders/_common.wgsl");
+    const SHADER_GLYPH_FONT: &str = include_str!("../src/shaders/_glyph_font.wgsl");
+    source
+        .replace("// INCLUDE: common", SHADER_COMMON)
+        .replace("// INCLUDE: glyph_font", SHADER_GLYPH_FONT)
+}
+
+fn print_usage(program: &str) {
+    eprintln!("Usage: {program} [all|fire|ferrofluid|glass_water|flip_lyrics|3d_osc|canyon|storm]");
+}
+
+fn main() {
+    let mut args = std::env::args();
+    let program = args
+        .next()
+        .unwrap_or_else(|| "render_snapshots".to_string());
+    let target = args.next().unwrap_or_else(|| "all".to_string());
+    if args.next().is_some() {
+        print_usage(&program);
+        std::process::exit(2);
+    }
+
+    match target.as_str() {
+        "all" => {
+            test_render_retro_fire_snapshot();
+            test_render_flip_ferrofluid_snapshot();
+            test_render_glass_water_snapshot();
+            test_render_flip_lyrics_animation();
+            test_render_3d_freq_oscilloscope_snapshot();
+            test_vis_spectrum_canyon_snapshot();
+            test_vis_midnight_storm_snapshot();
+        }
+        "fire" => test_render_retro_fire_snapshot(),
+        "ferrofluid" => test_render_flip_ferrofluid_snapshot(),
+        "glass_water" => test_render_glass_water_snapshot(),
+        "flip_lyrics" => test_render_flip_lyrics_animation(),
+        "3d_osc" => test_render_3d_freq_oscilloscope_snapshot(),
+        "canyon" => test_vis_spectrum_canyon_snapshot(),
+        "storm" => test_vis_midnight_storm_snapshot(),
+        "-h" | "--help" => {
+            print_usage(&program);
+        }
+        unknown => {
+            eprintln!("Unknown snapshot target: {unknown}");
+            print_usage(&program);
+            std::process::exit(2);
+        }
+    }
+}
+
+fn test_render_retro_fire_snapshot() {
+    const W: usize = 320;
+    const H: usize = 180;
+    let mut cells = [0u8; W * H];
+    let mut rng = 0x98765432u32;
+
+    let mut state = state::AppState::new("Test App".to_string());
+    state.file_loaded = true;
+    state.is_paused = false;
+    state.track_ended = false;
+    state.tracker_channels = Some(4);
+    state.spectrum_data = vec![0.0; 1024];
+
+    // Tracker module playing:
+    // Track 1 (kick): 1.0, Track 2 (snare): 0.8, Track 3 (silent rest): 0.05, Track 4 (lead): 0.95
+    state.channel_vus = vec![0.5, 1.0, 0.8, 0.05, 0.95, 0.5];
+    for i in 1..16 {
+        state.spectrum_data[i] = 85.0;
+    }
+    for i in 250..350 {
+        state.spectrum_data[i] = 60.0;
+    }
+
+    for _ in 0..90 {
+        engine::VulkanEngine::update_retro_fire_grid(&mut cells, &mut rng, 1.0, &state);
+    }
+
+    const DOOM_PAL: [(u8, u8, u8); 37] = [
+        (0x07, 0x07, 0x07),
+        (0x1f, 0x07, 0x07),
+        (0x2f, 0x0f, 0x07),
+        (0x47, 0x0f, 0x07),
+        (0x57, 0x17, 0x07),
+        (0x67, 0x1f, 0x07),
+        (0x77, 0x1f, 0x07),
+        (0x8f, 0x27, 0x07),
+        (0x9f, 0x2f, 0x07),
+        (0xaf, 0x3f, 0x07),
+        (0xbf, 0x47, 0x07),
+        (0xc7, 0x47, 0x07),
+        (0xdf, 0x4f, 0x07),
+        (0xdf, 0x57, 0x07),
+        (0xdf, 0x57, 0x07),
+        (0xd7, 0x5f, 0x07),
+        (0xd7, 0x5f, 0x07),
+        (0xd7, 0x67, 0x0f),
+        (0xcf, 0x6f, 0x0f),
+        (0xcf, 0x77, 0x0f),
+        (0xcf, 0x7f, 0x0f),
+        (0xcf, 0x87, 0x17),
+        (0xc7, 0x87, 0x17),
+        (0xc7, 0x8f, 0x17),
+        (0xc7, 0x97, 0x1f),
+        (0xbf, 0x9f, 0x1f),
+        (0xbf, 0x9f, 0x1f),
+        (0xbf, 0xa7, 0x27),
+        (0xbf, 0xa7, 0x27),
+        (0xbf, 0xaf, 0x2f),
+        (0xb7, 0xaf, 0x2f),
+        (0xb7, 0xb7, 0x2f),
+        (0xb7, 0xb7, 0x37),
+        (0xcf, 0xcf, 0x6f),
+        (0xdf, 0xdf, 0x9f),
+        (0xef, 0xef, 0xc7),
+        (0xff, 0xff, 0xff),
+    ];
+
+    let scale = 3;
+    let mut img = image::ImageBuffer::new((W * scale) as u32, (H * scale) as u32);
+    for y in 0..H {
+        for x in 0..W {
+            let heat = cells[y * W + x].min(36) as usize;
+            let (r, g, b) = DOOM_PAL[heat];
+            for sy in 0..scale {
+                for sx in 0..scale {
+                    let px = (x * scale + sx) as u32;
+                    let py = (y * scale + sy) as u32;
+                    img.put_pixel(px, py, image::Rgb([r, g, b]));
+                }
+            }
+        }
+    }
+    let out_path = std::env::temp_dir().join("actual_retro_fire_reactive.png");
+    let _ = img.save(out_path);
+}
+
+fn test_render_flip_ferrofluid_snapshot() {
+    pollster::block_on(run_flip_snapshot());
+}
+
+async fn run_flip_snapshot() {
+    let instance = Instance::new(InstanceDescriptor {
+        backends: Backends::PRIMARY,
+        flags: InstanceFlags::default(),
+        backend_options: BackendOptions::default(),
+        display: None,
+        memory_budget_thresholds: MemoryBudgetThresholds::default(),
+    });
+
+    let adapter = instance
+        .request_adapter(&RequestAdapterOptions {
+            power_preference: PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        })
+        .await
+        .unwrap();
+
+    let (device, queue) = adapter
+        .request_device(&DeviceDescriptor {
+            label: Some("FLIP Snapshot Device"),
+            required_features: Features::empty(),
+            required_limits: Limits::default(),
+            memory_hints: MemoryHints::default(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let width = 960u32;
+    let height = 540u32;
+    let color_format = TextureFormat::Rgba8UnormSrgb;
+
+    let render_target = device.create_texture(&TextureDescriptor {
+        label: Some("FLIP RenderTarget"),
+        size: Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: color_format,
+        usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let color_view = render_target.create_view(&TextureViewDescriptor::default());
+
+    let depth_texture = device.create_texture(&TextureDescriptor {
+        label: Some("FLIP Depth"),
+        size: Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Depth32Float,
+        usage: TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let depth_view = depth_texture.create_view(&TextureViewDescriptor::default());
+
+    let mut uniforms = crate::engine::AudioUniforms {
+        spectrum: [0.1; 1024],
+        fire_heat: [0.0; 1024],
+        channels: [0.8; 32],
+        channel_peaks: [0.8; 32],
+        spatial_channels: [0.0; 16],
+        display_order: [0; 16],
+        channel_phases: [0.0; 32],
+        vu_segment_glows: [0; 256],
+        num_channels: 16,
+        mode: 27,
+        time: 5.0,
+        duration: 200.0,
+        smooth_time: 5.12,
+        heatmap_row: 0,
+        fft_channels: 2,
+        num_spatial_channels: 2,
+        ui_meters_rect: [0.0; 4],
+        ui_heatmap_rect: [0.0; 4],
+        ui_fire_rect: [0.0; 4],
+        waveform_resolution: 1024,
+        waveform_history_size: 60,
+        frame_count: 300,
+        step_fraction: 0.1,
+        steps_to_fill: 1,
+        aspect_ratio: (width as f32) / (height as f32),
+        frame_dt: 0.016,
+        history_cam_z: 0.0,
+        fire_intensity: 1.0,
+        waveform_history_ring_base: 0,
+        _pad2: 0.0,
+        _pad3: 0.0,
+    };
+    uniforms.spectrum[0] = 1.4;
+    uniforms.spectrum[1] = 1.2;
+    for i in 0..16 {
+        let bin = i * 8 + 4;
+        let factor = 0.6 + 0.55 * ((i as f32) * 1.3).sin().abs();
+        uniforms.spectrum[bin] = factor;
+    }
+    uniforms.channels[0] = 1.3; // sub-bass boost
+
+    let uniform_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("FLIP Uniforms"),
+        size: std::mem::size_of::<crate::engine::AudioUniforms>() as u64,
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+
+    let dummy_waveform = device.create_buffer(&BufferDescriptor {
+        label: Some("Dummy Waveform"),
+        size: 1024,
+        usage: BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let dummy_tex = device.create_texture(&TextureDescriptor {
+        label: Some("Dummy Tex"),
+        size: Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::R32Float,
+        usage: TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let dummy_view = dummy_tex.create_view(&TextureViewDescriptor::default());
+    let dummy_storage = device.create_buffer(&BufferDescriptor {
+        label: Some("Dummy Storage"),
+        size: 1024,
+        usage: BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+
+    let bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        entries: &[
+            BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 1,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 2,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: false },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 3,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: false },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 4,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+        label: Some("audio_bind_group_layout"),
+    });
+
+    let uniform_bind_group = device.create_bind_group(&BindGroupDescriptor {
+        layout: &bind_group_layout,
+        entries: &[
+            BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 1,
+                resource: dummy_waveform.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 2,
+                resource: BindingResource::TextureView(&dummy_view),
+            },
+            BindGroupEntry {
+                binding: 3,
+                resource: BindingResource::TextureView(&dummy_view),
+            },
+            BindGroupEntry {
+                binding: 4,
+                resource: dummy_storage.as_entire_binding(),
+            },
+        ],
+        label: Some("audio_bind_group"),
+    });
+
+    let flip_particles = device.create_buffer(&BufferDescriptor {
+        label: Some("FLIP Particles"),
+        size: 65536 * 32,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&flip_particles, 0, &vec![0u8; 65536 * 32]);
+
+    let flip_grid_accum = device.create_buffer(&BufferDescriptor {
+        label: Some("FLIP Grid Accum"),
+        size: 131072 * 16,
+        usage: BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let flip_grid_vel_new = device.create_buffer(&BufferDescriptor {
+        label: Some("FLIP Grid Vel New"),
+        size: 131072 * 16,
+        usage: BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let flip_grid_vel_old = device.create_buffer(&BufferDescriptor {
+        label: Some("FLIP Grid Vel Old"),
+        size: 131072 * 16,
+        usage: BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let flip_pressure_0 = device.create_buffer(&BufferDescriptor {
+        label: Some("FLIP Pressure 0"),
+        size: 131072 * 4,
+        usage: BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let flip_pressure_1 = device.create_buffer(&BufferDescriptor {
+        label: Some("FLIP Pressure 1"),
+        size: 131072 * 4,
+        usage: BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let flip_render_grid = device.create_buffer(&BufferDescriptor {
+        label: Some("FLIP Render Grid"),
+        size: 512 * 512 * 4,
+        usage: BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+
+    let flip_compute_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("flip_compute_layout"),
+        entries: &[
+            BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 1,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 2,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 3,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 4,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 5,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 6,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 7,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+
+    let flip_compute_bg = device.create_bind_group(&BindGroupDescriptor {
+        label: Some("flip_compute_bg"),
+        layout: &flip_compute_layout,
+        entries: &[
+            BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 1,
+                resource: flip_particles.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 2,
+                resource: flip_grid_accum.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 3,
+                resource: flip_grid_vel_new.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 4,
+                resource: flip_grid_vel_old.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 5,
+                resource: flip_pressure_0.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 6,
+                resource: flip_pressure_1.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 7,
+                resource: flip_render_grid.as_entire_binding(),
+            },
+        ],
+    });
+
+    let flip_compute_source =
+        resolve_shader_includes(include_str!("../src/shaders/flip_ferrofluid_compute.wgsl"));
+    let flip_compute_shader = device.create_shader_module(ShaderModuleDescriptor {
+        label: Some("FLIP Compute Module"),
+        source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&flip_compute_source)),
+    });
+    let flip_compute_layout_desc = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+        label: Some("flip_pipeline_layout"),
+        bind_group_layouts: &[Some(&flip_compute_layout)],
+        immediate_size: 0,
+    });
+
+    let flip_clear_pipe = device.create_compute_pipeline(&ComputePipelineDescriptor {
+        label: Some("Clear"),
+        layout: Some(&flip_compute_layout_desc),
+        module: &flip_compute_shader,
+        entry_point: Some("cs_clear"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let flip_clear_render_pipe = device.create_compute_pipeline(&ComputePipelineDescriptor {
+        label: Some("Clear Render"),
+        layout: Some(&flip_compute_layout_desc),
+        module: &flip_compute_shader,
+        entry_point: Some("cs_clear_render"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let flip_p2g_pipe = device.create_compute_pipeline(&ComputePipelineDescriptor {
+        label: Some("P2G"),
+        layout: Some(&flip_compute_layout_desc),
+        module: &flip_compute_shader,
+        entry_point: Some("cs_p2g"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let flip_forces_pipe = device.create_compute_pipeline(&ComputePipelineDescriptor {
+        label: Some("Forces"),
+        layout: Some(&flip_compute_layout_desc),
+        module: &flip_compute_shader,
+        entry_point: Some("cs_grid_forces"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let flip_p01_pipe = device.create_compute_pipeline(&ComputePipelineDescriptor {
+        label: Some("P 0->1"),
+        layout: Some(&flip_compute_layout_desc),
+        module: &flip_compute_shader,
+        entry_point: Some("cs_pressure_0_to_1"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let flip_p10_pipe = device.create_compute_pipeline(&ComputePipelineDescriptor {
+        label: Some("P 1->0"),
+        layout: Some(&flip_compute_layout_desc),
+        module: &flip_compute_shader,
+        entry_point: Some("cs_pressure_1_to_0"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let flip_proj_pipe = device.create_compute_pipeline(&ComputePipelineDescriptor {
+        label: Some("Project"),
+        layout: Some(&flip_compute_layout_desc),
+        module: &flip_compute_shader,
+        entry_point: Some("cs_grid_project"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let flip_g2p_pipe = device.create_compute_pipeline(&ComputePipelineDescriptor {
+        label: Some("G2P"),
+        layout: Some(&flip_compute_layout_desc),
+        module: &flip_compute_shader,
+        entry_point: Some("cs_g2p_advect_splat"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+
+    let flip_render_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("Render BG Layout"),
+        entries: &[BindGroupLayoutEntry {
+            binding: 0,
+            visibility: ShaderStages::FRAGMENT,
+            ty: BindingType::Buffer {
+                ty: BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+    let flip_render_bg = device.create_bind_group(&BindGroupDescriptor {
+        label: Some("Render BG"),
+        layout: &flip_render_layout,
+        entries: &[BindGroupEntry {
+            binding: 0,
+            resource: flip_render_grid.as_entire_binding(),
+        }],
+    });
+    let flip_render_pipe_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+        label: Some("Render Pipe Layout"),
+        bind_group_layouts: &[Some(&bind_group_layout), Some(&flip_render_layout)],
+        immediate_size: 0,
+    });
+
+    let flip_render_source =
+        resolve_shader_includes(include_str!("../src/shaders/vis_flip_ferrofluid.wgsl"));
+    let flip_render_shader = device.create_shader_module(ShaderModuleDescriptor {
+        label: Some("FLIP Render Module"),
+        source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&flip_render_source)),
+    });
+
+    let flip_render_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+        label: Some("FLIP Render Pipeline"),
+        layout: Some(&flip_render_pipe_layout),
+        vertex: VertexState {
+            module: &flip_render_shader,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(FragmentState {
+            module: &flip_render_shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(ColorTargetState {
+                format: color_format,
+                blend: Some(BlendState::REPLACE),
+                write_mask: ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: PrimitiveState::default(),
+        depth_stencil: Some(DepthStencilState {
+            format: TextureFormat::Depth32Float,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(CompareFunction::LessEqual),
+            stencil: StencilState::default(),
+            bias: DepthBiasState::default(),
+        }),
+        multisample: MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    let bytes_per_pixel = 4u32;
+    let unaligned_bytes_per_row = width * bytes_per_pixel;
+    let align = 256u32;
+    let bytes_per_row = (unaligned_bytes_per_row + align - 1) & !(align - 1);
+
+    // Warmup 25 frames then render 36 animation frames
+    let warmup_frames = 25;
+    let anim_frames = 36;
+    let total_frames = warmup_frames + anim_frames;
+
+    std::fs::create_dir_all("target/flip_anim").ok();
+
+    for frame in 0..total_frames {
+        let t = if frame < warmup_frames {
+            (frame as f32) / (warmup_frames as f32)
+        } else {
+            ((frame - warmup_frames) as f32) / (anim_frames as f32)
+        };
+
+        uniforms.time = (frame as f32) * 0.033;
+        uniforms.smooth_time = (frame as f32) * 0.033;
+
+        // Sub-bass beat: two energetic kick drums during the loop
+        let kick1 = (-((t * 2.0 - 0.0).fract() * 6.0)).exp();
+        let kick2 = (-((t * 2.0 - 1.0).fract() * 6.0)).exp();
+        let kick = kick1.max(kick2);
+        uniforms.spectrum[0] = 0.4 + 1.2 * kick;
+        uniforms.channels[0] = 0.3 + 1.1 * kick;
+
+        // Arpeggiated melody sweeping around the 16 magnetic poles
+        for i in 0..16 {
+            let bin = i * 8 + 4;
+            let phase = (i as f32) / 16.0 * std::f32::consts::TAU;
+            let sweep = (t * std::f32::consts::TAU * 2.0 - phase)
+                .cos()
+                .max(0.0)
+                .powi(3);
+            uniforms.spectrum[bin] = 0.25 + 1.15 * sweep;
+        }
+
+        queue.write_buffer(&uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+
+        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("FLIP Sim Encoder"),
+        });
+        {
+            let mut cp = encoder.begin_compute_pass(&ComputePassDescriptor::default());
+            cp.set_pipeline(&flip_clear_pipe);
+            cp.set_bind_group(0, Some(&flip_compute_bg), &[]);
+            cp.dispatch_workgroups(512, 1, 1);
+
+            cp.set_pipeline(&flip_clear_render_pipe);
+            cp.set_bind_group(0, Some(&flip_compute_bg), &[]);
+            cp.dispatch_workgroups(1024, 1, 1);
+
+            cp.set_pipeline(&flip_p2g_pipe);
+            cp.set_bind_group(0, Some(&flip_compute_bg), &[]);
+            cp.dispatch_workgroups(256, 1, 1);
+
+            cp.set_pipeline(&flip_forces_pipe);
+            cp.set_bind_group(0, Some(&flip_compute_bg), &[]);
+            cp.dispatch_workgroups(512, 1, 1);
+
+            for _ in 0..8 {
+                cp.set_pipeline(&flip_p01_pipe);
+                cp.set_bind_group(0, Some(&flip_compute_bg), &[]);
+                cp.dispatch_workgroups(512, 1, 1);
+
+                cp.set_pipeline(&flip_p10_pipe);
+                cp.set_bind_group(0, Some(&flip_compute_bg), &[]);
+                cp.dispatch_workgroups(512, 1, 1);
+            }
+
+            cp.set_pipeline(&flip_proj_pipe);
+            cp.set_bind_group(0, Some(&flip_compute_bg), &[]);
+            cp.dispatch_workgroups(512, 1, 1);
+
+            cp.set_pipeline(&flip_g2p_pipe);
+            cp.set_bind_group(0, Some(&flip_compute_bg), &[]);
+            cp.dispatch_workgroups(256, 1, 1);
+        }
+
+        if frame >= warmup_frames {
+            let anim_idx = frame - warmup_frames;
+            {
+                let mut rp = encoder.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("FLIP Snapshot Pass"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view: &color_view,
+                        resolve_target: None,
+                        ops: Operations {
+                            load: LoadOp::Clear(Color::BLACK),
+                            store: StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                        view: &depth_view,
+                        depth_ops: Some(Operations {
+                            load: LoadOp::Clear(1.0),
+                            store: StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                rp.set_pipeline(&flip_render_pipeline);
+                rp.set_bind_group(0, &uniform_bind_group, &[]);
+                rp.set_bind_group(1, &flip_render_bg, &[]);
+                rp.draw(0..3, 0..1);
+            }
+
+            let output_buffer = device.create_buffer(&BufferDescriptor {
+                label: Some("Readback Buffer"),
+                size: (bytes_per_row * height) as u64,
+                usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+
+            encoder.copy_texture_to_buffer(
+                TexelCopyTextureInfo {
+                    texture: &render_target,
+                    mip_level: 0,
+                    origin: Origin3d::ZERO,
+                    aspect: TextureAspect::All,
+                },
+                TexelCopyBufferInfo {
+                    buffer: &output_buffer,
+                    layout: TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(bytes_per_row),
+                        rows_per_image: Some(height),
+                    },
+                },
+                Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+
+            queue.submit(Some(encoder.finish()));
+
+            let buffer_slice = output_buffer.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            buffer_slice.map_async(MapMode::Read, move |result| {
+                tx.send(result).unwrap();
+            });
+            let _ = device.poll(PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            });
+            rx.recv().unwrap().unwrap();
+
+            let data = buffer_slice.get_mapped_range().unwrap();
+            let mut img = image::ImageBuffer::<image::Rgba<u8>, _>::new(width, height);
+            for y in 0..height {
+                let row_start = (y * bytes_per_row) as usize;
+                for x in 0..width {
+                    let px_start = row_start + (x * bytes_per_pixel) as usize;
+                    let r = data[px_start];
+                    let g = data[px_start + 1];
+                    let b = data[px_start + 2];
+                    let a = data[px_start + 3];
+                    img.put_pixel(x, y, image::Rgba([r, g, b, a]));
+                }
+            }
+            drop(data);
+            output_buffer.unmap();
+
+            let frame_path = format!("target/flip_anim/frame_{:03}.png", anim_idx);
+            img.save(&frame_path).unwrap();
+
+            if anim_idx == 0 || anim_idx == 18 {
+                img.save("test_flip_ferrofluid.png").unwrap();
+            }
+        } else {
+            queue.submit(Some(encoder.finish()));
+        }
+    }
+
+    // Compile animated WebP and GIF using ffmpeg
+    let _ = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-r",
+            "24",
+            "-i",
+            "target/flip_anim/frame_%03d.png",
+            "-vcodec",
+            "libwebp",
+            "-lossless",
+            "0",
+            "-compression_level",
+            "4",
+            "-q:v",
+            "80",
+            "-loop",
+            "0",
+            "test_flip_ferrofluid.webp",
+        ])
+        .output();
+
+    let _ = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-r",
+            "24",
+            "-i",
+            "target/flip_anim/frame_%03d.png",
+            "-vf",
+            "fps=20,scale=640:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse",
+            "test_flip_ferrofluid.gif",
+        ])
+        .output();
+
+    println!(
+        "Saved test_flip_ferrofluid.png, test_flip_ferrofluid.webp, and test_flip_ferrofluid.gif successfully!"
+    );
+}
+
+fn test_render_glass_water_snapshot() {
+    pollster::block_on(run_glass_water_snapshot());
+}
+
+async fn run_glass_water_snapshot() {
+    let instance = Instance::new(InstanceDescriptor {
+        backends: Backends::PRIMARY,
+        flags: InstanceFlags::default(),
+        backend_options: BackendOptions::default(),
+        display: None,
+        memory_budget_thresholds: MemoryBudgetThresholds::default(),
+    });
+
+    let adapter = instance
+        .request_adapter(&RequestAdapterOptions {
+            power_preference: PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        })
+        .await
+        .unwrap();
+
+    let (device, queue) = adapter
+        .request_device(&DeviceDescriptor {
+            label: Some("Glass Water Snapshot Device"),
+            required_features: Features::empty(),
+            required_limits: Limits::default(),
+            memory_hints: MemoryHints::default(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let width = 960u32;
+    let height = 540u32;
+    let color_format = TextureFormat::Rgba8UnormSrgb;
+
+    let render_target = device.create_texture(&TextureDescriptor {
+        label: Some("Water RenderTarget"),
+        size: Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: color_format,
+        usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let color_view = render_target.create_view(&TextureViewDescriptor::default());
+
+    let depth_texture = device.create_texture(&TextureDescriptor {
+        label: Some("Water Depth"),
+        size: Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Depth32Float,
+        usage: TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let depth_view = depth_texture.create_view(&TextureViewDescriptor::default());
+
+    let mut uniforms = crate::engine::AudioUniforms {
+        spectrum: [0.1; 1024],
+        fire_heat: [0.0; 1024],
+        channels: [0.8; 32],
+        channel_peaks: [0.8; 32],
+        spatial_channels: [0.0; 16],
+        display_order: [0; 16],
+        channel_phases: [0.0; 32],
+        vu_segment_glows: [0; 256],
+        num_channels: 16,
+        mode: 28,
+        time: 5.0,
+        duration: 200.0,
+        smooth_time: 5.12,
+        heatmap_row: 0,
+        fft_channels: 2,
+        num_spatial_channels: 2,
+        ui_meters_rect: [0.0; 4],
+        ui_heatmap_rect: [0.0; 4],
+        ui_fire_rect: [0.0; 4],
+        waveform_resolution: 1024,
+        waveform_history_size: 60,
+        frame_count: 300,
+        step_fraction: 0.1,
+        steps_to_fill: 1,
+        aspect_ratio: (width as f32) / (height as f32),
+        frame_dt: 0.016,
+        history_cam_z: 0.0,
+        fire_intensity: 1.0,
+        waveform_history_ring_base: 0,
+        _pad2: 0.0,
+        _pad3: 0.0,
+    };
+    uniforms.spectrum[0] = 1.4;
+    uniforms.spectrum[1] = 1.2;
+    for i in 0..16 {
+        let bin = i * 8 + 4;
+        let factor = 0.6 + 0.55 * ((i as f32) * 1.3).sin().abs();
+        uniforms.spectrum[bin] = factor;
+    }
+    uniforms.channels[0] = 1.3;
+
+    let uniform_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("Water Uniforms"),
+        size: std::mem::size_of::<crate::engine::AudioUniforms>() as u64,
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+
+    let dummy_waveform = device.create_buffer(&BufferDescriptor {
+        label: Some("Dummy Waveform"),
+        size: 1024,
+        usage: BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let dummy_tex = device.create_texture(&TextureDescriptor {
+        label: Some("Dummy Tex"),
+        size: Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::R32Float,
+        usage: TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let dummy_view = dummy_tex.create_view(&TextureViewDescriptor::default());
+    let dummy_storage = device.create_buffer(&BufferDescriptor {
+        label: Some("Dummy Storage"),
+        size: 1024,
+        usage: BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+
+    let bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        entries: &[
+            BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 1,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 2,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: false },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 3,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: false },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 4,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+        label: Some("audio_bind_group_layout"),
+    });
+
+    let uniform_bind_group = device.create_bind_group(&BindGroupDescriptor {
+        layout: &bind_group_layout,
+        entries: &[
+            BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 1,
+                resource: dummy_waveform.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 2,
+                resource: BindingResource::TextureView(&dummy_view),
+            },
+            BindGroupEntry {
+                binding: 3,
+                resource: BindingResource::TextureView(&dummy_view),
+            },
+            BindGroupEntry {
+                binding: 4,
+                resource: dummy_storage.as_entire_binding(),
+            },
+        ],
+        label: Some("audio_bind_group"),
+    });
+
+    let flip_particles = device.create_buffer(&BufferDescriptor {
+        label: Some("Water Particles"),
+        size: 65536 * 32,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&flip_particles, 0, &vec![0u8; 65536 * 32]);
+
+    let flip_grid_accum = device.create_buffer(&BufferDescriptor {
+        label: Some("Water Grid Accum"),
+        size: 131072 * 16,
+        usage: BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let flip_grid_vel_new = device.create_buffer(&BufferDescriptor {
+        label: Some("Water Grid Vel New"),
+        size: 131072 * 16,
+        usage: BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let flip_grid_vel_old = device.create_buffer(&BufferDescriptor {
+        label: Some("Water Grid Vel Old"),
+        size: 131072 * 16,
+        usage: BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let flip_pressure_0 = device.create_buffer(&BufferDescriptor {
+        label: Some("Water Pressure 0"),
+        size: 131072 * 4,
+        usage: BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let flip_pressure_1 = device.create_buffer(&BufferDescriptor {
+        label: Some("Water Pressure 1"),
+        size: 131072 * 4,
+        usage: BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let flip_render_grid = device.create_buffer(&BufferDescriptor {
+        label: Some("Water Render Grid"),
+        size: 512 * 512 * 4,
+        usage: BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+
+    let flip_compute_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("water_compute_layout"),
+        entries: &[
+            BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 1,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 2,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 3,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 4,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 5,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 6,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 7,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 8,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+
+    let water_splash_compact = device.create_buffer(&BufferDescriptor {
+        label: Some("Water Splash Compact"),
+        size: ((8 + 65536) * 4) as u64,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let flip_compute_bg = device.create_bind_group(&BindGroupDescriptor {
+        label: Some("Water Compute BG"),
+        layout: &flip_compute_layout,
+        entries: &[
+            BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 1,
+                resource: flip_particles.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 2,
+                resource: flip_grid_accum.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 3,
+                resource: flip_grid_vel_new.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 4,
+                resource: flip_grid_vel_old.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 5,
+                resource: flip_pressure_0.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 6,
+                resource: flip_pressure_1.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 7,
+                resource: flip_render_grid.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 8,
+                resource: water_splash_compact.as_entire_binding(),
+            },
+        ],
+    });
+
+    let flip_compute_source =
+        resolve_shader_includes(include_str!("../src/shaders/flip_water_compute.wgsl"));
+    let flip_compute_shader = device.create_shader_module(ShaderModuleDescriptor {
+        label: Some("Water FLIP Compute Module"),
+        source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&flip_compute_source)),
+    });
+    let flip_compute_layout_desc = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+        label: Some("water_compute_layout"),
+        bind_group_layouts: &[Some(&flip_compute_layout)],
+        immediate_size: 0,
+    });
+
+    let flip_clear_pipe = device.create_compute_pipeline(&ComputePipelineDescriptor {
+        label: Some("Clear"),
+        layout: Some(&flip_compute_layout_desc),
+        module: &flip_compute_shader,
+        entry_point: Some("cs_clear"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let flip_clear_render_pipe = device.create_compute_pipeline(&ComputePipelineDescriptor {
+        label: Some("Clear Render"),
+        layout: Some(&flip_compute_layout_desc),
+        module: &flip_compute_shader,
+        entry_point: Some("cs_clear_render"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let flip_p2g_pipe = device.create_compute_pipeline(&ComputePipelineDescriptor {
+        label: Some("P2G"),
+        layout: Some(&flip_compute_layout_desc),
+        module: &flip_compute_shader,
+        entry_point: Some("cs_p2g"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let flip_forces_pipe = device.create_compute_pipeline(&ComputePipelineDescriptor {
+        label: Some("Forces"),
+        layout: Some(&flip_compute_layout_desc),
+        module: &flip_compute_shader,
+        entry_point: Some("cs_grid_forces"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let flip_p01_pipe = device.create_compute_pipeline(&ComputePipelineDescriptor {
+        label: Some("P 0->1"),
+        layout: Some(&flip_compute_layout_desc),
+        module: &flip_compute_shader,
+        entry_point: Some("cs_pressure_0_to_1"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let flip_p10_pipe = device.create_compute_pipeline(&ComputePipelineDescriptor {
+        label: Some("P 1->0"),
+        layout: Some(&flip_compute_layout_desc),
+        module: &flip_compute_shader,
+        entry_point: Some("cs_pressure_1_to_0"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let flip_proj_pipe = device.create_compute_pipeline(&ComputePipelineDescriptor {
+        label: Some("Project"),
+        layout: Some(&flip_compute_layout_desc),
+        module: &flip_compute_shader,
+        entry_point: Some("cs_grid_project"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let flip_g2p_pipe = device.create_compute_pipeline(&ComputePipelineDescriptor {
+        label: Some("G2P"),
+        layout: Some(&flip_compute_layout_desc),
+        module: &flip_compute_shader,
+        entry_point: Some("cs_g2p_advect_splat"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+
+    let flip_render_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("Water Render BG Layout"),
+        entries: &[BindGroupLayoutEntry {
+            binding: 0,
+            visibility: ShaderStages::FRAGMENT,
+            ty: BindingType::Buffer {
+                ty: BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+    let flip_render_bg = device.create_bind_group(&BindGroupDescriptor {
+        label: Some("Water Render BG"),
+        layout: &flip_render_layout,
+        entries: &[BindGroupEntry {
+            binding: 0,
+            resource: flip_render_grid.as_entire_binding(),
+        }],
+    });
+    let flip_render_pipe_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+        label: Some("Water Render Pipe Layout"),
+        bind_group_layouts: &[Some(&bind_group_layout), Some(&flip_render_layout)],
+        immediate_size: 0,
+    });
+
+    let flip_render_source =
+        resolve_shader_includes(include_str!("../src/shaders/vis_glass_water.wgsl"));
+    let flip_render_shader = device.create_shader_module(ShaderModuleDescriptor {
+        label: Some("Water Render Module"),
+        source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&flip_render_source)),
+    });
+
+    let flip_render_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+        label: Some("Water Render Pipeline"),
+        layout: Some(&flip_render_pipe_layout),
+        vertex: VertexState {
+            module: &flip_render_shader,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(FragmentState {
+            module: &flip_render_shader,
+            entry_point: Some("fs_main"),
+            targets: &[Some(ColorTargetState {
+                format: color_format,
+                blend: Some(BlendState::REPLACE),
+                write_mask: ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: PrimitiveState::default(),
+        depth_stencil: Some(DepthStencilState {
+            format: TextureFormat::Depth32Float,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(CompareFunction::LessEqual),
+            stencil: StencilState::default(),
+            bias: DepthBiasState::default(),
+        }),
+        multisample: MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    let bytes_per_pixel = 4u32;
+    let unaligned_bytes_per_row = width * bytes_per_pixel;
+    let align = 256u32;
+    let bytes_per_row = (unaligned_bytes_per_row + align - 1) & !(align - 1);
+
+    // Warmup 25 frames then render 36 animation frames
+    let warmup_frames = 25;
+    let anim_frames = 36;
+    let total_frames = warmup_frames + anim_frames;
+
+    std::fs::create_dir_all("target/water_anim").ok();
+
+    for frame in 0..total_frames {
+        let t = if frame < warmup_frames {
+            (frame as f32) / (warmup_frames as f32)
+        } else {
+            ((frame - warmup_frames) as f32) / (anim_frames as f32)
+        };
+
+        uniforms.time = (frame as f32) * 0.033;
+        uniforms.smooth_time = (frame as f32) * 0.033;
+
+        // Sub-bass kick beats: two energetic pulses to trigger acoustic geysers
+        let kick1 = (-((t * 2.0 - 0.0).fract() * 6.0)).exp();
+        let kick2 = (-((t * 2.0 - 1.0).fract() * 6.0)).exp();
+        let kick = kick1.max(kick2);
+        uniforms.spectrum[0] = 0.4 + 1.35 * kick;
+        uniforms.channels[0] = 0.3 + 1.25 * kick;
+
+        // Mid/high frequencies driving Faraday acoustic standing ripples
+        for i in 0..16 {
+            let bin = i * 8 + 4;
+            let phase = (i as f32) / 16.0 * std::f32::consts::TAU;
+            let sweep = (t * std::f32::consts::TAU * 2.0 - phase)
+                .cos()
+                .max(0.0)
+                .powi(3);
+            uniforms.spectrum[bin] = 0.25 + 1.15 * sweep;
+        }
+
+        queue.write_buffer(&uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+
+        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+            label: Some("Water Frame Encoder"),
+        });
+
+        // 1. Compute Pass
+        {
+            let mut cp = encoder.begin_compute_pass(&ComputePassDescriptor {
+                label: Some("Water FLIP Passes"),
+                timestamp_writes: None,
+            });
+
+            // Clear
+            cp.set_pipeline(&flip_clear_pipe);
+            cp.set_bind_group(0, Some(&flip_compute_bg), &[]);
+            cp.dispatch_workgroups(512, 1, 1);
+
+            // Clear Render Grid
+            cp.set_pipeline(&flip_clear_render_pipe);
+            cp.set_bind_group(0, Some(&flip_compute_bg), &[]);
+            cp.dispatch_workgroups(1024, 1, 1);
+
+            // P2G
+            cp.set_pipeline(&flip_p2g_pipe);
+            cp.set_bind_group(0, Some(&flip_compute_bg), &[]);
+            cp.dispatch_workgroups(256, 1, 1);
+
+            // Forces
+            cp.set_pipeline(&flip_forces_pipe);
+            cp.set_bind_group(0, Some(&flip_compute_bg), &[]);
+            cp.dispatch_workgroups(512, 1, 1);
+
+            // Pressure solve (8 pairs = 16 iterations)
+            for _ in 0..8 {
+                cp.set_pipeline(&flip_p01_pipe);
+                cp.set_bind_group(0, Some(&flip_compute_bg), &[]);
+                cp.dispatch_workgroups(512, 1, 1);
+
+                cp.set_pipeline(&flip_p10_pipe);
+                cp.set_bind_group(0, Some(&flip_compute_bg), &[]);
+                cp.dispatch_workgroups(512, 1, 1);
+            }
+
+            // Project
+            cp.set_pipeline(&flip_proj_pipe);
+            cp.set_bind_group(0, Some(&flip_compute_bg), &[]);
+            cp.dispatch_workgroups(512, 1, 1);
+
+            // G2P & Splat
+            cp.set_pipeline(&flip_g2p_pipe);
+            cp.set_bind_group(0, Some(&flip_compute_bg), &[]);
+            cp.dispatch_workgroups(256, 1, 1);
+        }
+
+        // 2. Render Pass
+        if frame >= warmup_frames {
+            let anim_idx = frame - warmup_frames;
+            {
+                let mut rp = encoder.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("Water Render Pass"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view: &color_view,
+                        resolve_target: None,
+                        ops: Operations {
+                            load: LoadOp::Clear(Color::BLACK),
+                            store: StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                        view: &depth_view,
+                        depth_ops: Some(Operations {
+                            load: LoadOp::Clear(1.0),
+                            store: StoreOp::Store,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                rp.set_pipeline(&flip_render_pipeline);
+                rp.set_bind_group(0, &uniform_bind_group, &[]);
+                rp.set_bind_group(1, &flip_render_bg, &[]);
+                rp.draw(0..3, 0..1);
+            }
+
+            let output_buffer = device.create_buffer(&BufferDescriptor {
+                label: Some("Readback Buffer"),
+                size: (bytes_per_row * height) as u64,
+                usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+                mapped_at_creation: false,
+            });
+
+            encoder.copy_texture_to_buffer(
+                TexelCopyTextureInfo {
+                    texture: &render_target,
+                    mip_level: 0,
+                    origin: Origin3d::ZERO,
+                    aspect: TextureAspect::All,
+                },
+                TexelCopyBufferInfo {
+                    buffer: &output_buffer,
+                    layout: TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(bytes_per_row),
+                        rows_per_image: Some(height),
+                    },
+                },
+                Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+
+            queue.submit(Some(encoder.finish()));
+
+            let buffer_slice = output_buffer.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            buffer_slice.map_async(MapMode::Read, move |result| {
+                tx.send(result).unwrap();
+            });
+            let _ = device.poll(PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            });
+            rx.recv().unwrap().unwrap();
+
+            let data = buffer_slice.get_mapped_range().unwrap();
+            let mut img = image::ImageBuffer::<image::Rgba<u8>, _>::new(width, height);
+            for y in 0..height {
+                let row_start = (y * bytes_per_row) as usize;
+                for x in 0..width {
+                    let px_start = row_start + (x * bytes_per_pixel) as usize;
+                    let r = data[px_start];
+                    let g = data[px_start + 1];
+                    let b = data[px_start + 2];
+                    let a = data[px_start + 3];
+                    img.put_pixel(x, y, image::Rgba([r, g, b, a]));
+                }
+            }
+            drop(data);
+            output_buffer.unmap();
+
+            let frame_path = format!("target/water_anim/frame_{:03}.png", anim_idx);
+            img.save(&frame_path).unwrap();
+
+            if anim_idx == 8 || anim_idx == 10 {
+                img.save("test_glass_water.png").unwrap();
+            }
+        } else {
+            queue.submit(Some(encoder.finish()));
+        }
+    }
+
+    // Compile animated WebP and GIF using ffmpeg
+    let _ = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-r",
+            "24",
+            "-i",
+            "target/water_anim/frame_%03d.png",
+            "-vcodec",
+            "libwebp",
+            "-lossless",
+            "0",
+            "-compression_level",
+            "4",
+            "-q:v",
+            "80",
+            "-loop",
+            "0",
+            "test_glass_water.webp",
+        ])
+        .output();
+
+    let _ = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-r",
+            "24",
+            "-i",
+            "target/water_anim/frame_%03d.png",
+            "-vf",
+            "fps=20,scale=640:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse",
+            "test_glass_water.gif",
+        ])
+        .output();
+
+    // Render Legacy Visualizer #23 (3D Glass Water Lyrics) for direct side-by-side comparison
+    let camera_bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("Legacy Camera Layout"),
+        entries: &[BindGroupLayoutEntry {
+            binding: 0,
+            visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+            ty: BindingType::Buffer {
+                ty: BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+    let aspect = (width as f32) / (height as f32);
+    let lyrics_scale = (2.2 / aspect).max(1.0);
+    let eye_y = 0.45 + 0.95 * lyrics_scale;
+    let eye_z = 4.2 * lyrics_scale;
+    let view = glam::Mat4::look_at_rh(
+        glam::Vec3::new(0.0, eye_y, eye_z),
+        glam::Vec3::new(0.0, 0.45, 0.0),
+        glam::Vec3::new(0.0, 1.0, 0.0),
+    );
+    let proj = glam::Mat4::perspective_rh(45.0f32.to_radians(), aspect, 0.1, 100.0);
+    let cam_uniforms = crate::engine::CameraUniforms {
+        view_matrix: view.to_cols_array_2d(),
+        proj_matrix: proj.to_cols_array_2d(),
+    };
+    let camera_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("Legacy Camera Buffer"),
+        size: std::mem::size_of::<crate::engine::CameraUniforms>() as u64,
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&camera_buffer, 0, bytemuck::cast_slice(&[cam_uniforms]));
+
+    let camera_bg = device.create_bind_group(&BindGroupDescriptor {
+        label: Some("Legacy Camera BG"),
+        layout: &camera_bind_group_layout,
+        entries: &[BindGroupEntry {
+            binding: 0,
+            resource: camera_buffer.as_entire_binding(),
+        }],
+    });
+
+    let dummy_smoke_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("Dummy Smoke Layout"),
+        entries: &[
+            BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 1,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+    let dummy_smoke_bg = device.create_bind_group(&BindGroupDescriptor {
+        label: Some("Dummy Smoke BG"),
+        layout: &dummy_smoke_layout,
+        entries: &[
+            BindGroupEntry {
+                binding: 0,
+                resource: flip_render_grid.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 1,
+                resource: flip_particles.as_entire_binding(),
+            },
+        ],
+    });
+
+    let legacy_lyrics_src = resolve_shader_includes(include_str!("../src/shaders/vis_lyrics.wgsl"));
+    let legacy_lyrics_module = device.create_shader_module(ShaderModuleDescriptor {
+        label: Some("Legacy Lyrics Module"),
+        source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&legacy_lyrics_src)),
+    });
+    let legacy_lyrics_pipe_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+        label: Some("Legacy Lyrics Layout"),
+        bind_group_layouts: &[
+            Some(&bind_group_layout),
+            Some(&dummy_smoke_layout),
+            Some(&camera_bind_group_layout),
+        ],
+        immediate_size: 0,
+    });
+    let (mesh_verts, mesh_inds) = crate::engine::generate_glass_lyrics_mesh("RUSTTRACKER");
+    let mesh_vb = device.create_buffer(&BufferDescriptor {
+        label: Some("Legacy Mesh VB"),
+        size: (mesh_verts.len() * std::mem::size_of::<crate::engine::Vertex>()) as u64,
+        usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&mesh_vb, 0, bytemuck::cast_slice(&mesh_verts));
+
+    let mesh_ib = device.create_buffer(&BufferDescriptor {
+        label: Some("Legacy Mesh IB"),
+        size: (mesh_inds.len() * std::mem::size_of::<u32>()) as u64,
+        usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&mesh_ib, 0, bytemuck::cast_slice(&mesh_inds));
+
+    let legacy_lyrics_pipe = device.create_render_pipeline(&RenderPipelineDescriptor {
+        label: Some("Legacy Lyrics Pipe"),
+        layout: Some(&legacy_lyrics_pipe_layout),
+        vertex: VertexState {
+            module: &legacy_lyrics_module,
+            entry_point: Some("vs_main_3d"),
+            buffers: &[Some(crate::engine::Vertex::desc())],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(FragmentState {
+            module: &legacy_lyrics_module,
+            entry_point: Some("fs_main"),
+            targets: &[Some(ColorTargetState {
+                format: color_format,
+                blend: Some(BlendState::REPLACE),
+                write_mask: ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: PrimitiveState {
+            topology: PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: Some(DepthStencilState {
+            format: TextureFormat::Depth32Float,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(CompareFunction::LessEqual),
+            stencil: StencilState::default(),
+            bias: DepthBiasState::default(),
+        }),
+        multisample: MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    let mut legacy_encoder = device.create_command_encoder(&CommandEncoderDescriptor {
+        label: Some("Legacy Render Encoder"),
+    });
+    {
+        let mut rp = legacy_encoder.begin_render_pass(&RenderPassDescriptor {
+            label: Some("Legacy Lyrics Render Pass"),
+            color_attachments: &[Some(RenderPassColorAttachment {
+                view: &color_view,
+                resolve_target: None,
+                ops: Operations {
+                    load: LoadOp::Clear(Color::BLACK),
+                    store: StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                view: &depth_view,
+                depth_ops: Some(Operations {
+                    load: LoadOp::Clear(1.0),
+                    store: StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        rp.set_pipeline(&legacy_lyrics_pipe);
+        rp.set_bind_group(0, &uniform_bind_group, &[]);
+        rp.set_bind_group(1, &dummy_smoke_bg, &[]);
+        rp.set_bind_group(2, &camera_bg, &[]);
+        rp.set_vertex_buffer(0, mesh_vb.slice(..));
+        rp.set_index_buffer(mesh_ib.slice(..), IndexFormat::Uint32);
+        rp.draw_indexed(0..(mesh_inds.len() as u32), 0, 0..1);
+    }
+
+    let legacy_out_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("Legacy Readback Buffer"),
+        size: (bytes_per_row * height) as u64,
+        usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    legacy_encoder.copy_texture_to_buffer(
+        TexelCopyTextureInfo {
+            texture: &render_target,
+            mip_level: 0,
+            origin: Origin3d::ZERO,
+            aspect: TextureAspect::All,
+        },
+        TexelCopyBufferInfo {
+            buffer: &legacy_out_buffer,
+            layout: TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(height),
+            },
+        },
+        Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(Some(legacy_encoder.finish()));
+
+    let buffer_slice = legacy_out_buffer.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    buffer_slice.map_async(MapMode::Read, move |result| {
+        tx.send(result).unwrap();
+    });
+    let _ = device.poll(PollType::Wait {
+        submission_index: None,
+        timeout: None,
+    });
+    rx.recv().unwrap().unwrap();
+
+    let data = buffer_slice.get_mapped_range().unwrap();
+    let mut img = image::ImageBuffer::<image::Rgba<u8>, _>::new(width, height);
+    for y in 0..height {
+        let row_start = (y * bytes_per_row) as usize;
+        for x in 0..width {
+            let px_start = row_start + (x * bytes_per_pixel) as usize;
+            let r = data[px_start];
+            let g = data[px_start + 1];
+            let b = data[px_start + 2];
+            let a = data[px_start + 3];
+            img.put_pixel(x, y, image::Rgba([r, g, b, a]));
+        }
+    }
+    drop(data);
+    legacy_out_buffer.unmap();
+    img.save("test_legacy_glass_water.png").unwrap();
+
+    println!(
+        "Saved test_glass_water.png, test_legacy_glass_water.png, test_glass_water.webp, and test_glass_water.gif successfully!"
+    );
+}
+
+fn test_render_flip_lyrics_animation() {
+    pollster::block_on(run_flip_lyrics_animation());
+}
+
+async fn run_flip_lyrics_animation() {
+    let instance = Instance::new(InstanceDescriptor {
+        backends: Backends::PRIMARY,
+        flags: InstanceFlags::default(),
+        backend_options: BackendOptions::default(),
+        display: None,
+        memory_budget_thresholds: MemoryBudgetThresholds::default(),
+    });
+
+    let adapter = instance
+        .request_adapter(&RequestAdapterOptions {
+            power_preference: PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        })
+        .await
+        .unwrap();
+
+    let (device, queue) = adapter
+        .request_device(&DeviceDescriptor {
+            label: Some("Lyrics FLIP Device"),
+            required_features: Features::empty(),
+            required_limits: Limits::default(),
+            memory_hints: MemoryHints::default(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let width = 1280u32;
+    let height = 720u32;
+    let color_format = TextureFormat::Rgba8UnormSrgb;
+
+    let render_target = device.create_texture(&TextureDescriptor {
+        label: Some("Lyrics Render Target"),
+        size: Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: color_format,
+        usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let color_view = render_target.create_view(&TextureViewDescriptor::default());
+
+    let depth_texture = device.create_texture(&TextureDescriptor {
+        label: Some("Lyrics Depth Target"),
+        size: Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Depth32Float,
+        usage: TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let depth_view = depth_texture.create_view(&TextureViewDescriptor::default());
+
+    let mut uniforms = crate::engine::AudioUniforms {
+        time: 0.0,
+        smooth_time: 0.0,
+        frame_dt: 0.016,
+        mode: 23,
+        spectrum: [0.0; 1024],
+        fire_heat: [0.0; 1024],
+        channels: [0.0; 32],
+        channel_peaks: [0.0; 32],
+        spatial_channels: [0.0; 16],
+        display_order: [0; 16],
+        channel_phases: [0.0; 32],
+        vu_segment_glows: [0; 256],
+        num_channels: 4,
+        duration: 200.0,
+        heatmap_row: 0,
+        fft_channels: 2,
+        num_spatial_channels: 4,
+        ui_meters_rect: [0.0; 4],
+        ui_heatmap_rect: [0.0; 4],
+        ui_fire_rect: [0.0; 4],
+        waveform_resolution: 512,
+        waveform_history_size: 144,
+        frame_count: 0,
+        step_fraction: 0.0,
+        steps_to_fill: 0,
+        aspect_ratio: (width as f32) / (height as f32),
+        history_cam_z: 0.0,
+        fire_intensity: 1.0,
+        waveform_history_ring_base: 0,
+        _pad2: 0.0,
+        _pad3: 0.0,
+    };
+
+    let uniform_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("Audio Uniform Buffer"),
+        size: std::mem::size_of::<crate::engine::AudioUniforms>() as u64,
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+
+    let dummy_waveform = device.create_buffer(&BufferDescriptor {
+        label: Some("Dummy Waveform"),
+        size: 2048 * 4,
+        usage: BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let dummy_tex = device.create_texture(&TextureDescriptor {
+        label: Some("Dummy Texture"),
+        size: Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::R32Float,
+        usage: TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let dummy_view = dummy_tex.create_view(&TextureViewDescriptor::default());
+    let dummy_storage = device.create_buffer(&BufferDescriptor {
+        label: Some("Dummy Storage"),
+        size: 1024,
+        usage: BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+
+    let bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        entries: &[
+            BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT | ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 1,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 2,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: false },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 3,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: false },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 4,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+        label: Some("audio_bind_group_layout"),
+    });
+
+    let uniform_bind_group = device.create_bind_group(&BindGroupDescriptor {
+        layout: &bind_group_layout,
+        entries: &[
+            BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 1,
+                resource: dummy_waveform.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 2,
+                resource: BindingResource::TextureView(&dummy_view),
+            },
+            BindGroupEntry {
+                binding: 3,
+                resource: BindingResource::TextureView(&dummy_view),
+            },
+            BindGroupEntry {
+                binding: 4,
+                resource: dummy_storage.as_entire_binding(),
+            },
+        ],
+        label: Some("audio_bind_group"),
+    });
+
+    // Camera uniforms
+    let aspect = width as f32 / height as f32;
+    let proj = glam::Mat4::perspective_rh(50.0f32.to_radians(), aspect, 0.1, 100.0);
+    let lyrics_scale = (2.2 / aspect).max(1.0);
+    let eye_y = 0.45 + 0.95 * lyrics_scale;
+    let eye_z = 4.2 * lyrics_scale;
+    let view = glam::Mat4::look_at_rh(
+        glam::Vec3::new(0.0, eye_y, eye_z),
+        glam::Vec3::new(0.0, 0.45, 0.0),
+        glam::Vec3::new(0.0, 1.0, 0.0),
+    );
+    let camera_uniforms = crate::engine::CameraUniforms {
+        view_matrix: view.to_cols_array_2d(),
+        proj_matrix: proj.to_cols_array_2d(),
+    };
+    let camera_buf = device.create_buffer(&BufferDescriptor {
+        label: Some("Camera Buffer"),
+        size: std::mem::size_of::<crate::engine::CameraUniforms>() as u64,
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&camera_buf, 0, bytemuck::cast_slice(&[camera_uniforms]));
+
+    let camera_bg_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("Camera BG Layout"),
+        entries: &[BindGroupLayoutEntry {
+            binding: 0,
+            visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+            ty: BindingType::Buffer {
+                ty: BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+    let camera_bg = device.create_bind_group(&BindGroupDescriptor {
+        label: Some("Camera BG"),
+        layout: &camera_bg_layout,
+        entries: &[BindGroupEntry {
+            binding: 0,
+            resource: camera_buf.as_entire_binding(),
+        }],
+    });
+
+    // FLIP compute buffers
+    let num_particles = 65536usize;
+    let flip_particles = device.create_buffer(&BufferDescriptor {
+        label: Some("FLIP Particles"),
+        size: (num_particles * 32) as u64,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&flip_particles, 0, &vec![0u8; num_particles * 32]);
+
+    let flip_grid_accum = device.create_buffer(&BufferDescriptor {
+        label: Some("FLIP Grid Accum"),
+        size: (131072 * 16) as u64,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let flip_grid_vel_new = device.create_buffer(&BufferDescriptor {
+        label: Some("FLIP Grid Vel New"),
+        size: (131072 * 16) as u64,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let flip_grid_vel_old = device.create_buffer(&BufferDescriptor {
+        label: Some("FLIP Grid Vel Old"),
+        size: (131072 * 16) as u64,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let flip_pressure_0 = device.create_buffer(&BufferDescriptor {
+        label: Some("FLIP Pressure 0"),
+        size: (131072 * 4) as u64,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let flip_pressure_1 = device.create_buffer(&BufferDescriptor {
+        label: Some("FLIP Pressure 1"),
+        size: (131072 * 4) as u64,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let flip_render_grid = device.create_buffer(&BufferDescriptor {
+        label: Some("FLIP Render Grid"),
+        size: (512 * 512 * 4) as u64,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let flip_compute_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("FLIP Compute Layout"),
+        entries: &[
+            BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 1,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 2,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 3,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 4,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 5,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 6,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 7,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 8,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+
+    let splash_compact_buf = device.create_buffer(&BufferDescriptor {
+        label: Some("Splash Compact Buffer"),
+        size: ((8 + 65536) * 4) as u64,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let splash_indirect_buf = device.create_buffer(&BufferDescriptor {
+        label: Some("Splash Indirect Args"),
+        size: 20,
+        usage: BufferUsages::INDIRECT | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(
+        &splash_indirect_buf,
+        0,
+        bytemuck::cast_slice(&[6u32, 0, 0, 0, 0]),
+    );
+
+    let flip_compute_bg = device.create_bind_group(&BindGroupDescriptor {
+        label: Some("FLIP Compute BG"),
+        layout: &flip_compute_layout,
+        entries: &[
+            BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 1,
+                resource: flip_particles.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 2,
+                resource: flip_grid_accum.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 3,
+                resource: flip_grid_vel_new.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 4,
+                resource: flip_grid_vel_old.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 5,
+                resource: flip_pressure_0.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 6,
+                resource: flip_pressure_1.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 7,
+                resource: flip_render_grid.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 8,
+                resource: splash_compact_buf.as_entire_binding(),
+            },
+        ],
+    });
+
+    let flip_compute_pipe_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+        label: Some("FLIP Compute Pipe Layout"),
+        bind_group_layouts: &[Some(&flip_compute_layout)],
+        immediate_size: 0,
+    });
+
+    let compute_src =
+        resolve_shader_includes(include_str!("../src/shaders/flip_water_compute.wgsl"));
+    let compute_module = device.create_shader_module(ShaderModuleDescriptor {
+        label: Some("Water Compute Module"),
+        source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&compute_src)),
+    });
+
+    let pipe_clear = device.create_compute_pipeline(&ComputePipelineDescriptor {
+        label: Some("Clear"),
+        layout: Some(&flip_compute_pipe_layout),
+        module: &compute_module,
+        entry_point: Some("cs_clear"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let pipe_clear_render = device.create_compute_pipeline(&ComputePipelineDescriptor {
+        label: Some("Clear Render"),
+        layout: Some(&flip_compute_pipe_layout),
+        module: &compute_module,
+        entry_point: Some("cs_clear_render"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let pipe_p2g = device.create_compute_pipeline(&ComputePipelineDescriptor {
+        label: Some("P2G"),
+        layout: Some(&flip_compute_pipe_layout),
+        module: &compute_module,
+        entry_point: Some("cs_p2g"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let pipe_forces = device.create_compute_pipeline(&ComputePipelineDescriptor {
+        label: Some("Forces"),
+        layout: Some(&flip_compute_pipe_layout),
+        module: &compute_module,
+        entry_point: Some("cs_grid_forces"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let pipe_p0_to_1 = device.create_compute_pipeline(&ComputePipelineDescriptor {
+        label: Some("P0->1"),
+        layout: Some(&flip_compute_pipe_layout),
+        module: &compute_module,
+        entry_point: Some("cs_pressure_0_to_1"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let pipe_p1_to_0 = device.create_compute_pipeline(&ComputePipelineDescriptor {
+        label: Some("P1->0"),
+        layout: Some(&flip_compute_pipe_layout),
+        module: &compute_module,
+        entry_point: Some("cs_pressure_1_to_0"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let pipe_project = device.create_compute_pipeline(&ComputePipelineDescriptor {
+        label: Some("Project"),
+        layout: Some(&flip_compute_pipe_layout),
+        module: &compute_module,
+        entry_point: Some("cs_grid_project"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+    let pipe_g2p_advect = device.create_compute_pipeline(&ComputePipelineDescriptor {
+        label: Some("G2P Advect"),
+        layout: Some(&flip_compute_pipe_layout),
+        module: &compute_module,
+        entry_point: Some("cs_g2p_advect_splat"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+
+    // Render bind group for lyrics
+    let flip_render_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("Lyrics Render Layout"),
+        entries: &[
+            BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 1,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 2,
+                visibility: ShaderStages::VERTEX,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+    let flip_render_bg = device.create_bind_group(&BindGroupDescriptor {
+        label: Some("Lyrics Render BG"),
+        layout: &flip_render_layout,
+        entries: &[
+            BindGroupEntry {
+                binding: 0,
+                resource: flip_render_grid.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 1,
+                resource: flip_particles.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 2,
+                resource: splash_compact_buf.as_entire_binding(),
+            },
+        ],
+    });
+    let lyrics_pipe_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+        label: Some("Lyrics Pipe Layout"),
+        bind_group_layouts: &[
+            Some(&bind_group_layout),
+            Some(&flip_render_layout),
+            Some(&camera_bg_layout),
+        ],
+        immediate_size: 0,
+    });
+
+    let lyrics_src = resolve_shader_includes(include_str!("../src/shaders/vis_lyrics.wgsl"));
+    let lyrics_module = device.create_shader_module(ShaderModuleDescriptor {
+        label: Some("Lyrics Module"),
+        source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&lyrics_src)),
+    });
+
+    let (mesh_verts, mesh_inds) = crate::engine::generate_glass_lyrics_mesh("RUSTTRACKER");
+    let mesh_vb = device.create_buffer(&BufferDescriptor {
+        label: Some("Mesh VB"),
+        size: (mesh_verts.len() * std::mem::size_of::<crate::engine::Vertex>()) as u64,
+        usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&mesh_vb, 0, bytemuck::cast_slice(&mesh_verts));
+
+    let mesh_ib = device.create_buffer(&BufferDescriptor {
+        label: Some("Mesh IB"),
+        size: (mesh_inds.len() * std::mem::size_of::<u32>()) as u64,
+        usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&mesh_ib, 0, bytemuck::cast_slice(&mesh_inds));
+
+    let lyrics_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+        label: Some("Lyrics Pipeline"),
+        layout: Some(&lyrics_pipe_layout),
+        vertex: VertexState {
+            module: &lyrics_module,
+            entry_point: Some("vs_main_3d"),
+            buffers: &[Some(crate::engine::Vertex::desc())],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(FragmentState {
+            module: &lyrics_module,
+            entry_point: Some("fs_main"),
+            targets: &[Some(ColorTargetState {
+                format: color_format,
+                blend: Some(BlendState::REPLACE),
+                write_mask: ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: PrimitiveState {
+            topology: PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: Some(DepthStencilState {
+            format: TextureFormat::Depth32Float,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(CompareFunction::LessEqual),
+            stencil: StencilState::default(),
+            bias: DepthBiasState::default(),
+        }),
+        multisample: MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    // 3D Airborne Water Splash Droplet Pipeline
+    let splash_quad_verts = [
+        crate::engine::Vertex {
+            position: [-0.5, -0.5, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            tex_coords: [0.0, 0.0],
+        },
+        crate::engine::Vertex {
+            position: [0.5, -0.5, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            tex_coords: [1.0, 0.0],
+        },
+        crate::engine::Vertex {
+            position: [0.5, 0.5, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            tex_coords: [1.0, 1.0],
+        },
+        crate::engine::Vertex {
+            position: [-0.5, 0.5, 0.0],
+            normal: [0.0, 0.0, 1.0],
+            tex_coords: [0.0, 1.0],
+        },
+    ];
+    let splash_quad_inds: [u32; 6] = [0, 1, 2, 0, 2, 3];
+    let splash_vb = device.create_buffer(&BufferDescriptor {
+        label: Some("Splash VB"),
+        size: (splash_quad_verts.len() * std::mem::size_of::<crate::engine::Vertex>()) as u64,
+        usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&splash_vb, 0, bytemuck::cast_slice(&splash_quad_verts));
+
+    let splash_ib = device.create_buffer(&BufferDescriptor {
+        label: Some("Splash IB"),
+        size: (splash_quad_inds.len() * std::mem::size_of::<u32>()) as u64,
+        usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&splash_ib, 0, bytemuck::cast_slice(&splash_quad_inds));
+
+    let splash_src = resolve_shader_includes(include_str!("../src/shaders/vis_water_splash.wgsl"));
+    let splash_module = device.create_shader_module(ShaderModuleDescriptor {
+        label: Some("Splash Module"),
+        source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&splash_src)),
+    });
+    let splash_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+        label: Some("Splash Pipeline"),
+        layout: Some(&lyrics_pipe_layout),
+        vertex: VertexState {
+            module: &splash_module,
+            entry_point: Some("vs_splash"),
+            buffers: &[Some(crate::engine::Vertex::desc())],
+            compilation_options: Default::default(),
+        },
+        fragment: Some(FragmentState {
+            module: &splash_module,
+            entry_point: Some("fs_splash"),
+            targets: &[Some(ColorTargetState {
+                format: color_format,
+                blend: Some(BlendState::ALPHA_BLENDING),
+                write_mask: ColorWrites::ALL,
+            })],
+            compilation_options: Default::default(),
+        }),
+        primitive: PrimitiveState {
+            topology: PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: Some(DepthStencilState {
+            format: TextureFormat::Depth32Float,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(CompareFunction::LessEqual),
+            stencil: StencilState::default(),
+            bias: DepthBiasState::default(),
+        }),
+        multisample: MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    let _ = std::fs::create_dir_all("target/lyrics_anim");
+
+    let bytes_per_pixel = 4u32;
+    let unpadded_bytes_per_row = width * bytes_per_pixel;
+    let align = 256u32;
+    let bytes_per_row = (unpadded_bytes_per_row + align - 1) & !(align - 1);
+
+    // 40 frame simulation of letter slam and crown splash
+    for f in 0..40 {
+        let t_norm = f as f32 / 40.0;
+        let slam_t = 0.16 + t_norm * 0.55;
+        let slam_y = if slam_t < 0.26 {
+            let p = (0.26 - slam_t) / 0.26;
+            p * p * 3.8
+        } else {
+            let dt_impact = slam_t - 0.26;
+            -0.32 * (-3.6 * dt_impact).exp() * (9.5 * dt_impact).cos()
+                + ((slam_t * 1.6).sin() * 0.022) * (1.0 - (-2.0 * dt_impact).exp())
+        };
+
+        uniforms.time = f as f32 * 0.025;
+        uniforms.smooth_time = uniforms.time;
+        uniforms.fire_heat[0] = slam_t;
+        uniforms.fire_heat[1] = slam_y;
+        uniforms.fire_heat[6] = 1.0; // bass
+        uniforms.fire_heat[7] = 3.6; // half_w
+        uniforms.channels[0] = 1.2;
+        uniforms.channels[1] = 0.9;
+        uniforms.channels[2] = 1.1;
+        uniforms.channels[3] = 0.8;
+        queue.write_buffer(&uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+
+        let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
+
+        // 1. FLIP Compute Passes
+        {
+            let mut cp = encoder.begin_compute_pass(&ComputePassDescriptor {
+                label: Some("FLIP Passes"),
+                timestamp_writes: None,
+            });
+            cp.set_pipeline(&pipe_clear);
+            cp.set_bind_group(0, Some(&flip_compute_bg), &[]);
+            cp.dispatch_workgroups(512, 1, 1);
+
+            cp.set_pipeline(&pipe_clear_render);
+            cp.set_bind_group(0, Some(&flip_compute_bg), &[]);
+            cp.dispatch_workgroups(1024, 1, 1);
+
+            cp.set_pipeline(&pipe_p2g);
+            cp.set_bind_group(0, Some(&flip_compute_bg), &[]);
+            cp.dispatch_workgroups(256, 1, 1);
+
+            cp.set_pipeline(&pipe_forces);
+            cp.set_bind_group(0, Some(&flip_compute_bg), &[]);
+            cp.dispatch_workgroups(512, 1, 1);
+
+            for _ in 0..8 {
+                cp.set_pipeline(&pipe_p0_to_1);
+                cp.set_bind_group(0, Some(&flip_compute_bg), &[]);
+                cp.dispatch_workgroups(512, 1, 1);
+
+                cp.set_pipeline(&pipe_p1_to_0);
+                cp.set_bind_group(0, Some(&flip_compute_bg), &[]);
+                cp.dispatch_workgroups(512, 1, 1);
+            }
+
+            cp.set_pipeline(&pipe_project);
+            cp.set_bind_group(0, Some(&flip_compute_bg), &[]);
+            cp.dispatch_workgroups(512, 1, 1);
+
+            cp.set_pipeline(&pipe_g2p_advect);
+            cp.set_bind_group(0, Some(&flip_compute_bg), &[]);
+            cp.dispatch_workgroups(256, 1, 1);
+        }
+
+        encoder.copy_buffer_to_buffer(&splash_compact_buf, 0, &splash_indirect_buf, 0, 20);
+
+        // 2. Render Pass: Lyrics Scene + Airborne Splash Droplets
+        {
+            let mut rp = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("Lyrics Render Pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &color_view,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Clear(Color::BLACK),
+                        store: StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                    view: &depth_view,
+                    depth_ops: Some(Operations {
+                        load: LoadOp::Clear(1.0),
+                        store: StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+
+            // 2A. Glass lyrics & FLIP water surface
+            rp.set_pipeline(&lyrics_pipeline);
+            rp.set_bind_group(0, &uniform_bind_group, &[]);
+            rp.set_bind_group(1, &flip_render_bg, &[]);
+            rp.set_bind_group(2, &camera_bg, &[]);
+            rp.set_vertex_buffer(0, mesh_vb.slice(..));
+            rp.set_index_buffer(mesh_ib.slice(..), IndexFormat::Uint32);
+            rp.draw_indexed(0..(mesh_inds.len() as u32), 0, 0..1);
+
+            // 2B. 3D Airborne Water Splash Droplets (GPU-compacted draw_indexed_indirect)
+            rp.set_pipeline(&splash_pipeline);
+            rp.set_vertex_buffer(0, splash_vb.slice(..));
+            rp.set_index_buffer(splash_ib.slice(..), IndexFormat::Uint32);
+            rp.draw_indexed_indirect(&splash_indirect_buf, 0);
+        }
+
+        // 3. Readback Frame
+        let out_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("Readback Buf"),
+            size: (bytes_per_row * height) as u64,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            TexelCopyTextureInfo {
+                texture: &render_target,
+                mip_level: 0,
+                origin: Origin3d::ZERO,
+                aspect: TextureAspect::All,
+            },
+            TexelCopyBufferInfo {
+                buffer: &out_buf,
+                layout: TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(height),
+                },
+            },
+            Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(encoder.finish()));
+
+        let slice = out_buf.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(MapMode::Read, move |res| {
+            tx.send(res).unwrap();
+        });
+        let _ = device.poll(PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        rx.recv().unwrap().unwrap();
+
+        let data = slice.get_mapped_range().unwrap();
+        let mut img = image::ImageBuffer::<image::Rgba<u8>, _>::new(width, height);
+        for y in 0..height {
+            let row_start = (y * bytes_per_row) as usize;
+            for x in 0..width {
+                let px_start = row_start + (x * bytes_per_pixel) as usize;
+                let r = data[px_start];
+                let g = data[px_start + 1];
+                let b = data[px_start + 2];
+                let a = data[px_start + 3];
+                img.put_pixel(x, y, image::Rgba([r, g, b, a]));
+            }
+        }
+        drop(data);
+        out_buf.unmap();
+
+        let frame_path = format!("target/lyrics_anim/frame_{:03}.png", f);
+        img.save(&frame_path).unwrap();
+
+        if f == 14 {
+            img.save("test_flip_lyrics_impact.png").unwrap();
+        }
+    }
+
+    // Compile animated WebP and GIF using ffmpeg
+    let _ = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-r",
+            "20",
+            "-i",
+            "target/lyrics_anim/frame_%03d.png",
+            "-vcodec",
+            "libwebp",
+            "-lossless",
+            "0",
+            "-compression_level",
+            "4",
+            "-q:v",
+            "85",
+            "-loop",
+            "0",
+            "test_flip_lyrics.webp",
+        ])
+        .output();
+
+    let _ = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-r",
+            "20",
+            "-i",
+            "target/lyrics_anim/frame_%03d.png",
+            "-vf",
+            "fps=18,scale=800:-1:flags=lanczos,split[s0][s1];[s0]palettegen[p];[s1][p]paletteuse",
+            "test_flip_lyrics.gif",
+        ])
+        .output();
+
+    println!(
+        "Saved test_flip_lyrics_impact.png, test_flip_lyrics.webp, and test_flip_lyrics.gif successfully!"
+    );
+}
+
+fn test_render_3d_freq_oscilloscope_snapshot() {
+    pollster::block_on(run_3d_freq_oscilloscope_snapshot());
+}
+
+async fn run_3d_freq_oscilloscope_snapshot() {
+    let instance = Instance::new(InstanceDescriptor {
+        backends: Backends::PRIMARY,
+        flags: InstanceFlags::default(),
+        backend_options: BackendOptions::default(),
+        display: None,
+        memory_budget_thresholds: MemoryBudgetThresholds::default(),
+    });
+
+    let adapter = instance
+        .request_adapter(&RequestAdapterOptions {
+            power_preference: PowerPreference::HighPerformance,
+            compatible_surface: None,
+            force_fallback_adapter: false,
+            apply_limit_buckets: false,
+        })
+        .await
+        .unwrap();
+
+    let (device, queue) = adapter
+        .request_device(&DeviceDescriptor {
+            label: Some("3D Freq Oscilloscope Snapshot Device"),
+            required_features: Features::empty(),
+            required_limits: Limits::default(),
+            memory_hints: MemoryHints::default(),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let width = 1920u32;
+    let height = 1080u32;
+    let color_format = TextureFormat::Rgba8UnormSrgb;
+
+    let render_target = device.create_texture(&TextureDescriptor {
+        label: Some("3D Freq Scope RenderTarget"),
+        size: Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: color_format,
+        usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let color_view = render_target.create_view(&TextureViewDescriptor::default());
+
+    let depth_texture = device.create_texture(&TextureDescriptor {
+        label: Some("3D Freq Scope Depth"),
+        size: Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Depth32Float,
+        usage: TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let depth_view = depth_texture.create_view(&TextureViewDescriptor::default());
+
+    let uniforms = crate::engine::AudioUniforms {
+        spectrum: [0.25; 1024],
+        fire_heat: [0.0; 1024],
+        channels: [0.85; 32],
+        channel_peaks: [0.92; 32],
+        spatial_channels: [0.8; 16],
+        display_order: [0; 16],
+        channel_phases: [0.0; 32],
+        vu_segment_glows: [0; 256],
+        num_channels: 16,
+        mode: 4,
+        time: 4.2,
+        duration: 200.0,
+        smooth_time: 4.2,
+        heatmap_row: 0,
+        fft_channels: 2,
+        num_spatial_channels: 2,
+        ui_meters_rect: [0.0; 4],
+        ui_heatmap_rect: [0.0; 4],
+        ui_fire_rect: [0.0; 4],
+        waveform_resolution: 1024,
+        waveform_history_size: 144,
+        frame_count: 300,
+        step_fraction: 0.25,
+        steps_to_fill: 1,
+        aspect_ratio: (width as f32) / (height as f32),
+        frame_dt: 0.016,
+        history_cam_z: 15.0,
+        fire_intensity: 1.0,
+        waveform_history_ring_base: 0,
+        _pad2: 0.0,
+        _pad3: 0.0,
+    };
+
+    let uniform_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("Uniforms"),
+        size: std::mem::size_of::<crate::engine::AudioUniforms>() as u64,
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+
+    // Populate gpu_spectrum with realistic stereo L/R musical harmonics (on the norm/sqrt(N) scale of src/audio.rs)
+    let mut gpu_spectrum_data = vec![0.0f32; 32 * 1024 * 2];
+    for b in 0..1024usize {
+        let t = (b as f32) / 1024.0;
+        let freq_hz = 20.0 * (t * 8.965784).exp2();
+        let eq_boost = (freq_hz / 45.0).powf(0.28);
+
+        let band = b / 32;
+        let bin_in_band = b % 32;
+
+        // Realistic musical band selectivity (active instruments separated by quiet spectral valleys)
+        let (env_l, env_r) = match band {
+            0..=2 => (1.10, 1.00),   // Deep sub-bass & kick fundamental (centered)
+            3..=5 => (0.04, 0.04),   // Quiet valley above sub-bass
+            6..=9 => (1.05, 0.12),   // Left-panned synth bassline
+            10..=11 => (0.04, 0.04), // Quiet valley
+            12..=15 => (0.10, 0.98), // Right-panned rhythm chord
+            16..=17 => (0.04, 0.04), // Quiet valley
+            18..=21 => (0.88, 0.95), // Stereo mid-range lead
+            22..=24 => (0.04, 0.04), // Quiet valley
+            25..=27 => (0.78, 0.14), // Left-panned upper-mid stab
+            28 => (0.04, 0.04),      // Quiet valley
+            _ => (0.18, 0.82),       // Right-panned treble hi-hat & arpeggio shimmer
+        };
+
+        let is_primary = bin_in_band == 6 || bin_in_band == 18;
+        let is_secondary = bin_in_band == 12 || bin_in_band == 24;
+        let shape = if is_primary {
+            1.0
+        } else if is_secondary {
+            0.55
+        } else {
+            0.05
+        };
+
+        let mag_l = (env_l * shape * 0.42) / eq_boost;
+        let mag_r = (env_r * shape * 0.42) / eq_boost;
+        let phase = (b as f32) * 0.42;
+        gpu_spectrum_data[b * 2] = mag_l * phase.cos();
+        gpu_spectrum_data[b * 2 + 1] = mag_l * phase.sin();
+        gpu_spectrum_data[(1024 + b) * 2] = mag_r * (phase + 0.5).cos();
+        gpu_spectrum_data[(1024 + b) * 2 + 1] = mag_r * (phase + 0.5).sin();
+    }
+
+    let gpu_spectrum_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("GPU FFT Spectrum Buffer"),
+        size: (32 * 1024 * 8) as u64,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(
+        &gpu_spectrum_buffer,
+        0,
+        bytemuck::cast_slice(&gpu_spectrum_data),
+    );
+
+    // Run resynth_compute.wgsl to synthesize the 32x512 frequency waveforms into gpu_spectrum[16*1024..]
+    let resynth_bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("resynth_bind_group_layout"),
+        entries: &[
+            BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 1,
+                visibility: ShaderStages::COMPUTE,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+    let resynth_bind_group = device.create_bind_group(&BindGroupDescriptor {
+        label: Some("resynth_bind_group"),
+        layout: &resynth_bind_group_layout,
+        entries: &[
+            BindGroupEntry {
+                binding: 0,
+                resource: gpu_spectrum_buffer.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 1,
+                resource: uniform_buffer.as_entire_binding(),
+            },
+        ],
+    });
+    let resynth_src = resolve_shader_includes(include_str!("../src/shaders/resynth_compute.wgsl"));
+    let resynth_module = device.create_shader_module(ShaderModuleDescriptor {
+        label: Some("Resynth Compute Module"),
+        source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&resynth_src)),
+    });
+    let resynth_pipe_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+        label: Some("resynth_pipe_layout"),
+        bind_group_layouts: &[Some(&resynth_bind_group_layout)],
+        immediate_size: 0,
+    });
+    let resynth_pipeline = device.create_compute_pipeline(&ComputePipelineDescriptor {
+        label: Some("Resynth Compute Pipeline"),
+        layout: Some(&resynth_pipe_layout),
+        module: &resynth_module,
+        entry_point: Some("main"),
+        compilation_options: Default::default(),
+        cache: None,
+    });
+
+    // Audio & Camera bind groups for 3D render
+    let dummy_waveform = device.create_buffer(&BufferDescriptor {
+        label: Some("Dummy Waveform"),
+        size: 1024,
+        usage: BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let dummy_tex = device.create_texture(&TextureDescriptor {
+        label: Some("Dummy Tex"),
+        size: Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::R32Float,
+        usage: TextureUsages::TEXTURE_BINDING,
+        view_formats: &[],
+    });
+    let dummy_view = dummy_tex.create_view(&TextureViewDescriptor::default());
+
+    let bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("audio_bind_group_layout"),
+        entries: &[
+            BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 1,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 2,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: false },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 3,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: false },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 4,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+
+    let uniform_bind_group = device.create_bind_group(&BindGroupDescriptor {
+        label: Some("audio_bind_group"),
+        layout: &bind_group_layout,
+        entries: &[
+            BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 1,
+                resource: dummy_waveform.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 2,
+                resource: BindingResource::TextureView(&dummy_view),
+            },
+            BindGroupEntry {
+                binding: 3,
+                resource: BindingResource::TextureView(&dummy_view),
+            },
+            BindGroupEntry {
+                binding: 4,
+                resource: gpu_spectrum_buffer.as_entire_binding(),
+            },
+        ],
+    });
+
+    let camera_bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("Camera Bind Group Layout"),
+        entries: &[BindGroupLayoutEntry {
+            binding: 0,
+            visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+            ty: BindingType::Buffer {
+                ty: BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+    let camera_uniforms = crate::engine::CameraUniforms {
+        view_matrix: glam::Mat4::IDENTITY.to_cols_array_2d(),
+        proj_matrix: glam::Mat4::IDENTITY.to_cols_array_2d(),
+    };
+    let camera_uniform_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("Camera Uniforms"),
+        size: std::mem::size_of::<crate::engine::CameraUniforms>() as u64,
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(
+        &camera_uniform_buffer,
+        0,
+        bytemuck::cast_slice(&[camera_uniforms]),
+    );
+    let camera_bind_group = device.create_bind_group(&BindGroupDescriptor {
+        label: Some("Camera Bind Group"),
+        layout: &camera_bind_group_layout,
+        entries: &[BindGroupEntry {
+            binding: 0,
+            resource: camera_uniform_buffer.as_entire_binding(),
+        }],
+    });
+
+    let render_pipeline_layout_3d = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+        label: Some("3D Render Pipeline Layout"),
+        bind_group_layouts: &[Some(&bind_group_layout), Some(&camera_bind_group_layout)],
+        immediate_size: 0,
+    });
+
+    let shader_src =
+        resolve_shader_includes(include_str!("../src/shaders/vis_3doscilloscope_freq.wgsl"));
+    let shader_module = device.create_shader_module(ShaderModuleDescriptor {
+        label: Some("3D Freq Oscilloscope Shader"),
+        source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&shader_src)),
+    });
+
+    let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+        label: Some("3D Freq Oscilloscope Pipeline"),
+        layout: Some(&render_pipeline_layout_3d),
+        vertex: VertexState {
+            module: &shader_module,
+            entry_point: Some("vs_main_3d"),
+            buffers: &[Some(crate::engine::Vertex::desc())],
+            compilation_options: PipelineCompilationOptions::default(),
+        },
+        fragment: Some(FragmentState {
+            module: &shader_module,
+            entry_point: Some("fs_main"),
+            targets: &[Some(ColorTargetState {
+                format: color_format,
+                blend: Some(BlendState {
+                    color: BlendComponent {
+                        src_factor: BlendFactor::One,
+                        dst_factor: BlendFactor::One,
+                        operation: BlendOperation::Add,
+                    },
+                    alpha: BlendComponent::OVER,
+                }),
+                write_mask: ColorWrites::ALL,
+            })],
+            compilation_options: PipelineCompilationOptions::default(),
+        }),
+        primitive: PrimitiveState {
+            topology: PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: Some(DepthStencilState {
+            format: TextureFormat::Depth32Float,
+            depth_write_enabled: Some(false),
+            depth_compare: Some(CompareFunction::LessEqual),
+            stencil: StencilState::default(),
+            bias: DepthBiasState::default(),
+        }),
+        multisample: MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    // Build exact 511 x 1 Grid mesh matching VisualizerDef for ID 4
+    let grid_width = 511u32;
+    let grid_depth = 1u32;
+    let mut vertices = Vec::new();
+    let mut indices = Vec::new();
+    for z in 0..=grid_depth {
+        for x in 0..=grid_width {
+            let px = x as f32 - (grid_width as f32) / 2.0;
+            let pz = z as f32 - (grid_depth as f32) / 2.0;
+            vertices.push(crate::engine::Vertex {
+                position: [px, 0.0, pz],
+                normal: [0.0, 1.0, 0.0],
+                tex_coords: [x as f32 / grid_width as f32, z as f32 / grid_depth as f32],
+            });
+        }
+    }
+    for z in 0..grid_depth {
+        for x in 0..grid_width {
+            let start = z * (grid_width + 1) + x;
+            indices.push(start);
+            indices.push(start + 1);
+            indices.push(start + grid_width + 1);
+            indices.push(start + 1);
+            indices.push(start + grid_width + 2);
+            indices.push(start + grid_width + 1);
+        }
+    }
+
+    let grid_vertex_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("Grid 511x1 Vertex Buffer"),
+        size: (vertices.len() * std::mem::size_of::<crate::engine::Vertex>()) as u64,
+        usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&grid_vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+
+    let grid_index_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("Grid 511x1 Index Buffer"),
+        size: (indices.len() * std::mem::size_of::<u32>()) as u64,
+        usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&grid_index_buffer, 0, bytemuck::cast_slice(&indices));
+    let grid_index_count = indices.len() as u32;
+
+    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
+    {
+        let mut cp = encoder.begin_compute_pass(&ComputePassDescriptor {
+            label: Some("Resynth Compute Pass"),
+            timestamp_writes: None,
+        });
+        cp.set_pipeline(&resynth_pipeline);
+        cp.set_bind_group(0, Some(&resynth_bind_group), &[]);
+        cp.dispatch_workgroups(32, 2, 1);
+    }
+    {
+        let mut rp = encoder.begin_render_pass(&RenderPassDescriptor {
+            label: Some("3D Freq Scope Render Pass"),
+            color_attachments: &[Some(RenderPassColorAttachment {
+                view: &color_view,
+                resolve_target: None,
+                ops: Operations {
+                    load: LoadOp::Clear(Color::BLACK),
+                    store: StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                view: &depth_view,
+                depth_ops: Some(Operations {
+                    load: LoadOp::Clear(1.0),
+                    store: StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        rp.set_pipeline(&pipeline);
+        rp.set_bind_group(0, &uniform_bind_group, &[]);
+        rp.set_bind_group(1, &camera_bind_group, &[]);
+        rp.set_vertex_buffer(0, grid_vertex_buffer.slice(..));
+        rp.set_index_buffer(grid_index_buffer.slice(..), IndexFormat::Uint32);
+        rp.draw_indexed(0..grid_index_count, 0, 0..32);
+    }
+
+    let bytes_per_pixel = 4u32;
+    let unpadded_bytes_per_row = width * bytes_per_pixel;
+    let align = 256u32;
+    let bytes_per_row = (unpadded_bytes_per_row + align - 1) & !(align - 1);
+
+    let out_buf = device.create_buffer(&BufferDescriptor {
+        label: Some("Readback Buf"),
+        size: (bytes_per_row * height) as u64,
+        usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    encoder.copy_texture_to_buffer(
+        TexelCopyTextureInfo {
+            texture: &render_target,
+            mip_level: 0,
+            origin: Origin3d::ZERO,
+            aspect: TextureAspect::All,
+        },
+        TexelCopyBufferInfo {
+            buffer: &out_buf,
+            layout: TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(height),
+            },
+        },
+        Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(Some(encoder.finish()));
+
+    let slice = out_buf.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(MapMode::Read, move |res| {
+        tx.send(res).unwrap();
+    });
+    let _ = device.poll(PollType::Wait {
+        submission_index: None,
+        timeout: None,
+    });
+    rx.recv().unwrap().unwrap();
+
+    let data = slice.get_mapped_range().unwrap();
+    let mut img = image::ImageBuffer::<image::Rgba<u8>, _>::new(width, height);
+    for y in 0..height {
+        let row_start = (y * bytes_per_row) as usize;
+        for x in 0..width {
+            let px_start = row_start + (x * bytes_per_pixel) as usize;
+            let r = data[px_start];
+            let g = data[px_start + 1];
+            let b = data[px_start + 2];
+            let a = data[px_start + 3];
+            img.put_pixel(x, y, image::Rgba([r, g, b, a]));
+        }
+    }
+    drop(data);
+    out_buf.unmap();
+
+    let out_path = std::env::temp_dir().join("vis_3doscilloscope_freq_mesh3d.png");
+    img.save(&out_path).unwrap();
+    println!("Saved 3D Freq Oscilloscope snapshot to {:?}", out_path);
+}
+
+fn test_vis_spectrum_canyon_snapshot() {
+    let instance = Instance::new(InstanceDescriptor {
+        backends: Backends::PRIMARY,
+        flags: InstanceFlags::default(),
+        backend_options: BackendOptions::default(),
+        display: None,
+        memory_budget_thresholds: MemoryBudgetThresholds::default(),
+    });
+
+    let adapter = match pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
+        power_preference: PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+        apply_limit_buckets: false,
+    })) {
+        Ok(a) => a,
+        Err(_) => {
+            println!("No GPU adapter found, skipping test.");
+            return;
+        }
+    };
+
+    let (device, queue) = pollster::block_on(adapter.request_device(&DeviceDescriptor {
+        label: Some("Spectrum Canyon Test Device"),
+        required_features: Features::empty(),
+        required_limits: Limits::default(),
+        memory_hints: MemoryHints::default(),
+        ..Default::default()
+    }))
+    .unwrap();
+
+    let width = 1280u32;
+    let height = 720u32;
+    let aspect = (width as f32) / (height as f32);
+    let color_format = TextureFormat::Rgba8UnormSrgb;
+
+    let render_target = device.create_texture(&TextureDescriptor {
+        label: Some("Spectrum Canyon Target"),
+        size: Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: color_format,
+        usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let color_view = render_target.create_view(&TextureViewDescriptor::default());
+
+    let depth_texture = device.create_texture(&TextureDescriptor {
+        label: Some("Spectrum Canyon Depth"),
+        size: Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::Depth32Float,
+        usage: TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    let depth_view = depth_texture.create_view(&TextureViewDescriptor::default());
+
+    let mut uniforms = crate::engine::AudioUniforms {
+        spectrum: [0.0; 1024],
+        fire_heat: [0.0; 1024],
+        channels: [0.75; 32],
+        channel_peaks: [0.85; 32],
+        spatial_channels: [0.0; 16],
+        display_order: [0; 16],
+        channel_phases: [0.0; 32],
+        vu_segment_glows: [0; 256],
+        num_channels: 2,
+        mode: 29,
+        time: 31.0,
+        duration: 180.0,
+        smooth_time: 31.0,
+        heatmap_row: 64,
+        fft_channels: 2,
+        num_spatial_channels: 2,
+        ui_meters_rect: [0.0; 4],
+        ui_heatmap_rect: [0.0; 4],
+        ui_fire_rect: [0.0; 4],
+        waveform_resolution: 1024,
+        waveform_history_size: 60,
+        frame_count: 1860,
+        step_fraction: 0.25,
+        steps_to_fill: 1,
+        aspect_ratio: aspect,
+        frame_dt: 0.016,
+        history_cam_z: 32.0,
+        fire_intensity: 1.0,
+        waveform_history_ring_base: 0,
+        _pad2: 0.0,
+        _pad3: 0.0,
+    };
+
+    for i in 0..1024 {
+        let f = (i as f32) / 1024.0;
+        let bass_boost = (-f * 6.5).exp() * 92.0;
+        let mid_groove = (-(f - 0.22).powi(2) / 0.025).exp() * 68.0;
+        let high_sparkle = (-(f - 0.58).powi(2) / 0.06).exp() * 48.0;
+        let harmonic_ripple = ((i as f32 * 0.37).sin() * 0.5 + 0.5) * 28.0;
+        let val = (bass_boost + mid_groove + high_sparkle + harmonic_ripple).clamp(8.0, 100.0);
+        uniforms.spectrum[i] = val;
+        uniforms.fire_heat[i] = (val * 1.12).min(100.0);
+    }
+
+    let uniform_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("Audio Uniform Buffer"),
+        size: std::mem::size_of::<crate::engine::AudioUniforms>() as u64,
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+
+    // Populate 256x1024 history texture with animated spectral waves
+    let history_texture = device.create_texture(&TextureDescriptor {
+        label: Some("History Texture"),
+        size: Extent3d {
+            width: 256,
+            height: 1024,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: TextureFormat::R32Float,
+        usage: TextureUsages::TEXTURE_BINDING | TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    let mut history_data = vec![0.0f32; 256 * 1024];
+    for row in 0..1024usize {
+        for bin in 0..256usize {
+            let f = (bin as f32) / 256.0;
+            let wave = ((row as f32 * 0.14 + bin as f32 * 0.23).sin() * 0.5 + 0.5) * 35.0;
+            let env = (-f * 3.2).exp() * 65.0 + 15.0;
+            history_data[row * 256 + bin] = (env + wave).clamp(5.0, 100.0);
+        }
+    }
+    queue.write_texture(
+        TexelCopyTextureInfo {
+            texture: &history_texture,
+            mip_level: 0,
+            origin: Origin3d::ZERO,
+            aspect: TextureAspect::All,
+        },
+        bytemuck::cast_slice(&history_data),
+        TexelCopyBufferLayout {
+            offset: 0,
+            bytes_per_row: Some(256 * 4),
+            rows_per_image: Some(1024),
+        },
+        Extent3d {
+            width: 256,
+            height: 1024,
+            depth_or_array_layers: 1,
+        },
+    );
+    let history_view = history_texture.create_view(&TextureViewDescriptor::default());
+
+    let dummy_waveform = device.create_buffer(&BufferDescriptor {
+        label: Some("Dummy Waveform"),
+        size: 1024,
+        usage: BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+    let dummy_storage = device.create_buffer(&BufferDescriptor {
+        label: Some("Dummy Storage"),
+        size: 1024,
+        usage: BufferUsages::STORAGE,
+        mapped_at_creation: false,
+    });
+
+    let bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("audio_bind_group_layout"),
+        entries: &[
+            BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 1,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 2,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: false },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 3,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Texture {
+                    sample_type: TextureSampleType::Float { filterable: false },
+                    view_dimension: TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            BindGroupLayoutEntry {
+                binding: 4,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+
+    let uniform_bind_group = device.create_bind_group(&BindGroupDescriptor {
+        label: Some("audio_bind_group"),
+        layout: &bind_group_layout,
+        entries: &[
+            BindGroupEntry {
+                binding: 0,
+                resource: uniform_buffer.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 1,
+                resource: dummy_waveform.as_entire_binding(),
+            },
+            BindGroupEntry {
+                binding: 2,
+                resource: BindingResource::TextureView(&history_view),
+            },
+            BindGroupEntry {
+                binding: 3,
+                resource: BindingResource::TextureView(&history_view),
+            },
+            BindGroupEntry {
+                binding: 4,
+                resource: dummy_storage.as_entire_binding(),
+            },
+        ],
+    });
+
+    let camera_bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("Camera Layout"),
+        entries: &[BindGroupLayoutEntry {
+            binding: 0,
+            visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+            ty: BindingType::Buffer {
+                ty: BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+    let fov_y = 48.0_f32.to_radians();
+    let proj = glam::Mat4::perspective_rh_gl(fov_y, aspect, 0.1, 1000.0);
+    let view = glam::Mat4::look_at_rh(
+        glam::Vec3::new(0.0, 0.0, -6.5),
+        glam::Vec3::new(0.0, 0.0, 20.0),
+        glam::Vec3::new(0.0, 1.0, 0.0),
+    );
+    let camera_uniforms = crate::engine::CameraUniforms {
+        view_matrix: view.to_cols_array_2d(),
+        proj_matrix: proj.to_cols_array_2d(),
+    };
+    let camera_uniform_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("Camera Uniforms"),
+        size: std::mem::size_of::<crate::engine::CameraUniforms>() as u64,
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(
+        &camera_uniform_buffer,
+        0,
+        bytemuck::cast_slice(&[camera_uniforms]),
+    );
+    let camera_bind_group = device.create_bind_group(&BindGroupDescriptor {
+        label: Some("Camera BG"),
+        layout: &camera_bind_group_layout,
+        entries: &[BindGroupEntry {
+            binding: 0,
+            resource: camera_uniform_buffer.as_entire_binding(),
+        }],
+    });
+
+    let render_pipeline_layout_3d = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+        label: Some("3D Render Pipeline Layout"),
+        bind_group_layouts: &[Some(&bind_group_layout), Some(&camera_bind_group_layout)],
+        immediate_size: 0,
+    });
+
+    let shader_src =
+        resolve_shader_includes(include_str!("../src/shaders/vis_spectrum_canyon.wgsl"));
+    let shader_module = device.create_shader_module(ShaderModuleDescriptor {
+        label: Some("Spectrum Canyon Shader"),
+        source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&shader_src)),
+    });
+
+    let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+        label: Some("Spectrum Canyon Pipeline"),
+        layout: Some(&render_pipeline_layout_3d),
+        vertex: VertexState {
+            module: &shader_module,
+            entry_point: Some("vs_main_3d"),
+            buffers: &[Some(crate::engine::Vertex::desc())],
+            compilation_options: PipelineCompilationOptions::default(),
+        },
+        fragment: Some(FragmentState {
+            module: &shader_module,
+            entry_point: Some("fs_main"),
+            targets: &[Some(ColorTargetState {
+                format: color_format,
+                blend: Some(BlendState::REPLACE),
+                write_mask: ColorWrites::ALL,
+            })],
+            compilation_options: PipelineCompilationOptions::default(),
+        }),
+        primitive: PrimitiveState {
+            topology: PrimitiveTopology::TriangleList,
+            strip_index_format: None,
+            front_face: FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: Some(DepthStencilState {
+            format: TextureFormat::Depth32Float,
+            depth_write_enabled: Some(true),
+            depth_compare: Some(CompareFunction::LessEqual),
+            stencil: StencilState::default(),
+            bias: DepthBiasState::default(),
+        }),
+        multisample: MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    // Build UnitBox mesh (24 vertices, 36 indices)
+    let mut vertices = Vec::with_capacity(24);
+    let mut indices = Vec::with_capacity(36);
+    let faces: [([f32; 3], [[f32; 3]; 4]); 6] = [
+        (
+            [0.0, 0.0, 1.0],
+            [
+                [-0.5, -0.5, 0.5],
+                [0.5, -0.5, 0.5],
+                [0.5, 0.5, 0.5],
+                [-0.5, 0.5, 0.5],
+            ],
+        ),
+        (
+            [0.0, 0.0, -1.0],
+            [
+                [0.5, -0.5, -0.5],
+                [-0.5, -0.5, -0.5],
+                [-0.5, 0.5, -0.5],
+                [0.5, 0.5, -0.5],
+            ],
+        ),
+        (
+            [-1.0, 0.0, 0.0],
+            [
+                [-0.5, -0.5, -0.5],
+                [-0.5, -0.5, 0.5],
+                [-0.5, 0.5, 0.5],
+                [-0.5, 0.5, -0.5],
+            ],
+        ),
+        (
+            [1.0, 0.0, 0.0],
+            [
+                [0.5, -0.5, 0.5],
+                [0.5, -0.5, -0.5],
+                [0.5, 0.5, -0.5],
+                [0.5, 0.5, 0.5],
+            ],
+        ),
+        (
+            [0.0, 1.0, 0.0],
+            [
+                [-0.5, 0.5, 0.5],
+                [0.5, 0.5, 0.5],
+                [0.5, 0.5, -0.5],
+                [-0.5, 0.5, -0.5],
+            ],
+        ),
+        (
+            [0.0, -1.0, 0.0],
+            [
+                [-0.5, -0.5, -0.5],
+                [0.5, -0.5, -0.5],
+                [0.5, -0.5, 0.5],
+                [-0.5, -0.5, 0.5],
+            ],
+        ),
+    ];
+    let uvs = [[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]];
+    for (normal, quad) in faces {
+        let base = vertices.len() as u32;
+        for (i, pos) in quad.into_iter().enumerate() {
+            vertices.push(crate::engine::Vertex {
+                position: pos,
+                normal,
+                tex_coords: uvs[i],
+            });
+        }
+        indices.extend_from_slice(&[base, base + 1, base + 2, base, base + 2, base + 3]);
+    }
+
+    let box_vertex_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("UnitBox Vertex Buffer"),
+        size: (vertices.len() * std::mem::size_of::<crate::engine::Vertex>()) as u64,
+        usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&box_vertex_buffer, 0, bytemuck::cast_slice(&vertices));
+
+    let box_index_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("UnitBox Index Buffer"),
+        size: (indices.len() * std::mem::size_of::<u32>()) as u64,
+        usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&box_index_buffer, 0, bytemuck::cast_slice(&indices));
+    let box_index_count = indices.len() as u32;
+
+    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
+    {
+        let mut rp = encoder.begin_render_pass(&RenderPassDescriptor {
+            label: Some("Spectrum Canyon Render Pass"),
+            color_attachments: &[Some(RenderPassColorAttachment {
+                view: &color_view,
+                resolve_target: None,
+                ops: Operations {
+                    load: LoadOp::Clear(Color::BLACK),
+                    store: StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                view: &depth_view,
+                depth_ops: Some(Operations {
+                    load: LoadOp::Clear(1.0),
+                    store: StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        rp.set_pipeline(&pipeline);
+        rp.set_bind_group(0, &uniform_bind_group, &[]);
+        rp.set_bind_group(1, &camera_bind_group, &[]);
+        rp.set_vertex_buffer(0, box_vertex_buffer.slice(..));
+        rp.set_index_buffer(box_index_buffer.slice(..), IndexFormat::Uint32);
+        rp.draw_indexed(0..box_index_count, 0, 0..8193);
+    }
+
+    let bytes_per_pixel = 4u32;
+    let unpadded_bytes_per_row = width * bytes_per_pixel;
+    let align = 256u32;
+    let bytes_per_row = (unpadded_bytes_per_row + align - 1) & !(align - 1);
+
+    let out_buf = device.create_buffer(&BufferDescriptor {
+        label: Some("Readback Buf"),
+        size: (bytes_per_row * height) as u64,
+        usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    encoder.copy_texture_to_buffer(
+        TexelCopyTextureInfo {
+            texture: &render_target,
+            mip_level: 0,
+            origin: Origin3d::ZERO,
+            aspect: TextureAspect::All,
+        },
+        TexelCopyBufferInfo {
+            buffer: &out_buf,
+            layout: TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(height),
+            },
+        },
+        Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(Some(encoder.finish()));
+
+    let slice = out_buf.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(MapMode::Read, move |res| {
+        tx.send(res).unwrap();
+    });
+    let _ = device.poll(PollType::Wait {
+        submission_index: None,
+        timeout: None,
+    });
+    rx.recv().unwrap().unwrap();
+
+    let data = slice.get_mapped_range().unwrap();
+    let mut img = image::ImageBuffer::<image::Rgba<u8>, _>::new(width, height);
+    let mut non_black_pixels = 0usize;
+    for y in 0..height {
+        let row_start = (y * bytes_per_row) as usize;
+        for x in 0..width {
+            let px_start = row_start + (x * bytes_per_pixel) as usize;
+            let r = data[px_start];
+            let g = data[px_start + 1];
+            let b = data[px_start + 2];
+            let a = data[px_start + 3];
+            if r > 20 || g > 20 || b > 20 {
+                non_black_pixels += 1;
+            }
+            img.put_pixel(x, y, image::Rgba([r, g, b, a]));
+        }
+    }
+    drop(data);
+    out_buf.unmap();
+
+    assert!(
+        non_black_pixels > (width as usize * height as usize) / 4,
+        "Expected vibrant 3D canyon output, got only {} non-black pixels",
+        non_black_pixels
+    );
+
+    let out_path = std::path::PathBuf::from("target/vis_spectrum_canyon.png");
+    img.save(&out_path).unwrap();
+    println!("Saved Prismatic Spectrum Canyon snapshot to {:?}", out_path);
+
+    // Verify that the central red region (around x = 600..680) has a wide range of movement across time
+    uniforms.smooth_time = 31.75;
+    uniforms.time = 31.75;
+    queue.write_buffer(&uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+
+    let mut encoder2 = device.create_command_encoder(&CommandEncoderDescriptor::default());
+    {
+        let mut rp = encoder2.begin_render_pass(&RenderPassDescriptor {
+            label: Some("Spectrum Canyon Render Pass t2"),
+            color_attachments: &[Some(RenderPassColorAttachment {
+                view: &color_view,
+                resolve_target: None,
+                ops: Operations {
+                    load: LoadOp::Clear(Color::BLACK),
+                    store: StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                view: &depth_view,
+                depth_ops: Some(Operations {
+                    load: LoadOp::Clear(1.0),
+                    store: StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        rp.set_pipeline(&pipeline);
+        rp.set_bind_group(0, &uniform_bind_group, &[]);
+        rp.set_bind_group(1, &camera_bind_group, &[]);
+        rp.set_vertex_buffer(0, box_vertex_buffer.slice(..));
+        rp.set_index_buffer(box_index_buffer.slice(..), IndexFormat::Uint32);
+        rp.draw_indexed(0..box_index_count, 0, 0..8193);
+    }
+    encoder2.copy_texture_to_buffer(
+        TexelCopyTextureInfo {
+            texture: &render_target,
+            mip_level: 0,
+            origin: Origin3d::ZERO,
+            aspect: TextureAspect::All,
+        },
+        TexelCopyBufferInfo {
+            buffer: &out_buf,
+            layout: TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(height),
+            },
+        },
+        Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(Some(encoder2.finish()));
+
+    let slice2 = out_buf.slice(..);
+    let (tx2, rx2) = std::sync::mpsc::channel();
+    slice2.map_async(MapMode::Read, move |res| {
+        tx2.send(res).unwrap();
+    });
+    let _ = device.poll(PollType::Wait {
+        submission_index: None,
+        timeout: None,
+    });
+    rx2.recv().unwrap().unwrap();
+
+    let data2 = slice2.get_mapped_range().unwrap();
+    let mut center_diff_pixels = 0usize;
+    for y in 120..600 {
+        let row_start = (y * bytes_per_row) as usize;
+        for x in 590..690 {
+            let px_start = row_start + (x * bytes_per_pixel) as usize;
+            let r2 = data2[px_start];
+            let r1 = img.get_pixel(x, y)[0];
+            if r1.abs_diff(r2) > 40 {
+                center_diff_pixels += 1;
+            }
+        }
+    }
+    drop(data2);
+    out_buf.unmap();
+
+    assert!(
+        center_diff_pixels > 8000,
+        "Expected wide range of movement in the central red spire across time, got only {} changed pixels",
+        center_diff_pixels
+    );
+}
+
+fn test_vis_midnight_storm_snapshot() {
+    let instance = Instance::new(InstanceDescriptor {
+        backends: Backends::PRIMARY,
+        flags: InstanceFlags::default(),
+        backend_options: BackendOptions::default(),
+        display: None,
+        memory_budget_thresholds: MemoryBudgetThresholds::default(),
+    });
+
+    let adapter = match pollster::block_on(instance.request_adapter(&RequestAdapterOptions {
+        power_preference: PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+        apply_limit_buckets: false,
+    })) {
+        Ok(a) => a,
+        Err(_) => {
+            println!("No GPU adapter found, skipping test.");
+            return;
+        }
+    };
+
+    let (device, queue) = pollster::block_on(adapter.request_device(&DeviceDescriptor {
+        label: Some("Midnight Storm Test Device"),
+        required_features: Features::empty(),
+        required_limits: Limits::default(),
+        memory_hints: MemoryHints::default(),
+        ..Default::default()
+    }))
+    .unwrap();
+
+    let width = 1280u32;
+    let height = 720u32;
+    let aspect = (width as f32) / (height as f32);
+    let color_format = TextureFormat::Rgba8UnormSrgb;
+
+    let render_target = device.create_texture(&TextureDescriptor {
+        label: Some("Midnight Storm Target"),
+        size: Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: TextureDimension::D2,
+        format: color_format,
+        usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let color_view = render_target.create_view(&TextureViewDescriptor::default());
+
+    let mut uniforms = crate::engine::AudioUniforms {
+        spectrum: [0.0; 1024],
+        fire_heat: [0.0; 1024],
+        channels: [0.88; 32],
+        channel_peaks: [0.95; 32],
+        spatial_channels: [0.85; 16],
+        display_order: [0; 16],
+        channel_phases: [0.0; 32],
+        vu_segment_glows: [0; 256],
+        num_channels: 16,
+        mode: 16,
+        time: 12.02,
+        duration: 180.0,
+        smooth_time: 12.02,
+        heatmap_row: 64,
+        fft_channels: 2,
+        num_spatial_channels: 12,
+        ui_meters_rect: [0.0; 4],
+        ui_heatmap_rect: [0.0; 4],
+        ui_fire_rect: [0.0; 4],
+        waveform_resolution: 1024,
+        waveform_history_size: 60,
+        frame_count: 720,
+        step_fraction: 0.25,
+        steps_to_fill: 1,
+        aspect_ratio: aspect,
+        frame_dt: 0.016,
+        history_cam_z: 32.0,
+        fire_intensity: 1.0,
+        waveform_history_ring_base: 0,
+        _pad2: 0.0,
+        _pad3: 0.0,
+    };
+
+    for i in 0..1024 {
+        let f = (i as f32) / 1024.0;
+        let bass_boost = (-f * 6.5).exp() * 94.0;
+        let mid_groove = (-(f - 0.18).powi(2) / 0.025).exp() * 74.0;
+        let high_sparkle = (-(f - 0.55).powi(2) / 0.06).exp() * 62.0;
+        let val = (bass_boost + mid_groove + high_sparkle).clamp(10.0, 100.0);
+        uniforms.spectrum[i] = val;
+    }
+
+    let uniform_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("Audio Uniform Buffer"),
+        size: std::mem::size_of::<crate::engine::AudioUniforms>() as u64,
+        usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(&uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
+
+    let bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+        label: Some("storm_bind_group_layout"),
+        entries: &[BindGroupLayoutEntry {
+            binding: 0,
+            visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+            ty: BindingType::Buffer {
+                ty: BufferBindingType::Uniform,
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        }],
+    });
+
+    let uniform_bind_group = device.create_bind_group(&BindGroupDescriptor {
+        label: Some("storm_bind_group"),
+        layout: &bind_group_layout,
+        entries: &[BindGroupEntry {
+            binding: 0,
+            resource: uniform_buffer.as_entire_binding(),
+        }],
+    });
+
+    let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+        label: Some("Storm Pipeline Layout"),
+        bind_group_layouts: &[Some(&bind_group_layout)],
+        immediate_size: 0,
+    });
+
+    let full_source = resolve_shader_includes(include_str!("../src/shaders/vis_rain.wgsl"));
+    let shader_module = device.create_shader_module(ShaderModuleDescriptor {
+        label: Some("Midnight Storm Shader"),
+        source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&full_source)),
+    });
+
+    let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+        label: Some("Midnight Storm Pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: VertexState {
+            module: &shader_module,
+            entry_point: Some("vs_main"),
+            buffers: &[],
+            compilation_options: PipelineCompilationOptions::default(),
+        },
+        fragment: Some(FragmentState {
+            module: &shader_module,
+            entry_point: Some("fs_main"),
+            targets: &[Some(ColorTargetState {
+                format: color_format,
+                blend: Some(BlendState::REPLACE),
+                write_mask: ColorWrites::ALL,
+            })],
+            compilation_options: PipelineCompilationOptions::default(),
+        }),
+        primitive: PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: MultisampleState::default(),
+        multiview_mask: None,
+        cache: None,
+    });
+
+    let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor::default());
+    {
+        let mut rp = encoder.begin_render_pass(&RenderPassDescriptor {
+            label: Some("Midnight Storm Render Pass"),
+            color_attachments: &[Some(RenderPassColorAttachment {
+                view: &color_view,
+                resolve_target: None,
+                ops: Operations {
+                    load: LoadOp::Clear(Color::BLACK),
+                    store: StoreOp::Store,
+                },
+                depth_slice: None,
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        rp.set_pipeline(&pipeline);
+        rp.set_bind_group(0, &uniform_bind_group, &[]);
+        rp.draw(0..3, 0..1);
+    }
+
+    let bytes_per_pixel = 4u32;
+    let unpadded_bytes_per_row = width * bytes_per_pixel;
+    let align = 256u32;
+    let bytes_per_row = (unpadded_bytes_per_row + align - 1) & !(align - 1);
+
+    let out_buf = device.create_buffer(&BufferDescriptor {
+        label: Some("Storm Readback Buf"),
+        size: (bytes_per_row * height) as u64,
+        usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+        mapped_at_creation: false,
+    });
+    encoder.copy_texture_to_buffer(
+        TexelCopyTextureInfo {
+            texture: &render_target,
+            mip_level: 0,
+            origin: Origin3d::ZERO,
+            aspect: TextureAspect::All,
+        },
+        TexelCopyBufferInfo {
+            buffer: &out_buf,
+            layout: TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(height),
+            },
+        },
+        Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+    );
+    queue.submit(Some(encoder.finish()));
+
+    let slice = out_buf.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(MapMode::Read, move |res| {
+        tx.send(res).unwrap();
+    });
+    let _ = device.poll(PollType::Wait {
+        submission_index: None,
+        timeout: None,
+    });
+    rx.recv().unwrap().unwrap();
+
+    let data = slice.get_mapped_range().unwrap();
+    let mut img = image::ImageBuffer::<image::Rgba<u8>, _>::new(width, height);
+    let mut bright_bolt_pixels = 0usize;
+    for y in 0..height {
+        let row_start = (y * bytes_per_row) as usize;
+        for x in 0..width {
+            let px_start = row_start + (x * bytes_per_pixel) as usize;
+            let r = data[px_start];
+            let g = data[px_start + 1];
+            let b = data[px_start + 2];
+            let a = data[px_start + 3];
+            if r > 200 && g > 210 && b > 235 {
+                bright_bolt_pixels += 1;
+            }
+            img.put_pixel(x, y, image::Rgba([r, g, b, a]));
+        }
+    }
+    drop(data);
+    out_buf.unmap();
+
+    let out_path = std::path::PathBuf::from("target/vis_midnight_storm.png");
+    img.save(&out_path).unwrap();
+    println!(
+        "Saved Midnight Storm snapshot to {:?} (bright_bolt_pixels={})",
+        out_path, bright_bolt_pixels
+    );
+
+    assert!(
+        bright_bolt_pixels > 400,
+        "Expected active lightning plasma cores, got only {} bright pixels",
+        bright_bolt_pixels
+    );
+}

@@ -140,14 +140,19 @@ pub fn start_bitstream_thread(
         state.stats.video_bitrate_kbps = video_bitrate_kbps;
     }
 
-    let pw_rate = if codec_name == "truehd" || codec_name == "dts" {
-        192000
-    } else {
-        48000
+    let raw_profile = unsafe { (*parameters.as_ptr()).profile };
+    let (pw_rate, pw_channels): (u32, u16) = match codec_name.as_str() {
+        "truehd" => (192000, 8),
+        "eac3" => (192000, 2),
+        // DTS-HD HRA (50), MA (60), MA X (61), MA X IMAX (62) use 8-channel 192 kHz HBR IEC 61937 carrier;
+        // Core DTS / ES / 96_24 use 2-channel 48 kHz carrier.
+        "dts" if matches!(raw_profile, 50 | 60 | 61 | 62) => (192000, 8),
+        "dts" | "ac3" => (48000, 2),
+        _ => (48000, 2),
     };
     println!(
-        "[bitstream] Codec: {}, Decoder Rate: {}, Output Rate: {}",
-        codec_name, decoder_sample_rate, pw_rate
+        "[bitstream] Codec: {}, Decoder Rate: {}, Output Carrier: {}ch @ {}Hz",
+        codec_name, decoder_sample_rate, pw_channels, pw_rate
     );
 
     let spawn_pipewire_stdin = |program: &str, extra_play_flag: bool| {
@@ -158,7 +163,7 @@ pub fn start_bitstream_thread(
         cmd.arg("--properties=node.passthrough=true")
             .arg("--format=s16")
             .arg(format!("--rate={}", pw_rate))
-            .arg("--channels=2")
+            .arg(format!("--channels={}", pw_channels))
             .arg("-")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::null())
@@ -173,7 +178,7 @@ pub fn start_bitstream_thread(
         .arg("-r")
         .arg(pw_rate.to_string())
         .arg("-c")
-        .arg("2")
+        .arg(pw_channels.to_string())
         .arg("--raw")
         .arg("-")
         .stdin(std::process::Stdio::piped())
@@ -247,6 +252,10 @@ pub fn start_bitstream_thread(
         let params_for_pump = parameters.clone();
         let stop_for_pump = stop_token.clone();
         let state_for_pump = shared_state.clone();
+        let rt_control_for_pump = shared_state
+            .lock()
+            .map(|s| s.rt_control.clone())
+            .unwrap_or_default();
         let tx_for_pump = tx.clone();
         let spdif_rx_for_pump = spdif_rx.clone();
 
@@ -274,6 +283,7 @@ pub fn start_bitstream_thread(
             dict.set("flush_packets", "1");
             if spdif_out.octx.write_header_with(dict).is_err() {
                 println!("[bitstream] Failed to write spdif header to PipeWire stdin");
+                rt_control_for_pump.signal_audio_device_lost();
                 return;
             }
             let Some(ost_stream) = spdif_out.octx.stream(ost_index) else {
@@ -282,20 +292,14 @@ pub fn start_bitstream_thread(
             let ost_time_base = ost_stream.time_base();
 
             let mut sent_paused_preview_epoch: Option<u64> = None;
-            let (mut is_paused, mut latest_epoch) = if let Ok(state) = state_for_pump.lock() {
-                (state.is_paused, state.seek_epoch)
-            } else {
-                (false, 0)
-            };
+            let mut pending_post_seek_item: Option<SpdifItem> = None;
 
             loop {
                 if stop_for_pump.load(std::sync::atomic::Ordering::Relaxed) {
                     break;
                 }
-                if let Ok(state) = state_for_pump.try_lock() {
-                    is_paused = state.is_paused;
-                    latest_epoch = state.seek_epoch;
-                }
+                let is_paused = rt_control_for_pump.is_paused();
+                let latest_epoch = rt_control_for_pump.seek_epoch();
 
                 if is_paused {
                     if let Ok(mut state) = state_for_pump.try_lock() {
@@ -303,37 +307,48 @@ pub fn start_bitstream_thread(
                         state.raw_spectrum_data.fill(0.0);
                         state.gpu_spectrum_data.fill(0.0);
                     }
-                    // If a seek occurred while paused, drain stale packets and emit the first post-seek DspMessage
-                    while let Ok(item) = spdif_rx_for_pump.try_recv() {
-                        if item.epoch < latest_epoch {
-                            continue;
+                    if pending_post_seek_item
+                        .as_ref()
+                        .is_some_and(|it| it.epoch < latest_epoch)
+                    {
+                        pending_post_seek_item = None;
+                    }
+                    // Hold the first post-seek packet rather than dropping it so resuming
+                    // writes clean contiguous bitstream audio.
+                    if pending_post_seek_item.is_none() {
+                        while let Ok(item) = spdif_rx_for_pump.try_recv() {
+                            if item.epoch < latest_epoch {
+                                continue;
+                            }
+                            if sent_paused_preview_epoch != Some(item.epoch)
+                                && let Some(first_msg) = item.dsp_messages.first()
+                            {
+                                let _ = tx_for_pump.try_send(first_msg.clone());
+                                sent_paused_preview_epoch = Some(item.epoch);
+                            }
+                            pending_post_seek_item = Some(item);
+                            break;
                         }
-                        if sent_paused_preview_epoch != Some(item.epoch)
-                            && let Some(first_msg) = item.dsp_messages.first()
-                        {
-                            let _ = tx_for_pump.try_send(first_msg.clone());
-                            sent_paused_preview_epoch = Some(item.epoch);
-                        }
-                        break;
                     }
                     std::thread::sleep(std::time::Duration::from_millis(15));
                     continue;
                 }
 
-                match spdif_rx_for_pump.recv_timeout(std::time::Duration::from_millis(25)) {
+                let next_item = if let Some(held) = pending_post_seek_item.take() {
+                    Ok(held)
+                } else {
+                    spdif_rx_for_pump.recv_timeout(std::time::Duration::from_millis(25))
+                };
+
+                match next_item {
                     Ok(mut item) => {
-                        let cur_epoch = state_for_pump
-                            .try_lock()
-                            .map(|s| s.seek_epoch)
-                            .unwrap_or(latest_epoch);
+                        let cur_epoch = rt_control_for_pump.seek_epoch();
                         if item.epoch < cur_epoch {
                             continue;
                         }
                         if item.is_eof {
-                            if let Ok(mut state) = state_for_pump.lock()
-                                && state.seek_epoch == item.epoch
-                            {
-                                state.track_ended = true;
+                            if rt_control_for_pump.seek_epoch() == item.epoch {
+                                rt_control_for_pump.signal_track_ended();
                             }
                             continue;
                         }
@@ -341,10 +356,8 @@ pub fn start_bitstream_thread(
                         item.packet.set_stream(ost_index);
                         if item.packet.write(&mut spdif_out.octx).is_err() {
                             spdif_out.abort_flush = true;
-                            if !stop_for_pump.load(std::sync::atomic::Ordering::Relaxed)
-                                && let Ok(mut state) = state_for_pump.lock()
-                            {
-                                state.audio_device_lost = true;
+                            if !stop_for_pump.load(std::sync::atomic::Ordering::Relaxed) {
+                                rt_control_for_pump.signal_audio_device_lost();
                             }
                             break;
                         }
@@ -975,13 +988,85 @@ mod wasapi_bitstream {
     use std::io::Read;
     use std::ptr;
     use std::sync::{Arc, Mutex, atomic::AtomicBool};
-    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE};
     use windows::Win32::Media::Audio::*;
     use windows::Win32::System::Com::*;
     use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
-    use windows::core::GUID;
+    use windows::core::{GUID, PWSTR};
 
     const WAIT_OBJECT_0: u32 = 0;
+    static PIPE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+    /// RAII guard for COM initialization on dedicated audio threads (`CoUninitialize` on Drop).
+    struct ComGuard(bool);
+
+    impl ComGuard {
+        fn new_multithreaded() -> Self {
+            Self(unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) }.is_ok())
+        }
+    }
+
+    impl Drop for ComGuard {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe {
+                    CoUninitialize();
+                }
+            }
+        }
+    }
+
+    /// RAII guard for COM-allocated `PWSTR` strings (`CoTaskMemFree` on Drop).
+    struct CoTaskMemPwstr(PWSTR);
+
+    impl CoTaskMemPwstr {
+        fn to_string_lossy(&self) -> Option<String> {
+            if self.0.is_null() {
+                None
+            } else {
+                unsafe { self.0.to_string().ok() }
+            }
+        }
+    }
+
+    impl Drop for CoTaskMemPwstr {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe {
+                    CoTaskMemFree(Some(self.0.0 as *const std::ffi::c_void));
+                }
+            }
+        }
+    }
+
+    /// RAII guard for Win32 `HANDLE` values (`CloseHandle` on Drop).
+    struct OwnedHandle(HANDLE);
+
+    impl OwnedHandle {
+        fn new(handle: HANDLE) -> Self {
+            Self(handle)
+        }
+
+        fn raw(&self) -> HANDLE {
+            self.0
+        }
+
+        fn into_raw(mut self) -> HANDLE {
+            let h = self.0;
+            self.0 = HANDLE(std::ptr::null_mut());
+            h
+        }
+    }
+
+    impl Drop for OwnedHandle {
+        fn drop(&mut self) {
+            if !self.0.is_null() && self.0 != INVALID_HANDLE_VALUE {
+                unsafe {
+                    let _ = CloseHandle(self.0);
+                }
+            }
+        }
+    }
     static PIPE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
     // ─── Standard PCM & IEEE Float WASAPI SubFormat GUIDs ──────────
@@ -1091,7 +1176,7 @@ mod wasapi_bitstream {
         device: &IMMDevice,
         profile: &AudioProfile,
         format: &[u8],
-    ) -> anyhow::Result<(IAudioClient, IAudioRenderClient, HANDLE, u32)> {
+    ) -> anyhow::Result<(IAudioClient, IAudioRenderClient, OwnedHandle, u32)> {
         let mut audio_client: IAudioClient = unsafe { device.Activate(CLSCTX_ALL, None)? };
         let mut default_period = 0;
         let mut min_period = 0;
@@ -1144,20 +1229,14 @@ mod wasapi_bitstream {
                 hr.map_err(|e| anyhow::anyhow!(e))?;
             }
         }
-        let event = unsafe { CreateEventW(None, false, false, None)? };
-        if let Err(e) = unsafe { audio_client.SetEventHandle(event) } {
-            unsafe {
-                let _ = CloseHandle(event);
-            }
+        let event = OwnedHandle::new(unsafe { CreateEventW(None, false, false, None)? });
+        if let Err(e) = unsafe { audio_client.SetEventHandle(event.raw()) } {
             return Err(anyhow::anyhow!(e));
         }
         let buffer_frames = unsafe { audio_client.GetBufferSize()? };
         let render_client: IAudioRenderClient = match unsafe { audio_client.GetService() } {
             Ok(rc) => rc,
             Err(e) => {
-                unsafe {
-                    let _ = CloseHandle(event);
-                }
                 return Err(anyhow::anyhow!(e));
             }
         };
@@ -1166,8 +1245,8 @@ mod wasapi_bitstream {
 
     fn detect_codec_profile(
         codec_id: ffmpeg_next::codec::Id,
-        src_channels: u16,
-        src_rate: u32,
+        _src_channels: u16,
+        _src_rate: u32,
     ) -> Result<(String, WasapiStreamType, Vec<AudioProfile>)> {
         match codec_id {
             ffmpeg_next::codec::Id::TRUEHD => Ok((
@@ -1256,87 +1335,7 @@ mod wasapi_bitstream {
                     sample_format: ffmpeg_next::format::sample::Sample::None,
                 }],
             )),
-            // Uncompressed Multi-Channel LPCM (only when >2 channels; stereo uses shared mode)
-            // Uncompressed Multi-Channel LPCM now uses WASAPI Shared Mode via cpal; Exclusive Mode is restricted to compressed bitstreams
-            id if false && src_channels > 2 => {
-                let codec_name = match id {
-                    ffmpeg_next::codec::Id::FLAC => "flac",
-                    ffmpeg_next::codec::Id::ALAC => "alac",
-                    ffmpeg_next::codec::Id::WAVPACK => "wavpack",
-                    _ if format!("{:?}", id).starts_with("PCM_") => "pcm",
-                    _ => "multichannel_pcm",
-                }
-                .to_string();
-
-                let mut profiles = Vec::new();
-                let rates_to_try = if src_rate != 48000 {
-                    vec![src_rate, 48000]
-                } else {
-                    vec![src_rate]
-                };
-
-                let channel_configs: Vec<(u16, u32)> = match src_channels {
-                    6 => vec![(6, 0x3F), (6, 0x60F), (8, 0x63F)],
-                    8 => vec![(8, 0x63F), (6, 0x3F)],
-                    4 => vec![(4, 0x33), (6, 0x3F)],
-                    2 => vec![(2, 0x3)],
-                    _ => vec![(src_channels, if src_channels <= 6 { 0x3F } else { 0x63F })],
-                };
-
-                for &rate in &rates_to_try {
-                    for &(ch, mask) in &channel_configs {
-                        profiles.push(AudioProfile {
-                            name: format!(
-                                "Multi-Channel LPCM 32-bit Float ({}ch x {}Hz, mask 0x{:X})",
-                                ch, rate, mask
-                            ),
-                            stream_type: WasapiStreamType::Lpcm,
-                            channels: ch,
-                            rate,
-                            valid_bits: 32,
-                            container_bits: 32,
-                            channel_mask: mask,
-                            sub_format: KSDATAFORMAT_SUBTYPE_IEEE_FLOAT,
-                            sample_format: ffmpeg_next::format::sample::Sample::F32(
-                                ffmpeg_next::format::sample::Type::Packed,
-                            ),
-                        });
-                        profiles.push(AudioProfile {
-                            name: format!(
-                                "Multi-Channel LPCM 16-bit ({}ch x {}Hz, mask 0x{:X})",
-                                ch, rate, mask
-                            ),
-                            stream_type: WasapiStreamType::Lpcm,
-                            channels: ch,
-                            rate,
-                            valid_bits: 16,
-                            container_bits: 16,
-                            channel_mask: mask,
-                            sub_format: KSDATAFORMAT_SUBTYPE_PCM,
-                            sample_format: ffmpeg_next::format::sample::Sample::I16(
-                                ffmpeg_next::format::sample::Type::Packed,
-                            ),
-                        });
-                        profiles.push(AudioProfile {
-                            name: format!(
-                                "Multi-Channel LPCM 24-bit ({}ch x {}Hz, mask 0x{:X})",
-                                ch, rate, mask
-                            ),
-                            stream_type: WasapiStreamType::Lpcm,
-                            channels: ch,
-                            rate,
-                            valid_bits: 24,
-                            container_bits: 32,
-                            channel_mask: mask,
-                            sub_format: KSDATAFORMAT_SUBTYPE_PCM,
-                            sample_format: ffmpeg_next::format::sample::Sample::I32(
-                                ffmpeg_next::format::sample::Type::Packed,
-                            ),
-                        });
-                    }
-                }
-                Ok((codec_name, WasapiStreamType::Lpcm, profiles))
-            }
+            // Uncompressed Multi-Channel LPCM uses WASAPI Shared Mode via cpal; Exclusive Mode is restricted to compressed bitstreams
             _ => Err(anyhow::anyhow!(
                 "Unsupported codec for bitstreaming or exclusive multi-channel LPCM: {:?}",
                 codec_id
@@ -1570,12 +1569,15 @@ mod wasapi_bitstream {
         let meta_duration_pump = meta_duration;
 
         let handle = std::thread::spawn(move || {
+            let _com_guard = ComGuard::new_multithreaded();
             let custom_io = custom_io;
             let ictx = ictx;
-            // Initialize COM strictly on this dedicated thread
-            unsafe {
-                let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-            }
+
+            let rt_control_pump = shared_state_pump
+                .lock()
+                .ok()
+                .map(|s| s.rt_control.clone())
+                .unwrap_or_default();
 
             let setup_result: Result<_> = (|| {
                 let custom_io = custom_io;
@@ -1604,12 +1606,10 @@ mod wasapi_bitstream {
                     for i in 0..count {
                         if let Ok(dev) = unsafe { collection.Item(i) } {
                             let dev_name = get_device_name(&dev).unwrap_or_default();
-                            let dev_id = unsafe {
-                                dev.GetId()
-                                    .ok()
-                                    .and_then(|id| id.to_string().ok())
-                                    .unwrap_or_default()
-                            };
+                            let dev_id = unsafe { dev.GetId().ok() }
+                                .map(CoTaskMemPwstr)
+                                .and_then(|pw| pw.to_string_lossy())
+                                .unwrap_or_default();
                             if dev_name.to_lowercase().contains(&target_lower)
                                 || target_lower.contains(&dev_name.to_lowercase())
                                 || dev_id == *target
@@ -1635,7 +1635,7 @@ mod wasapi_bitstream {
                 type NegotiatedClient = (
                     IAudioClient,
                     IAudioRenderClient,
-                    HANDLE,
+                    OwnedHandle,
                     u32,
                     AudioProfile,
                     Vec<u8>,
@@ -1777,28 +1777,27 @@ mod wasapi_bitstream {
                         );
                         let pipe_name_nul = format!("{}\0", pipe_name);
 
-                        let pipe_handle = match unsafe {
-                            CreateNamedPipeA(
-                                windows::core::PCSTR::from_raw(pipe_name_nul.as_ptr()),
-                                FILE_FLAGS_AND_ATTRIBUTES(1), // PIPE_ACCESS_INBOUND
-                                NAMED_PIPE_MODE(0), // PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT
-                                255,                // PIPE_UNLIMITED_INSTANCES
-                                65536,
-                                65536,
-                                0,
-                                None,
-                            )
-                        } {
-                            Ok(h) => h,
-                            Err(e) => {
-                                drop(render_client);
-                                drop(audio_client);
-                                unsafe {
-                                    let _ = CloseHandle(event);
+                        let pipe_handle = OwnedHandle::new(
+                            match unsafe {
+                                CreateNamedPipeA(
+                                    windows::core::PCSTR::from_raw(pipe_name_nul.as_ptr()),
+                                    FILE_FLAGS_AND_ATTRIBUTES(1), // PIPE_ACCESS_INBOUND
+                                    NAMED_PIPE_MODE(0), // PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT
+                                    255,                // PIPE_UNLIMITED_INSTANCES
+                                    65536,
+                                    65536,
+                                    0,
+                                    None,
+                                )
+                            } {
+                                Ok(h) => h,
+                                Err(e) => {
+                                    drop(render_client);
+                                    drop(audio_client);
+                                    return Err(anyhow::anyhow!(e));
                                 }
-                                return Err(anyhow::anyhow!(e));
-                            }
-                        };
+                            },
+                        );
 
                         let pipe_name_clone = pipe_name.clone();
                         let stop_token_worker = stop_token_pump.clone();
@@ -2287,11 +2286,11 @@ mod wasapi_bitstream {
 
                         println!("[bitstream] Connecting named pipe for bitstream...");
                         unsafe {
-                            let _ = ConnectNamedPipe(pipe_handle, None);
+                            let _ = ConnectNamedPipe(pipe_handle.raw(), None);
                         }
                         println!("[bitstream] Named pipe connected!");
 
-                        let pipe_handle_raw = pipe_handle.0 as isize;
+                        let pipe_handle_raw = pipe_handle.into_raw().0 as isize;
                         let pcm_tx_feeder = pcm_tx.clone();
                         let stop_token_feeder = stop_token_pump.clone();
                         let shared_state_feeder = shared_state_pump.clone();
@@ -3007,26 +3006,21 @@ mod wasapi_bitstream {
                         let _ = tx.try_send(msg);
                     }
 
+                    let mut fatal_err: Option<&'static str> = None;
+
                     loop {
                         if stop_token_pump.load(std::sync::atomic::Ordering::Relaxed) {
                             break;
                         }
 
-                        let (is_paused, seek_from_state) = {
-                            if let Ok(state) = shared_state_pump.lock() {
-                                let seek = if state.seek_epoch > local_epoch {
-                                    local_epoch = state.seek_epoch;
-                                    Some(state.current_seconds)
-                                } else {
-                                    None
-                                };
-                                (state.is_paused, seek)
-                            } else {
-                                (false, None)
-                            }
-                        };
+                        let is_paused = rt_control_pump.is_paused();
+                        let state_epoch = rt_control_pump.seek_epoch();
+                        let seek_occurred = state_epoch > local_epoch;
+                        if seek_occurred {
+                            local_epoch = state_epoch;
+                        }
 
-                        if seek_from_state.is_some() {
+                        if seek_occurred {
                             buffer_queue.clear();
                             eof = false;
                             while let Ok(pkt) = pcm_rx.try_recv() {
@@ -3075,13 +3069,8 @@ mod wasapi_bitstream {
                                 }
                                 drop(rc);
                                 drop(ac);
-                                unsafe {
-                                    let _ = CloseHandle(ev);
-                                }
+                                drop(ev);
                                 started = false;
-                                println!(
-                                    "[bitstream] Paused: released WASAPI Exclusive audio device lock."
-                                );
                             }
                             std::thread::sleep(std::time::Duration::from_millis(15));
                             continue;
@@ -3096,27 +3085,20 @@ mod wasapi_bitstream {
                                     buffer_duration = available as f64 / profile.rate as f64;
                                     active_client = Some((ac, rc, ev));
                                     started = false;
-                                    println!(
-                                        "[bitstream] Resumed: re-acquired WASAPI Exclusive audio device lock."
-                                    );
                                 }
-                                Err(e) => {
-                                    eprintln!(
-                                        "[bitstream] Waiting to re-acquire WASAPI Exclusive device: {:?}",
-                                        e
-                                    );
+                                Err(_) => {
                                     std::thread::sleep(std::time::Duration::from_millis(100));
                                     continue;
                                 }
                             }
                         }
-                        let (audio_client, render_client, event) = active_client
-                            .as_ref()
-                            .map(|(ac, rc, ev)| (ac, rc, *ev))
-                            .unwrap();
+                        let Some((audio_client, render_client, event)) = active_client.as_ref()
+                        else {
+                            break;
+                        };
 
                         if started {
-                            let wait_result = unsafe { WaitForSingleObject(event, 50) };
+                            let wait_result = unsafe { WaitForSingleObject(event.raw(), 50) };
                             if wait_result.0 == 258
                             /* WAIT_TIMEOUT */
                             {
@@ -3125,35 +3107,6 @@ mod wasapi_bitstream {
                             if wait_result.0 != WAIT_OBJECT_0 {
                                 break;
                             }
-                        }
-
-                        if false && is_paused {
-                            if playback_time.is_none() {
-                                let first_msg = if let Some(msg) = pending_vis_msg.take() {
-                                    Some(msg)
-                                } else {
-                                    vis_rx.try_recv().ok()
-                                };
-                                if let Some(msg) = first_msg {
-                                    let t = msg.current_seconds;
-                                    let _ = tx.try_send(msg);
-                                    playback_time = Some(t);
-                                }
-                            }
-                            if started {
-                                unsafe {
-                                    if let Ok(buf) = render_client.GetBuffer(available) {
-                                        ptr::write_bytes(buf, 0, bytes_needed);
-                                        let _ = render_client.ReleaseBuffer(
-                                            available,
-                                            AUDCLNT_BUFFERFLAGS_SILENT.0 as u32,
-                                        );
-                                    }
-                                }
-                            } else {
-                                std::thread::sleep(std::time::Duration::from_millis(15));
-                            }
-                            continue;
                         }
 
                         while buffer_queue.len() < target_prebuffer && !eof {
@@ -3209,9 +3162,7 @@ mod wasapi_bitstream {
                             while let Ok(msg) = vis_rx.try_recv() {
                                 let _ = tx.try_send(msg);
                             }
-                            if let Ok(mut state) = shared_state_pump.lock() {
-                                state.track_ended = true;
-                            }
+                            rt_control_pump.signal_track_ended();
                             break;
                         }
 
@@ -3253,19 +3204,15 @@ mod wasapi_bitstream {
                                     } else {
                                         0
                                     };
-                                    if let Err(e) = render_client.ReleaseBuffer(available, flags) {
-                                        eprintln!("[bitstream] ReleaseBuffer error: {:?}", e);
-                                        if let Ok(mut state) = shared_state_pump.lock() {
-                                            state.audio_device_lost = true;
-                                        }
+                                    if render_client.ReleaseBuffer(available, flags).is_err() {
+                                        rt_control_pump.signal_audio_device_lost();
+                                        fatal_err = Some("ReleaseBuffer error");
                                         break;
                                     }
                                 }
-                                Err(e) => {
-                                    eprintln!("[bitstream] GetBuffer error: {:?}", e);
-                                    if let Ok(mut state) = shared_state_pump.lock() {
-                                        state.audio_device_lost = true;
-                                    }
+                                Err(_) => {
+                                    rt_control_pump.signal_audio_device_lost();
+                                    fatal_err = Some("GetBuffer error");
                                     break;
                                 }
                             }
@@ -3273,11 +3220,9 @@ mod wasapi_bitstream {
 
                         if !started {
                             unsafe {
-                                if let Err(e) = audio_client.Start() {
-                                    eprintln!("[bitstream] audio_client.Start error: {:?}", e);
-                                    if let Ok(mut state) = shared_state_pump.lock() {
-                                        state.audio_device_lost = true;
-                                    }
+                                if audio_client.Start().is_err() {
+                                    rt_control_pump.signal_audio_device_lost();
+                                    fatal_err = Some("audio_client.Start error");
                                     break;
                                 }
                             }
@@ -3322,38 +3267,29 @@ mod wasapi_bitstream {
                             let _ = audio_client.Stop();
                             let _ = audio_client.Reset();
                         }
-                        // 2. Drop render and audio client COM interfaces BEFORE CoUninitialize!
+                        // 2. Drop render and audio client COM interfaces BEFORE closing event handle
                         drop(render_client);
                         drop(audio_client);
-
-                        // 3. Close event handle
-                        unsafe {
-                            let _ = CloseHandle(event);
-                        }
+                        drop(event);
                     }
                     drop(device);
+                    if let Some(err_label) = fatal_err {
+                        eprintln!("[bitstream] WASAPI pump stopped: {err_label}");
+                    }
 
                     // 4. Signal stop and drop receivers so worker thread exits promptly
                     stop_token_pump.store(true, std::sync::atomic::Ordering::SeqCst);
                     drop(pcm_rx);
                     drop(vis_rx);
 
-                    // 5. Join worker thread
+                    // 5. Join worker thread (ComGuard drops on scope exit)
                     let _ = ffmpeg_thread.join();
-
-                    // 6. Uninitialize COM
-                    unsafe {
-                        CoUninitialize();
-                    }
 
                     println!("[bitstream] Bitstream/LPCM pump thread finished cleanly.");
                 }
                 Err(e) => {
                     eprintln!("[bitstream] Initialization failed: {:?}", e);
                     let _ = init_tx.send(Err(e));
-                    unsafe {
-                        CoUninitialize();
-                    }
                 }
             }
         });

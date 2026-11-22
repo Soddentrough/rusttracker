@@ -89,7 +89,7 @@ impl Lyrics {
 
         // Apply overall LRC [offset:+/-ms]: per standard LRC specification, a positive offset
         // shifts lyrics earlier (subtracts from timestamps) and a negative offset delays them.
-        let offset_sec = (offset_ms as f64) / 1000.0;
+        let offset_sec = (offset_ms.clamp(-3_600_000, 3_600_000) as f64) / 1000.0;
         for line in &mut lines {
             line.time_seconds = (line.time_seconds - offset_sec).max(0.0);
         }
@@ -139,54 +139,71 @@ impl Lyrics {
     }
 }
 
+fn parse_ascii_uint(s: &str) -> Option<f64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let v: f64 = s.parse().ok()?;
+    v.is_finite().then_some(v)
+}
+
+fn parse_ascii_frac(s: &str) -> Option<f64> {
+    if s.is_empty() || !s.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let v: f64 = format!("0.{s}").parse().ok()?;
+    (v.is_finite() && v >= 0.0).then_some(v)
+}
+
 /// Parses standard LRC time tags such as "01:23.45", "01:23.456", "01:23:45", "01:23", or "01:02:03.45" into seconds.
 fn parse_time_tag(tag: &str) -> Option<f64> {
     let parts: Vec<&str> = tag.split(':').collect();
     match parts.len() {
         2 => {
             // [mm:ss.xx] or [mm:ss] or [mm:ss:xx]
-            let minutes: f64 = parts[0].trim().parse().ok()?;
+            let minutes = parse_ascii_uint(parts[0].trim())?;
             let sec_part = parts[1].trim();
 
-            if let Some((sec_str, frac_str)) = sec_part.split_once('.') {
-                let seconds: f64 = sec_str.parse().ok()?;
-                let frac: f64 = format!("0.{}", frac_str).parse().unwrap_or(0.0);
-                Some(minutes * 60.0 + seconds + frac)
-            } else if let Some((sec_str, frac_str)) = sec_part.split_once(',') {
-                let seconds: f64 = sec_str.parse().ok()?;
-                let frac: f64 = format!("0.{}", frac_str).parse().unwrap_or(0.0);
-                Some(minutes * 60.0 + seconds + frac)
+            if let Some((sec_str, frac_str)) = sec_part
+                .split_once('.')
+                .or_else(|| sec_part.split_once(','))
+            {
+                let seconds = parse_ascii_uint(sec_str.trim())?;
+                let frac = parse_ascii_frac(frac_str.trim()).unwrap_or(0.0);
+                let t = minutes * 60.0 + seconds + frac;
+                (t.is_finite() && t >= 0.0).then_some(t)
             } else {
-                let seconds: f64 = sec_part.parse().ok()?;
-                Some(minutes * 60.0 + seconds)
+                let seconds = parse_ascii_uint(sec_part)?;
+                let t = minutes * 60.0 + seconds;
+                (t.is_finite() && t >= 0.0).then_some(t)
             }
         }
         3 => {
             // [hh:mm:ss.xx] or legacy [mm:ss:xx] (where xx is centiseconds)
-            let p1: f64 = parts[0].trim().parse().ok()?;
-            let p2: f64 = parts[1].trim().parse().ok()?;
+            let p1 = parse_ascii_uint(parts[0].trim())?;
+            let p2 = parse_ascii_uint(parts[1].trim())?;
             let p3_str = parts[2].trim();
 
-            if p3_str.contains('.') || p3_str.contains(',') {
+            if let Some((sec_str, frac_str)) =
+                p3_str.split_once('.').or_else(|| p3_str.split_once(','))
+            {
                 // Definitely [hh:mm:ss.frac]
-                let (sec_str, frac_str) = p3_str
-                    .split_once('.')
-                    .or_else(|| p3_str.split_once(','))
-                    .unwrap();
-                let seconds: f64 = sec_str.parse().ok()?;
-                let frac: f64 = format!("0.{}", frac_str).parse().unwrap_or(0.0);
-                Some(p1 * 3600.0 + p2 * 60.0 + seconds + frac)
-            } else if let Ok(p3) = p3_str.parse::<f64>() {
+                let seconds = parse_ascii_uint(sec_str.trim())?;
+                let frac = parse_ascii_frac(frac_str.trim()).unwrap_or(0.0);
+                let t = p1 * 3600.0 + p2 * 60.0 + seconds + frac;
+                (t.is_finite() && t >= 0.0).then_some(t)
+            } else if let Some(p3) = parse_ascii_uint(p3_str) {
                 // If p3 is 2 digits and p1 < 60, it's typically [mm:ss:centiseconds]
-                if p3_str.len() <= 2 && p1 < 60.0 && p2 < 60.0 {
-                    Some(p1 * 60.0 + p2 + p3 / 100.0)
+                let t = if p3_str.len() <= 2 && p1 < 60.0 && p2 < 60.0 {
+                    p1 * 60.0 + p2 + p3 / 100.0
                 } else if p3_str.len() == 3 && p1 < 60.0 && p2 < 60.0 {
                     // [mm:ss:milliseconds]
-                    Some(p1 * 60.0 + p2 + p3 / 1000.0)
+                    p1 * 60.0 + p2 + p3 / 1000.0
                 } else {
                     // [hh:mm:ss]
-                    Some(p1 * 3600.0 + p2 * 60.0 + p3)
-                }
+                    p1 * 3600.0 + p2 * 60.0 + p3
+                };
+                (t.is_finite() && t >= 0.0).then_some(t)
             } else {
                 None
             }
@@ -321,8 +338,8 @@ fn stem_matches_at_delimiter_boundary(longer: &str, shorter: &str) -> bool {
 /// Discovers an .lrc sidecar file for a given audio file path.
 pub fn find_sidecar_lrc_path(audio_path: &str) -> Option<PathBuf> {
     let trimmed = audio_path.trim();
-    if (trimmed.len() >= 7 && trimmed.as_bytes()[..7].eq_ignore_ascii_case(b"http://"))
-        || (trimmed.len() >= 8 && trimmed.as_bytes()[..8].eq_ignore_ascii_case(b"https://"))
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("http://") || lower.starts_with("https://") || lower.starts_with("mic://")
     {
         return None;
     }
@@ -418,10 +435,16 @@ pub fn find_sidecar_lrc_path(audio_path: &str) -> Option<PathBuf> {
     None
 }
 
+const MAX_LRC_FILE_BYTES: u64 = 2 * 1024 * 1024;
+
 /// Loads and parses an .lrc sidecar lyrics file for the specified audio path if present.
 pub fn load_lyrics_for_file(audio_path: &str) -> Option<Lyrics> {
+    use std::io::Read;
     let lrc_path = find_sidecar_lrc_path(audio_path)?;
-    let content = fs::read_to_string(&lrc_path).ok()?;
+    let file = fs::File::open(&lrc_path).ok()?;
+    let mut buf = Vec::new();
+    file.take(MAX_LRC_FILE_BYTES).read_to_end(&mut buf).ok()?;
+    let content = String::from_utf8_lossy(&buf);
     let mut lyrics = Lyrics::parse(&content)?;
     lyrics.file_name = lrc_path
         .file_name()

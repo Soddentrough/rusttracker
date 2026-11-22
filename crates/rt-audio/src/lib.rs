@@ -9,3 +9,4 @@ pub(crate) use rt_decode::mpegh;
 
 pub mod audio;
 pub mod bitstream;
+pub mod devices;

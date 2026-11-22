@@ -35,8 +35,8 @@ android {
         applicationId = "com.rusttracker.app"
         minSdk = 29
         targetSdk = 35
-        versionCode = 39
-        versionName = "0.9.39"
+        versionCode = 40
+        versionName = "0.10.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         ndk {
@@ -81,7 +81,7 @@ androidComponents {
         val capName = variant.name.replaceFirstChar { it.uppercase() }
         val variantSyncTask = tasks.register<SyncLicenseAssetsTask>("sync${capName}LicenseAssets") {
             val rootDir = rootProject.projectDir.parentFile
-            licenseFiles.from(File(rootDir, "LICENSE"), File(rootDir, "THIRD_PARTY_NOTICES.txt"))
+            licenseFiles.from(File(rootDir, "LICENSE"), File(rootDir, "THIRD_PARTY_NOTICES.txt"), File(rootDir, "assets/soundfont.sf2"))
         }
         syncLicenseAssets.configure {
             dependsOn(variantSyncTask)
@@ -102,8 +102,6 @@ dependencies {
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("androidx.games:games-activity:3.0.5")
-    implementation("androidx.media3:media3-session:1.5.1")
-    implementation("androidx.media3:media3-common:1.5.1")
 }
 
 tasks.register<Exec>("buildRust") {

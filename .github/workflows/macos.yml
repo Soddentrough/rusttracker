@@ -32,7 +32,7 @@ jobs:
           CARGO_PROFILE_RELEASE_STRIP: "true"
           CARGO_PROFILE_RELEASE_DEBUG: "0"
         run: |
-          cargo run --bin validate_wgsl
+          cargo run -p rt-tools --bin validate_wgsl
           cargo test --workspace --lib
           cargo build --release --bin rusttracker
 
@@ -226,9 +226,13 @@ jobs:
           cp target/release/rusttracker RustTracker.app/Contents/MacOS/
           cp assets/soundfont.sf2 LICENSE THIRD_PARTY_NOTICES.txt RustTracker.app/Contents/Resources/
           dylibbundler -od -b -x RustTracker.app/Contents/MacOS/rusttracker -d RustTracker.app/Contents/Frameworks/ -p @executable_path/../Frameworks/ -s /opt/homebrew/opt/ffmpeg@7/lib -s /opt/homebrew/lib
-          
+
+      - name: Codesign Application
+        env:
+          MACOS_CERTIFICATE: ${{ secrets.MACOS_CERTIFICATE }}
+        run: |
           # Codesign the application (sign inner Frameworks first, then main executable and bundle with entitlements)
-          if [ -n "${{ secrets.MACOS_CERTIFICATE }}" ]; then
+          if [ -n "$MACOS_CERTIFICATE" ]; then
             echo "Signing with Developer ID Certificate..."
             find RustTracker.app/Contents/Frameworks -type f \( -name "*.dylib" -or -name "*.so" \) -exec codesign --force --options runtime --sign "Developer ID Application" {} \;
             codesign --force --options runtime --entitlements entitlements.plist --sign "Developer ID Application" RustTracker.app/Contents/MacOS/rusttracker

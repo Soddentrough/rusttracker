@@ -45,7 +45,7 @@ jobs:
         CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
         CARGO_PROFILE_RELEASE_STRIP: "true"
       run: |
-        cargo build --release
+        cargo build --release --bin rusttracker
         objdump -h target/release/rusttracker.exe | grep -q '\.rsrc'
         
     - name: Package Release

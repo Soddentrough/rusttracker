@@ -38,6 +38,17 @@ pub fn is_playlist_extension(ext: &str) -> bool {
 
 /// Maximum directory recursion depth when expanding folders into playlists.
 const MAX_DIRECTORY_SCAN_DEPTH: usize = 32;
+const MAX_PLAYLIST_BYTES: u64 = 16 * 1024 * 1024;
+const MAX_PLAYLIST_ENTRIES: usize = 50_000;
+const MAX_PLAYLIST_NEST_DEPTH: usize = 4;
+
+fn is_url_or_virtual_uri(s: &str) -> bool {
+    let lower = s.trim().to_ascii_lowercase();
+    lower.starts_with("http://")
+        || lower.starts_with("https://")
+        || lower.starts_with("file://")
+        || lower.starts_with("mic://")
+}
 
 /// Recursively scans a directory for supported media files, returning them sorted alphabetically.
 /// Guards against symlink cycles via canonicalized directory tracking and caps recursion depth.
@@ -102,6 +113,9 @@ fn collect_directory_files(
     };
 
     for entry in entries.flatten() {
+        if results.len() >= MAX_PLAYLIST_ENTRIES {
+            break;
+        }
         let path = entry.path();
         if path.is_dir() {
             collect_directory_files(&path, depth + 1, visited, results);
@@ -119,7 +133,12 @@ fn collect_directory_files(
 /// Parses a local playlist file (.pls, .m3u, .m3u8) and resolves any relative paths
 /// against the playlist file's parent directory.
 pub fn parse_playlist_file(playlist_path: &Path) -> Result<Vec<String>, std::io::Error> {
-    let content = std::fs::read_to_string(playlist_path)?;
+    use std::io::Read;
+    let file = std::fs::File::open(playlist_path)?;
+    let mut raw = Vec::new();
+    file.take(MAX_PLAYLIST_BYTES).read_to_end(&mut raw)?;
+    let content = String::from_utf8_lossy(&raw);
+    let content = content.trim_start_matches('\u{feff}');
     let parent_dir = playlist_path.parent().unwrap_or_else(|| Path::new("."));
     let ext = playlist_path
         .extension()
@@ -131,9 +150,16 @@ pub fn parse_playlist_file(playlist_path: &Path) -> Result<Vec<String>, std::io:
 
     if ext == "pls" {
         for line in content.lines() {
+            if paths.len() >= MAX_PLAYLIST_ENTRIES {
+                break;
+            }
             let trimmed = line.trim();
-            if let Some((_, path_part)) =
-                trimmed.strip_prefix("File").and_then(|s| s.split_once('='))
+            let lower = trimmed.to_ascii_lowercase();
+            if lower.starts_with("file")
+                && let Some((_, path_part)) = trimmed.split_once('=')
+                && trimmed[4..trimmed.find('=').unwrap_or(4)]
+                    .bytes()
+                    .all(|b| b.is_ascii_digit())
             {
                 let path_str = path_part.trim();
                 if !path_str.is_empty() {
@@ -144,6 +170,9 @@ pub fn parse_playlist_file(playlist_path: &Path) -> Result<Vec<String>, std::io:
     } else {
         // M3U / M3U8
         for line in content.lines() {
+            if paths.len() >= MAX_PLAYLIST_ENTRIES {
+                break;
+            }
             let trimmed = line.trim();
             if trimmed.is_empty() || trimmed.starts_with('#') {
                 continue;
@@ -157,7 +186,7 @@ pub fn parse_playlist_file(playlist_path: &Path) -> Result<Vec<String>, std::io:
 
 fn resolve_path(entry: &str, base_dir: &Path) -> String {
     // If it's a URL or absolute path, preserve as is
-    if entry.starts_with("http://") || entry.starts_with("https://") {
+    if is_url_or_virtual_uri(entry) {
         return entry.to_string();
     }
     let p = Path::new(entry);
@@ -175,15 +204,28 @@ fn resolve_path(entry: &str, base_dir: &Path) -> String {
 /// - Playlist files (.m3u, .pls) are parsed and resolved into their constituent tracks.
 /// - Normal files and stream URLs are passed through as-is.
 pub fn expand_input_paths(paths: &[String]) -> Vec<String> {
+    let mut visited_playlists = std::collections::HashSet::new();
     let mut expanded = Vec::new();
+    expand_input_paths_inner(paths, 0, &mut visited_playlists, &mut expanded);
+    expanded
+}
 
+fn expand_input_paths_inner(
+    paths: &[String],
+    depth: usize,
+    visited_playlists: &mut std::collections::HashSet<PathBuf>,
+    expanded: &mut Vec<String>,
+) {
     for path_str in paths {
+        if expanded.len() >= MAX_PLAYLIST_ENTRIES {
+            break;
+        }
         if path_str.is_empty() {
             continue;
         }
 
-        // Keep remote URLs as-is
-        if path_str.starts_with("http://") || path_str.starts_with("https://") {
+        // Keep remote URLs / virtual streams as-is
+        if is_url_or_virtual_uri(path_str) {
             expanded.push(path_str.clone());
             continue;
         }
@@ -191,11 +233,16 @@ pub fn expand_input_paths(paths: &[String]) -> Vec<String> {
         let p = Path::new(path_str);
         if p.is_dir() {
             let scanned = scan_directory(p);
-            expanded.extend(scanned);
+            let remaining = MAX_PLAYLIST_ENTRIES.saturating_sub(expanded.len());
+            expanded.extend(scanned.into_iter().take(remaining));
         } else if let Some(ext) = p.extension().and_then(|s| s.to_str()) {
             if is_playlist_extension(ext) {
-                if let Ok(entries) = parse_playlist_file(p) {
-                    expanded.extend(entries);
+                let canonical = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+                if depth < MAX_PLAYLIST_NEST_DEPTH
+                    && visited_playlists.insert(canonical)
+                    && let Ok(entries) = parse_playlist_file(p)
+                {
+                    expand_input_paths_inner(&entries, depth + 1, visited_playlists, expanded);
                 } else {
                     expanded.push(path_str.clone());
                 }
@@ -206,8 +253,6 @@ pub fn expand_input_paths(paths: &[String]) -> Vec<String> {
             expanded.push(path_str.clone());
         }
     }
-
-    expanded
 }
 
 #[cfg(test)]

@@ -1,6 +1,21 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
-use winit::event::{Touch, TouchPhase};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TouchPhase {
+    Started,
+    Moved,
+    Ended,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TouchEvent {
+    pub id: u64,
+    pub phase: TouchPhase,
+    pub x: f64,
+    pub y: f64,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TouchGesture {
@@ -72,21 +87,29 @@ impl TouchGestureController {
     }
 
     pub fn set_scale_factor(&mut self, scale_factor: f32) {
-        if scale_factor > 0.0 {
+        if scale_factor.is_finite() && scale_factor > 0.0 {
             self.scale_factor = scale_factor;
         }
     }
 
     pub fn handle_touch(
         &mut self,
-        touch: &Touch,
+        touch: &TouchEvent,
         window_width: f32,
         window_height: f32,
         is_portrait: bool,
         split_y: f32,
     ) -> Option<TouchGesture> {
-        let x = touch.location.x as f32;
-        let y = touch.location.y as f32;
+        let x = touch.x as f32;
+        let y = touch.y as f32;
+        if !x.is_finite()
+            || !y.is_finite()
+            || !window_width.is_finite()
+            || !window_height.is_finite()
+            || !split_y.is_finite()
+        {
+            return None;
+        }
         let sf = self.scale_factor.max(1.0);
         let swipe_min_px = 45.0 * sf;
         let tap_max_move_px = 24.0 * sf;
@@ -95,7 +118,12 @@ impl TouchGestureController {
 
         match touch.phase {
             TouchPhase::Started => {
-                self.active_touches.insert(touch.id, (x, y, Instant::now()));
+                // Evict stale pointers whose Ended/Cancelled event was lost (> 30s)
+                let now = Instant::now();
+                self.active_touches.retain(|_, (_, _, t0)| {
+                    now.saturating_duration_since(*t0) < Duration::from_secs(30)
+                });
+                self.active_touches.insert(touch.id, (x, y, now));
                 let touch_count = self.active_touches.len();
                 if touch_count > self.max_touch_count {
                     self.max_touch_count = touch_count;
@@ -103,7 +131,7 @@ impl TouchGestureController {
 
                 if touch_count >= 2 {
                     if self.multi_finger_start_time.is_none() {
-                        self.multi_finger_start_time = Some(Instant::now());
+                        self.multi_finger_start_time = Some(now);
                     }
                     self.pending_single_tap = None;
                     let was_scrubbing = self.is_scrubbing;
@@ -113,17 +141,16 @@ impl TouchGestureController {
                     }
                 } else if touch_count == 1 {
                     self.touch_start_pos = Some((x, y));
-                    self.touch_start_time = Some(Instant::now());
+                    self.touch_start_time = Some(now);
                     self.current_pos = Some((x, y));
                     self.is_scrubbing = false;
                 }
                 None
             }
             TouchPhase::Moved => {
-                if let Some(entry) = self.active_touches.get_mut(&touch.id) {
-                    entry.0 = x;
-                    entry.1 = y;
-                }
+                let entry = self.active_touches.get_mut(&touch.id)?;
+                entry.0 = x;
+                entry.1 = y;
                 self.current_pos = Some((x, y));
 
                 if self.max_touch_count == 1
@@ -147,7 +174,7 @@ impl TouchGestureController {
                 None
             }
             TouchPhase::Ended => {
-                self.active_touches.remove(&touch.id);
+                self.active_touches.remove(&touch.id)?;
                 let remaining = self.active_touches.len();
 
                 if self.is_scrubbing {
@@ -185,6 +212,9 @@ impl TouchGestureController {
                 }
 
                 self.max_touch_count = remaining;
+                if remaining == 0 {
+                    self.multi_finger_start_time = None;
+                }
                 let (Some((start_x, start_y)), Some(start_time)) =
                     (self.touch_start_pos, self.touch_start_time)
                 else {
@@ -321,17 +351,9 @@ impl TouchGestureController {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use winit::dpi::PhysicalPosition;
-    use winit::event::DeviceId;
 
-    fn make_touch(phase: TouchPhase, id: u64, x: f64, y: f64) -> Touch {
-        Touch {
-            device_id: DeviceId::dummy(),
-            phase,
-            location: PhysicalPosition::new(x, y),
-            force: None,
-            id,
-        }
+    fn make_touch(phase: TouchPhase, id: u64, x: f64, y: f64) -> TouchEvent {
+        TouchEvent { id, phase, x, y }
     }
 
     #[test]

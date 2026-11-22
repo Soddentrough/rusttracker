@@ -25,6 +25,7 @@ pub const MPEGH_714_DEFAULT_BITRATE: i32 = 768_000;
 /// IEC 61937-13 burst preamble and framing constants.
 pub const IEC61937_SYNC_PA: u16 = 0xF872;
 pub const IEC61937_SYNC_PB: u16 = 0x4E1F;
+pub const IEC61937_DATA_TYPE_PAUSE: u8 = 3; // 0x03 (IEC 61937-1 Type 3 Pause burst)
 pub const IEC61937_DATA_TYPE_MPEGH: u8 = 25; // 0x19
 const IEC_HEADER_SIZE_BYTES: usize = 8;
 const IEC_PAYLOAD_HEADER_SIZE_BYTES: usize = 8;
@@ -222,7 +223,14 @@ impl Iec61937MpeghPackager {
 
         // Pd: dataBurstLength in 64-bit (8-byte) units when audioMode == 1
         let data_burst_length_bytes = mhas_len + 2 * IEC_PAYLOAD_HEADER_SIZE_BYTES;
-        let pd_words = ((data_burst_length_bytes + 7) >> 3) as u16;
+        let pd_units = (data_burst_length_bytes + 7) >> 3;
+        if pd_units > u16::MAX as usize {
+            return Err(anyhow!(
+                "IEC 61937-13 Pd word count ({}) exceeds u16 maximum",
+                pd_units
+            ));
+        }
+        let pd_words = pd_units as u16;
         out_burst[6] = (pd_words >> 8) as u8;
         out_burst[7] = (pd_words & 0xFF) as u8;
 
@@ -253,6 +261,25 @@ impl Iec61937MpeghPackager {
         }
 
         Ok(())
+    }
+
+    /// Emits a valid IEC 61937-1/13 Type 3 Pause burst (`Pa=0xF872, Pb=0x4E1F, Pc=0x0003, Pd=0`).
+    pub fn package_pause_burst(&self, out_burst: &mut Vec<u8>) {
+        out_burst.clear();
+        out_burst.resize(self.burst_repetition_period, 0);
+        out_burst[0] = (IEC61937_SYNC_PA >> 8) as u8;
+        out_burst[1] = (IEC61937_SYNC_PA & 0xFF) as u8;
+        out_burst[2] = (IEC61937_SYNC_PB >> 8) as u8;
+        out_burst[3] = (IEC61937_SYNC_PB & 0xFF) as u8;
+        out_burst[4] = 0;
+        out_burst[5] = IEC61937_DATA_TYPE_PAUSE;
+        out_burst[6] = 0;
+        out_burst[7] = 0;
+        if self.swap_bytes_s16le {
+            for chunk in out_burst[..IEC_HEADER_SIZE_BYTES].as_chunks_mut::<2>().0 {
+                chunk.swap(0, 1);
+            }
+        }
     }
 }
 
@@ -532,5 +559,27 @@ mod tests {
         assert_eq!(mhas[0], 0xC0);
         assert_eq!(mhas[1], 0x01);
         assert_eq!(mhas[2], 0xA5);
+    }
+
+    #[test]
+    fn test_iec61937_pause_burst_framing() {
+        let packager = Iec61937MpeghPackager::new(4, true).expect("valid rate factor 4");
+        let mut pause_burst = Vec::new();
+        packager.package_pause_burst(&mut pause_burst);
+        assert_eq!(pause_burst.len(), packager.burst_size_bytes());
+        assert_eq!(
+            u16::from_le_bytes([pause_burst[0], pause_burst[1]]),
+            IEC61937_SYNC_PA
+        );
+        assert_eq!(
+            u16::from_le_bytes([pause_burst[2], pause_burst[3]]),
+            IEC61937_SYNC_PB
+        );
+        assert_eq!(
+            u16::from_le_bytes([pause_burst[4], pause_burst[5]]),
+            u16::from(IEC61937_DATA_TYPE_PAUSE)
+        );
+        assert_eq!(u16::from_le_bytes([pause_burst[6], pause_burst[7]]), 0);
+        assert!(pause_burst[8..].iter().all(|&b| b == 0));
     }
 }

@@ -88,12 +88,15 @@ pub extern "C" fn Java_com_rusttracker_app_MainActivity_nativeOnBackPressed<'loc
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) -> jni::sys::jboolean {
-    if let Some(app_state) = GLOBAL_APP_STATE.get()
-        && handle_back_navigation(app_state)
-    {
-        return jni::sys::JNI_TRUE;
-    }
-    jni::sys::JNI_FALSE
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Some(app_state) = GLOBAL_APP_STATE.get()
+            && handle_back_navigation(app_state)
+        {
+            return jni::sys::JNI_TRUE;
+        }
+        jni::sys::JNI_FALSE
+    }))
+    .unwrap_or(jni::sys::JNI_FALSE)
 }
 
 #[unsafe(no_mangle)]
@@ -101,13 +104,15 @@ pub extern "C" fn Java_com_rusttracker_app_MainActivity_nativeOnDestroy<'local>(
     _env: JNIEnv<'local>,
     _class: JClass<'local>,
 ) {
-    eprintln!("[RustTracker] JNI: nativeOnDestroy invoked from Android Activity");
-    if let Some(lock) = EVENT_LOOP_PROXY.get()
-        && let Ok(guard) = lock.lock()
-        && let Some(proxy) = guard.as_ref()
-    {
-        let _ = proxy.send_event(AppCustomEvent::Destroy);
-    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        eprintln!("[RustTracker] JNI: nativeOnDestroy invoked from Android Activity");
+        if let Some(lock) = EVENT_LOOP_PROXY.get()
+            && let Ok(guard) = lock.lock()
+            && let Some(proxy) = guard.as_ref()
+        {
+            let _ = proxy.send_event(AppCustomEvent::Destroy);
+        }
+    }));
 }
 
 #[unsafe(no_mangle)]
@@ -116,34 +121,36 @@ pub extern "C" fn Java_com_rusttracker_app_MainActivity_nativeOnFileLoadingStart
     _class: JClass<'local>,
     display_name: JString<'local>,
 ) {
-    if let Ok(name) = env.get_string(&display_name) {
-        let name_str: String = name.into();
-        eprintln!("[RustTracker] JNI: File loading started: {}", name_str);
-        if let Some(app_state) = GLOBAL_APP_STATE.get()
-            && let Ok(mut state) = app_state.lock()
-        {
-            state.is_paused = true;
-            state.song_title = format!("Loading {}...", name_str);
-            state.osd_text = Some(format!("Loading {}...", name_str));
-            state.osd_timer = 15.0;
-            let prev_total = state.file_transfer.as_ref().and_then(|ft| ft.total_bytes);
-            let prev_elapsed = state
-                .file_transfer
-                .as_ref()
-                .map(|ft| ft.elapsed_secs)
-                .unwrap_or(0.0);
-            state.file_transfer = Some(crate::state::FileTransferState {
-                file_name: name_str.clone(),
-                status_text: format!("Loading {}...", name_str),
-                bytes_copied: 0,
-                total_bytes: prev_total,
-                elapsed_secs: prev_elapsed,
-            });
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Ok(name) = env.get_string(&display_name) {
+            let name_str: String = name.into();
+            eprintln!("[RustTracker] JNI: File loading started: {}", name_str);
+            if let Some(app_state) = GLOBAL_APP_STATE.get()
+                && let Ok(mut state) = app_state.lock()
+            {
+                state.is_paused = true;
+                state.song_title = format!("Loading {}...", name_str);
+                state.osd_text = Some(format!("Loading {}...", name_str));
+                state.osd_timer = 15.0;
+                let prev_total = state.file_transfer.as_ref().and_then(|ft| ft.total_bytes);
+                let prev_elapsed = state
+                    .file_transfer
+                    .as_ref()
+                    .map(|ft| ft.elapsed_secs)
+                    .unwrap_or(0.0);
+                state.file_transfer = Some(crate::state::FileTransferState {
+                    file_name: name_str.clone(),
+                    status_text: format!("Loading {}...", name_str),
+                    bytes_copied: 0,
+                    total_bytes: prev_total,
+                    elapsed_secs: prev_elapsed,
+                });
+            }
+            let (tx, _) = get_file_channel();
+            let _ = tx.send(FilePickerEvent::LoadingStarted(name_str));
+            wake_event_loop();
         }
-        let (tx, _) = get_file_channel();
-        let _ = tx.send(FilePickerEvent::LoadingStarted(name_str));
-        wake_event_loop();
-    }
+    }));
 }
 
 #[unsafe(no_mangle)]
@@ -156,62 +163,64 @@ pub extern "C" fn Java_com_rusttracker_app_MainActivity_nativeOnFileTransferProg
     total_bytes: jni::sys::jlong,
     elapsed_ms: jni::sys::jlong,
 ) {
-    let name_str: String = env
-        .get_string(&display_name)
-        .map(Into::into)
-        .unwrap_or_else(|_| "Media File".to_string());
-    let status_str: String = env
-        .get_string(&status_text)
-        .map(Into::into)
-        .unwrap_or_else(|_| format!("Loading {}...", name_str));
-    let copied = bytes_copied.max(0) as u64;
-    let total = if total_bytes > 0 {
-        Some(total_bytes as u64)
-    } else {
-        None
-    };
-    let elapsed_secs = (elapsed_ms.max(0) as f32) / 1000.0;
-
-    if let Some(app_state) = GLOBAL_APP_STATE.get()
-        && let Ok(mut state) = app_state.lock()
-    {
-        state.file_transfer = Some(crate::state::FileTransferState {
-            file_name: name_str.clone(),
-            status_text: status_str.clone(),
-            bytes_copied: copied,
-            total_bytes: total,
-            elapsed_secs,
-        });
-        let osd_summary = if let Some(tot) = total
-            && tot > 0
-            && copied > 0
-        {
-            let pct = ((copied as f64 / tot as f64) * 100.0).clamp(0.0, 100.0);
-            format!(
-                "{} {:.0}% ({:.1} / {:.1} MB)",
-                status_str,
-                pct,
-                copied as f64 / (1024.0 * 1024.0),
-                tot as f64 / (1024.0 * 1024.0)
-            )
-        } else if let Some(tot) = total
-            && tot >= 1024 * 1024
-        {
-            format!(
-                "{} ({:.1} MB, {:.1}s)",
-                status_str,
-                tot as f64 / (1024.0 * 1024.0),
-                elapsed_secs
-            )
-        } else if elapsed_secs >= 0.5 {
-            format!("{} ({:.1}s)", status_str, elapsed_secs)
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let name_str: String = env
+            .get_string(&display_name)
+            .map(Into::into)
+            .unwrap_or_else(|_| "Media File".to_string());
+        let status_str: String = env
+            .get_string(&status_text)
+            .map(Into::into)
+            .unwrap_or_else(|_| format!("Loading {}...", name_str));
+        let copied = bytes_copied.max(0) as u64;
+        let total = if total_bytes > 0 {
+            Some(total_bytes as u64)
         } else {
-            status_str
+            None
         };
-        state.osd_text = Some(osd_summary);
-        state.osd_timer = 10.0;
-    }
-    wake_event_loop();
+        let elapsed_secs = (elapsed_ms.max(0) as f32) / 1000.0;
+
+        if let Some(app_state) = GLOBAL_APP_STATE.get()
+            && let Ok(mut state) = app_state.lock()
+        {
+            state.file_transfer = Some(crate::state::FileTransferState {
+                file_name: name_str.clone(),
+                status_text: status_str.clone(),
+                bytes_copied: copied,
+                total_bytes: total,
+                elapsed_secs,
+            });
+            let osd_summary = if let Some(tot) = total
+                && tot > 0
+                && copied > 0
+            {
+                let pct = ((copied as f64 / tot as f64) * 100.0).clamp(0.0, 100.0);
+                format!(
+                    "{} {:.0}% ({:.1} / {:.1} MB)",
+                    status_str,
+                    pct,
+                    copied as f64 / (1024.0 * 1024.0),
+                    tot as f64 / (1024.0 * 1024.0)
+                )
+            } else if let Some(tot) = total
+                && tot >= 1024 * 1024
+            {
+                format!(
+                    "{} ({:.1} MB, {:.1}s)",
+                    status_str,
+                    tot as f64 / (1024.0 * 1024.0),
+                    elapsed_secs
+                )
+            } else if elapsed_secs >= 0.5 {
+                format!("{} ({:.1}s)", status_str, elapsed_secs)
+            } else {
+                status_str
+            };
+            state.osd_text = Some(osd_summary);
+            state.osd_timer = 10.0;
+        }
+        wake_event_loop();
+    }));
 }
 
 #[unsafe(no_mangle)]
@@ -220,13 +229,15 @@ pub extern "C" fn Java_com_rusttracker_app_MainActivity_nativeOnFileSelected<'lo
     _class: JClass<'local>,
     file_path: JString<'local>,
 ) {
-    if let Ok(path) = env.get_string(&file_path) {
-        let path_str: String = path.into();
-        eprintln!("[RustTracker] JNI: Selected file path: {}", path_str);
-        let (tx, _) = get_file_channel();
-        let _ = tx.send(FilePickerEvent::Selected(path_str));
-        wake_event_loop();
-    }
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Ok(path) = env.get_string(&file_path) {
+            let path_str: String = path.into();
+            eprintln!("[RustTracker] JNI: Selected file path: {}", path_str);
+            let (tx, _) = get_file_channel();
+            let _ = tx.send(FilePickerEvent::Selected(path_str));
+            wake_event_loop();
+        }
+    }));
 }
 
 #[unsafe(no_mangle)]
@@ -235,22 +246,24 @@ pub extern "C" fn Java_com_rusttracker_app_MainActivity_nativeOnFileStatus<'loca
     _class: JClass<'local>,
     status_msg: JString<'local>,
 ) {
-    if let Ok(msg) = env.get_string(&status_msg) {
-        let msg_str: String = msg.into();
-        eprintln!("[RustTracker] JNI: File status: {}", msg_str);
-        if let Some(app_state) = GLOBAL_APP_STATE.get()
-            && let Ok(mut state) = app_state.lock()
-        {
-            if msg_str.starts_with("Failed") || msg_str.contains("empty") {
-                state.file_transfer = None;
-            } else if let Some(ref mut ft) = state.file_transfer {
-                ft.status_text = msg_str.clone();
+    let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        if let Ok(msg) = env.get_string(&status_msg) {
+            let msg_str: String = msg.into();
+            eprintln!("[RustTracker] JNI: File status: {}", msg_str);
+            if let Some(app_state) = GLOBAL_APP_STATE.get()
+                && let Ok(mut state) = app_state.lock()
+            {
+                if msg_str.starts_with("Failed") || msg_str.contains("empty") {
+                    state.file_transfer = None;
+                } else if let Some(ref mut ft) = state.file_transfer {
+                    ft.status_text = msg_str.clone();
+                }
+                state.osd_text = Some(msg_str);
+                state.osd_timer = 8.0;
             }
-            state.osd_text = Some(msg_str);
-            state.osd_timer = 8.0;
+            wake_event_loop();
         }
-        wake_event_loop();
-    }
+    }));
 }
 
 pub fn trigger_android_file_picker(app: &AndroidApp) {
@@ -329,6 +342,7 @@ pub fn ensure_android_record_audio_permission(app: &AndroidApp, mic_uri: &str) -
 struct AndroidRustTrackerApp {
     android_app: AndroidApp,
     app_state: Arc<Mutex<AppState>>,
+    ui_state: AppState,
     window: Option<Arc<Window>>,
     engine: Option<VulkanEngine>,
     egui_ctx: egui::Context,
@@ -446,7 +460,7 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                         {
                             let mut app_state = self.app_state.lock().unwrap();
                             app_state.apply_gpu_capability_profile(
-                                &eng.adapter_info,
+                                &crate::engine::gpu_adapter_profile_from_wgpu(&eng.adapter_info),
                                 eng.config.width,
                                 eng.config.height,
                             );
@@ -582,8 +596,9 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                             .as_ref()
                             .map(|e| e.has_video_stream())
                             .unwrap_or(false);
+                    let touch_ev = crate::engine::touch_event_from_winit(&touch);
                     if let Some(gesture) = self.touch_controller.handle_touch(
-                        &touch,
+                        &touch_ev,
                         size.width as f32,
                         size.height as f32,
                         is_portrait,
@@ -811,7 +826,7 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
 
                 // Per-frame state update, decay & smoothing (mirrors desktop pipeline)
                 let phase_timer = Instant::now();
-                let (state_copy, phase_lock_update_us, phase_snapshot_us) = {
+                let (phase_lock_update_us, phase_snapshot_us) = {
                     let mut state = self.app_state.lock().unwrap();
                     state.current_fps = fps;
                     state.update_visualizer_perf_guard(dt, self.display_refresh_hz);
@@ -892,21 +907,21 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                     let lock_update_us = phase_timer.elapsed().as_micros() as f32;
 
                     let snap_timer = Instant::now();
-                    let snap = state.render_snapshot();
+                    state.render_snapshot_into(&mut self.ui_state);
                     let snap_us = snap_timer.elapsed().as_micros() as f32;
-                    (snap, lock_update_us, snap_us)
+                    (lock_update_us, snap_us)
                 };
 
                 match eng.render(
                     &win,
                     &self.egui_ctx,
                     st,
-                    &state_copy,
+                    &self.ui_state,
                     &mut self.file_dialog,
                     Vec::new(),
                 ) {
                     Ok((
-                        action,
+                        actions,
                         ui_time,
                         render_time,
                         fire_time,
@@ -950,398 +965,410 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                                 state.stats.phase_post_us * 0.9 + post_us * 0.1;
                         }
 
-                        match action {
-                            EngineAction::OpenFile => {
-                                self.touch_controller.reset();
-                                trigger_android_file_picker(&self.android_app);
-                            }
-                            EngineAction::LoadFiles(files, append) => {
-                                if !files.is_empty() {
-                                    let is_mic = self.app_state.lock().unwrap().is_mic_input;
-                                    if append && !is_mic {
-                                        let mut state = self.app_state.lock().unwrap();
-                                        std::sync::Arc::make_mut(&mut state.playlist).extend(files);
-                                    } else {
-                                        self.load_and_play_file(&files[0]);
-                                        let mut state = self.app_state.lock().unwrap();
-                                        state.playlist = std::sync::Arc::new(files);
-                                        state.playlist_index = 0;
+                        for action in actions {
+                            match action {
+                                EngineAction::OpenFile => {
+                                    self.touch_controller.reset();
+                                    trigger_android_file_picker(&self.android_app);
+                                }
+                                EngineAction::LoadFiles(files, append) => {
+                                    if !files.is_empty() {
+                                        let is_mic = self.app_state.lock().unwrap().is_mic_input;
+                                        if append && !is_mic {
+                                            let mut state = self.app_state.lock().unwrap();
+                                            std::sync::Arc::make_mut(&mut state.playlist)
+                                                .extend(files);
+                                        } else {
+                                            self.load_and_play_file(&files[0]);
+                                            let mut state = self.app_state.lock().unwrap();
+                                            state.playlist = std::sync::Arc::new(files);
+                                            state.playlist_index = 0;
+                                        }
                                     }
                                 }
-                            }
-                            EngineAction::SetAppendToPlaylist(val) => {
-                                self.app_state.lock().unwrap().append_to_playlist = val;
-                            }
-                            EngineAction::SetPassthrough(val) => {
-                                self.app_state.lock().unwrap().passthrough_enabled = val;
-                            }
-                            EngineAction::SetSplitRatio(val) => {
-                                self.app_state.lock().unwrap().panel_split_ratio = val;
-                            }
-                            EngineAction::ScrubPreview(pct, delta) => {
-                                let mut state = self.app_state.lock().unwrap();
-                                let target = (state.duration_seconds * pct as f64)
-                                    .clamp(0.0, state.duration_seconds);
-                                state.scrub_target_seconds = Some(target);
-                                if delta == 0.0
-                                    && state.duration_seconds > 0.0
-                                    && self.last_touch_scrub_seek.elapsed()
-                                        >= std::time::Duration::from_millis(80)
-                                    && (target - state.current_seconds).abs() > 0.25
-                                {
+                                EngineAction::SetAppendToPlaylist(val) => {
+                                    self.app_state.lock().unwrap().append_to_playlist = val;
+                                }
+                                EngineAction::SetPassthrough(val) => {
+                                    self.app_state.lock().unwrap().passthrough_enabled = val;
+                                }
+                                EngineAction::SetSplitRatio(val) => {
+                                    self.app_state.lock().unwrap().panel_split_ratio = val;
+                                }
+                                EngineAction::ScrubPreview(pct, delta) => {
+                                    let mut state = self.app_state.lock().unwrap();
+                                    let target = (state.duration_seconds * pct as f64)
+                                        .clamp(0.0, state.duration_seconds);
+                                    state.scrub_target_seconds = Some(target);
+                                    if delta == 0.0
+                                        && state.duration_seconds > 0.0
+                                        && self.last_touch_scrub_seek.elapsed()
+                                            >= std::time::Duration::from_millis(80)
+                                        && (target - state.current_seconds).abs() > 0.25
+                                    {
+                                        state.seek_request = Some(target);
+                                        state.current_seconds = target;
+                                        state.track_ended = false;
+                                        self.last_touch_scrub_seek = Instant::now();
+                                    }
+                                    if delta != 0.0 {
+                                        if state.osd_timer > 0.0
+                                            && state
+                                                .osd_text
+                                                .as_ref()
+                                                .is_some_and(|s| s.starts_with("Scrubbing"))
+                                        {
+                                            state.cumulative_scrub += delta;
+                                        } else {
+                                            state.cumulative_scrub = delta;
+                                        }
+                                        state.osd_timer = 0.5;
+                                        let sign = if state.cumulative_scrub > 0.0 {
+                                            "+"
+                                        } else {
+                                            "-"
+                                        };
+                                        state.osd_text = Some(format!(
+                                            "Scrubbing {}{:.1}s",
+                                            sign,
+                                            state.cumulative_scrub.abs()
+                                        ));
+                                    }
+                                }
+                                EngineAction::ScrubEnd => {
+                                    let mut state = self.app_state.lock().unwrap();
+                                    state.finish_touch_scrub();
+                                }
+                                EngineAction::Seek(pct) => {
+                                    let mut state = self.app_state.lock().unwrap();
+                                    let target = (pct as f64 * state.duration_seconds)
+                                        .clamp(0.0, state.duration_seconds);
                                     state.seek_request = Some(target);
                                     state.current_seconds = target;
+                                    state.scrub_target_seconds = None;
+                                    state.is_touch_scrubbing = false;
                                     state.track_ended = false;
-                                    self.last_touch_scrub_seek = Instant::now();
                                 }
-                                if delta != 0.0 {
-                                    if state.osd_timer > 0.0
-                                        && state
-                                            .osd_text
-                                            .as_ref()
-                                            .is_some_and(|s| s.starts_with("Scrubbing"))
-                                    {
-                                        state.cumulative_scrub += delta;
-                                    } else {
-                                        state.cumulative_scrub = delta;
-                                    }
-                                    state.osd_timer = 0.5;
-                                    let sign = if state.cumulative_scrub > 0.0 {
-                                        "+"
-                                    } else {
-                                        "-"
-                                    };
-                                    state.osd_text = Some(format!(
-                                        "Scrubbing {}{:.1}s",
-                                        sign,
-                                        state.cumulative_scrub.abs()
-                                    ));
+                                EngineAction::SetForceStereo(force) => {
+                                    self.app_state
+                                        .lock()
+                                        .unwrap()
+                                        .set_force_stereo_downmix(force);
                                 }
-                            }
-                            EngineAction::ScrubEnd => {
-                                let mut state = self.app_state.lock().unwrap();
-                                state.finish_touch_scrub();
-                            }
-                            EngineAction::Seek(pct) => {
-                                let mut state = self.app_state.lock().unwrap();
-                                let target = (pct as f64 * state.duration_seconds)
-                                    .clamp(0.0, state.duration_seconds);
-                                state.seek_request = Some(target);
-                                state.current_seconds = target;
-                                state.scrub_target_seconds = None;
-                                state.is_touch_scrubbing = false;
-                                state.track_ended = false;
-                            }
-                            EngineAction::SetForceStereo(force) => {
-                                self.app_state
-                                    .lock()
-                                    .unwrap()
-                                    .set_force_stereo_downmix(force);
-                            }
-                            EngineAction::ToggleAudioTrackInMix(track_idx) => {
-                                let mut state = self.app_state.lock().unwrap();
-                                if state.audio_tracks.len() > 1
-                                    && track_idx < state.audio_tracks.len()
-                                {
-                                    if state.active_audio_tracks.is_empty() {
-                                        state.active_audio_tracks =
-                                            vec![state.selected_audio_track];
-                                    }
-                                    if let Some(pos) = state
-                                        .active_audio_tracks
-                                        .iter()
-                                        .position(|&t| t == track_idx)
-                                    {
-                                        if state.active_audio_tracks.len() > 1 {
-                                            state.active_audio_tracks.remove(pos);
-                                        }
-                                    } else {
-                                        state.active_audio_tracks.push(track_idx);
-                                        state.active_audio_tracks.sort();
-                                    }
-                                    state.multi_track_mix_mode =
-                                        state.active_audio_tracks.len() > 1;
-                                    if state.audio_track_volumes.len() != state.audio_tracks.len() {
-                                        state.audio_track_volumes =
-                                            vec![1.0; state.audio_tracks.len()];
-                                    }
-                                    let mix: Vec<(usize, f32)> = state
-                                        .active_audio_tracks
-                                        .iter()
-                                        .map(|&idx| {
-                                            (
-                                                idx,
-                                                state
-                                                    .audio_track_volumes
-                                                    .get(idx)
-                                                    .copied()
-                                                    .unwrap_or(1.0),
-                                            )
-                                        })
-                                        .collect();
-                                    state.audio_mix_request = Some(mix.clone());
-                                    crate::android::log_android(
-                                        3,
-                                        &format!(
-                                            "[RustTracker] ToggleAudioTrackInMix: track_idx={}, active={:?}",
-                                            track_idx, state.active_audio_tracks
-                                        ),
-                                    );
-                                }
-                            }
-                            EngineAction::SetAudioTrackVolume(track_idx, volume) => {
-                                let mut state = self.app_state.lock().unwrap();
-                                if track_idx < state.audio_tracks.len() {
-                                    if state.audio_track_volumes.len() != state.audio_tracks.len() {
-                                        state.audio_track_volumes =
-                                            vec![1.0; state.audio_tracks.len()];
-                                    }
-                                    state.audio_track_volumes[track_idx] = volume.clamp(0.0, 1.0);
-                                    let mix: Vec<(usize, f32)> = state
-                                        .active_audio_tracks
-                                        .iter()
-                                        .map(|&idx| {
-                                            (
-                                                idx,
-                                                state
-                                                    .audio_track_volumes
-                                                    .get(idx)
-                                                    .copied()
-                                                    .unwrap_or(1.0),
-                                            )
-                                        })
-                                        .collect();
-                                    state.audio_mix_request = Some(mix);
-                                }
-                            }
-                            EngineAction::SetAudioMixTracks(tracks) => {
-                                let mut state = self.app_state.lock().unwrap();
-                                state.multi_track_mix_mode = tracks.len() > 1;
-                                state.active_audio_tracks =
-                                    tracks.iter().map(|(idx, _)| *idx).collect();
-                                if state.audio_track_volumes.len() != state.audio_tracks.len() {
-                                    state.audio_track_volumes = vec![1.0; state.audio_tracks.len()];
-                                }
-                                for &(idx, vol) in &tracks {
-                                    if idx < state.audio_track_volumes.len() {
-                                        state.audio_track_volumes[idx] = vol;
-                                    }
-                                }
-                                if let Some(&(first_idx, _)) = tracks.first() {
-                                    state.selected_audio_track = first_idx;
-                                    if tracks.len() == 1 {
-                                        state.audio_track_request = Some(first_idx);
-                                    }
-                                }
-                                let mix_desc = if tracks.len() > 1 {
-                                    let track_nums: Vec<String> = tracks
-                                        .iter()
-                                        .map(|(idx, _)| (idx + 1).to_string())
-                                        .collect();
-                                    format!("🎛 Mix: Tracks {}", track_nums.join("+"))
-                                } else if let Some(&(idx, _)) = tracks.first() {
-                                    let track_title = state
-                                        .audio_tracks
-                                        .get(idx)
-                                        .map(|t| t.title.clone())
-                                        .unwrap_or_else(|| format!("Track {}", idx + 1));
-                                    format!("🎛 Audio: {}", track_title)
-                                } else {
-                                    "🎛 Audio Mix".to_string()
-                                };
-                                state.osd_text = Some(mix_desc);
-                                state.osd_timer = 2.0;
-                                crate::android::log_android(
-                                    3,
-                                    &format!(
-                                        "[RustTracker] SetAudioMixTracks: tracks={:?}",
-                                        tracks
-                                    ),
-                                );
-                                state.audio_mix_request = Some(tracks);
-                            }
-                            EngineAction::VisPickerSelect(idx) => {
-                                let mut state = self.app_state.lock().unwrap();
-                                if idx < VISUALIZERS.len() {
-                                    state.vis_user_overridden[idx] = true;
-                                    state.current_visualizer_idx = idx;
-                                    state.visualizer_mode = VISUALIZERS[idx].id;
-                                    state.osd_text = Some(VISUALIZERS[idx].name.to_string());
-                                    state.osd_timer = 2.0;
-                                    state.show_vis_picker = false;
-                                }
-                            }
-                            EngineAction::ToggleVisPicker => {
-                                let mut state = self.app_state.lock().unwrap();
-                                state.show_vis_picker = !state.show_vis_picker;
-                                if state.show_vis_picker {
-                                    state.vis_picker_cursor = state.current_visualizer_idx;
-                                    state.vis_picker_scroll_to_cursor = true;
-                                }
-                            }
-                            EngineAction::VisPickerToggleEnabled(idx) => {
-                                let mut state = self.app_state.lock().unwrap();
-                                if idx != 0 && idx < state.vis_enabled.len() {
-                                    state.vis_enabled[idx] = !state.vis_enabled[idx];
-                                    state.vis_user_overridden[idx] = true;
-                                }
-                            }
-                            EngineAction::VisPickerSetCursor(idx) => {
-                                self.app_state.lock().unwrap().vis_picker_cursor = idx;
-                            }
-                            EngineAction::VisPickerEnableAll => {
-                                let mut state = self.app_state.lock().unwrap();
-                                state.vis_enabled.fill(true);
-                                state.vis_user_overridden.fill(true);
-                            }
-                            EngineAction::VisPickerEnableNone => {
-                                let mut state = self.app_state.lock().unwrap();
-                                for (i, enabled) in state.vis_enabled.iter_mut().enumerate() {
-                                    *enabled = i == 0;
-                                }
-                            }
-                            EngineAction::OpenUrlDialog => {
-                                self.touch_controller.reset();
-                                let mut state = self.app_state.lock().unwrap();
-                                state.available_input_devices =
-                                    crate::audio::get_available_audio_devices(true);
-                                if state.is_mic_input {
-                                    state.available_audio_devices =
-                                        state.available_input_devices.clone();
-                                }
-                                state.is_url_dialog_open = true;
-                                state.focus_url_input = true;
-                                win.set_ime_allowed(true);
-                            }
-                            EngineAction::ClearFocusUrlInput => {
-                                self.app_state.lock().unwrap().focus_url_input = false;
-                            }
-                            EngineAction::CloseUrlDialog => {
-                                self.touch_controller.reset();
-                                self.app_state.lock().unwrap().is_url_dialog_open = false;
-                                win.set_ime_allowed(false);
-                            }
-                            EngineAction::SetUrlInput(url) => {
-                                self.app_state.lock().unwrap().url_input_text = url;
-                            }
-                            EngineAction::EditUrl(url) => {
-                                let mut state = self.app_state.lock().unwrap();
-                                state.url_input_text = url;
-                                state.focus_url_input = true;
-                                win.set_ime_allowed(true);
-                            }
-                            EngineAction::LoadInputDevice(device_name) => {
-                                self.touch_controller.reset();
-                                let mic_uri = crate::state::mic_uri_for_device(&device_name);
-                                win.set_ime_allowed(false);
-                                {
+                                EngineAction::ToggleAudioTrackInMix(track_idx) => {
                                     let mut state = self.app_state.lock().unwrap();
-                                    state.is_url_dialog_open = false;
-                                    state.set_mic_input_mode(true, Some(device_name.clone()));
-                                    state.osd_text =
-                                        Some(format!("🔊 Audio Input: {}", device_name));
-                                    state.osd_timer = 3.0;
-                                }
-                                self.load_and_play_file(&mic_uri);
-                            }
-                            EngineAction::LoadUrl(url) => {
-                                self.touch_controller.reset();
-                                let mut final_url = url;
-                                win.set_ime_allowed(false);
-                                if crate::state::is_mic_uri(&final_url) {
-                                    let dev_name = crate::state::device_from_mic_uri(&final_url)
-                                        .unwrap_or(crate::audio::SYSTEM_DEFAULT_AUDIO_DEVICE)
-                                        .to_string();
-                                    let mic_uri = crate::state::mic_uri_for_device(&dev_name);
+                                    if state.audio_tracks.len() > 1
+                                        && track_idx < state.audio_tracks.len()
                                     {
-                                        let mut state = self.app_state.lock().unwrap();
-                                        state.is_url_dialog_open = false;
-                                        state.url_input_text.clear();
-                                        state.set_mic_input_mode(true, Some(dev_name.clone()));
-                                        state.osd_text =
-                                            Some(format!("🔊 Audio Input: {}", dev_name));
-                                        state.osd_timer = 3.0;
-                                    }
-                                    self.load_and_play_file(&mic_uri);
-                                } else {
-                                    if !final_url.starts_with("http://")
-                                        && !final_url.starts_with("https://")
-                                    {
-                                        final_url = format!("https://{}", final_url);
-                                    }
-                                    {
-                                        let mut state = self.app_state.lock().unwrap();
-                                        state.set_mic_input_mode(false, None);
-                                        state.is_url_dialog_open = false;
-                                        state.url_input_text.clear();
-                                        state.playlist =
-                                            std::sync::Arc::new(vec![final_url.clone()]);
-                                        state.playlist_index = 0;
-                                        state.load_request = Some(final_url.clone());
-                                        state.file_loaded = true;
-                                        if let Some(idx) = state
-                                            .url_history
+                                        if state.active_audio_tracks.is_empty() {
+                                            state.active_audio_tracks =
+                                                vec![state.selected_audio_track];
+                                        }
+                                        if let Some(pos) = state
+                                            .active_audio_tracks
                                             .iter()
-                                            .position(|(u, _)| u == &final_url)
+                                            .position(|&t| t == track_idx)
                                         {
-                                            let item = state.url_history.remove(idx);
-                                            state.url_history.push(item);
+                                            if state.active_audio_tracks.len() > 1 {
+                                                state.active_audio_tracks.remove(pos);
+                                            }
                                         } else {
-                                            state
-                                                .url_history
-                                                .push((final_url, "Network Stream".to_string()));
+                                            state.active_audio_tracks.push(track_idx);
+                                            state.active_audio_tracks.sort();
                                         }
-                                        let mut out = String::new();
-                                        for (u, t) in &state.url_history {
-                                            out.push_str(&format!("{}|{}\n", u, t));
+                                        state.multi_track_mix_mode =
+                                            state.active_audio_tracks.len() > 1;
+                                        if state.audio_track_volumes.len()
+                                            != state.audio_tracks.len()
+                                        {
+                                            state.audio_track_volumes =
+                                                vec![1.0; state.audio_tracks.len()];
                                         }
-                                        let _ = std::fs::write(
-                                            crate::state::get_history_file_path(),
-                                            out,
+                                        let mix: Vec<(usize, f32)> = state
+                                            .active_audio_tracks
+                                            .iter()
+                                            .map(|&idx| {
+                                                (
+                                                    idx,
+                                                    state
+                                                        .audio_track_volumes
+                                                        .get(idx)
+                                                        .copied()
+                                                        .unwrap_or(1.0),
+                                                )
+                                            })
+                                            .collect();
+                                        state.audio_mix_request = Some(mix.clone());
+                                        crate::android::log_android(
+                                            3,
+                                            &format!(
+                                                "[RustTracker] ToggleAudioTrackInMix: track_idx={}, active={:?}",
+                                                track_idx, state.active_audio_tracks
+                                            ),
                                         );
                                     }
                                 }
-                            }
-                            EngineAction::SetAudioDevice(dev) => {
-                                let is_mic = {
+                                EngineAction::SetAudioTrackVolume(track_idx, volume) => {
                                     let mut state = self.app_state.lock().unwrap();
-                                    state.selected_audio_device = Some(dev.clone());
-                                    if !state.is_mic_input {
-                                        state.audio_device_change_request = Some(dev.clone());
+                                    if track_idx < state.audio_tracks.len() {
+                                        if state.audio_track_volumes.len()
+                                            != state.audio_tracks.len()
+                                        {
+                                            state.audio_track_volumes =
+                                                vec![1.0; state.audio_tracks.len()];
+                                        }
+                                        state.audio_track_volumes[track_idx] =
+                                            volume.clamp(0.0, 1.0);
+                                        let mix: Vec<(usize, f32)> = state
+                                            .active_audio_tracks
+                                            .iter()
+                                            .map(|&idx| {
+                                                (
+                                                    idx,
+                                                    state
+                                                        .audio_track_volumes
+                                                        .get(idx)
+                                                        .copied()
+                                                        .unwrap_or(1.0),
+                                                )
+                                            })
+                                            .collect();
+                                        state.audio_mix_request = Some(mix);
+                                    }
+                                }
+                                EngineAction::SetAudioMixTracks(tracks) => {
+                                    let mut state = self.app_state.lock().unwrap();
+                                    state.multi_track_mix_mode = tracks.len() > 1;
+                                    state.active_audio_tracks =
+                                        tracks.iter().map(|(idx, _)| *idx).collect();
+                                    if state.audio_track_volumes.len() != state.audio_tracks.len() {
+                                        state.audio_track_volumes =
+                                            vec![1.0; state.audio_tracks.len()];
+                                    }
+                                    for &(idx, vol) in &tracks {
+                                        if idx < state.audio_track_volumes.len() {
+                                            state.audio_track_volumes[idx] = vol;
+                                        }
+                                    }
+                                    if let Some(&(first_idx, _)) = tracks.first() {
+                                        state.selected_audio_track = first_idx;
+                                        if tracks.len() == 1 {
+                                            state.audio_track_request = Some(first_idx);
+                                        }
+                                    }
+                                    let mix_desc = if tracks.len() > 1 {
+                                        let track_nums: Vec<String> = tracks
+                                            .iter()
+                                            .map(|(idx, _)| (idx + 1).to_string())
+                                            .collect();
+                                        format!("🎛 Mix: Tracks {}", track_nums.join("+"))
+                                    } else if let Some(&(idx, _)) = tracks.first() {
+                                        let track_title = state
+                                            .audio_tracks
+                                            .get(idx)
+                                            .map(|t| t.title.clone())
+                                            .unwrap_or_else(|| format!("Track {}", idx + 1));
+                                        format!("🎛 Audio: {}", track_title)
                                     } else {
-                                        state.osd_text = Some(format!("🔊 Audio Input: {}", dev));
+                                        "🎛 Audio Mix".to_string()
+                                    };
+                                    state.osd_text = Some(mix_desc);
+                                    state.osd_timer = 2.0;
+                                    crate::android::log_android(
+                                        3,
+                                        &format!(
+                                            "[RustTracker] SetAudioMixTracks: tracks={:?}",
+                                            tracks
+                                        ),
+                                    );
+                                    state.audio_mix_request = Some(tracks);
+                                }
+                                EngineAction::VisPickerSelect(idx) => {
+                                    let mut state = self.app_state.lock().unwrap();
+                                    if idx < VISUALIZERS.len() {
+                                        state.vis_user_overridden[idx] = true;
+                                        state.current_visualizer_idx = idx;
+                                        state.visualizer_mode = VISUALIZERS[idx].id;
+                                        state.osd_text = Some(VISUALIZERS[idx].name.to_string());
+                                        state.osd_timer = 2.0;
+                                        state.show_vis_picker = false;
+                                    }
+                                }
+                                EngineAction::ToggleVisPicker => {
+                                    let mut state = self.app_state.lock().unwrap();
+                                    state.show_vis_picker = !state.show_vis_picker;
+                                    if state.show_vis_picker {
+                                        state.vis_picker_cursor = state.current_visualizer_idx;
+                                        state.vis_picker_scroll_to_cursor = true;
+                                    }
+                                }
+                                EngineAction::VisPickerToggleEnabled(idx) => {
+                                    let mut state = self.app_state.lock().unwrap();
+                                    if idx != 0 && idx < state.vis_enabled.len() {
+                                        state.vis_enabled[idx] = !state.vis_enabled[idx];
+                                        state.vis_user_overridden[idx] = true;
+                                    }
+                                }
+                                EngineAction::VisPickerSetCursor(idx) => {
+                                    self.app_state.lock().unwrap().vis_picker_cursor = idx;
+                                }
+                                EngineAction::VisPickerEnableAll => {
+                                    let mut state = self.app_state.lock().unwrap();
+                                    state.vis_enabled.fill(true);
+                                    state.vis_user_overridden.fill(true);
+                                }
+                                EngineAction::VisPickerEnableNone => {
+                                    let mut state = self.app_state.lock().unwrap();
+                                    for (i, enabled) in state.vis_enabled.iter_mut().enumerate() {
+                                        *enabled = i == 0;
+                                    }
+                                }
+                                EngineAction::OpenUrlDialog => {
+                                    self.touch_controller.reset();
+                                    let mut state = self.app_state.lock().unwrap();
+                                    state.set_audio_devices(
+                                        Vec::new(),
+                                        crate::audio::get_available_audio_devices(true),
+                                    );
+                                    state.is_url_dialog_open = true;
+                                    state.focus_url_input = true;
+                                    win.set_ime_allowed(true);
+                                }
+                                EngineAction::ClearFocusUrlInput => {
+                                    self.app_state.lock().unwrap().focus_url_input = false;
+                                }
+                                EngineAction::CloseUrlDialog => {
+                                    self.touch_controller.reset();
+                                    self.app_state.lock().unwrap().is_url_dialog_open = false;
+                                    win.set_ime_allowed(false);
+                                }
+                                EngineAction::SetUrlInput(url) => {
+                                    self.app_state.lock().unwrap().url_input_text = url;
+                                }
+                                EngineAction::EditUrl(url) => {
+                                    let mut state = self.app_state.lock().unwrap();
+                                    state.url_input_text = url;
+                                    state.focus_url_input = true;
+                                    win.set_ime_allowed(true);
+                                }
+                                EngineAction::LoadInputDevice(device_name) => {
+                                    self.touch_controller.reset();
+                                    let mic_uri = crate::state::mic_uri_for_device(&device_name);
+                                    win.set_ime_allowed(false);
+                                    {
+                                        let mut state = self.app_state.lock().unwrap();
+                                        state.is_url_dialog_open = false;
+                                        state.set_mic_input_mode(true, Some(device_name.clone()));
+                                        state.osd_text =
+                                            Some(format!("🔊 Audio Input: {}", device_name));
                                         state.osd_timer = 3.0;
                                     }
-                                    state.is_mic_input
-                                };
-                                if is_mic {
-                                    let mic_uri = crate::state::mic_uri_for_device(&dev);
                                     self.load_and_play_file(&mic_uri);
                                 }
+                                EngineAction::LoadUrl(url) => {
+                                    self.touch_controller.reset();
+                                    let mut final_url = url;
+                                    win.set_ime_allowed(false);
+                                    if crate::state::is_mic_uri(&final_url) {
+                                        let dev_name =
+                                            crate::state::device_from_mic_uri(&final_url)
+                                                .unwrap_or(
+                                                    crate::audio::SYSTEM_DEFAULT_AUDIO_DEVICE,
+                                                )
+                                                .to_string();
+                                        let mic_uri = crate::state::mic_uri_for_device(&dev_name);
+                                        {
+                                            let mut state = self.app_state.lock().unwrap();
+                                            state.is_url_dialog_open = false;
+                                            state.url_input_text.clear();
+                                            state.set_mic_input_mode(true, Some(dev_name.clone()));
+                                            state.osd_text =
+                                                Some(format!("🔊 Audio Input: {}", dev_name));
+                                            state.osd_timer = 3.0;
+                                        }
+                                        self.load_and_play_file(&mic_uri);
+                                    } else {
+                                        if !final_url.starts_with("http://")
+                                            && !final_url.starts_with("https://")
+                                        {
+                                            final_url = format!("https://{}", final_url);
+                                        }
+                                        {
+                                            let mut state = self.app_state.lock().unwrap();
+                                            state.set_mic_input_mode(false, None);
+                                            state.is_url_dialog_open = false;
+                                            state.url_input_text.clear();
+                                            state.playlist =
+                                                std::sync::Arc::new(vec![final_url.clone()]);
+                                            state.playlist_index = 0;
+                                            state.load_request = Some(final_url.clone());
+                                            state.file_loaded = true;
+                                            if let Some(idx) = state
+                                                .url_history
+                                                .iter()
+                                                .position(|(u, _)| u == &final_url)
+                                            {
+                                                let item = state.url_history.remove(idx);
+                                                state.url_history.push(item);
+                                            } else {
+                                                state.url_history.push((
+                                                    final_url,
+                                                    "Network Stream".to_string(),
+                                                ));
+                                            }
+                                            let mut out = String::new();
+                                            for (u, t) in &state.url_history {
+                                                out.push_str(&format!("{}|{}\n", u, t));
+                                            }
+                                            let _ = std::fs::write(
+                                                crate::state::get_history_file_path(),
+                                                out,
+                                            );
+                                        }
+                                    }
+                                }
+                                EngineAction::SetAudioDevice(dev) => {
+                                    let is_mic = {
+                                        let mut state = self.app_state.lock().unwrap();
+                                        state.selected_audio_device = Some(dev.clone());
+                                        if !state.is_mic_input {
+                                            state.audio_device_change_request = Some(dev.clone());
+                                        } else {
+                                            state.osd_text =
+                                                Some(format!("🔊 Audio Input: {}", dev));
+                                            state.osd_timer = 3.0;
+                                        }
+                                        state.is_mic_input
+                                    };
+                                    if is_mic {
+                                        let mic_uri = crate::state::mic_uri_for_device(&dev);
+                                        self.load_and_play_file(&mic_uri);
+                                    }
+                                }
+                                EngineAction::ToggleSurroundUpmix(val) => {
+                                    self.app_state.lock().unwrap().set_surround_upmix(val);
+                                }
+                                EngineAction::ToggleMpeghBitstream(val) => {
+                                    self.app_state.lock().unwrap().set_mpegh_bitstream(val);
+                                }
+                                EngineAction::SetSurroundUpmix(cfg) => {
+                                    self.app_state.lock().unwrap().surround_upmix = cfg;
+                                }
+                                EngineAction::SetShowSurroundEq(val) => {
+                                    self.app_state.lock().unwrap().set_show_surround_eq(val);
+                                }
+                                EngineAction::ToggleRoomVolumeSmoke => {
+                                    let mut state = self.app_state.lock().unwrap();
+                                    state.room_volume_smoke = !state.room_volume_smoke;
+                                    state.osd_text = Some(if state.room_volume_smoke {
+                                        "💨 Smoke Volume: ON".to_string()
+                                    } else {
+                                        "💨 Smoke Volume: OFF".to_string()
+                                    });
+                                    state.osd_timer = 2.0;
+                                }
+                                EngineAction::None | EngineAction::Quit => {}
                             }
-                            EngineAction::ToggleSurroundUpmix(val) => {
-                                self.app_state.lock().unwrap().set_surround_upmix(val);
-                            }
-                            EngineAction::ToggleMpeghBitstream(val) => {
-                                self.app_state.lock().unwrap().set_mpegh_bitstream(val);
-                            }
-                            EngineAction::SetSurroundUpmix(cfg) => {
-                                self.app_state.lock().unwrap().surround_upmix = cfg;
-                            }
-                            EngineAction::SetShowSurroundEq(val) => {
-                                self.app_state.lock().unwrap().set_show_surround_eq(val);
-                            }
-                            EngineAction::ToggleRoomVolumeSmoke => {
-                                let mut state = self.app_state.lock().unwrap();
-                                state.room_volume_smoke = !state.room_volume_smoke;
-                                state.osd_text = Some(if state.room_volume_smoke {
-                                    "💨 Smoke Volume: ON".to_string()
-                                } else {
-                                    "💨 Smoke Volume: OFF".to_string()
-                                });
-                                state.osd_timer = 2.0;
-                            }
-                            EngineAction::None => {}
                         }
                         self.app_state.lock().unwrap().sync_rt_control();
                     }
@@ -1757,8 +1784,14 @@ impl AndroidRustTrackerApp {
                     }
                 };
                 state.song_title = clean_name;
-                state.playlist = std::sync::Arc::new(vec![path.to_string()]);
-                state.playlist_index = 0;
+                let already_at_active_slot = state
+                    .playlist
+                    .get(state.playlist_index)
+                    .is_some_and(|p| p == path);
+                if !already_at_active_slot {
+                    state.playlist = std::sync::Arc::new(vec![path.to_string()]);
+                    state.playlist_index = 0;
+                }
                 state.lyrics = if is_mic {
                     None
                 } else {
@@ -1805,7 +1838,11 @@ unsafe extern "C" {
     fn pipe(pipefd: *mut i32) -> i32;
     fn dup2(oldfd: i32, newfd: i32) -> i32;
     fn close(fd: i32) -> i32;
+    fn signal(sig: i32, handler: usize) -> usize;
 }
+
+const SIGPIPE: i32 = 13;
+const SIG_IGN: usize = 1;
 
 static STDIO_REDIRECTED: std::sync::Once = std::sync::Once::new();
 
@@ -1835,6 +1872,9 @@ pub fn init_android_stdio_redirection() {
 
 #[unsafe(no_mangle)]
 fn android_main(app: AndroidApp) {
+    unsafe {
+        let _ = signal(SIGPIPE, SIG_IGN);
+    }
     init_android_stdio_redirection();
 
     if let Some(data_path) = app.internal_data_path() {
@@ -1875,6 +1915,10 @@ fn android_main(app: AndroidApp) {
         .unwrap() = Some(proxy);
 
     let app_state = Arc::new(Mutex::new(AppState::new("RustTracker Mobile".to_string())));
+    app_state.lock().unwrap().set_audio_devices(
+        crate::audio::get_available_audio_devices(false),
+        crate::audio::get_available_audio_devices(true),
+    );
     let _ = GLOBAL_APP_STATE.set(Arc::clone(&app_state));
     let egui_ctx = create_egui_context();
 
@@ -1883,6 +1927,7 @@ fn android_main(app: AndroidApp) {
     let mut android_app = AndroidRustTrackerApp {
         android_app: app,
         app_state,
+        ui_state: AppState::new("RustTracker Mobile".to_string()),
         window: None,
         engine: None,
         egui_ctx,

@@ -54,7 +54,7 @@ jobs:
       - name: Validate WGSL Shaders
         run: |
           source "$HOME/.cargo/env"
-          cargo run --bin validate_wgsl
+          cargo run -p rt-tools --bin validate_wgsl
 
       - name: Run Unit & Integration Tests
         run: |

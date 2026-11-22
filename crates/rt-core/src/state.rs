@@ -7,6 +7,12 @@ pub static UNCAPPED_PRESENT_MODE: AtomicBool = AtomicBool::new(false);
 pub static BENCH_FRAMES_OVERRIDE: AtomicU32 = AtomicU32::new(0);
 pub static CACHE_DIR_OVERRIDE: OnceLock<PathBuf> = OnceLock::new();
 
+pub const SYSTEM_DEFAULT_AUDIO_DEVICE: &str = "System Default (Auto)";
+
+pub fn get_default_audio_device_name(_mic: bool) -> Option<String> {
+    Some(SYSTEM_DEFAULT_AUDIO_DEVICE.to_string())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GamepadType {
     Xbox,
@@ -217,6 +223,21 @@ pub enum GpuCapabilityTier {
     Constrained,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GpuDeviceType {
+    DiscreteGpu,
+    IntegratedGpu,
+    VirtualGpu,
+    Cpu,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GpuAdapterProfile {
+    pub name: String,
+    pub device_type: GpuDeviceType,
+}
+
 /// Evaluates GPU hardware capability and display pixel load in an OS-agnostic manner.
 ///
 /// Rather than disabling visualizations based on the operating system (e.g. Android runs
@@ -225,13 +246,13 @@ pub enum GpuCapabilityTier {
 /// and physical viewport resolution to determine whether heavy per-pixel raymarching / 3D FLIP
 /// hydrodynamic shaders should be enabled by default in rotation.
 pub fn classify_gpu_capability(
-    info: &wgpu::AdapterInfo,
+    info: &GpuAdapterProfile,
     viewport_pixels: u32,
 ) -> GpuCapabilityTier {
     match info.device_type {
-        wgpu::DeviceType::DiscreteGpu => GpuCapabilityTier::High,
-        wgpu::DeviceType::Cpu | wgpu::DeviceType::VirtualGpu => GpuCapabilityTier::Constrained,
-        wgpu::DeviceType::IntegratedGpu | wgpu::DeviceType::Other => {
+        GpuDeviceType::DiscreteGpu => GpuCapabilityTier::High,
+        GpuDeviceType::Cpu | GpuDeviceType::VirtualGpu => GpuCapabilityTier::Constrained,
+        GpuDeviceType::IntegratedGpu | GpuDeviceType::Other => {
             let name = info.name.to_lowercase();
 
             // Software / fallback renderers reporting as Integrated/Other
@@ -875,16 +896,16 @@ impl SurroundUpmixConfig {
         let eq_gain = 10.0f32.powf(eq_db / 20.0);
 
         let f_sub = self.sub_crossover_hz.clamp(40.0, 250.0);
-        let sub_ratio_sq = (f / f_sub).powi(2);
-        let lfe_lp = 1.0 / (1.0 + sub_ratio_sq);
-        let sub_hp = sub_ratio_sq / (1.0 + sub_ratio_sq);
+        let sub_ratio_4 = (f / f_sub).powi(4);
+        let lfe_lp = 1.0 / (1.0 + sub_ratio_4);
+        let sub_hp = sub_ratio_4 / (1.0 + sub_ratio_4);
         let lfe_mag = eq_gain * lfe_lp * self.lfe_level;
 
         if has_height {
             let f_height = self.height_crossover_hz.clamp(800.0, 10000.0);
-            let height_ratio_sq = (f / f_height).powi(2);
-            let height_lp = 1.0 / (1.0 + height_ratio_sq);
-            let height_hp = height_ratio_sq / (1.0 + height_ratio_sq);
+            let height_ratio_4 = (f / f_height).powi(4);
+            let height_lp = 1.0 / (1.0 + height_ratio_4);
+            let height_hp = height_ratio_4 / (1.0 + height_ratio_4);
 
             let bed_mag = eq_gain
                 * sub_hp
@@ -920,6 +941,8 @@ pub struct RtAudioControl {
     lfe_level: std::sync::atomic::AtomicU32,
     surround_high_bleed: std::sync::atomic::AtomicU32,
     stereo_width: std::sync::atomic::AtomicU32,
+    need_gpu_spectrum: std::sync::atomic::AtomicBool,
+    need_multichannel_raw: std::sync::atomic::AtomicBool,
     track_ended_latch: std::sync::atomic::AtomicBool,
     audio_device_lost_latch: std::sync::atomic::AtomicBool,
 }
@@ -950,6 +973,8 @@ impl RtAudioControl {
             lfe_level: AtomicU32::new(cfg.lfe_level.to_bits()),
             surround_high_bleed: AtomicU32::new(cfg.surround_high_bleed.to_bits()),
             stereo_width: AtomicU32::new(cfg.stereo_width.to_bits()),
+            need_gpu_spectrum: AtomicBool::new(false),
+            need_multichannel_raw: AtomicBool::new(false),
             track_ended_latch: AtomicBool::new(false),
             audio_device_lost_latch: AtomicBool::new(false),
         }
@@ -993,6 +1018,30 @@ impl RtAudioControl {
     #[inline]
     pub fn seek_epoch(&self) -> u64 {
         self.seek_epoch.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn store_need_gpu_spectrum(&self, need: bool) {
+        self.need_gpu_spectrum
+            .store(need, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn need_gpu_spectrum(&self) -> bool {
+        self.need_gpu_spectrum
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub fn store_need_multichannel_raw(&self, need: bool) {
+        self.need_multichannel_raw
+            .store(need, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn need_multichannel_raw(&self) -> bool {
+        self.need_multichannel_raw
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[inline]
@@ -1126,7 +1175,6 @@ pub struct AppState {
     pub focus_url_input: bool,
     pub url_input_text: String,
     pub url_history: Vec<(String, String)>,
-    pub egui_gamepad_events: Vec<egui::Event>,
     pub force_stereo_downmix: bool,
     pub append_to_playlist: bool,
     pub panel_split_ratio: f32,
@@ -1156,6 +1204,7 @@ pub struct AppState {
     pub room_volume_smoke: bool,
     pub selected_audio_device: Option<String>,
     pub available_audio_devices: Vec<String>,
+    pub available_output_devices: Vec<String>,
     pub is_mic_input: bool,
     pub available_input_devices: Vec<String>,
     pub audio_device_change_request: Option<String>,
@@ -1168,6 +1217,7 @@ pub struct AppState {
     pub show_tui_device_picker: bool,
     pub tui_device_picker_cursor: usize,
     pub tui_center_view: Option<TuiCenterView>,
+    pub tui_pre_mute_volumes: Option<Vec<f32>>,
     pub tui_uptime_seconds: f32,
     pub lyrics: Option<std::sync::Arc<crate::lyrics::Lyrics>>,
     pub hovered_file: Option<String>,
@@ -1210,13 +1260,10 @@ pub fn get_history_file_path() -> std::path::PathBuf {
 impl AppState {
     pub fn new(title: String) -> Self {
         let is_mic = title == "Microphone Input" || is_mic_uri(&title);
-        let default_audio_device = crate::devices::get_default_audio_device_name(is_mic);
-        let available_audio_devices = crate::devices::get_available_audio_devices(is_mic);
-        let available_input_devices = if is_mic {
-            available_audio_devices.clone()
-        } else {
-            crate::devices::get_available_audio_devices(true)
-        };
+        let default_audio_device = get_default_audio_device_name(is_mic);
+        let available_audio_devices = vec![SYSTEM_DEFAULT_AUDIO_DEVICE.to_string()];
+        let available_output_devices = available_audio_devices.clone();
+        let available_input_devices = available_audio_devices.clone();
 
         let mut history = VecDeque::new();
         for _ in 0..120 {
@@ -1348,7 +1395,6 @@ impl AppState {
             focus_url_input: false,
             url_input_text: String::new(),
             url_history,
-            egui_gamepad_events: Vec::new(),
             force_stereo_downmix: false,
             append_to_playlist: false,
             panel_split_ratio: 0.5,
@@ -1378,6 +1424,7 @@ impl AppState {
             room_volume_smoke: true,
             selected_audio_device: default_audio_device,
             available_audio_devices,
+            available_output_devices,
             is_mic_input: is_mic,
             available_input_devices,
             audio_device_change_request: None,
@@ -1390,6 +1437,7 @@ impl AppState {
             show_tui_device_picker: false,
             tui_device_picker_cursor: 0,
             tui_center_view: None,
+            tui_pre_mute_volumes: None,
             tui_uptime_seconds: 0.0,
             lyrics: None,
             hovered_file: None,
@@ -1406,8 +1454,8 @@ impl AppState {
 
     /// Synchronizes lock-free atomic audio control state with `AppState`:
     /// drains RT latch signals (`track_ended`, `audio_device_lost`) and publishes
-    /// the latest `is_paused`, `seek_epoch`, and `surround_upmix` values for the
-    /// real-time audio callback.
+    /// the latest `is_paused`, `seek_epoch`, `surround_upmix`, and per-channel GPU spectrum
+    /// need flag for the real-time audio callback.
     #[inline]
     pub fn sync_rt_control(&mut self) {
         if self.rt_control.take_track_ended() {
@@ -1416,8 +1464,317 @@ impl AppState {
         if self.rt_control.take_audio_device_lost() {
             self.audio_device_lost = true;
         }
+        let vis_def = &VISUALIZERS[self.current_visualizer_idx.min(VISUALIZERS.len() - 1)];
+        let is_fullscreen_video =
+            self.video_mode == 3 && (self.has_video_stream || self.video_frame_rx.is_some());
+        let need_gpu_spec = !is_fullscreen_video && (vis_def.id == 6 || vis_def.requires_resynth);
+        let need_mc_raw =
+            !is_fullscreen_video && vis_def.requires_acoustic_waves && self.room_volume_smoke;
+        self.rt_control.store_need_gpu_spectrum(need_gpu_spec);
+        self.rt_control.store_need_multichannel_raw(need_mc_raw);
         self.rt_control
             .store_from_state(self.is_paused, self.seek_epoch, &self.surround_upmix);
+    }
+
+    /// Populate `dst` in-place as a lightweight UI render snapshot, reusing existing heap
+    /// capacities in `dst` so per-frame UI snapshots avoid repeated allocations.
+    pub fn render_snapshot_into(&self, dst: &mut Self) {
+        #[inline]
+        fn clone_option_from<T: Clone>(dst: &mut Option<T>, src: &Option<T>) {
+            match (dst.as_mut(), src.as_ref()) {
+                (Some(d), Some(s)) => d.clone_from(s),
+                _ => *dst = src.clone(),
+            }
+        }
+
+        let Self {
+            song_title,
+            artist,
+            module_type,
+            duration_seconds,
+            bitrate,
+            audio_tracks,
+            selected_audio_track,
+            active_audio_tracks,
+            audio_track_volumes,
+            multi_track_mix_mode,
+            audio_track_request: _,
+            audio_mix_request: _,
+            current_seconds,
+            seek_request: _,
+            scrub_target_seconds,
+            is_touch_scrubbing,
+            seek_epoch,
+            is_paused,
+            bpm,
+            speed,
+            num_channels,
+            hardware_channels,
+            source_channels,
+            raw_channel_vus: _,
+            channel_vus,
+            peak_vus,
+            raw_spectrum_data: _,
+            spectrum_data,
+            spectrum_peaks: _,
+            spectrum_history: _,
+            waveform_history: _,
+            waveform_history_push_count: _,
+            raw_waveform: _,
+            raw_audio_channels: _,
+            gpu_spectrum_data: _,
+            fire_heat: _,
+            lookahead_timeline: _,
+            lookahead_queue: _,
+            lookahead_sample_buffer: _,
+            lookahead_buffer_start_time: _,
+            show_hud,
+            max_frequency,
+            num_samples,
+            num_instruments,
+            num_patterns,
+            current_tracker_order,
+            current_tracker_row,
+            tracker_row_history,
+            current_tracker_row_string,
+            tracker_patterns_by_order,
+            tracker_channels,
+            load_request: _,
+            video_mode,
+            has_video_stream,
+            playlist,
+            playlist_index,
+            passthrough_enabled,
+            file_loaded,
+            video_info,
+            show_stats,
+            show_help,
+            stats,
+            current_fps,
+            current_sample_rate,
+            track_ended,
+            visualizer_mode,
+            visual_width,
+            target_fps,
+            current_visualizer_idx,
+            video_frame_rx,
+            free_video_frame_tx,
+            is_file_picker_open,
+            open_file_request: _,
+            is_url_dialog_open,
+            focus_url_input,
+            url_input_text,
+            url_history,
+            force_stereo_downmix,
+            append_to_playlist,
+            panel_split_ratio,
+            gamepad_type,
+            has_gamepad,
+            show_vis_picker,
+            vis_picker_cursor,
+            vis_picker_scroll_to_cursor,
+            vis_enabled,
+            vis_user_overridden,
+            gpu_capability_tier,
+            gpu_adapter_name,
+            vis_perf_watch_idx,
+            vis_active_frames,
+            vis_low_fps_frames,
+            auto_vis_guard,
+            vis_perf_warned_idx,
+            osd_text,
+            osd_timer,
+            cumulative_scrub,
+            audio_device_lost,
+            biolum_top_down,
+            room_volume_smoke,
+            selected_audio_device,
+            available_audio_devices,
+            available_output_devices,
+            is_mic_input,
+            available_input_devices,
+            audio_device_change_request,
+            audio_topology_reload_request,
+            active_audio_sink_id,
+            active_audio_sink_description,
+            active_audio_sink_channels,
+            is_dummy_audio_output,
+            passthrough_change_request,
+            show_tui_device_picker,
+            tui_device_picker_cursor,
+            tui_center_view,
+            tui_pre_mute_volumes,
+            tui_uptime_seconds,
+            lyrics,
+            hovered_file,
+            drag_cursor_pos,
+            track_info_rect,
+            mobile_hud_tab,
+            surround_upmix,
+            show_surround_eq,
+            is_native_atmos,
+            file_transfer,
+            rt_control,
+        } = self;
+
+        dst.passthrough_enabled = *passthrough_enabled;
+        dst.song_title.clone_from(song_title);
+        dst.artist.clone_from(artist);
+        dst.module_type.clone_from(module_type);
+        dst.duration_seconds = *duration_seconds;
+        dst.bitrate = *bitrate;
+        dst.audio_tracks.clone_from(audio_tracks);
+        dst.selected_audio_track = *selected_audio_track;
+        dst.active_audio_tracks.clone_from(active_audio_tracks);
+        dst.audio_track_volumes.clone_from(audio_track_volumes);
+        dst.multi_track_mix_mode = *multi_track_mix_mode;
+        dst.audio_track_request = None;
+        dst.audio_mix_request = None;
+        dst.current_seconds = *current_seconds;
+        dst.seek_request = None;
+        dst.scrub_target_seconds = *scrub_target_seconds;
+        dst.is_touch_scrubbing = *is_touch_scrubbing;
+        dst.seek_epoch = *seek_epoch;
+        dst.is_paused = *is_paused;
+        dst.bpm = *bpm;
+        dst.speed = *speed;
+        dst.num_channels = *num_channels;
+        dst.hardware_channels = *hardware_channels;
+        dst.source_channels = *source_channels;
+        dst.raw_channel_vus.clear();
+        if *file_loaded {
+            dst.channel_vus.clone_from(channel_vus);
+            dst.peak_vus.clone_from(peak_vus);
+        } else {
+            dst.channel_vus.clear();
+            dst.peak_vus.clear();
+        }
+        dst.raw_spectrum_data.clear();
+        if *file_loaded && (surround_upmix.enabled || *show_surround_eq) {
+            dst.spectrum_data.clone_from(spectrum_data);
+        } else {
+            dst.spectrum_data.clear();
+        }
+        dst.spectrum_peaks.clear();
+        dst.spectrum_history.clear();
+        dst.waveform_history.clear();
+        dst.waveform_history_push_count = 0;
+        dst.raw_waveform.clear();
+        dst.raw_audio_channels.clear();
+        dst.gpu_spectrum_data.clear();
+        dst.fire_heat.clear();
+        dst.lookahead_timeline.clear();
+        dst.lookahead_queue.clear();
+        dst.lookahead_sample_buffer.clear();
+        dst.lookahead_buffer_start_time = 0.0;
+        dst.show_hud = *show_hud;
+        dst.max_frequency = *max_frequency;
+        dst.num_samples = *num_samples;
+        dst.num_instruments = *num_instruments;
+        dst.num_patterns = *num_patterns;
+        dst.current_tracker_order = *current_tracker_order;
+        dst.current_tracker_row = *current_tracker_row;
+        if *file_loaded {
+            dst.tracker_row_history.clone_from(tracker_row_history);
+            dst.current_tracker_row_string
+                .clone_from(current_tracker_row_string);
+        } else {
+            dst.tracker_row_history.clear();
+            dst.current_tracker_row_string.clear();
+        }
+        if *file_loaded || tracker_patterns_by_order.is_empty() {
+            dst.tracker_patterns_by_order = std::sync::Arc::clone(tracker_patterns_by_order);
+        } else if !dst.tracker_patterns_by_order.is_empty() {
+            dst.tracker_patterns_by_order = std::sync::Arc::new(Vec::new());
+        }
+        dst.tracker_channels = *tracker_channels;
+        dst.load_request = None;
+        dst.video_mode = *video_mode;
+        dst.has_video_stream = *has_video_stream;
+        dst.file_loaded = *file_loaded;
+        clone_option_from(&mut dst.video_info, video_info);
+        dst.show_stats = *show_stats;
+        dst.show_help = *show_help;
+        dst.stats = stats.clone();
+        dst.current_fps = *current_fps;
+        dst.current_sample_rate = *current_sample_rate;
+        dst.playlist = std::sync::Arc::clone(playlist);
+        dst.playlist_index = *playlist_index;
+        dst.track_ended = *track_ended;
+        dst.visualizer_mode = *visualizer_mode;
+        dst.visual_width = *visual_width;
+        dst.target_fps = *target_fps;
+        dst.current_visualizer_idx = *current_visualizer_idx;
+        dst.video_frame_rx = video_frame_rx.clone();
+        dst.free_video_frame_tx = free_video_frame_tx.clone();
+        dst.is_file_picker_open = *is_file_picker_open;
+        dst.open_file_request = false;
+        dst.is_url_dialog_open = *is_url_dialog_open;
+        dst.focus_url_input = *focus_url_input;
+        dst.url_input_text.clone_from(url_input_text);
+        dst.url_history.clone_from(url_history);
+        dst.force_stereo_downmix = *force_stereo_downmix;
+        dst.append_to_playlist = *append_to_playlist;
+        dst.vis_enabled.clone_from(vis_enabled);
+        dst.vis_user_overridden.clone_from(vis_user_overridden);
+        dst.gpu_capability_tier = *gpu_capability_tier;
+        dst.gpu_adapter_name.clone_from(gpu_adapter_name);
+        dst.vis_perf_watch_idx = *vis_perf_watch_idx;
+        dst.vis_active_frames = *vis_active_frames;
+        dst.vis_low_fps_frames = *vis_low_fps_frames;
+        dst.auto_vis_guard = *auto_vis_guard;
+        dst.vis_perf_warned_idx = *vis_perf_warned_idx;
+        dst.gamepad_type = *gamepad_type;
+        dst.has_gamepad = *has_gamepad;
+        dst.panel_split_ratio = *panel_split_ratio;
+        dst.show_vis_picker = *show_vis_picker;
+        dst.vis_picker_cursor = *vis_picker_cursor;
+        dst.vis_picker_scroll_to_cursor = *vis_picker_scroll_to_cursor;
+        clone_option_from(&mut dst.osd_text, osd_text);
+        dst.osd_timer = *osd_timer;
+        dst.cumulative_scrub = *cumulative_scrub;
+        dst.audio_device_lost = *audio_device_lost;
+        dst.biolum_top_down = *biolum_top_down;
+        dst.room_volume_smoke = *room_volume_smoke;
+        clone_option_from(&mut dst.selected_audio_device, selected_audio_device);
+        dst.available_audio_devices
+            .clone_from(available_audio_devices);
+        dst.available_output_devices
+            .clone_from(available_output_devices);
+        dst.is_mic_input = *is_mic_input;
+        dst.available_input_devices
+            .clone_from(available_input_devices);
+        clone_option_from(
+            &mut dst.audio_device_change_request,
+            audio_device_change_request,
+        );
+        clone_option_from(
+            &mut dst.audio_topology_reload_request,
+            audio_topology_reload_request,
+        );
+        clone_option_from(&mut dst.active_audio_sink_id, active_audio_sink_id);
+        clone_option_from(
+            &mut dst.active_audio_sink_description,
+            active_audio_sink_description,
+        );
+        dst.active_audio_sink_channels = *active_audio_sink_channels;
+        dst.is_dummy_audio_output = *is_dummy_audio_output;
+        dst.passthrough_change_request = *passthrough_change_request;
+        dst.show_tui_device_picker = *show_tui_device_picker;
+        dst.tui_device_picker_cursor = *tui_device_picker_cursor;
+        dst.tui_center_view = *tui_center_view;
+        clone_option_from(&mut dst.tui_pre_mute_volumes, tui_pre_mute_volumes);
+        dst.tui_uptime_seconds = *tui_uptime_seconds;
+        dst.lyrics = lyrics.clone();
+        clone_option_from(&mut dst.hovered_file, hovered_file);
+        dst.drag_cursor_pos = *drag_cursor_pos;
+        dst.track_info_rect = *track_info_rect;
+        dst.mobile_hud_tab = *mobile_hud_tab;
+        dst.surround_upmix = *surround_upmix;
+        dst.show_surround_eq = *show_surround_eq;
+        dst.is_native_atmos = *is_native_atmos;
+        clone_option_from(&mut dst.file_transfer, file_transfer);
+        dst.rt_control = std::sync::Arc::clone(rt_control);
     }
 
     /// Create a lightweight clone for the render pass, skipping heavy audio data fields
@@ -1530,7 +1887,6 @@ impl AppState {
             focus_url_input: self.focus_url_input,
             url_input_text: self.url_input_text.clone(),
             url_history: self.url_history.clone(),
-            egui_gamepad_events: Vec::new(),
             force_stereo_downmix: self.force_stereo_downmix,
             append_to_playlist: self.append_to_playlist,
             vis_enabled: self.vis_enabled.clone(),
@@ -1556,6 +1912,7 @@ impl AppState {
             room_volume_smoke: self.room_volume_smoke,
             selected_audio_device: self.selected_audio_device.clone(),
             available_audio_devices: self.available_audio_devices.clone(),
+            available_output_devices: self.available_output_devices.clone(),
             is_mic_input: self.is_mic_input,
             available_input_devices: self.available_input_devices.clone(),
             audio_device_change_request: self.audio_device_change_request.clone(),
@@ -1568,6 +1925,7 @@ impl AppState {
             show_tui_device_picker: self.show_tui_device_picker,
             tui_device_picker_cursor: self.tui_device_picker_cursor,
             tui_center_view: self.tui_center_view,
+            tui_pre_mute_volumes: self.tui_pre_mute_volumes.clone(),
             tui_uptime_seconds: self.tui_uptime_seconds,
             lyrics: self.lyrics.clone(),
             hovered_file: self.hovered_file.clone(),
@@ -1592,15 +1950,30 @@ impl AppState {
                 || (!self.song_title.is_empty() && self.song_title != "Microphone Input"))
     }
 
+    /// Populates enumerated output and input audio device lists on host/mobile startup or refresh.
+    pub fn set_audio_devices(&mut self, output_devices: Vec<String>, input_devices: Vec<String>) {
+        if !output_devices.is_empty() {
+            self.available_output_devices = output_devices;
+        }
+        if !input_devices.is_empty() {
+            self.available_input_devices = input_devices;
+        }
+        self.available_audio_devices = if self.is_mic_input {
+            self.available_input_devices.clone()
+        } else {
+            self.available_output_devices.clone()
+        };
+    }
+
     /// Switches the audio device mode between microphone/input capture (`true`) and
-    /// playback output (`false`), refreshing `available_audio_devices` and `selected_audio_device`
+    /// playback output (`false`), updating `available_audio_devices` and `selected_audio_device`
     /// when transitioning between modes.
     pub fn set_mic_input_mode(&mut self, is_mic: bool, preferred_device: Option<String>) {
         let mode_changed = self.is_mic_input != is_mic;
         self.is_mic_input = is_mic;
         if is_mic {
             let input_devs = if self.available_input_devices.is_empty() {
-                crate::devices::get_available_audio_devices(true)
+                vec![SYSTEM_DEFAULT_AUDIO_DEVICE.to_string()]
             } else {
                 self.available_input_devices.clone()
             };
@@ -1609,12 +1982,18 @@ impl AppState {
             if let Some(dev) = preferred_device {
                 self.selected_audio_device = Some(dev);
             } else if mode_changed || self.selected_audio_device.is_none() {
-                self.selected_audio_device = crate::devices::get_default_audio_device_name(true);
+                self.selected_audio_device = get_default_audio_device_name(true);
             }
         } else if mode_changed {
-            self.available_audio_devices = crate::devices::get_available_audio_devices(false);
+            let output_devs = if self.available_output_devices.is_empty() {
+                vec![SYSTEM_DEFAULT_AUDIO_DEVICE.to_string()]
+            } else {
+                self.available_output_devices.clone()
+            };
+            self.available_output_devices = output_devs.clone();
+            self.available_audio_devices = output_devs;
             self.selected_audio_device =
-                preferred_device.or_else(|| crate::devices::get_default_audio_device_name(false));
+                preferred_device.or_else(|| get_default_audio_device_name(false));
         }
     }
 
@@ -1693,7 +2072,7 @@ impl AppState {
     /// by default no visualizer is unchecked or switched automatically.
     pub fn apply_gpu_capability_profile(
         &mut self,
-        info: &wgpu::AdapterInfo,
+        info: &GpuAdapterProfile,
         width: u32,
         height: u32,
     ) {
@@ -2618,5 +2997,65 @@ mod tests {
         std::sync::Arc::make_mut(&mut state.playlist).push("c.mod".to_string());
         assert_eq!(snap.playlist.len(), 2);
         assert_eq!(state.playlist.len(), 3);
+    }
+
+    #[test]
+    fn test_render_snapshot_into_reuses_capacities_and_matches_render_snapshot() {
+        let mut state = AppState::new("ReuseTest.flac".to_string());
+        state.file_loaded = true;
+        state.artist = "Artist".to_string();
+        state.channel_vus = vec![0.25, 0.75, 0.5, 0.1];
+        state.peak_vus = vec![0.8; 4];
+        state.spectrum_data = vec![12.0; 1024];
+        state.surround_upmix.enabled = true;
+        state.osd_text = Some("Volume +10%".to_string());
+        state.current_visualizer_idx = 0;
+        state.sync_rt_control();
+        assert!(
+            !state.rt_control.need_gpu_spectrum(),
+            "Spectrum visualizer (id 0) does not need per-channel GPU FFTs"
+        );
+        if let Some(fire_idx) = VISUALIZERS.iter().position(|v| v.id == 6) {
+            state.current_visualizer_idx = fire_idx;
+            state.sync_rt_control();
+            assert!(
+                state.rt_control.need_gpu_spectrum(),
+                "Firesim visualizer (id 6) requires per-channel GPU FFTs"
+            );
+            assert!(!state.rt_control.need_multichannel_raw());
+        }
+        if let Some(studio_idx) = VISUALIZERS.iter().position(|v| v.id == 31) {
+            state.current_visualizer_idx = studio_idx;
+            state.sync_rt_control();
+            assert!(
+                !state.rt_control.need_gpu_spectrum() && state.rt_control.need_multichannel_raw(),
+                "Neon Acoustic Studio (id 31) needs raw multi-channel audio without multi-channel FFTs"
+            );
+        }
+
+        let mut dst = AppState::new(String::new());
+        state.render_snapshot_into(&mut dst);
+        let baseline = state.render_snapshot();
+        assert_eq!(dst.song_title, baseline.song_title);
+        assert_eq!(dst.artist, baseline.artist);
+        assert_eq!(dst.channel_vus, baseline.channel_vus);
+        assert_eq!(dst.spectrum_data, baseline.spectrum_data);
+        assert_eq!(dst.osd_text, baseline.osd_text);
+
+        let vu_ptr = dst.channel_vus.as_ptr();
+        let vu_cap = dst.channel_vus.capacity();
+        let spec_ptr = dst.spectrum_data.as_ptr();
+        let spec_cap = dst.spectrum_data.capacity();
+
+        state.channel_vus[0] = 0.9;
+        state.spectrum_data[10] = 55.0;
+        state.render_snapshot_into(&mut dst);
+
+        assert_eq!(dst.channel_vus.as_ptr(), vu_ptr);
+        assert_eq!(dst.channel_vus.capacity(), vu_cap);
+        assert_eq!(dst.spectrum_data.as_ptr(), spec_ptr);
+        assert_eq!(dst.spectrum_data.capacity(), spec_cap);
+        assert_eq!(dst.channel_vus[0], 0.9);
+        assert_eq!(dst.spectrum_data[10], 55.0);
     }
 }

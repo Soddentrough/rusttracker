@@ -78,8 +78,7 @@ fn cs_clear(@builtin(global_invocation_id) global_id: vec3<u32>) {
     atomicStore(&grid_accum[idx].w_mom, 0);
     atomicStore(&grid_accum[idx].weight, 0u);
 
-    // Warm-start pressure from previous frame for 2x faster Jacobi convergence
-    pressure_0[idx] = pressure_0[idx] * 0.85;
+    pressure_0[idx] = 0.0;
     pressure_1[idx] = 0.0;
 }
 
@@ -262,19 +261,37 @@ fn cs_grid_forces(@builtin(global_invocation_id) global_id: vec3<u32>) {
 // ----------------------------------------------------------------------------
 // PASS 4A & 4B: Damped Jacobi Over-Relaxation Pressure Solver (Ping-Pong)
 // ----------------------------------------------------------------------------
-const JACOBI_OMEGA: f32 = 1.28;
+const JACOBI_OMEGA: f32 = 0.75;
 
 fn compute_divergence(gx: i32, gy: i32, gz: i32) -> f32 {
     let inv_2dx = 0.5 * INV_CELL_SIZE.x;
     let inv_2dy = 0.5 * INV_CELL_SIZE.y;
     let inv_2dz = 0.5 * INV_CELL_SIZE.z;
 
-    let x_plus = select(0.0, grid_vel_new[get_cell_idx(u32(gx + 1), u32(gy), u32(gz))].x, gx + 1 < i32(GRID_X));
-    let x_minus = select(0.0, grid_vel_new[get_cell_idx(u32(gx - 1), u32(gy), u32(gz))].x, gx - 1 >= 0);
-    let y_plus = select(0.0, grid_vel_new[get_cell_idx(u32(gx), u32(gy + 1), u32(gz))].y, gy + 1 < i32(GRID_Y));
-    let y_minus = select(0.0, grid_vel_new[get_cell_idx(u32(gx), u32(gy - 1), u32(gz))].y, gy - 1 >= 0);
-    let z_plus = select(0.0, grid_vel_new[get_cell_idx(u32(gx), u32(gy), u32(gz + 1))].z, gz + 1 < i32(GRID_Z));
-    let z_minus = select(0.0, grid_vel_new[get_cell_idx(u32(gx), u32(gy), u32(gz - 1))].z, gz - 1 >= 0);
+    var x_plus = 0.0;
+    if (gx + 1 < i32(GRID_X)) {
+        x_plus = grid_vel_new[get_cell_idx(u32(gx + 1), u32(gy), u32(gz))].x;
+    }
+    var x_minus = 0.0;
+    if (gx - 1 >= 0) {
+        x_minus = grid_vel_new[get_cell_idx(u32(gx - 1), u32(gy), u32(gz))].x;
+    }
+    var y_plus = 0.0;
+    if (gy + 1 < i32(GRID_Y)) {
+        y_plus = grid_vel_new[get_cell_idx(u32(gx), u32(gy + 1), u32(gz))].y;
+    }
+    var y_minus = 0.0;
+    if (gy - 1 >= 0) {
+        y_minus = grid_vel_new[get_cell_idx(u32(gx), u32(gy - 1), u32(gz))].y;
+    }
+    var z_plus = 0.0;
+    if (gz + 1 < i32(GRID_Z)) {
+        z_plus = grid_vel_new[get_cell_idx(u32(gx), u32(gy), u32(gz + 1))].z;
+    }
+    var z_minus = 0.0;
+    if (gz - 1 >= 0) {
+        z_minus = grid_vel_new[get_cell_idx(u32(gx), u32(gy), u32(gz - 1))].z;
+    }
 
     return (x_plus - x_minus) * inv_2dx + (y_plus - y_minus) * inv_2dy + (z_plus - z_minus) * inv_2dz;
 }

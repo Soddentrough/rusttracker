@@ -1,6 +1,6 @@
 # RustTracker Visualization System Review
 
-> **Document Status Note:** Sections 1–6 below are the historical **`2026-07-19`** review snapshot (written when the codebase had `22` registered visualizers and `34` WGSL files). **Section 7 (`2026-11-11` Audit & Resolution Status)** at the bottom of this file reflects current ground truth: **`19` registered visualizers** (`16` enabled in default rotation) and **`33` `.wgsl` files** in `src/shaders/` (**`31` standalone Naga-validated shader modules** + `2` shared include headers `_common.wgsl` and `_glyph_font.wgsl`).
+> **Document Status Note:** Sections 1–6 below are the historical **`2026-07-19`** review snapshot (written when the codebase had `22` registered visualizers and `34` WGSL files). **Section 7 (`2026-11-11` Audit & Resolution Status, updated for `v0.10.0`)** at the bottom of this file reflects current ground truth: **`19` registered visualizers** (`16` enabled in default rotation) and **`33` `.wgsl` files** in `src/shaders/` (**`31` standalone Naga-validated shader modules** + `2` shared include headers `_common.wgsl` and `_glyph_font.wgsl`), implemented modularly in `crates/rt-render/src/engine/` on `wgpu 30` / `naga 30`.
 
 Historical Review Date: 2026-07-19. Historical Scope: all 34 WGSL shaders in
 src/shaders/, the host-side visualization pipeline in src/engine.rs
@@ -341,7 +341,7 @@ Correctness & Spec Compliance Bugs (Section 3):
 
 Performance Wins (Section 4):
 - 3D Glass Lyrics font loading & indirect draws: RESOLVED (cached via `OnceLock<Option<Vec<u8>>>` in `generate_glass_lyrics_mesh`, reused GPU mesh buffers, and GPU-compacted active splash droplet `draw_indexed_indirect` instead of unconditional 65,536-instance draws).
-- FLIP Water Jacobi solver & particle splatting: RESOLVED (damped Jacobi over-relaxation `SOR_OMEGA = 1.28` ($\omega = 1.28$) in `cs_pressure_0_to_1` / `cs_pressure_1_to_0` of `flip_water_compute.wgsl`, active droplet compaction into `splash_compact.active_indices` in `cs_g2p_advect_splat`, and host `draw_indexed_indirect` rendering `vs_splash` in `vis_water_splash.wgsl`).
+- FLIP Water Jacobi solver & particle splatting: RESOLVED (damped Jacobi relaxation `SOR_OMEGA = 0.75` ($\omega = 0.75$) in `cs_pressure_0_to_1` / `cs_pressure_1_to_0` of `flip_water_compute.wgsl`, active droplet compaction into `splash_compact.active_indices` in `cs_g2p_advect_splat`, and host `draw_indexed_indirect` rendering `vs_splash` in `vis_water_splash.wgsl`).
 - Waveform history upload skipping & `f16` compression: RESOLVED (gated by `history_dirty`, uploading only dirty ring rows compressed 2× via IEEE-754 `f16` packing + branchless dual-lane `unpack2x16float_compat` from 1.18 MB to 589 KB, 4 KB/row, with zero optional Naga capabilities required).
 - Video chroma upload & border blur: RESOLVED (native 2-plane `NV12`/`NV21` `Rg8Unorm` and 10-bit `P010` `Rg16Unorm` GPU uploads with zero CPU UV de-interleaving, plus a generation-gated quarter-resolution `Rgba8UnormSrgb` pre-blurred border pass replacing the per-pixel 93-fetch blur loop in `vis_video.wgsl`).
 - GPU spectrum upload & 32-channel FFT skipping: RESOLVED (gated by active visualizer and `history_dirty`).
@@ -349,3 +349,8 @@ Performance Wins (Section 4):
 - Ferrofluid containment & sky early-out: RESOLVED (`p_entry` radial pre-test & `rd.y > 0.0` sky break in `vis_flip_ferrofluid.wgsl`; legacy `vis_ferrofluid.wgsl` subsequently purged).
 - Firesim black early-out: RESOLVED (skips erosion fbm when base_heat <= 0.003).
 - Unused visualizer pipelines & dead shaders: RESOLVED (only the 19 registered visualizers in `VISUALIZERS` have pipelines instantiated; 19 retired `.wgsl` shaders and 7 dead GPU pipelines were purged).
+
+`v0.10.0` Addendum (Architecture, Stack & Runtime Overhead):
+- Engine modularization & stack upgrade: split monolithic `engine.rs` into `crates/rt-render/src/engine/{mod,splash,types,ui_overlay,tests}.rs`, upgraded renderer stack to `wgpu 30.0.2`, `naga 30.0.2`, `egui`/`egui-wgpu`/`egui-winit 0.37.0`, `egui-file-dialog 0.16.0`, and trimmed `image 0.25.10` (`png`, `jpeg`).
+- Developer tools & snapshot separation: moved `validate_wgsl` (`cargo run -p rt-tools --bin validate_wgsl`) and `verify_3d_font` into `crates/rt-tools`, and extracted the 7 PNG/WebP/GIF snapshot generators out of `tests/test_performance.rs` into `examples/render_snapshots.rs`.
+- CPU/GPU frame-loop & allocation wins: fixed Wayland idle/occluded redraw spinning in `src/gui_runner.rs` (`ControlFlow::WaitUntil(16ms)` default, `Poll` only with `--uncapped` when unminimized), gated channels `1..31` DSP capture & multi-channel FFTs behind `RtAudioControl::need_gpu_spectrum`, skipped `resynth_compute` dispatch when paused, reused snapshot `Vec` capacities via `AppState::render_snapshot_into`, compared UTF-8 lyrics bytes before cloning text for 3D extrusion, and cached formatted HUD telemetry strings in `StatsDisplayCache` + static frequency axis labels.

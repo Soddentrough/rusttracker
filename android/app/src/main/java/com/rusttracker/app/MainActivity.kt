@@ -126,16 +126,28 @@ class MainActivity : GameActivity() {
 
     private fun ensureSoundfontExtracted() {
         val target = File(filesDir, "soundfont.sf2")
-        if (!target.exists() || target.length() == 0L) {
-            try {
-                assets.open("soundfont.sf2").use { input ->
-                    FileOutputStream(target).use { output ->
-                        input.copyTo(output)
+        if (target.exists() && target.length() > 0L) {
+            return
+        }
+        val appContext = applicationContext
+        java.util.concurrent.Executors.newSingleThreadExecutor().execute {
+            if (!target.exists() || target.length() == 0L) {
+                val tmp = File(filesDir, "soundfont.sf2.tmp")
+                try {
+                    appContext.assets.open("soundfont.sf2").use { input ->
+                        FileOutputStream(tmp).use { output ->
+                            input.copyTo(output)
+                        }
                     }
+                    if (!tmp.renameTo(target)) {
+                        tmp.delete()
+                    } else {
+                        Log.i(TAG, "SoundFont extracted to: ${target.absolutePath}")
+                    }
+                } catch (e: Exception) {
+                    tmp.delete()
+                    Log.e(TAG, "Failed to extract soundfont.sf2 from assets", e)
                 }
-                Log.i(TAG, "SoundFont extracted to: ${target.absolutePath}")
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to extract soundfont.sf2 from assets", e)
             }
         }
     }
@@ -151,7 +163,6 @@ class MainActivity : GameActivity() {
         }
         nativeOnDestroy()
         super.onDestroy()
-        android.os.Process.killProcess(android.os.Process.myPid())
     }
 
     fun openFilePicker() {

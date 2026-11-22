@@ -14,8 +14,9 @@ RustTracker pairs a **multi-threaded audio/video/DSP pipeline** (dedicated demux
 * **Multi-Platform Support:** Native support for **Linux (Fedora/RHEL & Ubuntu/Debian)**, **Android (Mobile & Tablet)**, **Windows 10/11**, **macOS**, and **Steam Deck (Gaming Mode)**.
 * **Universal Media Playback:**
   * **Tracker Modules:** `.MOD`, `.S3M`, `.IT`, `.XM` with real-time tracker pattern viewer and synchronized channel VU meters.
+  * **MIDI Playback:** Standard MIDI (`.MID`) synthesis with tempo-map support via `rustysynth` and embedded SoundFont.
   * **Lossless & Compressed Audio:** FLAC, WAV, MP3, AAC, OGG, Opus, AIFF.
-  * **Video Playback & Multi-Track Audio:** MP4, MKV, AVI, WebM with hardware-accelerated video decoding, HDR10/HLG tonemapping to SDR, and instant switching between multiple audio tracks (e.g., Vocals, Instrumental, Stems, Dubs).
+  * **Video Playback & Multi-Track Audio:** MP4, MKV, AVI, WebM with video decoding, HDR10/HLG tonemapping to SDR, and instant switching between multiple audio tracks (e.g., Vocals, Instrumental, Stems, Dubs).
   * **Bitstream Passthrough:** Real-time SPDIF/HDMI bitstream passthrough for Dolby Atmos, DTS-HD, and TrueHD on Linux (PipeWire/ALSA) and Windows (WASAPI Exclusive).
   * **Live Microphone Input:** Instant audio-reactive capture via `--mic`.
 * **Synchronized Lyrics & Heatmap:** Embedded and LRC synchronized lyrics with real-time heatmaps and 3D vector TrueType glyph extrusion.
@@ -180,7 +181,7 @@ ssh deck@<steamdeck-ip> "chmod +x ~/Downloads/RustTracker-SteamDeck.AppImage && 
 ## 🛠️ Building from Source
 
 ### Prerequisites
-* Rust 1.85+ (Edition 2024)
+* Rust (Edition 2024)
 * GPU Drivers: Vulkan SDK / Drivers (`vulkan-loader`, `mesa-vulkan-drivers`) on Linux/Windows, or Metal on macOS
 * FFmpeg 6.0+ libraries & `libopenmpt`
 
@@ -210,6 +211,18 @@ cargo build --release
 cargo install cargo-ndk
 rustup target add aarch64-linux-android
 cd android && ./gradlew assembleRelease
+```
+
+### Developer Verification & Snapshot Rendering
+```bash
+# Run workspace unit and integration suites
+cargo test --workspace
+
+# Validate all standalone WGSL shader modules via Naga
+cargo run -p rt-tools --bin validate_wgsl
+
+# Render visualizer snapshots on demand (fire|ferrofluid|glass_water|flip_lyrics|3d_osc|canyon|storm|all)
+cargo run --example render_snapshots -- all
 ```
 
 ---

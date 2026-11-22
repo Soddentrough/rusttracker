@@ -24,8 +24,17 @@ struct VertexOutput3D {
     @location(4) local_z: f32,
 }
 
-fn hash1(n: f32) -> f32 { return fract(sin(n) * 43758.5453123); }
-fn hash2(p: vec2<f32>) -> f32 { return fract(sin(dot(p, vec2<f32>(12.9898, 78.233))) * 43758.5453); }
+fn hash1(n: f32) -> f32 {
+    var u = bitcast<u32>(floor(n) + 0.0) * 1597334677u;
+    u = (u ^ (u >> 16u)) * 2654435769u;
+    return f32((u ^ (u >> 16u)) & 0x00FFFFFFu) / f32(0x01000000);
+}
+fn hash2(p: vec2<f32>) -> f32 {
+    let q = floor(p) + vec2<f32>(0.0);
+    var u = bitcast<u32>(q.x) * 1597334677u ^ bitcast<u32>(q.y) * 3812015801u;
+    u = (u ^ (u >> 16u)) * 2654435769u;
+    return f32((u ^ (u >> 16u)) & 0x00FFFFFFu) / f32(0x01000000);
+}
 
 // Smooth OutRun highway S-curve offset that begins ahead of the car (z > 8.0)
 fn road_curve_offset(z: f32, t: f32) -> f32 {

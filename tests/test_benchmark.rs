@@ -2,6 +2,7 @@ use std::process::Command;
 use std::str;
 
 #[test]
+#[ignore = "windowed display benchmark requires an active unoccluded display; run with cargo test --test test_benchmark -- --ignored"]
 fn test_visualizer_benchmark() {
     // If running in a headless environment without X11 or Wayland, skip the windowed benchmark
     if std::env::var("DISPLAY").is_err() && std::env::var("WAYLAND_DISPLAY").is_err() {
