@@ -2564,3 +2564,96 @@ fn test_neon_acoustic_studio_camera_choreography_and_clearance() {
         "Center (ch 2) must be cleanly stacked above LFE Sub (ch 3): min_y_c2={min_y_c2:.3}, max_y_c3={max_y_c3:.3}, avg_c2=({avg_x_c2:.2},{avg_z_c2:.2}), avg_c3=({avg_x_c3:.2},{avg_z_c3:.2})"
     );
 }
+
+#[test]
+fn test_biolum_refactor_mesh_camera_and_shaders() {
+    let biolum_vis = crate::state::VISUALIZERS
+        .iter()
+        .find(|v| v.id == 20)
+        .expect("Visualizer ID 20 (Bioluminescent Waves) must be registered in VISUALIZERS");
+    assert_eq!(biolum_vis.name, "Bioluminescent Waves");
+    assert_eq!(biolum_vis.filename, "vis_bioluminescence.wgsl");
+    assert!(!biolum_vis.heavy_shader);
+    assert_eq!(
+        biolum_vis.pipeline_type,
+        crate::state::PipelineType::Mesh3D {
+            geometry: crate::state::Geometry::UnitQuad,
+            instances: BIOLUM_PARTICLE_COUNT,
+        }
+    );
+    assert_eq!(BIOLUM_PARTICLE_COUNT, 36_864);
+    assert_eq!(BIOLUM_WORKGROUPS * 256, BIOLUM_PARTICLE_COUNT);
+
+    let default_state = AppState::new("Test App".to_string());
+    assert!(
+        !default_state.biolum_top_down,
+        "Bioluminescent Waves must default to 3D Perspective Horizon camera"
+    );
+
+    let (ocean_verts, ocean_inds) = generate_biolum_ocean_mesh();
+    assert_eq!(ocean_verts.len(), 161 * 141);
+    assert_eq!(ocean_inds.len(), 160 * 140 * 6);
+    for &idx in &ocean_inds {
+        assert!((idx as usize) < ocean_verts.len());
+    }
+    let mut min_u = f32::MAX;
+    let mut max_u = f32::MIN;
+    let mut min_v = f32::MAX;
+    let mut max_v = f32::MIN;
+    for v in &ocean_verts {
+        min_u = min_u.min(v.tex_coords[0]);
+        max_u = max_u.max(v.tex_coords[0]);
+        min_v = min_v.min(v.tex_coords[1]);
+        max_v = max_v.max(v.tex_coords[1]);
+    }
+    assert!((min_u - 0.0).abs() < 1e-6 && (max_u - 1.0).abs() < 1e-6);
+    assert!((min_v - 0.0).abs() < 1e-6 && (max_v - 1.0).abs() < 1e-6);
+
+    let (persp_eye, persp_target, persp_up) = compute_biolum_camera(10.0, false);
+    assert!(persp_eye.y > 0.0 && (persp_target.z - persp_eye.z) > 0.0 && persp_up == glam::Vec3::Y);
+    let (td_eye, td_target, td_up) = compute_biolum_camera(10.0, true);
+    assert!(td_eye.y > 10.0 && td_target.y.abs() < 1e-5 && (td_up.z - 1.0).abs() < 1e-5);
+
+    const SHADER_COMMON: &str = include_str!("../../../../src/shaders/_common.wgsl");
+    let raw_biolum_src = include_str!("../../../../src/shaders/vis_bioluminescence.wgsl");
+    let biolum_src = raw_biolum_src.replace("// INCLUDE: common", SHADER_COMMON);
+    let biolum_compute_src = include_str!("../../../../src/shaders/biolum_compute.wgsl")
+        .replace("// INCLUDE: common", SHADER_COMMON);
+
+    for fn_name in [
+        "fn vs_bg",
+        "fn fs_bg",
+        "fn vs_ocean",
+        "fn fs_ocean",
+        "fn vs_main_3d",
+        "fn fs_main",
+    ] {
+        assert!(
+            raw_biolum_src.contains(fn_name),
+            "vis_bioluminescence.wgsl must define {fn_name}"
+        );
+    }
+    for legacy_hack in ["bezel_mask", "scanline", "distorted_ndc"] {
+        assert!(
+            !raw_biolum_src.contains(legacy_hack),
+            "vis_bioluminescence.wgsl must not contain legacy CRT/bezel hack {legacy_hack}"
+        );
+    }
+
+    for (name, src) in [
+        ("vis_bioluminescence.wgsl", &biolum_src),
+        ("biolum_compute.wgsl", &biolum_compute_src),
+    ] {
+        let mut frontend = wgpu::naga::front::wgsl::Frontend::new();
+        let module = frontend
+            .parse(src)
+            .unwrap_or_else(|e| panic!("{name} parse error: {}", e.emit_to_string(src)));
+        let mut validator = wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::empty(),
+        );
+        validator
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{name} validation error: {e:?}"));
+    }
+}

@@ -9,7 +9,10 @@ mod splash;
 mod types;
 mod ui_overlay;
 
-pub use meshes::{generate_glass_lyrics_mesh, generate_lamp_mesh, generate_neon_room_mesh};
+pub use meshes::{
+    generate_biolum_ocean_mesh, generate_glass_lyrics_mesh, generate_lamp_mesh,
+    generate_neon_room_mesh,
+};
 pub(crate) use meshes::{generate_synthwave_racer_mesh, generate_vumeter_rack_mesh};
 pub(crate) use splash::{SplashCache, StatsDisplayCache};
 pub use types::*;
@@ -110,6 +113,10 @@ pub struct VulkanEngine {
     biolum_compute_bind_group: wgpu::BindGroup,
     biolum_render_bind_group: wgpu::BindGroup,
     _biolum_render_pipeline_layout: wgpu::PipelineLayout,
+    biolum_ocean_vertex_buffer: wgpu::Buffer,
+    biolum_ocean_index_buffer: wgpu::Buffer,
+    biolum_ocean_index_count: u32,
+    biolum_initialized: bool,
 
     // GPU FFT was removed (FFT is computed on the CPU); the dummy timestamp
     // pass in render() keeps the query-slot layout intact.
@@ -144,7 +151,8 @@ pub struct VulkanEngine {
     video_state: Option<VideoState>,
     video_repack_scratch: Vec<u8>,
     clear_black_pipeline: wgpu::RenderPipeline,
-    biolum_bg_pipeline: wgpu::RenderPipeline,
+    biolum_bg_pipeline: Option<wgpu::RenderPipeline>,
+    biolum_ocean_pipeline: Option<wgpu::RenderPipeline>,
     synthwave_sky_pipeline: wgpu::RenderPipeline,
     vumeters_bg_pipeline: wgpu::RenderPipeline,
 
@@ -1142,80 +1150,6 @@ impl VulkanEngine {
             cache: pipeline_cache_ref,
         });
 
-        let solid_biolum_bg_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("Solid Biolum BG Shader"),
-            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(
-                r#"
-                struct VertexOutput {
-                    @builtin(position) clip_position: vec4<f32>,
-                    @location(0) ndc: vec2<f32>,
-                }
-                @vertex
-                fn vs_main(@builtin(vertex_index) in_vertex_index: u32) -> VertexOutput {
-                    var out: VertexOutput;
-                    let x = f32((in_vertex_index << 1u) & 2u) * 2.0 - 1.0;
-                    let y = f32(in_vertex_index & 2u) * 2.0 - 1.0;
-                    let ndc = vec2<f32>(x, y);
-                    out.clip_position = vec4<f32>(ndc, 1.0, 1.0);
-                    out.ndc = ndc;
-                    return out;
-                }
-                @fragment
-                fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-                    let r2 = dot(in.ndc, in.ndc);
-                    let distorted_ndc = in.ndc * (1.0 + r2 * 0.055);
-                    if (abs(distorted_ndc.x) > 1.0 || abs(distorted_ndc.y) > 1.0) {
-                        discard;
-                    }
-                    let border_dist = min(1.0 - abs(distorted_ndc.x), 1.0 - abs(distorted_ndc.y));
-                    let bezel_mask = smoothstep(0.0, 0.03, border_dist);
-
-                    return vec4<f32>(vec3<f32>(0.001, 0.003, 0.008) * bezel_mask, 1.0);
-                }
-            "#,
-            )),
-        });
-
-        let biolum_bg_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: Some("Biolum BG Pipeline"),
-            layout: Some(&clear_black_layout),
-            vertex: wgpu::VertexState {
-                module: &solid_biolum_bg_shader,
-                entry_point: Some("vs_main"),
-                buffers: &[],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            },
-            fragment: Some(wgpu::FragmentState {
-                module: &solid_biolum_bg_shader,
-                entry_point: Some("fs_main"),
-                targets: &[Some(wgpu::ColorTargetState {
-                    format: config.format,
-                    blend: Some(wgpu::BlendState::REPLACE),
-                    write_mask: wgpu::ColorWrites::ALL,
-                })],
-                compilation_options: wgpu::PipelineCompilationOptions::default(),
-            }),
-            primitive: wgpu::PrimitiveState {
-                topology: wgpu::PrimitiveTopology::TriangleList,
-                strip_index_format: None,
-                front_face: wgpu::FrontFace::Ccw,
-                cull_mode: None,
-                polygon_mode: wgpu::PolygonMode::Fill,
-                unclipped_depth: false,
-                conservative: false,
-            },
-            depth_stencil: Some(wgpu::DepthStencilState {
-                format: wgpu::TextureFormat::Depth32Float,
-                depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Always),
-                stencil: wgpu::StencilState::default(),
-                bias: wgpu::DepthBiasState::default(),
-            }),
-            multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
-            cache: pipeline_cache_ref,
-        });
-
         let synthwave_sky_shader_src = resolve_shader_includes(include_str!(
             "../../../../src/shaders/vis_synthwave_racer_sky.wgsl"
         ));
@@ -2094,7 +2028,7 @@ impl VulkanEngine {
         // --- Bioluminescent Waves Compute & Render Setup ---
         let biolum_particles_buffer = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("Bioluminescent Particles"),
-            size: (65536 * 32) as u64, // 65,536 particles * 32 bytes/particle
+            size: (BIOLUM_PARTICLE_COUNT as u64) * 32, // 36,864 particles * 32 bytes/particle
             usage: wgpu::BufferUsages::STORAGE,
             mapped_at_creation: false,
         });
@@ -2625,6 +2559,32 @@ impl VulkanEngine {
         });
         queue.write_buffer(&lamp_index_buffer, 0, bytemuck::cast_slice(&lamp_inds));
         let lamp_index_count = lamp_inds.len() as u32;
+
+        let (biolum_ocean_verts, biolum_ocean_inds) = generate_biolum_ocean_mesh();
+        let biolum_ocean_vertex_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Biolum Ocean Vertex Buffer"),
+            size: (biolum_ocean_verts.len() * std::mem::size_of::<Vertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(
+            &biolum_ocean_vertex_buffer,
+            0,
+            bytemuck::cast_slice(&biolum_ocean_verts),
+        );
+
+        let biolum_ocean_index_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Biolum Ocean Index Buffer"),
+            size: (biolum_ocean_inds.len() * std::mem::size_of::<u32>()) as u64,
+            usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(
+            &biolum_ocean_index_buffer,
+            0,
+            bytemuck::cast_slice(&biolum_ocean_inds),
+        );
+        let biolum_ocean_index_count = biolum_ocean_inds.len() as u32;
         // --- END 3D Engine Extensions Init ---
 
         let pipeline_cache_path = if pipeline_cache_enabled {
@@ -2720,6 +2680,10 @@ impl VulkanEngine {
             biolum_compute_bind_group,
             biolum_render_bind_group,
             _biolum_render_pipeline_layout: biolum_render_pipeline_layout,
+            biolum_ocean_vertex_buffer,
+            biolum_ocean_index_buffer,
+            biolum_ocean_index_count,
+            biolum_initialized: false,
 
             resynth_compute_pipeline,
             resynth_bind_group,
@@ -2749,7 +2713,8 @@ impl VulkanEngine {
             video_state: None,
             video_repack_scratch: Vec::new(),
             clear_black_pipeline,
-            biolum_bg_pipeline,
+            biolum_bg_pipeline: None,
+            biolum_ocean_pipeline: None,
             synthwave_sky_pipeline,
             vumeters_bg_pipeline,
 
@@ -2954,7 +2919,7 @@ impl VulkanEngine {
                     entry_point: Some("fs_main"),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: self.config.format,
-                        blend: Some(if vis_def.id == 4 {
+                        blend: Some(if vis_def.id == 4 || vis_def.id == 20 {
                             wgpu::BlendState {
                                 color: wgpu::BlendComponent {
                                     src_factor: wgpu::BlendFactor::One,
@@ -2976,7 +2941,7 @@ impl VulkanEngine {
                 depth_stencil: if is_mesh_3d {
                     Some(wgpu::DepthStencilState {
                         format: wgpu::TextureFormat::Depth32Float,
-                        depth_write_enabled: Some(vis_def.id != 4),
+                        depth_write_enabled: Some(vis_def.id != 4 && vis_def.id != 20),
                         depth_compare: Some(wgpu::CompareFunction::LessEqual),
                         stencil: wgpu::StencilState::default(),
                         bias: wgpu::DepthBiasState::default(),
@@ -3055,6 +3020,103 @@ impl VulkanEngine {
                         cache: self.pipeline_cache.as_ref(),
                     });
                 self.lamp_pipeline = lp;
+            } else if vis_def.id == 20 {
+                let scope_biolum = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+                let bg_pipe = self
+                    .device
+                    .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                        label: Some("Biolum Sky/Horizon BG Pipeline"),
+                        layout: Some(&self.render_pipeline_layout_3d),
+                        vertex: wgpu::VertexState {
+                            module: &shader,
+                            entry_point: Some("vs_bg"),
+                            buffers: &[],
+                            compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        },
+                        fragment: Some(wgpu::FragmentState {
+                            module: &shader,
+                            entry_point: Some("fs_bg"),
+                            targets: &[Some(wgpu::ColorTargetState {
+                                format: self.config.format,
+                                blend: Some(wgpu::BlendState::REPLACE),
+                                write_mask: wgpu::ColorWrites::ALL,
+                            })],
+                            compilation_options: wgpu::PipelineCompilationOptions::default(),
+                        }),
+                        primitive: wgpu::PrimitiveState {
+                            topology: wgpu::PrimitiveTopology::TriangleList,
+                            strip_index_format: None,
+                            front_face: wgpu::FrontFace::Ccw,
+                            cull_mode: None,
+                            polygon_mode: wgpu::PolygonMode::Fill,
+                            unclipped_depth: false,
+                            conservative: false,
+                        },
+                        depth_stencil: Some(wgpu::DepthStencilState {
+                            format: wgpu::TextureFormat::Depth32Float,
+                            depth_write_enabled: Some(true),
+                            depth_compare: Some(wgpu::CompareFunction::Always),
+                            stencil: wgpu::StencilState::default(),
+                            bias: wgpu::DepthBiasState::default(),
+                        }),
+                        multisample: wgpu::MultisampleState::default(),
+                        multiview_mask: None,
+                        cache: self.pipeline_cache.as_ref(),
+                    });
+                let ocean_pipe =
+                    self.device
+                        .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                            label: Some("Biolum 3D Ocean Surface Pipeline"),
+                            layout: Some(&self.render_pipeline_layout_3d),
+                            vertex: wgpu::VertexState {
+                                module: &shader,
+                                entry_point: Some("vs_ocean"),
+                                buffers: &[Some(Vertex::desc())],
+                                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                            },
+                            fragment: Some(wgpu::FragmentState {
+                                module: &shader,
+                                entry_point: Some("fs_ocean"),
+                                targets: &[Some(wgpu::ColorTargetState {
+                                    format: self.config.format,
+                                    blend: Some(wgpu::BlendState::REPLACE),
+                                    write_mask: wgpu::ColorWrites::ALL,
+                                })],
+                                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                            }),
+                            primitive: wgpu::PrimitiveState {
+                                topology: wgpu::PrimitiveTopology::TriangleList,
+                                strip_index_format: None,
+                                front_face: wgpu::FrontFace::Ccw,
+                                cull_mode: None,
+                                polygon_mode: wgpu::PolygonMode::Fill,
+                                unclipped_depth: false,
+                                conservative: false,
+                            },
+                            depth_stencil: Some(wgpu::DepthStencilState {
+                                format: wgpu::TextureFormat::Depth32Float,
+                                depth_write_enabled: Some(true),
+                                depth_compare: Some(wgpu::CompareFunction::LessEqual),
+                                stencil: wgpu::StencilState::default(),
+                                bias: wgpu::DepthBiasState::default(),
+                            }),
+                            multisample: wgpu::MultisampleState::default(),
+                            multiview_mask: None,
+                            cache: self.pipeline_cache.as_ref(),
+                        });
+                let biolum_err = scope_biolum.pop();
+                let _ = self.device.poll(wgpu::PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                });
+                if let Some(error) = pollster::block_on(biolum_err) {
+                    eprintln!("Biolum auxiliary pipeline validation error: {:?}", error);
+                    self.biolum_bg_pipeline = None;
+                    self.biolum_ocean_pipeline = None;
+                } else {
+                    self.biolum_bg_pipeline = Some(bg_pipe);
+                    self.biolum_ocean_pipeline = Some(ocean_pipe);
+                }
             }
             self.save_pipeline_cache();
         }
@@ -3301,6 +3363,7 @@ impl VulkanEngine {
         self.vu_prev_num_channels = 0;
         self.channel_phases = [0.0; 32];
         self.acoustic_wave_initialized = false;
+        self.biolum_initialized = false;
         self.cached_meta_path.clear();
     }
 
@@ -3327,6 +3390,7 @@ impl VulkanEngine {
             self.vu_prev_num_channels = 0;
             self.channel_phases = [0.0; 32];
             self.acoustic_wave_initialized = false;
+            self.biolum_initialized = false;
             return;
         }
 
@@ -4851,12 +4915,10 @@ impl VulkanEngine {
                     base_fov
                 };
                 let proj = glam::Mat4::perspective_rh_gl(fov_y, aspect, 0.1, 1000.0);
-                let cam_view = if state.visualizer_mode == 20 && state.biolum_top_down {
-                    glam::Mat4::look_at_rh(
-                        glam::Vec3::new(0.0, 14.0, 0.0),
-                        glam::Vec3::new(0.0, 0.0, 0.0),
-                        glam::Vec3::new(0.0, 0.0, 1.0),
-                    )
+                let cam_view = if state.visualizer_mode == 20 {
+                    let (eye, target, up) =
+                        compute_biolum_camera(self.play_time, state.biolum_top_down);
+                    glam::Mat4::look_at_rh(eye, target, up)
                 } else if state.visualizer_mode == 14 {
                     let cam_y = if aspect < 1.0 { 1.65 } else { 1.50 };
                     let cam_z = if aspect < 1.0 { 0.2 } else { 0.6 };
@@ -5182,17 +5244,17 @@ impl VulkanEngine {
                         );
                     }
                 }
+            }
 
-                if vis_def.id == 20 {
-                    let mut compute_pass =
-                        encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                            label: Some("Bioluminescence Waves Sim Compute"),
-                            timestamp_writes: take_sim_timestamps(),
-                        });
-                    compute_pass.set_pipeline(&self.biolum_compute_pipeline);
-                    compute_pass.set_bind_group(0, Some(&self.biolum_compute_bind_group), &[]);
-                    compute_pass.dispatch_workgroups(144, 1, 1);
-                }
+            if vis_def.id == 20 && (!state.is_paused || !self.biolum_initialized) {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Bioluminescence Waves Sim Compute"),
+                    timestamp_writes: take_sim_timestamps(),
+                });
+                compute_pass.set_pipeline(&self.biolum_compute_pipeline);
+                compute_pass.set_bind_group(0, Some(&self.biolum_compute_bind_group), &[]);
+                compute_pass.dispatch_workgroups(BIOLUM_WORKGROUPS, 1, 1);
+                self.biolum_initialized = true;
             }
 
             if vis_def.requires_acoustic_waves && state.room_volume_smoke {
@@ -5303,8 +5365,23 @@ impl VulkanEngine {
             render_pass_3d.set_scissor_rect(vp_x as u32, vp_y as u32, vp_w as u32, vp_h as u32);
 
             if vis_def.id == 20 {
-                render_pass_3d.set_pipeline(&self.biolum_bg_pipeline);
-                render_pass_3d.draw(0..3, 0..1);
+                if let Some(bg_pipe) = &self.biolum_bg_pipeline {
+                    render_pass_3d.set_pipeline(bg_pipe);
+                    render_pass_3d.set_bind_group(0, &self.uniform_bind_group, &[]);
+                    render_pass_3d.set_bind_group(1, &self.camera_bind_group, &[]);
+                    render_pass_3d.draw(0..3, 0..1);
+                }
+                if let Some(ocean_pipe) = &self.biolum_ocean_pipeline {
+                    render_pass_3d.set_pipeline(ocean_pipe);
+                    render_pass_3d.set_bind_group(0, &self.uniform_bind_group, &[]);
+                    render_pass_3d.set_bind_group(1, &self.camera_bind_group, &[]);
+                    render_pass_3d.set_vertex_buffer(0, self.biolum_ocean_vertex_buffer.slice(..));
+                    render_pass_3d.set_index_buffer(
+                        self.biolum_ocean_index_buffer.slice(..),
+                        wgpu::IndexFormat::Uint32,
+                    );
+                    render_pass_3d.draw_indexed(0..self.biolum_ocean_index_count, 0, 0..1);
+                }
             } else if vis_def.id == 14 {
                 render_pass_3d.set_pipeline(&self.synthwave_sky_pipeline);
                 render_pass_3d.set_bind_group(0, &self.uniform_bind_group, &[]);

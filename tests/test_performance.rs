@@ -301,10 +301,35 @@ async fn run_perf_test() {
 
     let biolum_particles_buffer = device.create_buffer(&BufferDescriptor {
         label: Some("Bioluminescent Particles"),
-        size: 65536 * 32,
+        size: (crate::engine::BIOLUM_PARTICLE_COUNT as u64) * 32,
         usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
+
+    let (biolum_ocean_verts, biolum_ocean_inds) = crate::engine::generate_biolum_ocean_mesh();
+    let biolum_ocean_vertex_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("Biolum Ocean Vertex Buffer"),
+        size: (biolum_ocean_verts.len() * std::mem::size_of::<crate::engine::Vertex>()) as u64,
+        usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(
+        &biolum_ocean_vertex_buffer,
+        0,
+        bytemuck::cast_slice(&biolum_ocean_verts),
+    );
+    let biolum_ocean_index_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("Biolum Ocean Index Buffer"),
+        size: (biolum_ocean_inds.len() * std::mem::size_of::<u32>()) as u64,
+        usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    queue.write_buffer(
+        &biolum_ocean_index_buffer,
+        0,
+        bytemuck::cast_slice(&biolum_ocean_inds),
+    );
+    let biolum_ocean_index_count = biolum_ocean_inds.len() as u32;
 
     let biolum_render_bind_group = device.create_bind_group(&BindGroupDescriptor {
         label: Some("Biolum Render Bind Group"),
@@ -796,7 +821,18 @@ async fn run_perf_test() {
                 entry_point: Some("fs_main"),
                 targets: &[Some(ColorTargetState {
                     format: color_format,
-                    blend: Some(BlendState::REPLACE),
+                    blend: Some(if vis_def.id == 20 {
+                        BlendState {
+                            color: BlendComponent {
+                                src_factor: BlendFactor::One,
+                                dst_factor: BlendFactor::One,
+                                operation: BlendOperation::Add,
+                            },
+                            alpha: BlendComponent::OVER,
+                        }
+                    } else {
+                        BlendState::REPLACE
+                    }),
                     write_mask: ColorWrites::ALL,
                 })],
                 compilation_options: PipelineCompilationOptions::default(),
@@ -812,7 +848,7 @@ async fn run_perf_test() {
             },
             depth_stencil: Some(DepthStencilState {
                 format: TextureFormat::Depth32Float,
-                depth_write_enabled: Some(true),
+                depth_write_enabled: Some(vis_def.id != 20),
                 depth_compare: Some(CompareFunction::LessEqual),
                 stencil: StencilState::default(),
                 bias: DepthBiasState::default(),
@@ -821,6 +857,91 @@ async fn run_perf_test() {
             multiview_mask: None,
             cache: None,
         });
+
+        let (biolum_bg_pipeline, biolum_ocean_pipeline) = if vis_def.id == 20 {
+            let bg_p = device.create_render_pipeline(&RenderPipelineDescriptor {
+                label: Some("Biolum BG Pipeline"),
+                layout: Some(&render_pipeline_layout_3d),
+                vertex: VertexState {
+                    module: &shader_module,
+                    entry_point: Some("vs_bg"),
+                    buffers: &[],
+                    compilation_options: PipelineCompilationOptions::default(),
+                },
+                fragment: Some(FragmentState {
+                    module: &shader_module,
+                    entry_point: Some("fs_bg"),
+                    targets: &[Some(ColorTargetState {
+                        format: color_format,
+                        blend: Some(BlendState::REPLACE),
+                        write_mask: ColorWrites::ALL,
+                    })],
+                    compilation_options: PipelineCompilationOptions::default(),
+                }),
+                primitive: PrimitiveState {
+                    topology: PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: Some(DepthStencilState {
+                    format: TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(CompareFunction::Always),
+                    stencil: StencilState::default(),
+                    bias: DepthBiasState::default(),
+                }),
+                multisample: MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+            let ocean_buffers = [Some(crate::engine::Vertex::desc())];
+            let ocean_p = device.create_render_pipeline(&RenderPipelineDescriptor {
+                label: Some("Biolum Ocean Pipeline"),
+                layout: Some(&render_pipeline_layout_3d),
+                vertex: VertexState {
+                    module: &shader_module,
+                    entry_point: Some("vs_ocean"),
+                    buffers: &ocean_buffers,
+                    compilation_options: PipelineCompilationOptions::default(),
+                },
+                fragment: Some(FragmentState {
+                    module: &shader_module,
+                    entry_point: Some("fs_ocean"),
+                    targets: &[Some(ColorTargetState {
+                        format: color_format,
+                        blend: Some(BlendState::REPLACE),
+                        write_mask: ColorWrites::ALL,
+                    })],
+                    compilation_options: PipelineCompilationOptions::default(),
+                }),
+                primitive: PrimitiveState {
+                    topology: PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                depth_stencil: Some(DepthStencilState {
+                    format: TextureFormat::Depth32Float,
+                    depth_write_enabled: Some(true),
+                    depth_compare: Some(CompareFunction::LessEqual),
+                    stencil: StencilState::default(),
+                    bias: DepthBiasState::default(),
+                }),
+                multisample: MultisampleState::default(),
+                multiview_mask: None,
+                cache: None,
+            });
+            (Some(bg_p), Some(ocean_p))
+        } else {
+            (None, None)
+        };
 
         // Also build lamp pipeline if ID is 13
         let lamp_buffers = vec![Some(crate::engine::Vertex::desc())];
@@ -908,10 +1029,34 @@ async fn run_perf_test() {
                         rp.set_bind_group(1, &camera_bind_group, &[]);
                     }
                     if vis_def.id == 20 {
+                        if let Some(bg_p) = &biolum_bg_pipeline {
+                            rp.set_pipeline(bg_p);
+                            rp.set_bind_group(0, &uniform_bind_group, &[]);
+                            rp.set_bind_group(1, &camera_bind_group, &[]);
+                            rp.draw(0..3, 0..1);
+                        }
+                        if let Some(ocean_p) = &biolum_ocean_pipeline {
+                            rp.set_pipeline(ocean_p);
+                            rp.set_bind_group(0, &uniform_bind_group, &[]);
+                            rp.set_bind_group(1, &camera_bind_group, &[]);
+                            rp.set_vertex_buffer(0, biolum_ocean_vertex_buffer.slice(..));
+                            rp.set_index_buffer(
+                                biolum_ocean_index_buffer.slice(..),
+                                IndexFormat::Uint32,
+                            );
+                            rp.draw_indexed(0..biolum_ocean_index_count, 0, 0..1);
+                        }
+                        rp.set_pipeline(&pipeline);
+                        rp.set_bind_group(0, &uniform_bind_group, &[]);
+                        rp.set_bind_group(1, &camera_bind_group, &[]);
                         rp.set_bind_group(2, &biolum_render_bind_group, &[]);
                         rp.set_vertex_buffer(0, quad_vertex_buffer.slice(..));
                         rp.set_index_buffer(quad_index_buffer.slice(..), IndexFormat::Uint32);
-                        rp.draw_indexed(0..quad_index_count, 0, 0..65536);
+                        rp.draw_indexed(
+                            0..quad_index_count,
+                            0,
+                            0..crate::engine::BIOLUM_PARTICLE_COUNT,
+                        );
                     } else {
                         if vis_def.id == 31 {
                             rp.set_bind_group(2, &acoustic_render_bind_group, &[]);
@@ -1009,10 +1154,34 @@ async fn run_perf_test() {
                         rp.set_bind_group(1, &camera_bind_group, &[]);
                     }
                     if vis_def.id == 20 {
+                        if let Some(bg_p) = &biolum_bg_pipeline {
+                            rp.set_pipeline(bg_p);
+                            rp.set_bind_group(0, &uniform_bind_group, &[]);
+                            rp.set_bind_group(1, &camera_bind_group, &[]);
+                            rp.draw(0..3, 0..1);
+                        }
+                        if let Some(ocean_p) = &biolum_ocean_pipeline {
+                            rp.set_pipeline(ocean_p);
+                            rp.set_bind_group(0, &uniform_bind_group, &[]);
+                            rp.set_bind_group(1, &camera_bind_group, &[]);
+                            rp.set_vertex_buffer(0, biolum_ocean_vertex_buffer.slice(..));
+                            rp.set_index_buffer(
+                                biolum_ocean_index_buffer.slice(..),
+                                IndexFormat::Uint32,
+                            );
+                            rp.draw_indexed(0..biolum_ocean_index_count, 0, 0..1);
+                        }
+                        rp.set_pipeline(&pipeline);
+                        rp.set_bind_group(0, &uniform_bind_group, &[]);
+                        rp.set_bind_group(1, &camera_bind_group, &[]);
                         rp.set_bind_group(2, &biolum_render_bind_group, &[]);
                         rp.set_vertex_buffer(0, quad_vertex_buffer.slice(..));
                         rp.set_index_buffer(quad_index_buffer.slice(..), IndexFormat::Uint32);
-                        rp.draw_indexed(0..quad_index_count, 0, 0..65536);
+                        rp.draw_indexed(
+                            0..quad_index_count,
+                            0,
+                            0..crate::engine::BIOLUM_PARTICLE_COUNT,
+                        );
                     } else {
                         if vis_def.id == 31 {
                             rp.set_bind_group(2, &acoustic_render_bind_group, &[]);
@@ -3165,5 +3334,779 @@ fn test_neon_acoustic_studio_smoke_blasts_and_toggle() {
                 "{label} must stay cleanly framed and dark-contrasted (avg_luma={avg_luma:.4}, max_luma={max_luma:.2}, dark={dark_pixels}, min_dark={min_dark}, white={bright_white})"
             );
         }
+    });
+}
+
+#[test]
+fn test_gpu_bioluminescent_waves_render_and_compute() {
+    pollster::block_on(async {
+        let instance = Instance::new(InstanceDescriptor {
+            backends: Backends::PRIMARY,
+            flags: InstanceFlags::default(),
+            backend_options: BackendOptions::default(),
+            display: None,
+            memory_budget_thresholds: MemoryBudgetThresholds::default(),
+        });
+        let adapter = instance
+            .request_adapter(&RequestAdapterOptions {
+                power_preference: PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+                apply_limit_buckets: false,
+            })
+            .await
+            .expect("Failed to find an appropriate adapter");
+
+        let timestamp_supported = adapter.features().contains(Features::TIMESTAMP_QUERY);
+        let mut required_features = Features::empty();
+        if timestamp_supported {
+            required_features |= Features::TIMESTAMP_QUERY;
+        }
+        let (device, queue) = adapter
+            .request_device(&DeviceDescriptor {
+                label: Some("Biolum Test Device"),
+                required_features,
+                ..Default::default()
+            })
+            .await
+            .expect("Failed to create device");
+
+        let error_caught = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let err_flag = error_caught.clone();
+        device.on_uncaptured_error(std::sync::Arc::new(move |err| {
+            eprintln!("WGPU Validation/Device Error in Biolum test: {:?}", err);
+            err_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+
+        let common = include_str!("../src/shaders/_common.wgsl");
+        let biolum_compute_src = include_str!("../src/shaders/biolum_compute.wgsl")
+            .replace("// INCLUDE: common", common);
+        let biolum_render_src = include_str!("../src/shaders/vis_bioluminescence.wgsl")
+            .replace("// INCLUDE: common", common);
+
+        let uniform_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("Biolum Test Uniforms"),
+            size: std::mem::size_of::<engine::AudioUniforms>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let camera_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("Biolum Test Camera"),
+            size: std::mem::size_of::<engine::CameraUniforms>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let particles_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("Biolum Test Particles"),
+            size: (engine::BIOLUM_PARTICLE_COUNT as u64) * 32,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let (ocean_verts, ocean_inds) = engine::generate_biolum_ocean_mesh();
+        let ocean_vb = device.create_buffer(&BufferDescriptor {
+            label: Some("Biolum Test Ocean VB"),
+            size: (ocean_verts.len() * std::mem::size_of::<engine::Vertex>()) as u64,
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&ocean_vb, 0, bytemuck::cast_slice(&ocean_verts));
+        let ocean_ib = device.create_buffer(&BufferDescriptor {
+            label: Some("Biolum Test Ocean IB"),
+            size: (ocean_inds.len() * std::mem::size_of::<u32>()) as u64,
+            usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&ocean_ib, 0, bytemuck::cast_slice(&ocean_inds));
+        let ocean_index_count = ocean_inds.len() as u32;
+
+        let quad_verts = [
+            engine::Vertex {
+                position: [-0.5, -0.5, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                tex_coords: [0.0, 0.0],
+            },
+            engine::Vertex {
+                position: [0.5, -0.5, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                tex_coords: [1.0, 0.0],
+            },
+            engine::Vertex {
+                position: [0.5, 0.5, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                tex_coords: [1.0, 1.0],
+            },
+            engine::Vertex {
+                position: [-0.5, 0.5, 0.0],
+                normal: [0.0, 0.0, 1.0],
+                tex_coords: [0.0, 1.0],
+            },
+        ];
+        let quad_inds: [u32; 6] = [0, 1, 2, 0, 2, 3];
+        let quad_vb = device.create_buffer(&BufferDescriptor {
+            label: Some("Biolum Test Quad VB"),
+            size: std::mem::size_of_val(&quad_verts) as u64,
+            usage: BufferUsages::VERTEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&quad_vb, 0, bytemuck::cast_slice(&quad_verts));
+        let quad_ib = device.create_buffer(&BufferDescriptor {
+            label: Some("Biolum Test Quad IB"),
+            size: std::mem::size_of_val(&quad_inds) as u64,
+            usage: BufferUsages::INDEX | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        queue.write_buffer(&quad_ib, 0, bytemuck::cast_slice(&quad_inds));
+
+        let compute_bgl = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("Biolum Test Compute BGL"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+        let compute_bg = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Biolum Test Compute BG"),
+            layout: &compute_bgl,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: uniform_buf.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: particles_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let compute_mod = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("Biolum Test Compute Shader"),
+            source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&biolum_compute_src)),
+        });
+        let compute_pl = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Biolum Test Compute PL"),
+            bind_group_layouts: &[Some(&compute_bgl)],
+            immediate_size: 0,
+        });
+        let compute_pipe = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("Biolum Test Compute Pipeline"),
+            layout: Some(&compute_pl),
+            module: &compute_mod,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let audio_bgl = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("Biolum Test Audio BGL"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let cam_bgl = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("Biolum Test Camera BGL"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let part_bgl = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("Biolum Test Particles BGL"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let audio_bg = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Biolum Test Audio BG"),
+            layout: &audio_bgl,
+            entries: &[BindGroupEntry {
+                binding: 0,
+                resource: uniform_buf.as_entire_binding(),
+            }],
+        });
+        let cam_bg = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Biolum Test Camera BG"),
+            layout: &cam_bgl,
+            entries: &[BindGroupEntry {
+                binding: 0,
+                resource: camera_buf.as_entire_binding(),
+            }],
+        });
+        let part_bg = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Biolum Test Particles BG"),
+            layout: &part_bgl,
+            entries: &[BindGroupEntry {
+                binding: 0,
+                resource: particles_buf.as_entire_binding(),
+            }],
+        });
+
+        let layout_3d = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Biolum Test 3D PL"),
+            bind_group_layouts: &[Some(&audio_bgl), Some(&cam_bgl)],
+            immediate_size: 0,
+        });
+        let layout_particles = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Biolum Test Particles PL"),
+            bind_group_layouts: &[Some(&audio_bgl), Some(&cam_bgl), Some(&part_bgl)],
+            immediate_size: 0,
+        });
+
+        let render_mod = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("Biolum Test Render Shader"),
+            source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&biolum_render_src)),
+        });
+        let color_format = TextureFormat::Rgba8UnormSrgb;
+        let v_desc = [Some(engine::Vertex::desc())];
+
+        let bg_pipe = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("Biolum Test BG Pipeline"),
+            layout: Some(&layout_3d),
+            vertex: VertexState {
+                module: &render_mod,
+                entry_point: Some("vs_bg"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(FragmentState {
+                module: &render_mod,
+                entry_point: Some("fs_bg"),
+                targets: &[Some(ColorTargetState {
+                    format: color_format,
+                    blend: Some(BlendState::REPLACE),
+                    write_mask: ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: PrimitiveState::default(),
+            depth_stencil: Some(DepthStencilState {
+                format: TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(CompareFunction::Always),
+                stencil: StencilState::default(),
+                bias: DepthBiasState::default(),
+            }),
+            multisample: MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let ocean_pipe = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("Biolum Test Ocean Pipeline"),
+            layout: Some(&layout_3d),
+            vertex: VertexState {
+                module: &render_mod,
+                entry_point: Some("vs_ocean"),
+                buffers: &v_desc,
+                compilation_options: Default::default(),
+            },
+            fragment: Some(FragmentState {
+                module: &render_mod,
+                entry_point: Some("fs_ocean"),
+                targets: &[Some(ColorTargetState {
+                    format: color_format,
+                    blend: Some(BlendState::REPLACE),
+                    write_mask: ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: PrimitiveState::default(),
+            depth_stencil: Some(DepthStencilState {
+                format: TextureFormat::Depth32Float,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(CompareFunction::LessEqual),
+                stencil: StencilState::default(),
+                bias: DepthBiasState::default(),
+            }),
+            multisample: MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let particle_pipe = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("Biolum Test Particle Pipeline"),
+            layout: Some(&layout_particles),
+            vertex: VertexState {
+                module: &render_mod,
+                entry_point: Some("vs_main_3d"),
+                buffers: &v_desc,
+                compilation_options: Default::default(),
+            },
+            fragment: Some(FragmentState {
+                module: &render_mod,
+                entry_point: Some("fs_main"),
+                targets: &[Some(ColorTargetState {
+                    format: color_format,
+                    blend: Some(BlendState {
+                        color: BlendComponent {
+                            src_factor: BlendFactor::One,
+                            dst_factor: BlendFactor::One,
+                            operation: BlendOperation::Add,
+                        },
+                        alpha: BlendComponent::OVER,
+                    }),
+                    write_mask: ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: PrimitiveState::default(),
+            depth_stencil: Some(DepthStencilState {
+                format: TextureFormat::Depth32Float,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(CompareFunction::LessEqual),
+                stencil: StencilState::default(),
+                bias: DepthBiasState::default(),
+            }),
+            multisample: MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        // Drive 20 compute simulation ticks with realistic multi-band musical energy
+        let mut uniforms: engine::AudioUniforms = bytemuck::Zeroable::zeroed();
+        uniforms.mode = 20;
+        uniforms.num_channels = 2;
+        uniforms.num_spatial_channels = 2;
+        uniforms.aspect_ratio = 16.0 / 9.0;
+        uniforms.frame_dt = 0.0166;
+        uniforms.channels[0] = 0.85;
+        uniforms.channels[1] = 0.72;
+        uniforms.spatial_channels[0] = 0.85;
+        uniforms.spatial_channels[1] = 0.72;
+        uniforms.spectrum[0..12].fill(68.0);
+        uniforms.spectrum[32..88].fill(42.0);
+        uniforms.spectrum[160..320].fill(36.0);
+
+        let mut play_time = 6.5_f64;
+        for step in 0..20 {
+            play_time += 0.0166 * 2.88;
+            uniforms.time = (play_time / 2.88) as f32;
+            uniforms.smooth_time = play_time as f32;
+            uniforms.frame_count = step;
+            queue.write_buffer(&uniform_buf, 0, bytemuck::cast_slice(&[uniforms]));
+
+            let mut enc = device.create_command_encoder(&CommandEncoderDescriptor::default());
+            {
+                let mut cp = enc.begin_compute_pass(&ComputePassDescriptor {
+                    label: Some("Biolum Test Compute"),
+                    timestamp_writes: None,
+                });
+                cp.set_pipeline(&compute_pipe);
+                cp.set_bind_group(0, Some(&compute_bg), &[]);
+                cp.dispatch_workgroups(engine::BIOLUM_WORKGROUPS, 1, 1);
+            }
+            queue.submit(Some(enc.finish()));
+        }
+        let _ = device.poll(PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+
+        let snapshot_dir = std::env::var("RT_SAVE_BIOLUM_SNAPSHOT_DIR").ok();
+        let cases = [
+            (1280u32, 720u32, false, "biolum_perspective_16x9.png"),
+            (1400u32, 400u32, false, "biolum_perspective_ultrawide.png"),
+            (1400u32, 400u32, true, "biolum_topdown_ultrawide.png"),
+        ];
+
+        for (w, h, top_down, filename) in cases {
+            let aspect = w as f32 / h as f32;
+            let fov_y = 48.0_f32.to_radians();
+            let proj = glam::Mat4::perspective_rh_gl(fov_y, aspect, 0.1, 1000.0);
+            let (eye, target, up) = engine::compute_biolum_camera(play_time, top_down);
+            let view = glam::Mat4::look_at_rh(eye, target, up);
+
+            let cam_u = engine::CameraUniforms {
+                view_matrix: view.to_cols_array_2d(),
+                proj_matrix: proj.to_cols_array_2d(),
+            };
+            queue.write_buffer(&camera_buf, 0, bytemuck::cast_slice(&[cam_u]));
+
+            let mut u = uniforms;
+            u.aspect_ratio = aspect;
+            queue.write_buffer(&uniform_buf, 0, bytemuck::cast_slice(&[u]));
+
+            let color_tex = device.create_texture(&TextureDescriptor {
+                label: Some("Biolum Test Color"),
+                size: Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: color_format,
+                usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let color_view = color_tex.create_view(&TextureViewDescriptor::default());
+            let depth_tex = device.create_texture(&TextureDescriptor {
+                label: Some("Biolum Test Depth"),
+                size: Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: TextureFormat::Depth32Float,
+                usage: TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            let depth_view = depth_tex.create_view(&TextureViewDescriptor::default());
+
+            let padded_row_bytes = (w * 4).div_ceil(256) * 256;
+            let readback_buf = device.create_buffer(&BufferDescriptor {
+                label: Some("Biolum Test Readback"),
+                size: (padded_row_bytes * h) as u64,
+                usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+            // Sentinel magenta background clear proves fs_bg + fs_ocean cover 100% of every pixel without border gaps
+            let sentinel_clear = Color {
+                r: 1.0,
+                g: 0.0,
+                b: 1.0,
+                a: 1.0,
+            };
+
+            let mut enc = device.create_command_encoder(&CommandEncoderDescriptor::default());
+            {
+                let mut rp = enc.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("Biolum Test Render"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view: &color_view,
+                        resolve_target: None,
+                        ops: Operations {
+                            load: LoadOp::Clear(sentinel_clear),
+                            store: StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                        view: &depth_view,
+                        depth_ops: Some(Operations {
+                            load: LoadOp::Clear(1.0),
+                            store: StoreOp::Discard,
+                        }),
+                        stencil_ops: None,
+                    }),
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                rp.set_pipeline(&bg_pipe);
+                rp.set_bind_group(0, &audio_bg, &[]);
+                rp.set_bind_group(1, &cam_bg, &[]);
+                rp.draw(0..3, 0..1);
+
+                rp.set_pipeline(&ocean_pipe);
+                rp.set_bind_group(0, &audio_bg, &[]);
+                rp.set_bind_group(1, &cam_bg, &[]);
+                rp.set_vertex_buffer(0, ocean_vb.slice(..));
+                rp.set_index_buffer(ocean_ib.slice(..), IndexFormat::Uint32);
+                rp.draw_indexed(0..ocean_index_count, 0, 0..1);
+
+                rp.set_pipeline(&particle_pipe);
+                rp.set_bind_group(0, &audio_bg, &[]);
+                rp.set_bind_group(1, &cam_bg, &[]);
+                rp.set_bind_group(2, &part_bg, &[]);
+                rp.set_vertex_buffer(0, quad_vb.slice(..));
+                rp.set_index_buffer(quad_ib.slice(..), IndexFormat::Uint32);
+                rp.draw_indexed(0..6, 0, 0..engine::BIOLUM_PARTICLE_COUNT);
+            }
+            enc.copy_texture_to_buffer(
+                TexelCopyTextureInfo {
+                    texture: &color_tex,
+                    mip_level: 0,
+                    origin: Origin3d::ZERO,
+                    aspect: TextureAspect::All,
+                },
+                TexelCopyBufferInfo {
+                    buffer: &readback_buf,
+                    layout: TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded_row_bytes),
+                        rows_per_image: Some(h),
+                    },
+                },
+                Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.submit(Some(enc.finish()));
+
+            let slice = readback_buf.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(MapMode::Read, move |r| tx.send(r).unwrap());
+            let _ = device.poll(PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            });
+            rx.recv().unwrap().unwrap();
+            let mapped = slice.get_mapped_range().unwrap();
+            let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+            for y in 0..h as usize {
+                let row_start = y * padded_row_bytes as usize;
+                rgba.extend_from_slice(&mapped[row_start..row_start + (w * 4) as usize]);
+            }
+            drop(mapped);
+            readback_buf.unmap();
+
+            if let Some(dir) = &snapshot_dir {
+                let out_path = std::path::Path::new(dir).join(filename);
+                image::save_buffer(&out_path, &rgba, w, h, image::ColorType::Rgba8)
+                    .expect("Failed to save biolum snapshot");
+            }
+
+            let total_px = (w * h) as usize;
+            let mut dark_px = 0usize;
+            let mut cyan_glow_px = 0usize;
+            let mut white_clip_px = 0usize;
+            let mut border_grey_leaks = 0usize;
+            let mut luma_sum = 0.0f64;
+
+            for y in 0..h as usize {
+                for x in 0..w as usize {
+                    let i = (y * w as usize + x) * 4;
+                    let [r, g, b, _] = [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]];
+                    let luma = (0.2126 * r as f64 + 0.7152 * g as f64 + 0.0722 * b as f64) / 255.0;
+                    luma_sum += luma;
+                    if luma < 0.22 {
+                        dark_px += 1;
+                    }
+                    if b > r.saturating_add(25) && g >= 95 && b >= 130 {
+                        cyan_glow_px += 1;
+                    }
+                    if r > 240 && g > 240 && b > 240 {
+                        white_clip_px += 1;
+                    }
+                    let is_edge = x < 4 || x >= w as usize - 4 || y < 4 || y >= h as usize - 4;
+                    if is_edge && r > 180 && g < 50 && b > 180 {
+                        border_grey_leaks += 1;
+                    }
+                }
+            }
+
+            let avg_luma = luma_sum / total_px as f64;
+            println!(
+                "Biolum {filename} ({w}x{h}, top_down={top_down}): avg_luma={avg_luma:.4}, dark={dark_px}/{total_px}, cyan_glow={cyan_glow_px}, white_clip={white_clip_px}, border_leaks={border_grey_leaks}"
+            );
+
+            assert_eq!(
+                border_grey_leaks, 0,
+                "{filename} must fill 100% edge-to-edge with zero grey border leaks"
+            );
+            assert!(
+                dark_px > total_px / 4,
+                "{filename} must preserve deep dark midnight troughs/sky ({dark_px} / {total_px})"
+            );
+            assert!(
+                cyan_glow_px > 500,
+                "{filename} must display vibrant bioluminescent cyan waves/particles (got {cyan_glow_px})"
+            );
+            assert!(
+                white_clip_px < total_px / 20,
+                "{filename} must not blow out into flat white ({white_clip_px} / {total_px})"
+            );
+        }
+
+        // Benchmark 3-pass render time at 1280x720 when timestamp queries are supported
+        if timestamp_supported {
+            let w = 1280u32;
+            let h = 720u32;
+            let aspect = w as f32 / h as f32;
+            let proj = glam::Mat4::perspective_rh_gl(48.0_f32.to_radians(), aspect, 0.1, 1000.0);
+            let (eye, target, up) = engine::compute_biolum_camera(play_time, false);
+            let view = glam::Mat4::look_at_rh(eye, target, up);
+            let cam_u = engine::CameraUniforms {
+                view_matrix: view.to_cols_array_2d(),
+                proj_matrix: proj.to_cols_array_2d(),
+            };
+            queue.write_buffer(&camera_buf, 0, bytemuck::cast_slice(&[cam_u]));
+
+            let color_tex = device.create_texture(&TextureDescriptor {
+                label: Some("Biolum Perf Color"),
+                size: Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: color_format,
+                usage: TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            let color_view = color_tex.create_view(&TextureViewDescriptor::default());
+            let depth_tex = device.create_texture(&TextureDescriptor {
+                label: Some("Biolum Perf Depth"),
+                size: Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: TextureFormat::Depth32Float,
+                usage: TextureUsages::RENDER_ATTACHMENT,
+                view_formats: &[],
+            });
+            let depth_view = depth_tex.create_view(&TextureViewDescriptor::default());
+
+            let qs = device.create_query_set(&QuerySetDescriptor {
+                label: Some("Biolum Perf QS"),
+                ty: QueryType::Timestamp,
+                count: 2,
+            });
+            let res_buf = device.create_buffer(&BufferDescriptor {
+                label: Some("Biolum Perf Res"),
+                size: 16,
+                usage: BufferUsages::QUERY_RESOLVE | BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+            let ts_read_buf = device.create_buffer(&BufferDescriptor {
+                label: Some("Biolum Perf Read"),
+                size: 16,
+                usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            let period = queue.get_timestamp_period();
+            let iters = 30u32;
+            let mut sum_ms = 0.0f32;
+            for _ in 0..iters {
+                let mut enc = device.create_command_encoder(&CommandEncoderDescriptor::default());
+                {
+                    let mut rp = enc.begin_render_pass(&RenderPassDescriptor {
+                        label: Some("Biolum Perf Pass"),
+                        color_attachments: &[Some(RenderPassColorAttachment {
+                            view: &color_view,
+                            resolve_target: None,
+                            ops: Operations {
+                                load: LoadOp::Clear(Color::BLACK),
+                                store: StoreOp::Store,
+                            },
+                            depth_slice: None,
+                        })],
+                        depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                            view: &depth_view,
+                            depth_ops: Some(Operations {
+                                load: LoadOp::Clear(1.0),
+                                store: StoreOp::Discard,
+                            }),
+                            stencil_ops: None,
+                        }),
+                        timestamp_writes: Some(RenderPassTimestampWrites {
+                            query_set: &qs,
+                            beginning_of_pass_write_index: Some(0),
+                            end_of_pass_write_index: Some(1),
+                        }),
+                        occlusion_query_set: None,
+                        multiview_mask: None,
+                    });
+                    rp.set_pipeline(&bg_pipe);
+                    rp.set_bind_group(0, &audio_bg, &[]);
+                    rp.set_bind_group(1, &cam_bg, &[]);
+                    rp.draw(0..3, 0..1);
+
+                    rp.set_pipeline(&ocean_pipe);
+                    rp.set_bind_group(0, &audio_bg, &[]);
+                    rp.set_bind_group(1, &cam_bg, &[]);
+                    rp.set_vertex_buffer(0, ocean_vb.slice(..));
+                    rp.set_index_buffer(ocean_ib.slice(..), IndexFormat::Uint32);
+                    rp.draw_indexed(0..ocean_index_count, 0, 0..1);
+
+                    rp.set_pipeline(&particle_pipe);
+                    rp.set_bind_group(0, &audio_bg, &[]);
+                    rp.set_bind_group(1, &cam_bg, &[]);
+                    rp.set_bind_group(2, &part_bg, &[]);
+                    rp.set_vertex_buffer(0, quad_vb.slice(..));
+                    rp.set_index_buffer(quad_ib.slice(..), IndexFormat::Uint32);
+                    rp.draw_indexed(0..6, 0, 0..engine::BIOLUM_PARTICLE_COUNT);
+                }
+                enc.resolve_query_set(&qs, 0..2, &res_buf, 0);
+                enc.copy_buffer_to_buffer(&res_buf, 0, &ts_read_buf, 0, 16);
+                queue.submit(Some(enc.finish()));
+                let _ = device.poll(PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                });
+                let slice = ts_read_buf.slice(..);
+                let (tx, rx) = std::sync::mpsc::channel();
+                slice.map_async(MapMode::Read, move |r| tx.send(r).unwrap());
+                let _ = device.poll(PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                });
+                rx.recv().unwrap().unwrap();
+                let data = slice.get_mapped_range().unwrap();
+                let s = u64::from_le_bytes(data[0..8].try_into().unwrap());
+                let e = u64::from_le_bytes(data[8..16].try_into().unwrap());
+                drop(data);
+                ts_read_buf.unmap();
+                if e > s {
+                    sum_ms += ((e - s) as f32 * period) / 1_000_000.0;
+                }
+            }
+            let avg_ms = sum_ms / iters as f32;
+            println!(
+                "Bioluminescent Waves 1280x720 3-pass GPU render: {avg_ms:.3} ms (budget < 0.700 ms)"
+            );
+            assert!(
+                avg_ms < 0.700,
+                "Bioluminescent Waves 3-pass render exceeded 0.7ms budget: {avg_ms:.3} ms"
+            );
+        }
+
+        assert!(
+            !error_caught.load(std::sync::atomic::Ordering::SeqCst),
+            "WGPU validation error was triggered during Bioluminescent Waves test!"
+        );
     });
 }

@@ -310,6 +310,42 @@ pub fn wrap_host_phase_time(time_secs: f64) -> f32 {
 pub const NEON_STUDIO_CAM_SHOT_SECS: f64 = 9.0;
 pub const NEON_STUDIO_CAM_CYCLE_SECS: f64 = 54.0;
 
+pub const BIOLUM_PARTICLE_COUNT: u32 = 36_864;
+pub const BIOLUM_WORKGROUPS: u32 = 144;
+
+/// Computes the camera `(eye, target, up)` for Visualizer 20 (`Bioluminescent Waves`)
+/// in either Perspective Horizon mode (`top_down = false`) or Top-Down Aerial mode (`top_down = true`).
+pub fn compute_biolum_camera(
+    play_time: f64,
+    top_down: bool,
+) -> (glam::Vec3, glam::Vec3, glam::Vec3) {
+    let t = if play_time.is_finite() && play_time > 0.0 {
+        (play_time / 2.88) as f32
+    } else {
+        0.0
+    };
+
+    if top_down {
+        let cx = (t * 0.12).sin() * 1.1;
+        let cz = 6.0 + (t * 0.09).cos() * 0.9;
+        (
+            glam::Vec3::new(cx, 18.0, cz),
+            glam::Vec3::new(cx, 0.0, cz),
+            glam::Vec3::new(0.0, 0.0, 1.0),
+        )
+    } else {
+        (
+            glam::Vec3::new(
+                (t * 0.14).sin() * 1.5,
+                3.65 + (t * 0.28).sin() * 0.20,
+                -13.5,
+            ),
+            glam::Vec3::new((t * 0.10).sin() * 2.0, 0.35, 16.0),
+            glam::Vec3::Y,
+        )
+    }
+}
+
 #[inline]
 fn quintic_hermite_vec3(
     p0: glam::Vec3,

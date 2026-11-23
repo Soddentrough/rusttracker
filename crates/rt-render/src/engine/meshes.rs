@@ -2317,3 +2317,40 @@ pub(crate) fn generate_vumeter_rack_mesh() -> (Vec<Vertex>, Vec<u32>) {
     );
     (vertices, indices)
 }
+
+pub fn generate_biolum_ocean_mesh() -> (Vec<Vertex>, Vec<u32>) {
+    const GRID_W: u32 = 160;
+    const GRID_D: u32 = 140;
+
+    let mut vertices = Vec::with_capacity(((GRID_W + 1) * (GRID_D + 1)) as usize);
+    let mut indices = Vec::with_capacity((GRID_W * GRID_D * 6) as usize);
+
+    for z in 0..=GRID_D {
+        let v = z as f32 / GRID_D as f32;
+        let pz = v * 2.0 - 1.0;
+        for x in 0..=GRID_W {
+            let u = x as f32 / GRID_W as f32;
+            let px = u * 2.0 - 1.0;
+            vertices.push(Vertex {
+                position: [px, 0.0, pz],
+                normal: [0.0, 1.0, 0.0],
+                tex_coords: [u, v],
+            });
+        }
+    }
+
+    let stride = GRID_W + 1;
+    for z in 0..GRID_D {
+        for x in 0..GRID_W {
+            let start = z * stride + x;
+            indices.push(start);
+            indices.push(start + 1);
+            indices.push(start + stride);
+            indices.push(start + 1);
+            indices.push(start + stride + 1);
+            indices.push(start + stride);
+        }
+    }
+
+    (vertices, indices)
+}

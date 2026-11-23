@@ -558,7 +558,7 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         id: 20,
         name: "Bioluminescent Waves",
         filename: "vis_bioluminescence.wgsl",
-        description: "GPU compute-driven bioluminescent particle waves",
+        description: "3D midnight ocean swells with GPU-compute bioluminescent plankton & glowing crests",
         pipeline_type: PipelineType::Mesh3D {
             geometry: Geometry::UnitQuad,
             instances: 36864,
@@ -1420,7 +1420,7 @@ impl AppState {
             osd_timer: 0.0,
             cumulative_scrub: 0.0,
             audio_device_lost: false,
-            biolum_top_down: true,
+            biolum_top_down: false,
             room_volume_smoke: true,
             selected_audio_device: default_audio_device,
             available_audio_devices,
