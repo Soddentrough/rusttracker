@@ -2594,12 +2594,47 @@ fn run_wasapi_exclusive_multichannel(
         Err(last_err)
     }
 
+    const SPATIAL_714_STATIC_OBJECT_TYPES: [AudioObjectType; 12] = [
+        AudioObjectType_FrontLeft,
+        AudioObjectType_FrontRight,
+        AudioObjectType_FrontCenter,
+        AudioObjectType_LowFrequency,
+        AudioObjectType_SideLeft,
+        AudioObjectType_SideRight,
+        AudioObjectType_BackLeft,
+        AudioObjectType_BackRight,
+        AudioObjectType_TopFrontLeft,
+        AudioObjectType_TopFrontRight,
+        AudioObjectType_TopBackLeft,
+        AudioObjectType_TopBackRight,
+    ];
+
+    // Field declaration order is load-bearing for COM teardown: child `ISpatialAudioObject`
+    // instances must be released before `stream`, `_fmt_enum`, and `_spatial_client`.
     struct SpatialAudio714State {
-        _spatial_client: ISpatialAudioClient,
-        _fmt_enum: IAudioFormatEnumerator,
-        stream: ISpatialAudioObjectRenderStream,
         objects: Vec<ISpatialAudioObject>,
+        stream: ISpatialAudioObjectRenderStream,
+        _fmt_enum: IAudioFormatEnumerator,
+        _spatial_client: ISpatialAudioClient,
         carrier_label: String,
+    }
+
+    impl SpatialAudio714State {
+        fn activate_static_objects(&mut self) -> Result<()> {
+            self.objects.clear();
+            if self.objects.capacity() < SPATIAL_714_STATIC_OBJECT_TYPES.len() {
+                self.objects
+                    .reserve(SPATIAL_714_STATIC_OBJECT_TYPES.len() - self.objects.capacity());
+            }
+            for obj_type in SPATIAL_714_STATIC_OBJECT_TYPES {
+                let obj =
+                    unsafe { self.stream.ActivateSpatialAudioObject(obj_type) }.map_err(|e| {
+                        anyhow::anyhow!("ActivateSpatialAudioObject({:?}) failed: {}", obj_type, e)
+                    })?;
+                self.objects.push(obj);
+            }
+            Ok(())
+        }
     }
 
     /// Opens a 12-channel (`7.1.4` / `11.1`) Windows Spatial Audio (`ISpatialAudioClient` ->
@@ -2721,30 +2756,6 @@ fn run_wasapi_exclusive_multichannel(
             unsafe { sac.ActivateSpatialAudioStream(&*pv) }
                 .map_err(|e| anyhow::anyhow!("ActivateSpatialAudioStream(7.1.4) failed: {}", e))?;
 
-        // Activate all 12 static 7.1.4 bed objects in RustTracker's canonical 12-channel order:
-        // [0:FL, 1:FR, 2:FC, 3:LFE, 4:SL, 5:SR, 6:BL(RL), 7:BR(RR), 8:TFL, 9:TFR, 10:TBL(TRL), 11:TBR(TRR)]
-        let static_types = [
-            AudioObjectType_FrontLeft,
-            AudioObjectType_FrontRight,
-            AudioObjectType_FrontCenter,
-            AudioObjectType_LowFrequency,
-            AudioObjectType_SideLeft,
-            AudioObjectType_SideRight,
-            AudioObjectType_BackLeft,
-            AudioObjectType_BackRight,
-            AudioObjectType_TopFrontLeft,
-            AudioObjectType_TopFrontRight,
-            AudioObjectType_TopBackLeft,
-            AudioObjectType_TopBackRight,
-        ];
-        let mut objects = Vec::with_capacity(12);
-        for obj_type in static_types {
-            let obj = unsafe { stream.ActivateSpatialAudioObject(obj_type) }.map_err(|e| {
-                anyhow::anyhow!("ActivateSpatialAudioObject({:?}) failed: {}", obj_type, e)
-            })?;
-            objects.push(obj);
-        }
-
         let carrier_label = if max_dyn > 0 {
             format!(
                 "ISpatialAudioClient 7.1.4 (Dolby Atmos / MAT 2.0, {} dynamic objects supported)",
@@ -2754,14 +2765,19 @@ fn run_wasapi_exclusive_multichannel(
             "ISpatialAudioClient 7.1.4 (Static Bed — enable 'Dolby Atmos for Home Theater' in Windows Sound Settings for eARC heights)".to_string()
         };
 
+        let mut spatial_state = SpatialAudio714State {
+            objects: Vec::with_capacity(SPATIAL_714_STATIC_OBJECT_TYPES.len()),
+            stream,
+            _fmt_enum: fmt_enum,
+            _spatial_client: sac,
+            carrier_label,
+        };
+        // Activate all 12 static 7.1.4 bed objects in RustTracker's canonical 12-channel order:
+        // [0:FL, 1:FR, 2:FC, 3:LFE, 4:SL, 5:SR, 6:BL(RL), 7:BR(RR), 8:TFL, 9:TFR, 10:TBL(TRL), 11:TBR(TRR)]
+        spatial_state.activate_static_objects()?;
+
         Ok((
-            SpatialAudio714State {
-                _spatial_client: sac,
-                _fmt_enum: fmt_enum,
-                stream,
-                objects,
-                carrier_label,
-            },
+            spatial_state,
             event.into_raw(),
             max_frames.max(480),
             chosen_rate,
@@ -3148,6 +3164,9 @@ fn run_wasapi_exclusive_multichannel(
             }
         }
 
+        // Declare `event` before WASAPI / Spatial Audio COM interfaces so reverse-declaration-order
+        // unwinding always drops COM clients/streams before closing the Win32 event handle.
+        let mut event = OwnedHandle::new(HANDLE::default());
         let (
             active_device,
             active_device_name,
@@ -3168,7 +3187,7 @@ fn run_wasapi_exclusive_multichannel(
                 return;
             }
         };
-        let mut event = OwnedHandle::new(raw_event);
+        event.reset(raw_event);
 
         let is_mpegh_iec_bitstream = mpegh_state.is_some();
         let is_spatial_714 = spatial_state.is_some();
@@ -3275,15 +3294,17 @@ fn run_wasapi_exclusive_multichannel(
         // - For LPCM WASAPI, prime the buffer with silence before calling `audio_client.Start()`.
         // - For IEC 61937-13 MPEG-H bitstreaming, pre-fill the first DMA buffer with real IEC 61937
         //   bursts inside the loop before calling `audio_client.Start()`.
+        let mut start_failed = false;
         if !is_paused_init {
             if let Some(ref spatial) = spatial_state {
                 unsafe {
                     if let Err(e) = spatial.stream.Start() {
-                        eprintln!(
+                        fatal_err_msg = Some(format!(
                             "[audio] ISpatialAudioObjectRenderStream::Start() failed: {:?}",
                             e
-                        );
-                        return;
+                        ));
+                        rt_control.signal_audio_device_lost();
+                        start_failed = true;
                     }
                 }
             } else if !is_mpegh_iec_bitstream
@@ -3304,14 +3325,17 @@ fn run_wasapi_exclusive_multichannel(
                             .ReleaseBuffer(prime_frames, AUDCLNT_BUFFERFLAGS_SILENT.0 as u32);
                     }
                     if let Err(e) = audio_client.Start() {
-                        eprintln!("[audio] WASAPI Start() failed: {:?}", e);
-                        return;
+                        fatal_err_msg = Some(format!("[audio] WASAPI Start() failed: {:?}", e));
+                        rt_control.signal_audio_device_lost();
+                        start_failed = true;
                     }
                 }
             }
         }
 
-        while !stop_token_thread.load(std::sync::atomic::Ordering::Relaxed) {
+        let mut consecutive_wait_timeouts = 0u32;
+
+        while !start_failed && !stop_token_thread.load(std::sync::atomic::Ordering::Relaxed) {
             let is_paused = rt_control.is_paused();
             let ctrl_epoch = rt_control.seek_epoch();
             if ctrl_epoch > latest_seek_epoch {
@@ -3341,16 +3365,23 @@ fn run_wasapi_exclusive_multichannel(
             // Stop active hardware stream / release Exclusive Mode lock while paused so we never
             // pump 100 Hz spatial objects or hold an Exclusive lock when playback is paused.
             if is_paused {
+                consecutive_wait_timeouts = 0;
                 if stream_started {
                     fft_buffer.fill(0.0);
                     for ch_buf in &mut channel_fft_buffers {
                         ch_buf.fill(0.0);
                     }
                 }
-                if let Some(ref spatial) = spatial_state {
+                if let Some(ref mut spatial) = spatial_state {
                     if stream_started {
                         unsafe {
                             let _ = spatial.stream.Stop();
+                        }
+                        // Calling `Reset()` revokes all active `ISpatialAudioObject` instances, so
+                        // release them beforehand and re-activate on resume inside
+                        // `BeginUpdatingAudioObjects`.
+                        spatial.objects.clear();
+                        unsafe {
                             let _ = spatial.stream.Reset();
                         }
                         stream_started = false;
@@ -3379,6 +3410,7 @@ fn run_wasapi_exclusive_multichannel(
                 if let Some(ref spatial) = spatial_state {
                     if !stream_started {
                         startup_fade_pos = 0;
+                        consecutive_wait_timeouts = 0;
                         unsafe {
                             if let Err(e) = spatial.stream.Start() {
                                 fatal_err_msg = Some(format!(
@@ -3468,8 +3500,20 @@ fn run_wasapi_exclusive_multichannel(
             if stream_started {
                 let wait_res = unsafe { WaitForSingleObject(event.as_raw(), 50) };
                 if wait_res.0 != WAIT_OBJECT_0 {
+                    if !is_paused {
+                        consecutive_wait_timeouts += 1;
+                        if consecutive_wait_timeouts >= 60 {
+                            fatal_err_msg = Some(
+                                "[audio] WASAPI/Spatial Audio event timed out for ~3s while playing; triggering device recovery"
+                                    .to_string(),
+                            );
+                            rt_control.signal_audio_device_lost();
+                            break;
+                        }
+                    }
                     continue;
                 }
+                consecutive_wait_timeouts = 0;
             }
 
             let mut frames_written = 0usize;
@@ -3501,24 +3545,62 @@ fn run_wasapi_exclusive_multichannel(
                     continue;
                 }
 
+                if spatial.objects.len() < SPATIAL_714_STATIC_OBJECT_TYPES.len()
+                    && let Err(e) = spatial.activate_static_objects()
+                {
+                    unsafe {
+                        let _ = spatial.stream.EndUpdatingAudioObjects();
+                    }
+                    spatial.objects.clear();
+                    consecutive_render_errors += 1;
+                    if consecutive_render_errors >= 8 {
+                        fatal_err_msg = Some(format!(
+                            "[audio] Failed to re-activate Spatial Audio 7.1.4 static objects: {:?}",
+                            e
+                        ));
+                        rt_control.signal_audio_device_lost();
+                        break;
+                    }
+                    continue;
+                }
+
                 let frames_to_render = avail_frames as usize;
                 let mut obj_ptrs = [std::ptr::null_mut::<f32>(); 12];
                 let mut buffer_err = false;
+                let mut buffer_err_code: Option<i32> = None;
                 for (c, obj) in spatial.objects.iter().enumerate().take(12) {
                     let mut ptr: *mut u8 = std::ptr::null_mut();
                     let mut byte_len = 0u32;
-                    if unsafe { obj.GetBuffer(&mut ptr, &mut byte_len) }.is_err()
-                        || ptr.is_null()
-                        || (byte_len as usize) < frames_to_render * 4
-                    {
-                        buffer_err = true;
-                        break;
+                    match unsafe { obj.GetBuffer(&mut ptr, &mut byte_len) } {
+                        Ok(()) if !ptr.is_null() && (byte_len as usize) >= frames_to_render * 4 => {
+                            obj_ptrs[c] = ptr as *mut f32;
+                        }
+                        Ok(()) => {
+                            buffer_err = true;
+                            break;
+                        }
+                        Err(e) => {
+                            buffer_err = true;
+                            buffer_err_code = Some(e.code().0);
+                            break;
+                        }
                     }
-                    obj_ptrs[c] = ptr as *mut f32;
                 }
                 if buffer_err {
                     unsafe {
                         let _ = spatial.stream.EndUpdatingAudioObjects();
+                    }
+                    spatial.objects.clear();
+                    consecutive_render_errors += 1;
+                    if buffer_err_code.is_some_and(is_fatal_device_error)
+                        || consecutive_render_errors >= 8
+                    {
+                        fatal_err_msg = Some(format!(
+                            "[audio] ISpatialAudioObject::GetBuffer failed (hr={:?}); triggering device recovery",
+                            buffer_err_code
+                        ));
+                        rt_control.signal_audio_device_lost();
+                        break;
                     }
                     continue;
                 }
@@ -4168,9 +4250,12 @@ fn run_wasapi_exclusive_multichannel(
             }
         }
 
-        if let Some(ref spatial) = spatial_state {
+        if let Some(ref mut spatial) = spatial_state {
             unsafe {
                 let _ = spatial.stream.Stop();
+            }
+            spatial.objects.clear();
+            unsafe {
                 let _ = spatial.stream.Reset();
             }
         }
@@ -4183,9 +4268,9 @@ fn run_wasapi_exclusive_multichannel(
         if let Some(msg) = fatal_err_msg {
             eprintln!("{}", msg);
         }
-        event.clear();
         drop(spatial_state);
         drop(wasapi_clients);
+        event.clear();
         drop(active_device);
         drop(enumerator);
     });

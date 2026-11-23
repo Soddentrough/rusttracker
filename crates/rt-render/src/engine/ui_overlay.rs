@@ -4,6 +4,920 @@ use super::{
 };
 use crate::state::AppState;
 
+const TRAY_STROKE_W: f32 = 1.0;
+
+pub(crate) const OPEN_BTN_DULL_ORANGE_TOP: egui::Color32 = egui::Color32::from_rgb(166, 104, 56);
+pub(crate) const OPEN_BTN_DULL_ORANGE_MID: egui::Color32 = egui::Color32::from_rgb(146, 88, 44);
+pub(crate) const OPEN_BTN_DULL_ORANGE_BOT: egui::Color32 = egui::Color32::from_rgb(115, 66, 30);
+
+const OPEN_BTN_DULL_ORANGE_HOVER_TOP: egui::Color32 = egui::Color32::from_rgb(180, 116, 66);
+const OPEN_BTN_DULL_ORANGE_HOVER_MID: egui::Color32 = egui::Color32::from_rgb(160, 100, 53);
+const OPEN_BTN_DULL_ORANGE_HOVER_BOT: egui::Color32 = egui::Color32::from_rgb(128, 76, 36);
+
+const OPEN_BTN_DULL_ORANGE_PRESSED_TOP: egui::Color32 = egui::Color32::from_rgb(110, 64, 28);
+const OPEN_BTN_DULL_ORANGE_PRESSED_MID: egui::Color32 = egui::Color32::from_rgb(130, 78, 38);
+const OPEN_BTN_DULL_ORANGE_PRESSED_BOT: egui::Color32 = egui::Color32::from_rgb(146, 90, 46);
+
+pub(crate) const TOGGLE_ACTIVE_LIGHT_GREY_TOP: egui::Color32 =
+    egui::Color32::from_rgb(196, 198, 202);
+pub(crate) const TOGGLE_ACTIVE_LIGHT_GREY_MID: egui::Color32 =
+    egui::Color32::from_rgb(176, 178, 183);
+pub(crate) const TOGGLE_ACTIVE_LIGHT_GREY_BOT: egui::Color32 =
+    egui::Color32::from_rgb(146, 148, 154);
+
+pub(crate) const TOGGLE_INACTIVE_DARK_GREY_TOP: egui::Color32 = egui::Color32::from_rgb(82, 84, 89);
+pub(crate) const TOGGLE_INACTIVE_DARK_GREY_MID: egui::Color32 = egui::Color32::from_rgb(69, 71, 76);
+pub(crate) const TOGGLE_INACTIVE_DARK_GREY_BOT: egui::Color32 = egui::Color32::from_rgb(54, 56, 61);
+
+struct Rounded3dButtonColors {
+    top: egui::Color32,
+    mid: egui::Color32,
+    bot: egui::Color32,
+    top_bevel: [u8; 4],
+    bot_bevel: [u8; 4],
+    border: [u8; 4],
+    shadow: [u8; 4],
+    shadow_offset_y: f32,
+    text: egui::Color32,
+    text_shadow: [u8; 4],
+}
+
+struct Rounded3dButtonPalette {
+    idle: Rounded3dButtonColors,
+    hover: Rounded3dButtonColors,
+    pressed: Rounded3dButtonColors,
+}
+
+const OPEN_BTN_DULL_ORANGE_PALETTE: Rounded3dButtonPalette = Rounded3dButtonPalette {
+    idle: Rounded3dButtonColors {
+        top: OPEN_BTN_DULL_ORANGE_TOP,
+        mid: OPEN_BTN_DULL_ORANGE_MID,
+        bot: OPEN_BTN_DULL_ORANGE_BOT,
+        top_bevel: [255, 224, 190, 68],
+        bot_bevel: [34, 16, 4, 85],
+        border: [48, 24, 10, 195],
+        shadow: [0, 0, 0, 82],
+        shadow_offset_y: 1.25,
+        text: egui::Color32::from_rgb(246, 241, 234),
+        text_shadow: [0, 0, 0, 110],
+    },
+    hover: Rounded3dButtonColors {
+        top: OPEN_BTN_DULL_ORANGE_HOVER_TOP,
+        mid: OPEN_BTN_DULL_ORANGE_HOVER_MID,
+        bot: OPEN_BTN_DULL_ORANGE_HOVER_BOT,
+        top_bevel: [255, 232, 206, 92],
+        bot_bevel: [40, 20, 6, 78],
+        border: [68, 36, 14, 205],
+        shadow: [0, 0, 0, 95],
+        shadow_offset_y: 1.25,
+        text: egui::Color32::from_rgb(255, 251, 246),
+        text_shadow: [0, 0, 0, 110],
+    },
+    pressed: Rounded3dButtonColors {
+        top: OPEN_BTN_DULL_ORANGE_PRESSED_TOP,
+        mid: OPEN_BTN_DULL_ORANGE_PRESSED_MID,
+        bot: OPEN_BTN_DULL_ORANGE_PRESSED_BOT,
+        top_bevel: [28, 12, 4, 90],
+        bot_bevel: [255, 215, 175, 40],
+        border: [42, 20, 8, 215],
+        shadow: [0, 0, 0, 35],
+        shadow_offset_y: 0.5,
+        text: egui::Color32::from_rgb(236, 230, 222),
+        text_shadow: [0, 0, 0, 110],
+    },
+};
+
+const TOGGLE_ACTIVE_LIGHT_GREY_PALETTE: Rounded3dButtonPalette = Rounded3dButtonPalette {
+    idle: Rounded3dButtonColors {
+        top: TOGGLE_ACTIVE_LIGHT_GREY_TOP,
+        mid: TOGGLE_ACTIVE_LIGHT_GREY_MID,
+        bot: TOGGLE_ACTIVE_LIGHT_GREY_BOT,
+        top_bevel: [255, 255, 255, 130],
+        bot_bevel: [38, 40, 44, 85],
+        border: [36, 38, 42, 200],
+        shadow: [0, 0, 0, 88],
+        shadow_offset_y: 1.25,
+        text: egui::Color32::from_rgb(24, 25, 28),
+        text_shadow: [255, 255, 255, 85],
+    },
+    hover: Rounded3dButtonColors {
+        top: egui::Color32::from_rgb(204, 206, 210),
+        mid: egui::Color32::from_rgb(184, 186, 191),
+        bot: egui::Color32::from_rgb(154, 156, 162),
+        top_bevel: [255, 255, 255, 150],
+        bot_bevel: [38, 40, 44, 80],
+        border: [42, 44, 48, 210],
+        shadow: [0, 0, 0, 96],
+        shadow_offset_y: 1.25,
+        text: egui::Color32::from_rgb(18, 19, 22),
+        text_shadow: [255, 255, 255, 95],
+    },
+    pressed: Rounded3dButtonColors {
+        top: egui::Color32::from_rgb(148, 150, 156),
+        mid: egui::Color32::from_rgb(164, 166, 171),
+        bot: egui::Color32::from_rgb(176, 178, 183),
+        top_bevel: [34, 36, 40, 82],
+        bot_bevel: [255, 255, 255, 75],
+        border: [32, 34, 38, 215],
+        shadow: [0, 0, 0, 35],
+        shadow_offset_y: 0.5,
+        text: egui::Color32::from_rgb(28, 29, 33),
+        text_shadow: [255, 255, 255, 65],
+    },
+};
+
+const TOGGLE_INACTIVE_DARK_GREY_PALETTE: Rounded3dButtonPalette = Rounded3dButtonPalette {
+    idle: Rounded3dButtonColors {
+        top: TOGGLE_INACTIVE_DARK_GREY_TOP,
+        mid: TOGGLE_INACTIVE_DARK_GREY_MID,
+        bot: TOGGLE_INACTIVE_DARK_GREY_BOT,
+        top_bevel: [255, 255, 255, 34],
+        bot_bevel: [0, 0, 0, 78],
+        border: [22, 23, 26, 200],
+        shadow: [0, 0, 0, 52],
+        shadow_offset_y: 0.65,
+        text: egui::Color32::from_rgb(186, 188, 194),
+        text_shadow: [0, 0, 0, 105],
+    },
+    hover: Rounded3dButtonColors {
+        top: egui::Color32::from_rgb(98, 100, 106),
+        mid: egui::Color32::from_rgb(84, 86, 92),
+        bot: egui::Color32::from_rgb(66, 68, 74),
+        top_bevel: [255, 255, 255, 58],
+        bot_bevel: [0, 0, 0, 82],
+        border: [30, 32, 36, 210],
+        shadow: [0, 0, 0, 72],
+        shadow_offset_y: 1.0,
+        text: egui::Color32::from_rgb(228, 230, 236),
+        text_shadow: [0, 0, 0, 115],
+    },
+    pressed: Rounded3dButtonColors {
+        top: egui::Color32::from_rgb(52, 54, 58),
+        mid: egui::Color32::from_rgb(64, 66, 70),
+        bot: egui::Color32::from_rgb(74, 76, 82),
+        top_bevel: [0, 0, 0, 88],
+        bot_bevel: [255, 255, 255, 34],
+        border: [18, 19, 22, 215],
+        shadow: [0, 0, 0, 30],
+        shadow_offset_y: 0.35,
+        text: egui::Color32::from_rgb(212, 214, 220),
+        text_shadow: [0, 0, 0, 95],
+    },
+};
+
+fn open_style_tray_frame(corner_radius: f32, pad_l: i8, pad_r: i8, pad_v: i8) -> egui::Frame {
+    egui::Frame::NONE
+        .fill(egui::Color32::from_rgba_unmultiplied(22, 22, 26, 130))
+        .stroke(egui::Stroke::new(
+            TRAY_STROKE_W,
+            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 28),
+        ))
+        .corner_radius(corner_radius)
+        .inner_margin(egui::Margin {
+            left: pad_l,
+            right: pad_r,
+            top: pad_v,
+            bottom: pad_v,
+        })
+}
+
+#[inline]
+fn lerp_color32(a: egui::Color32, b: egui::Color32, t: f32) -> egui::Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let inv = 1.0 - t;
+    egui::Color32::from_rgba_unmultiplied(
+        (a.r() as f32 * inv + b.r() as f32 * t).round() as u8,
+        (a.g() as f32 * inv + b.g() as f32 * t).round() as u8,
+        (a.b() as f32 * inv + b.b() as f32 * t).round() as u8,
+        (a.a() as f32 * inv + b.a() as f32 * t).round() as u8,
+    )
+}
+
+fn build_rounded_vertical_gradient_mesh(
+    rect: egui::Rect,
+    radius: f32,
+    top: egui::Color32,
+    mid: egui::Color32,
+    bot: egui::Color32,
+) -> egui::Mesh {
+    let mut mesh = egui::Mesh::default();
+    let w = rect.width();
+    let h = rect.height();
+    if w <= 0.0 || h <= 0.0 {
+        return mesh;
+    }
+
+    let r = radius.clamp(0.0, (w * 0.5).min(h * 0.5));
+    let mut slices: Vec<(f32, f32, f32)> = Vec::with_capacity(15);
+    let mut push_slice = |y: f32, inset: f32| {
+        let xl = rect.left() + inset;
+        let xr = (rect.right() - inset).max(xl);
+        if slices
+            .last()
+            .is_none_or(|&(prev_y, _, _)| (y - prev_y).abs() > 1e-4)
+        {
+            slices.push((y, xl, xr));
+        }
+    };
+
+    const CAP_SEGMENTS: usize = 6;
+    for i in 0..=CAP_SEGMENTS {
+        let angle = std::f32::consts::FRAC_PI_2 * (1.0 - i as f32 / CAP_SEGMENTS as f32);
+        let y = rect.top() + r * (1.0 - angle.sin());
+        let inset = r * (1.0 - angle.cos());
+        push_slice(y, inset);
+    }
+
+    let y_mid = rect.top() + h * 0.45;
+    if y_mid > rect.top() + r + 1e-4 && y_mid < rect.bottom() - r - 1e-4 {
+        push_slice(y_mid, 0.0);
+    }
+
+    for i in 0..=CAP_SEGMENTS {
+        let angle = std::f32::consts::FRAC_PI_2 * (i as f32 / CAP_SEGMENTS as f32);
+        let y = rect.bottom() - r + r * angle.sin();
+        let inset = r * (1.0 - angle.cos());
+        push_slice(y, inset);
+    }
+
+    if slices.len() < 2 {
+        return mesh;
+    }
+
+    let white_uv = egui::pos2(0.0, 0.0);
+    mesh.vertices.reserve(slices.len() * 2);
+    mesh.indices.reserve((slices.len() - 1) * 6);
+
+    for &(y, xl, xr) in &slices {
+        let t = ((y - rect.top()) / h).clamp(0.0, 1.0);
+        let col = if t <= 0.45 {
+            lerp_color32(top, mid, t / 0.45)
+        } else {
+            lerp_color32(mid, bot, (t - 0.45) / 0.55)
+        };
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: egui::pos2(xl, y),
+            uv: white_uv,
+            color: col,
+        });
+        mesh.vertices.push(egui::epaint::Vertex {
+            pos: egui::pos2(xr, y),
+            uv: white_uv,
+            color: col,
+        });
+    }
+
+    for row in 0..(slices.len() - 1) {
+        let i0 = (row * 2) as u32;
+        let i1 = i0 + 1;
+        let i2 = i0 + 2;
+        let i3 = i0 + 3;
+        mesh.indices.extend_from_slice(&[i0, i1, i3, i0, i3, i2]);
+    }
+
+    mesh
+}
+
+fn build_rounded_cap_arc(rect: egui::Rect, radius: f32, is_top: bool) -> Vec<egui::Pos2> {
+    let inner = rect.shrink(1.25);
+    if inner.width() <= 2.0 || inner.height() <= 2.0 {
+        return Vec::new();
+    }
+
+    let r = (radius - 1.25).clamp(0.0, (inner.width() * 0.5).min(inner.height() * 0.5));
+    if r < 0.25 {
+        let y = if is_top { inner.top() } else { inner.bottom() };
+        return vec![
+            egui::pos2(inner.left() + 0.5, y),
+            egui::pos2(inner.right() - 0.5, y),
+        ];
+    }
+
+    let cx_left = inner.left() + r;
+    let cx_right = inner.right() - r;
+    let cy = if is_top {
+        inner.top() + r
+    } else {
+        inner.bottom() - r
+    };
+    let y_sign = if is_top { -1.0 } else { 1.0 };
+
+    const ARC_START: f32 = 0.60;
+    const ARC_END: f32 = std::f32::consts::FRAC_PI_2;
+    const ARC_SEGS: usize = 4;
+
+    let mut pts = Vec::with_capacity((ARC_SEGS + 1) * 2);
+    let mut push_pt = |pt: egui::Pos2| {
+        if pts
+            .last()
+            .is_none_or(|p: &egui::Pos2| p.distance(pt) >= 0.05)
+        {
+            pts.push(pt);
+        }
+    };
+
+    for k in 0..=ARC_SEGS {
+        let t = k as f32 / ARC_SEGS as f32;
+        let angle = ARC_START + (ARC_END - ARC_START) * t;
+        push_pt(egui::pos2(
+            cx_left - r * angle.cos(),
+            cy + y_sign * r * angle.sin(),
+        ));
+    }
+    for k in 0..=ARC_SEGS {
+        let t = k as f32 / ARC_SEGS as f32;
+        let angle = ARC_END - (ARC_END - ARC_START) * t;
+        push_pt(egui::pos2(
+            cx_right + r * angle.cos(),
+            cy + y_sign * r * angle.sin(),
+        ));
+    }
+
+    pts
+}
+
+fn render_3d_rounded_button(
+    ui: &mut egui::Ui,
+    label: &str,
+    size: egui::Vec2,
+    corner_radius: f32,
+    font_size: f32,
+    palette: &Rounded3dButtonPalette,
+) -> egui::Response {
+    let (rect, response) = ui.allocate_exact_size(size, egui::Sense::click());
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+
+    let is_pressed = response.is_pointer_button_down_on();
+    let is_hovered = response.hovered() || response.has_focus();
+    let colors = if is_pressed {
+        &palette.pressed
+    } else if is_hovered {
+        &palette.hover
+    } else {
+        &palette.idle
+    };
+
+    let btn_rect = if is_pressed {
+        rect.translate(egui::vec2(0.0, 0.75))
+    } else {
+        rect
+    };
+
+    #[inline]
+    fn rgba(c: [u8; 4]) -> egui::Color32 {
+        egui::Color32::from_rgba_unmultiplied(c[0], c[1], c[2], c[3])
+    }
+
+    let painter = ui.painter();
+    painter.rect_filled(
+        btn_rect.translate(egui::vec2(0.0, colors.shadow_offset_y)),
+        corner_radius,
+        rgba(colors.shadow),
+    );
+    painter.rect_filled(btn_rect, corner_radius, colors.mid);
+
+    let grad_mesh = build_rounded_vertical_gradient_mesh(
+        btn_rect.shrink(0.5),
+        (corner_radius - 0.5).max(0.0),
+        colors.top,
+        colors.mid,
+        colors.bot,
+    );
+    if !grad_mesh.is_empty() {
+        painter.add(egui::Shape::mesh(grad_mesh));
+    }
+
+    let top_arc = build_rounded_cap_arc(btn_rect, corner_radius, true);
+    if top_arc.len() >= 2 {
+        painter.add(egui::Shape::line(
+            top_arc,
+            egui::Stroke::new(1.0_f32, rgba(colors.top_bevel)),
+        ));
+    }
+    let bot_arc = build_rounded_cap_arc(btn_rect, corner_radius, false);
+    if bot_arc.len() >= 2 {
+        painter.add(egui::Shape::line(
+            bot_arc,
+            egui::Stroke::new(1.0_f32, rgba(colors.bot_bevel)),
+        ));
+    }
+
+    painter.rect(
+        btn_rect,
+        corner_radius,
+        egui::Color32::TRANSPARENT,
+        egui::Stroke::new(1.0_f32, rgba(colors.border)),
+        egui::StrokeKind::Inside,
+    );
+
+    let font_id = egui::FontId::proportional(font_size);
+    painter.text(
+        btn_rect.center() + egui::vec2(0.0, 1.0),
+        egui::Align2::CENTER_CENTER,
+        label,
+        font_id.clone(),
+        rgba(colors.text_shadow),
+    );
+    painter.text(
+        btn_rect.center(),
+        egui::Align2::CENTER_CENTER,
+        label,
+        font_id,
+        colors.text,
+    );
+
+    response
+}
+
+pub(crate) fn render_track_info_open_area(
+    ui: &mut egui::Ui,
+    is_portrait: bool,
+    engine_action: &mut Vec<EngineAction>,
+) -> (egui::Rect, Option<egui::Rect>, egui::Rect, bool) {
+    struct OpenAreaLayout {
+        show_open_label: bool,
+        show_stream_btn: bool,
+        btn_font: f32,
+        btn_w: f32,
+        pad_l: i8,
+        pad_r: i8,
+        div_gap: f32,
+        btn_gap: f32,
+        total_w: f32,
+        open_galley: Option<std::sync::Arc<egui::Galley>>,
+    }
+
+    let btn_h = if is_portrait { 28.0 } else { 20.0 };
+    let pad_v: i8 = if is_portrait { 3 } else { 2 };
+    let btn_radius = if is_portrait { 6.5 } else { 5.5 };
+    let area_radius = if is_portrait { 8.0 } else { 7.0 };
+    let open_text_col = egui::Color32::from_rgb(208, 198, 186);
+
+    #[derive(Clone, Copy)]
+    struct OpenAreaTierSpec {
+        show_open_label: bool,
+        show_stream_btn: bool,
+        btn_font: f32,
+        open_font: f32,
+        h_pad: f32,
+        pad_l: i8,
+        pad_r: i8,
+        div_gap: f32,
+        btn_gap: f32,
+    }
+
+    let candidates: [OpenAreaTierSpec; 4] = [
+        // Standard tier
+        OpenAreaTierSpec {
+            show_open_label: true,
+            show_stream_btn: true,
+            btn_font: if is_portrait { 11.5 } else { 11.0 },
+            open_font: if is_portrait { 10.5 } else { 10.0 },
+            h_pad: if is_portrait { 9.0 } else { 8.0 },
+            pad_l: 7,
+            pad_r: 4,
+            div_gap: 5.0,
+            btn_gap: 5.0,
+        },
+        // Compact tier
+        OpenAreaTierSpec {
+            show_open_label: true,
+            show_stream_btn: true,
+            btn_font: 10.0,
+            open_font: 9.5,
+            h_pad: 5.5,
+            pad_l: 5,
+            pad_r: 3,
+            div_gap: 3.5,
+            btn_gap: 4.0,
+        },
+        // Tight tier
+        OpenAreaTierSpec {
+            show_open_label: false,
+            show_stream_btn: true,
+            btn_font: 9.5,
+            open_font: 9.5,
+            h_pad: 4.5,
+            pad_l: 3,
+            pad_r: 3,
+            div_gap: 0.0,
+            btn_gap: 3.0,
+        },
+        // Fallback tier
+        OpenAreaTierSpec {
+            show_open_label: false,
+            show_stream_btn: false,
+            btn_font: 9.5,
+            open_font: 9.5,
+            h_pad: 4.5,
+            pad_l: 3,
+            pad_r: 3,
+            div_gap: 0.0,
+            btn_gap: 0.0,
+        },
+    ];
+
+    let measure_tier = |tier: OpenAreaTierSpec| -> OpenAreaLayout {
+        let OpenAreaTierSpec {
+            show_open_label,
+            show_stream_btn,
+            btn_font,
+            open_font,
+            h_pad,
+            pad_l,
+            pad_r,
+            div_gap,
+            btn_gap,
+        } = tier;
+        let stream_w = ui
+            .painter()
+            .layout_no_wrap(
+                "STREAM/DEV".to_string(),
+                egui::FontId::proportional(btn_font),
+                egui::Color32::WHITE,
+            )
+            .size()
+            .x;
+        let file_w = ui
+            .painter()
+            .layout_no_wrap(
+                "FILE/BLOCK".to_string(),
+                egui::FontId::proportional(btn_font),
+                egui::Color32::WHITE,
+            )
+            .size()
+            .x;
+        let btn_w = (stream_w.max(file_w) + h_pad * 2.0).ceil();
+
+        let open_galley = if show_open_label {
+            Some(ui.painter().layout_no_wrap(
+                "OPEN".to_string(),
+                egui::FontId::proportional(open_font),
+                open_text_col,
+            ))
+        } else {
+            None
+        };
+
+        let label_div_w = if let Some(ref g) = open_galley {
+            g.size().x + div_gap * 2.0 + 1.0
+        } else {
+            0.0
+        };
+        let buttons_w = if show_stream_btn {
+            btn_w * 2.0 + btn_gap
+        } else {
+            btn_w
+        };
+        let total_w = pad_l as f32 + label_div_w + buttons_w + pad_r as f32 + TRAY_STROKE_W * 2.0;
+
+        OpenAreaLayout {
+            show_open_label,
+            show_stream_btn,
+            btn_font,
+            btn_w,
+            pad_l,
+            pad_r,
+            div_gap,
+            btn_gap,
+            total_w,
+            open_galley,
+        }
+    };
+
+    let avail = ui.available_width();
+    let mut chosen: Option<OpenAreaLayout> = None;
+    for (idx, &tier) in candidates.iter().enumerate() {
+        let measured = measure_tier(tier);
+        if measured.total_w <= avail || idx + 1 == candidates.len() {
+            chosen = Some(measured);
+            break;
+        }
+    }
+    let chosen = chosen.unwrap();
+
+    let spacer = (avail - chosen.total_w).max(0.0);
+    if spacer > 0.0 {
+        ui.add_space(spacer);
+    }
+
+    let mut stream_rect: Option<egui::Rect> = None;
+    let mut file_rect = egui::Rect::NOTHING;
+
+    let frame_resp =
+        open_style_tray_frame(area_radius, chosen.pad_l, chosen.pad_r, pad_v).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+
+                if let Some(open_galley) = chosen.open_galley {
+                    let open_size = open_galley.size();
+                    let (open_rect, _) = ui
+                        .allocate_exact_size(egui::vec2(open_size.x, btn_h), egui::Sense::hover());
+                    ui.painter().galley(
+                        egui::pos2(open_rect.left(), open_rect.center().y - open_size.y * 0.5),
+                        open_galley,
+                        open_text_col,
+                    );
+
+                    ui.add_space(chosen.div_gap);
+                    let (div_rect, _) =
+                        ui.allocate_exact_size(egui::vec2(1.0, btn_h), egui::Sense::hover());
+                    let div_h = (btn_h - 6.0).max(10.0);
+                    let div_x = div_rect.center().x;
+                    ui.painter().line_segment(
+                        [
+                            egui::pos2(div_x, div_rect.center().y - div_h * 0.5),
+                            egui::pos2(div_x, div_rect.center().y + div_h * 0.5),
+                        ],
+                        egui::Stroke::new(
+                            1.0_f32,
+                            egui::Color32::from_rgba_unmultiplied(255, 255, 255, 34),
+                        ),
+                    );
+                    ui.add_space(chosen.div_gap);
+                }
+
+                if chosen.show_stream_btn {
+                    let stream_resp = render_3d_rounded_button(
+                        ui,
+                        "STREAM/DEV",
+                        egui::vec2(chosen.btn_w, btn_h),
+                        btn_radius,
+                        chosen.btn_font,
+                        &OPEN_BTN_DULL_ORANGE_PALETTE,
+                    )
+                    .on_hover_text(
+                        "Open network stream URL or local audio input device (microphone)",
+                    );
+                    stream_rect = Some(stream_resp.rect);
+                    if stream_resp.clicked() {
+                        engine_action.push(EngineAction::OpenUrlDialog);
+                    }
+                    ui.add_space(chosen.btn_gap);
+                }
+
+                let file_resp = render_3d_rounded_button(
+                    ui,
+                    "FILE/BLOCK",
+                    egui::vec2(chosen.btn_w, btn_h),
+                    btn_radius,
+                    chosen.btn_font,
+                    &OPEN_BTN_DULL_ORANGE_PALETTE,
+                )
+                .on_hover_text(
+                    "Open audio/video file, playlist, or disc/ISO block image (Shortcut: 'o')",
+                );
+                file_rect = file_resp.rect;
+                if file_resp.clicked() {
+                    engine_action.push(EngineAction::OpenFile);
+                }
+            });
+        });
+
+    (
+        frame_resp.response.rect,
+        stream_rect,
+        file_rect,
+        chosen.show_open_label,
+    )
+}
+
+pub(crate) fn render_heatmap_eq_header(
+    ui: &mut egui::Ui,
+    show_surround_eq: bool,
+    has_lyrics: bool,
+    has_tracker_patterns: bool,
+    hardware_channels: i32,
+    engine_action: &mut Vec<EngineAction>,
+) -> (egui::Rect, egui::Rect, egui::Rect, Option<egui::Rect>, bool) {
+    struct ToggleLayout<'a> {
+        left_label: &'a str,
+        right_label: &'a str,
+        btn_font: f32,
+        btn_w: f32,
+        pad_h: i8,
+        btn_gap: f32,
+    }
+
+    const BTN_H: f32 = 20.0;
+    const PAD_V: i8 = 2;
+    const BTN_RADIUS: f32 = 5.5;
+    const AREA_RADIUS: f32 = 7.0;
+    const RESET_FONT: f32 = 10.5;
+    let tray_h = BTN_H + (PAD_V as f32) * 2.0 + TRAY_STROKE_W * 2.0;
+
+    ui.spacing_mut().item_spacing.x = 0.0;
+
+    let left_full = if has_lyrics {
+        "LYRICS"
+    } else if has_tracker_patterns {
+        "TRACKER PATTERN"
+    } else {
+        "PATTERN HEATMAP"
+    };
+    let left_short = if has_lyrics {
+        "LYRICS"
+    } else if has_tracker_patterns {
+        "PATTERN"
+    } else {
+        "HEATMAP"
+    };
+    let right_full = if hardware_channels > 2 {
+        format!(
+            "SURROUND EQ ({})",
+            crate::state::SurroundUpmixConfig::short_tag(hardware_channels)
+        )
+    } else {
+        "SURROUND EQ".to_string()
+    };
+    let right_mid = "SURROUND EQ";
+    let right_short = "EQ";
+
+    let reset_text_w = ui
+        .painter()
+        .layout_no_wrap(
+            "RESET".to_string(),
+            egui::FontId::proportional(RESET_FONT),
+            egui::Color32::WHITE,
+        )
+        .size()
+        .x;
+    let reset_w = (reset_text_w + 14.0).ceil();
+    let reset_reserve = if show_surround_eq { reset_w + 6.0 } else { 0.0 };
+
+    let avail = ui.available_width();
+    let tray_budget = (avail - reset_reserve).max(110.0);
+
+    let candidates: [(&str, &str, f32, f32, i8, f32); 4] = [
+        (left_full, right_full.as_str(), 11.0, 8.0, 3, 3.0),
+        (left_full, right_mid, 11.0, 7.0, 3, 3.0),
+        (left_short, right_mid, 10.0, 6.0, 2, 2.0),
+        (left_short, right_short, 9.5, 5.0, 2, 2.0),
+    ];
+
+    let mut chosen: Option<ToggleLayout<'_>> = None;
+    for (idx, &(left_label, right_label, btn_font, h_pad, pad_h, btn_gap)) in
+        candidates.iter().enumerate()
+    {
+        let left_w = ui
+            .painter()
+            .layout_no_wrap(
+                left_label.to_string(),
+                egui::FontId::proportional(btn_font),
+                egui::Color32::WHITE,
+            )
+            .size()
+            .x;
+        let right_w = ui
+            .painter()
+            .layout_no_wrap(
+                right_label.to_string(),
+                egui::FontId::proportional(btn_font),
+                egui::Color32::WHITE,
+            )
+            .size()
+            .x;
+        let btn_w = (left_w.max(right_w) + h_pad * 2.0).ceil();
+        let tray_w = pad_h as f32 * 2.0 + btn_w * 2.0 + btn_gap + TRAY_STROKE_W * 2.0;
+        if tray_w <= tray_budget || idx + 1 == candidates.len() {
+            chosen = Some(ToggleLayout {
+                left_label,
+                right_label,
+                btn_font,
+                btn_w,
+                pad_h,
+                btn_gap,
+            });
+            break;
+        }
+    }
+    let chosen = chosen.unwrap();
+
+    let mut pattern_btn_rect = egui::Rect::NOTHING;
+    let mut eq_btn_rect = egui::Rect::NOTHING;
+
+    let tray_resp =
+        open_style_tray_frame(AREA_RADIUS, chosen.pad_h, chosen.pad_h, PAD_V).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing.x = 0.0;
+
+                let pattern_palette = if show_surround_eq {
+                    &TOGGLE_INACTIVE_DARK_GREY_PALETTE
+                } else {
+                    &TOGGLE_ACTIVE_LIGHT_GREY_PALETTE
+                };
+                let pattern_resp = render_3d_rounded_button(
+                    ui,
+                    chosen.left_label,
+                    egui::vec2(chosen.btn_w, BTN_H),
+                    BTN_RADIUS,
+                    chosen.btn_font,
+                    pattern_palette,
+                )
+                .on_hover_text("Show Tracker Pattern / Pattern Heatmap / Lyrics viewer");
+                pattern_btn_rect = pattern_resp.rect;
+                if pattern_resp.clicked() && show_surround_eq {
+                    engine_action.push(EngineAction::SetShowSurroundEq(false));
+                }
+
+                ui.add_space(chosen.btn_gap);
+
+                let eq_palette = if show_surround_eq {
+                    &TOGGLE_ACTIVE_LIGHT_GREY_PALETTE
+                } else {
+                    &TOGGLE_INACTIVE_DARK_GREY_PALETTE
+                };
+                let eq_resp = render_3d_rounded_button(
+                    ui,
+                    chosen.right_label,
+                    egui::vec2(chosen.btn_w, BTN_H),
+                    BTN_RADIUS,
+                    chosen.btn_font,
+                    eq_palette,
+                )
+                .on_hover_text("Show Surround Upmix Crossover & 5-band Parametric EQ controls");
+                eq_btn_rect = eq_resp.rect;
+                if eq_resp.clicked() && !show_surround_eq {
+                    engine_action.push(EngineAction::SetShowSurroundEq(true));
+                }
+            });
+        });
+
+    let mut reset_btn_rect: Option<egui::Rect> = None;
+    let mut reset_clicked = false;
+
+    if show_surround_eq {
+        let rem = ui.available_width();
+        let has_height = crate::state::SurroundUpmixConfig::has_height_channels(hardware_channels);
+        let mut legend_entries: Vec<(std::sync::Arc<egui::Galley>, egui::Color32)> =
+            Vec::with_capacity(3);
+        let mut push_legend = |txt: &str, col: egui::Color32| {
+            let g =
+                ui.painter()
+                    .layout_no_wrap(txt.to_string(), egui::FontId::proportional(10.0), col);
+            legend_entries.push((g, col));
+        };
+        push_legend("• LFE", egui::Color32::from_rgb(220, 68, 32));
+        push_legend("• Bed", egui::Color32::from_rgb(255, 165, 35));
+        if has_height {
+            push_legend("• Height ↑", egui::Color32::from_rgb(255, 225, 130));
+        }
+        let legend_gap = 5.0;
+        let legend_w: f32 = legend_entries.iter().map(|(g, _)| g.size().x).sum::<f32>()
+            + legend_gap * legend_entries.len().saturating_sub(1) as f32;
+        let show_legend = legend_w + 8.0 + reset_w <= rem;
+        let right_w = if show_legend {
+            legend_w + 8.0 + reset_w
+        } else {
+            reset_w
+        };
+        let spacer = (rem - right_w).max(0.0);
+        if spacer > 0.0 {
+            ui.add_space(spacer);
+        }
+
+        if show_legend {
+            let count = legend_entries.len();
+            for (idx, (g, col)) in legend_entries.into_iter().enumerate() {
+                let g_size = g.size();
+                let (l_rect, _) =
+                    ui.allocate_exact_size(egui::vec2(g_size.x, tray_h), egui::Sense::hover());
+                ui.painter().galley(
+                    egui::pos2(l_rect.left(), l_rect.center().y - g_size.y * 0.5),
+                    g,
+                    col,
+                );
+                if idx + 1 < count {
+                    ui.add_space(legend_gap);
+                }
+            }
+            ui.add_space(8.0);
+        }
+
+        let reset_resp = render_3d_rounded_button(
+            ui,
+            "RESET",
+            egui::vec2(reset_w, BTN_H),
+            BTN_RADIUS,
+            RESET_FONT,
+            &TOGGLE_INACTIVE_DARK_GREY_PALETTE,
+        )
+        .on_hover_text("Reset surround routing bands, crossovers, and speaker levels to defaults");
+        reset_btn_rect = Some(reset_resp.rect);
+        reset_clicked = reset_resp.clicked();
+    }
+
+    (
+        tray_resp.response.rect,
+        pattern_btn_rect,
+        eq_btn_rect,
+        reset_btn_rect,
+        reset_clicked,
+    )
+}
+
 impl VulkanEngine {
     pub(in crate::engine) fn build_ui_overlay(
         &mut self,
@@ -568,6 +1482,8 @@ impl VulkanEngine {
                             shortcut(ui, "[ / ]", Some("L/R Stick"), "Scale Panels");
                             if state.visualizer_mode == 20 {
                                 shortcut(ui, "c", None, "Toggle Camera Mode");
+                            } else if state.visualizer_mode == 27 {
+                                shortcut(ui, "c", None, "Toggle Ferrofluid View");
                             } else if state.visualizer_mode == 31 {
                                 shortcut(ui, "c", None, "Toggle Smoke Volume");
                             }
@@ -1926,89 +2842,35 @@ impl VulkanEngine {
                             };
 
                             let render_col_heatmap = |col: &mut egui::Ui, out_heatmap_rect: &mut Option<egui::Rect>, engine_action: &mut Vec<EngineAction>| {
+                                let mut eq_reset_clicked = false;
+                                if !is_portrait {
+                                    col.horizontal(|ui| {
+                                        let (_, _, _, _, reset_clicked) = render_heatmap_eq_header(
+                                            ui,
+                                            state.show_surround_eq,
+                                            state.lyrics.is_some(),
+                                            !state.tracker_patterns_by_order.is_empty(),
+                                            state.hardware_channels,
+                                            engine_action,
+                                        );
+                                        eq_reset_clicked = reset_clicked;
+                                    });
+                                    col.separator();
+                                }
                                 if state.show_surround_eq {
                                     // Swap out the Tracker Pattern / Heatmap viewer with the Surround Routing & Crossover Curve
                                     // when the user flips the middle panel to the EQ view.
                                     *out_heatmap_rect = None;
                                     let mut cfg = state.surround_upmix;
                                     let mut cfg_changed = false;
+                                    if eq_reset_clicked {
+                                        cfg.reset_tuning();
+                                        cfg_changed = true;
+                                    }
                                     let has_height =
                                         crate::state::SurroundUpmixConfig::has_height_channels(
                                             state.hardware_channels,
                                         );
-
-                                    if !is_portrait {
-                                        let eq_heading = if state.hardware_channels > 2 {
-                                            format!(
-                                                "Surround Upmix ({})",
-                                                crate::state::SurroundUpmixConfig::short_tag(
-                                                    state.hardware_channels,
-                                                )
-                                            )
-                                        } else {
-                                            "Surround Upmix".to_string()
-                                        };
-                                        col.horizontal(|ui| {
-                                            ui.heading(eq_heading);
-                                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                                let flip_btn = egui::Button::new(
-                                                    egui::RichText::new("📊 Pattern View")
-                                                        .size(11.0)
-                                                        .strong()
-                                                        .color(egui::Color32::from_rgb(255, 228, 185)),
-                                                )
-                                                .fill(egui::Color32::from_rgb(48, 36, 24))
-                                                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(210, 135, 45)))
-                                                .corner_radius(4.0);
-                                                if ui
-                                                    .add(flip_btn)
-                                                    .on_hover_text("Flip middle panel back to Tracker Pattern / Heatmap / Lyrics viewer")
-                                                    .clicked()
-                                                {
-                                                    engine_action.push(EngineAction::SetShowSurroundEq(false));
-                                                }
-                                                ui.add_space(4.0);
-                                                let reset_btn = egui::Button::new(
-                                                    egui::RichText::new("↺ Reset")
-                                                        .size(11.0)
-                                                        .strong()
-                                                        .color(egui::Color32::from_rgb(225, 220, 212)),
-                                                )
-                                                .fill(egui::Color32::from_rgb(44, 42, 40))
-                                                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(105, 98, 90)))
-                                                .corner_radius(4.0);
-                                                if ui
-                                                    .add(reset_btn)
-                                                    .on_hover_text("Reset surround routing bands, crossovers, and speaker levels to defaults")
-                                                    .clicked()
-                                                {
-                                                    cfg.reset_tuning();
-                                                    cfg_changed = true;
-                                                }
-                                                if ui.available_width() > 110.0 {
-                                                    ui.add_space(4.0);
-                                                    if has_height {
-                                                        ui.label(
-                                                            egui::RichText::new("• Height ↑")
-                                                                .size(10.5)
-                                                                .color(egui::Color32::from_rgb(255, 225, 130)),
-                                                        );
-                                                    }
-                                                    ui.label(
-                                                        egui::RichText::new("• Surround Bed")
-                                                            .size(10.5)
-                                                            .color(egui::Color32::from_rgb(255, 165, 35)),
-                                                    );
-                                                    ui.label(
-                                                        egui::RichText::new("• LFE")
-                                                            .size(10.5)
-                                                            .color(egui::Color32::from_rgb(220, 68, 32)),
-                                                    );
-                                                }
-                                            });
-                                        });
-                                        col.separator();
-                                    }
 
                                     let controls_h = 46.0;
                                     let graph_h = (col.available_height() - controls_h - 4.0).max(56.0);
@@ -2528,53 +3390,6 @@ impl VulkanEngine {
                                     return;
                                 }
 
-                                if !is_portrait {
-                                    let col1_heading = if state.lyrics.is_some() {
-                                        "Lyrics"
-                                    } else if !state.tracker_patterns_by_order.is_empty() {
-                                        "Tracker Pattern"
-                                    } else {
-                                        "Pattern Heatmap"
-                                    };
-                                    col.horizontal(|ui| {
-                                        ui.heading(col1_heading);
-                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            let upmix_active = state
-                                                .surround_upmix
-                                                .is_active_for(state.source_channels, state.hardware_channels);
-                                            let (eq_fill, eq_stroke, eq_col) = if upmix_active {
-                                                (
-                                                    egui::Color32::from_rgb(56, 38, 20),
-                                                    egui::Color32::from_rgb(210, 135, 45),
-                                                    egui::Color32::from_rgb(255, 228, 185),
-                                                )
-                                            } else {
-                                                (
-                                                    egui::Color32::from_rgb(44, 42, 40),
-                                                    egui::Color32::from_rgb(105, 98, 90),
-                                                    egui::Color32::from_rgb(225, 220, 212),
-                                                )
-                                            };
-                                            let eq_btn = egui::Button::new(
-                                                egui::RichText::new("🎚 Surround EQ")
-                                                    .size(11.0)
-                                                    .strong()
-                                                    .color(eq_col),
-                                            )
-                                            .fill(eq_fill)
-                                            .stroke(egui::Stroke::new(1.0_f32, eq_stroke))
-                                            .corner_radius(4.0);
-                                            if ui
-                                                .add(eq_btn)
-                                                .on_hover_text("Flip middle panel between Tracker Pattern / Heatmap / Lyrics viewer and Surround Upmix EQ")
-                                                .clicked()
-                                            {
-                                                engine_action.push(EngineAction::SetShowSurroundEq(true));
-                                            }
-                                        });
-                                    });
-                                    col.separator();
-                                }
                                 let hm_rect = col.available_rect_before_wrap();
                                 *out_heatmap_rect = Some(hm_rect);
 
@@ -2841,41 +3656,7 @@ impl VulkanEngine {
                                     };
                                     col.horizontal(|ui| {
                                         ui.heading(heading_text);
-                                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                            let btn_h = if is_portrait { 30.0 } else { 24.0 };
-                                            let open_hdr_btn = egui::Button::new(
-                                                egui::RichText::new("📂 OPEN FILE")
-                                                    .size(12.0)
-                                                    .strong()
-                                                    .color(egui::Color32::WHITE)
-                                            )
-                                            .fill(egui::Color32::from_rgb(205, 95, 0))
-                                            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(255, 145, 30)))
-                                            .corner_radius(4.0)
-                                            .min_size(egui::vec2(92.0, btn_h));
-                                            if ui.add(open_hdr_btn).clicked() {
-                                                engine_action.push(EngineAction::OpenFile);
-                                            }
-                                            if ui.available_width() > 110.0 {
-                                                let stream_hdr_btn = egui::Button::new(
-                                                    egui::RichText::new("🔊 STREAM/DEV")
-                                                        .size(11.5)
-                                                        .strong()
-                                                        .color(egui::Color32::WHITE)
-                                                )
-                                                .fill(egui::Color32::from_rgb(100, 50, 150))
-                                                .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_rgb(180, 80, 255)))
-                                                .corner_radius(4.0)
-                                                .min_size(egui::vec2(96.0, btn_h));
-                                                if ui
-                                                    .add(stream_hdr_btn)
-                                                    .on_hover_text("Open network stream URL or local audio input device (microphone)")
-                                                    .clicked()
-                                                {
-                                                    engine_action.push(EngineAction::OpenUrlDialog);
-                                                }
-                                            }
-                                        });
+                                        let _ = render_track_info_open_area(ui, is_portrait, engine_action);
                                     });
                                     col.separator();
 
@@ -3608,7 +4389,7 @@ impl VulkanEngine {
                                                     .corner_radius(4.0);
                                                     if ui
                                                         .add(upmix_btn)
-                                                        .on_hover_text("Upmix the media file's audio channels to fill all remaining available channels on the surround output device. Use the '🎚 Surround EQ' button in the middle panel title bar to view the live Crossover & 5-band Parametric EQ controls. (Shortcut: 'u' / 'e' / R3)")
+                                                        .on_hover_text("Upmix the media file's audio channels to fill all remaining available channels on the surround output device. Use the 'SURROUND EQ' selector in the middle panel title bar to view the live Crossover & 5-band Parametric EQ controls. (Shortcut: 'u' / 'e' / R3)")
                                                         .clicked()
                                                     {
                                                         engine_action.push(EngineAction::ToggleSurroundUpmix(!upmix_enabled));

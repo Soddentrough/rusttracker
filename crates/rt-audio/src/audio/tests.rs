@@ -3978,3 +3978,212 @@ fn test_upmixer_interleaved_stereo_block_matches_frame_by_frame() {
         }
     }
 }
+
+#[cfg(windows)]
+#[test]
+fn test_spatial_audio_reset_and_reactivate_static_objects() {
+    let _live_audio_guard = lock_live_audio_test();
+    use windows::Win32::Foundation::CloseHandle;
+    use windows::Win32::Media::Audio::*;
+    use windows::Win32::System::Com::StructuredStorage::PROPVARIANT;
+    use windows::Win32::System::Com::*;
+    use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
+    use windows::Win32::System::Variant::VT_BLOB;
+    use windows::core::Interface;
+
+    struct ComCleanup(bool);
+    impl Drop for ComCleanup {
+        fn drop(&mut self) {
+            if self.0 {
+                unsafe {
+                    CoUninitialize();
+                }
+            }
+        }
+    }
+
+    unsafe {
+        let _com = ComCleanup(CoInitializeEx(None, COINIT_MULTITHREADED).is_ok());
+        let Ok(enumerator): Result<IMMDeviceEnumerator, _> =
+            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)
+        else {
+            eprintln!("Skipping spatial reset test: MMDeviceEnumerator unavailable");
+            return;
+        };
+        let Ok(dev) = enumerator.GetDefaultAudioEndpoint(eRender, eConsole) else {
+            eprintln!("Skipping spatial reset test: no default render endpoint");
+            return;
+        };
+        let Ok(sac) = dev.Activate::<ISpatialAudioClient>(CLSCTX_ALL, None) else {
+            eprintln!("Skipping spatial reset test: ISpatialAudioClient unavailable");
+            return;
+        };
+        let max_dyn = sac.GetMaxDynamicObjectCount().unwrap_or(0);
+        if max_dyn == 0 {
+            eprintln!("Skipping spatial reset test: Windows Spatial Sound disabled (max_dyn == 0)");
+            return;
+        }
+        if sac
+            .IsSpatialAudioStreamAvailable(&ISpatialAudioObjectRenderStream::IID, None)
+            .is_err()
+        {
+            eprintln!("Skipping spatial reset test: ISpatialAudioObjectRenderStream unavailable");
+            return;
+        }
+
+        let fmt_enum = sac
+            .GetSupportedAudioObjectFormatEnumerator()
+            .expect("GetSupportedAudioObjectFormatEnumerator");
+        let fmt_count = fmt_enum.GetCount().unwrap_or(0);
+        let mut chosen_wf_ptr: *const WAVEFORMATEX = std::ptr::null();
+        for idx in 0..fmt_count {
+            if let Ok(wf_ptr) = fmt_enum.GetFormat(idx)
+                && !wf_ptr.is_null()
+            {
+                let wf = *wf_ptr;
+                if wf.wBitsPerSample == 32 && wf.nChannels == 1 {
+                    chosen_wf_ptr = wf_ptr;
+                    if wf.nSamplesPerSec == 48000 {
+                        break;
+                    }
+                }
+            }
+        }
+        assert!(
+            !chosen_wf_ptr.is_null(),
+            "Expected 32-bit float mono AudioObject format"
+        );
+
+        let ev = CreateEventW(None, false, false, None).expect("CreateEventW");
+        let mask_714 = AudioObjectType_FrontLeft
+            | AudioObjectType_FrontRight
+            | AudioObjectType_FrontCenter
+            | AudioObjectType_LowFrequency
+            | AudioObjectType_SideLeft
+            | AudioObjectType_SideRight
+            | AudioObjectType_BackLeft
+            | AudioObjectType_BackRight
+            | AudioObjectType_TopFrontLeft
+            | AudioObjectType_TopFrontRight
+            | AudioObjectType_TopBackLeft
+            | AudioObjectType_TopBackRight;
+        let mut params = SpatialAudioObjectRenderStreamActivationParams {
+            ObjectFormat: chosen_wf_ptr,
+            StaticObjectTypeMask: mask_714,
+            MinDynamicObjectCount: 0,
+            MaxDynamicObjectCount: 0,
+            Category: AudioCategory_Media,
+            EventHandle: ev,
+            NotifyObject: std::mem::ManuallyDrop::new(None),
+        };
+        let mut pv = std::mem::ManuallyDrop::new(PROPVARIANT::default());
+        (*pv.Anonymous.Anonymous).vt = VT_BLOB;
+        (*pv.Anonymous.Anonymous).Anonymous.blob = BLOB {
+            cbSize: std::mem::size_of::<SpatialAudioObjectRenderStreamActivationParams>() as u32,
+            pBlobData: &mut params as *mut _ as *mut u8,
+        };
+
+        let stream: ISpatialAudioObjectRenderStream = sac
+            .ActivateSpatialAudioStream(&*pv)
+            .expect("ActivateSpatialAudioStream(7.1.4)");
+
+        let static_types = [
+            AudioObjectType_FrontLeft,
+            AudioObjectType_FrontRight,
+            AudioObjectType_FrontCenter,
+            AudioObjectType_LowFrequency,
+            AudioObjectType_SideLeft,
+            AudioObjectType_SideRight,
+            AudioObjectType_BackLeft,
+            AudioObjectType_BackRight,
+            AudioObjectType_TopFrontLeft,
+            AudioObjectType_TopFrontRight,
+            AudioObjectType_TopBackLeft,
+            AudioObjectType_TopBackRight,
+        ];
+
+        let mut objects: Vec<ISpatialAudioObject> = static_types
+            .iter()
+            .map(|&t| {
+                stream
+                    .ActivateSpatialAudioObject(t)
+                    .expect("initial ActivateSpatialAudioObject")
+            })
+            .collect();
+
+        let render_silent_passes =
+            |objs: &mut Vec<ISpatialAudioObject>, passes: usize, phase: &str| {
+                for pass in 0..passes {
+                    let wait_res = WaitForSingleObject(ev, 200);
+                    assert_eq!(
+                        wait_res.0, 0,
+                        "{} pass {}: WaitForSingleObject failed/timed out ({:?})",
+                        phase, pass, wait_res
+                    );
+                    let mut dyn_count = 0u32;
+                    let mut frame_count = 0u32;
+                    stream
+                        .BeginUpdatingAudioObjects(&mut dyn_count, &mut frame_count)
+                        .expect("BeginUpdatingAudioObjects");
+                    if frame_count > 0 {
+                        if objs.len() < static_types.len() {
+                            objs.clear();
+                            for &t in &static_types {
+                                objs.push(
+                                    stream
+                                        .ActivateSpatialAudioObject(t)
+                                        .expect("re-ActivateSpatialAudioObject after Reset"),
+                                );
+                            }
+                        }
+                        for (ch, obj) in objs.iter().enumerate() {
+                            let mut buf_ptr: *mut u8 = std::ptr::null_mut();
+                            let mut buf_bytes = 0u32;
+                            obj.GetBuffer(&mut buf_ptr, &mut buf_bytes)
+                                .unwrap_or_else(|e| {
+                                    panic!(
+                                        "{} pass {} ch {}: GetBuffer failed after Reset: {:?}",
+                                        phase, pass, ch, e
+                                    )
+                                });
+                            assert!(
+                                !buf_ptr.is_null()
+                                    && (buf_bytes as usize) >= (frame_count as usize) * 4,
+                                "{} pass {} ch {}: invalid buffer len {}",
+                                phase,
+                                pass,
+                                ch,
+                                buf_bytes
+                            );
+                            std::ptr::write_bytes(buf_ptr, 0, buf_bytes as usize);
+                        }
+                    }
+                    stream
+                        .EndUpdatingAudioObjects()
+                        .expect("EndUpdatingAudioObjects");
+                }
+            };
+
+        stream.Start().expect("initial stream.Start");
+        render_silent_passes(&mut objects, 2, "pre-pause");
+
+        // Pause: Stop -> release revoked objects -> Reset
+        stream.Stop().expect("stream.Stop");
+        objects.clear();
+        stream.Reset().expect("stream.Reset");
+
+        // Resume: Start -> Wait -> BeginUpdatingAudioObjects -> re-activate 12 objects -> GetBuffer
+        stream.Start().expect("resume stream.Start");
+        render_silent_passes(&mut objects, 3, "post-resume");
+
+        let _ = stream.Stop();
+        objects.clear();
+        let _ = stream.Reset();
+        drop(stream);
+        drop(fmt_enum);
+        drop(sac);
+        drop(dev);
+        drop(enumerator);
+        let _ = CloseHandle(ev);
+    }
+}

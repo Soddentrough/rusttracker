@@ -560,21 +560,24 @@ fn test_artist_unknown_omission() {
 #[test]
 fn test_single_open_file_button() {
     let engine_source = include_str!("ui_overlay.rs");
-    // Count occurrences of OPEN FILE button definitions in engine.rs
-    // 1: In the empty state (no file loaded) -> btn_text = ... "OPEN FILE"
-    // 2: In the Track Info header (shared by mobile portrait & desktop) -> "📂 OPEN FILE"
-    // Ensure that render_col_info has the only header button and no duplicates exist
-    let target_needle = format!("{}(\"{}\")", "egui::RichText::new", "📂 OPEN FILE");
-    let rich_open_occurrences = engine_source
+    // Ensure legacy Track Info header emoji buttons are removed and replaced by a single
+    // grouped "OPEN" area containing "STREAM/DEV" and "FILE/BLOCK" buttons.
+    assert!(
+        !engine_source.contains("📂 OPEN FILE") && !engine_source.contains("📂  OPEN FILE"),
+        "Legacy Track Info header OPEN FILE button should be replaced by FILE/BLOCK inside the OPEN area"
+    );
+    let open_area_calls = engine_source
         .lines()
-        .take_while(|l| !l.contains("mod tests"))
-        .filter(|l| l.contains(&target_needle) || l.contains("📂  OPEN FILE"))
+        .filter(|l| l.contains("render_track_info_open_area(ui,"))
         .count();
     assert_eq!(
-        rich_open_occurrences, 1,
-        "Expected exactly 1 RichText OPEN FILE button in engine.rs Track Info header, found {}",
-        rich_open_occurrences
+        open_area_calls, 1,
+        "Expected exactly 1 render_track_info_open_area call in Track Info header, found {}",
+        open_area_calls
     );
+    assert!(engine_source.contains("\"OPEN\""));
+    assert!(engine_source.contains("\"STREAM/DEV\""));
+    assert!(engine_source.contains("\"FILE/BLOCK\""));
 }
 
 #[test]
@@ -1314,10 +1317,6 @@ fn test_visualizer_curation_and_glass_water_overhaul() {
         (
             "vis_flip_ferrofluid.wgsl",
             include_str!("../../../../src/shaders/vis_flip_ferrofluid.wgsl"),
-        ),
-        (
-            "flip_ferrofluid_compute.wgsl",
-            include_str!("../../../../src/shaders/flip_ferrofluid_compute.wgsl"),
         ),
         (
             "vis_vumeters_bg.wgsl",
@@ -2655,5 +2654,571 @@ fn test_biolum_refactor_mesh_camera_and_shaders() {
         validator
             .validate(&module)
             .unwrap_or_else(|e| panic!("{name} validation error: {e:?}"));
+    }
+}
+
+#[test]
+fn test_ferrofluid_sdf_registration_and_shader() {
+    let ferro_vis = crate::state::VISUALIZERS
+        .iter()
+        .find(|v| v.id == 27)
+        .expect("Visualizer ID 27 (Quantum Ferrofluid) must be registered in VISUALIZERS");
+    assert_eq!(ferro_vis.name, "Quantum Ferrofluid");
+    assert_eq!(ferro_vis.filename, "vis_flip_ferrofluid.wgsl");
+    assert_eq!(
+        ferro_vis.pipeline_type,
+        crate::state::PipelineType::FullscreenTriangle
+    );
+    assert!(!ferro_vis.requires_flip_water);
+
+    let mut state = crate::state::AppState::new("Test App".to_string());
+    assert!(
+        !state.ferrofluid_pool_mode,
+        "Quantum Ferrofluid must default to Magnetic Core view (ferrofluid_pool_mode = false)"
+    );
+    state.ferrofluid_pool_mode = true;
+    let snap = state.render_snapshot();
+    assert!(snap.ferrofluid_pool_mode);
+    let mut dst = crate::state::AppState::new(String::new());
+    state.render_snapshot_into(&mut dst);
+    assert!(dst.ferrofluid_pool_mode);
+
+    const SHADER_COMMON: &str = include_str!("../../../../src/shaders/_common.wgsl");
+    let raw_src = include_str!("../../../../src/shaders/vis_flip_ferrofluid.wgsl");
+    assert!(raw_src.contains("// INCLUDE: common"));
+    assert!(raw_src.contains("audio._pad3"));
+    assert!(raw_src.contains("aces_tonemap"));
+    assert!(!raw_src.contains("@group(1)"));
+    assert!(!raw_src.contains("render_grid"));
+    for legacy_hack in ["pow(", "bezel_mask", "scanline", "distorted_ndc"] {
+        assert!(
+            !raw_src.contains(legacy_hack),
+            "vis_flip_ferrofluid.wgsl must not contain {legacy_hack}"
+        );
+    }
+
+    let resolved = raw_src.replace("// INCLUDE: common", SHADER_COMMON);
+    let mut frontend = wgpu::naga::front::wgsl::Frontend::new();
+    let module = frontend.parse(&resolved).unwrap_or_else(|e| {
+        panic!(
+            "vis_flip_ferrofluid.wgsl parse error: {}",
+            e.emit_to_string(&resolved)
+        )
+    });
+    let mut validator = wgpu::naga::valid::Validator::new(
+        wgpu::naga::valid::ValidationFlags::all(),
+        wgpu::naga::valid::Capabilities::empty(),
+    );
+    validator
+        .validate(&module)
+        .unwrap_or_else(|e| panic!("vis_flip_ferrofluid.wgsl validation error: {e:?}"));
+}
+
+#[test]
+fn test_track_info_open_area_layout_and_actions() {
+    use super::ui_overlay::{
+        OPEN_BTN_DULL_ORANGE_BOT, OPEN_BTN_DULL_ORANGE_MID, OPEN_BTN_DULL_ORANGE_TOP,
+        render_track_info_open_area,
+    };
+
+    let run_open_area_frame = |ctx: &egui::Context,
+                               col_w: f32,
+                               heading: &str,
+                               is_portrait: bool,
+                               events: Vec<egui::Event>| {
+        let mut col_rect = egui::Rect::NOTHING;
+        let mut result = None;
+        let mut actions = Vec::new();
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(800.0, 400.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw_input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                let _ = ui.allocate_ui_with_layout(
+                    egui::vec2(col_w, 120.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        col_rect = ui.max_rect();
+                        ui.horizontal(|ui| {
+                            ui.heading(heading);
+                            result =
+                                Some(render_track_info_open_area(ui, is_portrait, &mut actions));
+                        });
+                    },
+                );
+            });
+        });
+        out.textures_delta.clear();
+        let (container_rect, stream_rect, file_rect, showed_open_label) =
+            result.expect("render_track_info_open_area must return layout rects");
+        (
+            col_rect,
+            container_rect,
+            stream_rect,
+            file_rect,
+            showed_open_label,
+            actions,
+        )
+    };
+
+    let cases = [
+        (464.0_f32, "Track Info", false, true, true, "desktop 1440px"),
+        (
+            410.0_f32,
+            "Track Info",
+            false,
+            true,
+            true,
+            "Steam Deck 1280px",
+        ),
+        (
+            325.0_f32,
+            "Track Info",
+            false,
+            true,
+            true,
+            "desktop min 1024px single-track",
+        ),
+        (
+            325.0_f32,
+            "Track Info (12/99)",
+            false,
+            true,
+            false,
+            "desktop min 1024px playlist",
+        ),
+        (328.0_f32, "Track Info", true, true, false, "portrait 360px"),
+    ];
+
+    for (col_w, heading, is_portrait, expect_stream, expect_open_label, label) in cases {
+        let ctx = egui::Context::default();
+        let (col_rect, container_rect, stream_rect, file_rect, showed_open_label, actions) =
+            run_open_area_frame(&ctx, col_w, heading, is_portrait, Vec::new());
+
+        assert!(actions.is_empty(), "{label}: idle frame emitted actions");
+        assert!(
+            container_rect.right() <= col_rect.right() + 1.0,
+            "{label}: container_rect.right() ({}) exceeded col_rect.right() ({})",
+            container_rect.right(),
+            col_rect.right()
+        );
+        if !is_portrait {
+            assert!(
+                container_rect.height() <= 26.5,
+                "{label}: desktop container height ({}) exceeded 26.5px",
+                container_rect.height()
+            );
+        }
+        if expect_stream {
+            let s = stream_rect
+                .unwrap_or_else(|| panic!("{label}: expected STREAM/DEV button to be visible"));
+            assert!(
+                (s.width() - file_rect.width()).abs() < 0.5,
+                "{label}: button widths differed (stream={}, file={})",
+                s.width(),
+                file_rect.width()
+            );
+            assert!(
+                s.right() < file_rect.left(),
+                "{label}: STREAM/DEV right ({}) must be left of FILE/BLOCK left ({})",
+                s.right(),
+                file_rect.left()
+            );
+            assert!(
+                !s.intersects(file_rect),
+                "{label}: STREAM/DEV and FILE/BLOCK rects overlapped"
+            );
+        } else if let Some(s) = stream_rect {
+            assert!(s.right() < file_rect.left());
+        }
+        if expect_open_label {
+            assert!(
+                showed_open_label,
+                "{label}: expected OPEN label to be visible"
+            );
+        }
+    }
+
+    // Verify clicking STREAM/DEV emits EngineAction::OpenUrlDialog
+    let stream_ctx = egui::Context::default();
+    let (_, _, stream_rect, _, _, _) =
+        run_open_area_frame(&stream_ctx, 464.0, "Track Info", false, Vec::new());
+    let stream_center = stream_rect
+        .expect("STREAM/DEV rect required for click test")
+        .center();
+    let (_, _, _, _, _, press_actions) = run_open_area_frame(
+        &stream_ctx,
+        464.0,
+        "Track Info",
+        false,
+        vec![
+            egui::Event::PointerMoved(stream_center),
+            egui::Event::PointerButton {
+                pos: stream_center,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+    );
+    assert!(press_actions.is_empty());
+    let (_, _, _, _, _, release_actions) = run_open_area_frame(
+        &stream_ctx,
+        464.0,
+        "Track Info",
+        false,
+        vec![
+            egui::Event::PointerMoved(stream_center),
+            egui::Event::PointerButton {
+                pos: stream_center,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+    );
+    assert!(
+        matches!(release_actions.as_slice(), [EngineAction::OpenUrlDialog]),
+        "Clicking STREAM/DEV must emit EngineAction::OpenUrlDialog"
+    );
+
+    // Verify clicking FILE/BLOCK emits EngineAction::OpenFile
+    let file_ctx = egui::Context::default();
+    let (_, _, _, file_rect, _, _) =
+        run_open_area_frame(&file_ctx, 464.0, "Track Info", false, Vec::new());
+    let file_center = file_rect.center();
+    let (_, _, _, _, _, press_actions) = run_open_area_frame(
+        &file_ctx,
+        464.0,
+        "Track Info",
+        false,
+        vec![
+            egui::Event::PointerMoved(file_center),
+            egui::Event::PointerButton {
+                pos: file_center,
+                button: egui::PointerButton::Primary,
+                pressed: true,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+    );
+    assert!(press_actions.is_empty());
+    let (_, _, _, _, _, release_actions) = run_open_area_frame(
+        &file_ctx,
+        464.0,
+        "Track Info",
+        false,
+        vec![
+            egui::Event::PointerMoved(file_center),
+            egui::Event::PointerButton {
+                pos: file_center,
+                button: egui::PointerButton::Primary,
+                pressed: false,
+                modifiers: egui::Modifiers::NONE,
+            },
+        ],
+    );
+    assert!(
+        matches!(release_actions.as_slice(), [EngineAction::OpenFile]),
+        "Clicking FILE/BLOCK must emit EngineAction::OpenFile"
+    );
+
+    // Verify shared dull-orange 3D palette invariants
+    assert!(
+        OPEN_BTN_DULL_ORANGE_TOP.r() > OPEN_BTN_DULL_ORANGE_MID.r()
+            && OPEN_BTN_DULL_ORANGE_MID.r() > OPEN_BTN_DULL_ORANGE_BOT.r(),
+        "3D button gradient must descend in luminance from top to bottom"
+    );
+    for col in [
+        OPEN_BTN_DULL_ORANGE_TOP,
+        OPEN_BTN_DULL_ORANGE_MID,
+        OPEN_BTN_DULL_ORANGE_BOT,
+    ] {
+        assert!(
+            col.r() > col.g() && col.g() > col.b(),
+            "Palette color {col:?} must remain warm orange (r > g > b)"
+        );
+    }
+    assert!(
+        OPEN_BTN_DULL_ORANGE_TOP.r() < 205 && OPEN_BTN_DULL_ORANGE_MID.b() > 20,
+        "Palette must stay muted/dull orange relative to vivid splash orange (205, 95, 0)"
+    );
+}
+
+#[test]
+fn test_heatmap_eq_toggle_selector_layout_and_actions() {
+    use super::ui_overlay::{
+        TOGGLE_ACTIVE_LIGHT_GREY_BOT, TOGGLE_ACTIVE_LIGHT_GREY_MID, TOGGLE_ACTIVE_LIGHT_GREY_TOP,
+        TOGGLE_INACTIVE_DARK_GREY_BOT, TOGGLE_INACTIVE_DARK_GREY_MID,
+        TOGGLE_INACTIVE_DARK_GREY_TOP, render_heatmap_eq_header,
+    };
+
+    let run_header_frame = |ctx: &egui::Context,
+                            col_w: f32,
+                            show_surround_eq: bool,
+                            has_lyrics: bool,
+                            has_tracker_patterns: bool,
+                            hardware_channels: i32,
+                            events: Vec<egui::Event>| {
+        let mut col_rect = egui::Rect::NOTHING;
+        let mut result = None;
+        let mut actions = Vec::new();
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::pos2(0.0, 0.0),
+                egui::vec2(800.0, 400.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        let mut out = ctx.run_ui(raw_input, |ui| {
+            egui::CentralPanel::default().show(ui, |ui| {
+                let _ = ui.allocate_ui_with_layout(
+                    egui::vec2(col_w, 120.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |ui| {
+                        col_rect = ui.max_rect();
+                        ui.horizontal(|ui| {
+                            result = Some(render_heatmap_eq_header(
+                                ui,
+                                show_surround_eq,
+                                has_lyrics,
+                                has_tracker_patterns,
+                                hardware_channels,
+                                &mut actions,
+                            ));
+                        });
+                    },
+                );
+            });
+        });
+        out.textures_delta.clear();
+        let (tray_rect, pattern_btn_rect, eq_btn_rect, reset_btn_rect, reset_clicked) =
+            result.expect("render_heatmap_eq_header must return layout rects");
+        (
+            col_rect,
+            tray_rect,
+            pattern_btn_rect,
+            eq_btn_rect,
+            reset_btn_rect,
+            reset_clicked,
+            actions,
+        )
+    };
+
+    let configs = [
+        (false, false, 2, "Heatmap Stereo"),
+        (false, true, 8, "Tracker Pattern 7.1"),
+        (true, false, 12, "Lyrics 7.1.4"),
+    ];
+    for &col_w in &[464.0_f32, 410.0, 325.0] {
+        for &(has_lyrics, has_tracker_patterns, hardware_channels, cfg_label) in &configs {
+            let mut tray_left_by_mode = [0.0_f32; 2];
+            for (mode_idx, &show_surround_eq) in [false, true].iter().enumerate() {
+                let ctx = egui::Context::default();
+                let (
+                    col_rect,
+                    tray_rect,
+                    pattern_btn_rect,
+                    eq_btn_rect,
+                    reset_btn_rect,
+                    reset_clicked,
+                    actions,
+                ) = run_header_frame(
+                    &ctx,
+                    col_w,
+                    show_surround_eq,
+                    has_lyrics,
+                    has_tracker_patterns,
+                    hardware_channels,
+                    Vec::new(),
+                );
+                let label = format!("w={col_w}, eq={show_surround_eq}, {cfg_label}");
+                assert!(!reset_clicked, "{label}: idle frame triggered reset");
+                assert!(actions.is_empty(), "{label}: idle frame emitted actions");
+                assert!(
+                    tray_rect.right() <= col_rect.right() + 1.0,
+                    "{label}: tray_rect.right() ({}) exceeded col_rect.right() ({})",
+                    tray_rect.right(),
+                    col_rect.right()
+                );
+                assert!(
+                    tray_rect.height() <= 26.5,
+                    "{label}: tray height ({}) exceeded 26.5px",
+                    tray_rect.height()
+                );
+                assert!(
+                    (pattern_btn_rect.width() - eq_btn_rect.width()).abs() < 0.5,
+                    "{label}: selector widths differed (pattern={}, eq={})",
+                    pattern_btn_rect.width(),
+                    eq_btn_rect.width()
+                );
+                assert!(
+                    !pattern_btn_rect.intersects(eq_btn_rect),
+                    "{label}: pattern and EQ selector rects overlapped"
+                );
+                assert!(
+                    pattern_btn_rect.right() < eq_btn_rect.left(),
+                    "{label}: pattern right ({}) must be left of EQ left ({})",
+                    pattern_btn_rect.right(),
+                    eq_btn_rect.left()
+                );
+                if show_surround_eq {
+                    let r = reset_btn_rect
+                        .unwrap_or_else(|| panic!("{label}: RESET button missing in EQ mode"));
+                    assert!(
+                        r.right() <= col_rect.right() + 1.0,
+                        "{label}: reset_btn_rect.right() ({}) exceeded col_rect.right() ({})",
+                        r.right(),
+                        col_rect.right()
+                    );
+                    assert!(
+                        tray_rect.right() < r.left(),
+                        "{label}: tray_rect.right() ({}) overlapped reset_btn_rect.left() ({})",
+                        tray_rect.right(),
+                        r.left()
+                    );
+                } else {
+                    assert!(
+                        reset_btn_rect.is_none(),
+                        "{label}: RESET button must not appear when EQ is inactive"
+                    );
+                }
+                tray_left_by_mode[mode_idx] = tray_rect.left();
+            }
+            assert!(
+                (tray_left_by_mode[0] - tray_left_by_mode[1]).abs() < 0.5,
+                "w={col_w}, {cfg_label}: tray left edge shifted between modes ({} vs {})",
+                tray_left_by_mode[0],
+                tray_left_by_mode[1]
+            );
+        }
+    }
+
+    let click_at = |ctx: &egui::Context,
+                    show_surround_eq: bool,
+                    pos: egui::Pos2|
+     -> (bool, Vec<EngineAction>) {
+        let _ = run_header_frame(
+            ctx,
+            464.0,
+            show_surround_eq,
+            false,
+            false,
+            8,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: true,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        let (_, _, _, _, _, reset_clicked, actions) = run_header_frame(
+            ctx,
+            464.0,
+            show_surround_eq,
+            false,
+            false,
+            8,
+            vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed: false,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ],
+        );
+        (reset_clicked, actions)
+    };
+
+    // Heatmap mode: clicking EQ switches to EQ; clicking active Pattern does nothing
+    let hm_eq_ctx = egui::Context::default();
+    let (_, _, pattern_rect, eq_rect, _, _, _) =
+        run_header_frame(&hm_eq_ctx, 464.0, false, false, false, 8, Vec::new());
+    let (reset_clicked, actions) = click_at(&hm_eq_ctx, false, eq_rect.center());
+    assert!(!reset_clicked);
+    assert!(
+        matches!(actions.as_slice(), [EngineAction::SetShowSurroundEq(true)]),
+        "Clicking EQ in Heatmap mode must emit SetShowSurroundEq(true)"
+    );
+
+    let hm_pat_ctx = egui::Context::default();
+    let _ = run_header_frame(&hm_pat_ctx, 464.0, false, false, false, 8, Vec::new());
+    let (_, actions) = click_at(&hm_pat_ctx, false, pattern_rect.center());
+    assert!(
+        actions.is_empty(),
+        "Clicking already-active Pattern selector must not emit an action"
+    );
+
+    // EQ mode: clicking Pattern switches back to Pattern/Heatmap; clicking RESET returns reset_clicked == true
+    let eq_pat_ctx = egui::Context::default();
+    let (_, _, pattern_rect_eq, _, reset_rect_eq, _, _) =
+        run_header_frame(&eq_pat_ctx, 464.0, true, false, false, 8, Vec::new());
+    let (reset_clicked, actions) = click_at(&eq_pat_ctx, true, pattern_rect_eq.center());
+    assert!(!reset_clicked);
+    assert!(
+        matches!(actions.as_slice(), [EngineAction::SetShowSurroundEq(false)]),
+        "Clicking Pattern in EQ mode must emit SetShowSurroundEq(false)"
+    );
+
+    let eq_reset_ctx = egui::Context::default();
+    let _ = run_header_frame(&eq_reset_ctx, 464.0, true, false, false, 8, Vec::new());
+    let reset_center = reset_rect_eq
+        .expect("RESET rect must exist in EQ mode")
+        .center();
+    let (reset_clicked, actions) = click_at(&eq_reset_ctx, true, reset_center);
+    assert!(
+        reset_clicked,
+        "Clicking RESET must return reset_clicked == true"
+    );
+    assert!(actions.is_empty());
+
+    // Palette invariants: top-to-bottom 3D gradient, neutral grey balance, active > inactive luminance
+    assert!(
+        TOGGLE_ACTIVE_LIGHT_GREY_TOP.r() > TOGGLE_ACTIVE_LIGHT_GREY_MID.r()
+            && TOGGLE_ACTIVE_LIGHT_GREY_MID.r() > TOGGLE_ACTIVE_LIGHT_GREY_BOT.r()
+    );
+    assert!(
+        TOGGLE_INACTIVE_DARK_GREY_TOP.r() > TOGGLE_INACTIVE_DARK_GREY_MID.r()
+            && TOGGLE_INACTIVE_DARK_GREY_MID.r() > TOGGLE_INACTIVE_DARK_GREY_BOT.r()
+    );
+    for col in [
+        TOGGLE_ACTIVE_LIGHT_GREY_TOP,
+        TOGGLE_ACTIVE_LIGHT_GREY_MID,
+        TOGGLE_ACTIVE_LIGHT_GREY_BOT,
+        TOGGLE_INACTIVE_DARK_GREY_TOP,
+        TOGGLE_INACTIVE_DARK_GREY_MID,
+        TOGGLE_INACTIVE_DARK_GREY_BOT,
+    ] {
+        let max_c = col.r().max(col.g()).max(col.b());
+        let min_c = col.r().min(col.g()).min(col.b());
+        assert!(
+            max_c - min_c <= 10,
+            "Selector grey color {col:?} must be neutral grey"
+        );
+    }
+    assert!(
+        TOGGLE_ACTIVE_LIGHT_GREY_MID.r() >= TOGGLE_INACTIVE_DARK_GREY_MID.r() + 90,
+        "Active light grey must be clearly brighter than inactive dark grey"
+    );
+
+    let ui_src = include_str!("ui_overlay.rs");
+    assert!(!ui_src.contains("🎚 Surround EQ"));
+    assert!(!ui_src.contains("📊 Pattern View"));
+    for forbidden in ["allow(dead_code", "allow(unused", "allow(deprecated"] {
+        assert!(
+            !ui_src.contains(forbidden),
+            "ui_overlay.rs must not contain forbidden attribute {forbidden}"
+        );
     }
 }

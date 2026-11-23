@@ -433,15 +433,6 @@ async fn run_perf_test() {
         ],
     });
 
-    let flip_render_pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-        label: Some("FLIP Render Pipeline Layout"),
-        bind_group_layouts: &[
-            Some(&bind_group_layout),
-            Some(&flip_render_bind_group_layout),
-        ],
-        immediate_size: 0,
-    });
-
     let lyrics_render_pipeline_layout_3d =
         device.create_pipeline_layout(&PipelineLayoutDescriptor {
             label: Some("Lyrics 3D Render Pipeline Layout"),
@@ -786,8 +777,6 @@ async fn run_perf_test() {
 
         let layout = if vis_def.id == 20 {
             &biolum_render_pipeline_layout
-        } else if vis_def.id == 27 {
-            &flip_render_pipeline_layout
         } else if vis_def.id == 31 {
             &neon_acoustic_render_pipeline_layout_3d
         } else if vis_def.id == 23 {
@@ -1018,9 +1007,6 @@ async fn run_perf_test() {
                 });
                 rp.set_pipeline(&pipeline);
                 rp.set_bind_group(0, &uniform_bind_group, &[]);
-                if vis_def.id == 27 {
-                    rp.set_bind_group(1, &flip_render_bind_group, &[]);
-                }
                 if is_3d {
                     if vis_def.id == 23 {
                         rp.set_bind_group(1, &flip_render_bind_group, &[]);
@@ -1143,9 +1129,6 @@ async fn run_perf_test() {
                 });
                 rp.set_pipeline(&pipeline);
                 rp.set_bind_group(0, &uniform_bind_group, &[]);
-                if vis_def.id == 27 {
-                    rp.set_bind_group(1, &flip_render_bind_group, &[]);
-                }
                 if is_3d {
                     if vis_def.id == 23 {
                         rp.set_bind_group(1, &flip_render_bind_group, &[]);
@@ -4107,6 +4090,516 @@ fn test_gpu_bioluminescent_waves_render_and_compute() {
         assert!(
             !error_caught.load(std::sync::atomic::Ordering::SeqCst),
             "WGPU validation error was triggered during Bioluminescent Waves test!"
+        );
+    });
+}
+
+#[test]
+fn test_gpu_ferrofluid_render_and_perf() {
+    pollster::block_on(async {
+        let instance = Instance::new(InstanceDescriptor {
+            backends: Backends::PRIMARY,
+            flags: InstanceFlags::default(),
+            backend_options: BackendOptions::default(),
+            display: None,
+            memory_budget_thresholds: MemoryBudgetThresholds::default(),
+        });
+
+        let adapter = match instance
+            .request_adapter(&RequestAdapterOptions {
+                power_preference: PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+                apply_limit_buckets: false,
+            })
+            .await
+        {
+            Ok(a) => a,
+            Err(_) => {
+                println!("Skipping ferrofluid GPU test: No GPU adapter available.");
+                return;
+            }
+        };
+
+        let timestamp_supported = adapter.features().contains(Features::TIMESTAMP_QUERY);
+        let req_features = if timestamp_supported {
+            Features::TIMESTAMP_QUERY
+        } else {
+            Features::empty()
+        };
+
+        let (device, queue) = match adapter
+            .request_device(&DeviceDescriptor {
+                label: Some("Ferrofluid Test Device"),
+                required_features: req_features,
+                required_limits: Limits::default(),
+                memory_hints: MemoryHints::default(),
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(dq) => dq,
+            Err(e) => {
+                println!("Skipping ferrofluid GPU test: Failed to request device: {e:?}");
+                return;
+            }
+        };
+
+        let error_caught = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let err_flag = error_caught.clone();
+        device.on_uncaptured_error(std::sync::Arc::new(move |err| {
+            eprintln!("WGPU uncaptured error in ferrofluid test: {err:?}");
+            err_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+
+        const SHADER_COMMON: &str = include_str!("../src/shaders/_common.wgsl");
+        let ferro_src = include_str!("../src/shaders/vis_flip_ferrofluid.wgsl")
+            .replace("// INCLUDE: common", SHADER_COMMON);
+
+        let uniform_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("Ferrofluid Test Uniforms"),
+            size: std::mem::size_of::<engine::AudioUniforms>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let audio_bgl = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("Ferrofluid Test Audio BGL"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+
+        let audio_bg = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Ferrofluid Test Audio BG"),
+            layout: &audio_bgl,
+            entries: &[BindGroupEntry {
+                binding: 0,
+                resource: uniform_buf.as_entire_binding(),
+            }],
+        });
+
+        let pipeline_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Ferrofluid Test PL"),
+            bind_group_layouts: &[Some(&audio_bgl)],
+            immediate_size: 0,
+        });
+
+        let shader_mod = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("Ferrofluid Test Shader"),
+            source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&ferro_src)),
+        });
+
+        let color_format = TextureFormat::Rgba8UnormSrgb;
+        let pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("Ferrofluid Test Pipeline"),
+            layout: Some(&pipeline_layout),
+            vertex: VertexState {
+                module: &shader_mod,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(FragmentState {
+                module: &shader_mod,
+                entry_point: Some("fs_main"),
+                targets: &[Some(ColorTargetState {
+                    format: color_format,
+                    blend: Some(BlendState::REPLACE),
+                    write_mask: ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let make_uniforms =
+            |w: u32, h: u32, pool_mode: bool, loud: bool| -> engine::AudioUniforms {
+                let mut u: engine::AudioUniforms = bytemuck::Zeroable::zeroed();
+                u.mode = 27;
+                u.num_channels = 2;
+                u.num_spatial_channels = 2;
+                u.time = 6.2;
+                u.smooth_time = 6.2;
+                u.duration = 200.0;
+                u.frame_dt = 0.0166;
+                u.aspect_ratio = w as f32 / h as f32;
+                u._pad3 = if pool_mode { 1.0 } else { 0.0 };
+                if loud {
+                    u.channels[0] = 0.88;
+                    u.channels[1] = 0.72;
+                    u.spatial_channels[0] = 0.88;
+                    u.spatial_channels[1] = 0.72;
+                    for (offset, dst) in u.spectrum[56..=260].iter_mut().enumerate() {
+                        let i = 56 + offset;
+                        *dst = 72.0 - (i as f32 - 140.0).abs() * 0.15;
+                    }
+                    for (offset, dst) in u.spectrum[261..=680].iter_mut().enumerate() {
+                        let i = 261 + offset;
+                        *dst = 48.0 + 18.0 * ((i as f32) * 0.07).sin().abs();
+                    }
+                    for (offset, dst) in u.spectrum[681..=990].iter_mut().enumerate() {
+                        let i = 681 + offset;
+                        *dst = 36.0 + 16.0 * ((i as f32) * 0.11).cos().abs();
+                    }
+                }
+                u
+            };
+
+        let snapshot_dir = std::env::var("RT_SAVE_FERROFLUID_SNAPSHOT_DIR").ok();
+        if let Some(dir) = &snapshot_dir {
+            std::fs::create_dir_all(dir).expect("Failed to create snapshot output dir");
+        }
+
+        let cases = [
+            (1280u32, 720u32, false, true, "core_16x9.png"),
+            (1400u32, 400u32, false, true, "core_ultrawide.png"),
+            (540u32, 960u32, false, true, "core_portrait.png"),
+            (1280u32, 720u32, true, true, "pool_16x9.png"),
+            (1280u32, 720u32, false, false, "core_quiet_16x9.png"),
+        ];
+
+        let mut core_loud_rgba: Option<Vec<u8>> = None;
+        let mut core_quiet_rgba: Option<Vec<u8>> = None;
+
+        for (w, h, pool_mode, loud, filename) in cases {
+            let u = make_uniforms(w, h, pool_mode, loud);
+            queue.write_buffer(&uniform_buf, 0, bytemuck::cast_slice(&[u]));
+
+            let color_tex = device.create_texture(&TextureDescriptor {
+                label: Some("Ferrofluid Test Color"),
+                size: Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: color_format,
+                usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let color_view = color_tex.create_view(&TextureViewDescriptor::default());
+
+            let padded_row_bytes = (w * 4).div_ceil(256) * 256;
+            let readback_buf = device.create_buffer(&BufferDescriptor {
+                label: Some("Ferrofluid Test Readback"),
+                size: (padded_row_bytes * h) as u64,
+                usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+            // Sentinel magenta proves 100% viewport coverage without border leaks
+            let sentinel_clear = Color {
+                r: 1.0,
+                g: 0.0,
+                b: 1.0,
+                a: 1.0,
+            };
+
+            let mut enc = device.create_command_encoder(&CommandEncoderDescriptor::default());
+            {
+                let mut rp = enc.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("Ferrofluid Test Pass"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view: &color_view,
+                        resolve_target: None,
+                        ops: Operations {
+                            load: LoadOp::Clear(sentinel_clear),
+                            store: StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                rp.set_pipeline(&pipeline);
+                rp.set_bind_group(0, &audio_bg, &[]);
+                rp.draw(0..3, 0..1);
+            }
+            enc.copy_texture_to_buffer(
+                TexelCopyTextureInfo {
+                    texture: &color_tex,
+                    mip_level: 0,
+                    origin: Origin3d::ZERO,
+                    aspect: TextureAspect::All,
+                },
+                TexelCopyBufferInfo {
+                    buffer: &readback_buf,
+                    layout: TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded_row_bytes),
+                        rows_per_image: Some(h),
+                    },
+                },
+                Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.submit(Some(enc.finish()));
+
+            let slice = readback_buf.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(MapMode::Read, move |r| tx.send(r).unwrap());
+            let _ = device.poll(PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            });
+            rx.recv().unwrap().unwrap();
+            let mapped = slice.get_mapped_range().unwrap();
+            let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+            for y in 0..h as usize {
+                let row_start = y * padded_row_bytes as usize;
+                rgba.extend_from_slice(&mapped[row_start..row_start + (w * 4) as usize]);
+            }
+            drop(mapped);
+            readback_buf.unmap();
+
+            if let Some(dir) = &snapshot_dir {
+                let out_path = std::path::Path::new(dir).join(filename);
+                image::save_buffer(&out_path, &rgba, w, h, image::ColorType::Rgba8)
+                    .expect("Failed to save ferrofluid snapshot");
+            }
+
+            let total_px = (w * h) as usize;
+            let mut dark_px = 0usize;
+            let mut bright_px = 0usize;
+            let mut white_clip_px = 0usize;
+            let mut border_leaks = 0usize;
+            let mut luma_sum = 0.0f64;
+
+            for y in 0..h as usize {
+                for x in 0..w as usize {
+                    let i = (y * w as usize + x) * 4;
+                    let [r, g, b, _] = [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]];
+                    let luma = (0.2126 * r as f64 + 0.7152 * g as f64 + 0.0722 * b as f64) / 255.0;
+                    luma_sum += luma;
+                    if luma < 0.18 {
+                        dark_px += 1;
+                    }
+                    if r.max(g).max(b) >= 95 {
+                        bright_px += 1;
+                    }
+                    if r > 245 && g > 245 && b > 245 {
+                        white_clip_px += 1;
+                    }
+                    let is_edge = x < 4 || x >= w as usize - 4 || y < 4 || y >= h as usize - 4;
+                    if is_edge && r > 180 && g < 50 && b > 180 {
+                        border_leaks += 1;
+                    }
+                }
+            }
+
+            let avg_luma = luma_sum / total_px as f64;
+            println!(
+                "Ferrofluid {filename} ({w}x{h}, pool={pool_mode}, loud={loud}): avg_luma={avg_luma:.4}, dark={dark_px}/{total_px}, bright={bright_px}, white_clip={white_clip_px}, border_leaks={border_leaks}"
+            );
+
+            assert_eq!(
+                border_leaks, 0,
+                "{filename} must fill 100% edge-to-edge with zero border leaks"
+            );
+            assert!(
+                dark_px > total_px * 35 / 100,
+                "{filename} must preserve deep obsidian contrast ({dark_px} / {total_px})"
+            );
+            let min_bright = if loud { 400 } else { 150 };
+            assert!(
+                bright_px > min_bright,
+                "{filename} must display crisp specular/rim highlights (got {bright_px})"
+            );
+            assert!(
+                white_clip_px < total_px / 20,
+                "{filename} must not blow out into flat white ({white_clip_px} / {total_px})"
+            );
+
+            if filename == "core_16x9.png" {
+                core_loud_rgba = Some(rgba);
+            } else if filename == "core_quiet_16x9.png" {
+                core_quiet_rgba = Some(rgba);
+            }
+        }
+
+        let loud_px = core_loud_rgba.expect("loud frame captured");
+        let quiet_px = core_quiet_rgba.expect("quiet frame captured");
+        let mean_diff: f64 = loud_px
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(quiet_px.as_chunks::<4>().0.iter())
+            .map(|(a, b)| {
+                ((a[0] as f64 - b[0] as f64).abs()
+                    + (a[1] as f64 - b[1] as f64).abs()
+                    + (a[2] as f64 - b[2] as f64).abs())
+                    / 3.0
+            })
+            .sum::<f64>()
+            / (loud_px.len() / 4) as f64;
+        println!("Ferrofluid audio reactivity mean channel diff (loud vs quiet): {mean_diff:.3}");
+        assert!(
+            mean_diff > 1.8,
+            "Ferrofluid shader must respond strongly to audio energy (mean_diff={mean_diff:.3})"
+        );
+
+        if timestamp_supported {
+            for (bw, bh, budget_ms, label) in [
+                (1280u32, 720u32, Some(0.700_f32), "1280x720"),
+                (1920u32, 1080u32, None, "1920x1080"),
+            ] {
+                let u = make_uniforms(bw, bh, false, true);
+                queue.write_buffer(&uniform_buf, 0, bytemuck::cast_slice(&[u]));
+
+                let color_tex = device.create_texture(&TextureDescriptor {
+                    label: Some("Ferrofluid Perf Color"),
+                    size: Extent3d {
+                        width: bw,
+                        height: bh,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: TextureDimension::D2,
+                    format: color_format,
+                    usage: TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                });
+                let color_view = color_tex.create_view(&TextureViewDescriptor::default());
+
+                let qs = device.create_query_set(&QuerySetDescriptor {
+                    label: Some("Ferrofluid Perf QS"),
+                    ty: QueryType::Timestamp,
+                    count: 2,
+                });
+                let res_buf = device.create_buffer(&BufferDescriptor {
+                    label: Some("Ferrofluid Perf Res"),
+                    size: 16,
+                    usage: BufferUsages::QUERY_RESOLVE | BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                });
+                let ts_read_buf = device.create_buffer(&BufferDescriptor {
+                    label: Some("Ferrofluid Perf Read"),
+                    size: 16,
+                    usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let period = queue.get_timestamp_period();
+
+                // Warmup 5 iterations
+                for _ in 0..5 {
+                    let mut enc =
+                        device.create_command_encoder(&CommandEncoderDescriptor::default());
+                    {
+                        let mut rp = enc.begin_render_pass(&RenderPassDescriptor {
+                            label: Some("Ferrofluid Warmup"),
+                            color_attachments: &[Some(RenderPassColorAttachment {
+                                view: &color_view,
+                                resolve_target: None,
+                                ops: Operations {
+                                    load: LoadOp::Clear(Color::BLACK),
+                                    store: StoreOp::Store,
+                                },
+                                depth_slice: None,
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                            multiview_mask: None,
+                        });
+                        rp.set_pipeline(&pipeline);
+                        rp.set_bind_group(0, &audio_bg, &[]);
+                        rp.draw(0..3, 0..1);
+                    }
+                    queue.submit(Some(enc.finish()));
+                }
+                let _ = device.poll(PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                });
+
+                let iters = 30u32;
+                let mut sum_ms = 0.0f32;
+                for _ in 0..iters {
+                    let mut enc =
+                        device.create_command_encoder(&CommandEncoderDescriptor::default());
+                    {
+                        let mut rp = enc.begin_render_pass(&RenderPassDescriptor {
+                            label: Some("Ferrofluid Perf Pass"),
+                            color_attachments: &[Some(RenderPassColorAttachment {
+                                view: &color_view,
+                                resolve_target: None,
+                                ops: Operations {
+                                    load: LoadOp::Clear(Color::BLACK),
+                                    store: StoreOp::Store,
+                                },
+                                depth_slice: None,
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: Some(RenderPassTimestampWrites {
+                                query_set: &qs,
+                                beginning_of_pass_write_index: Some(0),
+                                end_of_pass_write_index: Some(1),
+                            }),
+                            occlusion_query_set: None,
+                            multiview_mask: None,
+                        });
+                        rp.set_pipeline(&pipeline);
+                        rp.set_bind_group(0, &audio_bg, &[]);
+                        rp.draw(0..3, 0..1);
+                    }
+                    enc.resolve_query_set(&qs, 0..2, &res_buf, 0);
+                    enc.copy_buffer_to_buffer(&res_buf, 0, &ts_read_buf, 0, 16);
+                    queue.submit(Some(enc.finish()));
+                    let _ = device.poll(PollType::Wait {
+                        submission_index: None,
+                        timeout: None,
+                    });
+                    let slice = ts_read_buf.slice(..);
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    slice.map_async(MapMode::Read, move |r| tx.send(r).unwrap());
+                    let _ = device.poll(PollType::Wait {
+                        submission_index: None,
+                        timeout: None,
+                    });
+                    rx.recv().unwrap().unwrap();
+                    let data = slice.get_mapped_range().unwrap();
+                    let s = u64::from_le_bytes(data[0..8].try_into().unwrap());
+                    let e = u64::from_le_bytes(data[8..16].try_into().unwrap());
+                    drop(data);
+                    ts_read_buf.unmap();
+                    if e > s {
+                        sum_ms += ((e - s) as f32 * period) / 1_000_000.0;
+                    }
+                }
+                let avg_ms = sum_ms / iters as f32;
+                println!("Ferrofluid {label} GPU render: {avg_ms:.3} ms");
+                if let Some(limit) = budget_ms {
+                    assert!(
+                        avg_ms < limit,
+                        "Ferrofluid {label} render exceeded {limit:.3}ms budget: {avg_ms:.3} ms"
+                    );
+                }
+            }
+        }
+
+        assert!(
+            !error_caught.load(std::sync::atomic::Ordering::SeqCst),
+            "WGPU validation error was triggered during Ferrofluid test!"
         );
     });
 }

@@ -205,10 +205,10 @@ async fn run_flip_snapshot() {
     let depth_view = depth_texture.create_view(&TextureViewDescriptor::default());
 
     let mut uniforms = crate::engine::AudioUniforms {
-        spectrum: [0.1; 1024],
+        spectrum: [0.0; 1024],
         fire_heat: [0.0; 1024],
-        channels: [0.8; 32],
-        channel_peaks: [0.8; 32],
+        channels: [0.65; 32],
+        channel_peaks: [0.75; 32],
         spatial_channels: [0.0; 16],
         display_order: [0; 16],
         channel_phases: [0.0; 32],
@@ -237,426 +237,62 @@ async fn run_flip_snapshot() {
         _pad2: 0.0,
         _pad3: 0.0,
     };
-    uniforms.spectrum[0] = 1.4;
-    uniforms.spectrum[1] = 1.2;
-    for i in 0..16 {
-        let bin = i * 8 + 4;
-        let factor = 0.6 + 0.55 * ((i as f32) * 1.3).sin().abs();
-        uniforms.spectrum[bin] = factor;
-    }
-    uniforms.channels[0] = 1.3; // sub-bass boost
 
     let uniform_buffer = device.create_buffer(&BufferDescriptor {
-        label: Some("FLIP Uniforms"),
+        label: Some("Ferrofluid Uniforms"),
         size: std::mem::size_of::<crate::engine::AudioUniforms>() as u64,
         usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
     queue.write_buffer(&uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
-    let dummy_waveform = device.create_buffer(&BufferDescriptor {
-        label: Some("Dummy Waveform"),
-        size: 1024,
-        usage: BufferUsages::STORAGE,
-        mapped_at_creation: false,
-    });
-    let dummy_tex = device.create_texture(&TextureDescriptor {
-        label: Some("Dummy Tex"),
-        size: Extent3d {
-            width: 1,
-            height: 1,
-            depth_or_array_layers: 1,
-        },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: TextureDimension::D2,
-        format: TextureFormat::R32Float,
-        usage: TextureUsages::TEXTURE_BINDING,
-        view_formats: &[],
-    });
-    let dummy_view = dummy_tex.create_view(&TextureViewDescriptor::default());
-    let dummy_storage = device.create_buffer(&BufferDescriptor {
-        label: Some("Dummy Storage"),
-        size: 1024,
-        usage: BufferUsages::STORAGE,
-        mapped_at_creation: false,
-    });
-
     let bind_group_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-        entries: &[
-            BindGroupLayoutEntry {
-                binding: 0,
-                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
-                ty: BindingType::Buffer {
-                    ty: BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            BindGroupLayoutEntry {
-                binding: 1,
-                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
-                ty: BindingType::Buffer {
-                    ty: BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            BindGroupLayoutEntry {
-                binding: 2,
-                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
-                ty: BindingType::Texture {
-                    sample_type: TextureSampleType::Float { filterable: false },
-                    view_dimension: TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            BindGroupLayoutEntry {
-                binding: 3,
-                visibility: ShaderStages::FRAGMENT,
-                ty: BindingType::Texture {
-                    sample_type: TextureSampleType::Float { filterable: false },
-                    view_dimension: TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
-            },
-            BindGroupLayoutEntry {
-                binding: 4,
-                visibility: ShaderStages::FRAGMENT,
-                ty: BindingType::Buffer {
-                    ty: BufferBindingType::Storage { read_only: true },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-        ],
-        label: Some("audio_bind_group_layout"),
-    });
-
-    let uniform_bind_group = device.create_bind_group(&BindGroupDescriptor {
-        layout: &bind_group_layout,
-        entries: &[
-            BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            },
-            BindGroupEntry {
-                binding: 1,
-                resource: dummy_waveform.as_entire_binding(),
-            },
-            BindGroupEntry {
-                binding: 2,
-                resource: BindingResource::TextureView(&dummy_view),
-            },
-            BindGroupEntry {
-                binding: 3,
-                resource: BindingResource::TextureView(&dummy_view),
-            },
-            BindGroupEntry {
-                binding: 4,
-                resource: dummy_storage.as_entire_binding(),
-            },
-        ],
-        label: Some("audio_bind_group"),
-    });
-
-    let flip_particles = device.create_buffer(&BufferDescriptor {
-        label: Some("FLIP Particles"),
-        size: 65536 * 32,
-        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    queue.write_buffer(&flip_particles, 0, &vec![0u8; 65536 * 32]);
-
-    let flip_grid_accum = device.create_buffer(&BufferDescriptor {
-        label: Some("FLIP Grid Accum"),
-        size: 131072 * 16,
-        usage: BufferUsages::STORAGE,
-        mapped_at_creation: false,
-    });
-    let flip_grid_vel_new = device.create_buffer(&BufferDescriptor {
-        label: Some("FLIP Grid Vel New"),
-        size: 131072 * 16,
-        usage: BufferUsages::STORAGE,
-        mapped_at_creation: false,
-    });
-    let flip_grid_vel_old = device.create_buffer(&BufferDescriptor {
-        label: Some("FLIP Grid Vel Old"),
-        size: 131072 * 16,
-        usage: BufferUsages::STORAGE,
-        mapped_at_creation: false,
-    });
-    let flip_pressure_0 = device.create_buffer(&BufferDescriptor {
-        label: Some("FLIP Pressure 0"),
-        size: 131072 * 4,
-        usage: BufferUsages::STORAGE,
-        mapped_at_creation: false,
-    });
-    let flip_pressure_1 = device.create_buffer(&BufferDescriptor {
-        label: Some("FLIP Pressure 1"),
-        size: 131072 * 4,
-        usage: BufferUsages::STORAGE,
-        mapped_at_creation: false,
-    });
-    let flip_render_grid = device.create_buffer(&BufferDescriptor {
-        label: Some("FLIP Render Grid"),
-        size: 512 * 512 * 4,
-        usage: BufferUsages::STORAGE,
-        mapped_at_creation: false,
-    });
-
-    let flip_compute_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-        label: Some("flip_compute_layout"),
-        entries: &[
-            BindGroupLayoutEntry {
-                binding: 0,
-                visibility: ShaderStages::COMPUTE,
-                ty: BindingType::Buffer {
-                    ty: BufferBindingType::Uniform,
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            BindGroupLayoutEntry {
-                binding: 1,
-                visibility: ShaderStages::COMPUTE,
-                ty: BindingType::Buffer {
-                    ty: BufferBindingType::Storage { read_only: false },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            BindGroupLayoutEntry {
-                binding: 2,
-                visibility: ShaderStages::COMPUTE,
-                ty: BindingType::Buffer {
-                    ty: BufferBindingType::Storage { read_only: false },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            BindGroupLayoutEntry {
-                binding: 3,
-                visibility: ShaderStages::COMPUTE,
-                ty: BindingType::Buffer {
-                    ty: BufferBindingType::Storage { read_only: false },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            BindGroupLayoutEntry {
-                binding: 4,
-                visibility: ShaderStages::COMPUTE,
-                ty: BindingType::Buffer {
-                    ty: BufferBindingType::Storage { read_only: false },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            BindGroupLayoutEntry {
-                binding: 5,
-                visibility: ShaderStages::COMPUTE,
-                ty: BindingType::Buffer {
-                    ty: BufferBindingType::Storage { read_only: false },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            BindGroupLayoutEntry {
-                binding: 6,
-                visibility: ShaderStages::COMPUTE,
-                ty: BindingType::Buffer {
-                    ty: BufferBindingType::Storage { read_only: false },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-            BindGroupLayoutEntry {
-                binding: 7,
-                visibility: ShaderStages::COMPUTE,
-                ty: BindingType::Buffer {
-                    ty: BufferBindingType::Storage { read_only: false },
-                    has_dynamic_offset: false,
-                    min_binding_size: None,
-                },
-                count: None,
-            },
-        ],
-    });
-
-    let flip_compute_bg = device.create_bind_group(&BindGroupDescriptor {
-        label: Some("flip_compute_bg"),
-        layout: &flip_compute_layout,
-        entries: &[
-            BindGroupEntry {
-                binding: 0,
-                resource: uniform_buffer.as_entire_binding(),
-            },
-            BindGroupEntry {
-                binding: 1,
-                resource: flip_particles.as_entire_binding(),
-            },
-            BindGroupEntry {
-                binding: 2,
-                resource: flip_grid_accum.as_entire_binding(),
-            },
-            BindGroupEntry {
-                binding: 3,
-                resource: flip_grid_vel_new.as_entire_binding(),
-            },
-            BindGroupEntry {
-                binding: 4,
-                resource: flip_grid_vel_old.as_entire_binding(),
-            },
-            BindGroupEntry {
-                binding: 5,
-                resource: flip_pressure_0.as_entire_binding(),
-            },
-            BindGroupEntry {
-                binding: 6,
-                resource: flip_pressure_1.as_entire_binding(),
-            },
-            BindGroupEntry {
-                binding: 7,
-                resource: flip_render_grid.as_entire_binding(),
-            },
-        ],
-    });
-
-    let flip_compute_source =
-        resolve_shader_includes(include_str!("../src/shaders/flip_ferrofluid_compute.wgsl"));
-    let flip_compute_shader = device.create_shader_module(ShaderModuleDescriptor {
-        label: Some("FLIP Compute Module"),
-        source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&flip_compute_source)),
-    });
-    let flip_compute_layout_desc = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-        label: Some("flip_pipeline_layout"),
-        bind_group_layouts: &[Some(&flip_compute_layout)],
-        immediate_size: 0,
-    });
-
-    let flip_clear_pipe = device.create_compute_pipeline(&ComputePipelineDescriptor {
-        label: Some("Clear"),
-        layout: Some(&flip_compute_layout_desc),
-        module: &flip_compute_shader,
-        entry_point: Some("cs_clear"),
-        compilation_options: Default::default(),
-        cache: None,
-    });
-    let flip_clear_render_pipe = device.create_compute_pipeline(&ComputePipelineDescriptor {
-        label: Some("Clear Render"),
-        layout: Some(&flip_compute_layout_desc),
-        module: &flip_compute_shader,
-        entry_point: Some("cs_clear_render"),
-        compilation_options: Default::default(),
-        cache: None,
-    });
-    let flip_p2g_pipe = device.create_compute_pipeline(&ComputePipelineDescriptor {
-        label: Some("P2G"),
-        layout: Some(&flip_compute_layout_desc),
-        module: &flip_compute_shader,
-        entry_point: Some("cs_p2g"),
-        compilation_options: Default::default(),
-        cache: None,
-    });
-    let flip_forces_pipe = device.create_compute_pipeline(&ComputePipelineDescriptor {
-        label: Some("Forces"),
-        layout: Some(&flip_compute_layout_desc),
-        module: &flip_compute_shader,
-        entry_point: Some("cs_grid_forces"),
-        compilation_options: Default::default(),
-        cache: None,
-    });
-    let flip_p01_pipe = device.create_compute_pipeline(&ComputePipelineDescriptor {
-        label: Some("P 0->1"),
-        layout: Some(&flip_compute_layout_desc),
-        module: &flip_compute_shader,
-        entry_point: Some("cs_pressure_0_to_1"),
-        compilation_options: Default::default(),
-        cache: None,
-    });
-    let flip_p10_pipe = device.create_compute_pipeline(&ComputePipelineDescriptor {
-        label: Some("P 1->0"),
-        layout: Some(&flip_compute_layout_desc),
-        module: &flip_compute_shader,
-        entry_point: Some("cs_pressure_1_to_0"),
-        compilation_options: Default::default(),
-        cache: None,
-    });
-    let flip_proj_pipe = device.create_compute_pipeline(&ComputePipelineDescriptor {
-        label: Some("Project"),
-        layout: Some(&flip_compute_layout_desc),
-        module: &flip_compute_shader,
-        entry_point: Some("cs_grid_project"),
-        compilation_options: Default::default(),
-        cache: None,
-    });
-    let flip_g2p_pipe = device.create_compute_pipeline(&ComputePipelineDescriptor {
-        label: Some("G2P"),
-        layout: Some(&flip_compute_layout_desc),
-        module: &flip_compute_shader,
-        entry_point: Some("cs_g2p_advect_splat"),
-        compilation_options: Default::default(),
-        cache: None,
-    });
-
-    let flip_render_layout = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
-        label: Some("Render BG Layout"),
         entries: &[BindGroupLayoutEntry {
             binding: 0,
-            visibility: ShaderStages::FRAGMENT,
+            visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
             ty: BindingType::Buffer {
-                ty: BufferBindingType::Storage { read_only: true },
+                ty: BufferBindingType::Uniform,
                 has_dynamic_offset: false,
                 min_binding_size: None,
             },
             count: None,
         }],
+        label: Some("ferrofluid_bind_group_layout"),
     });
-    let flip_render_bg = device.create_bind_group(&BindGroupDescriptor {
-        label: Some("Render BG"),
-        layout: &flip_render_layout,
+
+    let uniform_bind_group = device.create_bind_group(&BindGroupDescriptor {
+        layout: &bind_group_layout,
         entries: &[BindGroupEntry {
             binding: 0,
-            resource: flip_render_grid.as_entire_binding(),
+            resource: uniform_buffer.as_entire_binding(),
         }],
+        label: Some("ferrofluid_bind_group"),
     });
-    let flip_render_pipe_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
-        label: Some("Render Pipe Layout"),
-        bind_group_layouts: &[Some(&bind_group_layout), Some(&flip_render_layout)],
+
+    let ferro_pipe_layout = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+        label: Some("Ferrofluid Render Pipe Layout"),
+        bind_group_layouts: &[Some(&bind_group_layout)],
         immediate_size: 0,
     });
 
-    let flip_render_source =
+    let ferro_render_source =
         resolve_shader_includes(include_str!("../src/shaders/vis_flip_ferrofluid.wgsl"));
-    let flip_render_shader = device.create_shader_module(ShaderModuleDescriptor {
-        label: Some("FLIP Render Module"),
-        source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&flip_render_source)),
+    let ferro_render_shader = device.create_shader_module(ShaderModuleDescriptor {
+        label: Some("Ferrofluid Render Module"),
+        source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&ferro_render_source)),
     });
 
-    let flip_render_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
-        label: Some("FLIP Render Pipeline"),
-        layout: Some(&flip_render_pipe_layout),
+    let ferro_render_pipeline = device.create_render_pipeline(&RenderPipelineDescriptor {
+        label: Some("Ferrofluid Render Pipeline"),
+        layout: Some(&ferro_pipe_layout),
         vertex: VertexState {
-            module: &flip_render_shader,
+            module: &ferro_render_shader,
             entry_point: Some("vs_main"),
             buffers: &[],
             compilation_options: Default::default(),
         },
         fragment: Some(FragmentState {
-            module: &flip_render_shader,
+            module: &ferro_render_shader,
             entry_point: Some("fs_main"),
             targets: &[Some(ColorTargetState {
                 format: color_format,
@@ -683,181 +319,133 @@ async fn run_flip_snapshot() {
     let align = 256u32;
     let bytes_per_row = (unaligned_bytes_per_row + align - 1) & !(align - 1);
 
-    // Warmup 25 frames then render 36 animation frames
-    let warmup_frames = 25;
     let anim_frames = 36;
-    let total_frames = warmup_frames + anim_frames;
-
     std::fs::create_dir_all("target/flip_anim").ok();
 
-    for frame in 0..total_frames {
-        let t = if frame < warmup_frames {
-            (frame as f32) / (warmup_frames as f32)
-        } else {
-            ((frame - warmup_frames) as f32) / (anim_frames as f32)
-        };
+    for anim_idx in 0..anim_frames {
+        let t = (anim_idx as f32) / (anim_frames as f32);
 
-        uniforms.time = (frame as f32) * 0.033;
-        uniforms.smooth_time = (frame as f32) * 0.033;
+        uniforms.time = 5.0 + (anim_idx as f32) * 0.033;
+        uniforms.smooth_time = 5.0 + (anim_idx as f32) * 0.033;
 
-        // Sub-bass beat: two energetic kick drums during the loop
+        // Sub-bass beat: two energetic kick drums during the loop (0..100 live spectrum scale)
         let kick1 = (-((t * 2.0 - 0.0).fract() * 6.0)).exp();
         let kick2 = (-((t * 2.0 - 1.0).fract() * 6.0)).exp();
         let kick = kick1.max(kick2);
-        uniforms.spectrum[0] = 0.4 + 1.2 * kick;
-        uniforms.channels[0] = 0.3 + 1.1 * kick;
+        uniforms.channels[0] = 0.35 + 0.70 * kick;
+        uniforms.channels[1] = 0.25 + 0.65 * kick;
+        uniforms.spectrum[64..=240].fill(20.0 + 70.0 * kick);
 
-        // Arpeggiated melody sweeping around the 16 magnetic poles
+        // Arpeggiated melody sweeping across log-spaced bands (bins 64..984)
         for i in 0..16 {
-            let bin = i * 8 + 4;
             let phase = (i as f32) / 16.0 * std::f32::consts::TAU;
             let sweep = (t * std::f32::consts::TAU * 2.0 - phase)
                 .cos()
                 .max(0.0)
                 .powi(3);
-            uniforms.spectrum[bin] = 0.25 + 1.15 * sweep;
+            let base_bin = 56 + i * 58;
+            for offset in 0..24 {
+                uniforms.spectrum[(base_bin + offset).min(1023)] = 15.0 + 75.0 * sweep;
+            }
         }
 
         queue.write_buffer(&uniform_buffer, 0, bytemuck::cast_slice(&[uniforms]));
 
         let mut encoder = device.create_command_encoder(&CommandEncoderDescriptor {
-            label: Some("FLIP Sim Encoder"),
+            label: Some("Ferrofluid Snapshot Encoder"),
         });
         {
-            let mut cp = encoder.begin_compute_pass(&ComputePassDescriptor::default());
-            cp.set_pipeline(&flip_clear_pipe);
-            cp.set_bind_group(0, Some(&flip_compute_bg), &[]);
-            cp.dispatch_workgroups(512, 1, 1);
-
-            cp.set_pipeline(&flip_clear_render_pipe);
-            cp.set_bind_group(0, Some(&flip_compute_bg), &[]);
-            cp.dispatch_workgroups(1024, 1, 1);
-
-            cp.set_pipeline(&flip_p2g_pipe);
-            cp.set_bind_group(0, Some(&flip_compute_bg), &[]);
-            cp.dispatch_workgroups(256, 1, 1);
-
-            cp.set_pipeline(&flip_forces_pipe);
-            cp.set_bind_group(0, Some(&flip_compute_bg), &[]);
-            cp.dispatch_workgroups(512, 1, 1);
-
-            for _ in 0..8 {
-                cp.set_pipeline(&flip_p01_pipe);
-                cp.set_bind_group(0, Some(&flip_compute_bg), &[]);
-                cp.dispatch_workgroups(512, 1, 1);
-
-                cp.set_pipeline(&flip_p10_pipe);
-                cp.set_bind_group(0, Some(&flip_compute_bg), &[]);
-                cp.dispatch_workgroups(512, 1, 1);
-            }
-
-            cp.set_pipeline(&flip_proj_pipe);
-            cp.set_bind_group(0, Some(&flip_compute_bg), &[]);
-            cp.dispatch_workgroups(512, 1, 1);
-
-            cp.set_pipeline(&flip_g2p_pipe);
-            cp.set_bind_group(0, Some(&flip_compute_bg), &[]);
-            cp.dispatch_workgroups(256, 1, 1);
+            let mut rp = encoder.begin_render_pass(&RenderPassDescriptor {
+                label: Some("Ferrofluid Snapshot Pass"),
+                color_attachments: &[Some(RenderPassColorAttachment {
+                    view: &color_view,
+                    resolve_target: None,
+                    ops: Operations {
+                        load: LoadOp::Clear(Color::BLACK),
+                        store: StoreOp::Store,
+                    },
+                    depth_slice: None,
+                })],
+                depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
+                    view: &depth_view,
+                    depth_ops: Some(Operations {
+                        load: LoadOp::Clear(1.0),
+                        store: StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            rp.set_pipeline(&ferro_render_pipeline);
+            rp.set_bind_group(0, &uniform_bind_group, &[]);
+            rp.draw(0..3, 0..1);
         }
 
-        if frame >= warmup_frames {
-            let anim_idx = frame - warmup_frames;
-            {
-                let mut rp = encoder.begin_render_pass(&RenderPassDescriptor {
-                    label: Some("FLIP Snapshot Pass"),
-                    color_attachments: &[Some(RenderPassColorAttachment {
-                        view: &color_view,
-                        resolve_target: None,
-                        ops: Operations {
-                            load: LoadOp::Clear(Color::BLACK),
-                            store: StoreOp::Store,
-                        },
-                        depth_slice: None,
-                    })],
-                    depth_stencil_attachment: Some(RenderPassDepthStencilAttachment {
-                        view: &depth_view,
-                        depth_ops: Some(Operations {
-                            load: LoadOp::Clear(1.0),
-                            store: StoreOp::Store,
-                        }),
-                        stencil_ops: None,
-                    }),
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                    multiview_mask: None,
-                });
-                rp.set_pipeline(&flip_render_pipeline);
-                rp.set_bind_group(0, &uniform_bind_group, &[]);
-                rp.set_bind_group(1, &flip_render_bg, &[]);
-                rp.draw(0..3, 0..1);
-            }
+        let output_buffer = device.create_buffer(&BufferDescriptor {
+            label: Some("Readback Buffer"),
+            size: (bytes_per_row * height) as u64,
+            usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
 
-            let output_buffer = device.create_buffer(&BufferDescriptor {
-                label: Some("Readback Buffer"),
-                size: (bytes_per_row * height) as u64,
-                usage: BufferUsages::COPY_DST | BufferUsages::MAP_READ,
-                mapped_at_creation: false,
-            });
-
-            encoder.copy_texture_to_buffer(
-                TexelCopyTextureInfo {
-                    texture: &render_target,
-                    mip_level: 0,
-                    origin: Origin3d::ZERO,
-                    aspect: TextureAspect::All,
+        encoder.copy_texture_to_buffer(
+            TexelCopyTextureInfo {
+                texture: &render_target,
+                mip_level: 0,
+                origin: Origin3d::ZERO,
+                aspect: TextureAspect::All,
+            },
+            TexelCopyBufferInfo {
+                buffer: &output_buffer,
+                layout: TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(height),
                 },
-                TexelCopyBufferInfo {
-                    buffer: &output_buffer,
-                    layout: TexelCopyBufferLayout {
-                        offset: 0,
-                        bytes_per_row: Some(bytes_per_row),
-                        rows_per_image: Some(height),
-                    },
-                },
-                Extent3d {
-                    width,
-                    height,
-                    depth_or_array_layers: 1,
-                },
-            );
+            },
+            Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
 
-            queue.submit(Some(encoder.finish()));
+        queue.submit(Some(encoder.finish()));
 
-            let buffer_slice = output_buffer.slice(..);
-            let (tx, rx) = std::sync::mpsc::channel();
-            buffer_slice.map_async(MapMode::Read, move |result| {
-                tx.send(result).unwrap();
-            });
-            let _ = device.poll(PollType::Wait {
-                submission_index: None,
-                timeout: None,
-            });
-            rx.recv().unwrap().unwrap();
+        let buffer_slice = output_buffer.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        buffer_slice.map_async(MapMode::Read, move |result| {
+            tx.send(result).unwrap();
+        });
+        let _ = device.poll(PollType::Wait {
+            submission_index: None,
+            timeout: None,
+        });
+        rx.recv().unwrap().unwrap();
 
-            let data = buffer_slice.get_mapped_range().unwrap();
-            let mut img = image::ImageBuffer::<image::Rgba<u8>, _>::new(width, height);
-            for y in 0..height {
-                let row_start = (y * bytes_per_row) as usize;
-                for x in 0..width {
-                    let px_start = row_start + (x * bytes_per_pixel) as usize;
-                    let r = data[px_start];
-                    let g = data[px_start + 1];
-                    let b = data[px_start + 2];
-                    let a = data[px_start + 3];
-                    img.put_pixel(x, y, image::Rgba([r, g, b, a]));
-                }
+        let data = buffer_slice.get_mapped_range().unwrap();
+        let mut img = image::ImageBuffer::<image::Rgba<u8>, _>::new(width, height);
+        for y in 0..height {
+            let row_start = (y * bytes_per_row) as usize;
+            for x in 0..width {
+                let px_start = row_start + (x * bytes_per_pixel) as usize;
+                let r = data[px_start];
+                let g = data[px_start + 1];
+                let b = data[px_start + 2];
+                let a = data[px_start + 3];
+                img.put_pixel(x, y, image::Rgba([r, g, b, a]));
             }
-            drop(data);
-            output_buffer.unmap();
+        }
+        drop(data);
+        output_buffer.unmap();
 
-            let frame_path = format!("target/flip_anim/frame_{:03}.png", anim_idx);
-            img.save(&frame_path).unwrap();
+        let frame_path = format!("target/flip_anim/frame_{:03}.png", anim_idx);
+        img.save(&frame_path).unwrap();
 
-            if anim_idx == 0 || anim_idx == 18 {
-                img.save("test_flip_ferrofluid.png").unwrap();
-            }
-        } else {
-            queue.submit(Some(encoder.finish()));
+        if anim_idx == 0 || anim_idx == 18 {
+            img.save("test_flip_ferrofluid.png").unwrap();
         }
     }
 

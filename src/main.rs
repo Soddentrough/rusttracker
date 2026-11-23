@@ -41,8 +41,9 @@ pub(crate) use cli::{
 pub(crate) use crossterm::event::KeyCode;
 #[cfg(test)]
 pub(crate) use gui_runner::{
-    apply_gamepad_playback_button, apply_gamepad_stick_panel_resize, apply_gamepad_trigger_scrub,
-    clamp_panel_split_ratio, clamp_window_geometry_to_monitor,
+    advance_playlist_on_track_ended, apply_gamepad_playback_button,
+    apply_gamepad_stick_panel_resize, apply_gamepad_trigger_scrub, apply_ipc_file_paths_to_state,
+    apply_picked_file_paths_to_state, clamp_panel_split_ratio, clamp_window_geometry_to_monitor,
 };
 #[cfg(test)]
 pub(crate) use steam::{

@@ -782,6 +782,8 @@ impl ApplicationHandler<AppCustomEvent> for AndroidRustTrackerApp {
                     if state.track_ended && state.load_request.is_none() {
                         if state.playlist_index + 1 < state.playlist.len() {
                             state.track_ended = false;
+                            let _ = state.rt_control.take_track_ended();
+                            state.is_paused = false;
                             state.playlist_index += 1;
                             state.load_request = Some(state.playlist[state.playlist_index].clone());
                         } else {

@@ -1023,7 +1023,6 @@ impl StatsDisplayCache {
         let mut total_vis_us = state.stats.shader_us;
         let has_gpu_sim_pass = (vis_def.requires_fire && vis_def.id != 5)
             || vis_def.id == 20
-            || vis_def.requires_flip_ferrofluid
             || vis_def.requires_flip_water
             || vis_def.requires_acoustic_waves;
         if has_gpu_sim_pass {

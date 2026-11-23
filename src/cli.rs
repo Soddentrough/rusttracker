@@ -304,6 +304,11 @@ pub(crate) fn matches_visualizer_spec(vis: &str) -> Option<usize> {
                         | "psxfire"
                 ))
             || (v.id == 6 && matches!(vis_norm.as_str(), "firesim" | "firesimulation"))
+            || (v.id == 27
+                && matches!(
+                    vis_norm.as_str(),
+                    "ferrofluid" | "flipferrofluid" | "quantumferrofluid" | "quantumflipferrofluid"
+                ))
             || (v.id == 31
                 && matches!(
                     vis_norm.as_str(),

@@ -1,8 +1,9 @@
 use super::{
-    AppState, Args, KeyCode, Parser, apply_gamepad_stick_panel_resize, clamp_panel_split_ratio,
-    clamp_window_geometry_to_monitor, extract_rusttracker_shortcut_appids, handle_tui_key_event,
-    handle_tui_mouse_event, provision_steam_shortcut_artwork_in_root,
-    upsert_rusttracker_shortcut_in_vdf,
+    AppState, Args, KeyCode, Parser, advance_playlist_on_track_ended,
+    apply_gamepad_stick_panel_resize, apply_ipc_file_paths_to_state,
+    apply_picked_file_paths_to_state, clamp_panel_split_ratio, clamp_window_geometry_to_monitor,
+    extract_rusttracker_shortcut_appids, handle_tui_key_event, handle_tui_mouse_event,
+    provision_steam_shortcut_artwork_in_root, upsert_rusttracker_shortcut_in_vdf,
 };
 use crossterm::event::{KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
@@ -444,8 +445,11 @@ fn test_middle_panel_defaults_to_pattern_view_and_flips_to_eq() {
         &std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("crates/rt-render/src/engine"),
         true,
     );
-    assert!(engine_src.contains("🎚 Surround EQ"));
-    assert!(engine_src.contains("📊 Pattern View"));
+    assert!(engine_src.contains("SURROUND EQ"));
+    assert!(engine_src.contains("PATTERN HEATMAP"));
+    assert!(engine_src.contains("render_heatmap_eq_header"));
+    assert!(!engine_src.contains("🎚 Surround EQ"));
+    assert!(!engine_src.contains("📊 Pattern View"));
     assert!(!engine_src.contains("🎹 Piano Roll"));
     assert!(!engine_src.contains("🔊 SURROUND UPMIX: ON"));
     assert!(!engine_src.contains("11.1 (7.1.4): ON"));
@@ -1424,8 +1428,8 @@ fn test_gamepad_l2_r2_scrub_no_hud_collision_and_l3_r3_bindings() {
     }
     let shared_wgsl = total_wgsl - standalone_wgsl;
     assert_eq!(shared_wgsl, 2);
-    assert_eq!(standalone_wgsl, 31);
-    assert_eq!(total_wgsl, 33);
+    assert_eq!(standalone_wgsl, 30);
+    assert_eq!(total_wgsl, 32);
 
     let vis_count = crate::state::VISUALIZERS.len();
     let vis_review = include_str!("../VIS_REVIEW.md");
@@ -1642,4 +1646,100 @@ fn test_vis_review_flip_water_and_package_metadata_truthfulness() {
 
     let desktop = include_str!("../rusttracker.desktop");
     assert!(desktop.contains("Comment=High-Performance WGPU Audio, Video & Tracker Visualizer"));
+}
+
+#[test]
+fn test_open_file_and_ipc_unpause_and_clear_track_ended() {
+    // 1. Opening a new file via native file picker after the previous track ended & paused
+    // must clear `is_paused`, clear `track_ended` (both state & `rt_control` latch), and queue `load_request`.
+    let mut state = AppState::new("Previous.flac".to_string());
+    state.file_loaded = true;
+    state.playlist = std::sync::Arc::new(vec!["C:\\Music\\Previous.flac".to_string()]);
+    state.playlist_index = 0;
+    state.track_ended = true;
+    state.is_paused = true;
+    state.rt_control.signal_track_ended();
+    state.sync_rt_control();
+    assert!(state.rt_control.is_paused());
+
+    let mut initial_dir = std::path::PathBuf::from("C:\\");
+    let picked = "C:\\Music\\Howard Jones\\01 - Things Can Only Get Better.flac".to_string();
+    assert!(apply_picked_file_paths_to_state(
+        &mut state,
+        vec![picked.clone()],
+        &mut initial_dir
+    ));
+    assert_eq!(
+        initial_dir,
+        std::path::PathBuf::from("C:\\Music\\Howard Jones")
+    );
+    assert_eq!(state.load_request.as_deref(), Some(picked.as_str()));
+    assert!(state.file_loaded);
+    assert!(!state.is_paused);
+    assert!(!state.rt_control.is_paused());
+    assert!(!state.track_ended);
+    assert!(!state.rt_control.take_track_ended());
+
+    // 2. Appending a file after a single-track playlist has finished and advancing on `track_ended`
+    // must unpause and load the newly appended track.
+    state.load_request = None;
+    state.append_to_playlist = true;
+    state.track_ended = true;
+    state.is_paused = true;
+    state.rt_control.signal_track_ended();
+    state.sync_rt_control();
+
+    let appended = "C:\\Music\\Howard Jones\\02 - What Is Love.flac".to_string();
+    assert!(apply_picked_file_paths_to_state(
+        &mut state,
+        vec![appended.clone()],
+        &mut initial_dir
+    ));
+    assert_eq!(state.playlist.len(), 2);
+    assert!(advance_playlist_on_track_ended(&mut state));
+    state.sync_rt_control();
+    assert_eq!(state.playlist_index, 1);
+    assert_eq!(state.load_request.as_deref(), Some(appended.as_str()));
+    assert!(!state.is_paused);
+    assert!(!state.rt_control.is_paused());
+    assert!(!state.track_ended);
+    assert!(!state.rt_control.take_track_ended());
+
+    // 3. IPC open-files path: fresh load from unloaded/paused state must unpause and clear `track_ended`.
+    let mut ipc_state = AppState::new(String::new());
+    ipc_state.track_ended = true;
+    ipc_state.is_paused = true;
+    ipc_state.rt_control.signal_track_ended();
+    ipc_state.sync_rt_control();
+
+    let ipc_first = "C:\\Music\\TrackA.flac".to_string();
+    assert!(apply_ipc_file_paths_to_state(
+        &mut ipc_state,
+        vec![ipc_first.clone()]
+    ));
+    assert_eq!(ipc_state.load_request.as_deref(), Some(ipc_first.as_str()));
+    assert!(ipc_state.file_loaded);
+    assert!(!ipc_state.is_paused);
+    assert!(!ipc_state.rt_control.is_paused());
+    assert!(!ipc_state.track_ended);
+    assert!(!ipc_state.rt_control.take_track_ended());
+
+    // 4. IPC open-files path when appending to an ended & paused session must also unpause & clear `track_ended`.
+    ipc_state.load_request = None;
+    ipc_state.track_ended = true;
+    ipc_state.is_paused = true;
+    ipc_state.rt_control.signal_track_ended();
+    ipc_state.sync_rt_control();
+
+    let ipc_second = "C:\\Music\\TrackB.flac".to_string();
+    assert!(apply_ipc_file_paths_to_state(
+        &mut ipc_state,
+        vec![ipc_second.clone()]
+    ));
+    assert_eq!(ipc_state.playlist_index, 1);
+    assert_eq!(ipc_state.load_request.as_deref(), Some(ipc_second.as_str()));
+    assert!(!ipc_state.is_paused);
+    assert!(!ipc_state.rt_control.is_paused());
+    assert!(!ipc_state.track_ended);
+    assert!(!ipc_state.rt_control.take_track_ended());
 }

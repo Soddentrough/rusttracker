@@ -1,6 +1,6 @@
 # RustTracker Visualization System Review
 
-> **Document Status Note:** Sections 1–6 below are the historical **`2026-07-19`** review snapshot (written when the codebase had `22` registered visualizers and `34` WGSL files). **Section 7 (`2026-11-11` Audit & Resolution Status, updated for `v0.10.0`)** at the bottom of this file reflects current ground truth: **`19` registered visualizers** (`16` enabled in default rotation) and **`33` `.wgsl` files** in `src/shaders/` (**`31` standalone Naga-validated shader modules** + `2` shared include headers `_common.wgsl` and `_glyph_font.wgsl`), implemented modularly in `crates/rt-render/src/engine/` on `wgpu 30` / `naga 30`.
+> **Document Status Note:** Sections 1–6 below are the historical **`2026-07-19`** review snapshot (written when the codebase had `22` registered visualizers and `34` WGSL files). **Section 7 (`2026-11-11` Audit & Resolution Status, updated for `v0.10.0`)** at the bottom of this file reflects current ground truth: **`19` registered visualizers** (`16` enabled in default rotation) and **`32` `.wgsl` files** in `src/shaders/` (**`30` standalone Naga-validated shader modules** + `2` shared include headers `_common.wgsl` and `_glyph_font.wgsl`), implemented modularly in `crates/rt-render/src/engine/` on `wgpu 30` / `naga 30`.
 
 Historical Review Date: 2026-07-19. Historical Scope: all 34 WGSL shaders in
 src/shaders/, the host-side visualization pipeline in src/engine.rs
@@ -319,10 +319,10 @@ P3 (aesthetics/UX):
 
 Current Registry & Shader Counts:
 - 19 visualizers registered in state.rs::VISUALIZERS (16 enabled in default rotation; IDs: 0, 25, 24, 1, 3, 4, 5, 6, 7, 13, 14, 16, 19, 20, 31, 23, 27, 28, 29).
-- 31 standalone WGSL shader modules + 2 shared include headers (`_common.wgsl`, `_glyph_font.wgsl`) = 33 `.wgsl` files in `src/shaders/` (all 31 standalone modules pass Naga validation with `Capabilities::empty()`; 21 unreferenced/retired `.wgsl` shaders were purged).
+- 30 standalone WGSL shader modules + 2 shared include headers (`_common.wgsl`, `_glyph_font.wgsl`) = 32 `.wgsl` files in `src/shaders/` (all 30 standalone modules pass Naga validation with `Capabilities::empty()`; 22 unreferenced/retired `.wgsl` shaders were purged).
 
 Critical Findings (Section 2):
-- [C1] Ferrofluidsim particle stride: RESOLVED (repacked to two vec4s = 32B; legacy `ferrofluidsim` shaders subsequently purged in favor of `flip_ferrofluid_compute.wgsl` / `vis_flip_ferrofluid.wgsl`).
+- [C1] Ferrofluidsim particle stride: RESOLVED (repacked to two vec4s = 32B; legacy `ferrofluidsim` and `flip_ferrofluid_compute.wgsl` shaders subsequently purged after upgrading ID 27 `vis_flip_ferrofluid.wgsl` to an analytic 3D SDF raymarched ferrofluid sculpture).
 - [C2] Video viewport dimensions: RESOLVED (uses actual surface dimensions / config.width in engine.rs).
 - [C3] Video row alignment: RESOLVED (256-byte stride repack in engine.rs).
 - [C4] Framerate-dependent simulation: RESOLVED (play_time derived from real elapsed time; compute passes scale via frame_dt/dt_scale; idle spectrum animation uses monotonic elapsed time).
@@ -346,7 +346,7 @@ Performance Wins (Section 4):
 - Video chroma upload & border blur: RESOLVED (native 2-plane `NV12`/`NV21` `Rg8Unorm` and 10-bit `P010` `Rg16Unorm` GPU uploads with zero CPU UV de-interleaving, plus a generation-gated quarter-resolution `Rgba8UnormSrgb` pre-blurred border pass replacing the per-pixel 93-fetch blur loop in `vis_video.wgsl`).
 - GPU spectrum upload & 32-channel FFT skipping: RESOLVED (gated by active visualizer and `history_dirty`).
 - VU meter ray-AABB early reject: RESOLVED (legacy raymarched `vis_vumeters.wgsl` subsequently purged in favor of 3D mesh `vis_vumeters_3d.wgsl` + `vis_vumeters_bg.wgsl`).
-- Ferrofluid containment & sky early-out: RESOLVED (`p_entry` radial pre-test & `rd.y > 0.0` sky break in `vis_flip_ferrofluid.wgsl`; legacy `vis_ferrofluid.wgsl` subsequently purged).
+- Ferrofluid containment & sky early-out: RESOLVED (ID 27 `vis_flip_ferrofluid.wgsl` upgraded to pure analytic 3D SDF raymarching with bounding-sphere early-out, `ferrofluid_pool_mode` toggle, and removal of unused `flip_ferrofluid_compute.wgsl`; legacy `vis_ferrofluid.wgsl` subsequently purged).
 - Firesim black early-out: RESOLVED (skips erosion fbm when base_heat <= 0.003).
 - Unused visualizer pipelines & dead shaders: RESOLVED (only the 19 registered visualizers in `VISUALIZERS` have pipelines instantiated; 19 retired `.wgsl` shaders and 7 dead GPU pipelines were purged).
 

@@ -543,6 +543,7 @@ where
         let (load_path, resume_pos_on_reload) = {
             let mut state = app_state.lock().unwrap();
             state.sync_rt_control();
+            let pending_new_track_load = state.load_request.is_some();
             let mut resume_pos_on_reload: Option<f64> = None;
             let active_mic = is_mic_launch || state.is_mic_input;
 
@@ -570,38 +571,44 @@ where
             let device_change = state.audio_device_change_request.take();
             if let Some(new_device) = device_change {
                 state.selected_audio_device = Some(new_device.clone());
-                let reload_path = resolve_reload_path(&state, active_mic);
+                state.osd_text = Some(if active_mic {
+                    format!("Audio Input: {}", new_device)
+                } else {
+                    format!("Audio Output: {}", new_device)
+                });
+                state.osd_timer = 3.0;
+                if !pending_new_track_load {
+                    let reload_path = resolve_reload_path(&state, active_mic);
 
-                if !reload_path.is_empty() || active_mic {
-                    if active_mic && !state.playlist.is_empty() {
-                        std::sync::Arc::make_mut(&mut state.playlist)[0] = reload_path.clone();
+                    if !reload_path.is_empty() || active_mic {
+                        if active_mic && !state.playlist.is_empty() {
+                            std::sync::Arc::make_mut(&mut state.playlist)[0] = reload_path.clone();
+                        }
+                        state.load_request = Some(reload_path);
+                        resume_pos_on_reload = Some(state.current_seconds);
+                        if !cli_upmix_override {
+                            state.surround_upmix.user_overridden = false;
+                        }
                     }
-                    state.load_request = Some(reload_path);
-                    resume_pos_on_reload = Some(state.current_seconds);
-                    state.osd_text = Some(if active_mic {
-                        format!("Audio Input: {}", new_device)
-                    } else {
-                        format!("Audio Output: {}", new_device)
-                    });
-                    if !cli_upmix_override {
-                        state.surround_upmix.user_overridden = false;
-                    }
-                    state.osd_timer = 3.0;
                 }
             }
 
             if let Some(pt_enabled) = state.passthrough_change_request.take() {
-                let reload_path = resolve_reload_path(&state, active_mic);
+                reconcile_passthrough_change_osd(&mut state, pt_enabled);
+                state.osd_timer = 3.0;
+                if !pending_new_track_load {
+                    let reload_path = resolve_reload_path(&state, active_mic);
 
-                if (!reload_path.is_empty() && state.file_loaded) || active_mic {
-                    state.load_request = Some(reload_path);
-                    resume_pos_on_reload = Some(state.current_seconds);
-                    reconcile_passthrough_change_osd(&mut state, pt_enabled);
-                    state.osd_timer = 3.0;
+                    if (!reload_path.is_empty() && state.file_loaded) || active_mic {
+                        state.load_request = Some(reload_path);
+                        resume_pos_on_reload = Some(state.current_seconds);
+                    }
                 }
             }
 
-            if let Some(osd_msg) = state.audio_topology_reload_request.take() {
+            if let Some(osd_msg) = state.audio_topology_reload_request.take()
+                && !pending_new_track_load
+            {
                 let reload_path = resolve_reload_path(&state, active_mic);
 
                 if (!reload_path.is_empty() && state.file_loaded) || active_mic {
@@ -617,22 +624,26 @@ where
 
             if state.audio_device_lost {
                 state.audio_device_lost = false;
-                let reload_path = resolve_reload_path(&state, active_mic);
+                if !pending_new_track_load {
+                    let reload_path = resolve_reload_path(&state, active_mic);
 
-                if !reload_path.is_empty() || active_mic {
-                    state.load_request = Some(reload_path);
-                    resume_pos_on_reload = Some(state.current_seconds);
-                    if !cli_upmix_override {
-                        state.surround_upmix.user_overridden = false;
+                    if !reload_path.is_empty() || active_mic {
+                        state.load_request = Some(reload_path);
+                        resume_pos_on_reload = Some(state.current_seconds);
+                        if !cli_upmix_override {
+                            state.surround_upmix.user_overridden = false;
+                        }
+                        state.osd_text = Some("Audio Device Reconnected".to_string());
+                        state.osd_timer = 3.0;
                     }
-                    state.osd_text = Some("Audio Device Reconnected".to_string());
-                    state.osd_timer = 3.0;
                 }
             }
 
             if state.track_ended && state.load_request.is_none() {
                 if state.playlist_index + 1 < state.playlist.len() {
                     state.track_ended = false;
+                    let _ = state.rt_control.take_track_ended();
+                    state.is_paused = false;
                     state.playlist_index += 1;
                     state.load_request = Some(state.playlist[state.playlist_index].clone());
                 } else {
@@ -710,8 +721,14 @@ where
                     state.stats.video_fps = 0.0;
                     state.stats.video_bitrate_kbps = None;
                     state.stats.audio_bitrate_kbps = None;
+                    state.audio_device_lost = false;
+                    let _ = state.rt_control.take_audio_device_lost();
                     state.track_ended = false;
                     let _ = state.rt_control.take_track_ended();
+                    if resume_pos_on_reload.is_none() {
+                        state.is_paused = false;
+                        state.seek_request = None;
+                    }
                     if !state.show_surround_eq {
                         state.tui_center_view = None;
                     }

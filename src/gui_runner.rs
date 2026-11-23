@@ -542,21 +542,20 @@ fn sync_keep_awake(
     *active_mode = desired;
 }
 
-fn apply_picked_file_paths(
+pub(crate) fn apply_picked_file_paths_to_state(
     state: &mut AppState,
     paths: Vec<String>,
     initial_dir: &mut std::path::PathBuf,
-    window: &winit::window::Window,
-) {
+) -> bool {
     if paths.is_empty() {
-        return;
+        return false;
     }
     if let Some(parent) = std::path::Path::new(&paths[0]).parent() {
         *initial_dir = parent.to_path_buf();
     }
     let expanded = crate::playlist::expand_input_paths(&paths);
     let append = state.append_to_playlist;
-    if append && !state.playlist.is_empty() && !state.is_mic_input {
+    if append && state.file_loaded && !state.playlist.is_empty() && !state.is_mic_input {
         std::sync::Arc::make_mut(&mut state.playlist).extend(expanded);
     } else if !expanded.is_empty() {
         state.set_mic_input_mode(false, None);
@@ -564,25 +563,33 @@ fn apply_picked_file_paths(
         state.playlist_index = 0;
         state.load_request = Some(state.playlist[0].clone());
         state.file_loaded = true;
+        state.is_paused = false;
+        state.track_ended = false;
+        let _ = state.rt_control.take_track_ended();
+        state.sync_rt_control();
     }
     state.is_file_picker_open = false;
-    window.request_redraw();
+    true
 }
 
-fn apply_ipc_file_paths(
+fn apply_picked_file_paths(
     state: &mut AppState,
-    raw_paths: Vec<String>,
+    paths: Vec<String>,
+    initial_dir: &mut std::path::PathBuf,
     window: &winit::window::Window,
 ) {
-    if raw_paths.is_empty() {
-        window.set_minimized(false);
-        window.focus_window();
+    if apply_picked_file_paths_to_state(state, paths, initial_dir) {
         window.request_redraw();
-        return;
+    }
+}
+
+pub(crate) fn apply_ipc_file_paths_to_state(state: &mut AppState, raw_paths: Vec<String>) -> bool {
+    if raw_paths.is_empty() {
+        return false;
     }
     let expanded = crate::playlist::expand_input_paths(&raw_paths);
     if expanded.is_empty() {
-        return;
+        return false;
     }
     if !state.file_loaded || state.playlist.is_empty() || state.is_mic_input {
         state.set_mic_input_mode(false, None);
@@ -595,7 +602,6 @@ fn apply_ipc_file_paths(
         std::sync::Arc::make_mut(&mut state.playlist).extend(expanded.clone());
         state.playlist_index = first_new_idx;
         state.load_request = Some(state.playlist[first_new_idx].clone());
-        state.is_paused = false;
         let file_name = std::path::Path::new(&expanded[0])
             .file_name()
             .unwrap_or_default()
@@ -612,9 +618,46 @@ fn apply_ipc_file_paths(
         }
         state.osd_timer = 3.0;
     }
-    window.set_minimized(false);
-    window.focus_window();
-    window.request_redraw();
+    state.is_paused = false;
+    state.track_ended = false;
+    let _ = state.rt_control.take_track_ended();
+    state.sync_rt_control();
+    true
+}
+
+fn apply_ipc_file_paths(
+    state: &mut AppState,
+    raw_paths: Vec<String>,
+    window: &winit::window::Window,
+) {
+    if raw_paths.is_empty() {
+        window.set_minimized(false);
+        window.focus_window();
+        window.request_redraw();
+        return;
+    }
+    if apply_ipc_file_paths_to_state(state, raw_paths) {
+        window.set_minimized(false);
+        window.focus_window();
+        window.request_redraw();
+    }
+}
+
+pub(crate) fn advance_playlist_on_track_ended(state: &mut AppState) -> bool {
+    if !state.track_ended || state.load_request.is_some() {
+        return false;
+    }
+    if state.playlist_index + 1 < state.playlist.len() {
+        state.track_ended = false;
+        let _ = state.rt_control.take_track_ended();
+        state.is_paused = false;
+        state.playlist_index += 1;
+        state.load_request = Some(state.playlist[state.playlist_index].clone());
+        true
+    } else {
+        state.is_paused = true;
+        false
+    }
 }
 
 #[inline]
@@ -1782,6 +1825,16 @@ pub(crate) async fn run_gui(
                                                     }
                                                 ));
                                                 state.osd_timer = 2.0;
+                                            } else if state.visualizer_mode == 27 {
+                                                state.ferrofluid_pool_mode =
+                                                    !state.ferrofluid_pool_mode;
+                                                state.osd_text =
+                                                    Some(if state.ferrofluid_pool_mode {
+                                                        "Ferrofluid: Studio Pool".to_string()
+                                                    } else {
+                                                        "Ferrofluid: Magnetic Core".to_string()
+                                                    });
+                                                state.osd_timer = 2.0;
                                             } else if state.visualizer_mode == 31 {
                                                 state.room_volume_smoke = !state.room_volume_smoke;
                                                 state.osd_text = Some(if state.room_volume_smoke {
@@ -2184,6 +2237,7 @@ pub(crate) async fn run_gui(
                             let (load_path, resume_pos_on_reload) = {
                                 let mut state = app_state.lock().unwrap();
                                 state.sync_rt_control();
+                                let pending_new_track_load = state.load_request.is_some();
                                 let mut resume_pos_on_reload: Option<f64> = None;
                                 let active_mic = is_mic_launch || state.is_mic_input;
 
@@ -2204,21 +2258,25 @@ pub(crate) async fn run_gui(
 
                                 if state.audio_device_lost {
                                     state.audio_device_lost = false;
-                                    let reload_path = resolve_reload_path(&state, active_mic);
+                                    if !pending_new_track_load {
+                                        let reload_path = resolve_reload_path(&state, active_mic);
 
-                                    if !reload_path.is_empty() || active_mic {
-                                        state.load_request = Some(reload_path);
-                                        if !cli_upmix_override {
-                                            state.surround_upmix.user_overridden = false;
+                                        if !reload_path.is_empty() || active_mic {
+                                            state.load_request = Some(reload_path);
+                                            if !cli_upmix_override {
+                                                state.surround_upmix.user_overridden = false;
+                                            }
+                                            resume_pos_on_reload = Some(state.current_seconds);
+                                            state.osd_text =
+                                                Some("Audio Device Reconnected".to_string());
+                                            state.osd_timer = 3.0;
                                         }
-                                        resume_pos_on_reload = Some(state.current_seconds);
-                                        state.osd_text =
-                                            Some("Audio Device Reconnected".to_string());
-                                        state.osd_timer = 3.0;
                                     }
                                 }
 
-                                if let Some(osd_msg) = state.audio_topology_reload_request.take() {
+                                if let Some(osd_msg) = state.audio_topology_reload_request.take()
+                                    && !pending_new_track_load
+                                {
                                     let reload_path = resolve_reload_path(&state, active_mic);
 
                                     if (!reload_path.is_empty() && state.file_loaded) || active_mic
@@ -2235,49 +2293,45 @@ pub(crate) async fn run_gui(
 
                                 let device_change = state.audio_device_change_request.take();
                                 if let Some(new_device) = device_change {
-                                    let reload_path = resolve_reload_path(&state, active_mic);
+                                    state.osd_text = Some(if active_mic {
+                                        format!("Audio Input: {}", new_device)
+                                    } else {
+                                        format!("Audio Output: {}", new_device)
+                                    });
+                                    state.osd_timer = 3.0;
+                                    if !pending_new_track_load {
+                                        let reload_path = resolve_reload_path(&state, active_mic);
 
-                                    if !reload_path.is_empty() || active_mic {
-                                        if active_mic && !state.playlist.is_empty() {
-                                            std::sync::Arc::make_mut(&mut state.playlist)[0] =
-                                                reload_path.clone();
+                                        if !reload_path.is_empty() || active_mic {
+                                            if active_mic && !state.playlist.is_empty() {
+                                                std::sync::Arc::make_mut(&mut state.playlist)[0] =
+                                                    reload_path.clone();
+                                            }
+                                            state.load_request = Some(reload_path);
+                                            if !cli_upmix_override {
+                                                state.surround_upmix.user_overridden = false;
+                                            }
+                                            resume_pos_on_reload = Some(state.current_seconds);
                                         }
-                                        state.load_request = Some(reload_path);
-                                        state.osd_text = Some(if active_mic {
-                                            format!("Audio Input: {}", new_device)
-                                        } else {
-                                            format!("Audio Output: {}", new_device)
-                                        });
-                                        if !cli_upmix_override {
-                                            state.surround_upmix.user_overridden = false;
-                                        }
-                                        resume_pos_on_reload = Some(state.current_seconds);
-                                        state.osd_timer = 3.0;
                                     }
                                 }
 
                                 if let Some(pt_enabled) = state.passthrough_change_request.take() {
-                                    let reload_path = resolve_reload_path(&state, active_mic);
+                                    reconcile_passthrough_change_osd(&mut state, pt_enabled);
+                                    state.osd_timer = 3.0;
+                                    if !pending_new_track_load {
+                                        let reload_path = resolve_reload_path(&state, active_mic);
 
-                                    if (!reload_path.is_empty() && state.file_loaded) || active_mic
-                                    {
-                                        state.load_request = Some(reload_path);
-                                        resume_pos_on_reload = Some(state.current_seconds);
-                                        reconcile_passthrough_change_osd(&mut state, pt_enabled);
-                                        state.osd_timer = 3.0;
+                                        if (!reload_path.is_empty() && state.file_loaded)
+                                            || active_mic
+                                        {
+                                            state.load_request = Some(reload_path);
+                                            resume_pos_on_reload = Some(state.current_seconds);
+                                        }
                                     }
                                 }
 
-                                if state.track_ended && state.load_request.is_none() {
-                                    if state.playlist_index + 1 < state.playlist.len() {
-                                        state.track_ended = false;
-                                        state.playlist_index += 1;
-                                        state.load_request =
-                                            Some(state.playlist[state.playlist_index].clone());
-                                    } else {
-                                        state.is_paused = true;
-                                    }
-                                }
+                                advance_playlist_on_track_ended(&mut state);
 
                                 if resume_pos_on_reload.is_none()
                                     && state.load_request.is_some()
@@ -2360,8 +2414,16 @@ pub(crate) async fn run_gui(
                                         state.stats.video_fps = 0.0;
                                         state.stats.video_bitrate_kbps = None;
                                         state.stats.audio_bitrate_kbps = None;
+                                        state.audio_device_lost = false;
+                                        let _ = state.rt_control.take_audio_device_lost();
                                         state.track_ended = false;
                                         let _ = state.rt_control.take_track_ended();
+                                        if resume_pos_on_reload.is_none() {
+                                            state.is_paused = false;
+                                            state.seek_request = None;
+                                            state.scrub_target_seconds = None;
+                                            state.is_touch_scrubbing = false;
+                                        }
                                         state.sync_rt_control();
                                     }
 
@@ -2458,6 +2520,7 @@ pub(crate) async fn run_gui(
                                                 }
                                                 state.osd_timer = 3.0;
                                             }
+                                            state.sync_rt_control();
                                         }
                                         active_stream = Some(stream);
                                     } else {
@@ -2980,6 +3043,7 @@ pub(crate) async fn run_gui(
                                                 state.file_loaded = true;
                                                 state.is_paused = false;
                                                 state.track_ended = false;
+                                                let _ = state.rt_control.take_track_ended();
                                             }
                                             state.is_file_picker_open = false;
                                         }
@@ -3289,6 +3353,9 @@ pub(crate) async fn run_gui(
                                                 state.playlist_index = 0;
                                                 state.load_request = Some(final_url.clone());
                                                 state.file_loaded = true;
+                                                state.is_paused = false;
+                                                state.track_ended = false;
+                                                let _ = state.rt_control.take_track_ended();
 
                                                 if let Some(idx) = state
                                                     .url_history
