@@ -1650,11 +1650,18 @@ fn test_vis_review_flip_water_and_package_metadata_truthfulness() {
 
 #[test]
 fn test_open_file_and_ipc_unpause_and_clear_track_ended() {
+    let music_dir = std::env::temp_dir().join("rusttracker_test_music");
+    let album_dir = music_dir.join("Howard Jones");
+    let prev_path = music_dir
+        .join("Previous.flac")
+        .to_string_lossy()
+        .into_owned();
+
     // 1. Opening a new file via native file picker after the previous track ended & paused
     // must clear `is_paused`, clear `track_ended` (both state & `rt_control` latch), and queue `load_request`.
     let mut state = AppState::new("Previous.flac".to_string());
     state.file_loaded = true;
-    state.playlist = std::sync::Arc::new(vec!["C:\\Music\\Previous.flac".to_string()]);
+    state.playlist = std::sync::Arc::new(vec![prev_path]);
     state.playlist_index = 0;
     state.track_ended = true;
     state.is_paused = true;
@@ -1662,17 +1669,17 @@ fn test_open_file_and_ipc_unpause_and_clear_track_ended() {
     state.sync_rt_control();
     assert!(state.rt_control.is_paused());
 
-    let mut initial_dir = std::path::PathBuf::from("C:\\");
-    let picked = "C:\\Music\\Howard Jones\\01 - Things Can Only Get Better.flac".to_string();
+    let mut initial_dir = std::env::temp_dir();
+    let picked = album_dir
+        .join("01 - Things Can Only Get Better.flac")
+        .to_string_lossy()
+        .into_owned();
     assert!(apply_picked_file_paths_to_state(
         &mut state,
         vec![picked.clone()],
         &mut initial_dir
     ));
-    assert_eq!(
-        initial_dir,
-        std::path::PathBuf::from("C:\\Music\\Howard Jones")
-    );
+    assert_eq!(initial_dir, album_dir);
     assert_eq!(state.load_request.as_deref(), Some(picked.as_str()));
     assert!(state.file_loaded);
     assert!(!state.is_paused);
@@ -1689,7 +1696,10 @@ fn test_open_file_and_ipc_unpause_and_clear_track_ended() {
     state.rt_control.signal_track_ended();
     state.sync_rt_control();
 
-    let appended = "C:\\Music\\Howard Jones\\02 - What Is Love.flac".to_string();
+    let appended = album_dir
+        .join("02 - What Is Love.flac")
+        .to_string_lossy()
+        .into_owned();
     assert!(apply_picked_file_paths_to_state(
         &mut state,
         vec![appended.clone()],
@@ -1712,7 +1722,7 @@ fn test_open_file_and_ipc_unpause_and_clear_track_ended() {
     ipc_state.rt_control.signal_track_ended();
     ipc_state.sync_rt_control();
 
-    let ipc_first = "C:\\Music\\TrackA.flac".to_string();
+    let ipc_first = music_dir.join("TrackA.flac").to_string_lossy().into_owned();
     assert!(apply_ipc_file_paths_to_state(
         &mut ipc_state,
         vec![ipc_first.clone()]
@@ -1731,7 +1741,7 @@ fn test_open_file_and_ipc_unpause_and_clear_track_ended() {
     ipc_state.rt_control.signal_track_ended();
     ipc_state.sync_rt_control();
 
-    let ipc_second = "C:\\Music\\TrackB.flac".to_string();
+    let ipc_second = music_dir.join("TrackB.flac").to_string_lossy().into_owned();
     assert!(apply_ipc_file_paths_to_state(
         &mut ipc_state,
         vec![ipc_second.clone()]
