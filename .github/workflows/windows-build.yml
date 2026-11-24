@@ -40,7 +40,7 @@ jobs:
         PKG_CONFIG_PATH: "/mingw64/lib/pkgconfig"
         CPATH: "/mingw64/include"
         LIBRARY_PATH: "/mingw64/lib"
-        BINDGEN_EXTRA_CLANG_ARGS: "-target x86_64-pc-windows-gnu -I/mingw64/include"
+        BINDGEN_EXTRA_CLANG_ARGS: "-target x86_64-pc-windows-gnu -I/mingw64/include -D__X86INTRIN_H"
         CARGO_PROFILE_RELEASE_LTO: "true"
         CARGO_PROFILE_RELEASE_CODEGEN_UNITS: "1"
         CARGO_PROFILE_RELEASE_STRIP: "true"
