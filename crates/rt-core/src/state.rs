@@ -630,6 +630,19 @@ pub const VISUALIZERS: &[VisualizerDef] = &[
         requires_acoustic_waves: false,
         heavy_shader: false,
     },
+    VisualizerDef {
+        id: 32,
+        name: "Mechanical Flip-Disc",
+        filename: "vis_flip_disc.wgsl",
+        description: "Tactile charcoal-and-white mechanical flip-disc wall driven by audio ripples",
+        pipeline_type: PipelineType::FullscreenTriangle,
+        requires_history: false,
+        requires_fire: false,
+        requires_resynth: false,
+        requires_flip_water: false,
+        requires_acoustic_waves: false,
+        heavy_shader: false,
+    },
 ];
 
 #[derive(Clone, Debug, PartialEq)]

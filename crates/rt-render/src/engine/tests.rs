@@ -1349,8 +1349,8 @@ fn test_hardware_capability_tier_and_vsync_stats_panel() {
     );
     assert_eq!(
         VISUALIZERS.len(),
-        19,
-        "All 19 visualizers must be compiled on every platform"
+        20,
+        "All 20 visualizers must be compiled on every platform"
     );
 
     let make_adapter = |name: &str, device_type: wgpu::DeviceType| wgpu::AdapterInfo {
@@ -3220,5 +3220,158 @@ fn test_heatmap_eq_toggle_selector_layout_and_actions() {
             !ui_src.contains(forbidden),
             "ui_overlay.rs must not contain forbidden attribute {forbidden}"
         );
+    }
+}
+
+#[test]
+fn test_flip_disc_registration_sim_and_shaders() {
+    let vis = crate::state::VISUALIZERS
+        .iter()
+        .find(|v| v.id == 32)
+        .expect("Visualizer ID 32 (Mechanical Flip-Disc) must be registered in VISUALIZERS");
+    assert_eq!(vis.name, "Mechanical Flip-Disc");
+    assert_eq!(vis.filename, "vis_flip_disc.wgsl");
+    assert_eq!(
+        vis.pipeline_type,
+        crate::state::PipelineType::FullscreenTriangle
+    );
+    assert!(!vis.heavy_shader);
+    assert!(!vis.requires_history);
+    assert!(!vis.requires_fire);
+    assert!(!vis.requires_resynth);
+    assert!(!vis.requires_flip_water);
+    assert!(!vis.requires_acoustic_waves);
+
+    let state = AppState::new("Test App".to_string());
+    let fd_idx = crate::state::VISUALIZERS
+        .iter()
+        .position(|v| v.id == 32)
+        .unwrap();
+    assert!(
+        state.vis_enabled[fd_idx],
+        "Mechanical Flip-Disc (ID 32) must be enabled by default"
+    );
+
+    assert_eq!(std::mem::size_of::<FlipDiscParams>(), 96);
+
+    // Silence & paused behavior
+    let mut sim = FlipDiscSimState::default();
+    let silent_spec = vec![0.0f32; 1024];
+    let silent_vu = [0.0f32, 0.0f32];
+    let (p_paused, sub_paused) =
+        sim.step(&silent_spec, &silent_vu, 1.0 / 60.0, 1.777, false, 1.0, false);
+    assert_eq!(sub_paused, 0);
+    assert!(p_paused.impulses.iter().all(|imp| imp[3] == 0.0));
+
+    let (p_silent, sub_silent) =
+        sim.step(&silent_spec, &silent_vu, 1.0 / 60.0, 1.777, true, 1.0, false);
+    assert_eq!(sub_silent, 1);
+    assert!(p_silent.impulses.iter().all(|imp| imp[3] == 0.0));
+
+    // Bass transient triggers slot 0 inside grid interior and obeys cooldown on next frame
+    let mut bass_spec = vec![0.0f32; 1024];
+    bass_spec[2..12].fill(70.0);
+    let (p_kick, sub_kick) = sim.step(
+        &bass_spec,
+        &[0.85, 0.85],
+        1.0 / 60.0,
+        1.777,
+        true,
+        2.0,
+        true,
+    );
+    assert_eq!(sub_kick, 1);
+    let kick_imp = p_kick.impulses[0];
+    assert!(kick_imp[3] > 1.5, "Expected strong bass impulse, got {kick_imp:?}");
+    assert!(
+        (5.0..=91.0).contains(&kick_imp[0]) && (5.0..=59.0).contains(&kick_imp[1]),
+        "Impulse out of safe grid interior: {kick_imp:?}"
+    );
+    let (p_next, _) = sim.step(
+        &bass_spec,
+        &[0.85, 0.85],
+        1.0 / 60.0,
+        1.777,
+        true,
+        2.016,
+        true,
+    );
+    assert_eq!(
+        p_next.impulses[0][3], 0.0,
+        "Bass cooldown must suppress consecutive-frame double triggers"
+    );
+
+    // Stereo panning bias: right-heavy audio pushes impulses right of left-heavy audio
+    let mut mid_spec = vec![0.0f32; 1024];
+    mid_spec[40..90].fill(65.0);
+    let mut sim_l = FlipDiscSimState::default();
+    let (p_left, _) = sim_l.step(&mid_spec, &[0.95, 0.05], 1.0 / 60.0, 1.777, true, 1.0, false);
+    let mut sim_r = FlipDiscSimState::default();
+    let (p_right, _) = sim_r.step(&mid_spec, &[0.05, 0.95], 1.0 / 60.0, 1.777, true, 1.0, false);
+    assert!(
+        p_right.impulses[1][0] > p_left.impulses[1][0] + 6.0,
+        "Stereo panning must shift mid ripples laterally (L={}, R={})",
+        p_left.impulses[1][0],
+        p_right.impulses[1][0]
+    );
+
+    // Framerate-independent 60 Hz wave substep accumulation across 144 Hz vs 60 Hz
+    let mut sim_144 = FlipDiscSimState::default();
+    let mut total_144 = 0u32;
+    for i in 0..144 {
+        let (_, s) = sim_144.step(
+            &silent_spec,
+            &silent_vu,
+            1.0 / 144.0,
+            1.777,
+            true,
+            i as f32 / 144.0,
+            true,
+        );
+        total_144 += s;
+    }
+    let mut sim_60 = FlipDiscSimState::default();
+    let mut total_60 = 0u32;
+    for i in 0..60 {
+        let (_, s) = sim_60.step(
+            &silent_spec,
+            &silent_vu,
+            1.0 / 60.0,
+            1.777,
+            true,
+            i as f32 / 60.0,
+            true,
+        );
+        total_60 += s;
+    }
+    assert!(
+        (58..=61).contains(&total_144) && (59..=61).contains(&total_60),
+        "Fixed-60Hz accumulator must produce ~60 substeps/sec at any FPS (144Hz={total_144}, 60Hz={total_60})"
+    );
+
+    // Naga parse and Capabilities::empty() validation for compute + render shaders
+    const SHADER_COMMON: &str = include_str!("../../../../src/shaders/_common.wgsl");
+    for (name, raw_src) in [
+        (
+            "vis_flip_disc.wgsl",
+            include_str!("../../../../src/shaders/vis_flip_disc.wgsl"),
+        ),
+        (
+            "flip_disc_compute.wgsl",
+            include_str!("../../../../src/shaders/flip_disc_compute.wgsl"),
+        ),
+    ] {
+        let resolved = raw_src.replace("// INCLUDE: common", SHADER_COMMON);
+        let mut frontend = wgpu::naga::front::wgsl::Frontend::new();
+        let module = frontend
+            .parse(&resolved)
+            .unwrap_or_else(|e| panic!("{name} parse error: {}", e.emit_to_string(&resolved)));
+        let mut validator = wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::empty(),
+        );
+        validator
+            .validate(&module)
+            .unwrap_or_else(|e| panic!("{name} validation error: {e:?}"));
     }
 }

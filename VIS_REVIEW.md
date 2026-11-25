@@ -1,6 +1,6 @@
 # RustTracker Visualization System Review
 
-> **Document Status Note:** Sections 1–6 below are the historical **`2026-07-19`** review snapshot (written when the codebase had `22` registered visualizers and `34` WGSL files). **Section 7 (`2026-11-11` Audit & Resolution Status, updated for `v0.10.0`)** at the bottom of this file reflects current ground truth: **`19` registered visualizers** (`16` enabled in default rotation) and **`32` `.wgsl` files** in `src/shaders/` (**`30` standalone Naga-validated shader modules** + `2` shared include headers `_common.wgsl` and `_glyph_font.wgsl`), implemented modularly in `crates/rt-render/src/engine/` on `wgpu 30` / `naga 30`.
+> **Document Status Note:** Sections 1–6 below are the historical **`2026-07-19`** review snapshot (written when the codebase had `22` registered visualizers and `34` WGSL files). **Section 7 (`2026-11-11` Audit & Resolution Status, updated for `v0.10.0`)** at the bottom of this file reflects current ground truth: **`20` registered visualizers** (`17` enabled in default rotation) and **`34` `.wgsl` files** in `src/shaders/` (**`32` standalone Naga-validated shader modules** + `2` shared include headers `_common.wgsl` and `_glyph_font.wgsl`), implemented modularly in `crates/rt-render/src/engine/` on `wgpu 30` / `naga 30`.
 
 Historical Review Date: 2026-07-19. Historical Scope: all 34 WGSL shaders in
 src/shaders/, the host-side visualization pipeline in src/engine.rs
@@ -318,8 +318,8 @@ P3 (aesthetics/UX):
 =====================================================================
 
 Current Registry & Shader Counts:
-- 19 visualizers registered in state.rs::VISUALIZERS (16 enabled in default rotation; IDs: 0, 25, 24, 1, 3, 4, 5, 6, 7, 13, 14, 16, 19, 20, 31, 23, 27, 28, 29).
-- 30 standalone WGSL shader modules + 2 shared include headers (`_common.wgsl`, `_glyph_font.wgsl`) = 32 `.wgsl` files in `src/shaders/` (all 30 standalone modules pass Naga validation with `Capabilities::empty()`; 22 unreferenced/retired `.wgsl` shaders were purged).
+- 20 visualizers registered in state.rs::VISUALIZERS (17 enabled in default rotation; IDs: 0, 25, 24, 1, 3, 4, 5, 6, 7, 13, 14, 16, 19, 20, 31, 23, 27, 28, 29, 32).
+- 32 standalone WGSL shader modules + 2 shared include headers (`_common.wgsl`, `_glyph_font.wgsl`) = 34 `.wgsl` files in `src/shaders/` (all 32 standalone modules pass Naga validation with `Capabilities::empty()`; 22 unreferenced/retired `.wgsl` shaders were purged).
 
 Critical Findings (Section 2):
 - [C1] Ferrofluidsim particle stride: RESOLVED (repacked to two vec4s = 32B; legacy `ferrofluidsim` and `flip_ferrofluid_compute.wgsl` shaders subsequently purged after upgrading ID 27 `vis_flip_ferrofluid.wgsl` to an analytic 3D SDF raymarched ferrofluid sculpture).
@@ -348,7 +348,7 @@ Performance Wins (Section 4):
 - VU meter ray-AABB early reject: RESOLVED (legacy raymarched `vis_vumeters.wgsl` subsequently purged in favor of 3D mesh `vis_vumeters_3d.wgsl` + `vis_vumeters_bg.wgsl`).
 - Ferrofluid containment & sky early-out: RESOLVED (ID 27 `vis_flip_ferrofluid.wgsl` upgraded to pure analytic 3D SDF raymarching with bounding-sphere early-out, `ferrofluid_pool_mode` toggle, and removal of unused `flip_ferrofluid_compute.wgsl`; legacy `vis_ferrofluid.wgsl` subsequently purged).
 - Firesim black early-out: RESOLVED (skips erosion fbm when base_heat <= 0.003).
-- Unused visualizer pipelines & dead shaders: RESOLVED (only the 19 registered visualizers in `VISUALIZERS` have pipelines instantiated; 19 retired `.wgsl` shaders and 7 dead GPU pipelines were purged).
+- Unused visualizer pipelines & dead shaders: RESOLVED (only the 20 registered visualizers in `VISUALIZERS` have pipelines instantiated; 19 retired `.wgsl` shaders and 7 dead GPU pipelines were purged).
 
 `v0.10.0` Addendum (Architecture, Stack & Runtime Overhead):
 - Engine modularization & stack upgrade: split monolithic `engine.rs` into `crates/rt-render/src/engine/{mod,splash,types,ui_overlay,tests}.rs`, upgraded renderer stack to `wgpu 30.0.2`, `naga 30.0.2`, `egui`/`egui-wgpu`/`egui-winit 0.37.0`, `egui-file-dialog 0.16.0`, and trimmed `image 0.25.10` (`png`, `jpeg`).

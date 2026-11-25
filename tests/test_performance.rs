@@ -478,6 +478,44 @@ async fn run_perf_test() {
             immediate_size: 0,
         });
 
+    let flip_disc_state_buffer = device.create_buffer(&BufferDescriptor {
+        label: Some("Flip-Disc State Buffer"),
+        size: (crate::engine::FLIP_DISC_COUNT as u64) * 16,
+        usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let flip_disc_render_bind_group_layout =
+        device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("Flip-Disc Render Layout"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+    let flip_disc_render_bind_group = device.create_bind_group(&BindGroupDescriptor {
+        label: Some("Flip-Disc Render Bind Group"),
+        layout: &flip_disc_render_bind_group_layout,
+        entries: &[BindGroupEntry {
+            binding: 0,
+            resource: flip_disc_state_buffer.as_entire_binding(),
+        }],
+    });
+    let flip_disc_render_pipeline_layout =
+        device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Flip-Disc Render Pipeline Layout"),
+            bind_group_layouts: &[
+                Some(&bind_group_layout),
+                Some(&flip_disc_render_bind_group_layout),
+            ],
+            immediate_size: 0,
+        });
+
     let acoustic_volume_texture = device.create_texture(&TextureDescriptor {
         label: Some("Acoustic Wave 3D Volume Texture"),
         size: Extent3d {
@@ -753,6 +791,7 @@ async fn run_perf_test() {
             28 => include_str!("../src/shaders/vis_glass_water.wgsl"),
             29 => include_str!("../src/shaders/vis_spectrum_canyon.wgsl"),
             31 => include_str!("../src/shaders/vis_neon_acoustic_room.wgsl"),
+            32 => include_str!("../src/shaders/vis_flip_disc.wgsl"),
             _ => include_str!("../src/shaders/vis_spectrum.wgsl"),
         }
     };
@@ -781,6 +820,8 @@ async fn run_perf_test() {
             &neon_acoustic_render_pipeline_layout_3d
         } else if vis_def.id == 23 {
             &lyrics_render_pipeline_layout_3d
+        } else if vis_def.id == 32 {
+            &flip_disc_render_pipeline_layout
         } else if is_3d {
             &render_pipeline_layout_3d
         } else {
@@ -1072,6 +1113,9 @@ async fn run_perf_test() {
                         rp.draw_indexed(0..lamp_index_count, 0, 0..16);
                     }
                 } else {
+                    if vis_def.id == 32 {
+                        rp.set_bind_group(1, &flip_disc_render_bind_group, &[]);
+                    }
                     rp.draw(0..3, 0..1);
                 }
             }
@@ -1194,6 +1238,9 @@ async fn run_perf_test() {
                         rp.draw_indexed(0..lamp_index_count, 0, 0..16);
                     }
                 } else {
+                    if vis_def.id == 32 {
+                        rp.set_bind_group(1, &flip_disc_render_bind_group, &[]);
+                    }
                     rp.draw(0..3, 0..1);
                 }
             }
@@ -4600,6 +4647,754 @@ fn test_gpu_ferrofluid_render_and_perf() {
         assert!(
             !error_caught.load(std::sync::atomic::Ordering::SeqCst),
             "WGPU validation error was triggered during Ferrofluid test!"
+        );
+    });
+}
+
+#[test]
+fn test_flip_disc_compute_and_render_verification() {
+    pollster::block_on(async {
+        let instance = Instance::new(InstanceDescriptor {
+            backends: Backends::PRIMARY,
+            flags: InstanceFlags::default(),
+            backend_options: BackendOptions::default(),
+            display: None,
+            memory_budget_thresholds: MemoryBudgetThresholds::default(),
+        });
+
+        let adapter = match instance
+            .request_adapter(&RequestAdapterOptions {
+                power_preference: PowerPreference::HighPerformance,
+                compatible_surface: None,
+                force_fallback_adapter: false,
+                apply_limit_buckets: false,
+            })
+            .await
+        {
+            Ok(a) => a,
+            Err(_) => {
+                println!("Skipping flip-disc GPU test: No GPU adapter available.");
+                return;
+            }
+        };
+
+        let timestamp_supported = adapter.features().contains(Features::TIMESTAMP_QUERY);
+        let req_features = if timestamp_supported {
+            Features::TIMESTAMP_QUERY
+        } else {
+            Features::empty()
+        };
+
+        let (device, queue) = match adapter
+            .request_device(&DeviceDescriptor {
+                label: Some("Flip-Disc Test Device"),
+                required_features: req_features,
+                required_limits: Limits::default(),
+                memory_hints: MemoryHints::default(),
+                ..Default::default()
+            })
+            .await
+        {
+            Ok(dq) => dq,
+            Err(e) => {
+                println!("Skipping flip-disc GPU test: Failed to request device: {e:?}");
+                return;
+            }
+        };
+
+        let error_caught = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let err_flag = error_caught.clone();
+        device.on_uncaptured_error(std::sync::Arc::new(move |err| {
+            eprintln!("WGPU uncaptured error in flip-disc test: {err:?}");
+            err_flag.store(true, std::sync::atomic::Ordering::SeqCst);
+        }));
+
+        const SHADER_COMMON: &str = include_str!("../src/shaders/_common.wgsl");
+        let compute_src = include_str!("../src/shaders/flip_disc_compute.wgsl")
+            .replace("// INCLUDE: common", SHADER_COMMON);
+        let render_src = include_str!("../src/shaders/vis_flip_disc.wgsl")
+            .replace("// INCLUDE: common", SHADER_COMMON);
+
+        let uniform_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("Flip-Disc Test Audio Uniforms"),
+            size: std::mem::size_of::<engine::AudioUniforms>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let buf_bytes = (engine::FLIP_DISC_COUNT as u64) * 16;
+        let params_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("Flip-Disc Test Params"),
+            size: std::mem::size_of::<engine::FlipDiscParams>() as u64,
+            usage: BufferUsages::UNIFORM | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let wave_a_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("Flip-Disc Test Wave A"),
+            size: buf_bytes,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let wave_b_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("Flip-Disc Test Wave B"),
+            size: buf_bytes,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let discs_buf = device.create_buffer(&BufferDescriptor {
+            label: Some("Flip-Disc Test State"),
+            size: buf_bytes,
+            usage: BufferUsages::STORAGE | BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let compute_bgl = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("Flip-Disc Test Compute BGL"),
+            entries: &[
+                BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+                BindGroupLayoutEntry {
+                    binding: 3,
+                    visibility: ShaderStages::COMPUTE,
+                    ty: BindingType::Buffer {
+                        ty: BufferBindingType::Storage { read_only: false },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                },
+            ],
+        });
+
+        let compute_bg_a = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Flip-Disc Test Compute BG A"),
+            layout: &compute_bgl,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: wave_a_buf.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: wave_b_buf.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 3,
+                    resource: discs_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let compute_bg_b = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Flip-Disc Test Compute BG B"),
+            layout: &compute_bgl,
+            entries: &[
+                BindGroupEntry {
+                    binding: 0,
+                    resource: params_buf.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 1,
+                    resource: wave_b_buf.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 2,
+                    resource: wave_a_buf.as_entire_binding(),
+                },
+                BindGroupEntry {
+                    binding: 3,
+                    resource: discs_buf.as_entire_binding(),
+                },
+            ],
+        });
+
+        let compute_pl = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Flip-Disc Test Compute PL"),
+            bind_group_layouts: &[Some(&compute_bgl)],
+            immediate_size: 0,
+        });
+        let compute_mod = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("Flip-Disc Test Compute Shader"),
+            source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&compute_src)),
+        });
+        let init_pipe = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("Flip-Disc Test Init"),
+            layout: Some(&compute_pl),
+            module: &compute_mod,
+            entry_point: Some("cs_init"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let wave_pipe = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("Flip-Disc Test Wave"),
+            layout: Some(&compute_pl),
+            module: &compute_mod,
+            entry_point: Some("cs_wave_step"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        let step_pipe = device.create_compute_pipeline(&ComputePipelineDescriptor {
+            label: Some("Flip-Disc Test Step"),
+            layout: Some(&compute_pl),
+            module: &compute_mod,
+            entry_point: Some("cs_disc_step"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+
+        let audio_bgl = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("Flip-Disc Test Audio BGL"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::VERTEX | ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let audio_bg = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Flip-Disc Test Audio BG"),
+            layout: &audio_bgl,
+            entries: &[BindGroupEntry {
+                binding: 0,
+                resource: uniform_buf.as_entire_binding(),
+            }],
+        });
+
+        let discs_render_bgl = device.create_bind_group_layout(&BindGroupLayoutDescriptor {
+            label: Some("Flip-Disc Test Render BGL"),
+            entries: &[BindGroupLayoutEntry {
+                binding: 0,
+                visibility: ShaderStages::FRAGMENT,
+                ty: BindingType::Buffer {
+                    ty: BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            }],
+        });
+        let discs_render_bg = device.create_bind_group(&BindGroupDescriptor {
+            label: Some("Flip-Disc Test Render BG"),
+            layout: &discs_render_bgl,
+            entries: &[BindGroupEntry {
+                binding: 0,
+                resource: discs_buf.as_entire_binding(),
+            }],
+        });
+
+        let render_pl = device.create_pipeline_layout(&PipelineLayoutDescriptor {
+            label: Some("Flip-Disc Test Render PL"),
+            bind_group_layouts: &[Some(&audio_bgl), Some(&discs_render_bgl)],
+            immediate_size: 0,
+        });
+        let render_mod = device.create_shader_module(ShaderModuleDescriptor {
+            label: Some("Flip-Disc Test Render Shader"),
+            source: ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&render_src)),
+        });
+        let color_format = TextureFormat::Rgba8UnormSrgb;
+        let render_pipe = device.create_render_pipeline(&RenderPipelineDescriptor {
+            label: Some("Flip-Disc Test Render Pipeline"),
+            layout: Some(&render_pl),
+            vertex: VertexState {
+                module: &render_mod,
+                entry_point: Some("vs_main"),
+                buffers: &[],
+                compilation_options: Default::default(),
+            },
+            fragment: Some(FragmentState {
+                module: &render_mod,
+                entry_point: Some("fs_main"),
+                targets: &[Some(ColorTargetState {
+                    format: color_format,
+                    blend: Some(BlendState::REPLACE),
+                    write_mask: ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive: PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
+        let snapshot_dir = std::env::var("RT_SAVE_FLIP_DISC_SNAPSHOT_DIR").ok();
+        if let Some(dir) = &snapshot_dir {
+            std::fs::create_dir_all(dir).expect("Failed to create flip-disc snapshot dir");
+        }
+
+        let cases = [
+            (1280u32, 720u32, true, "flip_disc_16x9.png"),
+            (1400u32, 400u32, true, "flip_disc_ultrawide.png"),
+            (540u32, 960u32, true, "flip_disc_portrait.png"),
+            (1280u32, 720u32, false, "flip_disc_quiet_16x9.png"),
+        ];
+
+        let mut loud_16x9_rgba: Option<Vec<u8>> = None;
+        let mut quiet_16x9_rgba: Option<Vec<u8>> = None;
+
+        for (w, h, loud, filename) in cases {
+            let aspect = w as f32 / h as f32;
+            let mut sim = engine::FlipDiscSimState::default();
+            let mut ping = true;
+            let mut initialized = false;
+            let steps = if loud { 36 } else { 48 };
+
+            for frame in 0..steps {
+                let t = (frame as f32) * (1.0 / 60.0);
+                let mut spec = [0.0f32; 1024];
+                let mut vus = [0.0f32, 0.0f32];
+                if loud {
+                    let kick_on = frame % 16 == 0 || frame % 16 == 1;
+                    let snare_on = frame % 12 == 4;
+                    let hat_on = frame % 5 == 0;
+                    if kick_on {
+                        spec[1..16].fill(82.0);
+                    } else {
+                        spec[1..16].fill(22.0);
+                    }
+                    if snare_on {
+                        spec[30..110].fill(72.0);
+                    } else {
+                        spec[30..110].fill(24.0);
+                    }
+                    if hat_on {
+                        spec[200..420].fill(58.0);
+                    } else {
+                        spec[200..420].fill(16.0);
+                    }
+                    let pan = (frame as f32 * 0.35).sin() * 0.38;
+                    vus[0] = (0.65 - pan).clamp(0.1, 1.0);
+                    vus[1] = (0.65 + pan).clamp(0.1, 1.0);
+                }
+
+                let (fd_params, substeps) =
+                    sim.step(&spec, &vus, 1.0 / 60.0, aspect, true, t, initialized);
+                queue.write_buffer(&params_buf, 0, bytemuck::cast_slice(&[fd_params]));
+
+                let mut enc = device.create_command_encoder(&CommandEncoderDescriptor::default());
+                {
+                    let mut cp = enc.begin_compute_pass(&ComputePassDescriptor::default());
+                    if !initialized {
+                        cp.set_pipeline(&init_pipe);
+                        cp.set_bind_group(0, Some(&compute_bg_a), &[]);
+                        cp.dispatch_workgroups(
+                            engine::FLIP_DISC_WORKGROUPS_X,
+                            engine::FLIP_DISC_WORKGROUPS_Y,
+                            1,
+                        );
+                        cp.set_bind_group(0, Some(&compute_bg_b), &[]);
+                        cp.dispatch_workgroups(
+                            engine::FLIP_DISC_WORKGROUPS_X,
+                            engine::FLIP_DISC_WORKGROUPS_Y,
+                            1,
+                        );
+                        initialized = true;
+                        ping = true;
+                    }
+                    for _ in 0..substeps.min(2) {
+                        cp.set_pipeline(&wave_pipe);
+                        let bg = if ping { &compute_bg_a } else { &compute_bg_b };
+                        cp.set_bind_group(0, Some(bg), &[]);
+                        cp.dispatch_workgroups(
+                            engine::FLIP_DISC_WORKGROUPS_X,
+                            engine::FLIP_DISC_WORKGROUPS_Y,
+                            1,
+                        );
+                        ping = !ping;
+                    }
+                    let disc_bg = if ping { &compute_bg_a } else { &compute_bg_b };
+                    cp.set_pipeline(&step_pipe);
+                    cp.set_bind_group(0, Some(disc_bg), &[]);
+                    cp.dispatch_workgroups(
+                        engine::FLIP_DISC_WORKGROUPS_X,
+                        engine::FLIP_DISC_WORKGROUPS_Y,
+                        1,
+                    );
+                }
+                queue.submit(Some(enc.finish()));
+            }
+
+            let mut u: engine::AudioUniforms = bytemuck::Zeroable::zeroed();
+            u.mode = 32;
+            u.num_channels = 2;
+            u.num_spatial_channels = 2;
+            u.time = 3.2;
+            u.smooth_time = 3.2;
+            u.frame_dt = 1.0 / 60.0;
+            u.aspect_ratio = aspect;
+            queue.write_buffer(&uniform_buf, 0, bytemuck::cast_slice(&[u]));
+
+            let color_tex = device.create_texture(&TextureDescriptor {
+                label: Some("Flip-Disc Test Color"),
+                size: Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: TextureDimension::D2,
+                format: color_format,
+                usage: TextureUsages::RENDER_ATTACHMENT | TextureUsages::COPY_SRC,
+                view_formats: &[],
+            });
+            let color_view = color_tex.create_view(&TextureViewDescriptor::default());
+
+            let padded_row_bytes = (w * 4).div_ceil(256) * 256;
+            let readback_buf = device.create_buffer(&BufferDescriptor {
+                label: Some("Flip-Disc Test Readback"),
+                size: (padded_row_bytes * h) as u64,
+                usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+
+            let sentinel_clear = Color {
+                r: 1.0,
+                g: 0.0,
+                b: 1.0,
+                a: 1.0,
+            };
+
+            let mut enc = device.create_command_encoder(&CommandEncoderDescriptor::default());
+            {
+                let mut rp = enc.begin_render_pass(&RenderPassDescriptor {
+                    label: Some("Flip-Disc Test Render"),
+                    color_attachments: &[Some(RenderPassColorAttachment {
+                        view: &color_view,
+                        resolve_target: None,
+                        ops: Operations {
+                            load: LoadOp::Clear(sentinel_clear),
+                            store: StoreOp::Store,
+                        },
+                        depth_slice: None,
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                });
+                rp.set_pipeline(&render_pipe);
+                rp.set_bind_group(0, &audio_bg, &[]);
+                rp.set_bind_group(1, &discs_render_bg, &[]);
+                rp.draw(0..3, 0..1);
+            }
+            enc.copy_texture_to_buffer(
+                TexelCopyTextureInfo {
+                    texture: &color_tex,
+                    mip_level: 0,
+                    origin: Origin3d::ZERO,
+                    aspect: TextureAspect::All,
+                },
+                TexelCopyBufferInfo {
+                    buffer: &readback_buf,
+                    layout: TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(padded_row_bytes),
+                        rows_per_image: Some(h),
+                    },
+                },
+                Extent3d {
+                    width: w,
+                    height: h,
+                    depth_or_array_layers: 1,
+                },
+            );
+            queue.submit(Some(enc.finish()));
+
+            let slice = readback_buf.slice(..);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(MapMode::Read, move |r| tx.send(r).unwrap());
+            let _ = device.poll(PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            });
+            rx.recv().unwrap().unwrap();
+            let mapped = slice.get_mapped_range().unwrap();
+            let mut rgba = Vec::with_capacity((w * h * 4) as usize);
+            for y in 0..h as usize {
+                let row_start = y * padded_row_bytes as usize;
+                rgba.extend_from_slice(&mapped[row_start..row_start + (w * 4) as usize]);
+            }
+            drop(mapped);
+            readback_buf.unmap();
+
+            if let Some(dir) = &snapshot_dir {
+                let out_path = std::path::Path::new(dir).join(filename);
+                image::save_buffer(&out_path, &rgba, w, h, image::ColorType::Rgba8)
+                    .expect("Failed to save flip-disc snapshot");
+            }
+
+            let total_px = (w * h) as usize;
+            let mut dark_px = 0usize;
+            let mut bright_px = 0usize;
+            let mut border_leaks = 0usize;
+            let mut chroma_outliers = 0usize;
+            let mut luma_sum = 0.0f64;
+
+            for y in 0..h as usize {
+                for x in 0..w as usize {
+                    let i = (y * w as usize + x) * 4;
+                    let [r, g, b, _] = [rgba[i], rgba[i + 1], rgba[i + 2], rgba[i + 3]];
+                    let luma = (0.2126 * r as f64 + 0.7152 * g as f64 + 0.0722 * b as f64) / 255.0;
+                    luma_sum += luma;
+                    if luma < 0.28 {
+                        dark_px += 1;
+                    }
+                    if r.max(g).max(b) >= 160 {
+                        bright_px += 1;
+                    }
+                    let spread = r.max(g).max(b) - r.min(g).min(b);
+                    if spread > 32 {
+                        chroma_outliers += 1;
+                    }
+                    let is_edge = x < 4 || x >= w as usize - 4 || y < 4 || y >= h as usize - 4;
+                    if is_edge && r > 180 && g < 50 && b > 180 {
+                        border_leaks += 1;
+                    }
+                }
+            }
+
+            let avg_luma = luma_sum / total_px as f64;
+            println!(
+                "Flip-Disc {filename} ({w}x{h}, loud={loud}): avg_luma={avg_luma:.4}, dark={dark_px}/{total_px}, bright={bright_px}, chroma_outliers={chroma_outliers}, border_leaks={border_leaks}"
+            );
+
+            assert_eq!(
+                border_leaks, 0,
+                "{filename} must fill 100% edge-to-edge with zero border leaks"
+            );
+            assert_eq!(
+                chroma_outliers, 0,
+                "{filename} must preserve charcoal-and-white monochrome neutrality"
+            );
+            assert!(
+                dark_px > total_px * 35 / 100,
+                "{filename} must preserve dark charcoal discs & pocket contrast ({dark_px}/{total_px})"
+            );
+            if loud {
+                assert!(
+                    bright_px > total_px / 30,
+                    "{filename} must show bright white flipped ripple discs (got {bright_px}/{total_px})"
+                );
+            } else {
+                assert!(
+                    bright_px < total_px / 100,
+                    "{filename} quiet wall should rest on charcoal discs (got bright={bright_px}/{total_px})"
+                );
+            }
+
+            if filename == "flip_disc_16x9.png" {
+                loud_16x9_rgba = Some(rgba);
+            } else if filename == "flip_disc_quiet_16x9.png" {
+                quiet_16x9_rgba = Some(rgba);
+            }
+        }
+
+        let loud_px = loud_16x9_rgba.expect("loud frame captured");
+        let quiet_px = quiet_16x9_rgba.expect("quiet frame captured");
+        let mean_diff: f64 = loud_px
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(quiet_px.as_chunks::<4>().0.iter())
+            .map(|(a, b)| {
+                ((a[0] as f64 - b[0] as f64).abs()
+                    + (a[1] as f64 - b[1] as f64).abs()
+                    + (a[2] as f64 - b[2] as f64).abs())
+                    / 3.0
+            })
+            .sum::<f64>()
+            / (loud_px.len() / 4) as f64;
+        println!("Flip-Disc audio reactivity mean channel diff (loud vs quiet): {mean_diff:.3}");
+        assert!(
+            mean_diff > 5.0,
+            "Flip-Disc shader must respond strongly to audio ripples (mean_diff={mean_diff:.3})"
+        );
+
+        if timestamp_supported {
+            for (bw, bh, budget_ms, label) in [
+                (1280u32, 720u32, Some(0.700_f32), "1280x720"),
+                (1920u32, 1080u32, None, "1920x1080"),
+            ] {
+                let mut u: engine::AudioUniforms = bytemuck::Zeroable::zeroed();
+                u.mode = 32;
+                u.time = 3.2;
+                u.smooth_time = 3.2;
+                u.aspect_ratio = bw as f32 / bh as f32;
+                queue.write_buffer(&uniform_buf, 0, bytemuck::cast_slice(&[u]));
+
+                let color_tex = device.create_texture(&TextureDescriptor {
+                    label: Some("Flip-Disc Perf Color"),
+                    size: Extent3d {
+                        width: bw,
+                        height: bh,
+                        depth_or_array_layers: 1,
+                    },
+                    mip_level_count: 1,
+                    sample_count: 1,
+                    dimension: TextureDimension::D2,
+                    format: color_format,
+                    usage: TextureUsages::RENDER_ATTACHMENT,
+                    view_formats: &[],
+                });
+                let color_view = color_tex.create_view(&TextureViewDescriptor::default());
+
+                let qs = device.create_query_set(&QuerySetDescriptor {
+                    label: Some("Flip-Disc Perf QS"),
+                    ty: QueryType::Timestamp,
+                    count: 2,
+                });
+                let res_buf = device.create_buffer(&BufferDescriptor {
+                    label: Some("Flip-Disc Perf Res"),
+                    size: 16,
+                    usage: BufferUsages::QUERY_RESOLVE | BufferUsages::COPY_SRC,
+                    mapped_at_creation: false,
+                });
+                let ts_read_buf = device.create_buffer(&BufferDescriptor {
+                    label: Some("Flip-Disc Perf Read"),
+                    size: 16,
+                    usage: BufferUsages::MAP_READ | BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                let period = queue.get_timestamp_period();
+
+                for _ in 0..5 {
+                    let mut enc =
+                        device.create_command_encoder(&CommandEncoderDescriptor::default());
+                    {
+                        let mut rp = enc.begin_render_pass(&RenderPassDescriptor {
+                            label: Some("Flip-Disc Warmup"),
+                            color_attachments: &[Some(RenderPassColorAttachment {
+                                view: &color_view,
+                                resolve_target: None,
+                                ops: Operations {
+                                    load: LoadOp::Clear(Color::BLACK),
+                                    store: StoreOp::Store,
+                                },
+                                depth_slice: None,
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: None,
+                            occlusion_query_set: None,
+                            multiview_mask: None,
+                        });
+                        rp.set_pipeline(&render_pipe);
+                        rp.set_bind_group(0, &audio_bg, &[]);
+                        rp.set_bind_group(1, &discs_render_bg, &[]);
+                        rp.draw(0..3, 0..1);
+                    }
+                    queue.submit(Some(enc.finish()));
+                }
+                let _ = device.poll(PollType::Wait {
+                    submission_index: None,
+                    timeout: None,
+                });
+
+                let iters = 30u32;
+                let mut sum_ms = 0.0f32;
+                for _ in 0..iters {
+                    let mut enc =
+                        device.create_command_encoder(&CommandEncoderDescriptor::default());
+                    {
+                        let mut rp = enc.begin_render_pass(&RenderPassDescriptor {
+                            label: Some("Flip-Disc Perf Pass"),
+                            color_attachments: &[Some(RenderPassColorAttachment {
+                                view: &color_view,
+                                resolve_target: None,
+                                ops: Operations {
+                                    load: LoadOp::Clear(Color::BLACK),
+                                    store: StoreOp::Store,
+                                },
+                                depth_slice: None,
+                            })],
+                            depth_stencil_attachment: None,
+                            timestamp_writes: Some(RenderPassTimestampWrites {
+                                query_set: &qs,
+                                beginning_of_pass_write_index: Some(0),
+                                end_of_pass_write_index: Some(1),
+                            }),
+                            occlusion_query_set: None,
+                            multiview_mask: None,
+                        });
+                        rp.set_pipeline(&render_pipe);
+                        rp.set_bind_group(0, &audio_bg, &[]);
+                        rp.set_bind_group(1, &discs_render_bg, &[]);
+                        rp.draw(0..3, 0..1);
+                    }
+                    enc.resolve_query_set(&qs, 0..2, &res_buf, 0);
+                    enc.copy_buffer_to_buffer(&res_buf, 0, &ts_read_buf, 0, 16);
+                    queue.submit(Some(enc.finish()));
+                    let _ = device.poll(PollType::Wait {
+                        submission_index: None,
+                        timeout: None,
+                    });
+                    let slice = ts_read_buf.slice(..);
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    slice.map_async(MapMode::Read, move |r| tx.send(r).unwrap());
+                    let _ = device.poll(PollType::Wait {
+                        submission_index: None,
+                        timeout: None,
+                    });
+                    rx.recv().unwrap().unwrap();
+                    let data = slice.get_mapped_range().unwrap();
+                    let s = u64::from_le_bytes(data[0..8].try_into().unwrap());
+                    let e = u64::from_le_bytes(data[8..16].try_into().unwrap());
+                    drop(data);
+                    ts_read_buf.unmap();
+                    if e > s {
+                        sum_ms += ((e - s) as f32 * period) / 1_000_000.0;
+                    }
+                }
+                let avg_ms = sum_ms / iters as f32;
+                println!("Flip-Disc {label} GPU render: {avg_ms:.3} ms");
+                if let Some(limit) = budget_ms {
+                    assert!(
+                        avg_ms < limit,
+                        "Flip-Disc {label} render exceeded {limit:.3}ms budget: {avg_ms:.3} ms"
+                    );
+                }
+            }
+        }
+
+        assert!(
+            !error_caught.load(std::sync::atomic::Ordering::SeqCst),
+            "WGPU validation error was triggered during Flip-Disc test!"
         );
     });
 }

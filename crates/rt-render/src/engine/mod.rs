@@ -4,11 +4,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use winit::window::Window;
 
 mod fire;
+mod flip_disc;
 mod meshes;
 mod splash;
 mod types;
 mod ui_overlay;
 
+pub use flip_disc::*;
 pub use meshes::{
     generate_biolum_ocean_mesh, generate_glass_lyrics_mesh, generate_lamp_mesh,
     generate_neon_room_mesh,
@@ -124,6 +126,23 @@ pub struct VulkanEngine {
     neon_acoustic_render_pipeline_layout_3d: wgpu::PipelineLayout,
     acoustic_render_bind_group: wgpu::BindGroup,
     acoustic_wave_initialized: bool,
+
+    // Mechanical Flip-Disc compute & render state (visualizer ID 32)
+    flip_disc_params_buffer: wgpu::Buffer,
+    _flip_disc_wave_a_buffer: wgpu::Buffer,
+    _flip_disc_wave_b_buffer: wgpu::Buffer,
+    _flip_disc_state_buffer: wgpu::Buffer,
+    flip_disc_compute_bg_a: wgpu::BindGroup,
+    flip_disc_compute_bg_b: wgpu::BindGroup,
+    flip_disc_init_pipeline: wgpu::ComputePipeline,
+    flip_disc_wave_pipeline: wgpu::ComputePipeline,
+    flip_disc_step_pipeline: wgpu::ComputePipeline,
+    flip_disc_render_pipeline_layout: wgpu::PipelineLayout,
+    flip_disc_render_bind_group: wgpu::BindGroup,
+    flip_disc_ping: bool,
+    flip_disc_initialized: bool,
+    flip_disc_sim: FlipDiscSimState,
+    flip_disc_pending_substeps: u32,
 
     depth_texture_view: wgpu::TextureView,
 
@@ -668,6 +687,31 @@ impl VulkanEngine {
                 immediate_size: 0,
             });
 
+        let flip_disc_render_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Flip-Disc Render Layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Storage { read_only: true },
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+
+        let flip_disc_render_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Flip-Disc Render Pipeline Layout"),
+                bind_group_layouts: &[
+                    Some(&bind_group_layout),
+                    Some(&flip_disc_render_bind_group_layout),
+                ],
+                immediate_size: 0,
+            });
+
         // Shared shader headers — included at compile time, resolved via simple string replacement.
         // This is the single source of truth for AudioUniforms layout and glyph font.
         const SHADER_COMMON: &str = include_str!("../../../../src/shaders/_common.wgsl");
@@ -700,6 +744,7 @@ impl VulkanEngine {
                 28 => include_str!("../../../../src/shaders/vis_glass_water.wgsl"),
                 29 => include_str!("../../../../src/shaders/vis_spectrum_canyon.wgsl"),
                 31 => include_str!("../../../../src/shaders/vis_neon_acoustic_room.wgsl"),
+                32 => include_str!("../../../../src/shaders/vis_flip_disc.wgsl"),
                 _ => include_str!("../../../../src/shaders/vis_spectrum.wgsl"),
             }
         };
@@ -2265,6 +2310,177 @@ impl VulkanEngine {
                 compilation_options: Default::default(),
                 cache: pipeline_cache_ref,
             });
+
+        // --- Mechanical Flip-Disc Compute & Render Setup (Visualizer ID 32) ---
+        let flip_disc_buf_bytes = (FLIP_DISC_COUNT as u64) * 16;
+        let flip_disc_params_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Flip-Disc Params Uniform"),
+            size: std::mem::size_of::<FlipDiscParams>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let flip_disc_wave_a_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Flip-Disc Wave A"),
+            size: flip_disc_buf_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let flip_disc_wave_b_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Flip-Disc Wave B"),
+            size: flip_disc_buf_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let flip_disc_state_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("Flip-Disc State Buffer"),
+            size: flip_disc_buf_bytes,
+            usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        let flip_disc_compute_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("Flip-Disc Compute Bind Group Layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: true },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::COMPUTE,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Storage { read_only: false },
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+
+        let flip_disc_compute_bg_a = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Flip-Disc Compute BG A"),
+            layout: &flip_disc_compute_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: flip_disc_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: flip_disc_wave_a_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: flip_disc_wave_b_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: flip_disc_state_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let flip_disc_compute_bg_b = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Flip-Disc Compute BG B"),
+            layout: &flip_disc_compute_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: flip_disc_params_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: flip_disc_wave_b_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: flip_disc_wave_a_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: flip_disc_state_buffer.as_entire_binding(),
+                },
+            ],
+        });
+
+        let flip_disc_render_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("Flip-Disc Render Bind Group"),
+            layout: &flip_disc_render_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: flip_disc_state_buffer.as_entire_binding(),
+            }],
+        });
+
+        let flip_disc_compute_source = resolve_shader_includes(include_str!(
+            "../../../../src/shaders/flip_disc_compute.wgsl"
+        ));
+        let flip_disc_compute_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("Flip-Disc Compute Shader"),
+            source: wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(&flip_disc_compute_source)),
+        });
+        let flip_disc_compute_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("Flip-Disc Compute Pipeline Layout"),
+                bind_group_layouts: &[Some(&flip_disc_compute_layout)],
+                immediate_size: 0,
+            });
+        let flip_disc_init_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Flip-Disc Init Pipeline"),
+                layout: Some(&flip_disc_compute_pipeline_layout),
+                module: &flip_disc_compute_shader,
+                entry_point: Some("cs_init"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+        let flip_disc_wave_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Flip-Disc Wave Step Pipeline"),
+                layout: Some(&flip_disc_compute_pipeline_layout),
+                module: &flip_disc_compute_shader,
+                entry_point: Some("cs_wave_step"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+        let flip_disc_step_pipeline =
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("Flip-Disc Disc Step Pipeline"),
+                layout: Some(&flip_disc_compute_pipeline_layout),
+                module: &flip_disc_compute_shader,
+                entry_point: Some("cs_disc_step"),
+                compilation_options: Default::default(),
+                cache: pipeline_cache_ref,
+            });
+
         // --- 3D Engine Extensions Init ---
         let mut mesh_registry = std::collections::HashMap::new();
         let mut unique_geometries = std::collections::HashSet::new();
@@ -2585,6 +2801,22 @@ impl VulkanEngine {
             acoustic_render_bind_group,
             acoustic_wave_initialized: false,
 
+            flip_disc_params_buffer,
+            _flip_disc_wave_a_buffer: flip_disc_wave_a_buffer,
+            _flip_disc_wave_b_buffer: flip_disc_wave_b_buffer,
+            _flip_disc_state_buffer: flip_disc_state_buffer,
+            flip_disc_compute_bg_a,
+            flip_disc_compute_bg_b,
+            flip_disc_init_pipeline,
+            flip_disc_wave_pipeline,
+            flip_disc_step_pipeline,
+            flip_disc_render_pipeline_layout,
+            flip_disc_render_bind_group,
+            flip_disc_ping: true,
+            flip_disc_initialized: false,
+            flip_disc_sim: FlipDiscSimState::default(),
+            flip_disc_pending_substeps: 0,
+
             depth_texture_view,
 
             waveform_history_flat: vec![0.0; 2048 * WAVEFORM_HISTORY_RING_CAP],
@@ -2738,6 +2970,21 @@ impl VulkanEngine {
                     conservative: false,
                 },
                 "vs_main_3d",
+            )
+        } else if vis_def.id == 32 {
+            (
+                &self.flip_disc_render_pipeline_layout,
+                Vec::new(),
+                wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    strip_index_format: None,
+                    front_face: wgpu::FrontFace::Ccw,
+                    cull_mode: None,
+                    polygon_mode: wgpu::PolygonMode::Fill,
+                    unclipped_depth: false,
+                    conservative: false,
+                },
+                "vs_main",
             )
         } else {
             match vis_def.pipeline_type {
@@ -3761,6 +4008,33 @@ impl VulkanEngine {
         }
 
         let vis_def = &crate::state::VISUALIZERS[state.current_visualizer_idx];
+        if vis_def.id == 32 {
+            let lr_pair = if state.tracker_channels.is_some() && state.channel_vus.len() >= 2 {
+                [
+                    state.channel_vus[0],
+                    state.channel_vus[state.channel_vus.len() - 1],
+                ]
+            } else {
+                let l = state.channel_vus.first().copied().unwrap_or(0.0);
+                let r = state.channel_vus.get(1).copied().unwrap_or(l);
+                [l, r]
+            };
+            let (fd_params, substeps) = self.flip_disc_sim.step(
+                &state.spectrum_data,
+                &lr_pair,
+                frame_dt,
+                self.last_aspect_ratio,
+                !state.is_paused && !state.track_ended,
+                uniforms.smooth_time,
+                self.flip_disc_initialized,
+            );
+            self.flip_disc_pending_substeps = substeps;
+            self.queue.write_buffer(
+                &self.flip_disc_params_buffer,
+                0,
+                bytemuck::cast_slice(&[fd_params]),
+            );
+        }
         if vis_def.requires_acoustic_waves && state.room_volume_smoke {
             Self::extract_acoustic_wave_phases(
                 &mut self.channel_phases,
@@ -5082,6 +5356,60 @@ impl VulkanEngine {
                 self.biolum_initialized = true;
             }
 
+            if vis_def.id == 32 && (!state.is_paused || !self.flip_disc_initialized) {
+                let mut compute_pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: Some("Mechanical Flip-Disc Compute"),
+                    timestamp_writes: take_sim_timestamps(),
+                });
+                if !self.flip_disc_initialized {
+                    compute_pass.set_pipeline(&self.flip_disc_init_pipeline);
+                    compute_pass.set_bind_group(0, Some(&self.flip_disc_compute_bg_a), &[]);
+                    compute_pass.dispatch_workgroups(
+                        FLIP_DISC_WORKGROUPS_X,
+                        FLIP_DISC_WORKGROUPS_Y,
+                        1,
+                    );
+                    compute_pass.set_bind_group(0, Some(&self.flip_disc_compute_bg_b), &[]);
+                    compute_pass.dispatch_workgroups(
+                        FLIP_DISC_WORKGROUPS_X,
+                        FLIP_DISC_WORKGROUPS_Y,
+                        1,
+                    );
+                    self.flip_disc_ping = true;
+                    self.flip_disc_initialized = true;
+                }
+                if !state.is_paused {
+                    let substeps = self.flip_disc_pending_substeps.min(2);
+                    for _ in 0..substeps {
+                        compute_pass.set_pipeline(&self.flip_disc_wave_pipeline);
+                        let bg = if self.flip_disc_ping {
+                            &self.flip_disc_compute_bg_a
+                        } else {
+                            &self.flip_disc_compute_bg_b
+                        };
+                        compute_pass.set_bind_group(0, Some(bg), &[]);
+                        compute_pass.dispatch_workgroups(
+                            FLIP_DISC_WORKGROUPS_X,
+                            FLIP_DISC_WORKGROUPS_Y,
+                            1,
+                        );
+                        self.flip_disc_ping = !self.flip_disc_ping;
+                    }
+                    let disc_bg = if self.flip_disc_ping {
+                        &self.flip_disc_compute_bg_a
+                    } else {
+                        &self.flip_disc_compute_bg_b
+                    };
+                    compute_pass.set_pipeline(&self.flip_disc_step_pipeline);
+                    compute_pass.set_bind_group(0, Some(disc_bg), &[]);
+                    compute_pass.dispatch_workgroups(
+                        FLIP_DISC_WORKGROUPS_X,
+                        FLIP_DISC_WORKGROUPS_Y,
+                        1,
+                    );
+                }
+            }
+
             if vis_def.requires_acoustic_waves && state.room_volume_smoke {
                 let needs_clear = !self.acoustic_wave_initialized;
                 if needs_clear || !state.is_paused {
@@ -5324,6 +5652,9 @@ impl VulkanEngine {
                         render_pass.set_pipeline(vis_pipeline);
                     }
                     render_pass.set_bind_group(0, &self.uniform_bind_group, &[]);
+                    if crate::state::VISUALIZERS[mode_idx].id == 32 {
+                        render_pass.set_bind_group(1, &self.flip_disc_render_bind_group, &[]);
+                    }
                     render_pass.draw(0..3, 0..1);
                 }
 

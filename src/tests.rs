@@ -1428,8 +1428,8 @@ fn test_gamepad_l2_r2_scrub_no_hud_collision_and_l3_r3_bindings() {
     }
     let shared_wgsl = total_wgsl - standalone_wgsl;
     assert_eq!(shared_wgsl, 2);
-    assert_eq!(standalone_wgsl, 30);
-    assert_eq!(total_wgsl, 32);
+    assert_eq!(standalone_wgsl, 32);
+    assert_eq!(total_wgsl, 34);
 
     let vis_count = crate::state::VISUALIZERS.len();
     let vis_review = include_str!("../VIS_REVIEW.md");
