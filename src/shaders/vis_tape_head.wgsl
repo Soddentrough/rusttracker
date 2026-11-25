@@ -96,13 +96,15 @@ fn hash11_tape(p: f32) -> f32 {
     return fract(p1);
 }
 
-fn get_slice_pos_for_px(p: f32, playhead_p: f32, max_w: f32) -> f32 {
+fn get_slice_pos_for_px(p: f32, playhead_p: f32, max_w: f32, time_span_scale: f32) -> f32 {
     if p < playhead_p {
         let prog = p / max(playhead_p, 1.0);
-        return clamp(20.0 + prog * 80.0, 0.0, 100.0);
+        let hist_span = 80.0 * time_span_scale;
+        return clamp((100.0 - hist_span) + prog * hist_span, 0.0, 100.0);
     } else {
         let prog = (p - playhead_p) / max(max_w - playhead_p, 1.0);
-        return clamp(100.0 + prog * 498.0, 100.0, 599.0);
+        let fut_span = 498.0 * time_span_scale;
+        return clamp(100.0 + prog * fut_span, 100.0, 599.0);
     }
 }
 
@@ -122,7 +124,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let p_i1 = (p_i0 + 1u) & 3u;
     let p_f = smoothstep(0.0, 1.0, fract(cycle));
 
-    let playhead_x_norm = 0.15;
+    let wide_t = smoothstep(0.6, 1.5, aspect);
+    let time_span_scale = clamp(aspect / 1.75, 0.42, 1.0);
+    let spark_x_scale = mix(0.65, 1.0, wide_t);
+    let playhead_x_norm = mix(0.24, 0.15, wide_t);
     let playhead_px = u32(playhead_x_norm * grid_size.x);
     let mid_py = u32(grid_size.y * 0.5);
 
@@ -165,8 +170,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         history_fade = hist_prog * mix(1.0, hist_prog, 0.35);
     }
 
-    let pos_curr = get_slice_pos_for_px(f32(px), f32(playhead_px), grid_size.x);
-    let pos_next = get_slice_pos_for_px(f32(px + 1u), f32(playhead_px), grid_size.x);
+    let pos_curr = get_slice_pos_for_px(f32(px), f32(playhead_px), grid_size.x, time_span_scale);
+    let pos_next = get_slice_pos_for_px(f32(px + 1u), f32(playhead_px), grid_size.x, time_span_scale);
 
     let curr_peaks = sample_timeline_peaks(pos_curr);
     let next_peaks = sample_timeline_peaks(pos_next);
@@ -308,7 +313,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         }
 
         // Horizontal Laser Streak across both sparks
-        let streak_len = i32(16.0 + now_treble * 50.0);
+        let streak_len = i32((16.0 + now_treble * 50.0) * spark_x_scale);
         if (dy_hit_top == 0 || dy_hit_bot == 0) && dx_playhead <= streak_len {
             let att = (1.0 - f32(dx_playhead) / f32(streak_len)) * (0.35 + now_treble * 0.75);
             col = col + spark_halo_col * att;
@@ -341,7 +346,7 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             for (var e = 0u; e < num_embers; e = e + 1u) {
                 let f_e = f32(e);
                 let seed = base_ember_cycle + f_e * 17.31;
-                let vx = -(hash11_tape(seed * 1.1) * 35.0 + 8.0 + now_treble * 30.0);
+                let vx = -(hash11_tape(seed * 1.1) * 35.0 + 8.0 + now_treble * 30.0) * spark_x_scale;
                 let life = clamp(1.0 - ember_frac + hash11_tape(seed * 3.7) * 0.3, 0.0, 1.0);
                 let age = 1.0 - life;
 

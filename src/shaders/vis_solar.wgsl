@@ -193,7 +193,7 @@ fn calcNormal(p: vec3<f32>) -> vec3<f32> {
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let uv = in.uv * 2.0 - 1.0;
     let aspect = max(audio.aspect_ratio, 0.1);
-    let fit_scale = min(aspect / 1.33, 1.0);
+    let fit_scale = min(aspect / 1.48, 1.0);
     let p = vec2<f32>(uv.x * aspect, -uv.y) / fit_scale;
 
     g_bass_energy = clamp((audio.spectrum[0].x + audio.spectrum[1].x + audio.spectrum[2].x) / 210.0, 0.0, 1.0);

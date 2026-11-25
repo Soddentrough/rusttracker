@@ -217,7 +217,8 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     var final_color = aces_tonemap(emission + in_scattering + halation + bloom + ember_sparks);
 
     // --- Draw Channel Labels along Hearth ---
-    if (uv.y > 0.95) {
+    let label_y = select(0.97, 0.925, aspect < 1.15);
+    if (uv.y > label_y - 0.025) {
         let channel_width = 1.0 / f32(max(n_spatial_ch, 1u));
         let center_x = (f32(hover_spatial_idx) + 0.5) * channel_width;
         let center_xc = center_x * aspect;
@@ -246,12 +247,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         let px_size = 0.003;
         let char_w = px_size * 4.0;
         let total_w = char_w * f32(lbl_len) - px_size;
-        let label_origin = vec2<f32>(center_xc - total_w * 0.5, 0.97);
+        let label_origin = vec2<f32>(center_xc - total_w * 0.5, label_y);
 
         let box_w = total_w + 0.01;
         let box_h = px_size * 5.0 + 0.01;
         let dx = abs(uv_c.x - center_xc);
-        let dy = abs(uv_c.y - (0.97 + px_size * 2.5));
+        let dy = abs(uv_c.y - (label_y + px_size * 2.5));
 
         if (dx < box_w * 0.5 && dy < box_h * 0.5) {
             final_color = vec3<f32>(0.0);

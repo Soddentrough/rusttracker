@@ -63,10 +63,11 @@ fn get_vfd_color(led_height_frac: f32) -> vec3<f32> {
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     let aspect = max(audio.aspect_ratio, 0.2);
 
-    // Adaptively scale column count based on aspect ratio (portrait mobile vs square vs ultrawide desktop)
-    let num_cols_f = clamp(floor(48.0 * aspect), 24.0, 112.0);
+    // Adaptively scale column & row counts based on aspect ratio (portrait mobile vs square vs ultrawide desktop)
+    let col_density = mix(30.0, 48.0, smoothstep(0.75, 1.55, aspect));
+    let num_cols_f = clamp(floor(col_density * aspect), 20.0, 112.0);
     let num_cols = u32(num_cols_f);
-    let num_leds = 32.0;
+    let num_leds = floor(mix(38.0, 32.0, smoothstep(0.75, 1.35, aspect)));
 
     // Smoked acrylic VFD bezel margins
     let margin_x = 0.015;

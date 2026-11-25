@@ -387,7 +387,10 @@ fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
 fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     let mat_id = in.mat;
     let n = normalize(in.normal);
-    let v = normalize(vec3<f32>(0.0, 0.0, 7.5) - in.world_pos);
+    let vu_aspect = max(audio.aspect_ratio, 0.25);
+    let vu_smooth = smoothstep(0.85, 1.25, vu_aspect);
+    let vu_cam_z = clamp((12.0 + 1.5 * vu_smooth) / vu_aspect, 6.2, 22.0);
+    let v = normalize(vec3<f32>(0.0, 0.0, vu_cam_z) - in.world_pos);
     let levels = in.levels;
 
     // Studio ambient & key lighting

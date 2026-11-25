@@ -45,6 +45,11 @@ fn get_lyrics_eye_pos() -> vec3<f32> {
 
 // Sample smoothed FLIP Navier-Stokes surface height from upper 16 bits of render_grid
 fn sample_flip_surface_displacement(pos_xz: vec2<f32>) -> f32 {
+    let domain_fade = smoothstep_r(15.8, 13.5, abs(pos_xz.x)) * smoothstep_r(9.8, 7.8, abs(pos_xz.y));
+    if (domain_fade <= 0.001) {
+        return 0.0;
+    }
+
     let u = clamp((pos_xz.x + 16.0) / 32.0, 0.002, 0.997);
     let v = clamp((pos_xz.y + 10.0) / 20.0, 0.002, 0.997);
     let cx = i32(u * 512.0);
@@ -64,7 +69,7 @@ fn sample_flip_surface_displacement(pos_xz: vec2<f32>) -> f32 {
         }
     }
     if (count > 0.0) {
-        return clamp((sum_h / count) * 0.04, 0.0, 0.06);
+        return clamp((sum_h / count) * 0.04, 0.0, 0.06) * domain_fade;
     }
     return 0.0;
 }
@@ -114,6 +119,9 @@ fn get_water_surface_height(pos_xz: vec2<f32>) -> f32 {
 
 // Sample splash droplet density from lower 16 bits of render grid for volumetric impact mist
 fn sample_flip_splash_density(pos_xz: vec2<f32>) -> f32 {
+    if (abs(pos_xz.x) >= 15.8 || abs(pos_xz.y) >= 9.8) {
+        return 0.0;
+    }
     let u = clamp((pos_xz.x + 16.0) / 32.0, 0.0, 0.999);
     let v = clamp((pos_xz.y + 10.0) / 20.0, 0.0, 0.999);
     let gx = u32(u * 512.0);

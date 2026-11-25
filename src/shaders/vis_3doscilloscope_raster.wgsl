@@ -104,8 +104,9 @@ fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
     let abs_w = abs(wave_val);
     let boosted_w = sign(wave_val) * (abs_w * 1.65 / (1.0 + abs_w * 0.65));
 
-    // Scale coordinates into 3D world coordinates
-    let x = (u_coord - 0.5) * 19.2;
+    // Scale coordinates into 3D world coordinates (fit width cleanly on portrait viewports)
+    let aspect = max(audio.aspect_ratio, 0.1);
+    let x = (u_coord - 0.5) * min(19.2, max(8.2 * aspect, 4.2));
     let y = boosted_w * 2.25 * height_taper;
     let z = mix(9.48, -2.6, v_scrolled);
 
@@ -130,7 +131,7 @@ fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
     );
 
     let view_pos = view_matrix * vec4<f32>(p3, 1.0);
-    let p_00 = 1.0 / (0.9 * max(audio.aspect_ratio, 0.1));
+    let p_00 = 1.0 / (0.9 * aspect);
     let p_11 = 1.11111111;
     let p_22 = -1.0001;
     let p_32 = -0.10001;
@@ -219,7 +220,8 @@ fn get_wire(line_val: f32, inv_coc_05: f32, inv_coc_02_b: f32, inv_coc_01_b: f32
 fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
     // Match depth wireframe lines to the actual history row count so horizontal lines sit on vertex ridges
     let hist_lines = f32(max(audio.waveform_history_size, 72u) - 1u);
-    let grid_res = vec2<f32>(128.0, hist_lines);
+    let grid_x = clamp(floor(128.0 * min(max(audio.aspect_ratio, 0.1) / 1.5, 1.0)), 56.0, 128.0);
+    let grid_res = vec2<f32>(grid_x, hist_lines);
 
     // Lock horizontal wireframe lines to physical vertex rows (in.local_z = v_coord) so lines sit
     // directly on the 3D wave ridges and glide smoothly backward in Z with the mesh

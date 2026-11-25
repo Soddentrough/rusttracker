@@ -368,21 +368,23 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
             sky_t
         );
         
-        // Sun glow
-        let sun_pos = vec2<f32>(0.0, 0.15);
-        let sun_dist = length(p - sun_pos);
+        // Sun glow & body (scaled proportionally for portrait / square viewports)
+        let sun_scale = 1.0 + clamp((1.6 - max(audio.aspect_ratio, 0.35)) / 0.7, 0.0, 1.0) * 2.1;
+        let sun_pos = vec2<f32>(0.0, 0.15 + 0.25 * (sun_scale - 1.0));
+        let rel_sun_p = (p - sun_pos) / sun_scale;
+        let sun_dist_s = length(rel_sun_p);
         let sun_radius = 0.35 + bass_pulse * 0.015;
         
-        sky_color += vec3<f32>(0.42, 0.10, 0.22) * exp(-sun_dist * 2.4) * (0.28 + mid_energy * 0.42);
+        sky_color += vec3<f32>(0.42, 0.10, 0.22) * exp(-sun_dist_s * 2.4) * (0.28 + mid_energy * 0.42);
         
         // Sun body with classic 80s OutRun scanline blinds
-        if sun_dist < sun_radius && p.y > -0.05 {
-            let cut = fract((p.y - sun_pos.y) * 20.0 - audio.smooth_time * (0.65 + bass_pulse * 0.85));
-            let cut_threshold = mix(0.28, 0.90, clamp((p.y - sun_pos.y + 0.2) * 2.5, 0.0, 1.0));
-            if cut > cut_threshold || p.y > sun_pos.y + 0.05 {
-                let sun_t = clamp((p.y - sun_pos.y + 0.2) * 2.0, 0.0, 1.0);
+        if sun_dist_s < sun_radius && p.y > -0.20 {
+            let cut = fract(rel_sun_p.y * 20.0 - audio.smooth_time * (0.65 + bass_pulse * 0.85));
+            let cut_threshold = mix(0.28, 0.90, clamp((rel_sun_p.y + 0.2) * 2.5, 0.0, 1.0));
+            if cut > cut_threshold || rel_sun_p.y > 0.05 {
+                let sun_t = clamp((rel_sun_p.y + 0.2) * 2.0, 0.0, 1.0);
                 let sun_col = mix(vec3<f32>(1.0, 0.05, 0.42), vec3<f32>(1.0, 0.86, 0.12), sun_t) * (1.1 + bass_pulse * 0.35);
-                sky_color = mix(sky_color, sun_col, smoothstep_r(sun_radius, sun_radius - 0.02, sun_dist));
+                sky_color = mix(sky_color, sun_col, smoothstep_r(sun_radius, sun_radius - 0.02, sun_dist_s));
             }
         }
         
@@ -393,7 +395,7 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
             let alt_mask = smoothstep(0.0, 0.5, p.y) * smoothstep_r(3.5, 1.5, p.y);
             let cloud_alpha = smoothstep(0.4, 0.6, cloud) * alt_mask * 0.55;
             sky_color = mix(sky_color, vec3<f32>(0.08, 0.02, 0.12), cloud_alpha);
-            sky_color += vec3<f32>(0.22, 0.05, 0.12) * smoothstep_r(0.55, 0.4, cloud) * alt_mask * exp(-sun_dist * 1.5) * (0.5 + bass_pulse * 0.25);
+            sky_color += vec3<f32>(0.22, 0.05, 0.12) * smoothstep_r(0.55, 0.4, cloud) * alt_mask * exp(-sun_dist_s * 1.5) * (0.5 + bass_pulse * 0.25);
         }
 
         // Stars with individual phase twinkle and treble sparkle (only evaluate trig/sqrt on the 3% star cells)
