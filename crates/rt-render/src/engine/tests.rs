@@ -2565,6 +2565,84 @@ fn test_neon_acoustic_studio_camera_choreography_and_clearance() {
 }
 
 #[test]
+fn test_neon_acoustic_studio_speaker_envelope_and_grounded_stands() {
+    let mut env_60 = [0.0f32; 16];
+    let mut target = [0.0f32; 16];
+    target[0] = 1.0;
+
+    VulkanEngine::step_neon_speaker_envelopes(&mut env_60, &target, 1.0 / 60.0);
+    assert!(
+        env_60[0] > 0.35 && env_60[0] < 0.50,
+        "Single 60Hz attack step must smooth impulse instead of snapping to 1.0, got {}",
+        env_60[0]
+    );
+    assert_eq!(env_60[1], 0.0);
+
+    let mut prev = env_60[0];
+    for _ in 0..5 {
+        VulkanEngine::step_neon_speaker_envelopes(&mut env_60, &target, 1.0 / 60.0);
+        assert!(
+            env_60[0] > prev && env_60[0] <= 1.0,
+            "Attack envelope must rise monotonically: prev={prev}, curr={}",
+            env_60[0]
+        );
+        prev = env_60[0];
+    }
+
+    let mut env_120 = [0.0f32; 16];
+    for _ in 0..12 {
+        VulkanEngine::step_neon_speaker_envelopes(&mut env_120, &target, 1.0 / 120.0);
+    }
+    assert!(
+        (env_60[0] - env_120[0]).abs() < 1e-4,
+        "Envelope smoothing must be framerate-independent: 60Hz={}, 120Hz={}",
+        env_60[0],
+        env_120[0]
+    );
+
+    let zero_target = [0.0f32; 16];
+    for _ in 0..120 {
+        VulkanEngine::step_neon_speaker_envelopes(&mut env_60, &zero_target, 1.0 / 60.0);
+    }
+    assert_eq!(
+        env_60[0], 0.0,
+        "Envelope must decay smoothly to exact 0.0 after sustained silence"
+    );
+
+    let (mesh_verts, _) = generate_neon_room_mesh();
+    let surround_stand_mats: Vec<f32> = mesh_verts
+        .iter()
+        .filter(|v| {
+            ((v.tex_coords[0] - 4.0).abs() < 0.1 || (v.tex_coords[0] - 5.0).abs() < 0.1)
+                && v.position[1] < -0.15
+        })
+        .map(|v| v.tex_coords[1])
+        .collect();
+    assert!(!surround_stand_mats.is_empty());
+    assert!(
+        surround_stand_mats.iter().all(|&m| (m - 1.0).abs() < 1e-3),
+        "Surround floor stands (ch 4 & 5, y < -0.15) must use static mat 1.0, found {:?}",
+        surround_stand_mats
+    );
+
+    let tower_pedestal_mats: Vec<f32> = mesh_verts
+        .iter()
+        .filter(|v| {
+            ((v.tex_coords[0] - 0.0).abs() < 0.1 || (v.tex_coords[0] - 1.0).abs() < 0.1)
+                && v.position[1] < -1.35
+                && v.tex_coords[1] > 0.9
+        })
+        .map(|v| v.tex_coords[1])
+        .collect();
+    assert!(!tower_pedestal_mats.is_empty());
+    assert!(
+        tower_pedestal_mats.iter().all(|&m| (m - 1.0).abs() < 1e-3),
+        "Front tower pedestal bases (ch 0 & 1, y < -1.35) must use static mat 1.0, found {:?}",
+        tower_pedestal_mats
+    );
+}
+
+#[test]
 fn test_biolum_refactor_mesh_camera_and_shaders() {
     let biolum_vis = crate::state::VISUALIZERS
         .iter()
@@ -3258,13 +3336,27 @@ fn test_flip_disc_registration_sim_and_shaders() {
     let mut sim = FlipDiscSimState::default();
     let silent_spec = vec![0.0f32; 1024];
     let silent_vu = [0.0f32, 0.0f32];
-    let (p_paused, sub_paused) =
-        sim.step(&silent_spec, &silent_vu, 1.0 / 60.0, 1.777, false, 1.0, false);
+    let (p_paused, sub_paused) = sim.step(
+        &silent_spec,
+        &silent_vu,
+        1.0 / 60.0,
+        1.777,
+        false,
+        1.0,
+        false,
+    );
     assert_eq!(sub_paused, 0);
     assert!(p_paused.impulses.iter().all(|imp| imp[3] == 0.0));
 
-    let (p_silent, sub_silent) =
-        sim.step(&silent_spec, &silent_vu, 1.0 / 60.0, 1.777, true, 1.0, false);
+    let (p_silent, sub_silent) = sim.step(
+        &silent_spec,
+        &silent_vu,
+        1.0 / 60.0,
+        1.777,
+        true,
+        1.0,
+        false,
+    );
     assert_eq!(sub_silent, 1);
     assert!(p_silent.impulses.iter().all(|imp| imp[3] == 0.0));
 
@@ -3282,7 +3374,10 @@ fn test_flip_disc_registration_sim_and_shaders() {
     );
     assert_eq!(sub_kick, 1);
     let kick_imp = p_kick.impulses[0];
-    assert!(kick_imp[3] > 1.5, "Expected strong bass impulse, got {kick_imp:?}");
+    assert!(
+        kick_imp[3] > 1.5,
+        "Expected strong bass impulse, got {kick_imp:?}"
+    );
     assert!(
         (5.0..=91.0).contains(&kick_imp[0]) && (5.0..=59.0).contains(&kick_imp[1]),
         "Impulse out of safe grid interior: {kick_imp:?}"
@@ -3305,9 +3400,25 @@ fn test_flip_disc_registration_sim_and_shaders() {
     let mut mid_spec = vec![0.0f32; 1024];
     mid_spec[40..90].fill(65.0);
     let mut sim_l = FlipDiscSimState::default();
-    let (p_left, _) = sim_l.step(&mid_spec, &[0.95, 0.05], 1.0 / 60.0, 1.777, true, 1.0, false);
+    let (p_left, _) = sim_l.step(
+        &mid_spec,
+        &[0.95, 0.05],
+        1.0 / 60.0,
+        1.777,
+        true,
+        1.0,
+        false,
+    );
     let mut sim_r = FlipDiscSimState::default();
-    let (p_right, _) = sim_r.step(&mid_spec, &[0.05, 0.95], 1.0 / 60.0, 1.777, true, 1.0, false);
+    let (p_right, _) = sim_r.step(
+        &mid_spec,
+        &[0.05, 0.95],
+        1.0 / 60.0,
+        1.777,
+        true,
+        1.0,
+        false,
+    );
     assert!(
         p_right.impulses[1][0] > p_left.impulses[1][0] + 6.0,
         "Stereo panning must shift mid ripples laterally (L={}, R={})",

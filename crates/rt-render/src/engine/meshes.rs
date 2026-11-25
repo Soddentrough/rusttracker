@@ -439,7 +439,7 @@ fn room_add_speaker_tower(
     };
 
     if is_tower {
-        // Pedestal base & Cabinet (mat = 1.2 for active speaker cabinet)
+        // Pedestal base (mat = 1.0 static satin hardware) & Cabinet (mat = 1.2 for active speaker cabinet)
         room_add_box(
             vertices,
             indices,
@@ -447,7 +447,7 @@ fn room_add_speaker_tower(
             [0.98, 0.12, 1.05],
             rot_y,
             ch,
-            1.2,
+            1.0,
         );
         room_add_box(vertices, indices, pos, [0.84, 2.2, 0.90], rot_y, ch, 1.2);
 
@@ -512,7 +512,7 @@ fn room_add_speaker_tower(
             5.2,
         );
     } else {
-        // Stand-mounted surround monitor
+        // Stand-mounted surround monitor (static floor stand mat = 1.0)
         room_add_box(
             vertices,
             indices,
@@ -520,7 +520,7 @@ fn room_add_speaker_tower(
             [0.10, 1.6, 0.10],
             rot_y,
             ch,
-            1.2,
+            1.0,
         );
         room_add_box(
             vertices,
@@ -529,7 +529,7 @@ fn room_add_speaker_tower(
             [0.75, 0.06, 0.75],
             rot_y,
             ch,
-            1.2,
+            1.0,
         );
         // Monitor box (mat = 1.2)
         room_add_box(vertices, indices, pos, [0.72, 1.18, 0.68], rot_y, ch, 1.2);
@@ -1736,17 +1736,17 @@ pub fn generate_glass_lyrics_mesh(text: &str) -> (Vec<Vertex>, Vec<u32>) {
         }
     }
 
-    // 2. Tessellated 3D Water Grid Plane: 128 x 128 vertices spanning [-16.0, 16.0] x [-10.0, 4.5]
+    // 2. Tessellated 3D Water Grid Plane: 128 x 128 vertices spanning [-24.0, 24.0] x [-14.0, 16.0]
     let grid_res_x = 128;
     let grid_res_z = 128;
     let start_water_vert = vertices.len() as u32;
 
     for iz in 0..grid_res_z {
         let fz = iz as f32 / (grid_res_z - 1) as f32;
-        let z = -10.0 + fz * 14.5;
+        let z = -14.0 + fz * 30.0;
         for ix in 0..grid_res_x {
             let fx = ix as f32 / (grid_res_x - 1) as f32;
-            let x = -16.0 + fx * 32.0;
+            let x = -24.0 + fx * 48.0;
             vertices.push(Vertex {
                 position: [x, 0.0, z],
                 normal: [0.0, 1.0, 0.0],

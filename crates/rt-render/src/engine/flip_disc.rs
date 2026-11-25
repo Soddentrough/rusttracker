@@ -37,8 +37,8 @@ pub struct FlipDiscSimState {
 #[inline]
 fn r2_offset(seq: u32) -> (f32, f32) {
     let s = (seq as f32) + 1.0;
-    let fx = (0.5 + s * 0.754_877_67).fract() * 2.0 - 1.0;
-    let fy = (0.5 + s * 0.569_840_29).fract() * 2.0 - 1.0;
+    let fx = (0.5 + s * 0.754_877_7).fract() * 2.0 - 1.0;
+    let fy = (0.5 + s * 0.569_840_3).fract() * 2.0 - 1.0;
     (fx, fy)
 }
 
@@ -152,10 +152,8 @@ impl FlipDiscSimState {
             if bass > (self.bass_env * 1.18 + 0.06) && self.bass_cd <= 0.0 {
                 self.emit_seq = self.emit_seq.wrapping_add(1);
                 let (fx, fy) = r2_offset(self.emit_seq);
-                let (gx, gy) = clamp_grid(
-                    (fx * 0.24 + stereo_bias * 0.14) * vis_w,
-                    fy * 0.20 * vis_h,
-                );
+                let (gx, gy) =
+                    clamp_grid((fx * 0.24 + stereo_bias * 0.14) * vis_w, fy * 0.20 * vis_h);
                 let radius = (2.6 + bass * 0.5).clamp(2.6, 3.3);
                 let strength = (1.65 + bass * 0.65).clamp(1.65, 2.55);
                 if strength > self.pending_impulses[0][3] {
@@ -169,10 +167,8 @@ impl FlipDiscSimState {
             if mids > (self.mid_env * 1.15 + 0.05) && self.mid_cd <= 0.0 {
                 self.emit_seq = self.emit_seq.wrapping_add(1);
                 let (fx, fy) = r2_offset(self.emit_seq);
-                let (gx, gy) = clamp_grid(
-                    (fx * 0.28 + stereo_bias * 0.34) * vis_w,
-                    fy * 0.32 * vis_h,
-                );
+                let (gx, gy) =
+                    clamp_grid((fx * 0.28 + stereo_bias * 0.34) * vis_w, fy * 0.32 * vis_h);
                 let radius = (1.8 + mids * 0.35).clamp(1.8, 2.3);
                 let strength = (1.15 + mids * 0.55).clamp(1.15, 1.85);
                 if strength > self.pending_impulses[1][3] {
@@ -186,10 +182,8 @@ impl FlipDiscSimState {
             if treble > (self.treble_env * 1.16 + 0.045) && self.treble_cd <= 0.0 {
                 self.emit_seq = self.emit_seq.wrapping_add(1);
                 let (fx, fy) = r2_offset(self.emit_seq);
-                let (gx, gy) = clamp_grid(
-                    (fx * 0.42 + stereo_bias * 0.18) * vis_w,
-                    fy * 0.40 * vis_h,
-                );
+                let (gx, gy) =
+                    clamp_grid((fx * 0.42 + stereo_bias * 0.18) * vis_w, fy * 0.40 * vis_h);
                 let radius = (1.15 + treble * 0.25).clamp(1.15, 1.50);
                 let strength = (0.85 + treble * 0.40).clamp(0.85, 1.35);
                 if strength > self.pending_impulses[2][3] {
@@ -203,10 +197,8 @@ impl FlipDiscSimState {
             if !any_pending && overall > 0.07 && self.ambient_cd <= 0.0 {
                 self.emit_seq = self.emit_seq.wrapping_add(1);
                 let (fx, fy) = r2_offset(self.emit_seq);
-                let (gx, gy) = clamp_grid(
-                    (fx * 0.34 + stereo_bias * 0.16) * vis_w,
-                    fy * 0.32 * vis_h,
-                );
+                let (gx, gy) =
+                    clamp_grid((fx * 0.34 + stereo_bias * 0.16) * vis_w, fy * 0.32 * vis_h);
                 let strength = (0.75 + overall * 1.1).clamp(0.75, 1.85);
                 self.pending_impulses[3] = [gx, gy, 2.2, strength];
                 self.ambient_cd = 0.42;

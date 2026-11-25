@@ -75,6 +75,22 @@ const SPEAKER_POS: array<vec3<f32>, 12> = array<vec3<f32>, 12>(
     vec3<f32>( 3.2,  4.32, -2.5)  // TRR (11)
 );
 
+// Grounded anchor Y coordinate for each speaker cabinet (prevents floor/plinth penetration)
+const SPEAKER_ANCHOR_Y: array<f32, 12> = array<f32, 12>(
+    -1.35, // 0: FL tower base on pedestal
+    -1.35, // 1: FR tower base on pedestal
+    -0.35, // 2: C bottom on isolation plinth
+    -1.36, // 3: LFE sub base on stage riser
+    -0.11, // 4: SL monitor bottom on rigid stand
+    -0.11, // 5: SR monitor bottom on rigid stand
+    -1.00, // 6: RL tower base on pedestal
+    -1.00, // 7: RR tower base on pedestal
+     4.55, // 8: TFL ceiling mount
+     4.55, // 9: TFR ceiling mount
+     4.55, // 10: TRL ceiling mount
+     4.55  // 11: TRR ceiling mount
+);
+
 // Speaker front baffle nozzles & normalized inward firing directions for smoke blasts
 const SPEAKER_NOZZLE: array<vec3<f32>, 12> = array<vec3<f32>, 12>(
     vec3<f32>(-3.63, -0.45,  5.07), // 0: FL
@@ -273,39 +289,39 @@ fn vs_main_3d(in: VertexInput) -> VertexOutput3D {
     let high_e = clamp((audio.spectrum[32].x + audio.spectrum[64].x) / 110.0, 0.0, 1.0);
 
     let ch_energy_raw = get_channel_level_bands(ch_idx, bass_e, lowmid_e, mid_e, high_e);
-    let ch_energy = clamp(ch_energy_raw, 0.0, 1.2);
+    let ch_energy = clamp(ch_energy_raw, 0.0, 1.0);
     let bass_pulse = clamp((audio.spectrum[0].y + audio.spectrum[0].z) / 135.0, 0.0, 1.2);
+    let bass_env = clamp(max(audio.channel_phases[7].z, bass_pulse * 0.75), 0.0, 1.0);
 
     var pos = in.position;
     let is_speaker = (mat_id > 1.1 && mat_id < 4.5) || (mat_id > 5.1 && mat_id < 5.3);
 
-    // 1. Whole-Speaker Physical Movement (Cabinet Pulse, Radial Expansion & Beat Bounce)
+    // 1. Whole-Speaker Grounded Pressure Swell (anchored at cabinet base/mount, no jittery hop/buzz)
     if (is_speaker) {
         let sp_center = SPEAKER_POS[ch_idx];
-        let rel = pos - sp_center;
-        let vib = 0.65 + 0.35 * sin(audio.smooth_time * 28.0 + f32(ch_idx) * 1.3);
-        let scale_xz = 1.0 + ch_energy * select(0.20, 0.14, ch_idx == 3u) * vib;
-        let y_expand = select(select(0.14, 0.09, ch_idx == 2u), 0.05, ch_idx == 3u);
-        let scale_y  = 1.0 + ch_energy * y_expand * vib;
-        let bounce_dir = select(1.0, -1.0, ch_idx >= 8u);
-        let hop_amp = select(select(0.15, 0.07, ch_idx == 2u), 0.02, ch_idx == 3u);
-        let hop_y = bounce_dir * ch_energy * hop_amp * abs(sin(audio.smooth_time * 16.0 + f32(ch_idx) * 1.1));
-        pos = sp_center + vec3<f32>(rel.x * scale_xz, rel.y * scale_y + hop_y, rel.z * scale_xz);
+        let anchor = vec3<f32>(sp_center.x, SPEAKER_ANCHOR_Y[ch_idx], sp_center.z);
+        let rel = pos - anchor;
+        let cab_drive = ch_energy * ch_energy;
+        let scale_xz = 1.0
+            + cab_drive * select(0.032, 0.024, ch_idx == 3u)
+            + bass_env * select(0.010, 0.018, ch_idx == 3u);
+        let y_expand = select(select(0.025, 0.018, ch_idx == 2u), 0.006, ch_idx == 3u);
+        let scale_y = 1.0 + cab_drive * y_expand;
+        pos = anchor + vec3<f32>(rel.x * scale_xz, rel.y * scale_y, rel.z * scale_xz);
     }
 
-    // 2. Woofer / Midrange / Tweeter Cone Piston Excursion along Normal
+    // 2. Woofer / Midrange / Tweeter Cone Piston Excursion along Normal (sealed rim, proportional travel)
     var displacement = 0.0;
     if (is_cone) {
-        let pump_osc = 0.55 + 0.45 * sin(audio.smooth_time * 44.0 + f32(ch_idx) * 1.5);
-        let radial_excursion = 0.14 + 0.86 * cone_center_weight;
+        let radial_excursion = cone_center_weight;
         if (ch_idx == 3u) {
-            displacement = (ch_energy * 0.90 + bass_pulse * 0.65) * 0.46 * pump_osc * radial_excursion;
+            displacement = (ch_energy * 0.55 + bass_env * 0.45) * 0.16 * radial_excursion;
         } else if (mat_id < 2.5) {
-            displacement = (ch_energy * 0.95 + bass_pulse * 0.35) * 0.38 * pump_osc * radial_excursion;
+            displacement = (ch_energy * 0.70 + bass_env * 0.30) * 0.11 * radial_excursion;
         } else if (mat_id < 3.5) {
-            displacement = ch_energy * 0.30 * pump_osc * radial_excursion;
+            displacement = ch_energy * 0.065 * radial_excursion;
         } else {
-            displacement = ch_energy * 0.18 * pump_osc * radial_excursion;
+            displacement = ch_energy * 0.025 * radial_excursion;
         }
     }
 
@@ -517,7 +533,7 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
         let cw = in.fill_diff_cw.w;
         let is_surround = smoothstep_r(0.16, 0.04, cw);
         let is_dustcap = smoothstep(0.65, 0.75, cw);
-        let cone_ribs = 0.80 + 0.20 * sin(cw * 38.0 - audio.smooth_time * 22.0 * step(0.05, ch_energy));
+        let cone_ribs = 0.86 + 0.14 * sin(cw * 36.0);
         let cone_base = vec3<f32>(0.030, 0.032, 0.042) * cone_ribs;
         let hot_core = vec3<f32>(1.0, 0.95, 0.85);
         let active_col = mix(ch_col, hot_core, is_dustcap * clamp(ch_energy * 0.85, 0.0, 0.75));
@@ -529,7 +545,7 @@ fn fs_main(in: VertexOutput3D) -> @location(0) vec4<f32> {
         // === Material 3.0: Active Midrange Diaphragms ===
         let cw = in.fill_diff_cw.w;
         let is_plug = smoothstep(0.68, 0.76, cw);
-        let cone_ribs = 0.82 + 0.18 * sin(cw * 30.0 - audio.smooth_time * 26.0 * step(0.05, ch_energy));
+        let cone_ribs = 0.86 + 0.14 * sin(cw * 30.0);
         let hot_core = vec3<f32>(1.0, 0.96, 0.90);
         let active_col = mix(ch_col, hot_core, is_plug * clamp(ch_energy * 0.8, 0.0, 0.7));
         let mid_glow = ch_energy * (3.4 + 1.2 * is_plug) * cone_ribs;

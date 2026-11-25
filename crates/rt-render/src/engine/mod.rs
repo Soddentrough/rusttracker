@@ -191,6 +191,7 @@ pub struct VulkanEngine {
     vu_needle_angles: Vec<f32>,
     vu_needle_velocities: Vec<f32>,
     channel_phases: [f32; 32],
+    neon_spatial_env: [f32; 16],
     vu_prev_active_segments: [u32; 32],
     vu_segment_glows: [[f32; 30]; 32],
     vu_prev_num_channels: u32,
@@ -2860,6 +2861,7 @@ impl VulkanEngine {
             vu_needle_angles: vec![0.0; 32],
             vu_needle_velocities: vec![0.0; 32],
             channel_phases: [0.0; 32],
+            neon_spatial_env: [0.0; 16],
             vu_prev_active_segments: [0; 32],
             vu_segment_glows: [[0.0; 30]; 32],
             vu_prev_num_channels: 0,
@@ -3472,12 +3474,34 @@ impl VulkanEngine {
         phases_out[31] += (sim_target - phases_out[31]) * sim_alpha;
     }
 
+    /// Asymmetric attack/release envelope smoothing for Neon Acoustic Studio speaker motion.
+    pub fn step_neon_speaker_envelopes(
+        envelopes: &mut [f32; 16],
+        targets: &[f32; 16],
+        frame_dt: f32,
+    ) {
+        let dt = frame_dt.clamp(0.0005, 0.05);
+        let alpha_up = 1.0 - (-dt / 0.032).exp();
+        let alpha_down = 1.0 - (-dt / 0.140).exp();
+        for (env, &raw_target) in envelopes.iter_mut().zip(targets.iter()) {
+            let target = raw_target.clamp(0.0, 1.0);
+            let alpha = if target > *env { alpha_up } else { alpha_down };
+            let next = *env + (target - *env) * alpha;
+            *env = if next < 1e-4 && target <= 1e-4 {
+                0.0
+            } else {
+                next
+            };
+        }
+    }
+
     pub fn clear_video_state(&mut self) {
         self.video_state = None;
         self.vu_prev_active_segments = [0; 32];
         self.vu_segment_glows = [[0.0; 30]; 32];
         self.vu_prev_num_channels = 0;
         self.channel_phases = [0.0; 32];
+        self.neon_spatial_env = [0.0; 16];
         self.acoustic_wave_initialized = false;
         self.biolum_initialized = false;
         self.cached_meta_path.clear();
@@ -3727,11 +3751,17 @@ impl VulkanEngine {
         }
 
         // 2. Populate Raw Spatial Channels (strict spatial mapping without UI reordering,
-        // blending fast raw_channel_vus for crisp per-note speaker cone & light transients)
+        // blending fast raw_channel_vus for crisp per-note speaker cone & light transients;
+        // Neon Acoustic Studio uses a calmer raw blend + asymmetric envelope smoothing).
+        let raw_vu_weight = if state.visualizer_mode == 31 {
+            0.25
+        } else {
+            0.72
+        };
         let get_fast_vu = |idx: usize| -> f32 {
             let smoothed = state.channel_vus.get(idx).copied().unwrap_or(0.0);
             if let Some(&raw) = state.raw_channel_vus.get(idx) {
-                raw * 0.72 + smoothed * 0.28
+                raw * raw_vu_weight + smoothed * (1.0 - raw_vu_weight)
             } else {
                 smoothed
             }
@@ -3760,6 +3790,14 @@ impl VulkanEngine {
             {
                 *dst = get_fast_vu(i);
             }
+        }
+        if state.visualizer_mode == 31 {
+            Self::step_neon_speaker_envelopes(
+                &mut self.neon_spatial_env,
+                &uniforms.spatial_channels,
+                frame_dt,
+            );
+            uniforms.spatial_channels = self.neon_spatial_env;
         }
 
         if state.visualizer_mode == 19 {
@@ -4035,7 +4073,7 @@ impl VulkanEngine {
                 bytemuck::cast_slice(&[fd_params]),
             );
         }
-        if vis_def.requires_acoustic_waves && state.room_volume_smoke {
+        if vis_def.requires_acoustic_waves {
             Self::extract_acoustic_wave_phases(
                 &mut self.channel_phases,
                 &state.raw_audio_channels,
@@ -5048,6 +5086,10 @@ impl VulkanEngine {
                     || state.visualizer_mode == 29
                 {
                     base_fov
+                } else if state.visualizer_mode == 13 && aspect < 1.35 {
+                    (48.0 * (1.35 / aspect.clamp(0.70, 1.35)))
+                        .min(76.0)
+                        .to_radians()
                 } else if aspect < 1.0 {
                     (base_fov / aspect.clamp(0.65, 1.0)).min(if is_room_vis {
                         85.0_f32.to_radians()
@@ -5071,7 +5113,9 @@ impl VulkanEngine {
                         glam::Vec3::new(0.0, 1.0, 0.0),
                     )
                 } else if state.visualizer_mode == 19 {
-                    let cam_z = (13.5 / aspect).clamp(6.2, 22.0);
+                    let vu_t = ((aspect - 0.85) / 0.40).clamp(0.0, 1.0);
+                    let vu_smooth = vu_t * vu_t * (3.0 - 2.0 * vu_t);
+                    let cam_z = ((12.0 + 1.5 * vu_smooth) / aspect).clamp(6.2, 22.0);
                     glam::Mat4::look_at_rh(
                         glam::Vec3::new(0.0, 0.0, cam_z),
                         glam::Vec3::new(0.0, 0.0, 0.0),
